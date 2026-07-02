@@ -33,9 +33,9 @@ The core (`root.zig`) is compiled into three artifacts by `build.zig`:
 1. **Native CLI** (`main.zig`) — `zig build` / `zig build run`. Uses the Zig-0.16 `std.process.Init`
    entry + new `Io` API (`Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64<<20))`,
    `Io.File.Writer`). See `design-decisions.md` for the 0.16 API notes.
-2. **C-ABI static library** (`c_api.zig` + `include/wazmrt.h`) — `zig build` installs `wazmrt.lib`/`.a`
-   and the header. Opaque `void*` handle; `smp_allocator` (no libc). This is what most
-   `universalWasmLoader-*` ports link.
+2. **C-ABI static library** (`wasm_c_api.zig`) — implements the **standard wasm-c-api**. `zig build`
+   installs `wazmrt.lib`/`.a` + both headers (`wasm.h`, `wazmrt.h`). Opaque handles; `smp_allocator`
+   (no libc). This is what the `universalWasmLoader-*` ports link. Verified from C by `tests/c_smoke.c`.
 3. **Freestanding wasm** (`wasm_entry.zig`) — `zig build wasm`, `ReleaseSmall`, `entry = .disabled`,
    `rdynamic = true`, `std.heap.wasm_allocator`. Proves the runtime compiles to wasm and gives web
    loaders a module to instantiate.
@@ -44,20 +44,36 @@ The core (`root.zig`) is compiled into three artifacts by `build.zig`:
 
 - `mod` = `addModule("wazmrt", root.zig)` — imported by the CLI and reused as the test root.
 - `exe` = CLI, imports `mod`; installed by default; `run` step.
-- `cabi` = `addLibrary(.static, c_api.zig)` + `installHeader(include/wazmrt.h)`; installed by default.
-  **Does NOT link libc** (deliberate — see `design-decisions.md`).
+- `cabi` = `addLibrary(.static, wasm_c_api.zig)` + `installHeader(wasm.h)` + `installHeader(wazmrt.h)`;
+  installed by default. **Does NOT link libc** (deliberate — see `design-decisions.md`).
 - `wasm_exe` = `addExecutable(wasm_entry.zig)` for `wasm32-freestanding`, under the `wasm` step only.
 - `mod_tests` = `addTest(mod)` under the `test` step.
 
-## C ABI contract (`include/wazmrt.h`)
+## C ABI contract — the standard wasm-c-api
+
+The integration ABI **is** the standard `wasm.h` (vendored, Apache-2.0, at
+`third_party/wasm-c-api/include/wasm.h`; ledger in `third_party/LICENSES.md`). `include/wazmrt.h` is a
+thin *extension* header (the wasmtime `wasm.h` + `wasmtime.h` pattern) that `#include`s `wasm.h` and
+adds only the wazmrt handshake.
+
+**Implemented today** (`src/wasm_c_api.zig`) — the subset the runtime can back:
 
 ```c
-uint32_t     wazmrt_abi_version(void);                 /* == root.abi_version, currently 1 */
-const char  *wazmrt_version_string(void);              /* static, NUL-terminated */
-int          wazmrt_module_decode(const uint8_t*, size_t, wazmrt_module** out);  /* wazmrt_status */
-size_t       wazmrt_module_section_count(wazmrt_module*);
-void         wazmrt_module_free(wazmrt_module*);
+/* lifecycle */            wasm_config_new/delete, wasm_engine_new[_with_config]/delete,
+                           wasm_store_new/delete
+/* byte vectors */         wasm_byte_vec_new[_empty|_uninitialized], _copy, _delete
+/* modules */              wasm_module_new(store, &binary)   -> own wasm_module_t* | NULL
+                           wasm_module_validate(store, &binary) -> bool
+                           wasm_module_delete
+/* wazmrt extension */     wazmrt_abi_version(void), wazmrt_version_string(void)
 ```
 
-`wazmrt_status`: `OK=0`, `ERR_NULL=-1`, `ERR_OOM=-2`, `ERR_DECODE=-3`. Handle is opaque; only the
-functions + status codes are stable. Bump `abi_version` on any breaking change.
+**Declared-but-deferred** (in `wasm.h`, unimplemented until instantiation/execution): instance, func,
+global, table, memory, trap, val/ref, the type-introspection vecs (`wasm_module_imports/exports`), and
+the module sharable-ref extras. An undefined symbol in a static lib only errors if a consumer
+references it, so partial implementation is honest and safe.
+
+**Conventions (from the standard):** opaque `struct wasm_*_t*` handles; `own`/delete ownership; vectors
+are `{ size_t size; T* data; }` the caller owns. **Windows:** consumers compile with `-DLIBWASM_STATIC`
+(we ship a static lib; otherwise `wasm.h` marks symbols `__declspec(dllimport)`). Bump `wazmrt_abi_version`
+on any wazmrt-extension break.

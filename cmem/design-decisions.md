@@ -11,10 +11,14 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   one allocator strategy across targets. If a future feature genuinely needs libc, add it as an opt-in
   `-Dlibc` build flag — never the default. See "Windows gotchas" for why this also unbroke the build.
 
-- **Stable C ABI, opaque handle (2026-07-02).** The module crosses the C boundary as `void*`. Only the
-  exported functions and `wazmrt_status` values in `include/wazmrt.h` are contractual; internal layout
-  is free to change. **Bump `root.abi_version`** (and the header comment) on any breaking ABI change.
-  Every `universalWasmLoader-*` port checks `wazmrt_abi_version()`.
+- **Integration ABI = the standard wasm-c-api (2026-07-02).** The C ABI **is** the vendored standard
+  `wasm.h` (Apache-2.0, `third_party/wasm-c-api/`); `include/wazmrt.h` is only a thin extension. Do NOT
+  reinvent module/engine/store signatures — implement the standard ones (`src/wasm_c_api.zig`).
+  Opaque `struct wasm_*_t*` handles; internal layout is free to change. Implement the standard
+  incrementally; leave unbacked functions undefined (a static-lib symbol only errors if referenced).
+  **Bump `root.abi_version`** on any wazmrt-extension break. Every `universalWasmLoader-*` port checks
+  `wazmrt_abi_version()`. Windows consumers compile with `-DLIBWASM_STATIC` (static lib). The retired
+  ad-hoc `wazmrt_module_decode/_section_count/_free` ABI was replaced by the standard `wasm_module_*`.
 
 - **Zero-copy decode (2026-07-02).** `Reader` borrows slices; `Module` stores only section
   `{id, offset, size}` extents — no eager payload copies. Consequence: a decoded `Module` must remain
@@ -67,5 +71,9 @@ The 0.16 stdlib differs from older docs — verified against the installed stdli
 
 ## Verified working (2026-07-02)
 
-`zig build` (5/5 steps), `zig build test` (7/7 tests), `zig build wasm` (3/3), and the CLI end-to-end:
-`wazmrt empty.wasm` → `valid wasm v1, 1 section(s)` / `custom (payload 1 bytes @ 0xa)`.
+- `zig build` (5/5 steps), `zig build test` (7/7 tests), `zig build wasm` (3/3).
+- CLI end-to-end: `wazmrt empty.wasm` → `valid wasm v1, 1 section(s)` / `custom (payload 1 bytes @ 0xa)`.
+- **C ABI end-to-end from C** (`tests/c_smoke.c`): built a static lib + compiled/linked the C client
+  with `zig cc -target x86_64-windows-gnu -DLIBWASM_STATIC` (mingw libc, no MSVC), ran it →
+  `validate(good): true`, `module_new: ok`, `validate(bad): false`, `abi_version: 1`, `version: 0.1.0`.
+  Note the gnu target: the C client needs a libc, and zig's bundled mingw provides one without MSVC.

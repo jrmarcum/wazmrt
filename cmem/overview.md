@@ -24,10 +24,13 @@ wazmrt/
 │   ├── types.zig          # Format constants, SectionId, DecodeError set
 │   ├── Reader.zig         # Zero-copy cursor: bounds-checked reads + LEB128 (file-as-struct)
 │   ├── Module.zig         # Decoded module: header validate + section index (file-as-struct)
-│   ├── c_api.zig          # extern "C" ABI surface (opaque handle; smp_allocator, no libc)
+│   ├── wasm_c_api.zig     # Implements the standard wasm-c-api (smp_allocator, no libc)
 │   └── wasm_entry.zig     # Freestanding wasm32 export surface (wasm_allocator)
+├── tests/
+│   └── c_smoke.c          # C smoke test exercising the wasm-c-api surface (zig cc)
 ├── third_party/
-│   └── LICENSES.md        # Compliance ledger + adoption checklist + SPDX inventory
+│   ├── LICENSES.md        # Compliance ledger + adoption checklist + SPDX inventory
+│   └── wasm-c-api/        # Vendored standard wasm.h (Apache-2.0) + its LICENSE
 ├── LICENSE-MIT · LICENSE-APACHE · NOTICE
 └── README.md              # Public, user-facing doc
 ```
@@ -38,7 +41,7 @@ wazmrt/
 | --- | --- |
 | `src/Module.zig` | The decoded-module type + `decode()`. Today: header validation + top-level section index. Future decode/validate/instantiate/execute hang off this type. |
 | `src/Reader.zig` | The fast, allocation-free core: bounds-checked byte reads, fixed-LE u32, unsigned LEB128. Everything decoder-side builds on it. |
-| `src/c_api.zig` | The stable C ABI (`wazmrt_module_decode`/`_section_count`/`_free`, `wazmrt_abi_version`, `wazmrt_version_string`). Opaque `void*` handle so internals can evolve. |
+| `src/wasm_c_api.zig` | Implements the **standard wasm-c-api** (`wasm_engine`/`store`/`module_new`/`validate`/`delete` + byte vectors) plus the `wazmrt_*` extension handshake. The integration ABI every `universalWasmLoader-*` port binds to. |
 | `src/root.zig` | What library consumers import (`@import("wazmrt")`). Re-exports `types`, `Reader`, `Module`, `decode`, `version`, `abi_version`. |
 
 ## Build targets (see architecture.md)

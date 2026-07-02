@@ -9,8 +9,12 @@
   clause. See `licensing.md`, `reference-projects.md`.
 - **First runtime vertical slice**: Zig 0.16 project reshaped from `zig init` into a runtime skeleton.
   `Reader` (zero-copy + LEB128) + `Module` (header validate + section index). 7 unit tests passing.
-- **Three build surfaces wired**: native CLI, C-ABI static lib + `include/wazmrt.h`, freestanding-wasm
-  build. All build/test/run verified (see `design-decisions.md`).
+- **Three build surfaces wired**: native CLI, C-ABI static lib, freestanding-wasm build. All
+  build/test/run verified (see `design-decisions.md`).
+- **C ABI = the standard wasm-c-api** (decision + first slice, 2026-07-02): vendored `wasm.h`
+  (Apache-2.0, first ledger entry), implemented `config`/`engine`/`store` + byte vecs +
+  `wasm_module_new`/`_validate`/`_delete` in `src/wasm_c_api.zig`, extension header `include/wazmrt.h`.
+  **Verified from C** via `tests/c_smoke.c` (zig cc). Retired the ad-hoc `wazmrt_module_*` ABI.
 - **cmem/ project memory** established (this folder), mirroring the wasmtk setup.
 
 **Not started:** any reference-project code adoption (100% original so far); validation; instantiation;
@@ -25,8 +29,10 @@ execution.
 4. **Execution** — the interpreter core. This is the key perf/size battleground; mine wasm3
    (threading/dispatch), wasmi (register machine), WAMR-fast-interp (footprint). First real Adoption
    Checklist + Component Ledger decisions likely happen here.
-5. **Grow the C ABI** (`wazmrt.h`) with instantiate + call-export, informed by wasmtime/wasmer/WAMR C
-   API shapes. Keep the handle opaque; bump `abi_version` on breaks.
+5. **Grow the wasm-c-api implementation** as the runtime gains ability: `wasm_module_imports/exports`
+   (once the import/export sections decode) → then instance/func/trap/call at instantiation+execution.
+   The standard signatures are already declared in the vendored `wasm.h`; we just implement more of
+   them. Extend `tests/c_smoke.c` alongside each addition.
 6. **First `universalWasmLoader-*` integration** — prove the C-ABI static lib and/or the wasm build
    load from at least one host language end-to-end.
 7. **Size/speed baseline** — measure `ReleaseSmall` binary size + a decode/exec microbench vs the

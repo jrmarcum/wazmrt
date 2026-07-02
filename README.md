@@ -10,6 +10,51 @@ adopting — with full attribution — only what earns its place. See
 [`third_party/LICENSES.md`](third_party/LICENSES.md) for the evaluation and
 compliance process, and for the ledger of any reused code.
 
+> **Status:** early. The decoder validates a module header and indexes its
+> sections; validation, instantiation, and execution are in progress. Requires
+> Zig 0.16.
+
+## Build
+
+```
+zig build                       # CLI + C-ABI static library (+ headers)
+zig build run -- module.wasm    # decode a .wasm and print a section summary
+zig build test                  # unit tests
+zig build wasm                  # build the runtime itself as a wasm module
+```
+
+## Embedding (C ABI)
+
+wazmrt implements the **standard [WebAssembly C API](https://github.com/WebAssembly/wasm-c-api)**
+(`wasm.h`), so it embeds exactly like wasmtime or wasmer — the
+`universalWasmLoader-*` ports bind to the same ABI. `zig build` installs both
+`wasm.h` and the small `wazmrt.h` extension header alongside the static library.
+
+```c
+#include "wazmrt.h"   /* pulls in <wasm.h> */
+
+wasm_engine_t *engine = wasm_engine_new();
+wasm_store_t  *store  = wasm_store_new(engine);
+
+wasm_byte_vec_t binary;                     /* your .wasm bytes */
+wasm_byte_vec_new_uninitialized(&binary, len);
+memcpy(binary.data, bytes, len);
+
+if (wasm_module_validate(store, &binary)) {
+    wasm_module_t *module = wasm_module_new(store, &binary);
+    /* ... */
+    wasm_module_delete(module);
+}
+wasm_byte_vec_delete(&binary);
+wasm_store_delete(store);
+wasm_engine_delete(engine);
+```
+
+Implemented today: engine/store/config lifecycle, byte vectors, and module
+`new`/`validate`/`delete`. Instance/function/call follow as execution lands.
+On Windows, compile consumers with `-DLIBWASM_STATIC` (wazmrt ships a static
+library). See [`tests/c_smoke.c`](tests/c_smoke.c) for a complete example.
+
 ## License
 
 Licensed under either of, at your option:

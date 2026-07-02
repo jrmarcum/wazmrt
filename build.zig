@@ -29,16 +29,18 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     // ---- C ABI library for universalWasmLoader-* ---------------------------
-    // Its own root so the core stays libc-free; this artifact links libc.
+    // Implements the standard wasm-c-api (third_party/wasm-c-api/include/wasm.h).
+    // Own root module so the core stays libc-free; this artifact is libc-free too.
     const cabi = b.addLibrary(.{
         .name = "wazmrt",
         .linkage = .static,
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/c_api.zig"),
+            .root_source_file = b.path("src/wasm_c_api.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
+    cabi.installHeader(b.path("third_party/wasm-c-api/include/wasm.h"), "wasm.h");
     cabi.installHeader(b.path("include/wazmrt.h"), "wazmrt.h");
     b.installArtifact(cabi);
 
