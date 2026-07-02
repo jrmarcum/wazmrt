@@ -31,6 +31,32 @@ pub const SectionId = enum(u8) {
     pub const max: u8 = 12;
 };
 
+/// WebAssembly value types (§5.3.1), encoded by their binary opcode byte.
+/// Non-exhaustive: an unrecognized byte decodes rather than crashing; a later
+/// validation pass rejects it.
+pub const ValType = enum(u8) {
+    i32 = 0x7f,
+    i64 = 0x7e,
+    f32 = 0x7d,
+    f64 = 0x7c,
+    v128 = 0x7b,
+    funcref = 0x70,
+    externref = 0x6f,
+    _,
+};
+
+/// The kind of an import or export, as encoded in the binary import/export
+/// descriptor byte (§5.5.10 / §5.5.5). NOTE: this is the *binary* ordering
+/// (func=0, table=1, mem=2, global=3), which differs from the wasm-c-api
+/// `wasm_externkind_t` ordering — the C ABI layer maps between them.
+pub const ExternKind = enum(u8) {
+    func = 0x00,
+    table = 0x01,
+    memory = 0x02,
+    global = 0x03,
+    _,
+};
+
 /// Errors that can arise while decoding a WebAssembly binary.
 pub const DecodeError = error{
     /// Ran out of input before a structure was complete.
@@ -43,4 +69,8 @@ pub const DecodeError = error{
     LebOverflow,
     /// A section declared an identifier outside the defined range.
     InvalidSectionId,
+    /// A function type did not begin with the 0x60 form byte.
+    BadFuncType,
+    /// An import/export descriptor used an unknown kind byte.
+    UnknownExternKind,
 };

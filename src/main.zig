@@ -40,4 +40,14 @@ pub fn main(init: std.process.Init) !void {
     for (module.sections) |s| {
         try out.print("  - {s} (payload {d} bytes @ 0x{x})\n", .{ @tagName(s.id), s.size, s.offset });
     }
+
+    try out.print("  types={d} imports={d} functions={d} exports={d}\n", .{
+        module.func_types.len, module.imports.len, module.functions.len, module.exports.len,
+    });
+    for (module.imports) |i| {
+        try out.print("  import {s}.{s} : {s}\n", .{ i.module, i.name, @tagName(i.kind) });
+    }
+    for (module.exports) |e| {
+        try out.print("  export {s} : {s} #{d}\n", .{ e.name, @tagName(e.kind), e.index });
+    }
 }
