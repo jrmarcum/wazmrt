@@ -23,10 +23,29 @@ all compatible with our dual `MIT OR Apache-2.0` distribution. See `licensing.md
 
 ## Adoption status
 
-**Nothing incorporated yet (2026-07-02).** wazmrt's current code is 100% original. When code is first
-adapted from one of these, move its row to **Adopted**, add the Component Ledger entry in
-`third_party/LICENSES.md`, copy the upstream `LICENSE`/`NOTICE` into `third_party/<component>/`, and add
-change-notes + SPDX headers to the adapting source (all per the Adoption Checklist).
+**First adoption 2026-07-02 — the C API standard.** The owner chose to **mirror the wasm-c-api standard
+`wasm.h`** as wazmrt's integration ABI (so `universalWasmLoader-*` and any wasm-c-api consumer bind
+identically to how they'd bind wasmtime/wasmer). The canonical header (`WebAssembly/wasm-c-api`,
+Apache-2.0) is vendored **verbatim** at `third_party/wasm-c-api/include/wasm.h`, pinned to commit
+`9d6b9376`, with the first Component Ledger entry in `third_party/LICENSES.md`. Note: wasm-c-api was not
+one of the original nine runtimes — it is the *standard* they implement.
+
+The nine runtimes above remain **Evaluating** — no interpreter/decoder code adapted from them yet
+(wazmrt's runtime code is still 100% original). When code is first adapted from one, move its row to
+**Adopted**, add the ledger entry, copy the upstream `LICENSE`/`NOTICE` into `third_party/<component>/`,
+and add change-notes + SPDX headers to the adapting source (per the Adoption Checklist).
+
+## C ABI decision (2026-07-02): mirror the wasm-c-api standard
+
+- **Integration ABI = the vendored standard `wasm.h`** (every loader binds to it).
+- **`include/wazmrt.h` = a small extension header** (version/ABI handshake + wazmrt-specifics), the
+  wasmtime `wasm.h` + `wasmtime.h` pattern.
+- **`src/wasm_c_api.zig` implements a growing subset.** "Minimal now" applies *within* the standard:
+  back `config`/`engine`/`store` + `byte_vec` + `wasm_module_new`/`_validate`/`_delete` first; leave
+  instance/func/trap/call declared-but-unimplemented until instantiation/execution exist (undefined
+  symbols in a static lib only error if referenced).
+- **Windows note:** the vendored header uses `__declspec(dllimport)` unless `LIBWASM_STATIC` is defined;
+  since wazmrt ships a **static** lib, consumers compile with `-DLIBWASM_STATIC`.
 
 ## Notes on what likely earns its place first
 

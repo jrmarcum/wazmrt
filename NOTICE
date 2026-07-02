@@ -26,5 +26,9 @@ propagated as required by Section 4 of that license. Any modifications made to
 incorporated Apache-2.0 code carry prominent change notices in the adapting
 source file, as required by Section 4(b).
 
-At the time of writing, no third-party code has been incorporated. This file
-will be updated as components are adopted.
+Incorporated components (see third_party/LICENSES.md for the full ledger):
+
+  * WebAssembly C API — "wasm.h" from https://github.com/WebAssembly/wasm-c-api
+    Copyright the wasm-c-api project authors.
+    Licensed under Apache-2.0 (see third_party/wasm-c-api/LICENSE).
+    Vendored verbatim as third_party/wasm-c-api/include/wasm.h.

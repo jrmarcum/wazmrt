@@ -64,8 +64,26 @@ allowed, and did we document it?).
 
 ## Component Ledger
 
-*No third-party code incorporated yet.* Add one entry per adopted component,
-newest first. Copy the template.
+Newest first. Copy the template for each adopted component.
+
+### wasm-c-api (standard `wasm.h`)
+- **Source:** https://github.com/WebAssembly/wasm-c-api
+- **Version / commit:** `9d6b93764ac96cdd9db51081c363e09d2d488b4d` (pinned)
+- **License (SPDX):** `Apache-2.0`
+- **License file:** third_party/wasm-c-api/LICENSE
+- **What we reused:** `include/wasm.h` — the standard WebAssembly C API header,
+  vendored **verbatim** (not modified). It is the integration ABI wazmrt
+  implements, so `universalWasmLoader-*` and any wasm-c-api consumer (wasmtime,
+  wasmer) bind identically.
+- **Where it lives in wazmrt:** third_party/wasm-c-api/include/wasm.h
+- **Modifications:** none (verbatim). Our implementation lives in
+  `src/wasm_c_api.zig`; wazmrt-specific extensions live in `include/wazmrt.h`,
+  not in the vendored header.
+- **Obligations satisfied:** [x] license copied  [x] NOTICE propagated
+  [x] verbatim — no change-notes required  [x] provenance commit pinned
+- **Benefit / drawback note:** Benefit — instant, standard interop; loaders bind
+  once to a familiar ABI. Drawback — large surface (~740 lines); we implement it
+  incrementally, backing only what the runtime can do today.
 
 <!--
 ### <component-name>
@@ -100,6 +118,7 @@ Verified against each upstream `LICENSE` file on 2026-07-02.
 | [rust-wasm](https://github.com/yblein/rust-wasm) | `ISC` | Evaluating |
 | [wain](https://github.com/rhysd/wain) | `MIT` | Evaluating |
 | [wazero](https://github.com/tetratelabs/wazero) | `Apache-2.0` | Evaluating |
+| [wasm-c-api](https://github.com/WebAssembly/wasm-c-api) (the C API standard) | `Apache-2.0` | **Adopted** — vendored `wasm.h`, see ledger |
 
 > **Trademarks:** permissive licenses grant no trademark rights. Do not use the
 > "Wasmtime", "Wasmer", "wazero", etc. names to brand wazmrt or imply
