@@ -10,19 +10,21 @@ adopting — with full attribution — only what earns its place. See
 [`third_party/LICENSES.md`](third_party/LICENSES.md) for the evaluation and
 compliance process, and for the ledger of any reused code.
 
-> **Status:** early. The decoder validates a module header, indexes its
-> sections, and decodes the type/import/function/table/memory/global/export/code
-> sections — resolving every import and export to its full type and capturing
-> each function's locals and body. Validation, instantiation, and execution are
-> in progress. Requires Zig 0.16.
+> **Status:** early but running. wazmrt decodes, validates, and **executes**
+> WebAssembly — integer/float arithmetic, control flow, `call`, and linear
+> memory — and runs a corpus of real modules to their expected values
+> (`fib(20)=6765`, `sieve(30)=10`, …). It also includes a native **WAT text
+> assembler** (`.wat` → wasm). `call_indirect`, host imports/WASI, and the
+> `.wast` script runner are in progress. Requires Zig 0.16.
 
 ## Build
 
 ```
-zig build                       # CLI + C-ABI static library (+ headers)
-zig build run -- module.wasm    # decode a .wasm and print a section summary
-zig build test                  # unit tests
-zig build wasm                  # build the runtime itself as a wasm module
+zig build                          # CLI + C-ABI static library (+ headers)
+zig build run -- <file.wasm>       # summarize a module's sections/exports
+zig build run -- <file.wasm> <export> [args…]   # run an exported function
+zig build test                     # unit tests
+zig build wasm                     # build the runtime itself as a wasm module
 ```
 
 ## Embedding (C ABI)

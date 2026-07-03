@@ -1,8 +1,18 @@
 # Roadmap
 
-## Status (2026-07-02) — project inception
+## Status (2026-07-02) — runtime executes; text toolchain in progress
+
+The full pipeline runs end-to-end: **decode → validate → execute** (int/float/memory), verified on the
+real `module/wasm_mod` corpus against its `.test.json` values. A native **WAT text assembler** is done;
+the **WAST script runner** (`wast.zig`) is next.
 
 **Done:**
+- **Runtime pipeline** — `Module.decode` (all core sections + resolved import/export types + bodies) →
+  `opcode.zig` IR → `validate.zig` (spec type-check) → `interp.zig` (switch interpreter: i32/i64/f32/f64
+  arithmetic, control flow, `call`, linear memory + data init, traps). Runs `fib(20)=6765`,
+  `fac(7)=5040`, `sieve(30)=10`, etc. — all match `.test.json`.
+- **Text toolchain** — `sexpr.zig` (S-expression parser) + `wat.zig` (WAT→wasm binary: funcs/exports,
+  folded+flat, control flow + labels, memarg, memory/data). Assemble→decode→validate→run verified.
 - **Licensing baseline** (git `888b87e`): dual `MIT OR Apache-2.0` (`LICENSE-MIT` + `LICENSE-APACHE`),
   `NOTICE`, and the compliance scaffold `third_party/LICENSES.md` (obligations table + Adoption
   Checklist + Component Ledger + verified SPDX inventory). README license section + SPDX + contribution
@@ -19,8 +29,10 @@
   (`env.add`) and export (`run`, params=2 results=1). Retired the ad-hoc `wazmrt_module_*` ABI.
 - **cmem/ project memory** established (this folder), mirroring the wasmtk setup.
 
-**Not started:** any reference-project code adoption (100% original so far); validation; instantiation;
-execution.
+**Remaining:** `wast.zig` (WAST runner) → run the spec testsuite; `call_indirect` + tables; host imports
+(→ WASI); global/table/elem in the assembler; growing the wasm-c-api past introspection; first
+`universalWasmLoader-*` integration. Still **100% original runtime code** — no reference-project code
+adopted yet (only the vendored `wasm.h`).
 
 ## Next increments (rough order)
 

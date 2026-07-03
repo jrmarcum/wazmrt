@@ -40,17 +40,23 @@ bytes ──► DECODE ──► VALIDATE ──► INSTANTIATE ──► EXECUT
   host-import calls. **Verified on real modules:** `Instance.invoke` runs the whole `wasm_mod` corpus
   to its `.test.json` expected values (`fib(20)=6765`, `fac(7)=5040`, `sieve(30)=10` via memory) — the
   CLI gained a run mode `wazmrt <file.wasm> <export> [args…]`.
-- **INSTANTIATE / EXECUTE** (later) — memories/tables/globals + an interpreter (the design space to
-  mine from wasm3 / WAMR-fast-interp / wasmi; see `reference-projects.md`).
+
+**Text front-end (a separate producer, not a pipeline stage):** `sexpr.zig` (S-expression parser) +
+`wat.zig` (WAT text → wasm binary) turn `.wat`/`.wast` text into a binary that re-enters DECODE. The
+assembler reuses `opcode.zig` in reverse (name → `Op` via `stringToEnum`). See `text-toolchain.md`.
 
 ## Module layout & responsibilities
 
 | Unit | Responsibility |
 | --- | --- |
-| `types.zig` | `magic`, `supported_version`, `SectionId`, `ValType` (binary opcodes), `ExternKind` (binary order), `DecodeError`. Dependency-free so it compiles for every target. |
-| `Reader.zig` | Zero-copy cursor (file-as-`@This()` struct): `readByte`, `readBytes`, `readU32Le`, `readVarU32` (unsigned LEB128). Bounds-checked, allocation-free. |
-| `Module.zig` | `decode(gpa, bytes) → Module`; arena-owned; `FuncType`/`Limits`/`TableType`/`MemoryType`/`GlobalType`/`Extern`, `Import`/`Export` (resolved `Extern` type), `Local`/`Code` (locals + raw body), `func_types`, `functions`, `code`, `sections`; `deinit`; `section(id)`. `Error = DecodeError || Allocator.Error`. |
-| `root.zig` | Public surface. Re-exports the above + `decode`, `version`, `abi_version`. libc-free. |
+| `types.zig` | `magic`, `supported_version`, `SectionId`, `ValType` (binary opcodes), `ExternKind`, `DecodeError`. Dependency-free so it compiles for every target. |
+| `Reader.zig` | Allocation-free cursor (file-as-`@This()` struct): `readByte`/`readBytes`/`readU32Le`, unsigned + signed LEB, float-bit reads. Bounds-checked. |
+| `Module.zig` | `decode(gpa, bytes) → Module`; arena-owned; `FuncType`/`Limits`/`TableType`/`MemoryType`/`GlobalType`/`Extern`, `Import`/`Export` (resolved `Extern`), `Local`/`Code`, `func_types`/`functions`/`code`/`globals`/`memories`/`data`/`sections`; `funcType`/`importedFuncCount`/`section` helpers. |
+| `opcode.zig` | The shared instruction authority: `Op` enum (0x00–0xC4), `Imm`/`Instr`, `immediateKind`, `decodeBody`. |
+| `validate.zig` | `validate(gpa, module)`: spec Appendix type-check over the IR (value + control-frame stacks). |
+| `interp.zig` | `Instance` (init/deinit/invoke), the switch interpreter (`Frame`, `execNumeric`/`execFloat`/`execMemory`), `Value` (u64) helpers. |
+| `sexpr.zig` / `wat.zig` | S-expression parser / WAT-text assembler (the text front-end). |
+| `root.zig` | Public surface; re-exports the pipeline modules + `decode`/`validate`/`interp`/`Instance`/`sexpr`/`wat`/`version`/`abi_version`. libc-free. |
 
 ## Three consumption surfaces (one core)
 
