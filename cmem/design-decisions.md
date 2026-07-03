@@ -96,8 +96,9 @@ The 0.16 stdlib differs from older docs — verified against the installed stdli
   `i32.trunc_f64_s`, memory store/load + data-segment init, and traps (div-by-zero, NaN→int). **On real
   corpus modules** (via CLI `wazmrt <file> <export> [args…]`): `fib(20)=6765`, `fac(7)=5040`,
   `sieve(30)=10` (memory), `isLeapYear`/`isOdd` — all match their `.test.json`.
-- **Text toolchain:** `sexpr.zig` (S-expression parser) + `wat.zig` (WAT→wasm binary MVP) —
-  assemble→decode→validate→run verified end-to-end. **31 unit tests total.**
+- **Text toolchain:** `sexpr.zig` (S-expression parser) + `wat.zig` (WAT→wasm binary — funcs,
+  control flow, memory/data, memarg) — assemble→decode→validate→run verified end-to-end (incl. a
+  named-label loop `sum(5)=15` and memory store/load). **41 unit tests total.**
 - **C ABI end-to-end from C** (`tests/c_smoke.c`): built a static lib + compiled/linked the C client
   with `zig cc -target x86_64-windows-gnu -DLIBWASM_STATIC` (mingw libc, no MSVC), ran it →
   `validate(good): true`, `module_new: ok`, `validate(bad): false`, `abi_version: 1`, `version: 0.1.0`.

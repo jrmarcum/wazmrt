@@ -49,10 +49,11 @@ execution.
    pass (Option B, wasmi) can be layered later if benchmarks demand it.
 5. **Text toolchain — WAT assembler + WAST runner** (IN PROGRESS, owner-chosen 2026-07-02; the
    `.test.json` harness was dropped in favor of the standard `.wast` format). `sexpr.zig` DONE;
-   **`wat.zig` MVP DONE** (WAT→binary for funcs/exports/non-control instrs, folded+flat —
-   assemble→run verified); next: control flow + memory/data/global in `wat.zig`, then `wast.zig`
-   (assertion runner). Becomes the standing conformance gate against
-   `module/wasm_wast/testsuite-main`. See `text-toolchain.md`.
+   **`wat.zig` DONE** (WAT→binary: funcs/exports, folded+flat, structured control flow + labels +
+   blocktypes, memarg, memory + data sections — all assemble→run verified). Next: `wast.zig`
+   (assertion runner), then run `module/wasm_wast/testsuite-main` as the standing conformance gate.
+   Deferred in `wat.zig`: global/table/elem, multi-value block types, `call_indirect`. See
+   `text-toolchain.md`.
 6. **Grow the wasm-c-api implementation** as the runtime gains ability: `wasm_module_imports/exports`
    → then instance/func/trap/call at instantiation+execution. The standard signatures are already
    declared in the vendored `wasm.h`; we just implement more of them. Extend `tests/c_smoke.c` alongside.

@@ -28,14 +28,17 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
 - **`src/sexpr.zig`** — S-expression lexer + parser (shared front-end). Atoms,
   strings (decoded to bytes, so `(module binary "\00asm…")` yields real bytes),
   lists; line `;;` + nestable block `(; ;)` comments. **DONE 2026-07-02** (4 tests).
-- **`src/wat.zig`** (MVP DONE 2026-07-02) — WAT text → wasm binary. Today: `(func …)`
-  with named/anonymous `(param)`/`(result)`/`(local)`, inline + top-level `(export …)`,
+- **`src/wat.zig`** (DONE 2026-07-02) — WAT text → wasm binary. `(func …)` with
+  named/anonymous `(param)`/`(result)`/`(local)`, inline + top-level `(export …)`,
   identifier→index resolution (locals/funcs), **folded + flat** instruction forms, a
-  dedup'd type section, and the non-control instruction encoder (name→`Op` via
-  `stringToEnum`, operands per `opcode.immediateKind`). **Verified:** assemble→decode→
-  validate→run for folded add, flat mul, nested const expr, and a two-func `call` module.
-  **Next in wat.zig:** structured control flow (`block`/`loop`/`if`, `br*`, blocktypes),
-  memory/data/global sections + memarg, `call_indirect`.
+  dedup'd type section, the instruction encoder (name→`Op` via `stringToEnum`, operands
+  per `opcode.immediateKind`), **structured control flow** (`block`/`loop`/`if`/`else`/`end`
+  with a label stack for `br`/`br_if`/`br_table` name→depth, single-result blocktypes),
+  **memarg** (`offset=`/`align=`), and the **memory + data** sections. **Verified:**
+  assemble→decode→validate→run for add, mul, nested const, two-func `call`, if/else,
+  a named-label loop `sum(5)=15`, flat block+br, memory store/load, and a data segment.
+  **Deferred in wat.zig:** `global`/`table`/`start`/`elem` sections, multi-value/type-index
+  block types, `call_indirect`.
 - **`src/wast.zig`** (after) — WAST script runner: `(module …)`, `assert_return`,
   `assert_trap`, `assert_invalid`, `assert_malformed`, `invoke`, `register`;
   value literals (`(i32.const N)`, `(f64.const nan:canonical)` …); drives an
@@ -45,15 +48,15 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
 
 1. ~~S-expression lexer/parser (`sexpr.zig`)~~ **DONE 2026-07-02.**
 2. ~~WAT assembler MVP~~ **DONE 2026-07-02** (`wat.zig`): func/param/result/local/export,
-   folded + flat, non-control instructions; assemble→decode→validate→run verified.
-3. **WAT assembler breadth (next)** — structured control flow (block/loop/if text forms +
-   blocktypes, `br`/`br_if`/`br_table`), memory/data/global sections, memarg
-   (`offset=`/`align=`), `call_indirect`. This unlocks most of the arithmetic testsuite.
-4. **WAST runner** — assertions + value literals; run the owner's converted
-   `.wast` and the 15 binary testsuite files.
-5. Run the text-module testsuite (`i32.wast`, `i64.wast`, …); expand coverage
-   until a meaningful share of `testsuite-main` passes. This becomes the standing
-   conformance gate (`testing.md`).
+   folded + flat, non-control instructions.
+3. ~~WAT assembler breadth~~ **DONE 2026-07-02**: control flow (block/loop/if/else/end +
+   labels + single-result blocktypes, `br`/`br_if`/`br_table`), memarg, memory + data
+   sections. Deferred: `global`/`table`/`elem`, multi-value block types, `call_indirect`.
+4. **WAST runner (`wast.zig`, next)** — `assert_return`/`assert_trap`/`invoke` + value
+   literals; drive an `Instance`, compare results. Runs the owner's converted `.wast` and
+   arithmetic testsuite files (`i32.wast`, `i64.wast`, …).
+5. Run the text-module testsuite; expand coverage until a meaningful share of
+   `testsuite-main` passes. This becomes the standing conformance gate (`testing.md`).
 
 ## Notes / invariants
 
