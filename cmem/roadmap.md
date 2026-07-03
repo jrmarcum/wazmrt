@@ -45,13 +45,16 @@ execution.
    **VERIFIED end-to-end on real modules:** the CLI gained `wazmrt <file.wasm> <export> [args…]` and
    runs the whole `module/wasm_mod` corpus to its `.test.json` values (`fib(20)=6765`, `fac(7)=5040`,
    `isLeapYear`, `isOdd`, `sieve(30)=10` via memory). **Remaining execution slices:** (a) `call_indirect`
-   + tables, (b) **host imports** (needed for WASI). Then wire the automated `.test.json` conformance
-   harness for a full pass/fail sweep. Keep the IR a clean seam so a register-machine
+   + tables, (b) **host imports** (needed for WASI). Keep the IR a clean seam so a register-machine
    pass (Option B, wasmi) can be layered later if benchmarks demand it.
-5. **Grow the wasm-c-api implementation** as the runtime gains ability: `wasm_module_imports/exports`
-   (once the import/export sections decode) → then instance/func/trap/call at instantiation+execution.
-   The standard signatures are already declared in the vendored `wasm.h`; we just implement more of
-   them. Extend `tests/c_smoke.c` alongside each addition.
+5. **Text toolchain — WAT assembler + WAST runner** (IN PROGRESS, owner-chosen 2026-07-02; the
+   `.test.json` harness was dropped in favor of the standard `.wast` format). `sexpr.zig` (S-expression
+   parser) DONE; next `wat.zig` (WAT text → wasm binary) then `wast.zig` (assertion runner). This
+   becomes the standing conformance gate against `module/wasm_wast/testsuite-main`. See
+   `text-toolchain.md`.
+6. **Grow the wasm-c-api implementation** as the runtime gains ability: `wasm_module_imports/exports`
+   → then instance/func/trap/call at instantiation+execution. The standard signatures are already
+   declared in the vendored `wasm.h`; we just implement more of them. Extend `tests/c_smoke.c` alongside.
 6. **First `universalWasmLoader-*` integration** — prove the C-ABI static lib and/or the wasm build
    load from at least one host language end-to-end.
 7. **Size/speed baseline** — measure `ReleaseSmall` binary size + a decode/exec microbench vs the

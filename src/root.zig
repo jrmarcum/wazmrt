@@ -13,6 +13,7 @@ pub const opcode = @import("opcode.zig");
 pub const validate = @import("validate.zig").validate;
 pub const interp = @import("interp.zig");
 pub const Instance = interp.Instance;
+pub const sexpr = @import("sexpr.zig");
 
 /// Human-readable library version (keep in sync with build.zig.zon).
 pub const version: [:0]const u8 = "0.1.0";
@@ -35,4 +36,5 @@ test {
     _ = opcode;
     _ = @import("validate.zig");
     _ = interp;
+    _ = sexpr;
 }
