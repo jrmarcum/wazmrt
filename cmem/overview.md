@@ -58,5 +58,7 @@ wazmrt/
 - **Libc-free core.** `root.zig` and its deps pull in no libc, so the same code targets native *and*
   `wasm32-freestanding`. The C-ABI lib uses `std.heap.smp_allocator` (not `c_allocator`). See
   `design-decisions.md` for why (smaller binary + no MSVC requirement on Windows).
-- **First vertical slice only.** Today the pipeline validates the header (`\0asm`, version 1) and
-  indexes sections. Validation, instantiation, and execution are the next increments (`roadmap.md`).
+- **Decode stage complete; later stages pending.** Today the pipeline validates the header, indexes
+  sections, and decodes type/import/function/table/memory/global/export/code — resolving import/export
+  extern types and capturing function bodies. Validation, instantiation, and execution are the next
+  increments (`roadmap.md`).

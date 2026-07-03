@@ -26,8 +26,11 @@ execution.
 
 1. ~~Decode the type/function/import/export sections~~ **DONE 2026-07-02** (also table/memory/global +
    full `Extern` resolution; exposed via C `wasm_module_imports/exports` + the wasm-c-api type-object
-   system). Next: decode the **code section** (function bodies) into instruction streams.
-2. **Validation** — type-check per the spec (study wasmi/wain/wazero validator structure).
+   system). ~~Decode the code section~~ **DONE 2026-07-02** (locals + raw body bytes per defined
+   function, arena-owned; instructions not yet parsed).
+2. **Validation** — parse instruction bytes + type-check per the spec: function/code count match,
+   index bounds, operand-stack typing (study wasmi/wain/wazero validator structure). This is where the
+   instruction opcode table gets defined, shared with execution.
 3. **Instantiation** — memories, tables, globals, imports/exports wiring.
 4. **Execution** — the interpreter core. This is the key perf/size battleground; mine wasm3
    (threading/dispatch), wasmi (register machine), WAMR-fast-interp (footprint). First real Adoption

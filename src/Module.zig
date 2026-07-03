@@ -68,6 +68,26 @@ pub const Export = struct {
     type: Extern,
 };
 
+/// A run of consecutive locals of the same type, as encoded in a code entry
+/// (§5.4.5). The binary groups locals by type with a repeat count.
+pub const Local = struct { count: u32, type: types.ValType };
+
+/// A defined function's body from the code section (§5.5.13): its declared
+/// locals and the raw instruction bytes (including the terminating `end`).
+/// Instructions are not decoded here — that happens with validation/execution,
+/// which choose the internal representation. `body` is arena-owned.
+pub const Code = struct {
+    locals: []const Local,
+    body: []const u8,
+
+    /// Total number of declared locals (excludes parameters).
+    pub fn localCount(self: Code) u64 {
+        var n: u64 = 0;
+        for (self.locals) |l| n += l.count;
+        return n;
+    }
+};
+
 /// Owns all decoded data. `arena.allocator()` is used only during `decode`, so
 /// moving the arena into the returned `Module` is safe.
 arena: std.heap.ArenaAllocator,
@@ -78,6 +98,9 @@ func_types: []const FuncType,
 functions: []const u32,
 imports: []const Import,
 exports: []const Export,
+/// Body of each defined function (code section), positionally matching
+/// `functions`. May be empty if the module has no code section.
+code: []const Code,
 
 pub const Error = types.DecodeError || std.mem.Allocator.Error;
 
@@ -110,6 +133,7 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
     var functions: []const u32 = &.{};
     var imports: []const Import = &.{};
     var exports: []const Export = &.{};
+    var code: []const Code = &.{};
 
     while (!r.atEnd()) {
         const raw_id = try r.readByte();
@@ -129,6 +153,7 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
             .memory => try decodeMemorySection(&d, &sub),
             .global => try decodeGlobalSection(&d, &sub),
             .@"export" => exports = try decodeExportSection(&d, &sub),
+            .code => code = try decodeCodeSection(&d, &sub),
             else => {},
         }
     }
@@ -141,6 +166,7 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
         .functions = functions,
         .imports = imports,
         .exports = exports,
+        .code = code,
     };
 }
 
@@ -314,6 +340,33 @@ fn spaceAt(comptime T: type, space: std.ArrayList(T), index: u32) Error!T {
     return space.items[index];
 }
 
+fn decodeLocals(a: std.mem.Allocator, r: *Reader) Error![]const Local {
+    const n = try r.readVarU32();
+    const locals = try a.alloc(Local, n);
+    for (locals) |*l| {
+        l.count = try r.readVarU32();
+        l.type = @enumFromInt(try r.readByte());
+    }
+    return locals;
+}
+
+fn decodeCodeSection(d: *Decoder, r: *Reader) Error![]const Code {
+    const count = try r.readVarU32();
+    const list = try d.a.alloc(Code, count);
+    for (list) |*c| {
+        // Each entry is a byte-counted (locals ++ body) blob; decode within it
+        // so a malformed local vector can't run past the entry.
+        const entry = try r.readBytes(try r.readVarU32());
+        var er = Reader.init(entry);
+        c.locals = try decodeLocals(d.a, &er);
+        const rest = entry[er.pos..]; // instruction bytes, incl. terminating end
+        const owned = try d.a.alloc(u8, rest.len);
+        @memcpy(owned, rest);
+        c.body = owned;
+    }
+    return list;
+}
+
 // --- Tests -----------------------------------------------------------------
 
 test "decodes an empty module (header only)" {
@@ -378,6 +431,32 @@ test "decodes and resolves type/import/function/export sections" {
     try std.testing.expectEqual(@as(u32, 1), m.exports[0].index);
     // export "run" resolves to the (i32,i32)->i32 signature of defined func 1.
     try std.testing.expectEqualSlices(types.ValType, &.{ .i32, .i32 }, m.exports[0].type.func.params);
+    try std.testing.expectEqualSlices(types.ValType, &.{.i32}, m.exports[0].type.func.results);
+}
+
+test "decodes a code section with locals and a body" {
+    // (func (param i32 i32) (result i32) (local i32)
+    //    local.get 0  local.get 1  i32.add)   ; export "add" (func 0)
+    const bytes =
+        types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+        [_]u8{ 0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f } ++ // type
+        [_]u8{ 0x03, 0x02, 0x01, 0x00 } ++ // function: 1 func of type 0
+        // code: 1 entry, size 9 = locals(01 01 7f) ++ body(20 00 20 01 6a 0b)
+        [_]u8{ 0x0a, 0x0b, 0x01, 0x09, 0x01, 0x01, 0x7f, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b } ++
+        [_]u8{ 0x07, 0x07, 0x01, 0x03, 'a', 'd', 'd', 0x00, 0x00 }; // export
+
+    var m = try Module.decode(std.testing.allocator, &bytes);
+    defer m.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), m.code.len);
+    try std.testing.expectEqual(@as(usize, 1), m.code[0].locals.len);
+    try std.testing.expectEqual(@as(u32, 1), m.code[0].locals[0].count);
+    try std.testing.expectEqual(types.ValType.i32, m.code[0].locals[0].type);
+    try std.testing.expectEqual(@as(u64, 1), m.code[0].localCount());
+    try std.testing.expectEqualSlices(u8, &.{ 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b }, m.code[0].body);
+
+    // export "add" still resolves to the defined function's signature.
+    try std.testing.expectEqual(types.ExternKind.func, m.exports[0].type.kind());
     try std.testing.expectEqualSlices(types.ValType, &.{.i32}, m.exports[0].type.func.results);
 }
 

@@ -11,13 +11,18 @@ bytes ──► DECODE ──► VALIDATE ──► INSTANTIATE ──► EXECUT
 ```
 
 - **DECODE** (`Module.decode`) — validate the 8-byte header (`\0asm` magic + version 1), index the
-  top-level sections, and decode the type / import / function / table / memory / global / export
+  top-level sections, and decode the type / import / function / table / memory / global / export / code
   sections. Every import and export is resolved to its full `Extern` type (func→signature,
   table/memory→limits, global→content+mutability) by building per-kind index spaces (imported entries
-  first, then defined). **Owned via an internal arena** and names are copied in, so the module survives
-  the input buffer being freed (required by wasm-c-api, where the caller deletes the byte vector after
-  `wasm_module_new`). The `{id, offset, size}` section extents are retained as metadata only.
-- **VALIDATE** (next) — decode the code section and type-check per the spec.
+  first, then defined). Each defined function's `Code` (declared locals + raw instruction bytes,
+  incl. the terminating `end`) is captured — instructions are **not** parsed here (that happens with
+  validation/execution, which pick the internal representation). **Owned via an internal arena** and
+  names/bodies are copied in, so the module survives the input buffer being freed (required by
+  wasm-c-api, where the caller deletes the byte vector after `wasm_module_new`). Decode is **lenient**:
+  the function/code count-match is a validation rule, not enforced here. The `{id, offset, size}`
+  section extents are retained as metadata only.
+- **VALIDATE** (next) — parse the instruction bytes and type-check per the spec (function/code count
+  match, local/type indices in range, operand-stack typing).
 - **INSTANTIATE / EXECUTE** (later) — memories/tables/globals + an interpreter (the design space to
   mine from wasm3 / WAMR-fast-interp / wasmi; see `reference-projects.md`).
 
@@ -27,7 +32,7 @@ bytes ──► DECODE ──► VALIDATE ──► INSTANTIATE ──► EXECUT
 | --- | --- |
 | `types.zig` | `magic`, `supported_version`, `SectionId`, `ValType` (binary opcodes), `ExternKind` (binary order), `DecodeError`. Dependency-free so it compiles for every target. |
 | `Reader.zig` | Zero-copy cursor (file-as-`@This()` struct): `readByte`, `readBytes`, `readU32Le`, `readVarU32` (unsigned LEB128). Bounds-checked, allocation-free. |
-| `Module.zig` | `decode(gpa, bytes) → Module`; arena-owned; `FuncType`/`Limits`/`TableType`/`MemoryType`/`GlobalType`/`Extern`, `Import`/`Export` (each with a resolved `Extern` type), `func_types`, `functions`, `sections`; `deinit`; `section(id)`. `Error = DecodeError || Allocator.Error`. |
+| `Module.zig` | `decode(gpa, bytes) → Module`; arena-owned; `FuncType`/`Limits`/`TableType`/`MemoryType`/`GlobalType`/`Extern`, `Import`/`Export` (resolved `Extern` type), `Local`/`Code` (locals + raw body), `func_types`, `functions`, `code`, `sections`; `deinit`; `section(id)`. `Error = DecodeError || Allocator.Error`. |
 | `root.zig` | Public surface. Re-exports the above + `decode`, `version`, `abi_version`. libc-free. |
 
 ## Three consumption surfaces (one core)

@@ -11,9 +11,10 @@ adopting — with full attribution — only what earns its place. See
 compliance process, and for the ledger of any reused code.
 
 > **Status:** early. The decoder validates a module header, indexes its
-> sections, and decodes the type/import/function/table/memory/global/export
-> sections — resolving every import and export to its full type. Validation,
-> instantiation, and execution are in progress. Requires Zig 0.16.
+> sections, and decodes the type/import/function/table/memory/global/export/code
+> sections — resolving every import and export to its full type and capturing
+> each function's locals and body. Validation, instantiation, and execution are
+> in progress. Requires Zig 0.16.
 
 ## Build
 
