@@ -22,8 +22,9 @@ wazmrt/
 │   ├── root.zig           # Public library surface (pub re-exports; wasm-friendly, libc-free)
 │   ├── main.zig           # CLI front-end (decode a .wasm, print a section summary)
 │   ├── types.zig          # Format constants, SectionId, DecodeError set
-│   ├── Reader.zig         # Zero-copy cursor: bounds-checked reads + LEB128 (file-as-struct)
-│   ├── Module.zig         # Decoded module: header validate + section index (file-as-struct)
+│   ├── Reader.zig         # Zero-copy cursor: bounds-checked reads + LEB128/SLEB (file-as-struct)
+│   ├── Module.zig         # Decoded module: sections + resolved imports/exports + code (file-as-struct)
+│   ├── opcode.zig         # Shared opcode table (Op/Imm/Instr) + byte-code → IR decodeBody
 │   ├── wasm_c_api.zig     # Implements the standard wasm-c-api (smp_allocator, no libc)
 │   └── wasm_entry.zig     # Freestanding wasm32 export surface (wasm_allocator)
 ├── tests/

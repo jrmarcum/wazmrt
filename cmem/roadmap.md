@@ -28,12 +28,13 @@ execution.
    full `Extern` resolution; exposed via C `wasm_module_imports/exports` + the wasm-c-api type-object
    system). ~~Decode the code section~~ **DONE 2026-07-02** (locals + raw body bytes per defined
    function, arena-owned; instructions not yet parsed).
-2. **Validation** — parse instruction bytes + type-check per the spec: function/code count match,
-   index bounds, operand-stack typing. This is where the **shared opcode table + `Instr` IR** get
-   defined (see `design-decisions.md` → interpreter architecture = **Option A**, switch-dispatched over
-   a pre-decoded IR). Concretely: `src/opcode.zig` (opcode enum + operand shapes), an `Instr`/decode
-   pass that both validation and execution consume, function/code count-match enforcement (deferred
-   from decode), index-bounds + operand-stack type checking.
+2. **Validation** (in progress). ~~Shared opcode table + `Instr` IR + byte-code decoder~~ **DONE
+   2026-07-02** (`src/opcode.zig`: core-MVP `Op` enum 0x00–0xC4, `Imm`/`Instr`, `decodeBody`; ref-type
+   / `0xFC` / `0xFD` / multi-byte block-types → `UnsupportedOpcode`; 4 tests). **Remaining:** the
+   type-checking validator over the IR — function/code count match (deferred from decode), index bounds
+   (local/global/func/type/label), structured control-flow + operand-stack typing (the meaty part;
+   study wasmi/wain/wazero validator structure). Then expand the opcode set (ref-types, `0xFC`
+   bulk-memory, eventually SIMD).
 3. **Instantiation** — memories, tables, globals, imports/exports wiring; grow the C ABI to
    `wasm_instance_new` + `wasm_func_call`.
 4. **Execution** — `while … switch(op)` interpreter over the `Instr` IR (Option A), untyped `u64`

@@ -9,6 +9,7 @@ const std = @import("std");
 pub const types = @import("types.zig");
 pub const Reader = @import("Reader.zig");
 pub const Module = @import("Module.zig");
+pub const opcode = @import("opcode.zig");
 
 /// Human-readable library version (keep in sync with build.zig.zon).
 pub const version: [:0]const u8 = "0.1.0";
@@ -28,4 +29,5 @@ test {
     std.testing.refAllDecls(@This());
     _ = Reader;
     _ = Module;
+    _ = opcode;
 }

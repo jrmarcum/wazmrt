@@ -21,8 +21,10 @@ bytes ──► DECODE ──► VALIDATE ──► INSTANTIATE ──► EXECUT
   wasm-c-api, where the caller deletes the byte vector after `wasm_module_new`). Decode is **lenient**:
   the function/code count-match is a validation rule, not enforced here. The `{id, offset, size}`
   section extents are retained as metadata only.
-- **VALIDATE** (next) — parse the instruction bytes and type-check per the spec (function/code count
-  match, local/type indices in range, operand-stack typing).
+- **VALIDATE** (in progress) — the shared opcode table + IR decoder is done (`opcode.zig`:
+  `decodeBody` turns a `Code.body` into a flat `[]Instr` with pre-parsed immediates; core-MVP set
+  0x00–0xC4, rest → `UnsupportedOpcode`). Remaining: the type-checking pass over the IR (function/code
+  count match, index bounds, structured control-flow + operand-stack typing).
 - **INSTANTIATE / EXECUTE** (later) — memories/tables/globals + an interpreter (the design space to
   mine from wasm3 / WAMR-fast-interp / wasmi; see `reference-projects.md`).
 
