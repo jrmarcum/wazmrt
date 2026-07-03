@@ -11,10 +11,12 @@
   `Reader` (zero-copy + LEB128) + `Module` (header validate + section index). 7 unit tests passing.
 - **Three build surfaces wired**: native CLI, C-ABI static lib, freestanding-wasm build. All
   build/test/run verified (see `design-decisions.md`).
-- **C ABI = the standard wasm-c-api** (decision + first slice, 2026-07-02): vendored `wasm.h`
-  (Apache-2.0, first ledger entry), implemented `config`/`engine`/`store` + byte vecs +
-  `wasm_module_new`/`_validate`/`_delete` in `src/wasm_c_api.zig`, extension header `include/wazmrt.h`.
-  **Verified from C** via `tests/c_smoke.c` (zig cc). Retired the ad-hoc `wazmrt_module_*` ABI.
+- **C ABI = the standard wasm-c-api** (decision + slices, 2026-07-02): vendored `wasm.h` (Apache-2.0,
+  first ledger entry); implemented `config`/`engine`/`store` + byte vecs + `wasm_module_new`/`_validate`/
+  `_delete`, **plus `wasm_module_imports`/`exports` and the full type-object system** (valtype/functype/
+  externtype/global/table/memory/importtype/exporttype) in `src/wasm_c_api.zig`; extension header
+  `include/wazmrt.h`. **Verified from C** via `tests/c_smoke.c` (zig cc) — enumerates a module's import
+  (`env.add`) and export (`run`, params=2 results=1). Retired the ad-hoc `wazmrt_module_*` ABI.
 - **cmem/ project memory** established (this folder), mirroring the wasmtk setup.
 
 **Not started:** any reference-project code adoption (100% original so far); validation; instantiation;
@@ -22,8 +24,9 @@ execution.
 
 ## Next increments (rough order)
 
-1. **Decode the type + function + code sections** into real structures (function signatures, code
-   bodies), extending `Module`. Add fixtures from real `.wat`→`.wasm` outputs.
+1. ~~Decode the type/function/import/export sections~~ **DONE 2026-07-02** (also table/memory/global +
+   full `Extern` resolution; exposed via C `wasm_module_imports/exports` + the wasm-c-api type-object
+   system). Next: decode the **code section** (function bodies) into instruction streams.
 2. **Validation** — type-check per the spec (study wasmi/wain/wazero validator structure).
 3. **Instantiation** — memories, tables, globals, imports/exports wiring.
 4. **Execution** — the interpreter core. This is the key perf/size battleground; mine wasm3

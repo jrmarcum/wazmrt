@@ -10,9 +10,10 @@ adopting — with full attribution — only what earns its place. See
 [`third_party/LICENSES.md`](third_party/LICENSES.md) for the evaluation and
 compliance process, and for the ledger of any reused code.
 
-> **Status:** early. The decoder validates a module header and indexes its
-> sections; validation, instantiation, and execution are in progress. Requires
-> Zig 0.16.
+> **Status:** early. The decoder validates a module header, indexes its
+> sections, and decodes the type/import/function/table/memory/global/export
+> sections — resolving every import and export to its full type. Validation,
+> instantiation, and execution are in progress. Requires Zig 0.16.
 
 ## Build
 
@@ -50,8 +51,11 @@ wasm_store_delete(store);
 wasm_engine_delete(engine);
 ```
 
-Implemented today: engine/store/config lifecycle, byte vectors, and module
-`new`/`validate`/`delete`. Instance/function/call follow as execution lands.
+Implemented today: engine/store/config lifecycle, byte vectors, module
+`new`/`validate`/`delete`, and **import/export introspection**
+(`wasm_module_imports`/`exports` + the `valtype`/`functype`/`externtype`/
+`importtype`/`exporttype` object system). Instance/function/call follow as
+execution lands.
 On Windows, compile consumers with `-DLIBWASM_STATIC` (wazmrt ships a static
 library). See [`tests/c_smoke.c`](tests/c_smoke.c) for a complete example.
 

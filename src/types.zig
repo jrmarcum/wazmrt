@@ -73,4 +73,6 @@ pub const DecodeError = error{
     BadFuncType,
     /// An import/export descriptor used an unknown kind byte.
     UnknownExternKind,
+    /// A type/function/extern index referred outside the decoded space.
+    IndexOutOfRange,
 };

@@ -1,9 +1,11 @@
 //! A decoded WebAssembly module.
 //!
 //! Pipeline stage 1 (decode): validate the header, index the top-level
-//! sections, and decode the type / function / import / export sections into
-//! owned structures. Validation, instantiation, and execution are later stages
-//! that build on this type.
+//! sections, and decode the type / import / function / table / memory / global
+//! / export sections. Every import and export is resolved to its full
+//! `Extern` type, so the wasm-c-api layer can hand back complete
+//! `wasm_importtype_t` / `wasm_exporttype_t` objects. Validation,
+//! instantiation, and execution are later stages that build on this type.
 //!
 //! **Ownership:** everything a `Module` exposes is owned by an internal arena,
 //! so a decoded module remains valid after the input `bytes` are freed (names
@@ -15,10 +17,8 @@ const Reader = @import("Reader.zig");
 
 const Module = @This();
 
-/// A top-level section, indexed by id and by its payload's location within the
-/// original binary. (The meaningful sections are also decoded eagerly below;
-/// `offset`/`size` are retained as metadata only — they must not be used to
-/// index the input after decode, which may have been freed.)
+/// A top-level section, indexed by id and payload location (metadata only —
+/// `offset`/`size` must not be used to index the input after decode).
 pub const Section = struct {
     id: types.SectionId,
     offset: usize,
@@ -31,29 +31,48 @@ pub const FuncType = struct {
     results: []const types.ValType,
 };
 
-/// An import from the import section (§5.5.10).
+/// Resizable-range limits shared by tables and memories (§5.3.7).
+pub const Limits = struct { min: u32, max: ?u32 };
+
+pub const TableType = struct { element: types.ValType, limits: Limits };
+pub const MemoryType = struct { limits: Limits };
+pub const GlobalType = struct { content: types.ValType, mutable: bool };
+
+/// The resolved type of an import or export.
+pub const Extern = union(enum) {
+    func: FuncType,
+    table: TableType,
+    memory: MemoryType,
+    global: GlobalType,
+
+    pub fn kind(self: Extern) types.ExternKind {
+        return switch (self) {
+            .func => .func,
+            .table => .table,
+            .memory => .memory,
+            .global => .global,
+        };
+    }
+};
+
 pub const Import = struct {
     module: []const u8,
     name: []const u8,
-    kind: types.ExternKind,
-    /// For a function import, the type index. Zero for other kinds in this
-    /// decode slice (their full type descriptors are consumed but not retained).
-    index: u32,
+    type: Extern,
 };
 
-/// An export from the export section (§5.5.10).
 pub const Export = struct {
     name: []const u8,
-    kind: types.ExternKind,
+    /// Index into the module's combined space for its kind (§5.5.10).
     index: u32,
+    type: Extern,
 };
 
-/// Owns all decoded data. Getting `.allocator()` before the return move is safe
-/// because that allocator is only used during `decode`.
+/// Owns all decoded data. `arena.allocator()` is used only during `decode`, so
+/// moving the arena into the returned `Module` is safe.
 arena: std.heap.ArenaAllocator,
 version: u32,
 sections: []const Section,
-/// Function signatures (type section).
 func_types: []const FuncType,
 /// Type index of each *defined* function (function section), in order.
 functions: []const u32,
@@ -61,6 +80,18 @@ imports: []const Import,
 exports: []const Export,
 
 pub const Error = types.DecodeError || std.mem.Allocator.Error;
+
+/// Working state threaded through the section decoders, accumulating the
+/// per-kind index spaces (imported entries first, then defined) needed to
+/// resolve export indices.
+const Decoder = struct {
+    a: std.mem.Allocator,
+    func_types: []const FuncType = &.{},
+    func_space: std.ArrayList(FuncType) = .empty,
+    table_space: std.ArrayList(TableType) = .empty,
+    mem_space: std.ArrayList(MemoryType) = .empty,
+    global_space: std.ArrayList(GlobalType) = .empty,
+};
 
 /// Decode a WebAssembly binary. Caller owns the result; release with `deinit`.
 /// `bytes` may be freed afterward — the module copies out everything it keeps.
@@ -74,8 +105,8 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
     const version = try r.readU32Le();
     if (version != types.supported_version) return error.UnsupportedVersion;
 
+    var d: Decoder = .{ .a = a };
     var sections: std.ArrayList(Section) = .empty;
-    var func_types: []const FuncType = &.{};
     var functions: []const u32 = &.{};
     var imports: []const Import = &.{};
     var exports: []const Export = &.{};
@@ -86,16 +117,18 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
         const id: types.SectionId = @enumFromInt(raw_id);
         const size = try r.readVarU32();
         const offset = r.pos;
-        const payload = try r.readBytes(size); // bounds-check + advance
-
+        const payload = try r.readBytes(size);
         try sections.append(a, .{ .id = id, .offset = offset, .size = size });
 
         var sub = Reader.init(payload);
         switch (id) {
-            .type => func_types = try decodeTypeSection(a, &sub),
-            .function => functions = try decodeFunctionSection(a, &sub),
-            .import => imports = try decodeImportSection(a, &sub),
-            .@"export" => exports = try decodeExportSection(a, &sub),
+            .type => d.func_types = try decodeTypeSection(&d, &sub),
+            .import => imports = try decodeImportSection(&d, &sub),
+            .function => functions = try decodeFunctionSection(&d, &sub),
+            .table => try decodeTableSection(&d, &sub),
+            .memory => try decodeMemorySection(&d, &sub),
+            .global => try decodeGlobalSection(&d, &sub),
+            .@"export" => exports = try decodeExportSection(&d, &sub),
             else => {},
         }
     }
@@ -104,7 +137,7 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
         .arena = arena,
         .version = version,
         .sections = try sections.toOwnedSlice(a),
-        .func_types = func_types,
+        .func_types = d.func_types,
         .functions = functions,
         .imports = imports,
         .exports = exports,
@@ -124,7 +157,7 @@ pub fn section(self: Module, id: types.SectionId) ?Section {
     return null;
 }
 
-// --- Section decoders (operate on a sub-reader over the section payload) ---
+// --- Low-level readers -----------------------------------------------------
 
 fn readValTypes(a: std.mem.Allocator, r: *Reader) Error![]const types.ValType {
     const n = try r.readVarU32();
@@ -142,65 +175,143 @@ fn readName(a: std.mem.Allocator, r: *Reader) Error![]const u8 {
     return dst;
 }
 
-/// Consume a `limits` (§5.3.7): flag byte, min, and max if the low flag bit set.
-fn skipLimits(r: *Reader) Error!void {
+fn readLimits(r: *Reader) Error!Limits {
     const flag = try r.readByte();
-    _ = try r.readVarU32();
-    if (flag & 0x01 != 0) _ = try r.readVarU32();
+    const min = try r.readVarU32();
+    const max: ?u32 = if (flag & 0x01 != 0) try r.readVarU32() else null;
+    return .{ .min = min, .max = max };
 }
 
-fn decodeTypeSection(a: std.mem.Allocator, r: *Reader) Error![]const FuncType {
-    const count = try r.readVarU32();
-    const list = try a.alloc(FuncType, count);
-    for (list) |*ft| {
-        if (try r.readByte() != 0x60) return error.BadFuncType;
-        ft.params = try readValTypes(a, r);
-        ft.results = try readValTypes(a, r);
-    }
-    return list;
+fn readTableType(r: *Reader) Error!TableType {
+    const element: types.ValType = @enumFromInt(try r.readByte());
+    return .{ .element = element, .limits = try readLimits(r) };
 }
 
-fn decodeFunctionSection(a: std.mem.Allocator, r: *Reader) Error![]const u32 {
-    const count = try r.readVarU32();
-    const list = try a.alloc(u32, count);
-    for (list) |*i| i.* = try r.readVarU32();
-    return list;
+fn readGlobalType(r: *Reader) Error!GlobalType {
+    const content: types.ValType = @enumFromInt(try r.readByte());
+    const mut = try r.readByte();
+    return .{ .content = content, .mutable = mut != 0 };
 }
 
-fn decodeImportSection(a: std.mem.Allocator, r: *Reader) Error![]const Import {
-    const count = try r.readVarU32();
-    const list = try a.alloc(Import, count);
-    for (list) |*imp| {
-        imp.module = try readName(a, r);
-        imp.name = try readName(a, r);
-        imp.kind = @enumFromInt(try r.readByte());
-        imp.index = 0;
-        switch (imp.kind) {
-            .func => imp.index = try r.readVarU32(), // typeidx
-            .table => {
-                _ = try r.readByte(); // reftype
-                try skipLimits(r);
-            },
-            .memory => try skipLimits(r),
-            .global => {
-                _ = try r.readByte(); // valtype
-                _ = try r.readByte(); // mutability
-            },
-            else => return error.UnknownExternKind,
+/// Skip a constant init expression (§5.4.9): a short instruction sequence
+/// terminated by `end` (0x0B). Handles the const-expr opcodes so an operand
+/// byte can never be mistaken for the terminator.
+fn skipConstExpr(r: *Reader) Error!void {
+    while (true) {
+        const op = try r.readByte();
+        switch (op) {
+            0x0b => return, // end
+            0x41, 0x42 => _ = try r.readVarU32(), // i32/i64.const (operand length-compatible)
+            0x23, 0xd2 => _ = try r.readVarU32(), // global.get / ref.func
+            0x43 => _ = try r.readBytes(4), // f32.const
+            0x44 => _ = try r.readBytes(8), // f64.const
+            0xd0 => _ = try r.readByte(), // ref.null (heaptype)
+            else => {}, // other zero-operand ops
         }
     }
+}
+
+// --- Section decoders ------------------------------------------------------
+
+fn decodeTypeSection(d: *Decoder, r: *Reader) Error![]const FuncType {
+    const count = try r.readVarU32();
+    const list = try d.a.alloc(FuncType, count);
+    for (list) |*ft| {
+        if (try r.readByte() != 0x60) return error.BadFuncType;
+        ft.params = try readValTypes(d.a, r);
+        ft.results = try readValTypes(d.a, r);
+    }
     return list;
 }
 
-fn decodeExportSection(a: std.mem.Allocator, r: *Reader) Error![]const Export {
+fn funcTypeAt(d: *Decoder, type_index: u32) Error!FuncType {
+    if (type_index >= d.func_types.len) return error.IndexOutOfRange;
+    return d.func_types[type_index];
+}
+
+fn decodeImportSection(d: *Decoder, r: *Reader) Error![]const Import {
     const count = try r.readVarU32();
-    const list = try a.alloc(Export, count);
-    for (list) |*e| {
-        e.name = try readName(a, r);
-        e.kind = @enumFromInt(try r.readByte());
-        e.index = try r.readVarU32();
+    const list = try d.a.alloc(Import, count);
+    for (list) |*imp| {
+        imp.module = try readName(d.a, r);
+        imp.name = try readName(d.a, r);
+        const kind: types.ExternKind = @enumFromInt(try r.readByte());
+        imp.type = switch (kind) {
+            .func => blk: {
+                const ft = try funcTypeAt(d, try r.readVarU32());
+                try d.func_space.append(d.a, ft);
+                break :blk .{ .func = ft };
+            },
+            .table => blk: {
+                const tt = try readTableType(r);
+                try d.table_space.append(d.a, tt);
+                break :blk .{ .table = tt };
+            },
+            .memory => blk: {
+                const mt: MemoryType = .{ .limits = try readLimits(r) };
+                try d.mem_space.append(d.a, mt);
+                break :blk .{ .memory = mt };
+            },
+            .global => blk: {
+                const gt = try readGlobalType(r);
+                try d.global_space.append(d.a, gt);
+                break :blk .{ .global = gt };
+            },
+            else => return error.UnknownExternKind,
+        };
     }
     return list;
+}
+
+fn decodeFunctionSection(d: *Decoder, r: *Reader) Error![]const u32 {
+    const count = try r.readVarU32();
+    const list = try d.a.alloc(u32, count);
+    for (list) |*i| {
+        i.* = try r.readVarU32();
+        try d.func_space.append(d.a, try funcTypeAt(d, i.*));
+    }
+    return list;
+}
+
+fn decodeTableSection(d: *Decoder, r: *Reader) Error!void {
+    var count = try r.readVarU32();
+    while (count > 0) : (count -= 1) try d.table_space.append(d.a, try readTableType(r));
+}
+
+fn decodeMemorySection(d: *Decoder, r: *Reader) Error!void {
+    var count = try r.readVarU32();
+    while (count > 0) : (count -= 1) try d.mem_space.append(d.a, .{ .limits = try readLimits(r) });
+}
+
+fn decodeGlobalSection(d: *Decoder, r: *Reader) Error!void {
+    var count = try r.readVarU32();
+    while (count > 0) : (count -= 1) {
+        try d.global_space.append(d.a, try readGlobalType(r));
+        try skipConstExpr(r); // init expression
+    }
+}
+
+fn decodeExportSection(d: *Decoder, r: *Reader) Error![]const Export {
+    const count = try r.readVarU32();
+    const list = try d.a.alloc(Export, count);
+    for (list) |*e| {
+        e.name = try readName(d.a, r);
+        const kind: types.ExternKind = @enumFromInt(try r.readByte());
+        e.index = try r.readVarU32();
+        e.type = switch (kind) {
+            .func => .{ .func = try spaceAt(FuncType, d.func_space, e.index) },
+            .table => .{ .table = try spaceAt(TableType, d.table_space, e.index) },
+            .memory => .{ .memory = try spaceAt(MemoryType, d.mem_space, e.index) },
+            .global => .{ .global = try spaceAt(GlobalType, d.global_space, e.index) },
+            else => return error.UnknownExternKind,
+        };
+    }
+    return list;
+}
+
+fn spaceAt(comptime T: type, space: std.ArrayList(T), index: u32) Error!T {
+    if (index >= space.items.len) return error.IndexOutOfRange;
+    return space.items[index];
 }
 
 // --- Tests -----------------------------------------------------------------
@@ -235,25 +346,20 @@ test "rejects an unsupported version" {
     try std.testing.expectError(error.UnsupportedVersion, Module.decode(std.testing.allocator, &bytes));
 }
 
-test "decodes type/import/function/export sections" {
+test "decodes and resolves type/import/function/export sections" {
     // (i32,i32)->i32 ; import env.add:func 0 ; one defined func of type 0 ;
     // export "run" = func 1 (imported func is index 0, defined func is index 1).
     const bytes =
         types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
-        // type section
         [_]u8{ 0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f } ++
-        // import section: "env" "add" func typeidx 0
         [_]u8{ 0x02, 0x0b, 0x01, 0x03, 'e', 'n', 'v', 0x03, 'a', 'd', 'd', 0x00, 0x00 } ++
-        // function section: one func, type 0
         [_]u8{ 0x03, 0x02, 0x01, 0x00 } ++
-        // export section: "run" func index 1
         [_]u8{ 0x07, 0x07, 0x01, 0x03, 'r', 'u', 'n', 0x00, 0x01 };
 
     var m = try Module.decode(std.testing.allocator, &bytes);
     defer m.deinit();
 
     try std.testing.expectEqual(@as(usize, 4), m.sections.len);
-
     try std.testing.expectEqual(@as(usize, 1), m.func_types.len);
     try std.testing.expectEqualSlices(types.ValType, &.{ .i32, .i32 }, m.func_types[0].params);
     try std.testing.expectEqualSlices(types.ValType, &.{.i32}, m.func_types[0].results);
@@ -261,13 +367,31 @@ test "decodes type/import/function/export sections" {
     try std.testing.expectEqual(@as(usize, 1), m.imports.len);
     try std.testing.expectEqualStrings("env", m.imports[0].module);
     try std.testing.expectEqualStrings("add", m.imports[0].name);
-    try std.testing.expectEqual(types.ExternKind.func, m.imports[0].kind);
-    try std.testing.expectEqual(@as(u32, 0), m.imports[0].index);
+    try std.testing.expectEqual(types.ExternKind.func, m.imports[0].type.kind());
+    try std.testing.expectEqualSlices(types.ValType, &.{ .i32, .i32 }, m.imports[0].type.func.params);
 
     try std.testing.expectEqualSlices(u32, &.{0}, m.functions);
 
     try std.testing.expectEqual(@as(usize, 1), m.exports.len);
     try std.testing.expectEqualStrings("run", m.exports[0].name);
-    try std.testing.expectEqual(types.ExternKind.func, m.exports[0].kind);
+    try std.testing.expectEqual(types.ExternKind.func, m.exports[0].type.kind());
     try std.testing.expectEqual(@as(u32, 1), m.exports[0].index);
+    // export "run" resolves to the (i32,i32)->i32 signature of defined func 1.
+    try std.testing.expectEqualSlices(types.ValType, &.{ .i32, .i32 }, m.exports[0].type.func.params);
+    try std.testing.expectEqualSlices(types.ValType, &.{.i32}, m.exports[0].type.func.results);
+}
+
+test "resolves a memory export with limits" {
+    // memory section: one memory, limits {min=1,max=2}; export "mem" memory 0.
+    const bytes =
+        types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+        [_]u8{ 0x05, 0x04, 0x01, 0x01, 0x01, 0x02 } ++ // memory: count 1, flag 1, min 1, max 2
+        [_]u8{ 0x07, 0x07, 0x01, 0x03, 'm', 'e', 'm', 0x02, 0x00 };
+
+    var m = try Module.decode(std.testing.allocator, &bytes);
+    defer m.deinit();
+    try std.testing.expectEqual(@as(usize, 1), m.exports.len);
+    try std.testing.expectEqual(types.ExternKind.memory, m.exports[0].type.kind());
+    try std.testing.expectEqual(@as(u32, 1), m.exports[0].type.memory.limits.min);
+    try std.testing.expectEqual(@as(?u32, 2), m.exports[0].type.memory.limits.max);
 }

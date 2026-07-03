@@ -10,10 +10,14 @@ bytes ──► DECODE ──► VALIDATE ──► INSTANTIATE ──► EXECUT
           (done)     (next)       (later)         (later)
 ```
 
-- **DECODE** (`Module.decode`) — validate the 8-byte header (`\0asm` magic + version 1), then walk the
-  top-level sections recording each `{id, offset, size}` without eagerly parsing payloads. Zero-copy:
-  the returned `Module` only borrows section extents, so the input buffer may be freed afterward.
-- **VALIDATE** (next) — decode the type/function/code sections and type-check per the spec.
+- **DECODE** (`Module.decode`) — validate the 8-byte header (`\0asm` magic + version 1), index the
+  top-level sections, and decode the type / import / function / table / memory / global / export
+  sections. Every import and export is resolved to its full `Extern` type (func→signature,
+  table/memory→limits, global→content+mutability) by building per-kind index spaces (imported entries
+  first, then defined). **Owned via an internal arena** and names are copied in, so the module survives
+  the input buffer being freed (required by wasm-c-api, where the caller deletes the byte vector after
+  `wasm_module_new`). The `{id, offset, size}` section extents are retained as metadata only.
+- **VALIDATE** (next) — decode the code section and type-check per the spec.
 - **INSTANTIATE / EXECUTE** (later) — memories/tables/globals + an interpreter (the design space to
   mine from wasm3 / WAMR-fast-interp / wasmi; see `reference-projects.md`).
 
@@ -21,9 +25,9 @@ bytes ──► DECODE ──► VALIDATE ──► INSTANTIATE ──► EXECUT
 
 | Unit | Responsibility |
 | --- | --- |
-| `types.zig` | `magic`, `supported_version`, `SectionId` (non-exhaustive enum, `.max`), `DecodeError`. Dependency-free so it compiles for every target. |
+| `types.zig` | `magic`, `supported_version`, `SectionId`, `ValType` (binary opcodes), `ExternKind` (binary order), `DecodeError`. Dependency-free so it compiles for every target. |
 | `Reader.zig` | Zero-copy cursor (file-as-`@This()` struct): `readByte`, `readBytes`, `readU32Le`, `readVarU32` (unsigned LEB128). Bounds-checked, allocation-free. |
-| `Module.zig` | `decode(allocator, bytes) → Module`; owns a `[]Section`; `deinit`; `section(id)` lookup. `Error = DecodeError || Allocator.Error`. |
+| `Module.zig` | `decode(gpa, bytes) → Module`; arena-owned; `FuncType`/`Limits`/`TableType`/`MemoryType`/`GlobalType`/`Extern`, `Import`/`Export` (each with a resolved `Extern` type), `func_types`, `functions`, `sections`; `deinit`; `section(id)`. `Error = DecodeError || Allocator.Error`. |
 | `root.zig` | Public surface. Re-exports the above + `decode`, `version`, `abi_version`. libc-free. |
 
 ## Three consumption surfaces (one core)
@@ -65,13 +69,22 @@ adds only the wazmrt handshake.
 /* modules */              wasm_module_new(store, &binary)   -> own wasm_module_t* | NULL
                            wasm_module_validate(store, &binary) -> bool
                            wasm_module_delete
+/* introspection */        wasm_module_imports/exports -> own importtype/exporttype vec
+                           + the type-object system: valtype, functype, externtype,
+                           globaltype/tabletype/memorytype, importtype, exporttype
+                           (kind, as_* casts, params/results, name/module/type, *_vec_delete)
 /* wazmrt extension */     wazmrt_abi_version(void), wazmrt_version_string(void)
 ```
 
+The type objects use the wasm-c-api "is-a externtype" convention: each concrete type is an `extern
+struct` whose first field is the extern kind, so `wasm_*type_as_externtype` / `wasm_externtype_as_*type`
+are pointer casts and `wasm_externtype_kind` reads the first byte. Every import/export is resolved by
+the decoder to its full `Extern` type (see below), so the returned vectors are complete.
+
 **Declared-but-deferred** (in `wasm.h`, unimplemented until instantiation/execution): instance, func,
-global, table, memory, trap, val/ref, the type-introspection vecs (`wasm_module_imports/exports`), and
-the module sharable-ref extras. An undefined symbol in a static lib only errors if a consumer
-references it, so partial implementation is honest and safe.
+global, table, memory *runtime objects*, trap, val/ref, type `_copy`/`_new` constructors, and the
+module sharable-ref extras. An undefined symbol in a static lib only errors if a consumer references
+it, so partial implementation is honest and safe.
 
 **Conventions (from the standard):** opaque `struct wasm_*_t*` handles; `own`/delete ownership; vectors
 are `{ size_t size; T* data; }` the caller owns. **Windows:** consumers compile with `-DLIBWASM_STATIC`

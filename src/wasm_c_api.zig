@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const root = @import("root.zig");
+const types = @import("types.zig");
 
 const alloc = std.heap.smp_allocator;
 
@@ -140,6 +141,344 @@ export fn wasm_module_delete(module: ?*Module) void {
     const m = module orelse return;
     m.inner.deinit();
     alloc.destroy(m);
+}
+
+// ===========================================================================
+// Type introspection: wasm_module_imports / wasm_module_exports and the
+// wasm-c-api type-object hierarchy they return.
+//
+// Each concrete type object (`FuncType`/`GlobalType`/`TableType`/`MemoryType`)
+// is an `extern struct` whose first field is `ekind`, so a pointer to it
+// doubles as a `wasm_externtype_t*` — the wasm-c-api "is-a externtype"
+// convention, letting `wasm_*type_as_externtype` / `wasm_externtype_as_*type`
+// be plain pointer casts and `wasm_externtype_kind` read the first byte.
+// ===========================================================================
+
+const Valkind = u8; // wasm_valkind_t
+const Externkind = u8; // wasm_externkind_t (C order: func,global,table,memory,tag)
+const EXTERN_FUNC: Externkind = 0;
+const EXTERN_GLOBAL: Externkind = 1;
+const EXTERN_TABLE: Externkind = 2;
+const EXTERN_MEMORY: Externkind = 3;
+
+/// wasm_limits_t: `{ uint32_t min; uint32_t max; }` (max 0xffffffff == none).
+const Limits = extern struct { min: u32, max: u32 };
+
+const ValType = struct { kind: Valkind };
+
+const ValTypeVec = extern struct { size: usize, data: [*c]?*ValType };
+const ImportTypeVec = extern struct { size: usize, data: [*c]?*ImportType };
+const ExportTypeVec = extern struct { size: usize, data: [*c]?*ExportType };
+
+const FuncType = extern struct { ekind: Externkind, params: ValTypeVec, results: ValTypeVec };
+const GlobalType = extern struct { ekind: Externkind, content: ?*ValType, mutability: u8 };
+const TableType = extern struct { ekind: Externkind, element: ?*ValType, limits: Limits };
+const MemoryType = extern struct { ekind: Externkind, limits: Limits };
+
+const ImportType = struct { module: ByteVec, name: ByteVec, ext: ?*anyopaque };
+const ExportType = struct { name: ByteVec, ext: ?*anyopaque };
+
+fn valkindOf(v: types.ValType) Valkind {
+    return switch (v) {
+        .i32 => 0,
+        .i64 => 1,
+        .f32 => 2,
+        .f64 => 3,
+        .externref => 128,
+        .funcref => 129,
+        else => 0, // v128 / unknown: no base wasm-c-api valkind — default to i32
+    };
+}
+
+fn limitsOf(l: root.Module.Limits) Limits {
+    return .{ .min = l.min, .max = l.max orelse 0xffff_ffff };
+}
+
+fn makeValType(v: types.ValType) ?*ValType {
+    const vt = alloc.create(ValType) catch return null;
+    vt.* = .{ .kind = valkindOf(v) };
+    return vt;
+}
+
+fn makeValTypeVec(out: *ValTypeVec, src: []const types.ValType) void {
+    if (src.len == 0) {
+        out.* = .{ .size = 0, .data = null };
+        return;
+    }
+    const arr = alloc.alloc(?*ValType, src.len) catch {
+        out.* = .{ .size = 0, .data = null };
+        return;
+    };
+    for (arr, src) |*slot, v| slot.* = makeValType(v);
+    out.* = .{ .size = src.len, .data = arr.ptr };
+}
+
+fn makeExternType(ext: root.Module.Extern) ?*anyopaque {
+    switch (ext) {
+        .func => |ft| {
+            const obj = alloc.create(FuncType) catch return null;
+            obj.ekind = EXTERN_FUNC;
+            makeValTypeVec(&obj.params, ft.params);
+            makeValTypeVec(&obj.results, ft.results);
+            return @ptrCast(obj);
+        },
+        .global => |gt| {
+            const obj = alloc.create(GlobalType) catch return null;
+            obj.* = .{ .ekind = EXTERN_GLOBAL, .content = makeValType(gt.content), .mutability = @intFromBool(gt.mutable) };
+            return @ptrCast(obj);
+        },
+        .table => |tt| {
+            const obj = alloc.create(TableType) catch return null;
+            obj.* = .{ .ekind = EXTERN_TABLE, .element = makeValType(tt.element), .limits = limitsOf(tt.limits) };
+            return @ptrCast(obj);
+        },
+        .memory => |mt| {
+            const obj = alloc.create(MemoryType) catch return null;
+            obj.* = .{ .ekind = EXTERN_MEMORY, .limits = limitsOf(mt.limits) };
+            return @ptrCast(obj);
+        },
+    }
+}
+
+fn externKindOf(p: *const anyopaque) Externkind {
+    return @as(*const Externkind, @ptrCast(@alignCast(p))).*;
+}
+
+fn freeValTypeVec(vec: *ValTypeVec) void {
+    if (vec.data != null and vec.size != 0) {
+        for (vec.data[0..vec.size]) |slot| {
+            if (slot) |vt| alloc.destroy(vt);
+        }
+        alloc.free(vec.data[0..vec.size]);
+    }
+    vec.* = .{ .size = 0, .data = null };
+}
+
+fn freeExternType(ext: ?*anyopaque) void {
+    const p = ext orelse return;
+    switch (externKindOf(p)) {
+        EXTERN_FUNC => {
+            const ft: *FuncType = @ptrCast(@alignCast(p));
+            freeValTypeVec(&ft.params);
+            freeValTypeVec(&ft.results);
+            alloc.destroy(ft);
+        },
+        EXTERN_GLOBAL => {
+            const gt: *GlobalType = @ptrCast(@alignCast(p));
+            if (gt.content) |vt| alloc.destroy(vt);
+            alloc.destroy(gt);
+        },
+        EXTERN_TABLE => {
+            const tt: *TableType = @ptrCast(@alignCast(p));
+            if (tt.element) |vt| alloc.destroy(vt);
+            alloc.destroy(tt);
+        },
+        EXTERN_MEMORY => alloc.destroy(@as(*MemoryType, @ptrCast(@alignCast(p)))),
+        else => {},
+    }
+}
+
+// ---- Value types ----------------------------------------------------------
+
+export fn wasm_valtype_new(kind: Valkind) ?*ValType {
+    const vt = alloc.create(ValType) catch return null;
+    vt.* = .{ .kind = kind };
+    return vt;
+}
+
+export fn wasm_valtype_delete(vt: ?*ValType) void {
+    if (vt) |v| alloc.destroy(v);
+}
+
+export fn wasm_valtype_kind(vt: ?*const ValType) Valkind {
+    return (vt orelse return 0).kind;
+}
+
+// ---- Function types -------------------------------------------------------
+
+export fn wasm_functype_delete(ft: ?*FuncType) void {
+    freeExternType(@ptrCast(ft));
+}
+
+export fn wasm_functype_params(ft: ?*const FuncType) ?*const ValTypeVec {
+    return &(ft orelse return null).params;
+}
+
+export fn wasm_functype_results(ft: ?*const FuncType) ?*const ValTypeVec {
+    return &(ft orelse return null).results;
+}
+
+export fn wasm_functype_as_externtype(ft: ?*FuncType) ?*anyopaque {
+    return @ptrCast(ft);
+}
+
+export fn wasm_functype_as_externtype_const(ft: ?*const FuncType) ?*const anyopaque {
+    return @ptrCast(ft);
+}
+
+// ---- Global / Table / Memory types ---------------------------------------
+
+export fn wasm_globaltype_delete(gt: ?*GlobalType) void {
+    freeExternType(@ptrCast(gt));
+}
+
+export fn wasm_globaltype_content(gt: ?*const GlobalType) ?*const ValType {
+    return (gt orelse return null).content;
+}
+
+export fn wasm_globaltype_mutability(gt: ?*const GlobalType) u8 {
+    return (gt orelse return 0).mutability;
+}
+
+export fn wasm_tabletype_delete(tt: ?*TableType) void {
+    freeExternType(@ptrCast(tt));
+}
+
+export fn wasm_tabletype_element(tt: ?*const TableType) ?*const ValType {
+    return (tt orelse return null).element;
+}
+
+export fn wasm_tabletype_limits(tt: ?*const TableType) ?*const Limits {
+    return &(tt orelse return null).limits;
+}
+
+export fn wasm_memorytype_delete(mt: ?*MemoryType) void {
+    freeExternType(@ptrCast(mt));
+}
+
+export fn wasm_memorytype_limits(mt: ?*const MemoryType) ?*const Limits {
+    return &(mt orelse return null).limits;
+}
+
+// ---- Extern types ---------------------------------------------------------
+
+export fn wasm_externtype_delete(et: ?*anyopaque) void {
+    freeExternType(et);
+}
+
+export fn wasm_externtype_kind(et: ?*const anyopaque) Externkind {
+    return externKindOf(et orelse return 0);
+}
+
+export fn wasm_externtype_as_functype(et: ?*anyopaque) ?*FuncType {
+    const p = et orelse return null;
+    return if (externKindOf(p) == EXTERN_FUNC) @ptrCast(@alignCast(p)) else null;
+}
+
+export fn wasm_externtype_as_functype_const(et: ?*const anyopaque) ?*const FuncType {
+    const p = et orelse return null;
+    return if (externKindOf(p) == EXTERN_FUNC) @ptrCast(@alignCast(p)) else null;
+}
+
+export fn wasm_externtype_as_globaltype(et: ?*anyopaque) ?*GlobalType {
+    const p = et orelse return null;
+    return if (externKindOf(p) == EXTERN_GLOBAL) @ptrCast(@alignCast(p)) else null;
+}
+
+export fn wasm_externtype_as_tabletype(et: ?*anyopaque) ?*TableType {
+    const p = et orelse return null;
+    return if (externKindOf(p) == EXTERN_TABLE) @ptrCast(@alignCast(p)) else null;
+}
+
+export fn wasm_externtype_as_memorytype(et: ?*anyopaque) ?*MemoryType {
+    const p = et orelse return null;
+    return if (externKindOf(p) == EXTERN_MEMORY) @ptrCast(@alignCast(p)) else null;
+}
+
+// ---- Import / Export types ------------------------------------------------
+
+export fn wasm_importtype_delete(it: ?*ImportType) void {
+    const i = it orelse return;
+    wasm_byte_vec_delete(&i.module);
+    wasm_byte_vec_delete(&i.name);
+    freeExternType(i.ext);
+    alloc.destroy(i);
+}
+
+export fn wasm_importtype_module(it: ?*const ImportType) ?*const ByteVec {
+    return &(it orelse return null).module;
+}
+
+export fn wasm_importtype_name(it: ?*const ImportType) ?*const ByteVec {
+    return &(it orelse return null).name;
+}
+
+export fn wasm_importtype_type(it: ?*const ImportType) ?*const anyopaque {
+    return (it orelse return null).ext;
+}
+
+export fn wasm_importtype_vec_delete(vec: *ImportTypeVec) void {
+    if (vec.data != null and vec.size != 0) {
+        for (vec.data[0..vec.size]) |slot| {
+            if (slot) |it| wasm_importtype_delete(it);
+        }
+        alloc.free(vec.data[0..vec.size]);
+    }
+    vec.* = .{ .size = 0, .data = null };
+}
+
+export fn wasm_exporttype_delete(et: ?*ExportType) void {
+    const e = et orelse return;
+    wasm_byte_vec_delete(&e.name);
+    freeExternType(e.ext);
+    alloc.destroy(e);
+}
+
+export fn wasm_exporttype_name(et: ?*const ExportType) ?*const ByteVec {
+    return &(et orelse return null).name;
+}
+
+export fn wasm_exporttype_type(et: ?*const ExportType) ?*const anyopaque {
+    return (et orelse return null).ext;
+}
+
+export fn wasm_exporttype_vec_delete(vec: *ExportTypeVec) void {
+    if (vec.data != null and vec.size != 0) {
+        for (vec.data[0..vec.size]) |slot| {
+            if (slot) |et| wasm_exporttype_delete(et);
+        }
+        alloc.free(vec.data[0..vec.size]);
+    }
+    vec.* = .{ .size = 0, .data = null };
+}
+
+// ---- Module introspection -------------------------------------------------
+
+export fn wasm_module_imports(module: ?*const Module, out: *ImportTypeVec) void {
+    out.* = .{ .size = 0, .data = null };
+    const m = module orelse return;
+    const src = m.inner.imports;
+    if (src.len == 0) return;
+    const arr = alloc.alloc(?*ImportType, src.len) catch return;
+    for (arr, src) |*slot, imp| {
+        const obj = alloc.create(ImportType) catch {
+            slot.* = null;
+            continue;
+        };
+        wasm_byte_vec_new(&obj.module, imp.module.len, imp.module.ptr);
+        wasm_byte_vec_new(&obj.name, imp.name.len, imp.name.ptr);
+        obj.ext = makeExternType(imp.type);
+        slot.* = obj;
+    }
+    out.* = .{ .size = src.len, .data = arr.ptr };
+}
+
+export fn wasm_module_exports(module: ?*const Module, out: *ExportTypeVec) void {
+    out.* = .{ .size = 0, .data = null };
+    const m = module orelse return;
+    const src = m.inner.exports;
+    if (src.len == 0) return;
+    const arr = alloc.alloc(?*ExportType, src.len) catch return;
+    for (arr, src) |*slot, e| {
+        const obj = alloc.create(ExportType) catch {
+            slot.* = null;
+            continue;
+        };
+        wasm_byte_vec_new(&obj.name, e.name.len, e.name.ptr);
+        obj.ext = makeExternType(e.type);
+        slot.* = obj;
+    }
+    out.* = .{ .size = src.len, .data = arr.ptr };
 }
 
 // ---- wazmrt extension surface (include/wazmrt.h) --------------------------
