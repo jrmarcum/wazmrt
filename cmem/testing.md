@@ -11,6 +11,10 @@ opcode). The C ABI is verified separately from C via `tests/c_smoke.c` compiled 
 Two folders in the sibling **wasmtk** project are the designated real-world test inputs. They are
 **outside this repo** (not copied in) — reference them by path.
 
+> ⚠ **Paths in flux (2026-07-02):** the owner is reorganizing folder names/locations and will provide
+> the corrected paths. The two paths below are the last-known-good locations — **verify they exist
+> before using them**, and update this section (and any harness) once the new layout is confirmed.
+
 ### Module functions → `…/wasmExamples/wasmtk/tests/wasm_mod`
 
 ~12 small modules that export plain functions (adder, factorial, evenOrOdd, isLeapYear, sieve, and
