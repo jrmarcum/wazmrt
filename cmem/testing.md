@@ -46,6 +46,17 @@ Run `wazmrt <file.wasm>` — the CLI now decodes each function body via `opcode.
   - `InvalidSectionId` — the module carries a **tag section (id 13)** from the exception-handling
     proposal (wasmtk emits `try`/`catch`); our decoder caps section ids at 12.
 
+## Validation-coverage snapshot (2026-07-02, `validate.zig`)
+
+The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>`).
+
+- **`wasm_mod`: 12/12 validate OK** — including the compiler-generated `fib-rs`/`fib-ts`/`fib-zig`.
+- **`wasm_wasi`: every fully-decoding module validates.** The only `validation: FAILED` cases are
+  `UnsupportedOpcode` on modules with a *partial* decode (one body uses a `0xFC` op) — i.e. the
+  validator re-decodes the IR and hits the same boundary. **No module that fully decodes fails
+  validation**, which is strong evidence the type-checker is correct across real, deeply-nested
+  control flow (not just the simple `wasm_mod` set).
+
 ## What this tells the roadmap
 
 1. **First execution milestone = the `wasm_mod` corpus + its `.test.json` files** — fully decodable now,

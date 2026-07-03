@@ -7,7 +7,7 @@ The standard wasm-runtime stages. Only the first is implemented today; each late
 
 ```text
 bytes ──► DECODE ──► VALIDATE ──► INSTANTIATE ──► EXECUTE
-          (done)     (next)       (later)         (later)
+          (done)     (done)       (next)          (next)
 ```
 
 - **DECODE** (`Module.decode`) — validate the 8-byte header (`\0asm` magic + version 1), index the
@@ -21,10 +21,13 @@ bytes ──► DECODE ──► VALIDATE ──► INSTANTIATE ──► EXECUT
   wasm-c-api, where the caller deletes the byte vector after `wasm_module_new`). Decode is **lenient**:
   the function/code count-match is a validation rule, not enforced here. The `{id, offset, size}`
   section extents are retained as metadata only.
-- **VALIDATE** (in progress) — the shared opcode table + IR decoder is done (`opcode.zig`:
-  `decodeBody` turns a `Code.body` into a flat `[]Instr` with pre-parsed immediates; core-MVP set
-  0x00–0xC4, rest → `UnsupportedOpcode`). Remaining: the type-checking pass over the IR (function/code
-  count match, index bounds, structured control-flow + operand-stack typing).
+- **VALIDATE** (`validate.zig`) — done. The spec's Appendix algorithm (abstract value stack + control
+  frames + a `unknown` bottom for polymorphic/unreachable code) over the `opcode.zig` IR: function/code
+  count match, local/global/func/type index bounds, structured control flow, and operand-stack typing.
+  Scope = core-MVP; memory presence + load/store alignment not yet enforced (documented leniency).
+  **Verified:** all 12 `wasm_mod` modules validate; across `wasm_wasi`, every fully-decoding module
+  validates (failures are only the `UnsupportedOpcode` decode boundary) — see `testing.md`.
+- **INSTANTIATE / EXECUTE** (next) — the switch interpreter over the IR (Option A).
 - **INSTANTIATE / EXECUTE** (later) — memories/tables/globals + an interpreter (the design space to
   mine from wasm3 / WAMR-fast-interp / wasmi; see `reference-projects.md`).
 

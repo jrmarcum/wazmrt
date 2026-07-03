@@ -67,4 +67,10 @@ pub fn main(init: std.process.Init) !void {
     if (module.code.len != 0) {
         try out.print("  bodies decoded: {d}/{d}\n", .{ ok, module.code.len });
     }
+
+    wazmrt.validate(arena, &module) catch |e| {
+        try out.print("  validation: FAILED — {s}\n", .{@errorName(e)});
+        return;
+    };
+    try out.print("  validation: OK\n", .{});
 }

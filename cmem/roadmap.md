@@ -28,14 +28,13 @@ execution.
    full `Extern` resolution; exposed via C `wasm_module_imports/exports` + the wasm-c-api type-object
    system). ~~Decode the code section~~ **DONE 2026-07-02** (locals + raw body bytes per defined
    function, arena-owned; instructions not yet parsed).
-2. **Validation** (in progress). ~~Shared opcode table + `Instr` IR + byte-code decoder~~ **DONE
-   2026-07-02** (`src/opcode.zig`: core-MVP `Op` enum 0x00–0xC4, `Imm`/`Instr`, `decodeBody`; ref-type
-   / `0xFC` / `0xFD` / multi-byte block-types → `UnsupportedOpcode`; 4 tests). **Remaining:** the
-   type-checking validator over the IR — function/code count match (deferred from decode), index bounds
-   (local/global/func/type/label), structured control-flow + operand-stack typing (the meaty part;
-   study wasmi/wain/wazero validator structure). **Opcode-expansion priority (from real corpus data,
-   see `testing.md`): `0xFC` bulk-memory first, then exception handling (tag section id 13 +
-   try/catch), then SIMD** — this is what `wasm_wasi` needs beyond core MVP.
+2. **Validation** — **DONE 2026-07-02.** `src/opcode.zig` (core-MVP `Op` enum 0x00–0xC4, `Imm`/`Instr`,
+   `decodeBody`; ref-type / `0xFC` / `0xFD` / multi-byte block-types → `UnsupportedOpcode`) + the
+   type-checking validator `src/validate.zig` (spec Appendix algorithm: value stack + control frames +
+   `unknown` bottom; count match, index bounds, control flow, operand-stack typing). 8 unit tests;
+   **all 12 `wasm_mod` validate; every fully-decoding `wasm_wasi` validates** (see `testing.md`).
+   **Opcode-expansion priority (from real corpus data): `0xFC` bulk-memory first, then exception
+   handling (tag section id 13 + try/catch), then SIMD** — what `wasm_wasi` needs beyond core MVP.
 3. **Instantiation** — memories, tables, globals, imports/exports wiring; grow the C ABI to
    `wasm_instance_new` + `wasm_func_call`.
 4. **Execution** — `while … switch(op)` interpreter over the `Instr` IR (Option A), untyped `u64`

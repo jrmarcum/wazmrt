@@ -25,6 +25,7 @@ wazmrt/
 │   ├── Reader.zig         # Zero-copy cursor: bounds-checked reads + LEB128/SLEB (file-as-struct)
 │   ├── Module.zig         # Decoded module: sections + resolved imports/exports + code (file-as-struct)
 │   ├── opcode.zig         # Shared opcode table (Op/Imm/Instr) + byte-code → IR decodeBody
+│   ├── validate.zig       # Spec type-checking validator over the IR (value + control-frame stacks)
 │   ├── wasm_c_api.zig     # Implements the standard wasm-c-api (smp_allocator, no libc)
 │   └── wasm_entry.zig     # Freestanding wasm32 export surface (wasm_allocator)
 ├── tests/
@@ -59,7 +60,6 @@ wazmrt/
 - **Libc-free core.** `root.zig` and its deps pull in no libc, so the same code targets native *and*
   `wasm32-freestanding`. The C-ABI lib uses `std.heap.smp_allocator` (not `c_allocator`). See
   `design-decisions.md` for why (smaller binary + no MSVC requirement on Windows).
-- **Decode stage complete; later stages pending.** Today the pipeline validates the header, indexes
-  sections, and decodes type/import/function/table/memory/global/export/code — resolving import/export
-  extern types and capturing function bodies. Validation, instantiation, and execution are the next
-  increments (`roadmap.md`).
+- **Decode + validate complete; execution pending.** The pipeline decodes all core sections (resolving
+  import/export extern types, capturing function bodies), decodes bodies to the `opcode.zig` IR, and
+  type-checks them (`validate.zig`). Instantiation + the switch interpreter are next (`roadmap.md`).

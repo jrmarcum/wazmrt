@@ -90,6 +90,8 @@ The 0.16 stdlib differs from older docs — verified against the installed stdli
 
 - `zig build` (5/5 steps), `zig build test` (7/7 tests), `zig build wasm` (3/3).
 - CLI end-to-end: `wazmrt empty.wasm` → `valid wasm v1, 1 section(s)` / `custom (payload 1 bytes @ 0xa)`.
+- **Validation over real modules:** all 12 `wasm_mod` modules and every fully-decoding `wasm_wasi`
+  module pass `validate.zig` (see `testing.md`); 19 unit tests total.
 - **C ABI end-to-end from C** (`tests/c_smoke.c`): built a static lib + compiled/linked the C client
   with `zig cc -target x86_64-windows-gnu -DLIBWASM_STATIC` (mingw libc, no MSVC), ran it →
   `validate(good): true`, `module_new: ok`, `validate(bad): false`, `abi_version: 1`, `version: 0.1.0`.

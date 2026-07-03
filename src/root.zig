@@ -10,6 +10,7 @@ pub const types = @import("types.zig");
 pub const Reader = @import("Reader.zig");
 pub const Module = @import("Module.zig");
 pub const opcode = @import("opcode.zig");
+pub const validate = @import("validate.zig").validate;
 
 /// Human-readable library version (keep in sync with build.zig.zon).
 pub const version: [:0]const u8 = "0.1.0";
@@ -30,4 +31,5 @@ test {
     _ = Reader;
     _ = Module;
     _ = opcode;
+    _ = @import("validate.zig");
 }

@@ -101,6 +101,9 @@ exports: []const Export,
 /// Body of each defined function (code section), positionally matching
 /// `functions`. May be empty if the module has no code section.
 code: []const Code,
+/// The global index space (imported globals first, then defined), for
+/// resolving `global.get`/`global.set` during validation.
+globals: []const GlobalType,
 
 pub const Error = types.DecodeError || std.mem.Allocator.Error;
 
@@ -167,6 +170,7 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
         .imports = imports,
         .exports = exports,
         .code = code,
+        .globals = try d.global_space.toOwnedSlice(a),
     };
 }
 
