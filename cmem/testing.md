@@ -8,34 +8,54 @@ opcode). The C ABI is verified separately from C via `tests/c_smoke.c` compiled 
 
 ## External conformance corpora (owner-designated 2026-07-02)
 
-Two folders in the sibling **wasmtk** project are the designated real-world test inputs. They are
-**outside this repo** (not copied in) — reference them by path.
+The designated real-world test inputs live in the sibling **wasmtk** project under
+`…/wasmExamples/wasmtk/tests/`. They are **outside this repo** (not copied in) — reference by path.
+Reorganized layout confirmed by the owner **2026-07-02**:
 
-> ⚠ **Paths in flux (2026-07-02):** the owner is reorganizing folder names/locations and will provide
-> the corrected paths. The two paths below are the last-known-good locations — **verify they exist
-> before using them**, and update this section (and any harness) once the new layout is confirmed.
-
-### Module functions → `…/wasmExamples/wasmtk/tests/wasm_mod`
-
-~12 small modules that export plain functions (adder, factorial, evenOrOdd, isLeapYear, sieve, and
-`fib` in wat / rs / ts / zig). Each `<name>.wasm` has a sibling **`<name>.test.json`** giving the
-expected results — a ready-made execution conformance harness:
-
-```json
-{ "add":  [ { "args": [10, 20], "expected": 30, "desc": "basic sum" }, … ],
-  "fib":  [ { "args": [10],     "expected": 55, "desc": "fib(10)" }, … ] }
+```text
+wasmtk/tests/
+├── module/                              # wasm module functions
+│   ├── wasm_mod/                        # 12 .wasm + 11 .test.json — FIRST EXECUTION TARGET
+│   ├── bindgen_fixtures/                # bindgen fixtures
+│   └── wasm_wast/
+│       ├── testsuite-main/              # ⭐ official WebAssembly spec testsuite: 257 .wast files
+│       ├── ArtOfWebAssembly_tests/      # "Art of WebAssembly" .wat, by chapter
+│       └── wasm-wat-samples-main/       # assorted .wat samples
+└── wasi/                                # WASI programs
+    ├── wasm_wasi/                       # ~336 .wasm (+ .wat/.wit/.ts) TS→WASI programs
+    ├── wasm_wasi_bundle/                # multi-module bundle fixtures (imports/chains)
+    └── wasm_wasi_dync/                  # dynamic (demoN.wasm/.wat/.wit/.ts)
 ```
 
-Shape: `{ "<exportName>": [ { "args": [...], "expected": <value>, "desc": "..." }, … ] }`. Once
-execution lands, the harness is: load the `.wasm`, call the named export with `args`, compare to
-`expected`. **This is the first execution target.** Also present per module: `.wat` (readable form)
-and the original `.ts`/`.rs`/`.zig` source.
+### `module/wasm_mod` — the first execution target
 
-### WASI programs → `…/wasmExamples/wasmtk/tests/wasm_wasi`
+~12 small modules that export plain functions (adder, factorial, evenOrOdd, isLeapYear, sieve, `fib`
+in wat/rs/ts/zig). Each `<name>.wasm` has a sibling **`<name>.test.json`** — a ready-made execution
+conformance harness:
 
-1377 entries — larger TS→WASI programs compiled by wasmtk (each with `.wasm` + `.wat` + `.wit` +
-`.ts`). The target for **WASI execution** later (needs the WASI import surface). Big, optimizer-heavy
-modules — they exercise far more of the instruction/section space than `wasm_mod`.
+```json
+{ "add": [ { "args": [10, 20], "expected": 30, "desc": "basic sum" }, … ],
+  "fib": [ { "args": [10],     "expected": 55, "desc": "fib(10)" }, … ] }
+```
+
+Shape: `{ "<export>": [ { "args": [...], "expected": <value>, "desc": "..." }, … ] }`. Harness = load
+the `.wasm`, call the named export with `args`, compare to `expected`. All 12 decode + validate today
+(below); wiring the harness is gated only on finishing the integer→float/memory execution slices.
+
+### `module/wasm_wast/testsuite-main` — the conformance gold standard (future)
+
+The **official WebAssembly spec testsuite** (257 `.wast` files: `address.wast`, `align.wast`,
+`i32.wast`, `call.wast`, `br_table.wast`, …). `.wast` is the spec *script* format — modules plus
+assertions (`assert_return`, `assert_trap`, `assert_invalid`, `assert_malformed`). Using it requires a
+**`.wast` script parser** (a distinct tool to build) but it is THE bar a serious runtime is measured
+against — every implemented feature should eventually be gated on the relevant `.wast` files.
+`ArtOfWebAssembly_tests` and `wasm-wat-samples-main` are additional `.wat` corpora for lighter coverage.
+
+### `wasi/wasm_wasi*` — WASI execution (later)
+
+TS→WASI programs (optimizer-heavy; exercise far more of the instruction/section space than `wasm_mod`),
+plus multi-module `wasm_wasi_bundle` and dynamic `wasm_wasi_dync`. The target for **WASI execution**
+once the runtime has memory + host imports + the WASI surface.
 
 ## Decode-coverage snapshot (2026-07-02, after the opcode/IR decoder)
 
@@ -63,8 +83,13 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
 
 ## What this tells the roadmap
 
-1. **First execution milestone = the `wasm_mod` corpus + its `.test.json` files** — fully decodable now,
-   small, with expected outputs. Build the interpreter against these.
-2. **Opcode-set expansion priority (from real data):** `0xFC` bulk-memory first (common in optimized
+1. **First execution milestone = the `module/wasm_mod` corpus + its `.test.json` files** — fully
+   decode + validate today, small, with expected outputs. Wire the interpreter harness against these
+   once the float/memory execution slices land.
+2. **Conformance gold standard = `module/wasm_wast/testsuite-main`** (the official spec `.wast` suite).
+   Building a `.wast` script parser (module + `assert_return`/`assert_trap`/`assert_invalid`) is a
+   distinct, high-value tool; every implemented feature should eventually gate on the relevant `.wast`
+   files. This is the real measure of correctness beyond the hand-picked corpora.
+3. **Opcode-set expansion priority (from real data):** `0xFC` bulk-memory first (common in optimized
    output), then the exception-handling surface (tag section id 13 + `try`/`catch`/`throw`) to unlock
    more of `wasm_wasi`. SIMD (`0xFD`) later.
