@@ -29,12 +29,17 @@ execution.
    system). ~~Decode the code section~~ **DONE 2026-07-02** (locals + raw body bytes per defined
    function, arena-owned; instructions not yet parsed).
 2. **Validation** — parse instruction bytes + type-check per the spec: function/code count match,
-   index bounds, operand-stack typing (study wasmi/wain/wazero validator structure). This is where the
-   instruction opcode table gets defined, shared with execution.
-3. **Instantiation** — memories, tables, globals, imports/exports wiring.
-4. **Execution** — the interpreter core. This is the key perf/size battleground; mine wasm3
-   (threading/dispatch), wasmi (register machine), WAMR-fast-interp (footprint). First real Adoption
-   Checklist + Component Ledger decisions likely happen here.
+   index bounds, operand-stack typing. This is where the **shared opcode table + `Instr` IR** get
+   defined (see `design-decisions.md` → interpreter architecture = **Option A**, switch-dispatched over
+   a pre-decoded IR). Concretely: `src/opcode.zig` (opcode enum + operand shapes), an `Instr`/decode
+   pass that both validation and execution consume, function/code count-match enforcement (deferred
+   from decode), index-bounds + operand-stack type checking.
+3. **Instantiation** — memories, tables, globals, imports/exports wiring; grow the C ABI to
+   `wasm_instance_new` + `wasm_func_call`.
+4. **Execution** — `while … switch(op)` interpreter over the `Instr` IR (Option A), untyped `u64`
+   value-stack slots; call/locals/globals/memory. The key perf/size battleground: keep the IR a clean
+   seam so a register-machine pass (Option B, wasmi) can be layered later if benchmarks demand it.
+   First real Adoption Checklist + Component Ledger decisions likely happen here.
 5. **Grow the wasm-c-api implementation** as the runtime gains ability: `wasm_module_imports/exports`
    (once the import/export sections decode) → then instance/func/trap/call at instantiation+execution.
    The standard signatures are already declared in the vendored `wasm.h`; we just implement more of
@@ -46,8 +51,9 @@ execution.
 
 ## Parking lot / open questions
 
-- Interpreter shape: threaded (wasm3-style) vs register-machine (wasmi-style) vs bytecode rewrite —
-  decide empirically against size+speed once basic execution works.
+- Interpreter shape: **DECIDED 2026-07-02 — Option A** (switch over a pre-decoded IR); see
+  `design-decisions.md`. Open sub-question: whether/when to add the Option B register-rewriting pass —
+  decide empirically against size+speed once basic execution works and there's a benchmark.
 - Optional `-Dlibc` build flag if an embedder wants wazmrt to share the host `malloc` (default stays
   libc-free — see `design-decisions.md`).
 - WASI support scope (study wasmtime/wazero) — deferred until core execution exists.

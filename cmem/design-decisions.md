@@ -28,6 +28,23 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
 - **Version string single-sourced (2026-07-02).** `root.version` (`"0.1.0"`) is the one truth; keep it
   in sync with `build.zig.zon` `.version`. The C ABI returns `root.version.ptr`.
 
+- **Interpreter architecture = switch-dispatched, IR-ready (owner, 2026-07-02).** wazmrt is an
+  **interpreter**, not a JIT/AOT — a native codegen backend violates "smallest binary" and can't run on
+  the `wasm32-freestanding` self-compile target. Among interpreters we chose **Option A: a
+  switch-dispatched interpreter over a pre-decoded instruction IR**, over B (register-machine rewriting,
+  modern wasmi) and C (tail-call threading, wasm3). Rationale: smallest + most portable + fastest to
+  *correct*, and it unblocks the loaders soonest. Load-bearing sub-rules:
+  - **One shared opcode table / instruction decoder** used by validation, IR-building, and execution —
+    they must never drift. Define it once (likely `src/opcode.zig` + an `Instr` type).
+  - **Untyped `u64` value-stack slots** (validation proves types; no per-value tag) — smaller/faster,
+    as in wasm3/wasmi.
+  - **Keep the IR a clean seam.** Do NOT bake stack-machine assumptions so deep that Option B (a
+    register-rewriting pass over the same validated input) becomes a rewrite. wasmi shipped stack-based
+    first, then evolved to a register machine — that is the intended path *if* benchmarks demand it.
+    Correct → measure → optimize; don't pay register-allocator complexity before execution exists.
+  - **Reference study when optimizing:** B → wasmi (`Apache-2.0 OR MIT`), C → wasm3 (`MIT`); both
+    ledger-friendly. No code adopted yet — architecture chosen at idea-level.
+
 ## Zig 0.16 API notes (this project targets 0.16.0)
 
 The 0.16 stdlib differs from older docs — verified against the installed stdlib this session:
