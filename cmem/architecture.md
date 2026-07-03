@@ -7,8 +7,9 @@ The standard wasm-runtime stages. Only the first is implemented today; each late
 
 ```text
 bytes ──► DECODE ──► VALIDATE ──► INSTANTIATE ──► EXECUTE
-          (done)     (done)       (partial)       (partial — integers)
+          (done)     (done)       (done*)         (done* — int/float/memory)
 ```
+*no host imports / call_indirect yet
 
 - **DECODE** (`Module.decode`) — validate the 8-byte header (`\0asm` magic + version 1), index the
   top-level sections, and decode the type / import / function / table / memory / global / export / code
@@ -33,9 +34,12 @@ bytes ──► DECODE ──► VALIDATE ──► INSTANTIATE ──► EXECUT
   per-call label stack, a branch that carries block/loop arity and resets the stack. **Implemented:**
   i32/i64 **and f32/f64** arithmetic/comparison/bitwise, all conversions (incl. trapping float→int,
   IEEE `min`/`max`/`nearest`, reinterpret), locals, globals (zero-init), `drop`, `select`, structured
-  control flow, direct `call`, and traps (`unreachable`, div-by-zero, overflow, call-depth,
-  invalid-float→int). **Deferred (trap `UnsupportedInstruction`):** memory load/store, `call_indirect`,
-  host-import calls — the next execution slices.
+  control flow, direct `call`, **linear memory** (allocate min pages + active data-segment init;
+  load/store all widths, `memory.size`/`grow`), and traps (`unreachable`, div-by-zero, overflow,
+  call-depth, invalid-float→int, memory-out-of-bounds). **Deferred (trap):** `call_indirect` + tables,
+  host-import calls. **Verified on real modules:** `Instance.invoke` runs the whole `wasm_mod` corpus
+  to its `.test.json` expected values (`fib(20)=6765`, `fac(7)=5040`, `sieve(30)=10` via memory) — the
+  CLI gained a run mode `wazmrt <file.wasm> <export> [args…]`.
 - **INSTANTIATE / EXECUTE** (later) — memories/tables/globals + an interpreter (the design space to
   mine from wasm3 / WAMR-fast-interp / wasmi; see `reference-projects.md`).
 

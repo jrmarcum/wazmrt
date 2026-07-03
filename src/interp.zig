@@ -17,9 +17,13 @@ const std = @import("std");
 const types = @import("types.zig");
 const Module = @import("Module.zig");
 const opcode = @import("opcode.zig");
+const Reader = @import("Reader.zig");
 
 const V = types.ValType;
 const Op = opcode.Op;
+
+/// WebAssembly linear-memory page size (64 KiB).
+const page_size = 64 * 1024;
 
 /// A runtime value: a raw 64-bit slot reinterpreted per the (validated) type.
 pub const Value = u64;
@@ -68,11 +72,17 @@ pub const Error = Module.Error || error{
     UndefinedFunc,
     /// Calling an imported (host) function — not yet supported.
     UnsupportedImportCall,
-    /// An opcode this interpreter slice does not execute yet (memory,
-    /// call_indirect).
+    /// An opcode this interpreter slice does not execute yet (call_indirect,
+    /// reference types).
     UnsupportedInstruction,
     /// A float→int truncation of NaN, infinity, or an out-of-range value.
     InvalidConversionToInt,
+    /// A memory access (or data-segment init) outside the memory bounds.
+    MemoryOutOfBounds,
+    /// A memory instruction in a module with no linear memory.
+    NoMemory,
+    /// A global index out of range (e.g. in a data-segment offset expression).
+    UndefinedGlobal,
 };
 
 const max_call_depth = 1024;
@@ -105,6 +115,11 @@ pub const Instance = struct {
     func_bodies: []FuncBody,
     globals: []Value,
     imported_funcs: u32,
+    /// Linear memory bytes (length is a multiple of `page_size`), or null if the
+    /// module has no memory. Allocated with `gpa` (grows via realloc).
+    memory: ?[]u8,
+    /// Maximum memory size in pages, if bounded.
+    mem_max: ?u32,
 
     pub fn init(gpa: std.mem.Allocator, module: *const Module) Error!Instance {
         var arena = std.heap.ArenaAllocator.init(gpa);
@@ -131,6 +146,25 @@ pub const Instance = struct {
         const globals = try a.alloc(Value, module.globals.len);
         @memset(globals, 0); // TODO: evaluate global init expressions
 
+        // Linear memory: allocate the declared minimum, then apply active data
+        // segments. (An imported memory is self-provided here — no host yet.)
+        var memory: ?[]u8 = null;
+        var mem_max: ?u32 = null;
+        if (module.memories.len > 0) {
+            const mt = module.memories[0];
+            const buf = try gpa.alloc(u8, @as(usize, mt.limits.min) * page_size);
+            errdefer gpa.free(buf);
+            @memset(buf, 0);
+            for (module.data) |seg| {
+                if (!seg.active) continue;
+                const offset = try evalConstOffset(module, globals, seg.offset_expr);
+                if (@as(u64, offset) + seg.bytes.len > buf.len) return error.MemoryOutOfBounds;
+                @memcpy(buf[offset..][0..seg.bytes.len], seg.bytes);
+            }
+            memory = buf;
+            mem_max = mt.limits.max;
+        }
+
         return .{
             .gpa = gpa,
             .arena = arena,
@@ -138,10 +172,13 @@ pub const Instance = struct {
             .func_bodies = bodies,
             .globals = globals,
             .imported_funcs = module.importedFuncCount(),
+            .memory = memory,
+            .mem_max = mem_max,
         };
     }
 
     pub fn deinit(self: *Instance) void {
+        if (self.memory) |m| self.gpa.free(m);
         self.arena.deinit();
         self.* = undefined;
     }
@@ -385,6 +422,11 @@ const Frame = struct {
                 },
                 .f64_const => {
                     try self.pushU64(instr.imm.f64);
+                    pc += 1;
+                },
+
+                .i32_load, .i64_load, .f32_load, .f64_load, .i32_load8_s, .i32_load8_u, .i32_load16_s, .i32_load16_u, .i64_load8_s, .i64_load8_u, .i64_load16_s, .i64_load16_u, .i64_load32_s, .i64_load32_u, .i32_store, .i64_store, .f32_store, .f64_store, .i32_store8, .i32_store16, .i64_store8, .i64_store16, .i64_store32, .memory_size, .memory_grow => {
+                    try self.execMemory(instr);
                     pc += 1;
                 },
 
@@ -634,7 +676,96 @@ const Frame = struct {
         const a = self.popI64();
         try self.pushI64(try applyInt(i64, u64, o, a, b));
     }
+
+    /// Load `T` from linear memory at (popped address + memarg offset), little-
+    /// endian. Signed `T` sign-extends, unsigned zero-extends when pushed.
+    fn load(self: *Frame, comptime T: type, ma: opcode.MemArg) Error!T {
+        const n = @sizeOf(T);
+        const base: u32 = @bitCast(self.popI32());
+        const mem = self.inst.memory orelse return error.NoMemory;
+        const ea = @as(u64, base) + ma.offset;
+        if (ea + n > mem.len) return error.MemoryOutOfBounds;
+        return std.mem.readInt(T, mem[@intCast(ea)..][0..n], .little);
+    }
+
+    /// Store `value: T` to linear memory at (popped address + memarg offset).
+    /// The caller has already popped the value; this pops the address.
+    fn store(self: *Frame, comptime T: type, ma: opcode.MemArg, value: T) Error!void {
+        const n = @sizeOf(T);
+        const base: u32 = @bitCast(self.popI32());
+        const mem = self.inst.memory orelse return error.NoMemory;
+        const ea = @as(u64, base) + ma.offset;
+        if (ea + n > mem.len) return error.MemoryOutOfBounds;
+        std.mem.writeInt(T, mem[@intCast(ea)..][0..n], value, .little);
+    }
+
+    fn memoryGrow(self: *Frame) Error!void {
+        const delta: u64 = @as(u32, @bitCast(self.popI32()));
+        const old = self.inst.memory orelse return error.NoMemory;
+        const old_pages: u64 = old.len / page_size;
+        const limit: u64 = self.inst.mem_max orelse 65536; // wasm32 hard cap
+        if (old_pages + delta > limit) return self.pushI32(-1);
+        const new_buf = self.inst.gpa.realloc(old, @intCast((old_pages + delta) * page_size)) catch
+            return self.pushI32(-1);
+        @memset(new_buf[old.len..], 0);
+        self.inst.memory = new_buf;
+        try self.pushI32(@intCast(old_pages));
+    }
+
+    fn execMemory(self: *Frame, instr: opcode.Instr) Error!void {
+        const ma = instr.imm.mem;
+        switch (instr.op) {
+            .i32_load => try self.pushI32(@bitCast(try self.load(u32, ma))),
+            .i64_load => try self.pushI64(@bitCast(try self.load(u64, ma))),
+            .f32_load => try self.pushU64(try self.load(u32, ma)),
+            .f64_load => try self.pushU64(try self.load(u64, ma)),
+            .i32_load8_s => try self.pushI32(try self.load(i8, ma)),
+            .i32_load8_u => try self.pushI32(try self.load(u8, ma)),
+            .i32_load16_s => try self.pushI32(try self.load(i16, ma)),
+            .i32_load16_u => try self.pushI32(try self.load(u16, ma)),
+            .i64_load8_s => try self.pushI64(try self.load(i8, ma)),
+            .i64_load8_u => try self.pushI64(try self.load(u8, ma)),
+            .i64_load16_s => try self.pushI64(try self.load(i16, ma)),
+            .i64_load16_u => try self.pushI64(try self.load(u16, ma)),
+            .i64_load32_s => try self.pushI64(try self.load(i32, ma)),
+            .i64_load32_u => try self.pushI64(try self.load(u32, ma)),
+
+            .i32_store => try self.store(i32, ma, self.popI32()),
+            .i64_store => try self.store(i64, ma, self.popI64()),
+            .f32_store => try self.store(u32, ma, @truncate(self.pop())),
+            .f64_store => try self.store(u64, ma, self.pop()),
+            .i32_store8 => try self.store(u8, ma, @truncate(@as(u32, @bitCast(self.popI32())))),
+            .i32_store16 => try self.store(u16, ma, @truncate(@as(u32, @bitCast(self.popI32())))),
+            .i64_store8 => try self.store(u8, ma, @truncate(@as(u64, @bitCast(self.popI64())))),
+            .i64_store16 => try self.store(u16, ma, @truncate(@as(u64, @bitCast(self.popI64())))),
+            .i64_store32 => try self.store(u32, ma, @truncate(@as(u64, @bitCast(self.popI64())))),
+
+            .memory_size => {
+                const mem = self.inst.memory orelse return error.NoMemory;
+                try self.pushI32(@intCast(mem.len / page_size));
+            },
+            .memory_grow => try self.memoryGrow(),
+            else => unreachable,
+        }
+    }
 };
+
+/// Evaluate a constant offset expression (data-segment offset): a single
+/// `i32.const` or `global.get`, then `end`.
+fn evalConstOffset(module: *const Module, globals: []const Value, expr: []const u8) Error!u32 {
+    _ = module;
+    var r = Reader.init(expr);
+    const val: i32 = switch (try r.readByte()) {
+        0x41 => try r.readVarI32(), // i32.const
+        0x23 => blk: { // global.get
+            const gi = try r.readVarU32();
+            if (gi >= globals.len) return error.UndefinedGlobal;
+            break :blk asI32(globals[gi]);
+        },
+        else => return error.UnsupportedInstruction,
+    };
+    return @bitCast(val);
+}
 
 /// Shared integer binary-op semantics for i32 (S=i32,U=u32) and i64.
 fn applyInt(comptime S: type, comptime U: type, comptime o: Frame.BinOp, a: S, b: S) Error!S {
@@ -893,4 +1024,39 @@ test "runs i32.trunc_f64_s and traps on NaN" {
     try std.testing.expectEqual(@as(i32, 3), asI32(r[0]));
 
     try std.testing.expectError(error.InvalidConversionToInt, inst.invoke("toi", &.{f64Value(std.math.nan(f64))}));
+}
+
+test "stores then loads through linear memory" {
+    // (memory 1) (func (param i32) (result i32) i32.const 0; local.get 0; i32.store;
+    //                                            i32.const 0; i32.load)
+    const bytes =
+        types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+        [_]u8{ 0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f } ++ // (i32)->(i32)
+        [_]u8{ 0x03, 0x02, 0x01, 0x00 } ++ // 1 func
+        [_]u8{ 0x05, 0x03, 0x01, 0x00, 0x01 } ++ // memory: min 1 page
+        [_]u8{ 0x07, 0x06, 0x01, 0x02, 'r', 't', 0x00, 0x00 } ++ // export "rt"
+        [_]u8{ 0x0a, 0x10, 0x01, 0x0e, 0x00, 0x41, 0x00, 0x20, 0x00, 0x36, 0x02, 0x00, 0x41, 0x00, 0x28, 0x02, 0x00, 0x0b };
+    var inst = try instantiate(&bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("rt", &.{i32Value(0x12345678)});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(u32, 0x12345678), @as(u32, @bitCast(asI32(r[0]))));
+}
+
+test "initializes memory from an active data segment" {
+    // (memory 1) (data (i32.const 0) "\ef\be\ad\de")   ; loads 0xDEADBEEF
+    // (func (result i32) i32.const 0; i32.load)
+    const bytes =
+        types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+        [_]u8{ 0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f } ++ // ()->(i32)
+        [_]u8{ 0x03, 0x02, 0x01, 0x00 } ++
+        [_]u8{ 0x05, 0x03, 0x01, 0x00, 0x01 } ++ // memory min 1
+        [_]u8{ 0x07, 0x07, 0x01, 0x03, 'g', 'e', 't', 0x00, 0x00 } ++
+        [_]u8{ 0x0a, 0x09, 0x01, 0x07, 0x00, 0x41, 0x00, 0x28, 0x02, 0x00, 0x0b } ++ // code
+        [_]u8{ 0x0b, 0x0a, 0x01, 0x00, 0x41, 0x00, 0x0b, 0x04, 0xef, 0xbe, 0xad, 0xde }; // data
+    var inst = try instantiate(&bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("get", &.{});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(u32, 0xDEADBEEF), @as(u32, @bitCast(asI32(r[0]))));
 }

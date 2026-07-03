@@ -68,6 +68,19 @@ pub const Export = struct {
     type: Extern,
 };
 
+/// A data segment (§5.5.14). Active segments initialize linear memory at an
+/// offset given by a constant expression; passive segments are copied
+/// explicitly by `memory.init` (bulk-memory, not run yet). `offset_expr` and
+/// `bytes` are arena-owned copies.
+pub const DataSegment = struct {
+    active: bool,
+    mem_index: u32,
+    /// Raw constant-expression bytes (including the terminating `end`); empty
+    /// for passive segments.
+    offset_expr: []const u8,
+    bytes: []const u8,
+};
+
 /// A run of consecutive locals of the same type, as encoded in a code entry
 /// (§5.4.5). The binary groups locals by type with a repeat count.
 pub const Local = struct { count: u32, type: types.ValType };
@@ -104,6 +117,11 @@ code: []const Code,
 /// The global index space (imported globals first, then defined), for
 /// resolving `global.get`/`global.set` during validation.
 globals: []const GlobalType,
+/// The memory index space (imported memories first, then defined). MVP allows
+/// at most one; kept as a slice for uniformity.
+memories: []const MemoryType,
+/// Data segments (data section), for initializing linear memory.
+data: []const DataSegment,
 
 pub const Error = types.DecodeError || std.mem.Allocator.Error;
 
@@ -137,6 +155,7 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
     var imports: []const Import = &.{};
     var exports: []const Export = &.{};
     var code: []const Code = &.{};
+    var data: []const DataSegment = &.{};
 
     while (!r.atEnd()) {
         const raw_id = try r.readByte();
@@ -157,6 +176,7 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
             .global => try decodeGlobalSection(&d, &sub),
             .@"export" => exports = try decodeExportSection(&d, &sub),
             .code => code = try decodeCodeSection(&d, &sub),
+            .data => data = try decodeDataSection(&d, &sub),
             else => {},
         }
     }
@@ -170,7 +190,9 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
         .imports = imports,
         .exports = exports,
         .code = code,
+        .data = data,
         .globals = try d.global_space.toOwnedSlice(a),
+        .memories = try d.mem_space.toOwnedSlice(a),
     };
 }
 
@@ -378,6 +400,40 @@ fn decodeLocals(a: std.mem.Allocator, r: *Reader) Error![]const Local {
         l.type = @enumFromInt(try r.readByte());
     }
     return locals;
+}
+
+/// Copy a length-prefixed byte vector into arena-owned memory.
+fn readByteVec(a: std.mem.Allocator, r: *Reader) Error![]const u8 {
+    const n = try r.readVarU32();
+    const src = try r.readBytes(n);
+    const dst = try a.alloc(u8, n);
+    @memcpy(dst, src);
+    return dst;
+}
+
+/// Capture the raw bytes of a constant expression (through its `end`) so it can
+/// be evaluated later (e.g. a data-segment offset).
+fn readConstExprBytes(a: std.mem.Allocator, r: *Reader) Error![]const u8 {
+    const start = r.pos;
+    try skipConstExpr(r);
+    const src = r.bytes[start..r.pos];
+    const dst = try a.alloc(u8, src.len);
+    @memcpy(dst, src);
+    return dst;
+}
+
+fn decodeDataSection(d: *Decoder, r: *Reader) Error![]const DataSegment {
+    const count = try r.readVarU32();
+    const list = try d.a.alloc(DataSegment, count);
+    for (list) |*seg| {
+        switch (try r.readVarU32()) { // segment flags (§5.5.14)
+            0 => seg.* = .{ .active = true, .mem_index = 0, .offset_expr = try readConstExprBytes(d.a, r), .bytes = try readByteVec(d.a, r) },
+            1 => seg.* = .{ .active = false, .mem_index = 0, .offset_expr = &.{}, .bytes = try readByteVec(d.a, r) },
+            2 => seg.* = .{ .active = true, .mem_index = try r.readVarU32(), .offset_expr = try readConstExprBytes(d.a, r), .bytes = try readByteVec(d.a, r) },
+            else => return error.UnsupportedOpcode,
+        }
+    }
+    return list;
 }
 
 fn decodeCodeSection(d: *Decoder, r: *Reader) Error![]const Code {

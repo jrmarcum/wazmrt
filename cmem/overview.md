@@ -63,5 +63,6 @@ wazmrt/
   `design-decisions.md` for why (smaller binary + no MSVC requirement on Windows).
 - **Decode + validate done; execution runs integers.** The pipeline decodes all core sections, decodes
   bodies to the `opcode.zig` IR, type-checks them (`validate.zig`), and a switch interpreter
-  (`interp.zig`) executes them — integer **and float** arithmetic, control flow, and `call` work
-  end-to-end today. Memory and `call_indirect` are the next execution slices (`roadmap.md`).
+  (`interp.zig`) executes them — integer/float arithmetic, control flow, `call`, and **linear memory**
+  all work end-to-end. The whole `module/wasm_mod` corpus runs to its `.test.json` values (via the CLI
+  run mode `wazmrt <file.wasm> <export> [args…]`). `call_indirect` + host imports are next (`roadmap.md`).

@@ -92,8 +92,10 @@ The 0.16 stdlib differs from older docs — verified against the installed stdli
 - CLI end-to-end: `wazmrt empty.wasm` → `valid wasm v1, 1 section(s)` / `custom (payload 1 bytes @ 0xa)`.
 - **Validation over real modules:** all 12 `wasm_mod` modules and every fully-decoding `wasm_wasi`
   module pass `validate.zig` (see `testing.md`).
-- **Execution (integer + float slices):** `interp.zig` runs `add`/`if-else`/nested-`call`/`br`,
-  `f64.add`, `i32.trunc_f64_s`, and traps on div-by-zero + NaN→int (7 unit tests). 26 unit tests total.
+- **Execution (integer + float + memory):** `interp.zig` runs `add`/`if-else`/`call`/`br`, `f64.add`,
+  `i32.trunc_f64_s`, memory store/load + data-segment init, and traps (div-by-zero, NaN→int) — 9 interp
+  unit tests. **On real corpus modules** (via CLI `wazmrt <file> <export> [args…]`): `fib(20)=6765`,
+  `fac(7)=5040`, `sieve(30)=10` (memory), `isLeapYear`/`isOdd` — all match their `.test.json`. 28 tests.
 - **C ABI end-to-end from C** (`tests/c_smoke.c`): built a static lib + compiled/linked the C client
   with `zig cc -target x86_64-windows-gnu -DLIBWASM_STATIC` (mingw libc, no MSVC), ran it →
   `validate(good): true`, `module_new: ok`, `validate(bad): false`, `abi_version: 1`, `version: 0.1.0`.

@@ -37,14 +37,16 @@ execution.
    handling (tag section id 13 + try/catch), then SIMD** — what `wasm_wasi` needs beyond core MVP.
 3. **Instantiation** — memories, tables, globals, imports/exports wiring; grow the C ABI to
    `wasm_instance_new` + `wasm_func_call`.
-4. **Execution** — **integer + float slices DONE 2026-07-02** (`interp.zig`): switch interpreter over
-   the IR (Option A), untyped `u64` slots, per-call label stack + precomputed branch targets. i32/i64
-   **and f32/f64** arithmetic/comparison/bitwise + all conversions (trapping float→int, IEEE
-   min/max/nearest, reinterpret), locals, globals, `drop`/`select`, structured control flow, direct
-   `call`, and traps — 7 unit tests. **Remaining execution slices:** (a) **memory** (instantiate linear
-   memory + data section + load/store/size/grow), (b) `call_indirect` + tables, (c) **host imports**
-   (needed for WASI). Then wire the conformance harness to `module/wasm_mod` + `.test.json` (load
-   `.wasm`, call export with `args`, compare `expected`). Keep the IR a clean seam so a register-machine
+4. **Execution** — **integer + float + memory slices DONE 2026-07-02** (`interp.zig`): switch
+   interpreter over the IR (Option A), untyped `u64` slots, per-call label stack + precomputed branch
+   targets. i32/i64 **and f32/f64** arithmetic/comparison/bitwise + all conversions, locals, globals,
+   `drop`/`select`, structured control flow, direct `call`, **linear memory** (min-page alloc + active
+   data-segment init, load/store all widths, `memory.size`/`grow`), and traps — 9 unit tests.
+   **VERIFIED end-to-end on real modules:** the CLI gained `wazmrt <file.wasm> <export> [args…]` and
+   runs the whole `module/wasm_mod` corpus to its `.test.json` values (`fib(20)=6765`, `fac(7)=5040`,
+   `isLeapYear`, `isOdd`, `sieve(30)=10` via memory). **Remaining execution slices:** (a) `call_indirect`
+   + tables, (b) **host imports** (needed for WASI). Then wire the automated `.test.json` conformance
+   harness for a full pass/fail sweep. Keep the IR a clean seam so a register-machine
    pass (Option B, wasmi) can be layered later if benchmarks demand it.
 5. **Grow the wasm-c-api implementation** as the runtime gains ability: `wasm_module_imports/exports`
    (once the import/export sections decode) → then instance/func/trap/call at instantiation+execution.
