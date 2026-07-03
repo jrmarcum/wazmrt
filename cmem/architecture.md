@@ -7,7 +7,7 @@ The standard wasm-runtime stages. Only the first is implemented today; each late
 
 ```text
 bytes ──► DECODE ──► VALIDATE ──► INSTANTIATE ──► EXECUTE
-          (done)     (done)       (next)          (next)
+          (done)     (done)       (partial)       (partial — integers)
 ```
 
 - **DECODE** (`Module.decode`) — validate the 8-byte header (`\0asm` magic + version 1), index the
@@ -27,7 +27,14 @@ bytes ──► DECODE ──► VALIDATE ──► INSTANTIATE ──► EXECUT
   Scope = core-MVP; memory presence + load/store alignment not yet enforced (documented leniency).
   **Verified:** all 12 `wasm_mod` modules validate; across `wasm_wasi`, every fully-decoding module
   validates (failures are only the `UnsupportedOpcode` decode boundary) — see `testing.md`.
-- **INSTANTIATE / EXECUTE** (next) — the switch interpreter over the IR (Option A).
+- **INSTANTIATE / EXECUTE** (`interp.zig`) — first slice done. `Instance.init` prepares each defined
+  function (decodes body → IR once, precomputes matching `end`/`else` for every `block`/`loop`/`if`).
+  `Instance.invoke(name, args)` runs the switch interpreter (Option A): untyped `u64` value slots, a
+  per-call label stack, a branch that carries block/loop arity and resets the stack. **Implemented:**
+  i32/i64 arithmetic/comparison/bitwise/integer-conversions, locals, globals (zero-init), `drop`,
+  `select`, structured control flow, direct `call`, and traps (`unreachable`, div-by-zero, overflow,
+  call-depth). **Deferred (trap `UnsupportedInstruction`):** floats, memory load/store, `call_indirect`,
+  host-import calls — the next execution slices.
 - **INSTANTIATE / EXECUTE** (later) — memories/tables/globals + an interpreter (the design space to
   mine from wasm3 / WAMR-fast-interp / wasmi; see `reference-projects.md`).
 

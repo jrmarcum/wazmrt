@@ -26,6 +26,7 @@ wazmrt/
 │   ├── Module.zig         # Decoded module: sections + resolved imports/exports + code (file-as-struct)
 │   ├── opcode.zig         # Shared opcode table (Op/Imm/Instr) + byte-code → IR decodeBody
 │   ├── validate.zig       # Spec type-checking validator over the IR (value + control-frame stacks)
+│   ├── interp.zig         # Instance + switch interpreter over the IR (u64 slots, label stack)
 │   ├── wasm_c_api.zig     # Implements the standard wasm-c-api (smp_allocator, no libc)
 │   └── wasm_entry.zig     # Freestanding wasm32 export surface (wasm_allocator)
 ├── tests/
@@ -60,6 +61,7 @@ wazmrt/
 - **Libc-free core.** `root.zig` and its deps pull in no libc, so the same code targets native *and*
   `wasm32-freestanding`. The C-ABI lib uses `std.heap.smp_allocator` (not `c_allocator`). See
   `design-decisions.md` for why (smaller binary + no MSVC requirement on Windows).
-- **Decode + validate complete; execution pending.** The pipeline decodes all core sections (resolving
-  import/export extern types, capturing function bodies), decodes bodies to the `opcode.zig` IR, and
-  type-checks them (`validate.zig`). Instantiation + the switch interpreter are next (`roadmap.md`).
+- **Decode + validate done; execution runs integers.** The pipeline decodes all core sections, decodes
+  bodies to the `opcode.zig` IR, type-checks them (`validate.zig`), and a switch interpreter
+  (`interp.zig`) executes them — integer arithmetic, control flow, and `call` work end-to-end today.
+  Floats, memory, and `call_indirect` are the next execution slices (`roadmap.md`).

@@ -187,6 +187,32 @@ pub fn section(self: Module, id: types.SectionId) ?Section {
     return null;
 }
 
+/// Number of imported functions (they occupy the low function indices).
+pub fn importedFuncCount(self: Module) u32 {
+    var n: u32 = 0;
+    for (self.imports) |imp| {
+        if (imp.type == .func) n += 1;
+    }
+    return n;
+}
+
+/// Resolve a function index (imports first, then defined) to its signature,
+/// or null if out of range.
+pub fn funcType(self: Module, index: u32) ?FuncType {
+    var i: u32 = 0;
+    for (self.imports) |imp| {
+        if (imp.type == .func) {
+            if (i == index) return imp.type.func;
+            i += 1;
+        }
+    }
+    const defined = index - i;
+    if (defined >= self.functions.len) return null;
+    const ti = self.functions[defined];
+    if (ti >= self.func_types.len) return null;
+    return self.func_types[ti];
+}
+
 // --- Low-level readers -----------------------------------------------------
 
 fn readValTypes(a: std.mem.Allocator, r: *Reader) Error![]const types.ValType {
