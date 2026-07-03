@@ -36,6 +36,18 @@ pub fn i64Value(x: i64) Value {
 pub fn asI64(v: Value) i64 {
     return @bitCast(v);
 }
+pub fn f32Value(x: f32) Value {
+    return @as(u32, @bitCast(x));
+}
+pub fn asF32(v: Value) f32 {
+    return @bitCast(@as(u32, @truncate(v)));
+}
+pub fn f64Value(x: f64) Value {
+    return @bitCast(x);
+}
+pub fn asF64(v: Value) f64 {
+    return @bitCast(v);
+}
 
 pub const Error = Module.Error || error{
     /// `unreachable` executed.
@@ -56,9 +68,11 @@ pub const Error = Module.Error || error{
     UndefinedFunc,
     /// Calling an imported (host) function — not yet supported.
     UnsupportedImportCall,
-    /// An opcode this interpreter slice does not execute yet (floats, memory,
+    /// An opcode this interpreter slice does not execute yet (memory,
     /// call_indirect).
     UnsupportedInstruction,
+    /// A float→int truncation of NaN, infinity, or an out-of-range value.
+    InvalidConversionToInt,
 };
 
 const max_call_depth = 1024;
@@ -232,6 +246,18 @@ const Frame = struct {
     fn popI64(self: *Frame) i64 {
         return asI64(self.pop());
     }
+    fn pushF32(self: *Frame, v: f32) Error!void {
+        try self.pushU64(f32Value(v));
+    }
+    fn popF32(self: *Frame) f32 {
+        return asF32(self.pop());
+    }
+    fn pushF64(self: *Frame, v: f64) Error!void {
+        try self.pushU64(f64Value(v));
+    }
+    fn popF64(self: *Frame) f64 {
+        return asF64(self.pop());
+    }
 
     fn branch(self: *Frame, n: u32) usize {
         const label = self.labels.items[self.labels.items.len - 1 - n];
@@ -353,6 +379,14 @@ const Frame = struct {
                     try self.pushI64(instr.imm.i64);
                     pc += 1;
                 },
+                .f32_const => {
+                    try self.pushU64(instr.imm.f32);
+                    pc += 1;
+                },
+                .f64_const => {
+                    try self.pushU64(instr.imm.f64);
+                    pc += 1;
+                },
 
                 else => {
                     try self.execNumeric(instr.op);
@@ -439,10 +473,112 @@ const Frame = struct {
             .i64_extend_i32_s => try self.pushI64(self.popI32()),
             .i64_extend_i32_u => try self.pushI64(@as(u32, @bitCast(self.popI32()))),
 
-            // Everything else (floats, memory, conversions to/from float,
-            // call_indirect, reference types) is a later slice.
-            else => return error.UnsupportedInstruction,
+            else => return self.execFloat(op),
         }
+    }
+
+    /// Float arithmetic / comparison / conversion opcodes (IEEE 754). Memory,
+    /// `call_indirect`, and reference-type ops remain a later slice.
+    fn execFloat(self: *Frame, op: Op) Error!void {
+        switch (op) {
+            // f32 comparison (result i32)
+            .f32_eq => try self.cmpF32(.eq),
+            .f32_ne => try self.cmpF32(.ne),
+            .f32_lt => try self.cmpF32(.lt),
+            .f32_gt => try self.cmpF32(.gt),
+            .f32_le => try self.cmpF32(.le),
+            .f32_ge => try self.cmpF32(.ge),
+            // f64 comparison (result i32)
+            .f64_eq => try self.cmpF64(.eq),
+            .f64_ne => try self.cmpF64(.ne),
+            .f64_lt => try self.cmpF64(.lt),
+            .f64_gt => try self.cmpF64(.gt),
+            .f64_le => try self.cmpF64(.le),
+            .f64_ge => try self.cmpF64(.ge),
+
+            // f32 unary
+            .f32_abs => try self.pushF32(@abs(self.popF32())),
+            .f32_neg => try self.pushF32(-self.popF32()),
+            .f32_ceil => try self.pushF32(@ceil(self.popF32())),
+            .f32_floor => try self.pushF32(@floor(self.popF32())),
+            .f32_trunc => try self.pushF32(@trunc(self.popF32())),
+            .f32_nearest => try self.pushF32(rintEven(f32, self.popF32())),
+            .f32_sqrt => try self.pushF32(@sqrt(self.popF32())),
+            // f64 unary
+            .f64_abs => try self.pushF64(@abs(self.popF64())),
+            .f64_neg => try self.pushF64(-self.popF64()),
+            .f64_ceil => try self.pushF64(@ceil(self.popF64())),
+            .f64_floor => try self.pushF64(@floor(self.popF64())),
+            .f64_trunc => try self.pushF64(@trunc(self.popF64())),
+            .f64_nearest => try self.pushF64(rintEven(f64, self.popF64())),
+            .f64_sqrt => try self.pushF64(@sqrt(self.popF64())),
+
+            // f32 binary
+            .f32_add => try self.binF32(.add),
+            .f32_sub => try self.binF32(.sub),
+            .f32_mul => try self.binF32(.mul),
+            .f32_div => try self.binF32(.div),
+            .f32_min => try self.binF32(.min),
+            .f32_max => try self.binF32(.max),
+            .f32_copysign => try self.binF32(.copysign),
+            // f64 binary
+            .f64_add => try self.binF64(.add),
+            .f64_sub => try self.binF64(.sub),
+            .f64_mul => try self.binF64(.mul),
+            .f64_div => try self.binF64(.div),
+            .f64_min => try self.binF64(.min),
+            .f64_max => try self.binF64(.max),
+            .f64_copysign => try self.binF64(.copysign),
+
+            // Float → int (trapping)
+            .i32_trunc_f32_s => try self.pushI32(try truncFloatS(i32, f32, self.popF32())),
+            .i32_trunc_f32_u => try self.pushI32(@bitCast(try truncFloatU(u32, f32, self.popF32()))),
+            .i32_trunc_f64_s => try self.pushI32(try truncFloatS(i32, f64, self.popF64())),
+            .i32_trunc_f64_u => try self.pushI32(@bitCast(try truncFloatU(u32, f64, self.popF64()))),
+            .i64_trunc_f32_s => try self.pushI64(try truncFloatS(i64, f32, self.popF32())),
+            .i64_trunc_f32_u => try self.pushI64(@bitCast(try truncFloatU(u64, f32, self.popF32()))),
+            .i64_trunc_f64_s => try self.pushI64(try truncFloatS(i64, f64, self.popF64())),
+            .i64_trunc_f64_u => try self.pushI64(@bitCast(try truncFloatU(u64, f64, self.popF64()))),
+
+            // Int → float
+            .f32_convert_i32_s => try self.pushF32(@floatFromInt(self.popI32())),
+            .f32_convert_i32_u => try self.pushF32(@floatFromInt(@as(u32, @bitCast(self.popI32())))),
+            .f32_convert_i64_s => try self.pushF32(@floatFromInt(self.popI64())),
+            .f32_convert_i64_u => try self.pushF32(@floatFromInt(@as(u64, @bitCast(self.popI64())))),
+            .f32_demote_f64 => try self.pushF32(@floatCast(self.popF64())),
+            .f64_convert_i32_s => try self.pushF64(@floatFromInt(self.popI32())),
+            .f64_convert_i32_u => try self.pushF64(@floatFromInt(@as(u32, @bitCast(self.popI32())))),
+            .f64_convert_i64_s => try self.pushF64(@floatFromInt(self.popI64())),
+            .f64_convert_i64_u => try self.pushF64(@floatFromInt(@as(u64, @bitCast(self.popI64())))),
+            .f64_promote_f32 => try self.pushF64(@floatCast(self.popF32())),
+
+            // Reinterpret: the u64 slot already holds the bit pattern, so these
+            // are identity on the stack value.
+            .i32_reinterpret_f32, .f32_reinterpret_i32, .i64_reinterpret_f64, .f64_reinterpret_i64 => {},
+
+            else => return error.UnsupportedInstruction, // memory, call_indirect, ref-types
+        }
+    }
+
+    fn cmpF32(self: *Frame, comptime c: FCmp) Error!void {
+        const b = self.popF32();
+        const a = self.popF32();
+        try self.pushI32(@intFromBool(fcmp(f32, c, a, b)));
+    }
+    fn cmpF64(self: *Frame, comptime c: FCmp) Error!void {
+        const b = self.popF64();
+        const a = self.popF64();
+        try self.pushI32(@intFromBool(fcmp(f64, c, a, b)));
+    }
+    fn binF32(self: *Frame, comptime o: FBin) Error!void {
+        const b = self.popF32();
+        const a = self.popF32();
+        try self.pushF32(fbin(f32, o, a, b));
+    }
+    fn binF64(self: *Frame, comptime o: FBin) Error!void {
+        const b = self.popF64();
+        const a = self.popF64();
+        try self.pushF64(fbin(f64, o, a, b));
     }
 
     const CmpOp = enum { eq, ne, lt_s, lt_u, gt_s, gt_u, le_s, le_u, ge_s, ge_u };
@@ -537,6 +673,85 @@ fn applyInt(comptime S: type, comptime U: type, comptime o: Frame.BinOp, a: S, b
         .rotl => @bitCast(std.math.rotl(U, ua, @mod(ub, bits))),
         .rotr => @bitCast(std.math.rotr(U, ua, @mod(ub, bits))),
     };
+}
+
+const FCmp = enum { eq, ne, lt, gt, le, ge };
+const FBin = enum { add, sub, mul, div, min, max, copysign };
+
+fn fcmp(comptime F: type, comptime c: FCmp, a: F, b: F) bool {
+    return switch (c) {
+        .eq => a == b,
+        .ne => a != b,
+        .lt => a < b,
+        .gt => a > b,
+        .le => a <= b,
+        .ge => a >= b,
+    };
+}
+
+fn fbin(comptime F: type, comptime o: FBin, a: F, b: F) F {
+    return switch (o) {
+        .add => a + b,
+        .sub => a - b,
+        .mul => a * b,
+        .div => a / b,
+        .min => fmin(F, a, b),
+        .max => fmax(F, a, b),
+        .copysign => std.math.copysign(a, b),
+    };
+}
+
+/// wasm `fmin`: NaN-propagating, and `min(+0,-0) == -0` (via sign-bit OR).
+fn fmin(comptime F: type, a: F, b: F) F {
+    if (std.math.isNan(a) or std.math.isNan(b)) return std.math.nan(F);
+    if (a < b) return a;
+    if (b < a) return b;
+    const U = std.meta.Int(.unsigned, @typeInfo(F).float.bits);
+    return @bitCast(@as(U, @bitCast(a)) | @as(U, @bitCast(b)));
+}
+
+/// wasm `fmax`: NaN-propagating, and `max(+0,-0) == +0` (via sign-bit AND).
+fn fmax(comptime F: type, a: F, b: F) F {
+    if (std.math.isNan(a) or std.math.isNan(b)) return std.math.nan(F);
+    if (a > b) return a;
+    if (b > a) return b;
+    const U = std.meta.Int(.unsigned, @typeInfo(F).float.bits);
+    return @bitCast(@as(U, @bitCast(a)) & @as(U, @bitCast(b)));
+}
+
+/// Round to nearest, ties to even (wasm `nearest`), preserving the sign of zero.
+fn rintEven(comptime F: type, x: F) F {
+    if (!std.math.isFinite(x)) return x;
+    const f = @floor(x);
+    const diff = x - f;
+    var r: F = f;
+    if (diff > 0.5) {
+        r = f + 1;
+    } else if (diff == 0.5) {
+        r = if (@rem(f, 2.0) == 0) f else f + 1;
+    }
+    if (r == 0) return std.math.copysign(@as(F, 0.0), x);
+    return r;
+}
+
+/// Trapping signed float→int truncation.
+fn truncFloatS(comptime I: type, comptime F: type, x: F) Error!I {
+    if (std.math.isNan(x)) return error.InvalidConversionToInt;
+    const t = @trunc(x);
+    const bits = @typeInfo(I).int.bits;
+    const hi: F = std.math.ldexp(@as(F, 1.0), bits - 1); // 2^(bits-1)
+    if (t < -hi or t >= hi) return error.InvalidConversionToInt;
+    return @intFromFloat(t);
+}
+
+/// Trapping unsigned float→int truncation.
+fn truncFloatU(comptime U: type, comptime F: type, x: F) Error!U {
+    if (std.math.isNan(x)) return error.InvalidConversionToInt;
+    const t = @trunc(x);
+    const bits = @typeInfo(U).int.bits;
+    const hi: F = std.math.ldexp(@as(F, 1.0), bits); // 2^bits
+    if (t < 0 or t >= hi) return error.InvalidConversionToInt;
+    return @intFromFloat(t);
 }
 
 // --- Tests -----------------------------------------------------------------
@@ -645,4 +860,37 @@ test "traps on division by zero" {
     var inst = try instantiate(&bytes);
     defer destroy(&inst);
     try std.testing.expectError(error.DivByZero, inst.invoke("div", &.{ i32Value(1), i32Value(0) }));
+}
+
+test "runs f64.add" {
+    // (func (param f64 f64) (result f64) local.get0 local.get1 f64.add)
+    const bytes =
+        types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+        [_]u8{ 0x01, 0x07, 0x01, 0x60, 0x02, 0x7c, 0x7c, 0x01, 0x7c } ++
+        [_]u8{ 0x03, 0x02, 0x01, 0x00 } ++
+        [_]u8{ 0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0xa0, 0x0b } ++
+        [_]u8{ 0x07, 0x08, 0x01, 0x04, 'f', 'a', 'd', 'd', 0x00, 0x00 };
+    var inst = try instantiate(&bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("fadd", &.{ f64Value(1.5), f64Value(2.25) });
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(f64, 3.75), asF64(r[0]));
+}
+
+test "runs i32.trunc_f64_s and traps on NaN" {
+    // (func (param f64) (result i32) local.get0 i32.trunc_f64_s)
+    const bytes =
+        types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+        [_]u8{ 0x01, 0x06, 0x01, 0x60, 0x01, 0x7c, 0x01, 0x7f } ++
+        [_]u8{ 0x03, 0x02, 0x01, 0x00 } ++
+        [_]u8{ 0x0a, 0x07, 0x01, 0x05, 0x00, 0x20, 0x00, 0xaa, 0x0b } ++
+        [_]u8{ 0x07, 0x07, 0x01, 0x03, 't', 'o', 'i', 0x00, 0x00 };
+    var inst = try instantiate(&bytes);
+    defer destroy(&inst);
+
+    const r = try inst.invoke("toi", &.{f64Value(3.7)});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(i32, 3), asI32(r[0]));
+
+    try std.testing.expectError(error.InvalidConversionToInt, inst.invoke("toi", &.{f64Value(std.math.nan(f64))}));
 }

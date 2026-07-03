@@ -37,15 +37,15 @@ execution.
    handling (tag section id 13 + try/catch), then SIMD** — what `wasm_wasi` needs beyond core MVP.
 3. **Instantiation** — memories, tables, globals, imports/exports wiring; grow the C ABI to
    `wasm_instance_new` + `wasm_func_call`.
-4. **Execution** — first slice **DONE 2026-07-02** (`interp.zig`): switch interpreter over the IR
-   (Option A), untyped `u64` slots, per-call label stack + precomputed branch targets. Integer core
-   (i32/i64 arithmetic/comparison/bitwise/conversions), locals, globals, `drop`/`select`, structured
-   control flow, direct `call`, and traps — 5 unit tests (add, if/else, nested call, br, div-by-zero).
-   **Remaining execution slices:** (a) **floats** (f32/f64 + float conversions/reinterpret),
-   (b) **memory** (instantiate linear memory + data section + load/store/size/grow), (c) `call_indirect`
-   + tables, (d) **host imports** (needed for WASI). Then wire the conformance harness to the module
-   corpus + `.test.json` (load `.wasm`, call export with `args`, compare `expected`). Keep the IR a
-   clean seam so a register-machine pass (Option B, wasmi) can be layered later if benchmarks demand it.
+4. **Execution** — **integer + float slices DONE 2026-07-02** (`interp.zig`): switch interpreter over
+   the IR (Option A), untyped `u64` slots, per-call label stack + precomputed branch targets. i32/i64
+   **and f32/f64** arithmetic/comparison/bitwise + all conversions (trapping float→int, IEEE
+   min/max/nearest, reinterpret), locals, globals, `drop`/`select`, structured control flow, direct
+   `call`, and traps — 7 unit tests. **Remaining execution slices:** (a) **memory** (instantiate linear
+   memory + data section + load/store/size/grow), (b) `call_indirect` + tables, (c) **host imports**
+   (needed for WASI). Then wire the conformance harness to `module/wasm_mod` + `.test.json` (load
+   `.wasm`, call export with `args`, compare `expected`). Keep the IR a clean seam so a register-machine
+   pass (Option B, wasmi) can be layered later if benchmarks demand it.
 5. **Grow the wasm-c-api implementation** as the runtime gains ability: `wasm_module_imports/exports`
    (once the import/export sections decode) → then instance/func/trap/call at instantiation+execution.
    The standard signatures are already declared in the vendored `wasm.h`; we just implement more of

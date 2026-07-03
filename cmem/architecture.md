@@ -31,9 +31,10 @@ bytes ──► DECODE ──► VALIDATE ──► INSTANTIATE ──► EXECUT
   function (decodes body → IR once, precomputes matching `end`/`else` for every `block`/`loop`/`if`).
   `Instance.invoke(name, args)` runs the switch interpreter (Option A): untyped `u64` value slots, a
   per-call label stack, a branch that carries block/loop arity and resets the stack. **Implemented:**
-  i32/i64 arithmetic/comparison/bitwise/integer-conversions, locals, globals (zero-init), `drop`,
-  `select`, structured control flow, direct `call`, and traps (`unreachable`, div-by-zero, overflow,
-  call-depth). **Deferred (trap `UnsupportedInstruction`):** floats, memory load/store, `call_indirect`,
+  i32/i64 **and f32/f64** arithmetic/comparison/bitwise, all conversions (incl. trapping float→int,
+  IEEE `min`/`max`/`nearest`, reinterpret), locals, globals (zero-init), `drop`, `select`, structured
+  control flow, direct `call`, and traps (`unreachable`, div-by-zero, overflow, call-depth,
+  invalid-float→int). **Deferred (trap `UnsupportedInstruction`):** memory load/store, `call_indirect`,
   host-import calls — the next execution slices.
 - **INSTANTIATE / EXECUTE** (later) — memories/tables/globals + an interpreter (the design space to
   mine from wasm3 / WAMR-fast-interp / wasmi; see `reference-projects.md`).

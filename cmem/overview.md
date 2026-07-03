@@ -63,5 +63,5 @@ wazmrt/
   `design-decisions.md` for why (smaller binary + no MSVC requirement on Windows).
 - **Decode + validate done; execution runs integers.** The pipeline decodes all core sections, decodes
   bodies to the `opcode.zig` IR, type-checks them (`validate.zig`), and a switch interpreter
-  (`interp.zig`) executes them — integer arithmetic, control flow, and `call` work end-to-end today.
-  Floats, memory, and `call_indirect` are the next execution slices (`roadmap.md`).
+  (`interp.zig`) executes them — integer **and float** arithmetic, control flow, and `call` work
+  end-to-end today. Memory and `call_indirect` are the next execution slices (`roadmap.md`).
