@@ -33,14 +33,18 @@ execution.
    / `0xFC` / `0xFD` / multi-byte block-types → `UnsupportedOpcode`; 4 tests). **Remaining:** the
    type-checking validator over the IR — function/code count match (deferred from decode), index bounds
    (local/global/func/type/label), structured control-flow + operand-stack typing (the meaty part;
-   study wasmi/wain/wazero validator structure). Then expand the opcode set (ref-types, `0xFC`
-   bulk-memory, eventually SIMD).
+   study wasmi/wain/wazero validator structure). **Opcode-expansion priority (from real corpus data,
+   see `testing.md`): `0xFC` bulk-memory first, then exception handling (tag section id 13 +
+   try/catch), then SIMD** — this is what `wasm_wasi` needs beyond core MVP.
 3. **Instantiation** — memories, tables, globals, imports/exports wiring; grow the C ABI to
    `wasm_instance_new` + `wasm_func_call`.
 4. **Execution** — `while … switch(op)` interpreter over the `Instr` IR (Option A), untyped `u64`
-   value-stack slots; call/locals/globals/memory. The key perf/size battleground: keep the IR a clean
-   seam so a register-machine pass (Option B, wasmi) can be layered later if benchmarks demand it.
-   First real Adoption Checklist + Component Ledger decisions likely happen here.
+   value-stack slots; call/locals/globals/memory. **First target: the `wasm_mod` corpus + its
+   `.test.json` expected-output files** (all 12 decode 100% today — see `testing.md`); the conformance
+   harness loads each `.wasm`, calls the named export with `args`, compares to `expected`. The key
+   perf/size battleground: keep the IR a clean seam so a register-machine pass (Option B, wasmi) can be
+   layered later if benchmarks demand it. First real Adoption Checklist + Component Ledger decisions
+   likely happen here.
 5. **Grow the wasm-c-api implementation** as the runtime gains ability: `wasm_module_imports/exports`
    (once the import/export sections decode) → then instance/func/trap/call at instantiation+execution.
    The standard signatures are already declared in the vendored `wasm.h`; we just implement more of

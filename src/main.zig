@@ -53,4 +53,18 @@ pub fn main(init: std.process.Init) !void {
     for (module.exports) |e| {
         try out.print("  export {s} : {s} #{d}\n", .{ e.name, @tagName(e.type.kind()), e.index });
     }
+
+    // Decode each function body into the instruction IR (opcode.decodeBody).
+    var ok: usize = 0;
+    for (module.code, 0..) |c, i| {
+        const instrs = wazmrt.opcode.decodeBody(arena, c.body) catch |e| {
+            try out.print("  fn[{d}]: body decode FAILED — {s}\n", .{ i, @errorName(e) });
+            continue;
+        };
+        ok += 1;
+        try out.print("  fn[{d}]: {d} instr, {d} locals\n", .{ i, instrs.len, c.localCount() });
+    }
+    if (module.code.len != 0) {
+        try out.print("  bodies decoded: {d}/{d}\n", .{ ok, module.code.len });
+    }
 }

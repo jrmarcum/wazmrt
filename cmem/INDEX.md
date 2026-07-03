@@ -47,8 +47,9 @@ a project is free; "copying/porting from" it always requires the ledger entry.
 | [architecture.md](architecture.md) | The decode → validate → instantiate → execute pipeline; module layout; the libc-free core; C ABI + freestanding-wasm build targets |
 | [licensing.md](licensing.md) | **License = `MIT OR Apache-2.0`** (dual, ecosystem-standard; chosen 2026-07-02). Why dual, one-way compatibility with the Apache reference projects, and the compliance workflow. Ledger lives in `third_party/LICENSES.md` |
 | [reference-projects.md](reference-projects.md) | The 9 candidate runtimes, their verified licenses, and per-project evaluation status (Evaluating until adopted) |
-| [design-decisions.md](design-decisions.md) | Load-bearing invariants that must not be silently reverted — libc-free core (`smp_allocator`), opaque C handles + stable ABI, zero-copy decode, Zig-0.16 API notes, and Windows build gotchas |
-| [roadmap.md](roadmap.md) | Current status (licensing baseline + first vertical slice done, 2026-07-02) and the next increments |
+| [design-decisions.md](design-decisions.md) | Load-bearing invariants that must not be silently reverted — libc-free core (`smp_allocator`), opaque C handles + stable ABI, arena-owned decode, **interpreter architecture = Option A** (switch over a pre-decoded IR), Zig-0.16 API notes, and Windows build gotchas |
+| [testing.md](testing.md) | Unit tests + the external conformance corpora: **`wasm_mod`** (module functions + `.test.json` expected outputs — the first execution target) and **`wasm_wasi`** (WASI programs). Decode-coverage snapshot + the opcode-expansion priorities it implies |
+| [roadmap.md](roadmap.md) | Current status and the next increments (decode done incl. code section; validator in progress) |
 
 ## Related files outside cmem
 
