@@ -28,6 +28,7 @@ wazmrt/
 │   ├── validate.zig       # Spec type-checking validator over the IR (value + control-frame stacks)
 │   ├── interp.zig         # Instance + switch interpreter over the IR (u64 slots, label stack)
 │   ├── sexpr.zig          # S-expression lexer/parser for .wat/.wast (text toolchain front-end)
+│   ├── wat.zig            # WAT text → wasm binary assembler (reuses opcode.zig in reverse)
 │   ├── wasm_c_api.zig     # Implements the standard wasm-c-api (smp_allocator, no libc)
 │   └── wasm_entry.zig     # Freestanding wasm32 export surface (wasm_allocator)
 ├── tests/
