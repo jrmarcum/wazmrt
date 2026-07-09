@@ -96,10 +96,9 @@ pub const Error = Module.Error || error{
     UndefinedType,
 };
 
-/// Uninitialized funcref table entry.
-const null_func: u32 = std.math.maxInt(u32);
-/// Null reference sentinel on the value stack (`ref.null`), distinct from any
-/// real function index or host externref payload.
+/// Null reference sentinel — on the value stack (`ref.null`) and as an
+/// uninitialized table entry, distinct from any real function index or host
+/// externref payload.
 const null_ref: Value = std.math.maxInt(u64);
 
 fn funcTypeEqual(x: Module.FuncType, y: Module.FuncType) bool {
@@ -141,9 +140,9 @@ pub const Instance = struct {
     memory: ?[]u8,
     /// Maximum memory size in pages, if bounded.
     mem_max: ?u32,
-    /// Funcref tables, one per module table (entries are function indices;
-    /// `null_func` = uninitialized). Each is `gpa`-allocated; the outer slice too.
-    tables: []const []u32,
+    /// Reference tables, one per module table, as `Value` slots (`null_ref` =
+    /// uninitialized). Each is `gpa`-allocated; the outer slice too.
+    tables: []const []Value,
 
     /// Host-supplied values for a module's imports. Today only imported globals
     /// are backed (in module-import order); imported functions/tables/memories
@@ -210,12 +209,15 @@ pub const Instance = struct {
         }
 
         // Tables: allocate each declared table's minimum, then apply active
-        // element segments to their target table.
-        const tables = try gpa.alloc([]u32, module.tables.len);
+        // element segments to their target table. Entries are `Value` slots
+        // (`null_ref` = uninitialized; a funcref is its function index; an
+        // externref is its host value) so funcref *and* externref tables share one
+        // representation.
+        const tables = try gpa.alloc([]Value, module.tables.len);
         errdefer gpa.free(tables);
         for (tables, module.tables) |*t, tt| {
-            t.* = try gpa.alloc(u32, tt.limits.min);
-            @memset(t.*, null_func);
+            t.* = try gpa.alloc(Value, tt.limits.min);
+            @memset(t.*, null_ref);
         }
         for (module.elements) |elem| {
             if (!elem.active) continue;
@@ -224,7 +226,7 @@ pub const Instance = struct {
             const offset = try evalConstOffset(module, globals, elem.offset_expr);
             for (elem.funcs, 0..) |f, k| {
                 if (@as(u64, offset) + k >= tbl.len) return error.TableOutOfBounds;
-                tbl[offset + k] = f;
+                tbl[offset + k] = @as(Value, f);
             }
         }
 
@@ -470,8 +472,8 @@ const Frame = struct {
                     const table = self.inst.tables[ci.table];
                     const slot = @as(u32, @bitCast(self.popI32())); // table element index (top of stack)
                     if (slot >= table.len) return error.TableOutOfBounds;
-                    const f = table[slot];
-                    if (f == null_func) return error.UninitializedElement;
+                    if (table[slot] == null_ref) return error.UninitializedElement;
+                    const f: u32 = @intCast(table[slot]); // funcref value = function index
                     if (ci.type_index >= self.inst.module.func_types.len) return error.UndefinedType;
                     const ft = self.inst.module.funcType(f) orelse return error.UndefinedFunc;
                     if (!funcTypeEqual(self.inst.module.func_types[ci.type_index], ft)) return error.IndirectTypeMismatch;
@@ -480,6 +482,23 @@ const Frame = struct {
                     const results = try self.inst.callFunction(self.a, f, args, self.depth + 1);
                     self.vstack.shrinkRetainingCapacity(self.vstack.items.len - np);
                     for (results) |r| try self.pushU64(r);
+                    pc += 1;
+                },
+
+                // --- Table access ---
+                .table_get => {
+                    const t = self.inst.tables[instr.imm.table];
+                    const i = @as(u32, @bitCast(self.popI32()));
+                    if (i >= t.len) return error.TableOutOfBounds;
+                    try self.pushU64(t[i]);
+                    pc += 1;
+                },
+                .table_set => {
+                    const t = self.inst.tables[instr.imm.table];
+                    const v = self.pop();
+                    const i = @as(u32, @bitCast(self.popI32()));
+                    if (i >= t.len) return error.TableOutOfBounds;
+                    t[i] = v;
                     pc += 1;
                 },
 

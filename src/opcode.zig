@@ -54,6 +54,10 @@ pub const Op = enum(u8) {
     global_get = 0x23,
     global_set = 0x24,
 
+    // Table access
+    table_get = 0x25, // immediate: table index
+    table_set = 0x26,
+
     // Memory
     i32_load = 0x28,
     i64_load = 0x29,
@@ -253,6 +257,7 @@ pub const Imm = union(enum) {
     call_indirect: CallIndirect,
     local: u32,
     global: u32,
+    table: u32,
     mem: MemArg,
     /// Reserved byte of `memory.size` / `memory.grow` (the memory index, 0).
     mem_reserved: u8,
@@ -278,6 +283,7 @@ const ImmKind = enum {
     call_indirect,
     local,
     global,
+    table,
     mem,
     mem_reserved,
     i32c,
@@ -300,6 +306,7 @@ pub fn immediateKind(op: Op) ImmKind {
         0x11 => .call_indirect,
         0x20, 0x21, 0x22 => .local,
         0x23, 0x24 => .global,
+        0x25, 0x26 => .table, // table.get / table.set
         0x28...0x3e => .mem,
         0x3f, 0x40 => .mem_reserved,
         0x41 => .i32c,
@@ -361,6 +368,7 @@ pub fn decodeBody(a: std.mem.Allocator, body: []const u8) (DecodeError || std.me
             },
             .local => .{ .local = try r.readVarU32() },
             .global => .{ .global = try r.readVarU32() },
+            .table => .{ .table = try r.readVarU32() },
             .mem => blk: {
                 const al = try r.readVarU32();
                 const of = try r.readVarU32();

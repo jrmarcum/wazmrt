@@ -32,6 +32,7 @@ pub const Error = Module.Error || error{
     ImmutableGlobal,
     UndefinedFunc,
     UndefinedType,
+    UndefinedTable,
 };
 
 /// Validate an entire module. Returns on the first error.
@@ -162,6 +163,10 @@ const FuncValidator = struct {
         if (i >= self.module.globals.len) return error.UndefinedGlobal;
         return self.module.globals[i];
     }
+    fn tableElemType(self: *FuncValidator, i: u32) Error!V {
+        if (i >= self.module.tables.len) return error.UndefinedTable;
+        return self.module.tables[i].element;
+    }
 
     const Sig = struct { pop: []const V, push: []const V };
 
@@ -268,6 +273,17 @@ const FuncValidator = struct {
                     },
                 };
                 try self.pushVal(rt);
+            },
+
+            .table_get => {
+                const et = try self.tableElemType(instr.imm.table);
+                _ = try self.popExpect(.i32);
+                try self.pushValT(et);
+            },
+            .table_set => {
+                const et = try self.tableElemType(instr.imm.table);
+                _ = try self.popExpect(et);
+                _ = try self.popExpect(.i32);
             },
 
             .ref_null => try self.pushValT(instr.imm.ref_type),

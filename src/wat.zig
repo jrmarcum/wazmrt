@@ -55,7 +55,7 @@ const ExportDef = struct { name: []const u8, kind: u8, index: u32 };
 const DataSeg = struct { offset: i64, bytes: []const u8 };
 /// A function type (for the type section): params → results.
 const Sig = struct { params: []const V, results: []const V };
-const TableDef = struct { min: u32, max: ?u32 };
+const TableDef = struct { min: u32, max: ?u32, elem: V = .funcref };
 /// An active element segment; `funcs` are unresolved func references.
 const ElemDef = struct { table_index: u32, offset: i64, funcs: []const Sexpr };
 /// A defined global: its value type, mutability, and (unencoded) init const-expr.
@@ -201,7 +201,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         var s: List(u8) = .empty;
         try uleb(a, &s, tables.items.len);
         for (tables.items) |t| {
-            try s.append(a, 0x70); // funcref
+            try s.append(a, @intFromEnum(t.elem)); // element reftype (funcref / externref)
             if (t.max) |mx| {
                 try s.append(a, 0x01);
                 try uleb(a, &s, t.min);
@@ -329,7 +329,8 @@ fn parseTypeDef(a: std.mem.Allocator, items: []const Sexpr, sigs: *List(Sig), ty
     try type_names.append(a, name);
 }
 
-/// `(table $name? <min> <max>? funcref)` or `(table $name? funcref (elem …))`.
+/// `(table $name? reftype (elem …))` or `(table $name? <min> <max>? reftype)`,
+/// where reftype is `funcref` / `externref` / `(ref null? …)`.
 fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef), table_names: *List(?[]const u8), elems: *List(ElemDef)) Error!void {
     const table_index: u32 = @intCast(tables.items.len);
     var i: usize = 1;
@@ -339,24 +340,33 @@ fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef
         i += 1;
     }
     try table_names.append(a, name);
-    if (i < items.len and eqAtom(items[i], "funcref")) {
+    if (isRefType(items[i])) {
+        // (table reftype (elem …))
+        const et = try parseValType(items[i]);
         i += 1;
         if (i < items.len and eqKw(items[i], "elem")) {
             const funcs = items[i].asList().?[1..];
-            try tables.append(a, .{ .min = @intCast(funcs.len), .max = @intCast(funcs.len) });
+            try tables.append(a, .{ .min = @intCast(funcs.len), .max = @intCast(funcs.len), .elem = et });
             try elems.append(a, .{ .table_index = table_index, .offset = 0, .funcs = funcs });
         } else {
-            try tables.append(a, .{ .min = 0, .max = null });
+            try tables.append(a, .{ .min = 0, .max = null, .elem = et });
         }
     } else {
         const min = try parseIndex(items[i]);
         i += 1;
         var max: ?u32 = null;
-        if (i < items.len and items[i].asAtom() != null and !eqAtom(items[i], "funcref")) {
+        if (i < items.len and !isRefType(items[i])) {
             max = try parseIndex(items[i]);
+            i += 1;
         }
-        try tables.append(a, .{ .min = min, .max = max });
+        try tables.append(a, .{ .min = min, .max = max, .elem = try parseValType(items[i]) });
     }
+}
+
+/// True if the form is a reference type: `funcref` / `externref` / `(ref …)`.
+fn isRefType(s: Sexpr) bool {
+    if (s.asList()) |l| return l.len >= 1 and eqAtom(l[0], "ref");
+    return eqAtom(s, "funcref") or eqAtom(s, "externref");
 }
 
 /// `(elem $id? (table $t)? (i32.const N)|(offset …) func? $f …)` — active segment.
@@ -744,6 +754,21 @@ fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Erro
             try emitCallIndirect(ctx, ann.idx, ann.table);
             return ann.next;
         },
+        .table_get, .table_set => {
+            try ctx.out.append(ctx.a, @intFromEnum(op));
+            // Optional explicit table index/id; a `$name` or numeric atom (a
+            // following instruction is never either), else default table 0.
+            var j = i + 1;
+            var t: u32 = 0;
+            if (j < items.len) if (items[j].asAtom()) |atom| {
+                if (atom.len != 0 and (atom[0] == '$' or std.ascii.isDigit(atom[0]))) {
+                    t = try resolveByName(ctx.table_names, items[j]);
+                    j += 1;
+                }
+            };
+            try uleb(ctx.a, ctx.out, t);
+            return j;
+        },
         else => {
             var buf: [4]Sexpr = undefined;
             var n: usize = 0;
@@ -836,6 +861,7 @@ fn emitInstr(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
         .none => {},
         .local => try uleb(ctx.a, ctx.out, try resolveLocal(ctx, try imm0(immediates))),
         .global => try uleb(ctx.a, ctx.out, try resolveByName(ctx.global_names, try imm0(immediates))),
+        .table => try uleb(ctx.a, ctx.out, if (immediates.len == 0) 0 else try resolveByName(ctx.table_names, immediates[0])),
         .func => try uleb(ctx.a, ctx.out, try resolveFunc(ctx, try imm0(immediates))),
         .label => try uleb(ctx.a, ctx.out, try resolveLabel(ctx, try imm0(immediates))),
         .i32c => try sleb(ctx.a, ctx.out, try parseWatI32(try imm0(immediates))),
@@ -1203,6 +1229,24 @@ test "assembles a type-reference block type" {
         \\    (block (type $sig) (i32.const 42))))
     ;
     try std.testing.expectEqual(@as(i32, 42), interp.asI32(try assembleAndRun(src, "b", &.{})));
+}
+
+test "table.get / table.set on an externref table" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bin = try assemble(a,
+        \\(module
+        \\  (table $t 3 externref)
+        \\  (func (export "set") (param i32 externref) (table.set $t (local.get 0) (local.get 1)))
+        \\  (func (export "get") (param i32) (result externref) (table.get $t (local.get 0))))
+    );
+    var m = try Module.decode(a, bin);
+    var inst = try interp.Instance.init(a, &m);
+    _ = try inst.invoke("set", &.{ interp.i32Value(1), interp.i64Value(42) });
+    try std.testing.expectEqual(@as(i64, 42), interp.asI64((try inst.invoke("get", &.{interp.i32Value(1)}))[0]));
+    // Slot 0 was never set → null reference sentinel.
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), (try inst.invoke("get", &.{interp.i32Value(0)}))[0]);
 }
 
 test "evaluates a compound (extended-const) global init" {

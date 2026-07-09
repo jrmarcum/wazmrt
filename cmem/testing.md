@@ -102,6 +102,8 @@ Run a `.wast` file directly: `wazmrt <file.wast>` → `N passed, N failed, N ski
 | `select.wast` | **124 passed, 0 failed** (30 skipped) |
 | `local_tee.wast` | **55 passed, 0 failed** (42 skipped) |
 | `global.wast` | **62 passed, 1 failed** (53 skipped — 1 module needs `register`/linking) |
+| `table_get.wast` | **9 passed, 0 failed** (5 skipped) |
+| `table_set.wast` | **18 passed, 0 failed** (7 skipped) |
 
 - **`skipped`** = commands the MVP runner doesn't handle (`assert_invalid`/`assert_malformed`,
   `register`, `get`), *plus* asserts whose module failed to build.
@@ -166,6 +168,16 @@ inits** like `(i32.add (i32.mul (i32.const 20) (i32.const 2)) (i32.const 2))` ev
 (previously only the first instruction was read → wrong value). The lone remaining `global.wast` failure
 is one module needing `register`/module-linking + `table.get` + element-init-expressions. **No
 regressions** (HEAD-baselined: `data` 0/13 and `memory`'s slowness are pre-existing).
+
+**Update 2026-07-09 — `table.get`/`table.set` + externref tables:** `table_get.wast` 0 → **9/0**,
+`table_set.wast` 0 → **18/0**. Added `table.get`/`table.set` (`0x25`/`0x26`) across
+opcode/interp/validator (typed by the table's element type), and refactored interp tables from `[]u32`
+(funcref indices) to `[]Value` slots so **funcref and externref tables share one representation**
+(`null_ref` = uninitialized; a funcref is its function index; an externref is its host value). The
+assembler parses `externref`/`(ref …)` table element types + emits the correct element byte, and emits
+`table.get`/`.set` (optional explicit table id, default 0). No regressions. **Next:** the
+`0xFC`-prefixed table ops (`table.size`/`.grow`/`.fill`), then passive element segments +
+`table.init`/`.copy` (which also need `register`/imported functions).
 
 ## What this tells the roadmap
 
