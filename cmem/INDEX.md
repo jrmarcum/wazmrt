@@ -38,6 +38,34 @@ complete the **Adoption Checklist** in `third_party/LICENSES.md` (benefit-vs-dra
 compliance), add a Component Ledger entry there, and update `reference-projects.md` status. "Looking at"
 a project is free; "copying/porting from" it always requires the ledger entry.
 
+### The "look for code issues" trigger (binding on every agent)
+
+When the owner says **"look for code issues"** (or a synonym — "code audit", "audit the code", "hunt
+for bugs"), perform a **COMPREHENSIVE audit across BOTH tested AND untested code paths**. The goal is to
+catch issues that **won't surface in today's tests but will bite a future change**. Look for all four
+categories:
+
+1. **Workarounds / temporary hacks** — is each still needed, or now stale? (e.g. cache-clean races,
+   leniency comments, `TODO`/`FIXME`, "for now" shortcuts.) Flag stale ones for removal.
+2. **Dead code** — unused methods/fields/helpers, duplicates, orphaned exports. **Verify each with
+   grep** before calling it dead (a symbol may be reached via `root.zig` re-export, the C ABI, or a
+   test-only path).
+3. **Bugs** — silently-wrong codegen, inverted logic, type-inference gaps, scanner/LEB off-by-ones,
+   union-field access on the wrong active tag, stack-order mistakes, missing bounds checks.
+4. **Fall-throughs (the worst failure mode)** — unhandled input that emits a stub/placeholder (a
+   comment + a bare `0` / empty slice / `.none`) **instead of erroring**. Prefer converting
+   silent-wrong to a **hard abort** (`error.Unsupported*` / a `diagnostics`-style failure), and guard
+   genuinely-speculative probes so they fail loud, not silent. In this codebase the canonical example is
+   an assembler/decoder path that should return `error.UnknownInstr` / `error.UnsupportedOpcode` rather
+   than emit wrong bytes.
+
+**Method:** for large files, **fan out parallel read-only investigators per category** (use the Agent
+tool / `Explore`), then consolidate. Report each finding as `file:line` + a one-line description +
+severity. **Fix the safe ones** and **keep the full suite green — diff the OUTPUT, not just exit codes**
+(`zig build test` *and* re-run the affected `.wast` conformance files via `wazmrt <file.wast>`, comparing
+`N passed / N failed` against the pre-change baseline; a build that still exits 0 while silently dropping
+passes is a regression). Surface anything risky or ambiguous rather than fixing blind.
+
 ## Files
 
 | File | What it holds |
