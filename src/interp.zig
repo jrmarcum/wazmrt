@@ -141,8 +141,11 @@ pub const Instance = struct {
     /// Maximum memory size in pages, if bounded.
     mem_max: ?u32,
     /// Reference tables, one per module table, as `Value` slots (`null_ref` =
-    /// uninitialized). Each is `gpa`-allocated; the outer slice too.
-    tables: []const []Value,
+    /// uninitialized). Each is `gpa`-allocated (and re-allocated by `table.grow`);
+    /// the outer slice too.
+    tables: [][]Value,
+    /// Maximum length of each table, if bounded (for `table.grow`).
+    table_max: []const ?u32,
 
     /// Host-supplied values for a module's imports. Today only imported globals
     /// are backed (in module-import order); imported functions/tables/memories
@@ -215,9 +218,12 @@ pub const Instance = struct {
         // representation.
         const tables = try gpa.alloc([]Value, module.tables.len);
         errdefer gpa.free(tables);
-        for (tables, module.tables) |*t, tt| {
+        const table_max = try gpa.alloc(?u32, module.tables.len);
+        errdefer gpa.free(table_max);
+        for (tables, table_max, module.tables) |*t, *tmax, tt| {
             t.* = try gpa.alloc(Value, tt.limits.min);
             @memset(t.*, null_ref);
+            tmax.* = tt.limits.max;
         }
         for (module.elements) |elem| {
             if (!elem.active) continue;
@@ -240,6 +246,7 @@ pub const Instance = struct {
             .memory = memory,
             .mem_max = mem_max,
             .tables = tables,
+            .table_max = table_max,
         };
     }
 
@@ -247,6 +254,7 @@ pub const Instance = struct {
         if (self.memory) |m| self.gpa.free(m);
         for (self.tables) |t| self.gpa.free(t);
         self.gpa.free(self.tables);
+        self.gpa.free(self.table_max);
         self.arena.deinit();
         self.* = undefined;
     }
@@ -499,6 +507,40 @@ const Frame = struct {
                     const i = @as(u32, @bitCast(self.popI32()));
                     if (i >= t.len) return error.TableOutOfBounds;
                     t[i] = v;
+                    pc += 1;
+                },
+                .table_size => {
+                    try self.pushI32(@intCast(self.inst.tables[instr.imm.table].len));
+                    pc += 1;
+                },
+                .table_grow => {
+                    const ti = instr.imm.table;
+                    const delta = @as(u32, @bitCast(self.popI32()));
+                    const init_val = self.pop();
+                    const old = self.inst.tables[ti];
+                    const new_len = @as(u64, old.len) + delta;
+                    const max = self.inst.table_max[ti] orelse std.math.maxInt(u32);
+                    if (new_len > max) {
+                        try self.pushI32(-1); // growth refused
+                    } else {
+                        const grown = self.inst.gpa.realloc(old, @intCast(new_len)) catch {
+                            try self.pushI32(-1);
+                            pc += 1;
+                            continue;
+                        };
+                        @memset(grown[old.len..], init_val);
+                        self.inst.tables[ti] = grown;
+                        try self.pushI32(@intCast(old.len));
+                    }
+                    pc += 1;
+                },
+                .table_fill => {
+                    const t = self.inst.tables[instr.imm.table];
+                    const n = @as(u32, @bitCast(self.popI32()));
+                    const val = self.pop();
+                    const dst = @as(u32, @bitCast(self.popI32()));
+                    if (@as(u64, dst) + n > t.len) return error.TableOutOfBounds;
+                    @memset(t[dst..][0..n], val);
                     pc += 1;
                 },
 

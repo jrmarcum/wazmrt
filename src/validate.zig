@@ -285,6 +285,22 @@ const FuncValidator = struct {
                 _ = try self.popExpect(et);
                 _ = try self.popExpect(.i32);
             },
+            .table_size => {
+                _ = try self.tableElemType(instr.imm.table); // bounds-check the index
+                try self.pushValT(.i32);
+            },
+            .table_grow => {
+                const et = try self.tableElemType(instr.imm.table);
+                _ = try self.popExpect(.i32); // delta
+                _ = try self.popExpect(et); // init value
+                try self.pushValT(.i32);
+            },
+            .table_fill => {
+                const et = try self.tableElemType(instr.imm.table);
+                _ = try self.popExpect(.i32); // n
+                _ = try self.popExpect(et); // value
+                _ = try self.popExpect(.i32); // dst
+            },
 
             .ref_null => try self.pushValT(instr.imm.ref_type),
             .ref_is_null => {

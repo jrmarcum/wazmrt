@@ -754,8 +754,8 @@ fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Erro
             try emitCallIndirect(ctx, ann.idx, ann.table);
             return ann.next;
         },
-        .table_get, .table_set => {
-            try ctx.out.append(ctx.a, @intFromEnum(op));
+        .table_get, .table_set, .table_grow, .table_size, .table_fill => {
+            try emitOpcode(ctx, op);
             // Optional explicit table index/id; a `$name` or numeric atom (a
             // following instruction is never either), else default table 0.
             var j = i + 1;
@@ -855,8 +855,19 @@ fn emitBrTable(ctx: *Ctx, labels: []const Sexpr) Error!void {
     try uleb(ctx.a, ctx.out, try resolveLabel(ctx, labels[labels.len - 1]));
 }
 
+/// Emit an opcode's bytes: a `0xFC`-prefixed pair for table ops, else the single
+/// enum byte.
+fn emitOpcode(ctx: *Ctx, op: Op) Error!void {
+    if (opcode.fcSubOpcode(op)) |sub| {
+        try ctx.out.append(ctx.a, 0xfc);
+        try uleb(ctx.a, ctx.out, sub);
+    } else {
+        try ctx.out.append(ctx.a, @intFromEnum(op));
+    }
+}
+
 fn emitInstr(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
-    try ctx.out.append(ctx.a, @intFromEnum(op));
+    try emitOpcode(ctx, op);
     switch (opcode.immediateKind(op)) {
         .none => {},
         .local => try uleb(ctx.a, ctx.out, try resolveLocal(ctx, try imm0(immediates))),
@@ -1229,6 +1240,33 @@ test "assembles a type-reference block type" {
         \\    (block (type $sig) (i32.const 42))))
     ;
     try std.testing.expectEqual(@as(i32, 42), interp.asI32(try assembleAndRun(src, "b", &.{})));
+}
+
+test "table.size / table.grow / table.fill" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bin = try assemble(a,
+        \\(module
+        \\  (table $t 1 5 externref)
+        \\  (func (export "size") (result i32) (table.size $t))
+        \\  (func (export "grow") (param i32 externref) (result i32) (table.grow $t (local.get 1) (local.get 0)))
+        \\  (func (export "fill") (param i32 externref i32) (table.fill $t (local.get 0) (local.get 1) (local.get 2)))
+        \\  (func (export "get") (param i32) (result externref) (table.get $t (local.get 0))))
+    );
+    var m = try Module.decode(a, bin);
+    var inst = try interp.Instance.init(a, &m);
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32((try inst.invoke("size", &.{}))[0]));
+    // grow by 2 (init 99) → returns old size 1; size now 3.
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32((try inst.invoke("grow", &.{ interp.i32Value(2), interp.i64Value(99) }))[0]));
+    try std.testing.expectEqual(@as(i32, 3), interp.asI32((try inst.invoke("size", &.{}))[0]));
+    // grow past max (5) → -1, size unchanged.
+    try std.testing.expectEqual(@as(i32, -1), interp.asI32((try inst.invoke("grow", &.{ interp.i32Value(10), interp.i64Value(0) }))[0]));
+    // fill [0..2) = 77; read one back.
+    _ = try inst.invoke("fill", &.{ interp.i32Value(0), interp.i64Value(77), interp.i32Value(2) });
+    try std.testing.expectEqual(@as(i64, 77), interp.asI64((try inst.invoke("get", &.{interp.i32Value(1)}))[0]));
+    // The grow-initialized region held 99.
+    try std.testing.expectEqual(@as(i64, 99), interp.asI64((try inst.invoke("get", &.{interp.i32Value(2)}))[0]));
 }
 
 test "table.get / table.set on an externref table" {

@@ -15,9 +15,10 @@ the **WAST script runner** (`wast.zig`) is next.
   Runs the **official spec testsuite** via `wazmrt <file.wast>`: `i32` 374/0, `i64` 384/0, `int_exprs`
   89/0, `address` 255/0, `f32`/`f64` 2498/2, plus **call_indirect + tables + globals + type-ref block
   types + reference types + multi-table (2026-07-09)**: nop 83/0, block 52/0, if 124/0, loop 77/0,
-  **call_indirect 132/0**, **select 124/0**, **local_tee 55/0**, plus **imported globals +
-  extended-const (2026-07-09)**: **global 62/1** (see `testing.md`). Remaining gaps: `table.get`/`.set`,
-  passive element segments, imported functions, `register`/module-linking.
+  **call_indirect 132/0**, **select 124/0**, **local_tee 55/0**, **global 62/1**, plus **reference-type
+  table ops (2026-07-09)**: table_get 9/0, table_set 18/0, table_size 36/0, table_grow 38/3, table_fill
+  35/0 (see `testing.md`). Remaining gaps: passive element segments + `table.init`/`.copy`, imported
+  functions, `register`/module-linking.
 - **Licensing baseline** (git `888b87e`): dual `MIT OR Apache-2.0` (`LICENSE-MIT` + `LICENSE-APACHE`),
   `NOTICE`, and the compliance scaffold `third_party/LICENSES.md` (obligations table + Adoption
   Checklist + Component Ledger + verified SPDX inventory). README license section + SPDX + contribution
@@ -34,12 +35,13 @@ the **WAST script runner** (`wast.zig`) is next.
   (`env.add`) and export (`run`, params=2 results=1). Retired the ad-hoc `wazmrt_module_*` ABI.
 - **cmem/ project memory** established (this folder), mirroring the wasmtk setup.
 
-**Remaining:** `table.get`/`.set` + passive element segments; imported functions/tables/memories (host
-imports → WASI); `register`/module-linking; growing the wasm-c-api past introspection; first
-`universalWasmLoader-*` integration. Still **100% original runtime code** — no reference-project code
-adopted yet (only the vendored `wasm.h`). `call_indirect` + tables + globals + type-ref block types +
-**reference types** + **multi-table** + NaN-payload float literals + **imported globals** +
-extended-const init exprs **DONE 2026-07-09**.
+**Remaining:** passive element segments + `table.init`/`.copy` + `elem.drop`; imported
+functions/tables/memories (host imports → WASI); `register`/module-linking; growing the wasm-c-api past
+introspection; first `universalWasmLoader-*` integration. Still **100% original runtime code** — no
+reference-project code adopted yet (only the vendored `wasm.h`). `call_indirect` + tables + globals +
+type-ref block types + **reference types** + **multi-table** + NaN-payload float literals + **imported
+globals** + extended-const init exprs + **reference-type table ops** (`table.get`/`.set`/`.size`/
+`.grow`/`.fill`) **DONE 2026-07-09**.
 
 ## Next increments (rough order)
 

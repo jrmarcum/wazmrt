@@ -88,9 +88,15 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
    backs the standard `spectest` globals; the assembler parses `(global (import "m" "n") type)` and
    emits an import section (2); `ref.null`/`ref.func` work in const-inits; and `evalConstExpr` is now a
    small stack machine so compound extended-const inits (`i32.add`/`sub`/`mul` etc.) evaluate correctly.
-   `global.wast` 0 → **62/1** (lone failure needs `register`/linking). **Next:** `table.get`/`.set` +
-   passive/declarative element segments, imported functions/tables/memories (→ host imports / WASI),
-   `register`/multi-module linking. Standing conformance gate (`testing.md`).
+   `global.wast` 0 → **62/1** (lone failure needs `register`/linking).
+10. ~~Reference-type table ops~~ **DONE 2026-07-09**. `table.get`/`.set` (`0x25`/`0x26`) +
+    `table.size`/`.grow`/`.fill` (`0xFC` prefix, decoded via internal `Op` tags + `fcSubOpcode`,
+    emitted via `emitOpcode`). Interp tables became `[]Value` slots (funcref + externref share one
+    representation) with per-table max so `table.grow` reallocs. Assembler parses `externref`/`(ref …)`
+    table element types. `table_get` 9/0, `table_set` 18/0, `table_size` 36/0, `table_grow` 38/3,
+    `table_fill` 35/0. **Next:** passive/declarative element segments + `table.init`/`.copy` +
+    `elem.drop`, `register`/multi-module linking, imported functions/tables/memories (→ host imports /
+    WASI). Standing conformance gate (`testing.md`).
 
 ## Notes / invariants
 

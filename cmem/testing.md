@@ -104,6 +104,9 @@ Run a `.wast` file directly: `wazmrt <file.wast>` → `N passed, N failed, N ski
 | `global.wast` | **62 passed, 1 failed** (53 skipped — 1 module needs `register`/linking) |
 | `table_get.wast` | **9 passed, 0 failed** (5 skipped) |
 | `table_set.wast` | **18 passed, 0 failed** (7 skipped) |
+| `table_size.wast` | **36 passed, 0 failed** (2 skipped) |
+| `table_grow.wast` | **38 passed, 3 failed** (12 skipped — 3 need `register`/imported tables) |
+| `table_fill.wast` | **35 passed, 0 failed** (9 skipped) |
 
 - **`skipped`** = commands the MVP runner doesn't handle (`assert_invalid`/`assert_malformed`,
   `register`, `get`), *plus* asserts whose module failed to build.
@@ -175,9 +178,17 @@ opcode/interp/validator (typed by the table's element type), and refactored inte
 (funcref indices) to `[]Value` slots so **funcref and externref tables share one representation**
 (`null_ref` = uninitialized; a funcref is its function index; an externref is its host value). The
 assembler parses `externref`/`(ref …)` table element types + emits the correct element byte, and emits
-`table.get`/`.set` (optional explicit table id, default 0). No regressions. **Next:** the
-`0xFC`-prefixed table ops (`table.size`/`.grow`/`.fill`), then passive element segments +
-`table.init`/`.copy` (which also need `register`/imported functions).
+`table.get`/`.set` (optional explicit table id, default 0). No regressions.
+
+**Update 2026-07-09 — `0xFC` table ops (`table.size`/`.grow`/`.fill`):** `table_size.wast` 0 → **36/0**,
+`table_grow.wast` 0 → **38/3**, `table_fill.wast` 0 → **35/0**. The decoder now intercepts the `0xFC`
+prefix and maps the LEB sub-opcode to internal `Op` tags (`table_grow`/`_size`/`_fill`, byte values in
+an unused range — the wire form is `0xFC`+subop, see `fcSubOpcode`); the assembler emits FC-aware
+opcodes via `emitOpcode`. The interp tracks per-table max and `table.grow` reallocs the entries
+(refusing past max → -1). `table_grow.wast`'s 3 failures need imported tables + `register`
+(module-linking). No regressions. **Next:** passive/declarative element segments + `table.init`/`.copy`
++ `elem.drop`, and `register`/imported functions (host imports / WASI) — which together unblock
+`table_copy.wast` (1650 skipped) and `table_init.wast` (730 skipped).
 
 ## What this tells the roadmap
 

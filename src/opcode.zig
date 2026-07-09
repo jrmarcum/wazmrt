@@ -233,8 +233,25 @@ pub const Op = enum(u8) {
     i64_extend16_s = 0xc3,
     i64_extend32_s = 0xc4,
 
+    // Table ops carried under the `0xFC` prefix. These enum values are INTERNAL
+    // tags in an otherwise-unused byte range — the wire encoding is `0xFC` + a
+    // LEB sub-opcode (see `fcSubOpcode` / `decodeBody`), not this byte.
+    table_grow = 0xe0, // 0xFC 0x0f
+    table_size = 0xe1, // 0xFC 0x10
+    table_fill = 0xe2, // 0xFC 0x11
+
     _,
 };
+
+/// The `0xFC` sub-opcode for an internal table-op tag, or null for a normal op.
+pub fn fcSubOpcode(op: Op) ?u8 {
+    return switch (op) {
+        .table_grow => 0x0f,
+        .table_size => 0x10,
+        .table_fill => 0x11,
+        else => null,
+    };
+}
 
 /// A block signature (§5.3.6): empty, a single value type, or a type index.
 pub const BlockType = union(enum) {
@@ -306,7 +323,7 @@ pub fn immediateKind(op: Op) ImmKind {
         0x11 => .call_indirect,
         0x20, 0x21, 0x22 => .local,
         0x23, 0x24 => .global,
-        0x25, 0x26 => .table, // table.get / table.set
+        0x25, 0x26, 0xe0, 0xe1, 0xe2 => .table, // table.get/set + table.grow/size/fill
         0x28...0x3e => .mem,
         0x3f, 0x40 => .mem_reserved,
         0x41 => .i32c,
@@ -349,7 +366,19 @@ pub fn decodeBody(a: std.mem.Allocator, body: []const u8) (DecodeError || std.me
     errdefer list.deinit(a);
 
     while (!r.atEnd()) {
-        const op: Op = @enumFromInt(try r.readByte());
+        const b0 = try r.readByte();
+        if (b0 == 0xfc) {
+            // 0xFC-prefixed op: a LEB sub-opcode picks the internal Op tag.
+            const op: Op = switch (try r.readVarU32()) {
+                0x0f => .table_grow,
+                0x10 => .table_size,
+                0x11 => .table_fill,
+                else => return error.UnsupportedOpcode,
+            };
+            try list.append(a, .{ .op = op, .imm = .{ .table = try r.readVarU32() } });
+            continue;
+        }
+        const op: Op = @enumFromInt(b0);
         const imm: Imm = switch (immediateKind(op)) {
             .none => .none,
             .block_type => .{ .block_type = try readBlockType(&r) },
