@@ -38,8 +38,9 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
   assemble→decode→validate→run for add, mul, nested const, two-func `call`, if/else,
   a named-label loop `sum(5)=15`, flat block+br, memory store/load, and a data segment.
   **Multi-value block types + typed `select` DONE 2026-07-02** (type-index blocktypes interned into
-  the type section; `select_t` 0x1c). **Deferred in wat.zig:** `global`/`table`/`start`/`elem`
-  sections, `(type $t)` block-type references, `call_indirect`.
+  the type section; `select_t` 0x1c). **`call_indirect` + `table`/`elem` + `global` + `(type $t)`
+  block-type references DONE 2026-07-09.** **Deferred in wat.zig:** `start` section, reference-type
+  instructions (`ref.func`/`ref.null`), imports.
 - **`src/wast.zig`** (MVP DONE 2026-07-02) — WAST script runner: `(module …)` text +
   `(module binary …)`, `assert_return`, `assert_trap`, `invoke`; value literals incl.
   `nan:canonical`/`nan:arithmetic`; drives an `Instance` and compares (NaN-aware). CLI
@@ -61,9 +62,14 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
    Deferred: `assert_invalid`/`assert_malformed`, `register`/multi-module, `get`, `(module quote …)`.
 5. ~~Multi-value block types/results + typed `select`~~ **DONE 2026-07-02** (decoder type-index
    blocktypes + `select_t` 0x1c; interp/validator; assembler interns block-type sigs into the type
-   section + emits typed select). Fixed `fac` (0→6). **Next: `call_indirect` + tables** — the blocker
-   for `block`/`nop`/`if`/`loop` (they use `(call_indirect (type $t) …)`). This is the standing
-   conformance gate (`testing.md`).
+   section + emits typed select). Fixed `fac` (0→6).
+6. ~~`call_indirect` + `table`/`elem` + `global` + type-ref block types~~ **DONE 2026-07-09**
+   (decoder/validator already handled call_indirect; added interp table + type-checked indirect
+   dispatch, global-init const-expr evaluation, and assembler support for all four). Control-flow
+   files jumped 0 → nop 83 / block 52 / if 124 / loop 77 / call_indirect 120, **0 failed**. Also fixed
+   a latent `memory.size`/`memory.grow` interp panic (`imm.mem` vs `mem_reserved`). **Next: reference
+   types** (`ref.func`/`ref.null`, funcref/externref values) — the blocker for `select.wast` and the
+   last `call_indirect` assert. This is the standing conformance gate (`testing.md`).
 
 ## Notes / invariants
 

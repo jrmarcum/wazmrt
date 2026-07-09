@@ -83,7 +83,24 @@ pub const Error = Module.Error || error{
     NoMemory,
     /// A global index out of range (e.g. in a data-segment offset expression).
     UndefinedGlobal,
+    /// `call_indirect` in a module with no table.
+    NoTable,
+    /// A table access (or element-segment init) outside the table bounds.
+    TableOutOfBounds,
+    /// `call_indirect` hit an uninitialized (null) table element.
+    UninitializedElement,
+    /// `call_indirect`'s declared type did not match the callee's signature.
+    IndirectTypeMismatch,
+    /// A type index out of range.
+    UndefinedType,
 };
+
+/// Uninitialized funcref table entry.
+const null_func: u32 = std.math.maxInt(u32);
+
+fn funcTypeEqual(x: Module.FuncType, y: Module.FuncType) bool {
+    return std.mem.eql(V, x.params, y.params) and std.mem.eql(V, y.results, x.results);
+}
 
 const max_call_depth = 1024;
 
@@ -120,6 +137,9 @@ pub const Instance = struct {
     memory: ?[]u8,
     /// Maximum memory size in pages, if bounded.
     mem_max: ?u32,
+    /// Funcref table (entries are function indices; `null_func` = uninitialized),
+    /// or null if the module has no table. Allocated with `gpa`.
+    table: ?[]u32,
 
     pub fn init(gpa: std.mem.Allocator, module: *const Module) Error!Instance {
         var arena = std.heap.ArenaAllocator.init(gpa);
@@ -144,7 +164,12 @@ pub const Instance = struct {
         }
 
         const globals = try a.alloc(Value, module.globals.len);
-        @memset(globals, 0); // TODO: evaluate global init expressions
+        @memset(globals, 0);
+        // Evaluate defined-global init expressions. Defined globals occupy the
+        // tail of the index space, after any imported globals.
+        const defined_start = module.globals.len - module.global_inits.len;
+        for (module.global_inits, 0..) |init_expr, gi|
+            globals[defined_start + gi] = try evalConstExpr(globals[0 .. defined_start + gi], init_expr);
 
         // Linear memory: allocate the declared minimum, then apply active data
         // segments. (An imported memory is self-provided here — no host yet.)
@@ -165,6 +190,23 @@ pub const Instance = struct {
             mem_max = mt.limits.max;
         }
 
+        // Table: allocate the declared minimum, then apply active element segments.
+        var table: ?[]u32 = null;
+        if (module.tables.len > 0) {
+            const tbl = try gpa.alloc(u32, module.tables[0].limits.min);
+            errdefer gpa.free(tbl);
+            @memset(tbl, null_func);
+            for (module.elements) |elem| {
+                if (!elem.active) continue;
+                const offset = try evalConstOffset(module, globals, elem.offset_expr);
+                for (elem.funcs, 0..) |f, k| {
+                    if (@as(u64, offset) + k >= tbl.len) return error.TableOutOfBounds;
+                    tbl[offset + k] = f;
+                }
+            }
+            table = tbl;
+        }
+
         return .{
             .gpa = gpa,
             .arena = arena,
@@ -174,11 +216,13 @@ pub const Instance = struct {
             .imported_funcs = module.importedFuncCount(),
             .memory = memory,
             .mem_max = mem_max,
+            .table = table,
         };
     }
 
     pub fn deinit(self: *Instance) void {
         if (self.memory) |m| self.gpa.free(m);
+        if (self.table) |t| self.gpa.free(t);
         self.arena.deinit();
         self.* = undefined;
     }
@@ -377,6 +421,23 @@ const Frame = struct {
                 .call => {
                     const f = instr.imm.func;
                     const ft = self.inst.module.funcType(f) orelse return error.UndefinedFunc;
+                    const np = ft.params.len;
+                    const args = self.vstack.items[self.vstack.items.len - np ..];
+                    const results = try self.inst.callFunction(self.a, f, args, self.depth + 1);
+                    self.vstack.shrinkRetainingCapacity(self.vstack.items.len - np);
+                    for (results) |r| try self.pushU64(r);
+                    pc += 1;
+                },
+                .call_indirect => {
+                    const ci = instr.imm.call_indirect;
+                    const table = self.inst.table orelse return error.NoTable;
+                    const slot = @as(u32, @bitCast(self.popI32())); // table element index (top of stack)
+                    if (slot >= table.len) return error.TableOutOfBounds;
+                    const f = table[slot];
+                    if (f == null_func) return error.UninitializedElement;
+                    if (ci.type_index >= self.inst.module.func_types.len) return error.UndefinedType;
+                    const ft = self.inst.module.funcType(f) orelse return error.UndefinedFunc;
+                    if (!funcTypeEqual(self.inst.module.func_types[ci.type_index], ft)) return error.IndirectTypeMismatch;
                     const np = ft.params.len;
                     const args = self.vstack.items[self.vstack.items.len - np ..];
                     const results = try self.inst.callFunction(self.a, f, args, self.depth + 1);
@@ -713,6 +774,15 @@ const Frame = struct {
     }
 
     fn execMemory(self: *Frame, instr: opcode.Instr) Error!void {
+        // memory.size / memory.grow carry a reserved-byte immediate, not a memarg.
+        switch (instr.op) {
+            .memory_size => {
+                const mem = self.inst.memory orelse return error.NoMemory;
+                return self.pushI32(@intCast(mem.len / page_size));
+            },
+            .memory_grow => return self.memoryGrow(),
+            else => {},
+        }
         const ma = instr.imm.mem;
         switch (instr.op) {
             .i32_load => try self.pushI32(@bitCast(try self.load(u32, ma))),
@@ -740,11 +810,6 @@ const Frame = struct {
             .i64_store16 => try self.store(u16, ma, @truncate(@as(u64, @bitCast(self.popI64())))),
             .i64_store32 => try self.store(u32, ma, @truncate(@as(u64, @bitCast(self.popI64())))),
 
-            .memory_size => {
-                const mem = self.inst.memory orelse return error.NoMemory;
-                try self.pushI32(@intCast(mem.len / page_size));
-            },
-            .memory_grow => try self.memoryGrow(),
             else => unreachable,
         }
     }
@@ -765,6 +830,24 @@ fn evalConstOffset(module: *const Module, globals: []const Value, expr: []const 
         else => return error.UnsupportedInstruction,
     };
     return @bitCast(val);
+}
+
+/// Evaluate a global's init const-expr (§3.3.7): a single `*.const`,
+/// `global.get` (of a preceding global), then `end`. Returns the raw slot.
+fn evalConstExpr(globals: []const Value, expr: []const u8) Error!Value {
+    var r = Reader.init(expr);
+    return switch (try r.readByte()) {
+        0x41 => i32Value(try r.readVarI32()), // i32.const
+        0x42 => i64Value(try r.readVarI64()), // i64.const
+        0x43 => std.mem.readInt(u32, (try r.readBytes(4))[0..4], .little), // f32.const
+        0x44 => std.mem.readInt(u64, (try r.readBytes(8))[0..8], .little), // f64.const
+        0x23 => blk: { // global.get
+            const gi = try r.readVarU32();
+            if (gi >= globals.len) return error.UndefinedGlobal;
+            break :blk globals[gi];
+        },
+        else => return error.UnsupportedInstruction,
+    };
 }
 
 /// Shared integer binary-op semantics for i32 (S=i32,U=u32) and i64.

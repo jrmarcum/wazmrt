@@ -93,7 +93,13 @@ Run a `.wast` file directly: `wazmrt <file.wast>` → `N passed, N failed, N ski
 | `int_exprs.wast` | **89 passed, 0 failed, 0 skipped** |
 | `address.wast` | **255 passed, 0 failed** (memory addressing) |
 | `f32.wast` / `f64.wast` | **2498 passed, 2 failed** each (NaN-payload edge cases) |
-| `nop`/`select`/`local_tee`/`fac`/`stack` | module build fails → asserts skipped |
+| `nop.wast` | **83 passed, 0 failed** (4 skipped) |
+| `block.wast` | **52 passed, 0 failed** (170 skipped) |
+| `if.wast` | **124 passed, 0 failed** (116 skipped) |
+| `loop.wast` | **77 passed, 0 failed** (42 skipped) |
+| `call_indirect.wast` | **120 passed, 1 failed** (49 skipped) |
+| `fac.wast` | **6 passed, 0 failed** (1 skipped) |
+| `select.wast` | module build fails (reference types) → asserts skipped |
 
 - **`skipped`** = commands the MVP runner doesn't handle (`assert_invalid`/`assert_malformed`,
   `register`, `get`), *plus* asserts whose module failed to build.
@@ -111,6 +117,18 @@ a core correctness bug.
 `0 passed` control-flow files (`block`/`nop`/`if`/`loop`/`local_tee`/`select`/`stack`) are blocked on
 **`call_indirect`** (they use `(call_indirect (type $t) …)`) — the next feature. i32/i64/int_exprs/
 address/f32/f64 unchanged.
+
+**Update 2026-07-09 — `call_indirect` + tables + globals + type-ref block types landed:** the
+control-flow files jumped from 0 → **nop 83 / block 52 / if 124 / loop 77 / call_indirect 120**, all
+with **0 failed**. This increment added, end to end: `call_indirect` (table lookup + runtime
+type-check), `table`/`elem` (incl. the inline `(table funcref (elem …))` abbreviation and skipping
+declarative `(elem declare …)` segments), **globals** (`(global (mut? t) init)` + `global.get`/`.set`,
+with the interp now *evaluating* global init const-exprs instead of zero-filling), and **type-index
+block types** (`(block (type $t) …)`). Also fixed a latent interp panic: `memory.size`/`memory.grow`
+read `imm.mem` (a memarg) but carry a `mem_reserved` immediate — now handled before the memarg read.
+Remaining `call_indirect` failure (1) and all of `select.wast` need **reference types** (`ref.func`,
+`ref.null`, funcref/externref values) — the next feature. i32/i64/int_exprs/address unchanged (no
+regressions).
 
 ## What this tells the roadmap
 

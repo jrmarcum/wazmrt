@@ -81,6 +81,15 @@ pub const DataSegment = struct {
     bytes: []const u8,
 };
 
+/// An element segment (§5.5.12) that populates a table with function references.
+/// MVP handles active funcref segments; `offset_expr` is an arena-owned copy.
+pub const Element = struct {
+    active: bool,
+    table_index: u32,
+    offset_expr: []const u8,
+    funcs: []const u32,
+};
+
 /// A run of consecutive locals of the same type, as encoded in a code entry
 /// (§5.4.5). The binary groups locals by type with a repeat count.
 pub const Local = struct { count: u32, type: types.ValType };
@@ -117,11 +126,18 @@ code: []const Code,
 /// The global index space (imported globals first, then defined), for
 /// resolving `global.get`/`global.set` during validation.
 globals: []const GlobalType,
+/// Init const-expr bytes for each *defined* global (positionally the tail of
+/// `globals`, after imported globals), for evaluating initial values.
+global_inits: []const []const u8,
 /// The memory index space (imported memories first, then defined). MVP allows
 /// at most one; kept as a slice for uniformity.
 memories: []const MemoryType,
+/// The table index space (imported tables first, then defined).
+tables: []const TableType,
 /// Data segments (data section), for initializing linear memory.
 data: []const DataSegment,
+/// Element segments (element section), for initializing tables.
+elements: []const Element,
 
 pub const Error = types.DecodeError || std.mem.Allocator.Error;
 
@@ -135,6 +151,7 @@ const Decoder = struct {
     table_space: std.ArrayList(TableType) = .empty,
     mem_space: std.ArrayList(MemoryType) = .empty,
     global_space: std.ArrayList(GlobalType) = .empty,
+    global_init_space: std.ArrayList([]const u8) = .empty,
 };
 
 /// Decode a WebAssembly binary. Caller owns the result; release with `deinit`.
@@ -156,6 +173,7 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
     var exports: []const Export = &.{};
     var code: []const Code = &.{};
     var data: []const DataSegment = &.{};
+    var elements: []const Element = &.{};
 
     while (!r.atEnd()) {
         const raw_id = try r.readByte();
@@ -175,6 +193,7 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
             .memory => try decodeMemorySection(&d, &sub),
             .global => try decodeGlobalSection(&d, &sub),
             .@"export" => exports = try decodeExportSection(&d, &sub),
+            .element => elements = try decodeElementSection(&d, &sub),
             .code => code = try decodeCodeSection(&d, &sub),
             .data => data = try decodeDataSection(&d, &sub),
             else => {},
@@ -191,8 +210,11 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
         .exports = exports,
         .code = code,
         .data = data,
+        .elements = elements,
         .globals = try d.global_space.toOwnedSlice(a),
+        .global_inits = try d.global_init_space.toOwnedSlice(a),
         .memories = try d.mem_space.toOwnedSlice(a),
+        .tables = try d.table_space.toOwnedSlice(a),
     };
 }
 
@@ -365,7 +387,7 @@ fn decodeGlobalSection(d: *Decoder, r: *Reader) Error!void {
     var count = try r.readVarU32();
     while (count > 0) : (count -= 1) {
         try d.global_space.append(d.a, try readGlobalType(r));
-        try skipConstExpr(r); // init expression
+        try d.global_init_space.append(d.a, try readConstExprBytes(d.a, r)); // init expression
     }
 }
 
@@ -420,6 +442,32 @@ fn readConstExprBytes(a: std.mem.Allocator, r: *Reader) Error![]const u8 {
     const dst = try a.alloc(u8, src.len);
     @memcpy(dst, src);
     return dst;
+}
+
+fn readFuncVec(a: std.mem.Allocator, r: *Reader) Error![]const u32 {
+    const n = try r.readVarU32();
+    const funcs = try a.alloc(u32, n);
+    for (funcs) |*f| f.* = try r.readVarU32();
+    return funcs;
+}
+
+fn decodeElementSection(d: *Decoder, r: *Reader) Error![]const Element {
+    const count = try r.readVarU32();
+    const list = try d.a.alloc(Element, count);
+    for (list) |*e| {
+        switch (try r.readVarU32()) { // segment flags (§5.5.12)
+            0 => e.* = .{ .active = true, .table_index = 0, .offset_expr = try readConstExprBytes(d.a, r), .funcs = try readFuncVec(d.a, r) },
+            2 => blk: {
+                const ti = try r.readVarU32();
+                const off = try readConstExprBytes(d.a, r);
+                _ = try r.readByte(); // elemkind (0x00 = funcref)
+                e.* = .{ .active = true, .table_index = ti, .offset_expr = off, .funcs = try readFuncVec(d.a, r) };
+                break :blk;
+            },
+            else => return error.UnsupportedOpcode, // passive/declarative/expr-form deferred
+        }
+    }
+    return list;
 }
 
 fn decodeDataSection(d: *Decoder, r: *Reader) Error![]const DataSegment {
