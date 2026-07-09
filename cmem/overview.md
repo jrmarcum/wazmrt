@@ -51,7 +51,7 @@ The pipeline, in order: **decode → validate → execute**, with a text front-e
 | `src/Module.zig` | The decoded module + `decode()`: header, all core sections, resolved import/export extern types, function bodies, globals/memories/data. Arena-owned. |
 | `src/opcode.zig` | The **shared instruction authority** — `Op` table, `Imm`/`Instr` IR, `decodeBody`. Used by validate, the interpreter, *and* the assembler (in reverse). |
 | `src/validate.zig` | Spec type-checking validator over the IR (value + control-frame stacks). |
-| `src/interp.zig` | `Instance` + the switch interpreter (untyped `u64` slots, label stack). Runs int/float/memory. |
+| `src/interp.zig` | `Instance` + the switch interpreter (untyped `u64` slots, label stack). Runs int/float/memory, `call_indirect` over multiple tables, reference types, and the reference-type table ops; globals get their init const-exprs evaluated (incl. imported + extended-const). |
 | `src/sexpr.zig` / `src/wat.zig` / `src/wast.zig` | Text toolchain: S-expression parser → WAT→wasm-binary assembler (`wat.zig` maps names→`Op` via `stringToEnum`) → WAST script runner (`wast.zig`, drives an `Instance`, compares — **runs the official spec testsuite**). |
 | `src/wasm_c_api.zig` | The **standard wasm-c-api** integration ABI every `universalWasmLoader-*` port binds to (+ the `wazmrt_*` extension handshake). |
 | `src/root.zig` | Library surface (`@import("wazmrt")`). Re-exports `types`/`Reader`/`Module`/`opcode`/`validate`/`interp`/`Instance`/`sexpr`/`wat`/`wast`/`decode`/`version`/`abi_version`. |
@@ -59,7 +59,7 @@ The pipeline, in order: **decode → validate → execute**, with a text front-e
 ## Build targets (see architecture.md)
 
 - `zig build`      → native CLI `wazmrt` + C-ABI static lib `wazmrt` + installs `wasm.h` + `wazmrt.h`
-- `zig build test` → runs the unit tests (**41 passing** as of 2026-07-02)
+- `zig build test` → runs the unit tests (**57 passing** as of 2026-07-09)
 - `zig build wasm` → builds the runtime itself as a freestanding `wasm32` module
 - `zig build run -- <file.wasm> [export args…]` → summarize a module, or invoke an export and print results
 
@@ -72,9 +72,13 @@ The pipeline, in order: **decode → validate → execute**, with a text front-e
   `design-decisions.md` for why (smaller binary + no MSVC requirement on Windows).
 - **Decode + validate + execute all work.** The pipeline decodes all core sections → the `opcode.zig`
   IR, type-checks it (`validate.zig`), and a switch interpreter (`interp.zig`) runs it — integer/float
-  arithmetic, control flow, `call`, and **linear memory** end-to-end. The whole `module/wasm_mod` corpus
-  runs to its `.test.json` values (CLI run mode). `call_indirect` + host imports are the remaining
-  execution slices (`roadmap.md`).
+  arithmetic, control flow, `call`/`call_indirect` (multi-table), **linear memory**, globals, reference
+  types, and the reference-type table ops end-to-end. The whole `module/wasm_mod` corpus runs to its
+  `.test.json` values (CLI run mode). **Imported functions + `register`/module-linking** are the main
+  remaining execution slices (→ host imports / WASI; see `roadmap.md`).
 - **Text toolchain (working).** `sexpr.zig` + `wat.zig` (WAT→wasm binary) + `wast.zig` (WAST script
   runner) — `wazmrt <file.wast>` **runs the official spec testsuite** (thousands of assertions pass; see
-  `testing.md`). Next: multi-value + typed `select`, then `table`/`call_indirect`.
+  `testing.md`). The assembler now covers control flow + multi-value/type-index block types,
+  `call_indirect` + multi-table + `elem`, globals (incl. imported + extended-const), reference types,
+  and the reference-type table ops. Next: passive element segments + `table.init`/`.copy`,
+  `register`/module-linking, imported functions.

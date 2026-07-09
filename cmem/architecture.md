@@ -7,9 +7,10 @@ The standard wasm-runtime stages. Only the first is implemented today; each late
 
 ```text
 bytes ──► DECODE ──► VALIDATE ──► INSTANTIATE ──► EXECUTE
-          (done)     (done)       (done*)         (done* — int/float/memory)
+          (done)     (done)       (done*)         (done* — see below)
 ```
-*no host imports / call_indirect yet
+*core-MVP + reference types + multi-table + reference-type table ops all run; imported *functions* and
+`register`/module-linking are the main remaining execution slices.
 
 - **DECODE** (`Module.decode`) — validate the 8-byte header (`\0asm` magic + version 1), index the
   top-level sections, and decode the type / import / function / table / memory / global / export / code
@@ -33,11 +34,16 @@ bytes ──► DECODE ──► VALIDATE ──► INSTANTIATE ──► EXECUT
   `Instance.invoke(name, args)` runs the switch interpreter (Option A): untyped `u64` value slots, a
   per-call label stack, a branch that carries block/loop arity and resets the stack. **Implemented:**
   i32/i64 **and f32/f64** arithmetic/comparison/bitwise, all conversions (incl. trapping float→int,
-  IEEE `min`/`max`/`nearest`, reinterpret), locals, globals (zero-init), `drop`, `select`, structured
-  control flow, direct `call`, **linear memory** (allocate min pages + active data-segment init;
-  load/store all widths, `memory.size`/`grow`), and traps (`unreachable`, div-by-zero, overflow,
-  call-depth, invalid-float→int, memory-out-of-bounds). **Deferred (trap):** `call_indirect` + tables,
-  host-import calls. **Verified on real modules:** `Instance.invoke` runs the whole `wasm_mod` corpus
+  IEEE `min`/`max`/`nearest`, reinterpret), locals, **globals** (init const-exprs evaluated — imported
+  host values + extended-const `add`/`sub`/`mul`), `drop`/`select` + typed `select`, structured control
+  flow with multi-value/type-index block types, direct `call` and **`call_indirect` over multiple
+  tables**, **reference types** (`ref.null`/`ref.is_null`/`ref.func`, funcref/externref values), the
+  **reference-type table ops** (`table.get`/`.set`/`.size`/`.grow`/`.fill`; tables are `[]Value` slots
+  so funcref + externref share one representation), **linear memory** (allocate min pages + active
+  data-segment init; load/store all widths, `memory.size`/`grow`), and traps (`unreachable`,
+  div-by-zero, overflow, call-depth, invalid-float→int, out-of-bounds memory/table, uninitialized/
+  mismatched indirect call). **Deferred (trap / unbuilt):** imported *function* calls, passive element
+  segments + `table.init`/`.copy`, `register`/module-linking. **Verified on real modules:** `Instance.invoke` runs the whole `wasm_mod` corpus
   to its `.test.json` expected values (`fib(20)=6765`, `fac(7)=5040`, `sieve(30)=10` via memory) — the
   CLI gained a run mode `wazmrt <file.wasm> <export> [args…]`.
 
@@ -54,7 +60,7 @@ the whole pipeline and **runs the official spec testsuite** (`wazmrt <file.wast>
 | `types.zig` | `magic`, `supported_version`, `SectionId`, `ValType` (binary opcodes), `ExternKind`, `DecodeError`. Dependency-free so it compiles for every target. |
 | `Reader.zig` | Allocation-free cursor (file-as-`@This()` struct): `readByte`/`readBytes`/`readU32Le`, unsigned + signed LEB, float-bit reads. Bounds-checked. |
 | `Module.zig` | `decode(gpa, bytes) → Module`; arena-owned; `FuncType`/`Limits`/`TableType`/`MemoryType`/`GlobalType`/`Extern`, `Import`/`Export` (resolved `Extern`), `Local`/`Code`, `func_types`/`functions`/`code`/`globals`/`memories`/`data`/`sections`; `funcType`/`importedFuncCount`/`section` helpers. |
-| `opcode.zig` | The shared instruction authority: `Op` enum (0x00–0xC4), `Imm`/`Instr`, `immediateKind`, `decodeBody`. |
+| `opcode.zig` | The shared instruction authority: `Op` enum (core-MVP 0x00–0xC4 + `table.get`/`.set` 0x25/26 + reference types 0xD0–D2 + `0xFC` table ops via internal tags/`fcSubOpcode`), `Imm`/`Instr`, `immediateKind`, `decodeBody`. |
 | `validate.zig` | `validate(gpa, module)`: spec Appendix type-check over the IR (value + control-frame stacks). |
 | `interp.zig` | `Instance` (init/deinit/invoke), the switch interpreter (`Frame`, `execNumeric`/`execFloat`/`execMemory`), `Value` (u64) helpers. |
 | `sexpr.zig` / `wat.zig` / `wast.zig` | Text toolchain: S-expression parser / WAT-text assembler / WAST script runner (runs the spec testsuite). |
