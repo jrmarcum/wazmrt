@@ -101,6 +101,7 @@ Run a `.wast` file directly: `wazmrt <file.wast>` → `N passed, N failed, N ski
 | `fac.wast` | **6 passed, 0 failed** (1 skipped) |
 | `select.wast` | **124 passed, 0 failed** (30 skipped) |
 | `local_tee.wast` | **55 passed, 0 failed** (42 skipped) |
+| `global.wast` | **62 passed, 1 failed** (53 skipped — 1 module needs `register`/linking) |
 
 - **`skipped`** = commands the MVP runner doesn't handle (`assert_invalid`/`assert_malformed`,
   `register`, `get`), *plus* asserts whose module failed to build.
@@ -154,6 +155,17 @@ element flags (`0x02` + tableidx + elemkind for non-zero tables). `floatBits` no
 fail identically before and after (pre-existing feature gaps: `table.get`/`.set`, passive/imported
 element segments, imported globals — the next features), while `elem`/`stack` improved. Numeric suites
 unchanged.
+
+**Update 2026-07-09 — imported globals + extended-const init expressions:** `global.wast` 0 →
+**62 passed, 1 failed**. `Instance.initWithImports` fills imported-global slots from host-supplied
+values (imports occupy the head of the global index space); the WAST runner backs the standard
+`spectest` globals (`global_i32`/`i64` = 666, `global_f32`/`f64` = 666.6); the assembler parses
+`(global (import "m" "n") type)` and emits an **import section (2)**; `ref.null`/`ref.func` are accepted
+in const-init exprs; and `evalConstExpr` became a small stack machine so **compound (extended-const)
+inits** like `(i32.add (i32.mul (i32.const 20) (i32.const 2)) (i32.const 2))` evaluate correctly
+(previously only the first instruction was read → wrong value). The lone remaining `global.wast` failure
+is one module needing `register`/module-linking + `table.get` + element-init-expressions. **No
+regressions** (HEAD-baselined: `data` 0/13 and `memory`'s slowness are pre-existing).
 
 ## What this tells the roadmap
 

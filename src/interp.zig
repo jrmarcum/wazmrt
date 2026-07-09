@@ -7,11 +7,12 @@
 //! per-call label stack plus a branch-target table precomputed once per function
 //! at instantiation (matching `end`/`else` for every `block`/`loop`/`if`).
 //!
-//! **Scope today:** integer core-MVP — i32/i64 arithmetic, comparison, bitwise,
-//! integer conversions, locals, globals (zero-initialized for now), `drop`,
-//! `select`, structured control flow, and direct `call`. Float ops, memory
-//! load/store, `call_indirect`, and host-import calls trap with a clear error;
-//! they are the next execution slices.
+//! **Scope today:** the core-MVP instruction set plus reference types — i32/i64/
+//! f32/f64 numeric ops, locals, globals (init const-exprs evaluated, incl.
+//! extended-const and imported-global values), linear memory, `drop`/`select`,
+//! structured control flow, direct `call`, `call_indirect` over multiple tables,
+//! and `ref.null`/`ref.is_null`/`ref.func`. Imported *functions* still trap
+//! (`UnsupportedImportCall`) — host-function calls are the next execution slice.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -144,7 +145,18 @@ pub const Instance = struct {
     /// `null_func` = uninitialized). Each is `gpa`-allocated; the outer slice too.
     tables: []const []u32,
 
+    /// Host-supplied values for a module's imports. Today only imported globals
+    /// are backed (in module-import order); imported functions/tables/memories
+    /// remain unbacked (calling one traps).
+    pub const Imports = struct {
+        globals: []const Value = &.{},
+    };
+
     pub fn init(gpa: std.mem.Allocator, module: *const Module) Error!Instance {
+        return initWithImports(gpa, module, .{});
+    }
+
+    pub fn initWithImports(gpa: std.mem.Allocator, module: *const Module, imports: Imports) Error!Instance {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const a = arena.allocator();
@@ -168,9 +180,13 @@ pub const Instance = struct {
 
         const globals = try a.alloc(Value, module.globals.len);
         @memset(globals, 0);
-        // Evaluate defined-global init expressions. Defined globals occupy the
-        // tail of the index space, after any imported globals.
+        // Imported globals occupy the head of the index space; fill them from the
+        // host-supplied values. Defined globals (each with an init expr) follow.
         const defined_start = module.globals.len - module.global_inits.len;
+        for (imports.globals, 0..) |gv, i| {
+            if (i >= defined_start) break;
+            globals[i] = gv;
+        }
         for (module.global_inits, 0..) |init_expr, gi|
             globals[defined_start + gi] = try evalConstExpr(globals[0 .. defined_start + gi], init_expr);
 
@@ -836,39 +852,73 @@ const Frame = struct {
     }
 };
 
-/// Evaluate a constant offset expression (data-segment offset): a single
-/// `i32.const` or `global.get`, then `end`.
+/// Evaluate a constant offset expression (data / element segment offset) to an
+/// i32 address.
 fn evalConstOffset(module: *const Module, globals: []const Value, expr: []const u8) Error!u32 {
     _ = module;
-    var r = Reader.init(expr);
-    const val: i32 = switch (try r.readByte()) {
-        0x41 => try r.readVarI32(), // i32.const
-        0x23 => blk: { // global.get
-            const gi = try r.readVarU32();
-            if (gi >= globals.len) return error.UndefinedGlobal;
-            break :blk asI32(globals[gi]);
-        },
-        else => return error.UnsupportedInstruction,
-    };
-    return @bitCast(val);
+    return @bitCast(asI32(try evalConstExpr(globals, expr)));
 }
 
-/// Evaluate a global's init const-expr (§3.3.7): a single `*.const`,
-/// `global.get` (of a preceding global), then `end`. Returns the raw slot.
+/// Evaluate a constant expression (§3.3.7, incl. the extended-const `i32`/`i64`
+/// `add`/`sub`/`mul`): a short stack machine over `*.const`, `global.get` (of a
+/// preceding global), `ref.null`/`ref.func`, terminated by `end`. Returns the
+/// single resulting slot.
 fn evalConstExpr(globals: []const Value, expr: []const u8) Error!Value {
     var r = Reader.init(expr);
-    return switch (try r.readByte()) {
-        0x41 => i32Value(try r.readVarI32()), // i32.const
-        0x42 => i64Value(try r.readVarI64()), // i64.const
-        0x43 => std.mem.readInt(u32, (try r.readBytes(4))[0..4], .little), // f32.const
-        0x44 => std.mem.readInt(u64, (try r.readBytes(8))[0..8], .little), // f64.const
-        0x23 => blk: { // global.get
-            const gi = try r.readVarU32();
-            if (gi >= globals.len) return error.UndefinedGlobal;
-            break :blk globals[gi];
-        },
-        else => return error.UnsupportedInstruction,
-    };
+    var stack: [16]Value = undefined;
+    var sp: usize = 0;
+    const push = struct {
+        fn f(s: *[16]Value, p: *usize, v: Value) Error!void {
+            if (p.* >= s.len) return error.UnsupportedInstruction;
+            s[p.*] = v;
+            p.* += 1;
+        }
+    }.f;
+    while (true) {
+        const op = try r.readByte();
+        switch (op) {
+            0x0b => break, // end
+            0x41 => try push(&stack, &sp, i32Value(try r.readVarI32())), // i32.const
+            0x42 => try push(&stack, &sp, i64Value(try r.readVarI64())), // i64.const
+            0x43 => try push(&stack, &sp, std.mem.readInt(u32, (try r.readBytes(4))[0..4], .little)), // f32.const
+            0x44 => try push(&stack, &sp, std.mem.readInt(u64, (try r.readBytes(8))[0..8], .little)), // f64.const
+            0x23 => { // global.get
+                const gi = try r.readVarU32();
+                if (gi >= globals.len) return error.UndefinedGlobal;
+                try push(&stack, &sp, globals[gi]);
+            },
+            0xd0 => { // ref.null <heaptype>
+                _ = try r.readByte();
+                try push(&stack, &sp, null_ref);
+            },
+            0xd2 => try push(&stack, &sp, @as(Value, try r.readVarU32())), // ref.func <funcidx>
+            0x6a, 0x6b, 0x6c => { // i32 add / sub / mul
+                if (sp < 2) return error.UnsupportedInstruction;
+                const b = asI32(stack[sp - 1]);
+                const a = asI32(stack[sp - 2]);
+                sp -= 1;
+                stack[sp - 1] = i32Value(switch (op) {
+                    0x6a => a +% b,
+                    0x6b => a -% b,
+                    else => a *% b,
+                });
+            },
+            0x7c, 0x7d, 0x7e => { // i64 add / sub / mul
+                if (sp < 2) return error.UnsupportedInstruction;
+                const b = asI64(stack[sp - 1]);
+                const a = asI64(stack[sp - 2]);
+                sp -= 1;
+                stack[sp - 1] = i64Value(switch (op) {
+                    0x7c => a +% b,
+                    0x7d => a -% b,
+                    else => a *% b,
+                });
+            },
+            else => return error.UnsupportedInstruction,
+        }
+    }
+    if (sp == 0) return error.UnsupportedInstruction;
+    return stack[sp - 1];
 }
 
 /// Shared integer binary-op semantics for i32 (S=i32,U=u32) and i64.

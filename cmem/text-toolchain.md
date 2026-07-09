@@ -82,9 +82,15 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
    tracks table names, resolves `call_indirect $t` (gated on a following `(type …)` annotation so a
    flat `call_indirect select` isn't misread), emits per-table element flags (`0x02`). `floatBits`
    parses `nan:canonical`/`nan:arithmetic`/`nan:0x<payload>`. `call_indirect.wast` 120/1 → **132/0**,
-   `local_tee.wast` 0 → **55/0**; no regressions (HEAD-baselined). **Next:** `table.get`/`.set` +
-   passive/imported element segments, imported globals (→ host imports / WASI). Standing conformance
-   gate (`testing.md`).
+   `local_tee.wast` 0 → **55/0**; no regressions (HEAD-baselined).
+9. ~~Imported globals + extended-const init expressions~~ **DONE 2026-07-09**. `Instance.initWithImports`
+   fills imported-global slots from host values (imports head the global index space); the WAST runner
+   backs the standard `spectest` globals; the assembler parses `(global (import "m" "n") type)` and
+   emits an import section (2); `ref.null`/`ref.func` work in const-inits; and `evalConstExpr` is now a
+   small stack machine so compound extended-const inits (`i32.add`/`sub`/`mul` etc.) evaluate correctly.
+   `global.wast` 0 → **62/1** (lone failure needs `register`/linking). **Next:** `table.get`/`.set` +
+   passive/declarative element segments, imported functions/tables/memories (→ host imports / WASI),
+   `register`/multi-module linking. Standing conformance gate (`testing.md`).
 
 ## Notes / invariants
 

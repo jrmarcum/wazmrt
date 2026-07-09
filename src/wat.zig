@@ -10,9 +10,11 @@
 //! and top-level `(export …)`, the full non-control instruction set, structured
 //! control flow (`block`/`loop`/`if`, `br*`) with single-result/multi-value/
 //! type-index block types, memory + data, tables + `elem` + `call_indirect`, and
-//! globals (`(global (mut? t) init)` + `global.get`/`.set`) — in both folded
+//! globals (`(global (mut? t) init)`, incl. imported globals + extended-const
+//! inits, `global.get`/`.set`), and reference types (`ref.null`/`ref.is_null`/
+//! `ref.func`, `(ref null? func|extern)`) — in both folded
 //! `(i32.add (local.get 0) (local.get 1))` and flat forms. Deferred: `start`,
-//! imports, and reference-type instructions (`ref.func`/`ref.null`).
+//! imported functions/tables/memories, `table.get`/`.set`.
 
 const std = @import("std");
 const sexpr = @import("sexpr.zig");
@@ -58,6 +60,8 @@ const TableDef = struct { min: u32, max: ?u32 };
 const ElemDef = struct { table_index: u32, offset: i64, funcs: []const Sexpr };
 /// A defined global: its value type, mutability, and (unencoded) init const-expr.
 const GlobalDef = struct { valtype: V, mutable: bool, init: Sexpr };
+/// An imported global (`(global (import "m" "n") type)`).
+const ImportedGlobal = struct { module: []const u8, name: []const u8, valtype: V, mutable: bool };
 
 /// Assemble the first `(module …)` form found in `src`.
 pub fn assemble(a: std.mem.Allocator, src: []const u8) Error![]const u8 {
@@ -81,6 +85,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     var sigs: List(Sig) = .empty;
     var type_names: List(?[]const u8) = .empty;
     var globals: List(GlobalDef) = .empty;
+    var global_imports: List(ImportedGlobal) = .empty;
     var global_names: List(?[]const u8) = .empty;
     var mem_min: ?u32 = null;
     var mem_max: ?u32 = null;
@@ -116,7 +121,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             };
             try exports.append(a, .{ .name = name, .kind = kind, .index = idx });
         } else if (std.mem.eql(u8, kw, "global")) {
-            try parseGlobal(a, items, &globals, &global_names, &exports);
+            try parseGlobal(a, items, &globals, &global_imports, &global_names, &exports);
         } else if (std.mem.eql(u8, kw, "memory")) {
             var mi: usize = 1;
             if (mi < items.len and isId(items[mi])) mi += 1; // optional $name
@@ -170,6 +175,19 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             try valTypeVec(a, &s, sig.results);
         }
         try emitSection(a, &out, 1, s.items);
+    }
+    // Import section (2) — imported globals (funcs/tables/memories not yet assembled)
+    if (global_imports.items.len != 0) {
+        var s: List(u8) = .empty;
+        try uleb(a, &s, global_imports.items.len);
+        for (global_imports.items) |g| {
+            try nameBytes(a, &s, g.module);
+            try nameBytes(a, &s, g.name);
+            try s.append(a, 0x03); // global import
+            try s.append(a, @intFromEnum(g.valtype));
+            try s.append(a, if (g.mutable) 0x01 else 0x00);
+        }
+        try emitSection(a, &out, 2, s.items);
     }
     // Function section (3)
     {
@@ -359,17 +377,25 @@ fn parseElem(a: std.mem.Allocator, items: []const Sexpr, elems: *List(ElemDef), 
     try elems.append(a, .{ .table_index = table_index, .offset = offset, .funcs = items[i..] });
 }
 
-/// `(global $name? (export "x")* (mut? valtype) init-expr)`.
-fn parseGlobal(a: std.mem.Allocator, items: []const Sexpr, globals: *List(GlobalDef), global_names: *List(?[]const u8), exports: *List(ExportDef)) Error!void {
+/// `(global $name? (export "x")* (import "m" "n")? (mut? valtype) init-expr?)`.
+fn parseGlobal(a: std.mem.Allocator, items: []const Sexpr, globals: *List(GlobalDef), global_imports: *List(ImportedGlobal), global_names: *List(?[]const u8), exports: *List(ExportDef)) Error!void {
     var i: usize = 1;
     var name: ?[]const u8 = null;
     if (i < items.len and isId(items[i])) {
         name = items[i].atom;
         i += 1;
     }
-    const idx: u32 = @intCast(globals.items.len);
+    // The global-space index this entry will occupy (imports precede definitions).
+    const idx: u32 = @intCast(global_names.items.len);
     while (i < items.len and eqKw(items[i], "export")) : (i += 1)
         try exports.append(a, .{ .name = items[i].asList().?[1].string, .kind = 3, .index = idx });
+    // Optional inline import: `(import "module" "name")`.
+    var imp: ?struct { module: []const u8, name: []const u8 } = null;
+    if (i < items.len and eqKw(items[i], "import")) {
+        const l = items[i].asList().?;
+        imp = .{ .module = l[1].string, .name = l[2].string };
+        i += 1;
+    }
     // Global type: `valtype` or `(mut valtype)`.
     var mutable = false;
     var valtype: V = undefined;
@@ -380,7 +406,11 @@ fn parseGlobal(a: std.mem.Allocator, items: []const Sexpr, globals: *List(Global
         valtype = try parseValType(items[i]);
     }
     i += 1;
-    try globals.append(a, .{ .valtype = valtype, .mutable = mutable, .init = items[i] });
+    if (imp) |m| {
+        try global_imports.append(a, .{ .module = m.module, .name = m.name, .valtype = valtype, .mutable = mutable });
+    } else {
+        try globals.append(a, .{ .valtype = valtype, .mutable = mutable, .init = items[i] });
+    }
     try global_names.append(a, name);
 }
 
@@ -1173,6 +1203,34 @@ test "assembles a type-reference block type" {
         \\    (block (type $sig) (i32.const 42))))
     ;
     try std.testing.expectEqual(@as(i32, 42), interp.asI32(try assembleAndRun(src, "b", &.{})));
+}
+
+test "evaluates a compound (extended-const) global init" {
+    const src =
+        \\(module
+        \\  (global $g i32 (i32.add (i32.mul (i32.const 20) (i32.const 2)) (i32.const 2)))
+        \\  (func (export "get") (result i32) (global.get $g)))
+    ;
+    // 20*2 + 2 = 42.
+    try std.testing.expectEqual(@as(i32, 42), interp.asI32(try assembleAndRun(src, "get", &.{})));
+}
+
+test "reads an imported global from the host value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bin = try assemble(a,
+        \\(module
+        \\  (global (import "env" "x") i32)
+        \\  (global $y i32 (i32.add (global.get 0) (i32.const 1)))
+        \\  (func (export "get-x") (result i32) (global.get 0))
+        \\  (func (export "get-y") (result i32) (global.get $y)))
+    );
+    var m = try Module.decode(a, bin);
+    var inst = try interp.Instance.initWithImports(a, &m, .{ .globals = &.{interp.i32Value(777)} });
+    try std.testing.expectEqual(@as(i32, 777), interp.asI32((try inst.invoke("get-x", &.{}))[0]));
+    // A defined global's init may read the imported one: 777 + 1.
+    try std.testing.expectEqual(@as(i32, 778), interp.asI32((try inst.invoke("get-y", &.{}))[0]));
 }
 
 test "dispatches call_indirect through distinct named tables" {

@@ -80,7 +80,18 @@ const Runner = struct {
         const m = try self.a.create(Module);
         m.* = try Module.decode(self.a, bin);
         try validate(self.a, m);
-        return interp.Instance.init(self.a, m);
+        return interp.Instance.initWithImports(self.a, m, try self.resolveImports(m));
+    }
+
+    /// Provide host values for a module's imported globals. Only the standard
+    /// `spectest` globals are backed; anything else defaults to zero.
+    fn resolveImports(self: *Runner, m: *const Module) !interp.Instance.Imports {
+        var gs: std.ArrayList(Value) = .empty;
+        for (m.imports) |imp| {
+            if (imp.type != .global) continue;
+            try gs.append(self.a, spectestGlobal(imp.module, imp.name) orelse 0);
+        }
+        return .{ .globals = gs.items };
     }
 
     fn moduleBinary(self: *Runner, form: []const Sexpr) ![]const u8 {
@@ -127,9 +138,10 @@ const Runner = struct {
             self.fail("assert_return: arity {d} != expected {d}", .{ results.len, expected.len });
             return;
         }
+        const action_name: []const u8 = if (form[1].asList()) |l| (if (l.len > 1) l[1].string else "?") else "?";
         for (results, expected) |got, exp_form| {
             if (!try matches(got, exp_form)) {
-                self.fail("assert_return: result mismatch (got 0x{x})", .{got});
+                self.fail("assert_return \"{s}\": result mismatch (got 0x{x})", .{ action_name, got });
                 return;
             }
         }
@@ -153,6 +165,17 @@ const Runner = struct {
 
 /// Null reference sentinel — must match `interp`'s `null_ref` on the value stack.
 const null_ref: Value = std.math.maxInt(u64);
+
+/// The standard testsuite `spectest` host globals (immutable), as their raw slot
+/// bits. Modules import these to test imported-global handling.
+fn spectestGlobal(module: []const u8, name: []const u8) ?Value {
+    if (!std.mem.eql(u8, module, "spectest")) return null;
+    if (std.mem.eql(u8, name, "global_i32")) return interp.i32Value(666);
+    if (std.mem.eql(u8, name, "global_i64")) return interp.i64Value(666);
+    if (std.mem.eql(u8, name, "global_f32")) return interp.f32Value(666.6);
+    if (std.mem.eql(u8, name, "global_f64")) return interp.f64Value(666.6);
+    return null;
+}
 
 /// Parse a concrete value literal (for invoke arguments): `(TYPE.const literal)`
 /// or a reference literal (`(ref.null …)`, `(ref.extern N)`, `(ref.func N)`).
