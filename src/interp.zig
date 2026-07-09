@@ -65,16 +65,14 @@ pub const Error = Module.Error || error{
     CallStackExhausted,
     /// No exported function with the requested name.
     UndefinedExport,
-    /// The named export is not a function.
-    ExportNotFunction,
     /// Wrong number of arguments for the invoked function.
     BadArgCount,
     /// Function index out of range (should not happen post-validation).
     UndefinedFunc,
     /// Calling an imported (host) function — not yet supported.
     UnsupportedImportCall,
-    /// An opcode this interpreter slice does not execute yet (call_indirect,
-    /// reference types).
+    /// An opcode this interpreter slice does not execute yet (e.g. an unhandled
+    /// const-expr opcode, or a `0xFC`/SIMD op with no runtime support).
     UnsupportedInstruction,
     /// A float→int truncation of NaN, infinity, or an out-of-range value.
     InvalidConversionToInt,
@@ -210,6 +208,9 @@ pub const Instance = struct {
             memory = buf;
             mem_max = mt.limits.max;
         }
+        // Cover errors raised after the memory block (table alloc / element init);
+        // the inner `errdefer gpa.free(buf)` only covers the data-segment loop.
+        errdefer if (memory) |m| gpa.free(m);
 
         // Tables: allocate each declared table's minimum, then apply active
         // element segments to their target table. Entries are `Value` slots
@@ -220,8 +221,11 @@ pub const Instance = struct {
         errdefer gpa.free(tables);
         const table_max = try gpa.alloc(?u32, module.tables.len);
         errdefer gpa.free(table_max);
+        var n_tables_alloc: usize = 0;
+        errdefer for (tables[0..n_tables_alloc]) |t| gpa.free(t);
         for (tables, table_max, module.tables) |*t, *tmax, tt| {
             t.* = try gpa.alloc(Value, tt.limits.min);
+            n_tables_alloc += 1;
             @memset(t.*, null_ref);
             tmax.* = tt.limits.max;
         }
@@ -510,7 +514,7 @@ const Frame = struct {
                     pc += 1;
                 },
                 .table_size => {
-                    try self.pushI32(@intCast(self.inst.tables[instr.imm.table].len));
+                    try self.pushI32(@bitCast(@as(u32, @intCast(self.inst.tables[instr.imm.table].len))));
                     pc += 1;
                 },
                 .table_grow => {
@@ -530,7 +534,7 @@ const Frame = struct {
                         };
                         @memset(grown[old.len..], init_val);
                         self.inst.tables[ti] = grown;
-                        try self.pushI32(@intCast(old.len));
+                        try self.pushI32(@bitCast(@as(u32, @intCast(old.len))));
                     }
                     pc += 1;
                 },
@@ -757,7 +761,7 @@ const Frame = struct {
             // are identity on the stack value.
             .i32_reinterpret_f32, .f32_reinterpret_i32, .i64_reinterpret_f64, .f64_reinterpret_i64 => {},
 
-            else => return error.UnsupportedInstruction, // memory, call_indirect, ref-types
+            else => return error.UnsupportedInstruction, // defensive: not a numeric/convert op
         }
     }
 

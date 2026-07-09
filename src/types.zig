@@ -75,7 +75,8 @@ pub const DecodeError = error{
     UnknownExternKind,
     /// A type/function/extern index referred outside the decoded space.
     IndexOutOfRange,
-    /// An instruction opcode wazmrt does not yet decode (SIMD, bulk-memory,
-    /// reference-type ops, and multi-byte block-type indices for now).
+    /// An instruction opcode wazmrt does not yet decode (SIMD `0xFD`, the
+    /// unimplemented `0xFC` ops — bulk-memory, `table.init`/`.copy`, saturating
+    /// truncation — for now).
     UnsupportedOpcode,
 };

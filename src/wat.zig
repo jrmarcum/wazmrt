@@ -9,12 +9,13 @@
 //! **Scope today:** `(func …)` with named/anonymous params/results/locals, inline
 //! and top-level `(export …)`, the full non-control instruction set, structured
 //! control flow (`block`/`loop`/`if`, `br*`) with single-result/multi-value/
-//! type-index block types, memory + data, tables + `elem` + `call_indirect`, and
-//! globals (`(global (mut? t) init)`, incl. imported globals + extended-const
-//! inits, `global.get`/`.set`), and reference types (`ref.null`/`ref.is_null`/
-//! `ref.func`, `(ref null? func|extern)`) — in both folded
-//! `(i32.add (local.get 0) (local.get 1))` and flat forms. Deferred: `start`,
-//! imported functions/tables/memories, `table.get`/`.set`.
+//! type-index block types, memory + data, tables (funcref/externref) + `elem` +
+//! `call_indirect`, the reference-type table ops (`table.get`/`.set`/`.size`/
+//! `.grow`/`.fill`), globals (`(global (mut? t) init)`, incl. imported globals +
+//! extended-const inits, `global.get`/`.set`), and reference types
+//! (`ref.null`/`ref.is_null`/`ref.func`, `(ref null? func|extern)`) — in both
+//! folded `(i32.add (local.get 0) (local.get 1))` and flat forms. Deferred:
+//! `start`, imported functions/tables/memories, `table.init`/`.copy`.
 
 const std = @import("std");
 const sexpr = @import("sexpr.zig");
@@ -109,15 +110,17 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             try funcs.append(a, f);
             try func_names.append(a, f.name);
         } else if (std.mem.eql(u8, kw, "export")) {
-            // (export "name" (func|memory|global|table $id|N))
+            // (export "name" (func|table|memory|global $id|N))
             const name = items[1].string;
             const target = items[2].asList().?;
             const tkw = target[0].asAtom().?;
-            const kind: u8 = if (std.mem.eql(u8, tkw, "memory")) 2 else if (std.mem.eql(u8, tkw, "global")) 3 else if (std.mem.eql(u8, tkw, "table")) 1 else 0;
+            const kind: u8 = if (std.mem.eql(u8, tkw, "func")) 0 else if (std.mem.eql(u8, tkw, "table")) 1 else if (std.mem.eql(u8, tkw, "memory")) 2 else if (std.mem.eql(u8, tkw, "global")) 3 else return error.BadModuleField;
             const idx: u32 = switch (kind) {
-                2, 1 => 0, // single memory / table 0
+                0 => try resolveByName(func_names.items, target[1]),
+                1 => try resolveByName(table_names.items, target[1]),
+                2 => 0, // single memory
                 3 => try resolveByName(global_names.items, target[1]),
-                else => try resolveByName(func_names.items, target[1]),
+                else => unreachable,
             };
             try exports.append(a, .{ .name = name, .kind = kind, .index = idx });
         } else if (std.mem.eql(u8, kw, "global")) {
@@ -407,6 +410,7 @@ fn parseGlobal(a: std.mem.Allocator, items: []const Sexpr, globals: *List(Global
         i += 1;
     }
     // Global type: `valtype` or `(mut valtype)`.
+    if (i >= items.len) return error.BadModuleField;
     var mutable = false;
     var valtype: V = undefined;
     if (items[i].asList()) |gt| {
@@ -419,6 +423,8 @@ fn parseGlobal(a: std.mem.Allocator, items: []const Sexpr, globals: *List(Global
     if (imp) |m| {
         try global_imports.append(a, .{ .module = m.module, .name = m.name, .valtype = valtype, .mutable = mutable });
     } else {
+        // A defined global requires an init const-expr.
+        if (i >= items.len) return error.BadModuleField;
         try globals.append(a, .{ .valtype = valtype, .mutable = mutable, .init = items[i] });
     }
     try global_names.append(a, name);
@@ -1240,6 +1246,28 @@ test "assembles a type-reference block type" {
         \\    (block (type $sig) (i32.const 42))))
     ;
     try std.testing.expectEqual(@as(i32, 42), interp.asI32(try assembleAndRun(src, "b", &.{})));
+}
+
+test "exports the correct table index (not hardcoded 0)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bin = try assemble(a,
+        \\(module
+        \\  (func $a) (func $b)
+        \\  (table $t0 funcref (elem $a))
+        \\  (table $t1 funcref (elem $b))
+        \\  (export "t1" (table $t1)))
+    );
+    const m = try Module.decode(a, bin);
+    var found = false;
+    for (m.exports) |e| {
+        if (std.mem.eql(u8, e.name, "t1")) {
+            try std.testing.expectEqual(@as(u32, 1), e.index); // $t1 is table index 1, not 0
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
 }
 
 test "table.size / table.grow / table.fill" {
