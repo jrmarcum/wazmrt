@@ -140,9 +140,9 @@ pub const Instance = struct {
     memory: ?[]u8,
     /// Maximum memory size in pages, if bounded.
     mem_max: ?u32,
-    /// Funcref table (entries are function indices; `null_func` = uninitialized),
-    /// or null if the module has no table. Allocated with `gpa`.
-    table: ?[]u32,
+    /// Funcref tables, one per module table (entries are function indices;
+    /// `null_func` = uninitialized). Each is `gpa`-allocated; the outer slice too.
+    tables: []const []u32,
 
     pub fn init(gpa: std.mem.Allocator, module: *const Module) Error!Instance {
         var arena = std.heap.ArenaAllocator.init(gpa);
@@ -193,21 +193,23 @@ pub const Instance = struct {
             mem_max = mt.limits.max;
         }
 
-        // Table: allocate the declared minimum, then apply active element segments.
-        var table: ?[]u32 = null;
-        if (module.tables.len > 0) {
-            const tbl = try gpa.alloc(u32, module.tables[0].limits.min);
-            errdefer gpa.free(tbl);
-            @memset(tbl, null_func);
-            for (module.elements) |elem| {
-                if (!elem.active) continue;
-                const offset = try evalConstOffset(module, globals, elem.offset_expr);
-                for (elem.funcs, 0..) |f, k| {
-                    if (@as(u64, offset) + k >= tbl.len) return error.TableOutOfBounds;
-                    tbl[offset + k] = f;
-                }
+        // Tables: allocate each declared table's minimum, then apply active
+        // element segments to their target table.
+        const tables = try gpa.alloc([]u32, module.tables.len);
+        errdefer gpa.free(tables);
+        for (tables, module.tables) |*t, tt| {
+            t.* = try gpa.alloc(u32, tt.limits.min);
+            @memset(t.*, null_func);
+        }
+        for (module.elements) |elem| {
+            if (!elem.active) continue;
+            if (elem.table_index >= tables.len) return error.NoTable;
+            const tbl = tables[elem.table_index];
+            const offset = try evalConstOffset(module, globals, elem.offset_expr);
+            for (elem.funcs, 0..) |f, k| {
+                if (@as(u64, offset) + k >= tbl.len) return error.TableOutOfBounds;
+                tbl[offset + k] = f;
             }
-            table = tbl;
         }
 
         return .{
@@ -219,13 +221,14 @@ pub const Instance = struct {
             .imported_funcs = module.importedFuncCount(),
             .memory = memory,
             .mem_max = mem_max,
-            .table = table,
+            .tables = tables,
         };
     }
 
     pub fn deinit(self: *Instance) void {
         if (self.memory) |m| self.gpa.free(m);
-        if (self.table) |t| self.gpa.free(t);
+        for (self.tables) |t| self.gpa.free(t);
+        self.gpa.free(self.tables);
         self.arena.deinit();
         self.* = undefined;
     }
@@ -447,7 +450,8 @@ const Frame = struct {
                 },
                 .call_indirect => {
                     const ci = instr.imm.call_indirect;
-                    const table = self.inst.table orelse return error.NoTable;
+                    if (ci.table >= self.inst.tables.len) return error.NoTable;
+                    const table = self.inst.tables[ci.table];
                     const slot = @as(u32, @bitCast(self.popI32())); // table element index (top of stack)
                     if (slot >= table.len) return error.TableOutOfBounds;
                     const f = table[slot];

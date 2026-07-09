@@ -97,9 +97,10 @@ Run a `.wast` file directly: `wazmrt <file.wast>` → `N passed, N failed, N ski
 | `block.wast` | **52 passed, 0 failed** (170 skipped) |
 | `if.wast` | **124 passed, 0 failed** (116 skipped) |
 | `loop.wast` | **77 passed, 0 failed** (42 skipped) |
-| `call_indirect.wast` | **120 passed, 1 failed** (49 skipped — multi-table) |
+| `call_indirect.wast` | **132 passed, 0 failed** (37 skipped) |
 | `fac.wast` | **6 passed, 0 failed** (1 skipped) |
 | `select.wast` | **124 passed, 0 failed** (30 skipped) |
+| `local_tee.wast` | **55 passed, 0 failed** (42 skipped) |
 
 - **`skipped`** = commands the MVP runner doesn't handle (`assert_invalid`/`assert_malformed`,
   `register`, `get`), *plus* asserts whose module failed to build.
@@ -140,6 +141,19 @@ encoded (single-table). **Remaining gaps are now two distinct features, not refe
 `call_indirect.wast`'s last failure and `local_tee.wast` need **multi-table** support (multiple
 `(table …)` + per-table element segments — today all elements collapse onto table 0) and **NaN-payload
 float literals** (`nan:0x…`/`inf`) in the WAT assembler, respectively. Numeric suites unchanged.
+
+**Update 2026-07-09 — multi-table + NaN-payload float literals landed:** `call_indirect.wast` 120/1 →
+**132/0** and `local_tee.wast` 0 → **55/0**. The interp now holds an array of tables (one funcref table
+per module table); `call_indirect` dispatches through `imm.table`, and element segments apply to their
+`table_index`. The assembler tracks table names, resolves `call_indirect $t`'s explicit table operand
+(gated so a *following* flat instruction like `call_indirect select` isn't mistaken for a table id —
+the id must be followed by a `(type …)`/`(param …)`/`(result …)` annotation), and emits per-table
+element flags (`0x02` + tableidx + elemkind for non-zero tables). `floatBits` now parses
+`nan:canonical`/`nan:arithmetic`/`nan:0x<payload>` (plain `nan`/`inf` already went through
+`std.fmt.parseFloat`). **Verified against HEAD: no regressions** — `global`/`table`/`func`/`br_table`
+fail identically before and after (pre-existing feature gaps: `table.get`/`.set`, passive/imported
+element segments, imported globals — the next features), while `elem`/`stack` improved. Numeric suites
+unchanged.
 
 ## What this tells the roadmap
 

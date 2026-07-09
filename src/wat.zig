@@ -54,8 +54,8 @@ const DataSeg = struct { offset: i64, bytes: []const u8 };
 /// A function type (for the type section): params → results.
 const Sig = struct { params: []const V, results: []const V };
 const TableDef = struct { min: u32, max: ?u32 };
-/// An active element segment (table 0); `funcs` are unresolved func references.
-const ElemDef = struct { offset: i64, funcs: []const Sexpr };
+/// An active element segment; `funcs` are unresolved func references.
+const ElemDef = struct { table_index: u32, offset: i64, funcs: []const Sexpr };
 /// A defined global: its value type, mutability, and (unencoded) init const-expr.
 const GlobalDef = struct { valtype: V, mutable: bool, init: Sexpr };
 
@@ -76,6 +76,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     var exports: List(ExportDef) = .empty;
     var datas: List(DataSeg) = .empty;
     var tables: List(TableDef) = .empty;
+    var table_names: List(?[]const u8) = .empty;
     var elems: List(ElemDef) = .empty;
     var sigs: List(Sig) = .empty;
     var type_names: List(?[]const u8) = .empty;
@@ -136,9 +137,9 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             }
             try datas.append(a, .{ .offset = try extractI32Const(items[1]), .bytes = bytes.items });
         } else if (std.mem.eql(u8, kw, "table")) {
-            try parseTable(a, items, &tables, &elems);
+            try parseTable(a, items, &tables, &table_names, &elems);
         } else if (std.mem.eql(u8, kw, "elem")) {
-            try parseElem(a, items, &elems);
+            try parseElem(a, items, &elems, table_names.items);
         } else {
             // `type` handled in the pre-pass; global/start/import deferred.
         }
@@ -154,7 +155,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     }
 
     var bodies: List([]const u8) = .empty;
-    for (funcs.items) |f| try bodies.append(a, try encodeBody(a, f, func_names.items, &sigs, type_names.items, global_names.items));
+    for (funcs.items) |f| try bodies.append(a, try encodeBody(a, f, func_names.items, &sigs, type_names.items, global_names.items, table_names.items));
 
     var out: List(u8) = .empty;
     try out.appendSlice(a, &.{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 }); // header
@@ -235,10 +236,16 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         var s: List(u8) = .empty;
         try uleb(a, &s, elems.items.len);
         for (elems.items) |e| {
-            try s.append(a, 0x00); // flags: active, table 0, offset expr, funcidx vec
+            if (e.table_index == 0) {
+                try s.append(a, 0x00); // flags: active, table 0, offset expr, funcidx vec
+            } else {
+                try s.append(a, 0x02); // flags: active, explicit table index, funcidx vec
+                try uleb(a, &s, e.table_index);
+            }
             try s.append(a, @intFromEnum(Op.i32_const));
             try sleb(a, &s, e.offset);
             try s.append(a, @intFromEnum(Op.end));
+            if (e.table_index != 0) try s.append(a, 0x00); // elemkind: funcref
             try uleb(a, &s, e.funcs.len);
             for (e.funcs) |ref| try uleb(a, &s, try resolveByName(func_names.items, ref));
         }
@@ -305,15 +312,21 @@ fn parseTypeDef(a: std.mem.Allocator, items: []const Sexpr, sigs: *List(Sig), ty
 }
 
 /// `(table $name? <min> <max>? funcref)` or `(table $name? funcref (elem …))`.
-fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef), elems: *List(ElemDef)) Error!void {
+fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef), table_names: *List(?[]const u8), elems: *List(ElemDef)) Error!void {
+    const table_index: u32 = @intCast(tables.items.len);
     var i: usize = 1;
-    if (i < items.len and isId(items[i])) i += 1; // $name
+    var name: ?[]const u8 = null;
+    if (i < items.len and isId(items[i])) {
+        name = items[i].atom;
+        i += 1;
+    }
+    try table_names.append(a, name);
     if (i < items.len and eqAtom(items[i], "funcref")) {
         i += 1;
         if (i < items.len and eqKw(items[i], "elem")) {
             const funcs = items[i].asList().?[1..];
             try tables.append(a, .{ .min = @intCast(funcs.len), .max = @intCast(funcs.len) });
-            try elems.append(a, .{ .offset = 0, .funcs = funcs });
+            try elems.append(a, .{ .table_index = table_index, .offset = 0, .funcs = funcs });
         } else {
             try tables.append(a, .{ .min = 0, .max = null });
         }
@@ -328,18 +341,22 @@ fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef
     }
 }
 
-/// `(elem $id? (table $t)? (i32.const N)|(offset …) func? $f …)` — active, table 0.
-fn parseElem(a: std.mem.Allocator, items: []const Sexpr, elems: *List(ElemDef)) Error!void {
+/// `(elem $id? (table $t)? (i32.const N)|(offset …) func? $f …)` — active segment.
+fn parseElem(a: std.mem.Allocator, items: []const Sexpr, elems: *List(ElemDef), table_names: []const ?[]const u8) Error!void {
     var i: usize = 1;
     if (i < items.len and isId(items[i])) i += 1; // segment $id
     // Declarative segment (`(elem declare func $f …)`) — a forward-declaration for
     // `ref.func`; it initializes no table, so nothing to emit.
     if (i < items.len and eqAtom(items[i], "declare")) return;
-    if (i < items.len and eqKw(items[i], "table")) i += 1; // explicit table index (assume 0)
+    var table_index: u32 = 0;
+    if (i < items.len and eqKw(items[i], "table")) {
+        table_index = try resolveByName(table_names, items[i].asList().?[1]);
+        i += 1;
+    }
     const offset = try extractI32Const(items[i]);
     i += 1;
     if (i < items.len and eqAtom(items[i], "func")) i += 1; // optional `func` marker
-    try elems.append(a, .{ .offset = offset, .funcs = items[i..] });
+    try elems.append(a, .{ .table_index = table_index, .offset = offset, .funcs = items[i..] });
 }
 
 /// `(global $name? (export "x")* (mut? valtype) init-expr)`.
@@ -480,12 +497,15 @@ const Ctx = struct {
     /// Global names (index-aligned with the global index space), for resolving
     /// `global.get $g` / `global.set $g`.
     global_names: []const ?[]const u8,
+    /// Table names (index-aligned with the table index space), for resolving the
+    /// explicit table operand of `call_indirect $t`.
+    table_names: []const ?[]const u8 = &.{},
     /// Control-flow label stack (innermost last), for resolving `br $name` to a
     /// relative depth.
     labels: List(?[]const u8) = .empty,
 };
 
-fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8) Error![]const u8 {
+fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, table_names: []const ?[]const u8) Error![]const u8 {
     var body: List(u8) = .empty;
     // Locals vector: one (count=1, type) group per declared local.
     try uleb(a, &body, f.locals.items.len);
@@ -493,7 +513,7 @@ fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, si
         try uleb(a, &body, 1);
         try body.append(a, @intFromEnum(t));
     }
-    var ctx: Ctx = .{ .a = a, .out = &body, .local_names = f.local_names.items, .func_names = func_names, .sigs = sigs, .type_names = type_names, .global_names = global_names };
+    var ctx: Ctx = .{ .a = a, .out = &body, .local_names = f.local_names.items, .func_names = func_names, .sigs = sigs, .type_names = type_names, .global_names = global_names, .table_names = table_names };
     try emitSeq(&ctx, f.body);
     try body.append(a, @intFromEnum(Op.end)); // implicit function end
     return body.items;
@@ -531,7 +551,7 @@ fn emitFoldedOne(ctx: *Ctx, l: []const Sexpr, i: usize) Error!usize {
             const ann = try parseCallIndirectType(ctx, l, 1);
             var j = ann.next;
             while (j < l.len) j = try emitOne(ctx, l, j); // operands
-            try emitCallIndirect(ctx, ann.idx);
+            try emitCallIndirect(ctx, ann.idx, ann.table);
         },
         else => try emitFoldedPlain(ctx, op, l),
     }
@@ -540,11 +560,16 @@ fn emitFoldedOne(ctx: *Ctx, l: []const Sexpr, i: usize) Error!usize {
 
 /// Parse a `call_indirect` type annotation (`(type $t)` and/or inline
 /// `(param)(result)`) from `items[start..]`; return its type index + next index.
-fn parseCallIndirectType(ctx: *Ctx, items: []const Sexpr, start: usize) Error!struct { idx: u32, next: usize } {
+fn parseCallIndirectType(ctx: *Ctx, items: []const Sexpr, start: usize) Error!struct { idx: u32, table: u32, next: usize } {
     var j = start;
-    // Optional explicit table index/id (`call_indirect $t (type …)`); the runtime
-    // is single-table today, so it is consumed but not encoded (emits table 0).
-    if (j < items.len and items[j].asAtom() != null) j += 1;
+    // Optional explicit table index/id — only when an atom is *followed by* a
+    // `(type …)`/`(param …)`/`(result …)` annotation (`call_indirect $t (type …)`).
+    // Otherwise a bare atom is the next instruction (e.g. flat `call_indirect select`).
+    var table: u32 = 0;
+    if (j + 1 < items.len and items[j].asAtom() != null and isTypeUse(items[j + 1])) {
+        table = try resolveByName(ctx.table_names, items[j]);
+        j += 1;
+    }
     var type_ref: ?Sexpr = null;
     var params: List(V) = .empty;
     var results: List(V) = .empty;
@@ -553,13 +578,20 @@ fn parseCallIndirectType(ctx: *Ctx, items: []const Sexpr, start: usize) Error!st
         if (std.mem.eql(u8, kw, "type")) type_ref = items[j].asList().?[1] else if (std.mem.eql(u8, kw, "param")) try parseDecls(ctx.a, items[j].asList().?, &params, null) else if (std.mem.eql(u8, kw, "result")) try parseDecls(ctx.a, items[j].asList().?, &results, null) else break;
     }
     const idx = if (type_ref) |tr| try resolveType(ctx.type_names, tr) else try internSig(ctx.a, ctx.sigs, params.items, results.items);
-    return .{ .idx = idx, .next = j };
+    return .{ .idx = idx, .table = table, .next = j };
 }
 
-fn emitCallIndirect(ctx: *Ctx, type_index: u32) Error!void {
+/// True if the form is a `call_indirect` type annotation: `(type …)` /
+/// `(param …)` / `(result …)`.
+fn isTypeUse(s: Sexpr) bool {
+    const kw = s.keyword() orelse return false;
+    return std.mem.eql(u8, kw, "type") or std.mem.eql(u8, kw, "param") or std.mem.eql(u8, kw, "result");
+}
+
+fn emitCallIndirect(ctx: *Ctx, type_index: u32, table: u32) Error!void {
     try ctx.out.append(ctx.a, @intFromEnum(Op.call_indirect));
     try uleb(ctx.a, ctx.out, type_index);
-    try uleb(ctx.a, ctx.out, 0); // table index 0
+    try uleb(ctx.a, ctx.out, table);
 }
 
 /// `(select (result t)* operand*)` — a `(result …)` annotation means typed select.
@@ -679,7 +711,7 @@ fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Erro
         },
         .call_indirect => {
             const ann = try parseCallIndirectType(ctx, items, i + 1);
-            try emitCallIndirect(ctx, ann.idx);
+            try emitCallIndirect(ctx, ann.idx, ann.table);
             return ann.next;
         },
         else => {
@@ -900,10 +932,31 @@ fn parseWatI64(s: Sexpr) Error!i64 {
 fn floatBits(ctx: *Ctx, comptime U: type, s: Sexpr) Error!void {
     const atom = s.asAtom() orelse return error.BadImmediate;
     const F = if (U == u32) f32 else f64;
-    const f = std.fmt.parseFloat(F, atom) catch return error.BadImmediate;
+    const bits = floatLitBits(U, F, atom) orelse return error.BadImmediate;
     var b: [@sizeOf(U)]u8 = undefined;
-    std.mem.writeInt(U, &b, @bitCast(f), .little);
+    std.mem.writeInt(U, &b, bits, .little);
     try ctx.out.appendSlice(ctx.a, &b);
+}
+
+/// Parse a WAT float literal to its bit pattern. `std.fmt.parseFloat` handles
+/// ordinary values plus plain `inf`/`nan`; this adds the wasm `nan:canonical` /
+/// `nan:arithmetic` / `nan:0x<payload>` forms. Returns null on a malformed literal.
+fn floatLitBits(comptime U: type, comptime F: type, lit: []const u8) ?U {
+    if (std.mem.indexOfScalar(u8, lit, ':')) |c| {
+        const canonical: U = if (F == f32) 0x7fc00000 else 0x7ff8000000000000;
+        const sign_bit: U = @as(U, 1) << (@bitSizeOf(F) - 1);
+        const mant_mask: U = (@as(U, 1) << std.math.floatMantissaBits(F)) - 1;
+        var bits: U = canonical;
+        const tail = lit[c + 1 ..];
+        if (!std.mem.eql(u8, tail, "canonical") and !std.mem.eql(u8, tail, "arithmetic")) {
+            const payload = std.fmt.parseInt(U, tail, 0) catch return null;
+            bits = (canonical & ~mant_mask) | (payload & mant_mask);
+        }
+        if (lit.len != 0 and lit[0] == '-') bits |= sign_bit;
+        return bits;
+    }
+    const f = std.fmt.parseFloat(F, lit) catch return null;
+    return @bitCast(f);
 }
 
 // --- Section / LEB helpers -------------------------------------------------
@@ -1120,6 +1173,21 @@ test "assembles a type-reference block type" {
         \\    (block (type $sig) (i32.const 42))))
     ;
     try std.testing.expectEqual(@as(i32, 42), interp.asI32(try assembleAndRun(src, "b", &.{})));
+}
+
+test "dispatches call_indirect through distinct named tables" {
+    const src =
+        \\(module
+        \\  (type $s (func (result i32)))
+        \\  (func $a (result i32) (i32.const 1))
+        \\  (func $b (result i32) (i32.const 2))
+        \\  (table $t0 funcref (elem $a))
+        \\  (table $t1 funcref (elem $b))
+        \\  (func (export "via0") (result i32) (call_indirect $t0 (type $s) (i32.const 0)))
+        \\  (func (export "via1") (result i32) (call_indirect $t1 (type $s) (i32.const 0))))
+    ;
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(src, "via0", &.{})));
+    try std.testing.expectEqual(@as(i32, 2), interp.asI32(try assembleAndRun(src, "via1", &.{})));
 }
 
 test "assembles reference types (ref.null / ref.func / ref.is_null)" {

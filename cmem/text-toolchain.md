@@ -40,9 +40,10 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
   **Multi-value block types + typed `select` DONE 2026-07-02** (type-index blocktypes interned into
   the type section; `select_t` 0x1c). **`call_indirect` + `table`/`elem` + `global` + `(type $t)`
   block-type references DONE 2026-07-09.** **Reference types (`ref.null`/`ref.is_null`/`ref.func`,
-  `(ref null? func|extern)` value types) DONE 2026-07-09.** **Deferred in wat.zig:** `start` section,
-  imports, multi-table (all elements collapse onto table 0 today), NaN-payload float literals
-  (`nan:0x…`/`inf`).
+  `(ref null? func|extern)` value types) + multi-table (per-table `elem`, `call_indirect $t`) +
+  NaN-payload float literals (`nan:canonical`/`nan:arithmetic`/`nan:0x…`) DONE 2026-07-09.**
+  **Deferred in wat.zig:** `start` section, imports, `table.get`/`.set`, passive/declarative element
+  segments beyond the `ref.func` forward-decl.
 - **`src/wast.zig`** (MVP DONE 2026-07-02) — WAST script runner: `(module …)` text +
   `(module binary …)`, `assert_return`, `assert_trap`, `invoke`; value literals incl.
   `nan:canonical`/`nan:arithmetic`; drives an `Instance` and compares (NaN-aware). CLI
@@ -75,10 +76,15 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
 7. ~~Reference types~~ **DONE 2026-07-09** (`ref.null`/`ref.is_null`/`ref.func` `0xD0`–`0xD2` across
    opcode/interp/validator; `(ref null? func|extern)` value types + heaptype immediates in the
    assembler; `(ref.null …)`/`(ref.extern N)`/`(ref.func)` value literals in the WAST runner). Null =
-   `maxInt(u64)` stack sentinel; a funcref is its function index. `select.wast` 0 → **124/0**. **Next:
-   multi-table** (multiple `(table …)` + per-table `elem`; today all elements collapse onto table 0,
-   which is `call_indirect.wast`'s + `local_tee.wast`'s last blocker alongside **NaN-payload float
-   literals** `nan:0x…`/`inf` in the assembler). Standing conformance gate (`testing.md`).
+   `maxInt(u64)` stack sentinel; a funcref is its function index. `select.wast` 0 → **124/0**.
+8. ~~Multi-table + NaN-payload float literals~~ **DONE 2026-07-09**. Interp holds an array of funcref
+   tables; `call_indirect` uses `imm.table`; element segments apply to their `table_index`. Assembler
+   tracks table names, resolves `call_indirect $t` (gated on a following `(type …)` annotation so a
+   flat `call_indirect select` isn't misread), emits per-table element flags (`0x02`). `floatBits`
+   parses `nan:canonical`/`nan:arithmetic`/`nan:0x<payload>`. `call_indirect.wast` 120/1 → **132/0**,
+   `local_tee.wast` 0 → **55/0**; no regressions (HEAD-baselined). **Next:** `table.get`/`.set` +
+   passive/imported element segments, imported globals (→ host imports / WASI). Standing conformance
+   gate (`testing.md`).
 
 ## Notes / invariants
 
