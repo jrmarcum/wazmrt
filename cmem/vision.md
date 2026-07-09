@@ -63,6 +63,41 @@ Prerequisites before this is possible: execution complete (incl. `call_indirect`
 WASI** (wasmtk's `wasi/` corpus needs it), and the C ABI grown to expose instantiate + call. Validate
 with the size/speed benchmark first (`roadmap.md`). "We'll see if it's achieved as wazmrt develops."
 
+## Candidate direction — wazmrt as the universalWasmLoader native backend (speculative, 2026-07-02)
+
+**Not decided; gated on wazmrt proving useful in wasmtk first.** The idea: replace the per-platform
+engine patchwork the `universalWasmLoader-*` ports use today (wasmtime for C/Rust/Py/.NET, wazero for
+Go, Chicory for JVM, host `WebAssembly` for web) with **one native wazmrt behind each language's FFI**.
+
+Benefits:
+
+- **Consistency** — one runtime, one WASI, one bug list across every native port (the actual point of a
+  "universal" loader).
+- **No heavy dependency** — wasmtime is megabytes + a Rust toolchain; wazmrt is a few hundred KB,
+  dependency-free, and self-owned.
+- **Low-friction swap** — wasmtime also implements wasm-c-api, so ports already on its C API are close
+  to drop-in against wazmrt's C ABI (a payoff of the wasm-c-api decision).
+- **Licensing freedom** — a structural win, not a preference. wazmrt is **`MIT OR Apache-2.0`** and
+  100% team-owned; wasmtime is `Apache-2.0 WITH LLVM-exception`. Dropping the wasmtime dependency means
+  a loader carries **no external-runtime license/NOTICE to propagate** and can license itself freely
+  (e.g. plain MIT). The whole stack (engine + loaders + producer) stays under one permissive,
+  self-chosen license.
+- **A self-consistent, ownable stack:** wazmrt = engine, `universalWasmLoader-*` = FFI bindings,
+  wasmtk = producer + first consumer.
+
+Scoping caveats (so this doesn't bite):
+
+- **Browsers can't FFI native.** `-js` (real browser) and `-dart-web` keep the host `WebAssembly`
+  engine; wazmrt replaces the **native/server tier** only (server-side Deno/Node *can* FFI).
+- **Default lightweight backend, not a hard replacement.** wazmrt (interpreter) wins on consistency,
+  size, startup, licensing, and short programs; for **heavy compute it will need wasmtime's JIT** for
+  process speed (owner-agreed). So offer wazmrt as the default zero-dependency backend **with wasmtime
+  kept as an optional high-performance backend** — not rip-and-replace.
+
+Sequencing: prove in wasmtk (native FFI) → earn trust via spec-testsuite conformance → propagate to the
+native loader ports. Prerequisites as in "Integration goal" (execution + `call_indirect`, host
+imports/WASI, C ABI instantiate+call).
+
 ## Distribution — the `universalWasmLoader-*` family
 
 wazmrt is meant to be embedded from any language via a matching loader repo:
