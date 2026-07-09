@@ -47,6 +47,22 @@ now.** The measurement: native wazmrt vs Deno/V8 on wasmtk's own outputs, timing
 wall-clock and steady-state throughput separately** so we know which regime wasmtk lives in. See the
 `design-decisions.md` interpreter-architecture entry and `roadmap.md` size/speed-baseline item.
 
+## Integration goal — wazmrt as wasmtk's wasm execution backend (owner, 2026-07-02)
+
+The concrete productization target: **wasmtk runs its wasm through native wazmrt instead of Deno/V8**,
+as a speed boost for wasmtk and its users. wasmtk is the ideal first real consumer (it already produces
+the wasm and the test corpora).
+
+**Critical routing nuance:** the speedup only materializes if wasmtk calls the **native** wazmrt —
+i.e. **Deno FFI → the C-ABI shared/static library** (`dlopen` the native runtime, per the Performance
+target's native-build constraint). It must **not** go through `universalWasmLoader-js`, which runs
+wazmrt-as-wasm on V8 (interpreter-on-JIT — slower than V8 running the wasm directly). So the wasmtk
+integration path is a **native FFI binding**, not the wasm/JS loader.
+
+Prerequisites before this is possible: execution complete (incl. `call_indirect`), **host imports +
+WASI** (wasmtk's `wasi/` corpus needs it), and the C ABI grown to expose instantiate + call. Validate
+with the size/speed benchmark first (`roadmap.md`). "We'll see if it's achieved as wazmrt develops."
+
 ## Distribution — the `universalWasmLoader-*` family
 
 wazmrt is meant to be embedded from any language via a matching loader repo:
