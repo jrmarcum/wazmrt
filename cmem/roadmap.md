@@ -14,8 +14,9 @@ the **WAST script runner** (`wast.zig`) is next.
 - **Text toolchain** — `sexpr.zig` + `wat.zig` (WAT→wasm binary) + **`wast.zig` (WAST runner MVP)**.
   Runs the **official spec testsuite** via `wazmrt <file.wast>`: `i32` 374/0, `i64` 384/0, `int_exprs`
   89/0, `address` 255/0, `f32`/`f64` 2498/2, plus **`call_indirect` + tables + globals + type-ref
-  block types (2026-07-09)**: nop 83/0, block 52/0, if 124/0, loop 77/0, call_indirect 120/1 (see
-  `testing.md`). Remaining gap is **reference types** (`ref.func`/`ref.null`, funcref/externref).
+  block types + reference types (2026-07-09)**: nop 83/0, block 52/0, if 124/0, loop 77/0,
+  call_indirect 120/1, **select 124/0** (see `testing.md`). Remaining gaps are **multi-table** and
+  **NaN-payload float literals** in the assembler.
 - **Licensing baseline** (git `888b87e`): dual `MIT OR Apache-2.0` (`LICENSE-MIT` + `LICENSE-APACHE`),
   `NOTICE`, and the compliance scaffold `third_party/LICENSES.md` (obligations table + Adoption
   Checklist + Component Ledger + verified SPDX inventory). README license section + SPDX + contribution
@@ -32,10 +33,11 @@ the **WAST script runner** (`wast.zig`) is next.
   (`env.add`) and export (`run`, params=2 results=1). Retired the ad-hoc `wazmrt_module_*` ABI.
 - **cmem/ project memory** established (this folder), mirroring the wasmtk setup.
 
-**Remaining:** reference types (`ref.func`/`ref.null`, funcref/externref, `table.get`/`.set`); host
+**Remaining:** multi-table + per-table `elem`; NaN-payload float literals in the assembler; host
 imports (→ WASI); growing the wasm-c-api past introspection; first `universalWasmLoader-*` integration.
 Still **100% original runtime code** — no reference-project code adopted yet (only the vendored
-`wasm.h`). `call_indirect` + tables + globals + type-ref block types **DONE 2026-07-09**.
+`wasm.h`). `call_indirect` + tables + globals + type-ref block types + **reference types** (basic
+`ref.null`/`ref.is_null`/`ref.func` + funcref/externref values) **DONE 2026-07-09**.
 
 ## Next increments (rough order)
 
@@ -59,10 +61,11 @@ Still **100% original runtime code** — no reference-project code adopted yet (
    data-segment init, load/store all widths, `memory.size`/`grow`), and traps — 9 unit tests.
    **VERIFIED end-to-end on real modules:** the CLI gained `wazmrt <file.wasm> <export> [args…]` and
    runs the whole `module/wasm_mod` corpus to its `.test.json` values (`fib(20)=6765`, `fac(7)=5040`,
-   `isLeapYear`, `isOdd`, `sieve(30)=10` via memory). **`call_indirect` + tables + globals DONE
-   2026-07-09** (type-checked indirect dispatch; global-init const-expr eval). **Remaining execution
-   slices:** (a) reference types, (b) **host imports** (needed for WASI). Keep the IR a clean seam so a register-machine
-   pass (Option B, wasmi) can be layered later if benchmarks demand it.
+   `isLeapYear`, `isOdd`, `sieve(30)=10` via memory). **`call_indirect` + tables + globals +
+   reference types DONE 2026-07-09** (type-checked indirect dispatch; global-init const-expr eval;
+   `ref.null`/`ref.is_null`/`ref.func` + funcref/externref values). **Remaining execution slices:**
+   (a) multi-table, (b) **host imports** (needed for WASI). Keep the IR a clean seam so a
+   register-machine pass (Option B, wasmi) can be layered later if benchmarks demand it.
 5. **Text toolchain — WAT assembler + WAST runner** (IN PROGRESS, owner-chosen 2026-07-02; the
    `.test.json` harness was dropped in favor of the standard `.wast` format). `sexpr.zig` DONE;
    **`wat.zig` DONE** (WAT→binary: funcs/exports, folded+flat, structured control flow + labels +

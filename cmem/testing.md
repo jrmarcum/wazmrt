@@ -97,9 +97,9 @@ Run a `.wast` file directly: `wazmrt <file.wast>` → `N passed, N failed, N ski
 | `block.wast` | **52 passed, 0 failed** (170 skipped) |
 | `if.wast` | **124 passed, 0 failed** (116 skipped) |
 | `loop.wast` | **77 passed, 0 failed** (42 skipped) |
-| `call_indirect.wast` | **120 passed, 1 failed** (49 skipped) |
+| `call_indirect.wast` | **120 passed, 1 failed** (49 skipped — multi-table) |
 | `fac.wast` | **6 passed, 0 failed** (1 skipped) |
-| `select.wast` | module build fails (reference types) → asserts skipped |
+| `select.wast` | **124 passed, 0 failed** (30 skipped) |
 
 - **`skipped`** = commands the MVP runner doesn't handle (`assert_invalid`/`assert_malformed`,
   `register`, `get`), *plus* asserts whose module failed to build.
@@ -129,6 +129,17 @@ read `imm.mem` (a memarg) but carry a `mem_reserved` immediate — now handled b
 Remaining `call_indirect` failure (1) and all of `select.wast` need **reference types** (`ref.func`,
 `ref.null`, funcref/externref values) — the next feature. i32/i64/int_exprs/address unchanged (no
 regressions).
+
+**Update 2026-07-09 — reference types landed:** `select.wast` jumped 0 → **124 passed, 0 failed**.
+Added `ref.null`/`ref.is_null`/`ref.func` (`0xD0`–`0xD2`) end to end, `(ref null? func|extern)` value
+types in the assembler, and reference value literals in the WAST runner (`(ref.null …)`,
+`(ref.extern N)`, `(ref.func)` = any-non-null / with-index = exact). Null references use a
+`maxInt(u64)` sentinel on the value stack; a funcref value is its function index. Also made
+`call_indirect` skip an optional explicit table id (`call_indirect $t (type …)`) — consumed but not
+encoded (single-table). **Remaining gaps are now two distinct features, not reference types:**
+`call_indirect.wast`'s last failure and `local_tee.wast` need **multi-table** support (multiple
+`(table …)` + per-table element segments — today all elements collapse onto table 0) and **NaN-payload
+float literals** (`nan:0x…`/`inf`) in the WAT assembler, respectively. Numeric suites unchanged.
 
 ## What this tells the roadmap
 

@@ -151,10 +151,21 @@ const Runner = struct {
 
 // --- Value literals & comparison -------------------------------------------
 
-/// Parse a concrete `(TYPE.const literal)` value (for invoke arguments).
+/// Null reference sentinel — must match `interp`'s `null_ref` on the value stack.
+const null_ref: Value = std.math.maxInt(u64);
+
+/// Parse a concrete value literal (for invoke arguments): `(TYPE.const literal)`
+/// or a reference literal (`(ref.null …)`, `(ref.extern N)`, `(ref.func N)`).
 fn parseConst(form: Sexpr) Error!Value {
     const list = form.asList() orelse return error.BadValue;
     const kw = list[0].asAtom() orelse return error.BadValue;
+    // Reference literals: `ref.null` carries an ignorable heaptype; `ref.extern`
+    // / `ref.func` carry an integer payload (the func index / host value).
+    if (std.mem.eql(u8, kw, "ref.null")) return null_ref;
+    if (std.mem.eql(u8, kw, "ref.extern") or std.mem.eql(u8, kw, "ref.func")) {
+        if (list.len < 2) return null_ref; // bare `(ref.func)` — any non-null; use 0 sentinel
+        return @intCast(try parseInt(list[1].asAtom() orelse return error.BadValue));
+    }
     const lit = list[1].asAtom() orelse return error.BadValue;
     if (std.mem.eql(u8, kw, "i32.const")) return interp.i32Value(@truncate(try parseInt(lit)));
     if (std.mem.eql(u8, kw, "i64.const")) return interp.i64Value(try parseInt(lit));
@@ -168,6 +179,13 @@ fn parseConst(form: Sexpr) Error!Value {
 fn matches(got: Value, exp_form: Sexpr) Error!bool {
     const list = exp_form.asList() orelse return error.BadValue;
     const kw = list[0].asAtom() orelse return error.BadValue;
+    // Reference matchers: `(ref.null …)` ⇒ null; a bare `(ref.func)` / `(ref.extern)`
+    // ⇒ any non-null; with a payload ⇒ exact.
+    if (std.mem.eql(u8, kw, "ref.null")) return got == null_ref;
+    if (std.mem.eql(u8, kw, "ref.func") or std.mem.eql(u8, kw, "ref.extern")) {
+        if (list.len < 2) return got != null_ref;
+        return got == @as(Value, @intCast(try parseInt(list[1].asAtom() orelse return error.BadValue)));
+    }
     const lit = list[1].asAtom() orelse return error.BadValue;
     if (std.mem.eql(u8, kw, "f32.const")) return floatMatches(f32, got, lit);
     if (std.mem.eql(u8, kw, "f64.const")) return floatMatches(f64, got, lit);

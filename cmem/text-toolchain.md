@@ -39,8 +39,10 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
   a named-label loop `sum(5)=15`, flat block+br, memory store/load, and a data segment.
   **Multi-value block types + typed `select` DONE 2026-07-02** (type-index blocktypes interned into
   the type section; `select_t` 0x1c). **`call_indirect` + `table`/`elem` + `global` + `(type $t)`
-  block-type references DONE 2026-07-09.** **Deferred in wat.zig:** `start` section, reference-type
-  instructions (`ref.func`/`ref.null`), imports.
+  block-type references DONE 2026-07-09.** **Reference types (`ref.null`/`ref.is_null`/`ref.func`,
+  `(ref null? func|extern)` value types) DONE 2026-07-09.** **Deferred in wat.zig:** `start` section,
+  imports, multi-table (all elements collapse onto table 0 today), NaN-payload float literals
+  (`nan:0x…`/`inf`).
 - **`src/wast.zig`** (MVP DONE 2026-07-02) — WAST script runner: `(module …)` text +
   `(module binary …)`, `assert_return`, `assert_trap`, `invoke`; value literals incl.
   `nan:canonical`/`nan:arithmetic`; drives an `Instance` and compares (NaN-aware). CLI
@@ -70,6 +72,13 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
    a latent `memory.size`/`memory.grow` interp panic (`imm.mem` vs `mem_reserved`). **Next: reference
    types** (`ref.func`/`ref.null`, funcref/externref values) — the blocker for `select.wast` and the
    last `call_indirect` assert. This is the standing conformance gate (`testing.md`).
+7. ~~Reference types~~ **DONE 2026-07-09** (`ref.null`/`ref.is_null`/`ref.func` `0xD0`–`0xD2` across
+   opcode/interp/validator; `(ref null? func|extern)` value types + heaptype immediates in the
+   assembler; `(ref.null …)`/`(ref.extern N)`/`(ref.func)` value literals in the WAST runner). Null =
+   `maxInt(u64)` stack sentinel; a funcref is its function index. `select.wast` 0 → **124/0**. **Next:
+   multi-table** (multiple `(table …)` + per-table `elem`; today all elements collapse onto table 0,
+   which is `call_indirect.wast`'s + `local_tee.wast`'s last blocker alongside **NaN-payload float
+   literals** `nan:0x…`/`inf` in the assembler). Standing conformance gate (`testing.md`).
 
 ## Notes / invariants
 

@@ -6,11 +6,12 @@
 //! interpreter. `decodeBody` turns a function's raw body bytes (captured in
 //! `Module.Code.body`) into a flat `[]Instr` with pre-parsed immediates.
 //!
-//! **Scope today:** the core MVP instruction set (`0x00`–`0xC4`). Reference-type
-//! ops, the `0xFC` (bulk-memory / saturating-truncation) and `0xFD` (SIMD)
-//! prefixes, and multi-byte block-type indices decode to `error.UnsupportedOpcode`
-//! — a clean, documented boundary to expand from. Control-flow nesting and
-//! branch-target resolution are *not* done here; that belongs to validation.
+//! **Scope today:** the core MVP instruction set (`0x00`–`0xC4`) plus the basic
+//! reference-type ops (`ref.null`/`ref.is_null`/`ref.func`, `0xD0`–`0xD2`). The
+//! `0xFC` (bulk-memory / saturating-truncation) and `0xFD` (SIMD) prefixes decode
+//! to `error.UnsupportedOpcode` — a clean, documented boundary to expand from.
+//! Control-flow nesting and branch-target resolution are *not* done here; that
+//! belongs to validation.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -35,6 +36,11 @@ pub const Op = enum(u8) {
     @"return" = 0x0f,
     call = 0x10,
     call_indirect = 0x11,
+
+    // Reference
+    ref_null = 0xd0, // immediate: a heaptype byte (func / extern)
+    ref_is_null = 0xd1,
+    ref_func = 0xd2, // immediate: a function index
 
     // Parametric
     drop = 0x1a,
@@ -257,6 +263,8 @@ pub const Imm = union(enum) {
     f64: u64,
     /// Result types of a typed `select` (`0x1c`).
     select_types: []const types.ValType,
+    /// Heap type of `ref.null` (`0xd0`) — as a `funcref` / `externref` value type.
+    ref_type: types.ValType,
 };
 
 pub const Instr = struct { op: Op, imm: Imm };
@@ -277,6 +285,7 @@ const ImmKind = enum {
     f32c,
     f64c,
     select_types,
+    ref_type,
     unsupported,
 };
 
@@ -298,8 +307,10 @@ pub fn immediateKind(op: Op) ImmKind {
         0x43 => .f32c,
         0x44 => .f64c,
         0x1c => .select_types,
+        0xd0 => .ref_type, // ref.null <heaptype>
+        0xd2 => .func, // ref.func <funcidx>
         // Everything else in the core-MVP range has no immediate.
-        0x00, 0x01, 0x05, 0x0b, 0x0f, 0x1a, 0x1b, 0x45...0xc4 => .none,
+        0x00, 0x01, 0x05, 0x0b, 0x0f, 0x1a, 0x1b, 0xd1, 0x45...0xc4 => .none,
         else => .unsupported,
     };
 }
@@ -366,6 +377,7 @@ pub fn decodeBody(a: std.mem.Allocator, body: []const u8) (DecodeError || std.me
                 for (tys) |*t| t.* = @enumFromInt(try r.readByte());
                 break :blk .{ .select_types = tys };
             },
+            .ref_type => .{ .ref_type = @enumFromInt(try r.readByte()) },
             .unsupported => return error.UnsupportedOpcode,
         };
         try list.append(a, .{ .op = op, .imm = imm });

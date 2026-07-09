@@ -97,6 +97,9 @@ pub const Error = Module.Error || error{
 
 /// Uninitialized funcref table entry.
 const null_func: u32 = std.math.maxInt(u32);
+/// Null reference sentinel on the value stack (`ref.null`), distinct from any
+/// real function index or host externref payload.
+const null_ref: Value = std.math.maxInt(u64);
 
 fn funcTypeEqual(x: Module.FuncType, y: Module.FuncType) bool {
     return std.mem.eql(V, x.params, y.params) and std.mem.eql(V, y.results, x.results);
@@ -376,6 +379,20 @@ const Frame = struct {
                     const b = self.pop();
                     const av = self.pop();
                     try self.pushU64(if (c != 0) av else b);
+                    pc += 1;
+                },
+
+                // --- Reference types ---
+                .ref_null => {
+                    try self.pushU64(null_ref);
+                    pc += 1;
+                },
+                .ref_is_null => {
+                    try self.pushI32(if (self.pop() == null_ref) 1 else 0);
+                    pc += 1;
+                },
+                .ref_func => {
+                    try self.pushU64(instr.imm.func); // a funcref is its function index
                     pc += 1;
                 },
 

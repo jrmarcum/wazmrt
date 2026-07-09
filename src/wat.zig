@@ -436,8 +436,22 @@ fn isId(s: Sexpr) bool {
 }
 
 fn parseValType(s: Sexpr) Error!V {
+    // Reference type spelled as a list: `(ref null? func|extern)`.
+    if (s.asList()) |l| {
+        if (l.len >= 2 and eqAtom(l[0], "ref")) return heapTypeToValType(l[l.len - 1]);
+        return error.BadValType;
+    }
     const atom = s.asAtom() orelse return error.BadValType;
     return stringToValType(atom) orelse error.BadValType;
+}
+
+/// A heap type (`func` / `extern`, or the `funcref` / `externref` aliases) → the
+/// corresponding reference value type.
+fn heapTypeToValType(s: Sexpr) Error!V {
+    const atom = s.asAtom() orelse return error.BadValType;
+    if (std.mem.eql(u8, atom, "func") or std.mem.eql(u8, atom, "funcref")) return .funcref;
+    if (std.mem.eql(u8, atom, "extern") or std.mem.eql(u8, atom, "externref")) return .externref;
+    return error.BadValType;
 }
 
 fn stringToValType(atom: []const u8) ?V {
@@ -528,6 +542,9 @@ fn emitFoldedOne(ctx: *Ctx, l: []const Sexpr, i: usize) Error!usize {
 /// `(param)(result)`) from `items[start..]`; return its type index + next index.
 fn parseCallIndirectType(ctx: *Ctx, items: []const Sexpr, start: usize) Error!struct { idx: u32, next: usize } {
     var j = start;
+    // Optional explicit table index/id (`call_indirect $t (type …)`); the runtime
+    // is single-table today, so it is consumed but not encoded (emits table 0).
+    if (j < items.len and items[j].asAtom() != null) j += 1;
     var type_ref: ?Sexpr = null;
     var params: List(V) = .empty;
     var results: List(V) = .empty;
@@ -765,6 +782,7 @@ fn emitInstr(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
         .f64c => try floatBits(ctx, u64, try imm0(immediates)),
         .mem => try emitMemArg(ctx, op, immediates),
         .mem_reserved => try ctx.out.append(ctx.a, 0x00),
+        .ref_type => try ctx.out.append(ctx.a, @intFromEnum(try heapTypeToValType(try imm0(immediates)))),
         .br_table => try emitBrTable(ctx, immediates),
         else => return error.UnsupportedInstr, // block_type (handled structurally), call_indirect
     }
@@ -820,7 +838,7 @@ fn imm0(immediates: []const Sexpr) Error!Sexpr {
 /// How many flat immediate atoms an opcode consumes (MVP-supported kinds).
 fn flatImmCount(op: Op) usize {
     return switch (opcode.immediateKind(op)) {
-        .local, .global, .func, .label, .i32c, .i64c, .f32c, .f64c => 1,
+        .local, .global, .func, .label, .i32c, .i64c, .f32c, .f64c, .ref_type => 1,
         else => 0,
     };
 }
@@ -1102,6 +1120,34 @@ test "assembles a type-reference block type" {
         \\    (block (type $sig) (i32.const 42))))
     ;
     try std.testing.expectEqual(@as(i32, 42), interp.asI32(try assembleAndRun(src, "b", &.{})));
+}
+
+test "assembles reference types (ref.null / ref.func / ref.is_null)" {
+    const src =
+        \\(module
+        \\  (func $f)
+        \\  (func (export "isnull") (param i32) (result i32)
+        \\    (if (result i32) (local.get 0)
+        \\      (then (ref.is_null (ref.null func)))
+        \\      (else (ref.is_null (ref.func $f))))))
+    ;
+    // cond=1 → ref.is_null(null) = 1; cond=0 → ref.is_null(a real funcref) = 0.
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(src, "isnull", &.{interp.i32Value(1)})));
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "isnull", &.{interp.i32Value(0)})));
+}
+
+test "assembles a funcref-typed select" {
+    const src =
+        \\(module
+        \\  (func $f)
+        \\  (func (export "sel") (param i32) (result i32)
+        \\    (ref.is_null
+        \\      (select (result funcref) (ref.func $f) (ref.null func) (local.get 0)))))
+    ;
+    // cond=1 → picks ref.func $f (non-null) → is_null = 0.
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "sel", &.{interp.i32Value(1)})));
+    // cond=0 → picks ref.null → is_null = 1.
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(src, "sel", &.{interp.i32Value(0)})));
 }
 
 test "assembles multi-value function results" {

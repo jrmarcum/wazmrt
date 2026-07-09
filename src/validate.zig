@@ -270,6 +270,16 @@ const FuncValidator = struct {
                 try self.pushVal(rt);
             },
 
+            .ref_null => try self.pushValT(instr.imm.ref_type),
+            .ref_is_null => {
+                _ = try self.popVal(); // any reference type
+                try self.pushValT(.i32);
+            },
+            .ref_func => {
+                if (funcTypeOf(self.module, instr.imm.func) == null) return error.UndefinedFunc;
+                try self.pushValT(.funcref);
+            },
+
             .local_get => try self.pushValT(try self.localAt(instr.imm.local)),
             .local_set => _ = try self.popExpect(try self.localAt(instr.imm.local)),
             .local_tee => {
