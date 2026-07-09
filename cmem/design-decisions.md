@@ -45,6 +45,25 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   - **Reference study when optimizing:** B → wasmi (`Apache-2.0 OR MIT`), C → wasm3 (`MIT`); both
     ledger-friendly. No code adopted yet — architecture chosen at idea-level.
 
+- **Optimization tiers above Option A (speculative; owner idea 2026-07-02).** The perf ladder, in
+  increasing effort and *decreasing* alignment with the size/wasm goals. All hang off the clean IR seam;
+  decide with the size/speed benchmark (`vision.md`), not now.
+  - **A.5 — partial evaluation + superinstructions (goal-aligned, the owner's idea).** On the pre-decoded
+    IR: constant-fold / pre-evaluate **acyclic** regions ("not recursively bound" = no loop back-edge or
+    recursion cycle — those stay for runtime), and **fuse common opcode sequences into superinstructions**
+    to cut per-instruction dispatch. Stays tiny *and* compiles-to-wasm (still an interpretable IR — unlike
+    a JIT); targets the beat-Deno/V8 startup + non-hot regime. **Nuances:** keep the *execution* IR flat
+    even if the *analysis* uses a tree/CFG (a full AST-walking interpreter is usually slower — cache +
+    dispatch); and wasmtk's producer already runs binaryen `-Oz`, so classic const-folding yields little,
+    but `-Oz` trades speed for size, so the real wins are dispatch reduction, stack-traffic elimination,
+    and specialization. **Complementary to Option B, not either/or.**
+  - **B — register machine (wasmi-style).** Eliminates operand-stack traffic; can combine with A.5.
+  - **JIT — native codegen (top tier, "later").** Fastest, but **breaks smallest-binary + compiles-to-wasm**
+    (a JIT can't emit native from inside wasm). Reserve for a **native-only high-performance mode**,
+    offered alongside the interpreter (mirrors the wasmtime-as-optional-backend framing in `vision.md`).
+    Exotic middle for the compile-to-wasm mode: emit specialized *wasm* for hot regions and let the host
+    engine JIT it — very speculative.
+
 ## Zig 0.16 API notes (this project targets 0.16.0)
 
 The 0.16 stdlib differs from older docs — verified against the installed stdlib this session:
