@@ -5,12 +5,47 @@ imported into any programming language.**
 
 ## The two axes
 
-1. **Fast + tiny as a native runtime.** Beat or match the small-footprint interpreters (wasm3, WAMR
-   "fast interpreter") on binary size and startup, while staying correct. Zig + `ReleaseSmall`, a
-   libc-free core, and zero-copy decoding are the levers.
+1. **Fast + tiny as a native runtime.** On **size**, the peers are the small interpreters (wasm3, WAMR
+   "fast interpreter") — not the JIT/AOT runtimes, which are a different weight class (their bulk is a
+   Cranelift/LLVM backend). Zig + `ReleaseSmall`, a libc-free core, and zero-copy decoding are the size
+   levers. On **speed**, the concrete target is beating wasmtk's Deno/V8 execution — see the
+   Performance target section below (a different goal from raw JIT throughput).
 2. **Itself compilable to wasm.** The runtime builds for `wasm32-freestanding` (`zig build wasm`), so
    wazmrt can run *inside* another wasm host — a runtime-in-a-runtime — which is what makes the
    universal-loader story work uniformly across languages.
+
+## Performance target (owner, 2026-07-02)
+
+The concrete speed goal is **not** "beat a Cranelift JIT." It is:
+
+- **Minimum goal: run wasm faster than `wasmtk` currently does** — and wasmtk executes its wasm through
+  **Deno → V8's wasm engine** (Liftoff baseline JIT → TurboFan optimizing JIT).
+- **Stretch goal: match wasmer / wasmtime** (native JITs).
+
+**Key insight — you don't beat V8 by out-executing it; you beat what it costs *around* execution.**
+Per run, wasmtk pays: Deno start + V8 init + wasm JIT-compile + **JS↔wasm marshalling** (bindgen) +
+execution. Three ways wazmrt wins, two of them structural:
+
+1. **No process / JIT-warmup tax.** Native wazmrt starts in ~1 ms and compiles nothing (just decode);
+   Deno+V8+Liftoff is tens-to->100 ms *every run*. For short-lived programs (all compiler-test outputs),
+   a native interpreter wins wall-clock decisively despite slower per-instruction speed.
+2. **No JS↔wasm boundary.** wazmrt touches linear memory directly — zero marshalling. If bindgen
+   marshalling is the bottleneck (it often is for wasmtk), we win without beating V8's raw execution.
+3. **Raw hot-loop throughput** — the *only* regime where a pure interpreter loses to TurboFan.
+
+**Hard constraint:** this win exists only for the **native** build. Running wazmrt *inside* wasm-on-V8
+(the compile-to-wasm / loader mode) is strictly slower than V8 running that wasm directly — an
+interpreter interpreting. Compile-to-wasm mode is for **portability/embedding, not speed**; the
+speed-vs-Deno win requires the native runtime. Don't conflate the two deployment targets.
+
+**Feasibility:** minimum goal is highly achievable *by architecture* (startup + boundary elimination),
+likely already true for short programs. Secondary goal (compute-bound parity with native JITs) is hard
+for a pure interpreter — **Option B (the wasmi-style register machine)** is the first lever (the IR is a
+clean seam for it); full JIT parity would require our own codegen, which trades against the
+smallest-binary + compiles-to-wasm goals. **Decide Option A→B (or beyond) with benchmark data, not
+now.** The measurement: native wazmrt vs Deno/V8 on wasmtk's own outputs, timing **cold-start
+wall-clock and steady-state throughput separately** so we know which regime wasmtk lives in. See the
+`design-decisions.md` interpreter-architecture entry and `roadmap.md` size/speed-baseline item.
 
 ## Distribution — the `universalWasmLoader-*` family
 
@@ -42,6 +77,8 @@ breaking change.
 
 ## Status (2026-07-02)
 
-Project inception. Licensing baseline (dual license + compliance scaffold) committed; first vertical
-slice of the runtime (header validation + section indexing) building and tested; C-ABI and
-freestanding-wasm build targets in place. No reference-project code incorporated yet. See `roadmap.md`.
+The runtime **decodes, validates, and executes** wasm (int/float/memory), and a native **text
+toolchain** (WAT assembler + WAST runner) runs the **official spec testsuite** (thousands of assertions
+pass — see `testing.md`). C-ABI + freestanding-wasm build targets in place. Still 100% original runtime
+code (only `wasm.h` vendored). Not yet done: `call_indirect`/host imports/WASI, multi-value, the
+size/speed baseline vs Deno/V8. See `roadmap.md`.

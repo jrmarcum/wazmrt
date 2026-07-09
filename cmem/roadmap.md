@@ -73,8 +73,12 @@ adopted yet (only the vendored `wasm.h`).
    declared in the vendored `wasm.h`; we just implement more of them. Extend `tests/c_smoke.c` alongside.
 6. **First `universalWasmLoader-*` integration** — prove the C-ABI static lib and/or the wasm build
    load from at least one host language end-to-end.
-7. **Size/speed baseline** — measure `ReleaseSmall` binary size + a decode/exec microbench vs the
-   reference interpreters; set targets.
+7. **Size/speed baseline** — the real perf gate (see `vision.md` → Performance target). Benchmark
+   **native wazmrt vs Deno/V8** on wasmtk's own outputs, timing **cold-start wall-clock** and
+   **steady-state throughput** separately (which regime does wasmtk live in?). Also size + startup vs
+   wasm3 / WAMR-fast-interp. This data decides whether/when to move Option A → B (register machine).
+   Baseline sizes today (`ReleaseSmall`): CLI exe ~611 KB (mostly Zig std + OS glue), C-ABI lib ~34 KB,
+   freestanding wasm ~13 KB (lib/wasm are the decode/validate subset — execution not yet exported).
 
 ## Parking lot / open questions
 
