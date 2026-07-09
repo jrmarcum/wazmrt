@@ -29,6 +29,7 @@ wazmrt/
 │   ├── interp.zig         # Instance + switch interpreter over the IR (u64 slots, label stack)
 │   ├── sexpr.zig          # S-expression lexer/parser for .wat/.wast (text toolchain front-end)
 │   ├── wat.zig            # WAT text → wasm binary assembler (reuses opcode.zig in reverse)
+│   ├── wast.zig           # WAST script runner (assert_return/assert_trap/invoke) — runs the spec testsuite
 │   ├── wasm_c_api.zig     # Implements the standard wasm-c-api (smp_allocator, no libc)
 │   └── wasm_entry.zig     # Freestanding wasm32 export surface (wasm_allocator)
 ├── tests/
@@ -51,9 +52,9 @@ The pipeline, in order: **decode → validate → execute**, with a text front-e
 | `src/opcode.zig` | The **shared instruction authority** — `Op` table, `Imm`/`Instr` IR, `decodeBody`. Used by validate, the interpreter, *and* the assembler (in reverse). |
 | `src/validate.zig` | Spec type-checking validator over the IR (value + control-frame stacks). |
 | `src/interp.zig` | `Instance` + the switch interpreter (untyped `u64` slots, label stack). Runs int/float/memory. |
-| `src/sexpr.zig` + `src/wat.zig` | Text toolchain: S-expression parser + WAT→wasm-binary assembler (`wat.zig` maps names→`Op` via `stringToEnum`). |
+| `src/sexpr.zig` / `src/wat.zig` / `src/wast.zig` | Text toolchain: S-expression parser → WAT→wasm-binary assembler (`wat.zig` maps names→`Op` via `stringToEnum`) → WAST script runner (`wast.zig`, drives an `Instance`, compares — **runs the official spec testsuite**). |
 | `src/wasm_c_api.zig` | The **standard wasm-c-api** integration ABI every `universalWasmLoader-*` port binds to (+ the `wazmrt_*` extension handshake). |
-| `src/root.zig` | Library surface (`@import("wazmrt")`). Re-exports `types`/`Reader`/`Module`/`opcode`/`validate`/`interp`/`Instance`/`sexpr`/`wat`/`decode`/`version`/`abi_version`. |
+| `src/root.zig` | Library surface (`@import("wazmrt")`). Re-exports `types`/`Reader`/`Module`/`opcode`/`validate`/`interp`/`Instance`/`sexpr`/`wat`/`wast`/`decode`/`version`/`abi_version`. |
 
 ## Build targets (see architecture.md)
 
@@ -74,6 +75,6 @@ The pipeline, in order: **decode → validate → execute**, with a text front-e
   arithmetic, control flow, `call`, and **linear memory** end-to-end. The whole `module/wasm_mod` corpus
   runs to its `.test.json` values (CLI run mode). `call_indirect` + host imports are the remaining
   execution slices (`roadmap.md`).
-- **Text toolchain (in progress).** `sexpr.zig` + `wat.zig` assemble WAT text → wasm binary
-  (funcs/exports, folded+flat instrs, control flow, memory/data). Next: `wast.zig`, the `.wast` script
-  runner, to run the spec testsuite as the conformance gate (`text-toolchain.md`, `testing.md`).
+- **Text toolchain (working).** `sexpr.zig` + `wat.zig` (WAT→wasm binary) + `wast.zig` (WAST script
+  runner) — `wazmrt <file.wast>` **runs the official spec testsuite** (thousands of assertions pass; see
+  `testing.md`). Next: multi-value + typed `select`, then `table`/`call_indirect`.

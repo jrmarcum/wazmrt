@@ -42,8 +42,10 @@ bytes ──► DECODE ──► VALIDATE ──► INSTANTIATE ──► EXECUT
   CLI gained a run mode `wazmrt <file.wasm> <export> [args…]`.
 
 **Text front-end (a separate producer, not a pipeline stage):** `sexpr.zig` (S-expression parser) +
-`wat.zig` (WAT text → wasm binary) turn `.wat`/`.wast` text into a binary that re-enters DECODE. The
-assembler reuses `opcode.zig` in reverse (name → `Op` via `stringToEnum`). See `text-toolchain.md`.
+`wat.zig` (WAT text → wasm binary, reuses `opcode.zig` in reverse) + `wast.zig` (WAST script runner:
+`assert_return`/`assert_trap`/`invoke`). `wat.zig` output re-enters DECODE; `wast.zig` orchestrates
+the whole pipeline and **runs the official spec testsuite** (`wazmrt <file.wast>`). See
+`text-toolchain.md`, `testing.md`.
 
 ## Module layout & responsibilities
 
@@ -55,8 +57,8 @@ assembler reuses `opcode.zig` in reverse (name → `Op` via `stringToEnum`). See
 | `opcode.zig` | The shared instruction authority: `Op` enum (0x00–0xC4), `Imm`/`Instr`, `immediateKind`, `decodeBody`. |
 | `validate.zig` | `validate(gpa, module)`: spec Appendix type-check over the IR (value + control-frame stacks). |
 | `interp.zig` | `Instance` (init/deinit/invoke), the switch interpreter (`Frame`, `execNumeric`/`execFloat`/`execMemory`), `Value` (u64) helpers. |
-| `sexpr.zig` / `wat.zig` | S-expression parser / WAT-text assembler (the text front-end). |
-| `root.zig` | Public surface; re-exports the pipeline modules + `decode`/`validate`/`interp`/`Instance`/`sexpr`/`wat`/`version`/`abi_version`. libc-free. |
+| `sexpr.zig` / `wat.zig` / `wast.zig` | Text toolchain: S-expression parser / WAT-text assembler / WAST script runner (runs the spec testsuite). |
+| `root.zig` | Public surface; re-exports the pipeline modules + `decode`/`validate`/`interp`/`Instance`/`sexpr`/`wat`/`wast`/`version`/`abi_version`. libc-free. |
 
 ## Three consumption surfaces (one core)
 
