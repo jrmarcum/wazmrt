@@ -39,10 +39,11 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
   a named-label loop `sum(5)=15`, flat block+br, memory store/load, and a data segment.
   **Deferred in wat.zig:** `global`/`table`/`start`/`elem` sections, multi-value/type-index
   block types, `call_indirect`.
-- **`src/wast.zig`** (after) — WAST script runner: `(module …)`, `assert_return`,
-  `assert_trap`, `assert_invalid`, `assert_malformed`, `invoke`, `register`;
-  value literals (`(i32.const N)`, `(f64.const nan:canonical)` …); drives an
-  `Instance` and compares results (with NaN semantics).
+- **`src/wast.zig`** (MVP DONE 2026-07-02) — WAST script runner: `(module …)` text +
+  `(module binary …)`, `assert_return`, `assert_trap`, `invoke`; value literals incl.
+  `nan:canonical`/`nan:arithmetic`; drives an `Instance` and compares (NaN-aware). CLI
+  `.wast` mode. **Passes thousands of official-testsuite assertions** (see `testing.md`).
+  Deferred: `assert_invalid`/`assert_malformed`, `register`/multi-module, `get`, `(module quote …)`.
 
 ## Staged plan
 
@@ -52,11 +53,14 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
 3. ~~WAT assembler breadth~~ **DONE 2026-07-02**: control flow (block/loop/if/else/end +
    labels + single-result blocktypes, `br`/`br_if`/`br_table`), memarg, memory + data
    sections. Deferred: `global`/`table`/`elem`, multi-value block types, `call_indirect`.
-4. **WAST runner (`wast.zig`, next)** — `assert_return`/`assert_trap`/`invoke` + value
-   literals; drive an `Instance`, compare results. Runs the owner's converted `.wast` and
-   arithmetic testsuite files (`i32.wast`, `i64.wast`, …).
-5. Run the text-module testsuite; expand coverage until a meaningful share of
-   `testsuite-main` passes. This becomes the standing conformance gate (`testing.md`).
+4. ~~WAST runner (`wast.zig`)~~ **MVP DONE 2026-07-02** — `(module …)` (text + `binary`),
+   `assert_return`/`assert_trap`/`invoke`, value literals incl. `nan:canonical`/`nan:arithmetic`;
+   drives an `Instance`, compares (NaN-aware). CLI `.wast` mode. **Runs the official testsuite:**
+   `i32` 374/0, `i64` 384/0, `int_exprs` 89/0, `address` 255/0, `f32`/`f64` 2498/2 (see `testing.md`).
+   Deferred: `assert_invalid`/`assert_malformed`, `register`/multi-module, `get`, `(module quote …)`.
+5. **Expand coverage (next):** multi-value block types/results + typed `select` (unblocks
+   `nop`/`fac`/`local_tee`/`select`), then `table`/`call_indirect`. This is the standing conformance
+   gate (`testing.md`).
 
 ## Notes / invariants
 

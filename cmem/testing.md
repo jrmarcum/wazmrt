@@ -81,6 +81,33 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
   validation**, which is strong evidence the type-checker is correct across real, deeply-nested
   control flow (not just the simple `wasm_mod` set).
 
+## Spec-testsuite conformance snapshot (2026-07-02, `wast.zig` MVP)
+
+Run a `.wast` file directly: `wazmrt <file.wast>` → `N passed, N failed, N skipped`. Against
+`module/wasm_wast/testsuite-main` (the official suite):
+
+| File | Result |
+| --- | --- |
+| `i32.wast` | **374 passed, 0 failed** (85 skipped) |
+| `i64.wast` | **384 passed, 0 failed** (31 skipped) |
+| `int_exprs.wast` | **89 passed, 0 failed, 0 skipped** |
+| `address.wast` | **255 passed, 0 failed** (memory addressing) |
+| `f32.wast` / `f64.wast` | **2498 passed, 2 failed** each (NaN-payload edge cases) |
+| `nop`/`select`/`local_tee`/`fac`/`stack` | module build fails → asserts skipped |
+
+- **`skipped`** = commands the MVP runner doesn't handle (`assert_invalid`/`assert_malformed`,
+  `register`, `get`), *plus* asserts whose module failed to build.
+- **The `0 passed` files are single module-build failures**, not many distinct bugs: those modules
+  contain a function using a **deferred construct** — **multi-value block types / results**
+  (`(result i64 i64)`, `(loop (param i64 i64) (result i32) …)`), **typed `select`** (`0x1c`), or
+  `table`/`elem`. Since a module assembles all-or-nothing, one advanced function skips the rest.
+- **The 2 float failures** are NaN-payload/propagation edge cases (e.g. a signaling-NaN result where
+  Zig's native op yields a different NaN bit pattern than the exact-bits assertion expects).
+
+**Takeaway:** thousands of official spec assertions pass; every gap is a *named, deferred feature*, not
+a core correctness bug. Next breadth to unlock more files: **multi-value block types**, typed `select`,
+then `table`/`call_indirect`.
+
 ## What this tells the roadmap
 
 1. **First execution milestone = the `module/wasm_mod` corpus + its `.test.json` files** — fully

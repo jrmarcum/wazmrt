@@ -69,7 +69,8 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     var mem_max: ?u32 = null;
 
     // Pass 1: collect definitions and resolve function indices (MVP: no imports).
-    for (module[1..]) |field| {
+    const start: usize = if (module.len > 1 and isId(module[1])) 2 else 1; // skip optional module $name
+    for (module[start..]) |field| {
         const kw = field.keyword() orelse return error.BadModuleField;
         const items = field.asList().?;
         if (std.mem.eql(u8, kw, "func")) {

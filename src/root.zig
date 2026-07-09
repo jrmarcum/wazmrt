@@ -15,6 +15,7 @@ pub const interp = @import("interp.zig");
 pub const Instance = interp.Instance;
 pub const sexpr = @import("sexpr.zig");
 pub const wat = @import("wat.zig");
+pub const wast = @import("wast.zig");
 
 /// Human-readable library version (keep in sync with build.zig.zon).
 pub const version: [:0]const u8 = "0.1.0";
@@ -39,4 +40,5 @@ test {
     _ = interp;
     _ = sexpr;
     _ = wat;
+    _ = wast;
 }

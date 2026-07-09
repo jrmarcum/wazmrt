@@ -30,6 +30,17 @@ pub fn main(init: std.process.Init) !void {
         return;
     };
 
+    // .wast script mode: parse + run the assertions, print a pass/fail summary.
+    if (std.mem.endsWith(u8, path, ".wast")) {
+        const s = wazmrt.wast.runScript(arena, bytes) catch |e| {
+            try out.print("error: cannot run '{s}': {s}\n", .{ path, @errorName(e) });
+            return;
+        };
+        try out.print("{s}: {d} passed, {d} failed, {d} skipped\n", .{ path, s.passed, s.failed, s.skipped });
+        if (s.first_failure) |f| try out.print("  first failure: {s}\n", .{f});
+        return;
+    }
+
     var module = wazmrt.decode(arena, bytes) catch |e| {
         try out.print("error: cannot decode '{s}': {s}\n", .{ path, @errorName(e) });
         return;

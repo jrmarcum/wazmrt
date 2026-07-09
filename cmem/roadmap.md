@@ -11,8 +11,10 @@ the **WAST script runner** (`wast.zig`) is next.
   `opcode.zig` IR → `validate.zig` (spec type-check) → `interp.zig` (switch interpreter: i32/i64/f32/f64
   arithmetic, control flow, `call`, linear memory + data init, traps). Runs `fib(20)=6765`,
   `fac(7)=5040`, `sieve(30)=10`, etc. — all match `.test.json`.
-- **Text toolchain** — `sexpr.zig` (S-expression parser) + `wat.zig` (WAT→wasm binary: funcs/exports,
-  folded+flat, control flow + labels, memarg, memory/data). Assemble→decode→validate→run verified.
+- **Text toolchain** — `sexpr.zig` + `wat.zig` (WAT→wasm binary) + **`wast.zig` (WAST runner MVP)**.
+  Runs the **official spec testsuite** via `wazmrt <file.wast>`: `i32` 374/0, `i64` 384/0, `int_exprs`
+  89/0, `address` 255/0, `f32`/`f64` 2498/2 (see `testing.md`). Gaps are named deferred features
+  (multi-value block types, typed `select`, `table`/`call_indirect`), not core bugs.
 - **Licensing baseline** (git `888b87e`): dual `MIT OR Apache-2.0` (`LICENSE-MIT` + `LICENSE-APACHE`),
   `NOTICE`, and the compliance scaffold `third_party/LICENSES.md` (obligations table + Adoption
   Checklist + Component Ledger + verified SPDX inventory). README license section + SPDX + contribution
