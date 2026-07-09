@@ -256,7 +256,7 @@ const FuncValidator = struct {
             },
 
             .drop => _ = try self.popVal(),
-            .select => {
+            .select, .select_t => {
                 _ = try self.popExpect(.i32);
                 const t1 = try self.popVal();
                 const t2 = try self.popVal();

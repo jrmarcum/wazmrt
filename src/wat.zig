@@ -48,6 +48,8 @@ const Func = struct {
 
 const ExportDef = struct { name: []const u8, kind: u8, index: u32 };
 const DataSeg = struct { offset: i64, bytes: []const u8 };
+/// A function type (for the type section): params → results.
+const Sig = struct { params: []const V, results: []const V };
 
 /// Assemble the first `(module …)` form found in `src`.
 pub fn assemble(a: std.mem.Allocator, src: []const u8) Error![]const u8 {
@@ -111,22 +113,27 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         }
     }
 
-    // Type section: dedup signatures; record each func's type index.
-    var sigs: List(Func) = .empty; // reuse Func just for its params/results slices
+    // Intern function signatures, then pre-encode bodies (which may intern more
+    // signatures for multi-value block types), so the type section — emitted
+    // first but computed last — includes them all.
+    var sigs: List(Sig) = .empty;
     var func_type: List(u32) = .empty;
-    for (funcs.items) |f| try func_type.append(a, try internSig(a, &sigs, f));
+    for (funcs.items) |f| try func_type.append(a, try internSig(a, &sigs, f.params.items, f.results.items));
+
+    var bodies: List([]const u8) = .empty;
+    for (funcs.items) |f| try bodies.append(a, try encodeBody(a, f, func_names.items, &sigs));
 
     var out: List(u8) = .empty;
     try out.appendSlice(a, &.{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 }); // header
 
-    // Type section (1)
+    // Type section (1) — complete (function sigs + multi-value block-type sigs)
     {
         var s: List(u8) = .empty;
         try uleb(a, &s, sigs.items.len);
         for (sigs.items) |sig| {
             try s.append(a, 0x60);
-            try valTypeVec(a, &s, sig.params.items);
-            try valTypeVec(a, &s, sig.results.items);
+            try valTypeVec(a, &s, sig.params);
+            try valTypeVec(a, &s, sig.results);
         }
         try emitSection(a, &out, 1, s.items);
     }
@@ -162,12 +169,11 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         }
         try emitSection(a, &out, 7, s.items);
     }
-    // Code section (10)
+    // Code section (10) — pre-encoded bodies
     {
         var s: List(u8) = .empty;
-        try uleb(a, &s, funcs.items.len);
-        for (funcs.items) |f| {
-            const body = try encodeBody(a, f, func_names.items);
+        try uleb(a, &s, bodies.items.len);
+        for (bodies.items) |body| {
             try uleb(a, &s, body.len);
             try s.appendSlice(a, body);
         }
@@ -270,12 +276,14 @@ const Ctx = struct {
     out: *List(u8),
     local_names: []const ?[]const u8,
     func_names: []const ?[]const u8,
+    /// Shared type section — multi-value block types intern their signatures here.
+    sigs: *List(Sig),
     /// Control-flow label stack (innermost last), for resolving `br $name` to a
     /// relative depth.
     labels: List(?[]const u8) = .empty,
 };
 
-fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8) Error![]const u8 {
+fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, sigs: *List(Sig)) Error![]const u8 {
     var body: List(u8) = .empty;
     // Locals vector: one (count=1, type) group per declared local.
     try uleb(a, &body, f.locals.items.len);
@@ -283,7 +291,7 @@ fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8) Er
         try uleb(a, &body, 1);
         try body.append(a, @intFromEnum(t));
     }
-    var ctx: Ctx = .{ .a = a, .out = &body, .local_names = f.local_names.items, .func_names = func_names };
+    var ctx: Ctx = .{ .a = a, .out = &body, .local_names = f.local_names.items, .func_names = func_names, .sigs = sigs };
     try emitSeq(&ctx, f.body);
     try body.append(a, @intFromEnum(Op.end)); // implicit function end
     return body.items;
@@ -316,9 +324,33 @@ fn emitFoldedOne(ctx: *Ctx, l: []const Sexpr, i: usize) Error!usize {
     switch (op) {
         .block, .loop => try emitFoldedBlock(ctx, op, l),
         .@"if" => try emitFoldedIf(ctx, l),
+        .select => try emitFoldedSelect(ctx, l),
         else => try emitFoldedPlain(ctx, op, l),
     }
     return i + 1;
+}
+
+/// `(select (result t)* operand*)` — a `(result …)` annotation means typed select.
+fn emitFoldedSelect(ctx: *Ctx, l: []const Sexpr) Error!void {
+    var j: usize = 1;
+    var tys: List(V) = .empty;
+    while (j < l.len and eqKw(l[j], "result")) : (j += 1) try parseDecls(ctx.a, l[j].asList().?, &tys, null);
+    while (j < l.len) j = try emitOne(ctx, l, j); // operands
+    try emitSelect(ctx, tys.items);
+}
+
+fn emitSelect(ctx: *Ctx, tys: []const V) Error!void {
+    if (tys.len == 0) {
+        try ctx.out.append(ctx.a, @intFromEnum(Op.select));
+    } else {
+        try ctx.out.append(ctx.a, @intFromEnum(Op.select_t));
+        try uleb(ctx.a, ctx.out, tys.len);
+        for (tys) |t| try ctx.out.append(ctx.a, @intFromEnum(t));
+    }
+}
+
+fn eqKw(s: Sexpr, kw: []const u8) bool {
+    return if (s.keyword()) |k| std.mem.eql(u8, k, kw) else false;
 }
 
 /// A plain folded instruction: `(op imm* operand*)` — operands emitted first.
@@ -336,7 +368,7 @@ fn emitFoldedBlock(ctx: *Ctx, op: Op, l: []const Sexpr) Error!void {
     try ctx.out.append(ctx.a, @intFromEnum(op));
     var j: usize = 1;
     const label = parseOptLabel(l, &j);
-    try emitBlockType(ctx, parseOptBlockType(l, &j));
+    try emitBlockTypeSig(ctx, try parseBlockTypeSig(ctx, l, &j));
     try ctx.labels.append(ctx.a, label);
     try emitSeq(ctx, l[j..]);
     try ctx.out.append(ctx.a, @intFromEnum(Op.end));
@@ -347,7 +379,7 @@ fn emitFoldedBlock(ctx: *Ctx, op: Op, l: []const Sexpr) Error!void {
 fn emitFoldedIf(ctx: *Ctx, l: []const Sexpr) Error!void {
     var j: usize = 1;
     const label = parseOptLabel(l, &j);
-    const bt = parseOptBlockType(l, &j);
+    const bt = try parseBlockTypeSig(ctx, l, &j);
 
     // An optional folded condition precedes `(then …)`; emit it first.
     if (j < l.len) {
@@ -364,7 +396,7 @@ fn emitFoldedIf(ctx: *Ctx, l: []const Sexpr) Error!void {
     const else_form: ?[]const Sexpr = if (j < l.len) l[j].asList() else null;
 
     try ctx.out.append(ctx.a, @intFromEnum(Op.@"if"));
-    try emitBlockType(ctx, bt);
+    try emitBlockTypeSig(ctx, bt);
     try ctx.labels.append(ctx.a, label);
     try emitSeq(ctx, then_form[1..]);
     if (else_form) |ef| {
@@ -383,7 +415,7 @@ fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Erro
             try ctx.out.append(ctx.a, @intFromEnum(op));
             var j = i + 1;
             const label = parseOptLabel(items, &j);
-            try emitBlockType(ctx, parseOptBlockType(items, &j));
+            try emitBlockTypeSig(ctx, try parseBlockTypeSig(ctx, items, &j));
             try ctx.labels.append(ctx.a, label);
             return j;
         },
@@ -404,6 +436,13 @@ fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Erro
                 try labels.append(ctx.a, items[j]);
             }
             try emitBrTable(ctx, labels.items);
+            return j;
+        },
+        .select => {
+            var j = i + 1;
+            var tys: List(V) = .empty;
+            while (j < items.len and eqKw(items[j], "result")) : (j += 1) try parseDecls(ctx.a, items[j].asList().?, &tys, null);
+            try emitSelect(ctx, tys.items);
             return j;
         },
         else => {
@@ -443,33 +482,32 @@ fn parseOptLabel(l: []const Sexpr, j: *usize) ?[]const u8 {
     return null;
 }
 
-fn parseOptBlockType(l: []const Sexpr, j: *usize) ?Sexpr {
-    if (j.* < l.len) {
-        if (l[j.*].keyword()) |kw| {
-            if (std.mem.eql(u8, kw, "result") or std.mem.eql(u8, kw, "param") or std.mem.eql(u8, kw, "type")) {
-                const form = l[j.*];
-                j.* += 1;
-                return form;
-            }
-        }
+/// Parse a block type — consecutive `(param …)` / `(result …)` forms → a `Sig`.
+fn parseBlockTypeSig(ctx: *Ctx, l: []const Sexpr, j: *usize) Error!Sig {
+    var params: List(V) = .empty;
+    var results: List(V) = .empty;
+    while (j.* < l.len) {
+        const kw = l[j.*].keyword() orelse break;
+        if (std.mem.eql(u8, kw, "param")) {
+            try parseDecls(ctx.a, l[j.*].asList().?, &params, null);
+        } else if (std.mem.eql(u8, kw, "result")) {
+            try parseDecls(ctx.a, l[j.*].asList().?, &results, null);
+        } else break; // `(type …)` block-type references are deferred
+        j.* += 1;
     }
-    return null;
+    return .{ .params = params.items, .results = results.items };
 }
 
-/// Emit a block type: empty → 0x40, `(result t)` → the value-type byte.
-/// Multi-value / `(param …)` / `(type …)` block types are deferred.
-fn emitBlockType(ctx: *Ctx, bt: ?Sexpr) Error!void {
-    const form = bt orelse {
+/// Emit a block type: empty → `0x40`; a single result → the value-type byte;
+/// anything with params or multiple results → a type index (interned).
+fn emitBlockTypeSig(ctx: *Ctx, sig: Sig) Error!void {
+    if (sig.params.len == 0 and sig.results.len == 0) {
         try ctx.out.append(ctx.a, 0x40);
-        return;
-    };
-    const inner = form.asList().?;
-    const kw = inner[0].asAtom().?;
-    if (std.mem.eql(u8, kw, "result") and inner.len == 2) {
-        try ctx.out.append(ctx.a, @intFromEnum(try parseValType(inner[1])));
-    } else if (std.mem.eql(u8, kw, "result") and inner.len == 1) {
-        try ctx.out.append(ctx.a, 0x40);
-    } else return error.UnsupportedInstr; // multi-value / type-index block types
+    } else if (sig.params.len == 0 and sig.results.len == 1) {
+        try ctx.out.append(ctx.a, @intFromEnum(sig.results[0]));
+    } else {
+        try sleb(ctx.a, ctx.out, try internSig(ctx.a, ctx.sigs, sig.params, sig.results));
+    }
 }
 
 fn emitBrTable(ctx: *Ctx, labels: []const Sexpr) Error!void {
@@ -618,17 +656,12 @@ fn floatBits(ctx: *Ctx, comptime U: type, s: Sexpr) Error!void {
 
 // --- Section / LEB helpers -------------------------------------------------
 
-fn internSig(a: std.mem.Allocator, sigs: *List(Func), f: Func) Error!u32 {
+fn internSig(a: std.mem.Allocator, sigs: *List(Sig), params: []const V, results: []const V) Error!u32 {
     for (sigs.items, 0..) |sig, i| {
-        if (slicesEqual(sig.params.items, f.params.items) and slicesEqual(sig.results.items, f.results.items))
-            return @intCast(i);
+        if (std.mem.eql(V, sig.params, params) and std.mem.eql(V, sig.results, results)) return @intCast(i);
     }
-    try sigs.append(a, f);
+    try sigs.append(a, .{ .params = params, .results = results });
     return @intCast(sigs.items.len - 1);
-}
-
-fn slicesEqual(x: []const V, y: []const V) bool {
-    return std.mem.eql(V, x, y);
 }
 
 fn valTypeVec(a: std.mem.Allocator, out: *List(u8), vts: []const V) Error!void {
@@ -777,4 +810,39 @@ test "assembles an active data segment" {
     ;
     const v = try assembleAndRun(src, "get", &.{});
     try std.testing.expectEqual(@as(u32, 0xDEADBEEF), @as(u32, @bitCast(interp.asI32(v))));
+}
+
+test "assembles a typed select" {
+    const src =
+        \\(module (func (export "sel") (param i32 i32 i32) (result i32)
+        \\  (select (result i32) (local.get 0) (local.get 1) (local.get 2))))
+    ;
+    try std.testing.expectEqual(@as(i32, 10), interp.asI32(try assembleAndRun(src, "sel", &.{ interp.i32Value(10), interp.i32Value(20), interp.i32Value(1) })));
+    try std.testing.expectEqual(@as(i32, 20), interp.asI32(try assembleAndRun(src, "sel", &.{ interp.i32Value(10), interp.i32Value(20), interp.i32Value(0) })));
+}
+
+test "assembles a multi-value block type" {
+    // (block (param i32) (result i32) …) — a block that consumes and produces a value.
+    const src =
+        \\(module (func (export "mv") (param i32) (result i32)
+        \\  (local.get 0)
+        \\  (block (param i32) (result i32) (i32.add (i32.const 1)))))
+    ;
+    try std.testing.expectEqual(@as(i32, 6), interp.asI32(try assembleAndRun(src, "mv", &.{interp.i32Value(5)})));
+}
+
+test "assembles multi-value function results" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bin = try assemble(a,
+        \\(module (func (export "swap") (param i32 i32) (result i32 i32)
+        \\  (local.get 1) (local.get 0)))
+    );
+    var m = try Module.decode(a, bin);
+    var inst = try interp.Instance.init(a, &m);
+    const r = try inst.invoke("swap", &.{ interp.i32Value(3), interp.i32Value(7) });
+    try std.testing.expectEqual(@as(usize, 2), r.len);
+    try std.testing.expectEqual(@as(i32, 7), interp.asI32(r[0]));
+    try std.testing.expectEqual(@as(i32, 3), interp.asI32(r[1]));
 }

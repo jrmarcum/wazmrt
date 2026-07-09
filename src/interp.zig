@@ -327,7 +327,7 @@ const Frame = struct {
                     _ = self.pop();
                     pc += 1;
                 },
-                .select => {
+                .select, .select_t => {
                     const c = self.popI32();
                     const b = self.pop();
                     const av = self.pop();

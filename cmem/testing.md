@@ -105,8 +105,12 @@ Run a `.wast` file directly: `wazmrt <file.wast>` → `N passed, N failed, N ski
   Zig's native op yields a different NaN bit pattern than the exact-bits assertion expects).
 
 **Takeaway:** thousands of official spec assertions pass; every gap is a *named, deferred feature*, not
-a core correctness bug. Next breadth to unlock more files: **multi-value block types**, typed `select`,
-then `table`/`call_indirect`.
+a core correctness bug.
+
+**Update 2026-07-02 — multi-value + typed `select` landed:** `fac` now passes (0→6). The remaining
+`0 passed` control-flow files (`block`/`nop`/`if`/`loop`/`local_tee`/`select`/`stack`) are blocked on
+**`call_indirect`** (they use `(call_indirect (type $t) …)`) — the next feature. i32/i64/int_exprs/
+address/f32/f64 unchanged.
 
 ## What this tells the roadmap
 

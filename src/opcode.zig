@@ -39,6 +39,7 @@ pub const Op = enum(u8) {
     // Parametric
     drop = 0x1a,
     select = 0x1b,
+    select_t = 0x1c, // typed select: immediate is a vec of result types
 
     // Variable
     local_get = 0x20,
@@ -254,6 +255,8 @@ pub const Imm = union(enum) {
     /// Raw little-endian bit pattern (`f32.const` / `f64.const`).
     f32: u32,
     f64: u64,
+    /// Result types of a typed `select` (`0x1c`).
+    select_types: []const types.ValType,
 };
 
 pub const Instr = struct { op: Op, imm: Imm };
@@ -273,6 +276,7 @@ const ImmKind = enum {
     i64c,
     f32c,
     f64c,
+    select_types,
     unsupported,
 };
 
@@ -293,26 +297,28 @@ pub fn immediateKind(op: Op) ImmKind {
         0x42 => .i64c,
         0x43 => .f32c,
         0x44 => .f64c,
+        0x1c => .select_types,
         // Everything else in the core-MVP range has no immediate.
         0x00, 0x01, 0x05, 0x0b, 0x0f, 0x1a, 0x1b, 0x45...0xc4 => .none,
         else => .unsupported,
     };
 }
 
+/// Decode a block type (§5.3.6): an s33 — negative values encode empty/valtype,
+/// non-negative values are a type index.
 fn readBlockType(r: *Reader) DecodeError!BlockType {
-    const b = try r.readByte();
-    return switch (b) {
-        0x40 => .empty,
-        0x7f => .{ .value = .i32 },
-        0x7e => .{ .value = .i64 },
-        0x7d => .{ .value = .f32 },
-        0x7c => .{ .value = .f64 },
-        0x7b => .{ .value = .v128 },
-        0x70 => .{ .value = .funcref },
-        0x6f => .{ .value = .externref },
-        // A single-byte non-negative SLEB is a type index; multi-byte (high bit
-        // set) type indices are deferred.
-        else => if (b < 0x40) BlockType{ .type_index = b } else error.UnsupportedOpcode,
+    const v = try r.readVarI64();
+    if (v >= 0) return .{ .type_index = @intCast(v) };
+    return switch (v) {
+        -64 => .empty,
+        -1 => .{ .value = .i32 },
+        -2 => .{ .value = .i64 },
+        -3 => .{ .value = .f32 },
+        -4 => .{ .value = .f64 },
+        -5 => .{ .value = .v128 },
+        -16 => .{ .value = .funcref },
+        -17 => .{ .value = .externref },
+        else => error.UnsupportedOpcode,
     };
 }
 
@@ -354,6 +360,12 @@ pub fn decodeBody(a: std.mem.Allocator, body: []const u8) (DecodeError || std.me
             .i64c => .{ .i64 = try r.readVarI64() },
             .f32c => .{ .f32 = try r.readF32Bits() },
             .f64c => .{ .f64 = try r.readF64Bits() },
+            .select_types => blk: {
+                const n = try r.readVarU32();
+                const tys = try a.alloc(types.ValType, n);
+                for (tys) |*t| t.* = @enumFromInt(try r.readByte());
+                break :blk .{ .select_types = tys };
+            },
             .unsupported => return error.UnsupportedOpcode,
         };
         try list.append(a, .{ .op = op, .imm = imm });

@@ -37,8 +37,9 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
   **memarg** (`offset=`/`align=`), and the **memory + data** sections. **Verified:**
   assemble→decode→validate→run for add, mul, nested const, two-func `call`, if/else,
   a named-label loop `sum(5)=15`, flat block+br, memory store/load, and a data segment.
-  **Deferred in wat.zig:** `global`/`table`/`start`/`elem` sections, multi-value/type-index
-  block types, `call_indirect`.
+  **Multi-value block types + typed `select` DONE 2026-07-02** (type-index blocktypes interned into
+  the type section; `select_t` 0x1c). **Deferred in wat.zig:** `global`/`table`/`start`/`elem`
+  sections, `(type $t)` block-type references, `call_indirect`.
 - **`src/wast.zig`** (MVP DONE 2026-07-02) — WAST script runner: `(module …)` text +
   `(module binary …)`, `assert_return`, `assert_trap`, `invoke`; value literals incl.
   `nan:canonical`/`nan:arithmetic`; drives an `Instance` and compares (NaN-aware). CLI
@@ -58,9 +59,11 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
    drives an `Instance`, compares (NaN-aware). CLI `.wast` mode. **Runs the official testsuite:**
    `i32` 374/0, `i64` 384/0, `int_exprs` 89/0, `address` 255/0, `f32`/`f64` 2498/2 (see `testing.md`).
    Deferred: `assert_invalid`/`assert_malformed`, `register`/multi-module, `get`, `(module quote …)`.
-5. **Expand coverage (next):** multi-value block types/results + typed `select` (unblocks
-   `nop`/`fac`/`local_tee`/`select`), then `table`/`call_indirect`. This is the standing conformance
-   gate (`testing.md`).
+5. ~~Multi-value block types/results + typed `select`~~ **DONE 2026-07-02** (decoder type-index
+   blocktypes + `select_t` 0x1c; interp/validator; assembler interns block-type sigs into the type
+   section + emits typed select). Fixed `fac` (0→6). **Next: `call_indirect` + tables** — the blocker
+   for `block`/`nop`/`if`/`loop` (they use `(call_indirect (type $t) …)`). This is the standing
+   conformance gate (`testing.md`).
 
 ## Notes / invariants
 
