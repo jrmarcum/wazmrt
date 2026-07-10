@@ -75,6 +75,8 @@ pub const DecodeError = error{
     UnknownExternKind,
     /// A type/function/extern index referred outside the decoded space.
     IndexOutOfRange,
+    /// A single-byte flag (global mutability, limits flag) held a reserved value.
+    MalformedFlag,
     /// An instruction opcode wazmrt does not yet decode (SIMD `0xFD`, the
     /// unimplemented `0xFC` ops — bulk-memory, `table.init`/`.copy`, saturating
     /// truncation — for now).

@@ -8,10 +8,12 @@
 //! official testsuite.
 //!
 //! **Scope today (MVP):** `(module …)` (text) and `(module binary …)`,
-//! `assert_return (invoke …) …`, `assert_trap (invoke …) …`, bare `(invoke …)`,
-//! and value literals (`i32`/`i64`/`f32`/`f64` incl. `nan:canonical` /
-//! `nan:arithmetic`). Deferred: `assert_invalid`/`assert_malformed`, `register`
-//! + multi-module linking, `get` actions, `(module quote …)`.
+//! `assert_return`/`assert_trap`/`assert_exhaustion (invoke …) …`,
+//! `assert_invalid`/`assert_malformed (module …)` (the module must be rejected),
+//! bare `(invoke …)`, and value literals (`i32`/`i64`/`f32`/`f64` incl.
+//! `nan:canonical`/`nan:arithmetic`, references). `assert_trap` accepts only a
+//! genuine runtime trap (see `isRuntimeTrap`), not an engine error. Deferred:
+//! `register` + multi-module linking, `get` actions, `(module quote …)`.
 
 const std = @import("std");
 const sexpr = @import("sexpr.zig");
@@ -68,10 +70,14 @@ const Runner = struct {
             try self.assertReturn(cmd.asList().?);
         } else if (std.mem.eql(u8, kw, "assert_trap")) {
             try self.assertTrap(cmd.asList().?);
+        } else if (std.mem.eql(u8, kw, "assert_exhaustion")) {
+            try self.assertExhaustion(cmd.asList().?);
+        } else if (std.mem.eql(u8, kw, "assert_invalid") or std.mem.eql(u8, kw, "assert_malformed")) {
+            try self.assertRejected(cmd.asList().?);
         } else if (std.mem.eql(u8, kw, "invoke")) {
             _ = self.runAction(cmd) catch |e| self.fail("invoke trapped: {s}", .{@errorName(e)});
         } else {
-            self.summary.skipped += 1; // assert_invalid/malformed, register, get, …
+            self.summary.skipped += 1; // register, get, (module quote …), …
         }
     }
 
@@ -155,11 +161,71 @@ const Runner = struct {
         }
         if (self.runAction(form[1])) |_| {
             self.fail("assert_trap: expected a trap, got a result", .{});
-        } else |_| {
-            self.summary.passed += 1; // any error counts as the expected trap
+        } else |e| {
+            // Only a genuine wasm runtime trap counts — an engine limitation or
+            // bug (UnsupportedInstruction, UndefinedFunc, a decode/assemble error)
+            // must NOT be green-washed as the expected trap.
+            if (isRuntimeTrap(e)) self.summary.passed += 1 else self.fail("assert_trap: non-trap error {s}", .{@errorName(e)});
         }
     }
+
+    /// `assert_exhaustion (invoke …) "call stack exhausted"` — expects the call
+    /// depth limit to trip (a runtime trap), not any other error.
+    fn assertExhaustion(self: *Runner, form: []const Sexpr) Error!void {
+        if (self.current == null) {
+            self.summary.skipped += 1;
+            return;
+        }
+        if (self.runAction(form[1])) |_| {
+            self.fail("assert_exhaustion: expected exhaustion, got a result", .{});
+        } else |e| {
+            if (e == error.CallStackExhausted) self.summary.passed += 1 else self.fail("assert_exhaustion: got {s}", .{@errorName(e)});
+        }
+    }
+
+    /// `assert_invalid`/`assert_malformed (module …) "reason"` — the inner module
+    /// must be REJECTED (fail to decode/validate). Passing means we rejected it;
+    /// failing means we wrongly accepted an invalid/malformed module. Does not
+    /// touch `self.current`.
+    fn assertRejected(self: *Runner, form: []const Sexpr) Error!void {
+        const inner = form[1].asList() orelse {
+            self.fail("assert_invalid: malformed command", .{});
+            return;
+        };
+        if (self.tryBuild(inner)) |_| {
+            self.fail("assert_invalid/malformed: module was accepted (should be rejected)", .{});
+        } else |_| {
+            self.summary.passed += 1;
+        }
+    }
+
+    /// Decode + validate a module form without instantiating or recording it.
+    fn tryBuild(self: *Runner, form: []const Sexpr) !void {
+        const bin = try self.moduleBinary(form);
+        const m = try self.a.create(Module);
+        m.* = try Module.decode(self.a, bin);
+        try validate(self.a, m);
+    }
 };
+
+/// True only for genuine wasm runtime traps (§4.2). Engine limitations, decode/
+/// assemble errors, and setup errors are explicitly excluded so `assert_trap` /
+/// `assert_exhaustion` cannot be satisfied by a bug.
+fn isRuntimeTrap(e: anyerror) bool {
+    return switch (e) {
+        error.Unreachable,
+        error.DivByZero,
+        error.IntOverflow,
+        error.InvalidConversionToInt,
+        error.MemoryOutOfBounds,
+        error.TableOutOfBounds,
+        error.UninitializedElement,
+        error.IndirectTypeMismatch,
+        error.CallStackExhausted,
+        => true,
+        else => false,
+    };
+}
 
 // --- Value literals & comparison -------------------------------------------
 

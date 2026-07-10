@@ -277,6 +277,7 @@ fn readName(a: std.mem.Allocator, r: *Reader) Error![]const u8 {
 
 fn readLimits(r: *Reader) Error!Limits {
     const flag = try r.readByte();
+    if (flag > 0x01) return error.MalformedFlag; // only 0x00 (min) / 0x01 (min,max)
     const min = try r.readVarU32();
     const max: ?u32 = if (flag & 0x01 != 0) try r.readVarU32() else null;
     return .{ .min = min, .max = max };
@@ -290,6 +291,7 @@ fn readTableType(r: *Reader) Error!TableType {
 fn readGlobalType(r: *Reader) Error!GlobalType {
     const content: types.ValType = @enumFromInt(try r.readByte());
     const mut = try r.readByte();
+    if (mut > 0x01) return error.MalformedFlag; // only 0x00 (const) / 0x01 (var)
     return .{ .content = content, .mutable = mut != 0 };
 }
 

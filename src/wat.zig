@@ -59,8 +59,10 @@ const Sig = struct { params: []const V, results: []const V };
 const TableDef = struct { min: u32, max: ?u32, elem: V = .funcref };
 /// An active element segment; `funcs` are unresolved func references.
 const ElemDef = struct { table_index: u32, offset: i64, funcs: []const Sexpr };
-/// A defined global: its value type, mutability, and (unencoded) init const-expr.
-const GlobalDef = struct { valtype: V, mutable: bool, init: Sexpr };
+/// A defined global: its value type, mutability, and (unencoded) init
+/// const-expr — a *sequence* of instruction forms (usually one folded expr, but
+/// a malformed module may list several, which validation then rejects on arity).
+const GlobalDef = struct { valtype: V, mutable: bool, init: []const Sexpr };
 /// An imported global (`(global (import "m" "n") type)`).
 const ImportedGlobal = struct { module: []const u8, name: []const u8, valtype: V, mutable: bool };
 
@@ -148,8 +150,11 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             try parseTable(a, items, &tables, &table_names, &elems);
         } else if (std.mem.eql(u8, kw, "elem")) {
             try parseElem(a, items, &elems, table_names.items);
+        } else if (std.mem.eql(u8, kw, "import")) {
+            // (import "m" "n" (global $id? type)) — only global imports today.
+            try parseImport(a, items, &global_imports, &global_names);
         } else {
-            // `type` handled in the pre-pass; global/start/import deferred.
+            // `type` handled in the pre-pass; `start` deferred.
         }
     }
 
@@ -423,17 +428,43 @@ fn parseGlobal(a: std.mem.Allocator, items: []const Sexpr, globals: *List(Global
     if (imp) |m| {
         try global_imports.append(a, .{ .module = m.module, .name = m.name, .valtype = valtype, .mutable = mutable });
     } else {
-        // A defined global requires an init const-expr.
-        if (i >= items.len) return error.BadModuleField;
-        try globals.append(a, .{ .valtype = valtype, .mutable = mutable, .init = items[i] });
+        // The init is every remaining form (an empty sequence — a missing init —
+        // encodes to a bare `end`, which validation rejects on arity).
+        try globals.append(a, .{ .valtype = valtype, .mutable = mutable, .init = items[i..] });
     }
     try global_names.append(a, name);
 }
 
-/// Emit a constant init expression (a single folded instruction) followed by `end`.
-fn emitConstExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, expr: Sexpr) Error!void {
+/// Top-level `(import "m" "n" (global $id? (mut? valtype)))`. Only global imports
+/// are assembled today; a func/table/memory import errors (honest, not silent).
+fn parseImport(a: std.mem.Allocator, items: []const Sexpr, global_imports: *List(ImportedGlobal), global_names: *List(?[]const u8)) Error!void {
+    const module = items[1].string;
+    const name = items[2].string;
+    const desc = items[3].asList() orelse return error.BadModuleField;
+    const dkw = desc[0].asAtom() orelse return error.BadModuleField;
+    if (!std.mem.eql(u8, dkw, "global")) return error.UnsupportedInstr; // func/table/memory imports
+    var di: usize = 1;
+    var gname: ?[]const u8 = null;
+    if (di < desc.len and isId(desc[di])) {
+        gname = desc[di].atom;
+        di += 1;
+    }
+    var mutable = false;
+    var valtype: V = undefined;
+    if (desc[di].asList()) |gt| {
+        mutable = eqAtom(gt[0], "mut");
+        valtype = try parseValType(gt[gt.len - 1]);
+    } else {
+        valtype = try parseValType(desc[di]);
+    }
+    try global_imports.append(a, .{ .module = module, .name = name, .valtype = valtype, .mutable = mutable });
+    try global_names.append(a, gname);
+}
+
+/// Emit a constant init expression (a sequence of instruction forms) + `end`.
+fn emitConstExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, exprs: []const Sexpr) Error!void {
     var ctx: Ctx = .{ .a = a, .out = out, .local_names = &.{}, .func_names = &.{}, .sigs = sigs, .type_names = type_names, .global_names = global_names };
-    try emitExpr(&ctx, expr);
+    try emitSeq(&ctx, exprs);
     try out.append(a, @intFromEnum(Op.end));
 }
 
@@ -1088,6 +1119,33 @@ fn sleb(a: std.mem.Allocator, out: *List(u8), value: i64) Error!void {
 
 const Module = @import("Module.zig");
 const interp = @import("interp.zig");
+const validate = @import("validate.zig").validate;
+
+/// Assemble + decode + validate `src`, asserting the module is REJECTED (at any
+/// stage). Fails the test only if the module is wrongly accepted.
+fn expectInvalid(src: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bin = assemble(a, src) catch return; // rejected at assembly is fine
+    var m = Module.decode(a, bin) catch return; // rejected at decode is fine
+    if (validate(a, &m)) |_| return error.TestExpectedRejection else |_| {}
+}
+
+test "validation rejects invalid modules" {
+    // Non-constant global init, wrong-typed init, forward global.get.
+    try expectInvalid("(module (global i32 (i32.ctz (i32.const 0))))");
+    try expectInvalid("(module (global i32 (f32.const 0)))");
+    try expectInvalid("(module (global i32 (global.get 0)))");
+    // Untyped select on reference operands.
+    try expectInvalid("(module (func (param funcref funcref i32) (drop (select (local.get 0) (local.get 1) (local.get 2)))))");
+    // call_indirect with no table.
+    try expectInvalid("(module (type (func)) (func (call_indirect (type 0) (i32.const 0))))");
+    // Over-aligned load (align=2 on load8).
+    try expectInvalid("(module (memory 0) (func (drop (i32.load8_u align=2 (i32.const 0)))))");
+    // Load with no memory at all.
+    try expectInvalid("(module (func (drop (i32.load (i32.const 0)))))");
+}
 
 fn assembleAndRun(src: []const u8, name: []const u8, args: []const interp.Value) !interp.Value {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

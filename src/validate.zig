@@ -15,6 +15,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const Module = @import("Module.zig");
 const opcode = @import("opcode.zig");
+const Reader = @import("Reader.zig");
 
 const V = types.ValType;
 const Op = opcode.Op;
@@ -33,11 +34,33 @@ pub const Error = Module.Error || error{
     UndefinedFunc,
     UndefinedType,
     UndefinedTable,
+    ConstantExpressionRequired,
+    InvalidAlignment,
+    MissingMemory,
 };
 
 /// Validate an entire module. Returns on the first error.
 pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
     if (module.functions.len != module.code.len) return error.CountMismatch;
+
+    // Global init const-exprs: each must be a constant expression producing
+    // exactly the declared type. Defined globals occupy the tail of the space.
+    const n_imported_globals: u32 = @intCast(module.globals.len - module.global_inits.len);
+    for (module.global_inits, 0..) |init_expr, i| {
+        const self_index = n_imported_globals + @as(u32, @intCast(i));
+        try validateConstExpr(module, init_expr, module.globals[self_index].content, self_index);
+    }
+
+    // Element segments: every referenced function index must exist; an active
+    // segment targets an existing funcref table with a valid i32 offset expr.
+    for (module.elements) |elem| {
+        for (elem.funcs) |fi| if (funcTypeOf(module, fi) == null) return error.UndefinedFunc;
+        if (elem.active) {
+            if (elem.table_index >= module.tables.len) return error.UndefinedTable;
+            if (module.tables[elem.table_index].element != .funcref) return error.TypeMismatch;
+            try validateConstExpr(module, elem.offset_expr, .i32, n_imported_globals);
+        }
+    }
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -47,6 +70,70 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
         try validateFunction(arena.allocator(), module, module.func_types[type_index], code);
         _ = arena.reset(.retain_capacity);
     }
+}
+
+/// Type-check a constant expression (§3.3.7 + extended-const `i32`/`i64`
+/// `add`/`sub`/`mul`). It must produce exactly one value of `expected`. A
+/// `global.get x` may reference only a *prior* (`x < self_index`) *immutable*
+/// global; anything outside the const-expr opcode set is rejected.
+fn validateConstExpr(module: *const Module, expr: []const u8, expected: V, self_index: u32) Error!void {
+    var r = Reader.init(expr);
+    var stack: [8]V = undefined;
+    var sp: usize = 0;
+    const push = struct {
+        fn f(s: *[8]V, p: *usize, t: V) Error!void {
+            if (p.* >= s.len) return error.ConstantExpressionRequired;
+            s[p.*] = t;
+            p.* += 1;
+        }
+    }.f;
+    while (true) {
+        const op = try r.readByte();
+        switch (op) {
+            0x0b => break, // end
+            0x41 => {
+                _ = try r.readVarI32();
+                try push(&stack, &sp, .i32);
+            },
+            0x42 => {
+                _ = try r.readVarI64();
+                try push(&stack, &sp, .i64);
+            },
+            0x43 => {
+                _ = try r.readBytes(4);
+                try push(&stack, &sp, .f32);
+            },
+            0x44 => {
+                _ = try r.readBytes(8);
+                try push(&stack, &sp, .f64);
+            },
+            0x23 => { // global.get x — only a prior, immutable global
+                const gi = try r.readVarU32();
+                if (gi >= self_index) return error.UndefinedGlobal;
+                if (module.globals[gi].mutable) return error.ConstantExpressionRequired;
+                try push(&stack, &sp, module.globals[gi].content);
+            },
+            0xd0 => { // ref.null <heaptype>
+                const ht: V = @enumFromInt(try r.readByte());
+                try push(&stack, &sp, ht);
+            },
+            0xd2 => { // ref.func x
+                const fi = try r.readVarU32();
+                if (funcTypeOf(module, fi) == null) return error.UndefinedFunc;
+                try push(&stack, &sp, .funcref);
+            },
+            0x6a, 0x6b, 0x6c => { // i32 add/sub/mul (extended-const)
+                if (sp < 2 or stack[sp - 1] != .i32 or stack[sp - 2] != .i32) return error.TypeMismatch;
+                sp -= 1;
+            },
+            0x7c, 0x7d, 0x7e => { // i64 add/sub/mul (extended-const)
+                if (sp < 2 or stack[sp - 1] != .i64 or stack[sp - 2] != .i64) return error.TypeMismatch;
+                sp -= 1;
+            },
+            else => return error.ConstantExpressionRequired,
+        }
+    }
+    if (sp != 1 or stack[0] != expected) return error.TypeMismatch;
 }
 
 fn validateFunction(a: std.mem.Allocator, module: *const Module, ft: Module.FuncType, code: Module.Code) Error!void {
@@ -215,6 +302,9 @@ const FuncValidator = struct {
             },
             .end => {
                 const frame = try self.popCtrl();
+                // An `if` closed without an `else` has an implicit identity else
+                // branch, which requires the param and result types to match.
+                if (frame.kind == .if_ and !std.mem.eql(V, frame.start, frame.end)) return error.TypeMismatch;
                 try self.pushVals(frame.end);
             },
 
@@ -253,6 +343,8 @@ const FuncValidator = struct {
             },
             .call_indirect => {
                 const ci = instr.imm.call_indirect;
+                if (ci.table >= self.module.tables.len) return error.UndefinedTable;
+                if (self.module.tables[ci.table].element != .funcref) return error.TypeMismatch;
                 if (ci.type_index >= self.module.func_types.len) return error.UndefinedType;
                 const ft = self.module.func_types[ci.type_index];
                 _ = try self.popExpect(.i32);
@@ -261,10 +353,13 @@ const FuncValidator = struct {
             },
 
             .drop => _ = try self.popVal(),
-            .select, .select_t => {
+            .select => {
+                // Untyped select: operands must be equal and a *numeric/vector*
+                // type — reference-typed operands require the typed form.
                 _ = try self.popExpect(.i32);
                 const t1 = try self.popVal();
                 const t2 = try self.popVal();
+                if (isRefStack(t1) or isRefStack(t2)) return error.TypeMismatch;
                 const rt: StackType = switch (t1) {
                     .unknown => t2,
                     .val => |a| switch (t2) {
@@ -273,6 +368,16 @@ const FuncValidator = struct {
                     },
                 };
                 try self.pushVal(rt);
+            },
+            .select_t => {
+                // Typed select: the annotation must be exactly one type; both
+                // operands must match it.
+                const tys = instr.imm.select_types;
+                if (tys.len != 1) return error.TypeMismatch; // invalid result arity
+                _ = try self.popExpect(.i32);
+                _ = try self.popExpect(tys[0]);
+                _ = try self.popExpect(tys[0]);
+                try self.pushValT(tys[0]);
             },
 
             .table_get => {
@@ -327,6 +432,12 @@ const FuncValidator = struct {
             },
 
             else => {
+                // Load/store: the alignment (log2) must not exceed the access's
+                // natural alignment, and a linear memory must exist.
+                if (opcode.immediateKind(instr.op) == .mem) {
+                    if (self.module.memories.len == 0) return error.MissingMemory;
+                    if (instr.imm.mem.alignment > naturalAlignLog2(instr.op)) return error.InvalidAlignment;
+                }
                 const s = simpleSig(instr.op) orelse return error.UnsupportedOpcode;
                 try self.popVals(s.pop);
                 try self.pushVals(s.push);
@@ -334,6 +445,17 @@ const FuncValidator = struct {
         }
     }
 };
+
+/// Natural alignment (log2 of the access size in bytes) for a load/store opcode.
+fn naturalAlignLog2(op: Op) u32 {
+    return switch (op) {
+        .i32_load8_s, .i32_load8_u, .i64_load8_s, .i64_load8_u, .i32_store8, .i64_store8 => 0,
+        .i32_load16_s, .i32_load16_u, .i64_load16_s, .i64_load16_u, .i32_store16, .i64_store16 => 1,
+        .i32_load, .f32_load, .i32_store, .f32_store, .i64_load32_s, .i64_load32_u, .i64_store32 => 2,
+        .i64_load, .f64_load, .i64_store, .f64_store => 3,
+        else => 0,
+    };
+}
 
 /// Resolve a function index (imports first, then defined) to its signature.
 fn funcTypeOf(module: *const Module, index: u32) ?Module.FuncType {
@@ -349,6 +471,15 @@ fn funcTypeOf(module: *const Module, index: u32) ?Module.FuncType {
     const ti = module.functions[defined];
     if (ti >= module.func_types.len) return null;
     return module.func_types[ti];
+}
+
+/// True if an abstract stack entry is a concrete reference type (funcref /
+/// externref). Unknown (polymorphic) entries are not — they can't be pinned.
+fn isRefStack(st: StackType) bool {
+    return switch (st) {
+        .val => |v| v == .funcref or v == .externref,
+        .unknown => false,
+    };
 }
 
 // Common operand lists, in stack bottom→top order.
