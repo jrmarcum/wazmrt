@@ -175,6 +175,8 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
     var data: []const DataSegment = &.{};
     var elements: []const Element = &.{};
 
+    var data_count: ?u32 = null;
+
     while (!r.atEnd()) {
         const raw_id = try r.readByte();
         if (raw_id > types.SectionId.max) return error.InvalidSectionId;
@@ -186,6 +188,12 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
 
         var sub = Reader.init(payload);
         switch (id) {
+            // A custom section's payload begins with a name (§5.5.3); an empty
+            // section (no name) or an over-long name length is malformed.
+            .custom => {
+                const nlen = try sub.readVarU32();
+                _ = try sub.readBytes(nlen);
+            },
             .type => d.func_types = try decodeTypeSection(&d, &sub),
             .import => imports = try decodeImportSection(&d, &sub),
             .function => functions = try decodeFunctionSection(&d, &sub),
@@ -196,9 +204,13 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
             .element => elements = try decodeElementSection(&d, &sub),
             .code => code = try decodeCodeSection(&d, &sub),
             .data => data = try decodeDataSection(&d, &sub),
+            .data_count => data_count = try sub.readVarU32(),
             else => {},
         }
     }
+
+    // If present, the data-count section must equal the data-segment count (§5.5.16).
+    if (data_count) |dc| if (dc != data.len) return error.DataCountMismatch;
 
     return .{
         .arena = arena,
@@ -522,8 +534,9 @@ test "decodes an empty module (header only)" {
 }
 
 test "indexes a single custom section" {
+    // custom section: id 0, size 1, payload = name-length 0 (empty name, no content).
     const bytes = types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
-        [_]u8{ 0x00, 0x01, 0x2a };
+        [_]u8{ 0x00, 0x01, 0x00 };
     var m = try Module.decode(std.testing.allocator, &bytes);
     defer m.deinit();
     try std.testing.expectEqual(@as(usize, 1), m.sections.len);

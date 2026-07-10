@@ -88,6 +88,8 @@ pub const DecodeError = error{
     MalformedFlag,
     /// A value-type byte was not one of the defined value types.
     BadValType,
+    /// The data-count section disagreed with the number of data segments.
+    DataCountMismatch,
     /// An instruction opcode wazmrt does not yet decode (SIMD `0xFD`, the
     /// unimplemented `0xFC` ops — bulk-memory, `table.init`/`.copy`, saturating
     /// truncation — for now).
