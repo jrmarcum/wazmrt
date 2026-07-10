@@ -1157,6 +1157,8 @@ test "validation rejects invalid modules" {
     try expectInvalid("(module (memory 0) (func (drop (i32.load8_u align=2 (i32.const 0)))))");
     // Load with no memory at all.
     try expectInvalid("(module (func (drop (i32.load (i32.const 0)))))");
+    // ref.is_null on a non-reference operand.
+    try expectInvalid("(module (func (drop (ref.is_null (i32.const 0)))))");
 }
 
 fn assembleAndRun(src: []const u8, name: []const u8, args: []const interp.Value) !interp.Value {

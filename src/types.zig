@@ -43,6 +43,15 @@ pub const ValType = enum(u8) {
     funcref = 0x70,
     externref = 0x6f,
     _,
+
+    /// True only for the defined value-type bytes (rejects garbage decoded via
+    /// `@enumFromInt`).
+    pub fn isValid(self: ValType) bool {
+        return switch (self) {
+            .i32, .i64, .f32, .f64, .v128, .funcref, .externref => true,
+            _ => false,
+        };
+    }
 };
 
 /// The kind of an import or export, as encoded in the binary import/export
@@ -77,6 +86,8 @@ pub const DecodeError = error{
     IndexOutOfRange,
     /// A single-byte flag (global mutability, limits flag) held a reserved value.
     MalformedFlag,
+    /// A value-type byte was not one of the defined value types.
+    BadValType,
     /// An instruction opcode wazmrt does not yet decode (SIMD `0xFD`, the
     /// unimplemented `0xFC` ops — bulk-memory, `table.init`/`.copy`, saturating
     /// truncation — for now).

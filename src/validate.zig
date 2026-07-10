@@ -409,7 +409,10 @@ const FuncValidator = struct {
 
             .ref_null => try self.pushValT(instr.imm.ref_type),
             .ref_is_null => {
-                _ = try self.popVal(); // any reference type
+                switch (try self.popVal()) { // requires a reference type (or polymorphic)
+                    .val => |v| if (v != .funcref and v != .externref) return error.TypeMismatch,
+                    .unknown => {},
+                }
                 try self.pushValT(.i32);
             },
             .ref_func => {

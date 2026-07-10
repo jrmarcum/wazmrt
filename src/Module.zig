@@ -259,10 +259,17 @@ pub fn funcType(self: Module, index: u32) ?FuncType {
 
 // --- Low-level readers -----------------------------------------------------
 
+/// Read one value-type byte, rejecting undefined encodings.
+fn readValType(r: *Reader) Error!types.ValType {
+    const v: types.ValType = @enumFromInt(try r.readByte());
+    if (!v.isValid()) return error.BadValType;
+    return v;
+}
+
 fn readValTypes(a: std.mem.Allocator, r: *Reader) Error![]const types.ValType {
     const n = try r.readVarU32();
     const vts = try a.alloc(types.ValType, n);
-    for (vts) |*v| v.* = @enumFromInt(try r.readByte());
+    for (vts) |*v| v.* = try readValType(r);
     return vts;
 }
 
@@ -284,12 +291,12 @@ fn readLimits(r: *Reader) Error!Limits {
 }
 
 fn readTableType(r: *Reader) Error!TableType {
-    const element: types.ValType = @enumFromInt(try r.readByte());
+    const element = try readValType(r);
     return .{ .element = element, .limits = try readLimits(r) };
 }
 
 fn readGlobalType(r: *Reader) Error!GlobalType {
-    const content: types.ValType = @enumFromInt(try r.readByte());
+    const content = try readValType(r);
     const mut = try r.readByte();
     if (mut > 0x01) return error.MalformedFlag; // only 0x00 (const) / 0x01 (var)
     return .{ .content = content, .mutable = mut != 0 };
@@ -421,7 +428,7 @@ fn decodeLocals(a: std.mem.Allocator, r: *Reader) Error![]const Local {
     const locals = try a.alloc(Local, n);
     for (locals) |*l| {
         l.count = try r.readVarU32();
-        l.type = @enumFromInt(try r.readByte());
+        l.type = try readValType(r);
     }
     return locals;
 }
@@ -533,6 +540,20 @@ test "rejects a bad magic" {
 test "rejects an unsupported version" {
     const bytes = types.magic ++ [_]u8{ 0x02, 0x00, 0x00, 0x00 };
     try std.testing.expectError(error.UnsupportedVersion, Module.decode(std.testing.allocator, &bytes));
+}
+
+test "rejects an undefined value-type byte" {
+    // type section: one func type with a single param byte 0x6d (not a valtype).
+    const bytes = types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+        [_]u8{ 0x01, 0x05, 0x01, 0x60, 0x01, 0x6d, 0x00 };
+    try std.testing.expectError(error.BadValType, Module.decode(std.testing.allocator, &bytes));
+}
+
+test "rejects a reserved global-mutability byte" {
+    // global section: one global i32 with mutability byte 0x02 (only 0/1 valid).
+    const bytes = types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+        [_]u8{ 0x06, 0x04, 0x01, 0x7f, 0x02, 0x0b };
+    try std.testing.expectError(error.MalformedFlag, Module.decode(std.testing.allocator, &bytes));
 }
 
 test "decodes and resolves type/import/function/export sections" {
