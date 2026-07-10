@@ -28,8 +28,18 @@ soundness gaps observable, so they were fixed together:
 - **#8 DONE** — `align=` over-natural is now a validation error (the assembler still doesn't reject a
   non-power-of-two `align=` literal, but no test exercises that path).
 
-Still open: #2e (`ref.is_null` accepts non-ref), #2f (`br_table` polymorphic arity-only), #3, #4,
-#9, #10, #11, #12, #13, plus the newly-found items in "Discovered 2026-07-09" below.
+Third pass (commit `c535de0`):
+- **#2e DONE** — `ref.is_null` rejects a non-reference operand.
+- **#6 DONE** — the decoder validates value-type bytes (`readValType` / `ValType.isValid`) in func
+  types, table element types, global content, and locals (reserved mutability/limits bytes were
+  already rejected). The `select_types` / `ref.null` heaptype immediates in `opcode.zig` are still
+  unvalidated, but those are instruction-level, not module structure.
+- **#2f NOT A BUG** — investigated and closed: the `pop_vals`/`push_vals` chain already cross-checks
+  `br_table` label *value types* (not just arity) even in polymorphic code. Verified empirically —
+  different-typed labels are rejected, same-typed accepted. No change needed.
+
+Still open: #1, #3, #4, #9, #10, #11, #12, #13, plus the "Discovered 2026-07-09" items below (#15,
+#16). #14 is resolved (see below).
 
 ## Grouped by the integration that trips them
 
