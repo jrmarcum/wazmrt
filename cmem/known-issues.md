@@ -11,6 +11,26 @@ This file tracks only what's left.
 
 Line numbers are hints (they drift) — the function/construct name is the durable anchor.
 
+## RESOLVED 2026-07-09 (second pass — commit `645874c`)
+
+Adding `assert_invalid`/`assert_malformed`/`assert_exhaustion` to the WAST runner made the
+soundness gaps observable, so they were fixed together:
+- **#5 DONE** — `assert_trap` now accepts only a genuine runtime trap (`isRuntimeTrap`).
+- **#7 DONE** — const-expr `global.get` restricted to a prior *immutable* global.
+- **#2a/#2b/#2c/#2d DONE** — untyped `select` rejects ref operands; `select_t` needs a 1-type
+  annotation; load/store require a memory + alignment ≤ natural; `if`-without-`else` needs
+  params == results. Also added: global-init const-expr validation, element-segment validation,
+  and `call_indirect` table-exists + funcref-typed checks.
+- **#6 PARTIAL** — reserved global-mutability / limits-flag bytes now rejected (`MalformedFlag`);
+  the invalid *valtype* byte (non-exhaustive `ValType` `@enumFromInt`) is still accepted.
+- **#1 PARTIAL** — top-level `(import … (global …))` is now assembled; func/table/memory imports
+  error honestly instead of being dropped (still need real host imports).
+- **#8 DONE** — `align=` over-natural is now a validation error (the assembler still doesn't reject a
+  non-power-of-two `align=` literal, but no test exercises that path).
+
+Still open: #2e (`ref.is_null` accepts non-ref), #2f (`br_table` polymorphic arity-only), #3, #4,
+#9, #10, #11, #12, #13, plus the newly-found items in "Discovered 2026-07-09" below.
+
 ## Grouped by the integration that trips them
 
 - **`register` / multi-module linking + imported functions** (host imports → WASI): #1 (top-level
@@ -135,3 +155,29 @@ function-body path, which interns first).
   tags are needed to skip bytes; persisting the values is wasted).
 - `src/main.zig` `runFunction` re-resolves the export that `Instance.invoke` resolves again.
 Harmless; clean up opportunistically.
+
+## Discovered 2026-07-09 (while adding assert_invalid support)
+
+### #14 — `func.wast` returns a wrong result (`got 0x2a` = 42) — MED (real functional bug)
+`func.wast` has been 2-failing since before the audit; with `assert_invalid` now handled the file is
+169 passed / **2 failed**, both `assert_return "f": result mismatch (got 0x2a)`. A concrete wrong
+*result* on a valid module — the only confirmed correctness bug left (not a feature gap). **Surfaces
+when:** always (it's a live `assert_return` failure). **Next:** isolate which `func.wast` export "f"
+returns 42, diff against the interpreter's handling — likely a large-index local/param or a
+default-value / multi-`func`-named-"f" resolution issue.
+
+### #15 — Table & element *initializer expressions* not assembled — LOW (feature)
+`(table $t N funcref (global.get $g))` (per-table init expr) and `(elem (table $t) (offset) funcref
+(ref.func $f) …)` (element *expression* form, vs the plain func-index list) are parsed loosely by
+`parseTable`/`parseElem`, which drop the trailing const-exprs. Consequence: invalid init exprs aren't
+validated (global.wast's last over-acceptance) and the linking-heavy `elem` forms don't assemble.
+**Surfaces when:** the reference-types element/table-init-expression tests, and the `register` module in
+`global.wast`. **Fix:** parse the init/element expressions and run them through `validateConstExpr`.
+
+### #16 — Decoder is lenient on malformed binaries — LOW/MED (hardening)
+Several `assert_malformed (module binary …)` cases are accepted: a custom/section length that overruns
+the input ("length out of bounds"), and various `binary-leb128.wast` over-long / overflowing LEB
+encodings. The decoder trusts declared lengths and doesn't fully bound-check. **Surfaces when:**
+`assert_malformed` on hand-crafted binaries, or any untrusted/fuzzed input. **Fix:** validate section
+lengths against remaining input; tighten LEB overflow/canonical-length checks. (Pairs with #6's
+valtype-byte check.)

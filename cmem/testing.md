@@ -190,6 +190,22 @@ opcodes via `emitOpcode`. The interp tracks per-table max and `table.grow` reall
 + `elem.drop`, and `register`/imported functions (host imports / WASI) — which together unblock
 `table_copy.wast` (1650 skipped) and `table_init.wast` (730 skipped).
 
+**Update 2026-07-09 — `assert_invalid`/`assert_malformed`/`assert_exhaustion` + validator strictness
+(commit `645874c`):** the runner now *executes* the negative-conformance commands (previously all
+`skipped`), and `assert_trap` accepts only a genuine runtime trap. This converted **thousands** of
+skips into real pass/fail AND forced the validator to correctly reject invalid modules. Representative
+before → after (all now **0 skipped** unless noted): i32 374 → **459/0**, i64 384 → **415/0**, block 52
+→ **222/0**, if 124 → **240/0**, loop 77 → **119/0**, call_indirect 132 → **169/0**, select 124 →
+**154/0**, local_tee 55 → **97/0**, nop 83 → **87/0**, align 96/44 → **140/0**, load **96/0**, store
+**67/0**, call **90/0**, br **96/0**, return **83/0**, func 94 → **169/2**, global 62/1 → **108/2**.
+Validator additions: global-init const-expr checking, untyped-`select` ref rejection + typed-`select`
+arity, `call_indirect` table-exists/funcref, `if`-without-`else` params==results, element-segment
+validation, load/store alignment ≤ natural + memory-presence; decoder rejects reserved
+mutability/limits bytes. **No regressions** (zero `assert_trap` flipped — verified no "non-trap error"
+failures). Remaining fails are pre-existing feature gaps (host imports for `imports.wast`, LEB/custom
+malformed edges, table/element init exprs) + the pre-existing `func.wast` result-mismatch bug — all in
+`known-issues.md` (#14–#16).
+
 ## What this tells the roadmap
 
 1. **First execution milestone = the `module/wasm_mod` corpus + its `.test.json` files** — fully
