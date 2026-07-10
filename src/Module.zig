@@ -310,8 +310,8 @@ fn skipConstExpr(r: *Reader) Error!void {
         const op = try r.readByte();
         switch (op) {
             0x0b => return, // end
-            0x41, 0x42 => _ = try r.readVarU32(), // i32/i64.const (operand length-compatible)
-            0x23, 0xd2 => _ = try r.readVarU32(), // global.get / ref.func
+            0x41, 0x23, 0xd2 => try r.skipLeb(5), // i32.const, global.get, ref.func (32-bit LEB)
+            0x42 => try r.skipLeb(10), // i64.const (64-bit LEB)
             0x43 => _ = try r.readBytes(4), // f32.const
             0x44 => _ = try r.readBytes(8), // f64.const
             0xd0 => _ = try r.readByte(), // ref.null (heaptype)
