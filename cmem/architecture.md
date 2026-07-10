@@ -20,15 +20,22 @@ bytes ──► DECODE ──► VALIDATE ──► INSTANTIATE ──► EXECUT
   incl. the terminating `end`) is captured — instructions are **not** parsed here (that happens with
   validation/execution, which pick the internal representation). **Owned via an internal arena** and
   names/bodies are copied in, so the module survives the input buffer being freed (required by
-  wasm-c-api, where the caller deletes the byte vector after `wasm_module_new`). Decode is **lenient**:
-  the function/code count-match is a validation rule, not enforced here. The `{id, offset, size}`
-  section extents are retained as metadata only.
+  wasm-c-api, where the caller deletes the byte vector after `wasm_module_new`). Decode **rejects
+  malformed binaries**: spec-correct LEB128 (over-long / integer-too-large → `LebOverflow`), reserved
+  global-mutability / limits-flag bytes (`MalformedFlag`), undefined value-type bytes (`BadValType`),
+  invalid custom-section names, and a data-count section that disagrees with the data segments
+  (`DataCountMismatch`). The function/code count-match remains a *validation* rule (checked there). The
+  `{id, offset, size}` section extents are retained as metadata only.
 - **VALIDATE** (`validate.zig`) — done. The spec's Appendix algorithm (abstract value stack + control
   frames + a `unknown` bottom for polymorphic/unreachable code) over the `opcode.zig` IR: function/code
-  count match, local/global/func/type index bounds, structured control flow, and operand-stack typing.
-  Scope = core-MVP; memory presence + load/store alignment not yet enforced (documented leniency).
-  **Verified:** all 12 `wasm_mod` modules validate; across `wasm_wasi`, every fully-decoding module
-  validates (failures are only the `UnsupportedOpcode` decode boundary) — see `testing.md`.
+  count match, local/global/func/type/table index bounds, structured control flow, and operand-stack
+  typing. Plus module-level checks: **global-init and element-offset const-exprs** (constant opcode set,
+  correct type, `global.get` only of a prior immutable global), **element func indices**, untyped
+  `select` (rejects reference operands) vs typed `select_t` (1-type annotation), `call_indirect`
+  (table exists + funcref-typed), `if`-without-`else` (params == results), `ref.is_null` (needs a
+  reference), and **load/store** (alignment ≤ natural, memory must exist). **Verified:** thousands of
+  positive-conformance assertions pass and the negative `assert_invalid`/`assert_malformed` suites now
+  run with ~zero over-acceptance — see `testing.md`.
 - **INSTANTIATE / EXECUTE** (`interp.zig`) — first slice done. `Instance.init` prepares each defined
   function (decodes body → IR once, precomputes matching `end`/`else` for every `block`/`loop`/`if`).
   `Instance.invoke(name, args)` runs the switch interpreter (Option A): untyped `u64` value slots, a
@@ -58,10 +65,10 @@ the whole pipeline and **runs the official spec testsuite** (`wazmrt <file.wast>
 | Unit | Responsibility |
 | --- | --- |
 | `types.zig` | `magic`, `supported_version`, `SectionId`, `ValType` (binary opcodes), `ExternKind`, `DecodeError`. Dependency-free so it compiles for every target. |
-| `Reader.zig` | Allocation-free cursor (file-as-`@This()` struct): `readByte`/`readBytes`/`readU32Le`, unsigned + signed LEB, float-bit reads. Bounds-checked. |
+| `Reader.zig` | Allocation-free cursor (file-as-`@This()` struct): `readByte`/`readBytes`/`readU32Le`, spec-correct unsigned + signed LEB (`readVarU32`/`readVarI32`/`readVarI64` reject over-long / integer-too-large), `skipLeb`, float-bit reads. Bounds-checked. |
 | `Module.zig` | `decode(gpa, bytes) → Module`; arena-owned; `FuncType`/`Limits`/`TableType`/`MemoryType`/`GlobalType`/`Extern`, `Import`/`Export` (resolved `Extern`), `Local`/`Code`, `func_types`/`functions`/`code`/`globals`/`memories`/`data`/`sections`; `funcType`/`importedFuncCount`/`section` helpers. |
 | `opcode.zig` | The shared instruction authority: `Op` enum (core-MVP 0x00–0xC4 + `table.get`/`.set` 0x25/26 + reference types 0xD0–D2 + `0xFC` table ops via internal tags/`fcSubOpcode`), `Imm`/`Instr`, `immediateKind`, `decodeBody`. |
-| `validate.zig` | `validate(gpa, module)`: spec Appendix type-check over the IR (value + control-frame stacks). |
+| `validate.zig` | `validate(gpa, module)`: spec Appendix type-check over the IR (value + control-frame stacks) + module-level const-expr / element / select / alignment / memory-presence checks. |
 | `interp.zig` | `Instance` (init/deinit/invoke), the switch interpreter (`Frame`, `execNumeric`/`execFloat`/`execMemory`), `Value` (u64) helpers. |
 | `sexpr.zig` / `wat.zig` / `wast.zig` | Text toolchain: S-expression parser / WAT-text assembler / WAST script runner (runs the spec testsuite). |
 | `root.zig` | Public surface; re-exports the pipeline modules + `decode`/`validate`/`interp`/`Instance`/`sexpr`/`wat`/`wast`/`version`/`abi_version`. libc-free. |

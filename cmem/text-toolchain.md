@@ -44,11 +44,12 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
   NaN-payload float literals (`nan:canonical`/`nan:arithmetic`/`nan:0x…`) DONE 2026-07-09.**
   **Deferred in wat.zig:** `start` section, imports, `table.get`/`.set`, passive/declarative element
   segments beyond the `ref.func` forward-decl.
-- **`src/wast.zig`** (MVP DONE 2026-07-02) — WAST script runner: `(module …)` text +
-  `(module binary …)`, `assert_return`, `assert_trap`, `invoke`; value literals incl.
-  `nan:canonical`/`nan:arithmetic`; drives an `Instance` and compares (NaN-aware). CLI
-  `.wast` mode. **Passes thousands of official-testsuite assertions** (see `testing.md`).
-  Deferred: `assert_invalid`/`assert_malformed`, `register`/multi-module, `get`, `(module quote …)`.
+- **`src/wast.zig`** (DONE 2026-07-02, extended 2026-07-09) — WAST script runner: `(module …)` text +
+  `(module binary …)`, `assert_return`, **`assert_trap` (genuine runtime traps only — `isRuntimeTrap`),
+  `assert_exhaustion`, `assert_invalid`/`assert_malformed` (the inner module must be rejected)**,
+  `invoke`; value literals incl. `nan:canonical`/`nan:arithmetic` + references; drives an `Instance` and
+  compares (NaN-aware). CLI `.wast` mode. **Passes thousands of positive + negative official-testsuite
+  assertions** (see `testing.md`). Deferred: `register`/multi-module linking, `get`, `(module quote …)`.
 
 ## Staged plan
 
@@ -97,6 +98,15 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
     `table_fill` 35/0. **Next:** passive/declarative element segments + `table.init`/`.copy` +
     `elem.drop`, `register`/multi-module linking, imported functions/tables/memories (→ host imports /
     WASI). Standing conformance gate (`testing.md`).
+11. ~~Negative conformance + validator/decoder strictness~~ **DONE 2026-07-09** (post-audit; commits
+    `645874c`/`0409f37`/`c535de0`/`10aca3b`/`3321921`). Runner executes `assert_invalid`/
+    `assert_malformed`/`assert_exhaustion` and gates `assert_trap` on a real runtime trap. Validator
+    rejects invalid modules (const-exprs, elements, `select`/`if`/`call_indirect`/`ref.is_null`,
+    alignment ≤ natural + memory-presence). Decoder rejects malformed binaries (spec-correct LEB128,
+    custom-section names, data-count consistency, reserved flag/valtype bytes). Fixed the `(type $t)`
+    function local-indexing bug (`func.wast` 171/0). Thousands of skips → pass/fail; malformed
+    over-acceptance ~zero. **Next:** `register`/linking + imported functions (host imports / WASI), then
+    table/element init expressions. See `known-issues.md` for the remaining ledger.
 
 ## Notes / invariants
 

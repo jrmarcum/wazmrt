@@ -206,6 +206,16 @@ failures). Remaining fails are pre-existing feature gaps (host imports for `impo
 malformed edges, table/element init exprs) + the pre-existing `func.wast` result-mismatch bug — all in
 `known-issues.md` (#14–#16).
 
+**Update 2026-07-09 — follow-ups (`0409f37`, `c535de0`, `10aca3b`, `3321921`):** cleared most of the
+newly-exposed gaps. `func.wast` **171/0** (fixed #14 — `(type $t)` functions mis-indexed their locals).
+`ref.is_null` requires a reference; decoder rejects undefined valtype bytes (#2e/#6). **Decoder
+hardening (#16):** spec-correct LEB128 (`binary-leb128.wast` 36/25 → **58/1**), custom-section-name +
+data-count validation (`custom.wast` 5/3 → **8/0**). Malformed-binary over-acceptance is now ~zero.
+`#2f` (`br_table` polymorphic) was investigated and found **not a bug** (the pop/push chain already
+cross-checks label types). Remaining testsuite fails are feature gaps — **host imports** (`imports.wast`
+24/58, `func_ptrs`, `table_copy`/`table_init` = thousands skipped) and table/element **init
+expressions** (#15) — not correctness holes. **63 unit tests.**
+
 ## What this tells the roadmap
 
 1. **First execution milestone = the `module/wasm_mod` corpus + its `.test.json` files** — fully

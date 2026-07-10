@@ -11,14 +11,16 @@ the **WAST script runner** (`wast.zig`) is next.
   `opcode.zig` IR → `validate.zig` (spec type-check) → `interp.zig` (switch interpreter: i32/i64/f32/f64
   arithmetic, control flow, `call`, linear memory + data init, traps). Runs `fib(20)=6765`,
   `fac(7)=5040`, `sieve(30)=10`, etc. — all match `.test.json`.
-- **Text toolchain** — `sexpr.zig` + `wat.zig` (WAT→wasm binary) + **`wast.zig` (WAST runner MVP)**.
-  Runs the **official spec testsuite** via `wazmrt <file.wast>`: `i32` 374/0, `i64` 384/0, `int_exprs`
-  89/0, `address` 255/0, `f32`/`f64` 2498/2, plus **call_indirect + tables + globals + type-ref block
-  types + reference types + multi-table (2026-07-09)**: nop 83/0, block 52/0, if 124/0, loop 77/0,
-  **call_indirect 132/0**, **select 124/0**, **local_tee 55/0**, **global 62/1**, plus **reference-type
-  table ops (2026-07-09)**: table_get 9/0, table_set 18/0, table_size 36/0, table_grow 38/3, table_fill
-  35/0 (see `testing.md`). Remaining gaps: passive element segments + `table.init`/`.copy`, imported
-  functions, `register`/module-linking.
+- **Text toolchain** — `sexpr.zig` + `wat.zig` (WAT→wasm binary) + **`wast.zig` (WAST runner)**. Runs
+  the **official spec testsuite** via `wazmrt <file.wast>`, both positive *and* negative conformance
+  (`assert_invalid`/`assert_malformed`/`assert_exhaustion`; `assert_trap` gated on a real trap).
+  Reference types, multi-table, imported globals, extended-const, and the reference-type table ops all
+  land; the validator/decoder now correctly reject invalid/malformed modules (2026-07-09 post-audit).
+  Representative: i32 **459/0**, i64 **415/0**, block **222/0**, if **240/0**, call_indirect **169/0**,
+  select **154/0**, func **171/0**, align **140/0**, custom **8/0**, binary-leb128 **58/1**, global
+  108/2 (see `testing.md`). **63 unit tests.** Remaining gaps: `register`/module-linking + imported
+  functions (host imports → WASI; `imports.wast` 24/58), table/element init expressions, passive
+  element segments + `table.init`/`.copy`.
 - **Licensing baseline** (git `888b87e`): dual `MIT OR Apache-2.0` (`LICENSE-MIT` + `LICENSE-APACHE`),
   `NOTICE`, and the compliance scaffold `third_party/LICENSES.md` (obligations table + Adoption
   Checklist + Component Ledger + verified SPDX inventory). README license section + SPDX + contribution
@@ -35,13 +37,16 @@ the **WAST script runner** (`wast.zig`) is next.
   (`env.add`) and export (`run`, params=2 results=1). Retired the ad-hoc `wazmrt_module_*` ABI.
 - **cmem/ project memory** established (this folder), mirroring the wasmtk setup.
 
-**Remaining:** passive element segments + `table.init`/`.copy` + `elem.drop`; imported
-functions/tables/memories (host imports → WASI); `register`/module-linking; growing the wasm-c-api past
-introspection; first `universalWasmLoader-*` integration. Still **100% original runtime code** — no
-reference-project code adopted yet (only the vendored `wasm.h`). `call_indirect` + tables + globals +
-type-ref block types + **reference types** + **multi-table** + NaN-payload float literals + **imported
-globals** + extended-const init exprs + **reference-type table ops** (`table.get`/`.set`/`.size`/
-`.grow`/`.fill`) **DONE 2026-07-09**.
+**Remaining:** `register`/module-linking + imported functions/tables/memories (host imports → WASI —
+the single highest-leverage item, gates `imports.wast`/`func_ptrs`/`table_copy`/`table_init`); table &
+element **init expressions**; passive element segments + `table.init`/`.copy` + `elem.drop`; growing the
+wasm-c-api past introspection; first `universalWasmLoader-*` integration. Still **100% original runtime
+code** — no reference-project code adopted yet (only the vendored `wasm.h`). `call_indirect` + tables +
+globals + type-ref block types + **reference types** + **multi-table** + NaN-payload float literals +
+**imported globals** + extended-const init exprs + **reference-type table ops** + **negative-conformance
++ validator/decoder strictness** (assert_invalid/malformed, const-expr/element/alignment validation,
+spec-correct LEB128, custom-name/data-count) **DONE 2026-07-09**. See `known-issues.md` for the
+post-audit fix ledger.
 
 ## Next increments (rough order)
 
