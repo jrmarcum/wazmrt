@@ -162,9 +162,21 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // then pre-encode bodies (which may intern block-type sigs / resolve
     // call_indirect type refs), so the type section is complete before emit.
     var func_type: List(u32) = .empty;
-    for (funcs.items) |f| {
+    for (funcs.items) |*f| {
         const ti = if (f.type_ref) |tr| try resolveType(type_names.items, tr) else try internSig(a, &sigs, f.params.items, f.results.items);
         try func_type.append(a, ti);
+        // A `(type $t)` reference supplies the params; when they aren't *also*
+        // written inline, they still occupy the low local indices, so prepend
+        // anonymous names to keep declared-local indices correct.
+        if (f.type_ref != null and f.params.items.len == 0 and ti < sigs.items.len) {
+            const params = sigs.items[ti].params;
+            if (params.len != 0) {
+                var names: List(?[]const u8) = .empty;
+                for (params) |_| try names.append(a, null);
+                try names.appendSlice(a, f.local_names.items);
+                f.local_names = names;
+            }
+        }
     }
 
     var bodies: List([]const u8) = .empty;
