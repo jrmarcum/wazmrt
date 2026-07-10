@@ -189,10 +189,13 @@ valid encodings up to the max width, reject over-long AND "integer too large" (f
 bits). This also fixed a real bug rejecting *valid* 10-byte `i64.const` modules (`skipConstExpr` skipped
 i64 operands with a 5-byte cap). `binary-leb128.wast` 36/25 → **56/3**. New `skipLeb(max_bytes)` for
 width-aware operand skipping.
-**Still open (niche, diminishing returns):** ~3 `binary-leb128` + ~3 `custom.wast` malformed cases —
-section/custom length that overruns the input ("length out of bounds" now passes in isolation but 1
-still slips), and the **data-count / function-code section-consistency** checks (`DataCount` section id
-12 is decoded to `else {}`; func-vs-code count IS checked in `validate`). **Surfaces when:**
-`assert_malformed` on hand-crafted binaries, or fuzzed input. **Fix:** validate declared section lengths
-against remaining input; decode + consistency-check the data-count section. (Pairs with #6's
-still-open valtype-byte check for instruction immediates.)
+**Part 2 done (`3321921`):** custom-section names are now validated (an empty/nameless or over-long-name
+custom section is rejected, §5.5.3), and the **data-count section** (id 12) is decoded and checked
+against the data-segment count (`DataCountMismatch`, §5.5.16). `custom.wast` 5/3 → **8/0**;
+`binary-leb128.wast` → **58/1**. **Malformed-binary over-acceptance is now ~zero** across the
+negative-conformance files.
+**Still open (feature gaps, NOT malformed-handling):** `binary-leb128` (1) and `names.wast` (1) fail
+with `UnsupportedInstr`/`UnsupportedOpcode` — valid modules using an op/instruction the
+assembler/decoder doesn't support yet, unrelated to #16. #6's valtype-byte check for *instruction
+immediates* (`select_types`/`ref.null` heaptype in `opcode.zig`) also remains, but is instruction-level,
+not module structure.
