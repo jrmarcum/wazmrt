@@ -183,10 +183,16 @@ validated (global.wast's last over-acceptance) and the linking-heavy `elem` form
 **Surfaces when:** the reference-types element/table-init-expression tests, and the `register` module in
 `global.wast`. **Fix:** parse the init/element expressions and run them through `validateConstExpr`.
 
-### #16 — Decoder is lenient on malformed binaries — LOW/MED (hardening)
-Several `assert_malformed (module binary …)` cases are accepted: a custom/section length that overruns
-the input ("length out of bounds"), and various `binary-leb128.wast` over-long / overflowing LEB
-encodings. The decoder trusts declared lengths and doesn't fully bound-check. **Surfaces when:**
-`assert_malformed` on hand-crafted binaries, or any untrusted/fuzzed input. **Fix:** validate section
-lengths against remaining input; tighten LEB overflow/canonical-length checks. (Pairs with #6's
-valtype-byte check.)
+### #16 — Decoder is lenient on malformed binaries — **LEB PART DONE (`10aca3b`); rest LOW**
+**Done:** the LEB128 readers (`readVarU32`/`readVarI32`/`readVarI64`) are now spec-correct — accept
+valid encodings up to the max width, reject over-long AND "integer too large" (final-byte overflow/sign
+bits). This also fixed a real bug rejecting *valid* 10-byte `i64.const` modules (`skipConstExpr` skipped
+i64 operands with a 5-byte cap). `binary-leb128.wast` 36/25 → **56/3**. New `skipLeb(max_bytes)` for
+width-aware operand skipping.
+**Still open (niche, diminishing returns):** ~3 `binary-leb128` + ~3 `custom.wast` malformed cases —
+section/custom length that overruns the input ("length out of bounds" now passes in isolation but 1
+still slips), and the **data-count / function-code section-consistency** checks (`DataCount` section id
+12 is decoded to `else {}`; func-vs-code count IS checked in `validate`). **Surfaces when:**
+`assert_malformed` on hand-crafted binaries, or fuzzed input. **Fix:** validate declared section lengths
+against remaining input; decode + consistency-check the data-count section. (Pairs with #6's
+still-open valtype-byte check for instruction immediates.)
