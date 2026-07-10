@@ -158,13 +158,12 @@ Harmless; clean up opportunistically.
 
 ## Discovered 2026-07-09 (while adding assert_invalid support)
 
-### #14 — `func.wast` returns a wrong result (`got 0x2a` = 42) — MED (real functional bug)
-`func.wast` has been 2-failing since before the audit; with `assert_invalid` now handled the file is
-169 passed / **2 failed**, both `assert_return "f": result mismatch (got 0x2a)`. A concrete wrong
-*result* on a valid module — the only confirmed correctness bug left (not a feature gap). **Surfaces
-when:** always (it's a live `assert_return` failure). **Next:** isolate which `func.wast` export "f"
-returns 42, diff against the interpreter's handling — likely a large-index local/param or a
-default-value / multi-`func`-named-"f" resolution issue.
+### #14 — `func.wast` returns a wrong result (`got 0x2a` = 42) — **RESOLVED 2026-07-09 (`0409f37`)**
+Root cause: a function declaring its signature via `(type $t)` (not inline `(param …)`) never added the
+type's params to the assembler's local name/index space, so a declared `(local $x)` resolved to the
+param's index. `(func (type $sig) (local $var i32) (local.get $var))` returned the param (42) instead
+of the uninitialized local (0). Fixed in `assembleModule`: prepend anonymous local names for the
+type's params (bounds-checked against `sigs`). `func.wast` 169/2 → **171/0**.
 
 ### #15 — Table & element *initializer expressions* not assembled — LOW (feature)
 `(table $t N funcref (global.get $g))` (per-table init expr) and `(elem (table $t) (offset) funcref
