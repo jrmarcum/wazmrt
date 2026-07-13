@@ -62,7 +62,8 @@ const TableDef = struct { min: u32, max: ?u32, elem: V = .funcref };
 const ElemDef = struct {
     mode: enum { active, passive, declarative },
     table_index: u32,
-    offset: i64,
+    /// Offset const-expr form for active segments (null → implicit `i32.const 0`).
+    offset_form: ?Sexpr,
     elem_type: V,
     expr_form: bool,
     funcs: []const Sexpr,
@@ -147,6 +148,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             if (mi + 1 < items.len) mem_max = try parseIndex(items[mi + 1]);
         } else if (std.mem.eql(u8, kw, "data")) {
             // (data offset-expr "bytes"…)  — active, memory 0
+            if (items.len < 2) return error.BadModuleField;
             var bytes: List(u8) = .empty;
             for (items[2..]) |it| {
                 if (it.asAtom() == null) switch (it) {
@@ -296,11 +298,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             if (e.expr_form) flag |= 0b100;
             try s.append(a, flag);
             if (explicit_table) try uleb(a, &s, e.table_index);
-            if (e.mode == .active) {
-                try s.append(a, @intFromEnum(Op.i32_const));
-                try sleb(a, &s, e.offset);
-                try s.append(a, @intFromEnum(Op.end));
-            }
+            if (e.mode == .active) try emitOffsetExpr(a, &s, &sigs, type_names.items, global_names.items, e.offset_form);
             // The leading kind byte: elemkind (0x00) for non-flag-0 func-index
             // variants, reftype for non-flag-4 const-expr variants.
             if (!e.expr_form and flag != 0) {
@@ -397,7 +395,7 @@ fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef
         if (i < items.len and eqKw(items[i], "elem")) {
             const funcs = items[i].asList().?[1..];
             try tables.append(a, .{ .min = @intCast(funcs.len), .max = @intCast(funcs.len), .elem = et });
-            try elems.append(a, .{ .mode = .active, .table_index = table_index, .offset = 0, .elem_type = .funcref, .expr_form = false, .funcs = funcs, .exprs = &.{} });
+            try elems.append(a, .{ .mode = .active, .table_index = table_index, .offset_form = null, .elem_type = .funcref, .expr_form = false, .funcs = funcs, .exprs = &.{} });
         } else {
             try tables.append(a, .{ .min = 0, .max = null, .elem = et });
         }
@@ -427,7 +425,7 @@ fn parseElem(a: std.mem.Allocator, items: []const Sexpr, elems: *List(ElemDef), 
     if (i < items.len and isId(items[i])) i += 1; // segment $id
     var mode: @FieldType(ElemDef, "mode") = .passive;
     var table_index: u32 = 0;
-    var offset: i64 = 0;
+    var offset_form: ?Sexpr = null;
     if (i < items.len and eqAtom(items[i], "declare")) {
         mode = .declarative;
         i += 1;
@@ -439,19 +437,19 @@ fn parseElem(a: std.mem.Allocator, items: []const Sexpr, elems: *List(ElemDef), 
         }
         if (i < items.len and isOffsetForm(items[i])) {
             mode = .active;
-            offset = try extractI32Const(items[i]);
+            offset_form = items[i];
             i += 1;
         }
     }
     // Kind: `func` (func-index form) or a reference type (const-expr form). An
     // absent kind keyword is the abbreviated func-index form.
     if (i < items.len and eqAtom(items[i], "func")) {
-        try elems.append(a, .{ .mode = mode, .table_index = table_index, .offset = offset, .elem_type = .funcref, .expr_form = false, .funcs = items[i + 1 ..], .exprs = &.{} });
+        try elems.append(a, .{ .mode = mode, .table_index = table_index, .offset_form = offset_form, .elem_type = .funcref, .expr_form = false, .funcs = items[i + 1 ..], .exprs = &.{} });
     } else if (i < items.len and isRefType(items[i])) {
         const et = try parseValType(items[i]);
-        try elems.append(a, .{ .mode = mode, .table_index = table_index, .offset = offset, .elem_type = et, .expr_form = true, .funcs = &.{}, .exprs = items[i + 1 ..] });
+        try elems.append(a, .{ .mode = mode, .table_index = table_index, .offset_form = offset_form, .elem_type = et, .expr_form = true, .funcs = &.{}, .exprs = items[i + 1 ..] });
     } else {
-        try elems.append(a, .{ .mode = mode, .table_index = table_index, .offset = offset, .elem_type = .funcref, .expr_form = false, .funcs = items[i..], .exprs = &.{} });
+        try elems.append(a, .{ .mode = mode, .table_index = table_index, .offset_form = offset_form, .elem_type = .funcref, .expr_form = false, .funcs = items[i..], .exprs = &.{} });
     }
 }
 
@@ -528,6 +526,21 @@ fn parseImport(a: std.mem.Allocator, items: []const Sexpr, global_imports: *List
     }
     try global_imports.append(a, .{ .module = module, .name = name, .valtype = valtype, .mutable = mutable });
     try global_names.append(a, gname);
+}
+
+/// Emit an active segment's offset const-expr + `end`. Unwraps `(offset …)`,
+/// accepts a folded const-expr (`(i32.const N)` / `(global.get $g)`), and emits
+/// an implicit `i32.const 0` when no offset form is present.
+fn emitOffsetExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, form: ?Sexpr) Error!void {
+    if (form) |f| {
+        if (f.asList()) |l| {
+            if (l.len != 0 and eqAtom(l[0], "offset")) return emitConstExpr(a, out, sigs, type_names, global_names, l[1..]);
+        }
+        return emitConstExpr(a, out, sigs, type_names, global_names, &[_]Sexpr{f});
+    }
+    try out.append(a, @intFromEnum(Op.i32_const));
+    try sleb(a, out, 0);
+    try out.append(a, @intFromEnum(Op.end));
 }
 
 /// Emit one element-segment const-expr + `end`. Accepts a folded expr form
