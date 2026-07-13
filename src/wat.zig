@@ -57,8 +57,17 @@ const DataSeg = struct { offset: i64, bytes: []const u8 };
 /// A function type (for the type section): params → results.
 const Sig = struct { params: []const V, results: []const V };
 const TableDef = struct { min: u32, max: ?u32, elem: V = .funcref };
-/// An active element segment; `funcs` are unresolved func references.
-const ElemDef = struct { table_index: u32, offset: i64, funcs: []const Sexpr };
+/// An element segment. `funcs` (func-index form) OR `exprs` (const-expr form) —
+/// exactly one is non-empty. `offset` applies only to active segments.
+const ElemDef = struct {
+    mode: enum { active, passive, declarative },
+    table_index: u32,
+    offset: i64,
+    elem_type: V,
+    expr_form: bool,
+    funcs: []const Sexpr,
+    exprs: []const Sexpr,
+};
 /// A defined global: its value type, mutability, and (unencoded) init
 /// const-expr — a *sequence* of instruction forms (usually one folded expr, but
 /// a malformed module may list several, which validation then rejects on arity).
@@ -269,23 +278,43 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         }
         try emitSection(a, &out, 7, s.items);
     }
-    // Element section (9) — active funcref segments (table 0)
+    // Element section (9) — all 8 flag variants (active/passive/declarative ×
+    // func-index/const-expr forms).
     if (elems.items.len != 0) {
         var s: List(u8) = .empty;
         try uleb(a, &s, elems.items.len);
         for (elems.items) |e| {
-            if (e.table_index == 0) {
-                try s.append(a, 0x00); // flags: active, table 0, offset expr, funcidx vec
-            } else {
-                try s.append(a, 0x02); // flags: active, explicit table index, funcidx vec
-                try uleb(a, &s, e.table_index);
+            // flag bits: bit0 = passive/declarative, bit1 = declarative-or-explicit-table,
+            // bit2 = const-expr form.
+            const explicit_table = e.mode == .active and e.table_index != 0;
+            var flag: u8 = 0;
+            switch (e.mode) {
+                .active => flag |= if (explicit_table) 0b010 else 0,
+                .passive => flag |= 0b001,
+                .declarative => flag |= 0b011,
             }
-            try s.append(a, @intFromEnum(Op.i32_const));
-            try sleb(a, &s, e.offset);
-            try s.append(a, @intFromEnum(Op.end));
-            if (e.table_index != 0) try s.append(a, 0x00); // elemkind: funcref
-            try uleb(a, &s, e.funcs.len);
-            for (e.funcs) |ref| try uleb(a, &s, try resolveByName(func_names.items, ref));
+            if (e.expr_form) flag |= 0b100;
+            try s.append(a, flag);
+            if (explicit_table) try uleb(a, &s, e.table_index);
+            if (e.mode == .active) {
+                try s.append(a, @intFromEnum(Op.i32_const));
+                try sleb(a, &s, e.offset);
+                try s.append(a, @intFromEnum(Op.end));
+            }
+            // The leading kind byte: elemkind (0x00) for non-flag-0 func-index
+            // variants, reftype for non-flag-4 const-expr variants.
+            if (!e.expr_form and flag != 0) {
+                try s.append(a, 0x00); // elemkind funcref
+            } else if (e.expr_form and flag != 4) {
+                try s.append(a, @intFromEnum(e.elem_type)); // reftype
+            }
+            if (e.expr_form) {
+                try uleb(a, &s, e.exprs.len);
+                for (e.exprs) |ex| try emitElementExpr(a, &s, &sigs, type_names.items, global_names.items, func_names.items, ex);
+            } else {
+                try uleb(a, &s, e.funcs.len);
+                for (e.funcs) |ref| try uleb(a, &s, try resolveByName(func_names.items, ref));
+            }
         }
         try emitSection(a, &out, 9, s.items);
     }
@@ -321,6 +350,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
 /// `(offset (i32.const N))`.
 fn extractI32Const(form: Sexpr) Error!i64 {
     const list = form.asList() orelse return error.BadImmediate;
+    if (list.len < 2) return error.BadImmediate;
     const kw = list[0].asAtom() orelse return error.BadImmediate;
     if (std.mem.eql(u8, kw, "offset")) return extractI32Const(list[1]);
     if (std.mem.eql(u8, kw, "i32.const")) return parseWatI32(list[1]);
@@ -367,7 +397,7 @@ fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef
         if (i < items.len and eqKw(items[i], "elem")) {
             const funcs = items[i].asList().?[1..];
             try tables.append(a, .{ .min = @intCast(funcs.len), .max = @intCast(funcs.len), .elem = et });
-            try elems.append(a, .{ .table_index = table_index, .offset = 0, .funcs = funcs });
+            try elems.append(a, .{ .mode = .active, .table_index = table_index, .offset = 0, .elem_type = .funcref, .expr_form = false, .funcs = funcs, .exprs = &.{} });
         } else {
             try tables.append(a, .{ .min = 0, .max = null, .elem = et });
         }
@@ -389,22 +419,49 @@ fn isRefType(s: Sexpr) bool {
     return eqAtom(s, "funcref") or eqAtom(s, "externref");
 }
 
-/// `(elem $id? (table $t)? (i32.const N)|(offset …) func? $f …)` — active segment.
+/// `(elem $id? mode? tableuse? offset? kind item*)` — active / passive /
+/// declarative, in either the func-index (`func $f …`) or const-expr
+/// (`funcref (ref.func $f) …`) form.
 fn parseElem(a: std.mem.Allocator, items: []const Sexpr, elems: *List(ElemDef), table_names: []const ?[]const u8) Error!void {
     var i: usize = 1;
     if (i < items.len and isId(items[i])) i += 1; // segment $id
-    // Declarative segment (`(elem declare func $f …)`) — a forward-declaration for
-    // `ref.func`; it initializes no table, so nothing to emit.
-    if (i < items.len and eqAtom(items[i], "declare")) return;
+    var mode: @FieldType(ElemDef, "mode") = .passive;
     var table_index: u32 = 0;
-    if (i < items.len and eqKw(items[i], "table")) {
-        table_index = try resolveByName(table_names, items[i].asList().?[1]);
+    var offset: i64 = 0;
+    if (i < items.len and eqAtom(items[i], "declare")) {
+        mode = .declarative;
         i += 1;
+    } else {
+        if (i < items.len and eqKw(items[i], "table")) {
+            mode = .active;
+            table_index = try resolveByName(table_names, items[i].asList().?[1]);
+            i += 1;
+        }
+        if (i < items.len and isOffsetForm(items[i])) {
+            mode = .active;
+            offset = try extractI32Const(items[i]);
+            i += 1;
+        }
     }
-    const offset = try extractI32Const(items[i]);
-    i += 1;
-    if (i < items.len and eqAtom(items[i], "func")) i += 1; // optional `func` marker
-    try elems.append(a, .{ .table_index = table_index, .offset = offset, .funcs = items[i..] });
+    // Kind: `func` (func-index form) or a reference type (const-expr form). An
+    // absent kind keyword is the abbreviated func-index form.
+    if (i < items.len and eqAtom(items[i], "func")) {
+        try elems.append(a, .{ .mode = mode, .table_index = table_index, .offset = offset, .elem_type = .funcref, .expr_form = false, .funcs = items[i + 1 ..], .exprs = &.{} });
+    } else if (i < items.len and isRefType(items[i])) {
+        const et = try parseValType(items[i]);
+        try elems.append(a, .{ .mode = mode, .table_index = table_index, .offset = offset, .elem_type = et, .expr_form = true, .funcs = &.{}, .exprs = items[i + 1 ..] });
+    } else {
+        try elems.append(a, .{ .mode = mode, .table_index = table_index, .offset = offset, .elem_type = .funcref, .expr_form = false, .funcs = items[i..], .exprs = &.{} });
+    }
+}
+
+/// True if the form is an element-segment offset (`(offset …)` or a folded
+/// const-expr like `(i32.const N)` / `(global.get $g)`) — distinct from a
+/// `(ref …)` reftype and from a `(ref.func …)` element expression.
+fn isOffsetForm(s: Sexpr) bool {
+    const l = s.asList() orelse return false;
+    const kw = l[0].asAtom() orelse return false;
+    return std.mem.eql(u8, kw, "offset") or std.mem.eql(u8, kw, "i32.const") or std.mem.eql(u8, kw, "global.get");
 }
 
 /// `(global $name? (export "x")* (import "m" "n")? (mut? valtype) init-expr?)`.
@@ -471,6 +528,21 @@ fn parseImport(a: std.mem.Allocator, items: []const Sexpr, global_imports: *List
     }
     try global_imports.append(a, .{ .module = module, .name = name, .valtype = valtype, .mutable = mutable });
     try global_names.append(a, gname);
+}
+
+/// Emit one element-segment const-expr + `end`. Accepts a folded expr form
+/// (`(ref.func $f)`) or an `(item …)` wrapper around an instruction sequence.
+fn emitElementExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, form: Sexpr) Error!void {
+    var ctx: Ctx = .{ .a = a, .out = out, .local_names = &.{}, .func_names = func_names, .sigs = sigs, .type_names = type_names, .global_names = global_names };
+    if (form.asList()) |l| {
+        if (l.len != 0 and eqAtom(l[0], "item")) {
+            try emitSeq(&ctx, l[1..]); // (item <instr seq>)
+            try out.append(a, @intFromEnum(Op.end));
+            return;
+        }
+    }
+    try emitExpr(&ctx, form);
+    try out.append(a, @intFromEnum(Op.end));
 }
 
 /// Emit a constant init expression (a sequence of instruction forms) + `end`.
@@ -1413,6 +1485,22 @@ test "reads an imported global from the host value" {
     try std.testing.expectEqual(@as(i32, 777), interp.asI32((try inst.invoke("get-x", &.{}))[0]));
     // A defined global's init may read the imported one: 777 + 1.
     try std.testing.expectEqual(@as(i32, 778), interp.asI32((try inst.invoke("get-y", &.{}))[0]));
+}
+
+test "active element-expression segment (ref.func / ref.null)" {
+    const src =
+        \\(module
+        \\  (type $v (func (result i32)))
+        \\  (func $a (result i32) (i32.const 7))
+        \\  (func $b (result i32) (i32.const 9))
+        \\  (table 3 funcref)
+        \\  (elem (i32.const 0) funcref (ref.func $a) (ref.null func) (ref.func $b))
+        \\  (func (export "call") (param i32) (result i32) (call_indirect (type $v) (local.get 0))))
+    ;
+    // slot 0 → $a (7), slot 2 → $b (9), slot 1 → null (traps).
+    try std.testing.expectEqual(@as(i32, 7), interp.asI32(try assembleAndRun(src, "call", &.{interp.i32Value(0)})));
+    try std.testing.expectEqual(@as(i32, 9), interp.asI32(try assembleAndRun(src, "call", &.{interp.i32Value(2)})));
+    try std.testing.expectError(error.UninitializedElement, assembleAndRun(src, "call", &.{interp.i32Value(1)}));
 }
 
 test "dispatches call_indirect through distinct named tables" {

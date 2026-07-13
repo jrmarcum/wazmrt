@@ -51,13 +51,16 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
         try validateConstExpr(module, init_expr, module.globals[self_index].content, self_index);
     }
 
-    // Element segments: every referenced function index must exist; an active
-    // segment targets an existing funcref table with a valid i32 offset expr.
+    // Element segments: every referenced function index must exist; each
+    // element const-expr must produce the segment's element type; an active
+    // segment targets an existing type-compatible table with a valid i32 offset.
     for (module.elements) |elem| {
         for (elem.funcs) |fi| if (funcTypeOf(module, fi) == null) return error.UndefinedFunc;
-        if (elem.active) {
+        for (elem.exprs) |ex| try validateConstExpr(module, ex, elem.elem_type, n_imported_globals);
+        if (elem.mode == .active) {
             if (elem.table_index >= module.tables.len) return error.UndefinedTable;
-            if (module.tables[elem.table_index].element != .funcref) return error.TypeMismatch;
+            const tet = module.tables[elem.table_index].element;
+            if (tet != elem.elem_type) return error.TypeMismatch;
             try validateConstExpr(module, elem.offset_expr, .i32, n_imported_globals);
         }
     }

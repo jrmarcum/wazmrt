@@ -230,13 +230,20 @@ pub const Instance = struct {
             tmax.* = tt.limits.max;
         }
         for (module.elements) |elem| {
-            if (!elem.active) continue;
+            // Only active segments initialize a table at instantiation; passive /
+            // declarative segments are consumed later (by table.init) or ignored.
+            if (elem.mode != .active) continue;
             if (elem.table_index >= tables.len) return error.NoTable;
             const tbl = tables[elem.table_index];
             const offset = try evalConstOffset(module, globals, elem.offset_expr);
+            // Exactly one of funcs / exprs is populated.
             for (elem.funcs, 0..) |f, k| {
                 if (@as(u64, offset) + k >= tbl.len) return error.TableOutOfBounds;
                 tbl[offset + k] = @as(Value, f);
+            }
+            for (elem.exprs, 0..) |ex, k| {
+                if (@as(u64, offset) + k >= tbl.len) return error.TableOutOfBounds;
+                tbl[offset + k] = try evalConstExpr(globals, ex);
             }
         }
 

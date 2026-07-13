@@ -81,13 +81,19 @@ pub const DataSegment = struct {
     bytes: []const u8,
 };
 
-/// An element segment (§5.5.12) that populates a table with function references.
-/// MVP handles active funcref segments; `offset_expr` is an arena-owned copy.
+/// An element segment (§5.5.12). Two element forms are supported: a plain
+/// function-index list (`funcs`) or a vector of const-expressions (`exprs`,
+/// each producing a reference); exactly one is non-empty. `offset_expr` is
+/// arena-owned and only meaningful for active segments.
 pub const Element = struct {
-    active: bool,
+    pub const Mode = enum { active, passive, declarative };
+    mode: Mode,
     table_index: u32,
     offset_expr: []const u8,
     funcs: []const u32,
+    exprs: []const []const u8,
+    /// The reference type of the elements (funcref for the func-index form).
+    elem_type: types.ValType,
 };
 
 /// A run of consecutive locals of the same type, as encoded in a code entry
@@ -472,20 +478,42 @@ fn readFuncVec(a: std.mem.Allocator, r: *Reader) Error![]const u32 {
     return funcs;
 }
 
+/// Read a vector of element const-expressions (each terminated by `end`).
+fn readExprVec(a: std.mem.Allocator, r: *Reader) Error![]const []const u8 {
+    const n = try r.readVarU32();
+    const exprs = try a.alloc([]const u8, n);
+    for (exprs) |*e| e.* = try readConstExprBytes(a, r);
+    return exprs;
+}
+
+const no_funcs: []const u32 = &.{};
+const no_exprs: []const []const u8 = &.{};
+
+/// Decode the element section (§5.5.12): all 8 flag variants — active /
+/// passive / declarative, in either the func-index or const-expr form.
 fn decodeElementSection(d: *Decoder, r: *Reader) Error![]const Element {
     const count = try r.readVarU32();
     const list = try d.a.alloc(Element, count);
     for (list) |*e| {
-        switch (try r.readVarU32()) { // segment flags (§5.5.12)
-            0 => e.* = .{ .active = true, .table_index = 0, .offset_expr = try readConstExprBytes(d.a, r), .funcs = try readFuncVec(d.a, r) },
-            2 => blk: {
-                const ti = try r.readVarU32();
-                const off = try readConstExprBytes(d.a, r);
-                _ = try r.readByte(); // elemkind (0x00 = funcref)
-                e.* = .{ .active = true, .table_index = ti, .offset_expr = off, .funcs = try readFuncVec(d.a, r) };
-                break :blk;
-            },
-            else => return error.UnsupportedOpcode, // passive/declarative/expr-form deferred
+        const flags = try r.readVarU32();
+        e.table_index = 0;
+        e.offset_expr = &.{};
+        e.funcs = no_funcs;
+        e.exprs = no_exprs;
+        e.elem_type = .funcref;
+        // bit0: 0 = active; bit1 (when bit0=1): 0 = passive, 1 = declarative.
+        e.mode = if (flags & 0b001 == 0) .active else if (flags & 0b010 == 0) .passive else .declarative;
+        // bit1 (of active) selects an explicit table index; bit2 selects the expr form.
+        if (e.mode == .active and (flags & 0b010) != 0) e.table_index = try r.readVarU32();
+        if (e.mode == .active) e.offset_expr = try readConstExprBytes(d.a, r);
+        if (flags & 0b100 == 0) {
+            // Func-index form. Non-flag-0 variants carry a leading elemkind byte.
+            if (flags != 0) _ = try r.readByte(); // elemkind (0x00 = funcref)
+            e.funcs = try readFuncVec(d.a, r);
+        } else {
+            // Const-expr form. Non-flag-4 variants carry a leading reftype byte.
+            if (flags != 4) e.elem_type = try readValType(r);
+            e.exprs = try readExprVec(d.a, r);
         }
     }
     return list;
