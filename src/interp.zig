@@ -147,6 +147,11 @@ pub const Instance = struct {
     tables: [][]Value,
     /// Maximum length of each table, if bounded (for `table.grow`).
     table_max: []const ?u32,
+    /// Evaluated reference values of each element segment (for `table.init`);
+    /// `elem_dropped[i]` marks a segment consumed (active/declarative at init, or
+    /// `elem.drop`), after which it behaves as an empty segment.
+    elem_values: []const []Value,
+    elem_dropped: []bool,
 
     /// A callable backing an imported function: another instance's exported
     /// function (module linking) or a native host function.
@@ -240,21 +245,30 @@ pub const Instance = struct {
             @memset(t.*, null_ref);
             tmax.* = tt.limits.max;
         }
-        for (module.elements) |elem| {
-            // Only active segments initialize a table at instantiation; passive /
-            // declarative segments are consumed later (by table.init) or ignored.
-            if (elem.mode != .active) continue;
-            if (elem.table_index >= tables.len) return error.NoTable;
-            const tbl = tables[elem.table_index];
-            const offset = try evalConstOffset(module, globals, elem.offset_expr);
-            // Exactly one of funcs / exprs is populated.
-            for (elem.funcs, 0..) |f, k| {
-                if (@as(u64, offset) + k >= tbl.len) return error.TableOutOfBounds;
-                tbl[offset + k] = @as(Value, f);
-            }
-            for (elem.exprs, 0..) |ex, k| {
-                if (@as(u64, offset) + k >= tbl.len) return error.TableOutOfBounds;
-                tbl[offset + k] = try evalConstExpr(globals, ex);
+        // Evaluate every element segment's reference values. Active segments are
+        // applied to their table and then dropped; passive segments stay
+        // available for `table.init` until `elem.drop`; declarative are dropped.
+        const elem_values = try gpa.alloc([]Value, module.elements.len);
+        errdefer gpa.free(elem_values);
+        const elem_dropped = try gpa.alloc(bool, module.elements.len);
+        errdefer gpa.free(elem_dropped);
+        var n_elem_alloc: usize = 0;
+        errdefer for (elem_values[0..n_elem_alloc]) |ev| gpa.free(ev);
+        for (module.elements, elem_values, elem_dropped) |elem, *ev, *dropped| {
+            const vals = try gpa.alloc(Value, elem.funcs.len + elem.exprs.len);
+            ev.* = vals;
+            n_elem_alloc += 1;
+            for (elem.funcs, 0..) |f, k| vals[k] = @as(Value, f);
+            for (elem.exprs, 0..) |ex, k| vals[k] = try evalConstExpr(globals, ex);
+            dropped.* = elem.mode != .passive;
+            if (elem.mode == .active) {
+                if (elem.table_index >= tables.len) return error.NoTable;
+                const tbl = tables[elem.table_index];
+                const offset = try evalConstOffset(module, globals, elem.offset_expr);
+                for (vals, 0..) |v, k| {
+                    if (@as(u64, offset) + k >= tbl.len) return error.TableOutOfBounds;
+                    tbl[offset + k] = v;
+                }
             }
         }
 
@@ -270,11 +284,16 @@ pub const Instance = struct {
             .mem_max = mem_max,
             .tables = tables,
             .table_max = table_max,
+            .elem_values = elem_values,
+            .elem_dropped = elem_dropped,
         };
     }
 
     pub fn deinit(self: *Instance) void {
         if (self.memory) |m| self.gpa.free(m);
+        for (self.elem_values) |ev| self.gpa.free(ev);
+        self.gpa.free(self.elem_values);
+        self.gpa.free(self.elem_dropped);
         for (self.tables) |t| self.gpa.free(t);
         self.gpa.free(self.tables);
         self.gpa.free(self.table_max);
@@ -576,6 +595,35 @@ const Frame = struct {
                     const dst = @as(u32, @bitCast(self.popI32()));
                     if (@as(u64, dst) + n > t.len) return error.TableOutOfBounds;
                     @memset(t[dst..][0..n], val);
+                    pc += 1;
+                },
+                .table_init => {
+                    const t = self.inst.tables[instr.imm.table_init.table];
+                    const seg: []const Value = if (self.inst.elem_dropped[instr.imm.table_init.elem]) &.{} else self.inst.elem_values[instr.imm.table_init.elem];
+                    const n = @as(u32, @bitCast(self.popI32()));
+                    const src = @as(u32, @bitCast(self.popI32()));
+                    const dst = @as(u32, @bitCast(self.popI32()));
+                    if (@as(u64, src) + n > seg.len or @as(u64, dst) + n > t.len) return error.TableOutOfBounds;
+                    @memcpy(t[dst..][0..n], seg[src..][0..n]);
+                    pc += 1;
+                },
+                .elem_drop => {
+                    self.inst.elem_dropped[instr.imm.elem] = true;
+                    pc += 1;
+                },
+                .table_copy => {
+                    const dt = self.inst.tables[instr.imm.table_copy.dst];
+                    const st = self.inst.tables[instr.imm.table_copy.src];
+                    const n = @as(u32, @bitCast(self.popI32()));
+                    const src = @as(u32, @bitCast(self.popI32()));
+                    const dst = @as(u32, @bitCast(self.popI32()));
+                    if (@as(u64, src) + n > st.len or @as(u64, dst) + n > dt.len) return error.TableOutOfBounds;
+                    // Overlapping ranges within one table: copy in the safe direction.
+                    if (dst <= src) {
+                        std.mem.copyForwards(Value, dt[dst..][0..n], st[src..][0..n]);
+                    } else {
+                        std.mem.copyBackwards(Value, dt[dst..][0..n], st[src..][0..n]);
+                    }
                     pc += 1;
                 },
 

@@ -236,9 +236,12 @@ pub const Op = enum(u8) {
     // Table ops carried under the `0xFC` prefix. These enum values are INTERNAL
     // tags in an otherwise-unused byte range — the wire encoding is `0xFC` + a
     // LEB sub-opcode (see `fcSubOpcode` / `decodeBody`), not this byte.
-    table_grow = 0xe0, // 0xFC 0x0f
-    table_size = 0xe1, // 0xFC 0x10
-    table_fill = 0xe2, // 0xFC 0x11
+    table_init = 0xe0, // 0xFC 0x0c
+    elem_drop = 0xe1, // 0xFC 0x0d
+    table_copy = 0xe2, // 0xFC 0x0e
+    table_grow = 0xe3, // 0xFC 0x0f
+    table_size = 0xe4, // 0xFC 0x10
+    table_fill = 0xe5, // 0xFC 0x11
 
     _,
 };
@@ -246,6 +249,9 @@ pub const Op = enum(u8) {
 /// The `0xFC` sub-opcode for an internal table-op tag, or null for a normal op.
 pub fn fcSubOpcode(op: Op) ?u8 {
     return switch (op) {
+        .table_init => 0x0c,
+        .elem_drop => 0x0d,
+        .table_copy => 0x0e,
         .table_grow => 0x0f,
         .table_size => 0x10,
         .table_fill => 0x11,
@@ -275,6 +281,12 @@ pub const Imm = union(enum) {
     local: u32,
     global: u32,
     table: u32,
+    /// `elem.drop` — a passive element-segment index.
+    elem: u32,
+    /// `table.init` — element-segment index + destination table index.
+    table_init: struct { elem: u32, table: u32 },
+    /// `table.copy` — destination + source table indices.
+    table_copy: struct { dst: u32, src: u32 },
     mem: MemArg,
     /// Reserved byte of `memory.size` / `memory.grow` (the memory index, 0).
     mem_reserved: u8,
@@ -301,6 +313,9 @@ const ImmKind = enum {
     local,
     global,
     table,
+    elem,
+    table_init,
+    table_copy,
     mem,
     mem_reserved,
     i32c,
@@ -323,7 +338,10 @@ pub fn immediateKind(op: Op) ImmKind {
         0x11 => .call_indirect,
         0x20, 0x21, 0x22 => .local,
         0x23, 0x24 => .global,
-        0x25, 0x26, 0xe0, 0xe1, 0xe2 => .table, // table.get/set + table.grow/size/fill
+        0x25, 0x26, 0xe3, 0xe4, 0xe5 => .table, // table.get/set + table.grow/size/fill
+        0xe0 => .table_init,
+        0xe1 => .elem, // elem.drop
+        0xe2 => .table_copy,
         0x28...0x3e => .mem,
         0x3f, 0x40 => .mem_reserved,
         0x41 => .i32c,
@@ -369,13 +387,16 @@ pub fn decodeBody(a: std.mem.Allocator, body: []const u8) (DecodeError || std.me
         const b0 = try r.readByte();
         if (b0 == 0xfc) {
             // 0xFC-prefixed op: a LEB sub-opcode picks the internal Op tag.
-            const op: Op = switch (try r.readVarU32()) {
-                0x0f => .table_grow,
-                0x10 => .table_size,
-                0x11 => .table_fill,
+            const imm: Instr = switch (try r.readVarU32()) {
+                0x0c => .{ .op = .table_init, .imm = .{ .table_init = .{ .elem = try r.readVarU32(), .table = try r.readVarU32() } } },
+                0x0d => .{ .op = .elem_drop, .imm = .{ .elem = try r.readVarU32() } },
+                0x0e => .{ .op = .table_copy, .imm = .{ .table_copy = .{ .dst = try r.readVarU32(), .src = try r.readVarU32() } } },
+                0x0f => .{ .op = .table_grow, .imm = .{ .table = try r.readVarU32() } },
+                0x10 => .{ .op = .table_size, .imm = .{ .table = try r.readVarU32() } },
+                0x11 => .{ .op = .table_fill, .imm = .{ .table = try r.readVarU32() } },
                 else => return error.UnsupportedOpcode,
             };
-            try list.append(a, .{ .op = op, .imm = .{ .table = try r.readVarU32() } });
+            try list.append(a, imm);
             continue;
         }
         const op: Op = @enumFromInt(b0);
@@ -415,6 +436,9 @@ pub fn decodeBody(a: std.mem.Allocator, body: []const u8) (DecodeError || std.me
                 break :blk .{ .select_types = tys };
             },
             .ref_type => .{ .ref_type = @enumFromInt(try r.readByte()) },
+            // These are `0xFC`-prefixed ops decoded via the interception above;
+            // reaching here means a raw synthetic-tag byte, which is malformed.
+            .elem, .table_init, .table_copy => return error.UnsupportedOpcode,
             .unsupported => return error.UnsupportedOpcode,
         };
         try list.append(a, .{ .op = op, .imm = imm });

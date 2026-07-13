@@ -101,6 +101,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     var tables: List(TableDef) = .empty;
     var table_names: List(?[]const u8) = .empty;
     var elems: List(ElemDef) = .empty;
+    var elem_names: List(?[]const u8) = .empty;
     var sigs: List(Sig) = .empty;
     var type_names: List(?[]const u8) = .empty;
     var globals: List(GlobalDef) = .empty;
@@ -169,9 +170,9 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             }
             try datas.append(a, .{ .offset = try extractI32Const(items[1]), .bytes = bytes.items });
         } else if (std.mem.eql(u8, kw, "table")) {
-            try parseTable(a, items, &tables, &table_names, &elems);
+            try parseTable(a, items, &tables, &table_names, &elems, &elem_names);
         } else if (std.mem.eql(u8, kw, "elem")) {
-            try parseElem(a, items, &elems, table_names.items);
+            try parseElem(a, items, &elems, &elem_names, table_names.items);
         } else if (std.mem.eql(u8, kw, "import")) {
             // (import "m" "n" (func …) | (global …)) — func + global imports.
             const desc = items[3].asList() orelse return error.BadModuleField;
@@ -217,7 +218,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     }
 
     var bodies: List([]const u8) = .empty;
-    for (funcs.items) |f| try bodies.append(a, try encodeBody(a, f, func_names.items, &sigs, type_names.items, global_names.items, table_names.items));
+    for (funcs.items) |f| try bodies.append(a, try encodeBody(a, f, func_names.items, &sigs, type_names.items, global_names.items, table_names.items, elem_names.items));
 
     var out: List(u8) = .empty;
     try out.appendSlice(a, &.{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 }); // header
@@ -411,7 +412,7 @@ fn parseTypeDef(a: std.mem.Allocator, items: []const Sexpr, sigs: *List(Sig), ty
 
 /// `(table $name? reftype (elem …))` or `(table $name? <min> <max>? reftype)`,
 /// where reftype is `funcref` / `externref` / `(ref null? …)`.
-fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef), table_names: *List(?[]const u8), elems: *List(ElemDef)) Error!void {
+fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef), table_names: *List(?[]const u8), elems: *List(ElemDef), elem_names: *List(?[]const u8)) Error!void {
     const table_index: u32 = @intCast(tables.items.len);
     var i: usize = 1;
     var name: ?[]const u8 = null;
@@ -428,6 +429,7 @@ fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef
             const funcs = items[i].asList().?[1..];
             try tables.append(a, .{ .min = @intCast(funcs.len), .max = @intCast(funcs.len), .elem = et });
             try elems.append(a, .{ .mode = .active, .table_index = table_index, .offset_form = null, .elem_type = .funcref, .expr_form = false, .funcs = funcs, .exprs = &.{} });
+            try elem_names.append(a, null);
         } else {
             try tables.append(a, .{ .min = 0, .max = null, .elem = et });
         }
@@ -452,9 +454,14 @@ fn isRefType(s: Sexpr) bool {
 /// `(elem $id? mode? tableuse? offset? kind item*)` — active / passive /
 /// declarative, in either the func-index (`func $f …`) or const-expr
 /// (`funcref (ref.func $f) …`) form.
-fn parseElem(a: std.mem.Allocator, items: []const Sexpr, elems: *List(ElemDef), table_names: []const ?[]const u8) Error!void {
+fn parseElem(a: std.mem.Allocator, items: []const Sexpr, elems: *List(ElemDef), elem_names: *List(?[]const u8), table_names: []const ?[]const u8) Error!void {
     var i: usize = 1;
-    if (i < items.len and isId(items[i])) i += 1; // segment $id
+    var name: ?[]const u8 = null;
+    if (i < items.len and isId(items[i])) {
+        name = items[i].atom;
+        i += 1; // segment $id
+    }
+    try elem_names.append(a, name);
     var mode: @FieldType(ElemDef, "mode") = .passive;
     var table_index: u32 = 0;
     var offset_form: ?Sexpr = null;
@@ -708,12 +715,15 @@ const Ctx = struct {
     /// Table names (index-aligned with the table index space), for resolving the
     /// explicit table operand of `call_indirect $t`.
     table_names: []const ?[]const u8 = &.{},
+    /// Element-segment names (index-aligned with the element index space), for
+    /// resolving `$e` in `table.init` / `elem.drop`.
+    elem_names: []const ?[]const u8 = &.{},
     /// Control-flow label stack (innermost last), for resolving `br $name` to a
     /// relative depth.
     labels: List(?[]const u8) = .empty,
 };
 
-fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, table_names: []const ?[]const u8) Error![]const u8 {
+fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, table_names: []const ?[]const u8, elem_names: []const ?[]const u8) Error![]const u8 {
     var body: List(u8) = .empty;
     // Locals vector: one (count=1, type) group per declared local.
     try uleb(a, &body, f.locals.items.len);
@@ -721,7 +731,7 @@ fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, si
         try uleb(a, &body, 1);
         try body.append(a, @intFromEnum(t));
     }
-    var ctx: Ctx = .{ .a = a, .out = &body, .local_names = f.local_names.items, .func_names = func_names, .sigs = sigs, .type_names = type_names, .global_names = global_names, .table_names = table_names };
+    var ctx: Ctx = .{ .a = a, .out = &body, .local_names = f.local_names.items, .func_names = func_names, .sigs = sigs, .type_names = type_names, .global_names = global_names, .table_names = table_names, .elem_names = elem_names };
     try emitSeq(&ctx, f.body);
     try body.append(a, @intFromEnum(Op.end)); // implicit function end
     return body.items;
@@ -937,6 +947,20 @@ fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Erro
             try uleb(ctx.a, ctx.out, t);
             return j;
         },
+        .table_init, .elem_drop, .table_copy => {
+            // Consume the leading index atoms (0–2), then the bulk-op immediate
+            // encoder (shared with the folded path) resolves + emits them.
+            var idxs: [2]Sexpr = undefined;
+            var n: usize = 0;
+            var j = i + 1;
+            while (j < items.len and n < 2 and isIndexAtom(items[j])) : (j += 1) {
+                idxs[n] = items[j];
+                n += 1;
+            }
+            try emitOpcode(ctx, op);
+            try emitBulkTableImm(ctx, op, idxs[0..n]);
+            return j;
+        },
         else => {
             var buf: [4]Sexpr = undefined;
             var n: usize = 0;
@@ -960,6 +984,13 @@ fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Erro
             return j;
         },
     }
+}
+
+/// True if the s-expr is an index atom — a `$name` or a numeric literal — as
+/// opposed to a folded operand list or a following instruction keyword.
+fn isIndexAtom(s: Sexpr) bool {
+    const atom = s.asAtom() orelse return false;
+    return atom.len != 0 and (atom[0] == '$' or std.ascii.isDigit(atom[0]));
 }
 
 fn parseOptLabel(l: []const Sexpr, j: *usize) ?[]const u8 {
@@ -1034,6 +1065,33 @@ fn emitOpcode(ctx: *Ctx, op: Op) Error!void {
     }
 }
 
+/// Emit the immediate operands of a bulk table op from its leading index atoms
+/// (`idxs`, 0–2 of them). Text operand order differs from binary: `table.init`
+/// is written `tableidx? elemidx` but encoded elem-then-table; `table.copy` is
+/// `dst? src?` in both. Shared by the flat and folded emit paths.
+fn emitBulkTableImm(ctx: *Ctx, op: Op, idxs: []const Sexpr) Error!void {
+    switch (op) {
+        .table_init => {
+            if (idxs.len == 0) return error.BadImmediate;
+            const table: u32 = if (idxs.len >= 2) try resolveByName(ctx.table_names, idxs[0]) else 0;
+            const elem: u32 = try resolveByName(ctx.elem_names, idxs[idxs.len - 1]);
+            try uleb(ctx.a, ctx.out, elem);
+            try uleb(ctx.a, ctx.out, table);
+        },
+        .elem_drop => {
+            if (idxs.len == 0) return error.BadImmediate;
+            try uleb(ctx.a, ctx.out, try resolveByName(ctx.elem_names, idxs[0]));
+        },
+        .table_copy => {
+            const dst: u32 = if (idxs.len >= 1) try resolveByName(ctx.table_names, idxs[0]) else 0;
+            const src: u32 = if (idxs.len >= 2) try resolveByName(ctx.table_names, idxs[1]) else 0;
+            try uleb(ctx.a, ctx.out, dst);
+            try uleb(ctx.a, ctx.out, src);
+        },
+        else => unreachable,
+    }
+}
+
 fn emitInstr(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
     try emitOpcode(ctx, op);
     switch (opcode.immediateKind(op)) {
@@ -1051,6 +1109,7 @@ fn emitInstr(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
         .mem_reserved => try ctx.out.append(ctx.a, 0x00),
         .ref_type => try ctx.out.append(ctx.a, @intFromEnum(try heapTypeToValType(try imm0(immediates)))),
         .br_table => try emitBrTable(ctx, immediates),
+        .table_init, .elem, .table_copy => try emitBulkTableImm(ctx, op, immediates),
         else => return error.UnsupportedInstr, // block_type (handled structurally), call_indirect
     }
 }

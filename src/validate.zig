@@ -34,6 +34,7 @@ pub const Error = Module.Error || error{
     UndefinedFunc,
     UndefinedType,
     UndefinedTable,
+    UndefinedElem,
     ConstantExpressionRequired,
     InvalidAlignment,
     MissingMemory,
@@ -407,6 +408,25 @@ const FuncValidator = struct {
                 const et = try self.tableElemType(instr.imm.table);
                 _ = try self.popExpect(.i32); // n
                 _ = try self.popExpect(et); // value
+                _ = try self.popExpect(.i32); // dst
+            },
+            .table_init => {
+                const tet = try self.tableElemType(instr.imm.table_init.table);
+                if (instr.imm.table_init.elem >= self.module.elements.len) return error.UndefinedElem;
+                if (self.module.elements[instr.imm.table_init.elem].elem_type != tet) return error.TypeMismatch;
+                _ = try self.popExpect(.i32); // n
+                _ = try self.popExpect(.i32); // src
+                _ = try self.popExpect(.i32); // dst
+            },
+            .elem_drop => {
+                if (instr.imm.elem >= self.module.elements.len) return error.UndefinedElem;
+            },
+            .table_copy => {
+                const dt = try self.tableElemType(instr.imm.table_copy.dst);
+                const st = try self.tableElemType(instr.imm.table_copy.src);
+                if (dt != st) return error.TypeMismatch;
+                _ = try self.popExpect(.i32); // n
+                _ = try self.popExpect(.i32); // src
                 _ = try self.popExpect(.i32); // dst
             },
 
