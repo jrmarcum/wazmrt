@@ -258,6 +258,24 @@ pub fn importedFuncCount(self: Module) u32 {
     return n;
 }
 
+/// Number of imported tables (they occupy the low table indices).
+pub fn importedTableCount(self: Module) u32 {
+    var n: u32 = 0;
+    for (self.imports) |imp| {
+        if (imp.type == .table) n += 1;
+    }
+    return n;
+}
+
+/// Number of imported memories (they occupy the low memory indices).
+pub fn importedMemoryCount(self: Module) u32 {
+    var n: u32 = 0;
+    for (self.imports) |imp| {
+        if (imp.type == .memory) n += 1;
+    }
+    return n;
+}
+
 /// Resolve a function index (imports first, then defined) to its signature,
 /// or null if out of range.
 pub fn funcType(self: Module, index: u32) ?FuncType {

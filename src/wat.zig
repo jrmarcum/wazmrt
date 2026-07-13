@@ -85,6 +85,8 @@ const ElemDef = struct {
 const GlobalDef = struct { valtype: V, mutable: bool, init: []const Sexpr };
 /// An imported global (`(global (import "m" "n") type)`).
 const ImportedGlobal = struct { module: []const u8, name: []const u8, valtype: V, mutable: bool };
+const ImportedTable = struct { module: []const u8, name: []const u8, min: u32, max: ?u32, elem: V };
+const ImportedMemory = struct { module: []const u8, name: []const u8, min: u32, max: ?u32 };
 
 /// Assemble the first `(module …)` form found in `src`.
 pub fn assemble(a: std.mem.Allocator, src: []const u8) Error![]const u8 {
@@ -110,6 +112,8 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     var type_names: List(?[]const u8) = .empty;
     var globals: List(GlobalDef) = .empty;
     var global_imports: List(ImportedGlobal) = .empty;
+    var table_imports: List(ImportedTable) = .empty;
+    var mem_imports: List(ImportedMemory) = .empty;
     var global_names: List(?[]const u8) = .empty;
     var func_imports: List(ImportedFunc) = .empty;
     var mem_min: ?u32 = null;
@@ -198,8 +202,34 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 const f = try parseFunc(a, desc); // reuse: parses $id + typeuse
                 try func_imports.append(a, .{ .module = items[1].string, .name = items[2].string, .type_ref = f.type_ref, .params = f.params.items, .results = f.results.items });
                 try func_names.append(a, f.name);
+            } else if (std.mem.eql(u8, dkw, "table")) {
+                // (import "m" "n" (table $id? min max? reftype)) — imported tables
+                // take the low table indices (before any defined table).
+                var ti: usize = 1;
+                var tname: ?[]const u8 = null;
+                if (ti < desc.len and isId(desc[ti])) {
+                    tname = desc[ti].atom;
+                    ti += 1;
+                }
+                const tmin = try parseIndex(desc[ti]);
+                ti += 1;
+                var tmax: ?u32 = null;
+                if (ti < desc.len and !isRefType(desc[ti])) {
+                    tmax = try parseIndex(desc[ti]);
+                    ti += 1;
+                }
+                try table_imports.append(a, .{ .module = items[1].string, .name = items[2].string, .min = tmin, .max = tmax, .elem = try parseValType(desc[ti]) });
+                try table_names.append(a, tname);
+            } else if (std.mem.eql(u8, dkw, "memory")) {
+                // (import "m" "n" (memory $id? min max?)) — the single memory 0.
+                var mi2: usize = 1;
+                if (mi2 < desc.len and isId(desc[mi2])) mi2 += 1;
+                const mmin = try parseIndex(desc[mi2]);
+                mi2 += 1;
+                const mmax: ?u32 = if (mi2 < desc.len) try parseIndex(desc[mi2]) else null;
+                try mem_imports.append(a, .{ .module = items[1].string, .name = items[2].string, .min = mmin, .max = mmax });
             } else {
-                try parseImport(a, items, &global_imports, &global_names); // global (table/memory error)
+                try parseImport(a, items, &global_imports, &global_names); // global
             }
         } else {
             // `type` handled in the pre-pass; `start` deferred.
@@ -251,15 +281,29 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         }
         try emitSection(a, &out, 1, s.items);
     }
-    // Import section (2) — imported functions + globals (tables/memories not yet assembled)
-    if (func_imports.items.len != 0 or global_imports.items.len != 0) {
+    // Import section (2) — imported functions, tables, memories, globals.
+    const n_imports = func_imports.items.len + table_imports.items.len + mem_imports.items.len + global_imports.items.len;
+    if (n_imports != 0) {
         var s: List(u8) = .empty;
-        try uleb(a, &s, func_imports.items.len + global_imports.items.len);
+        try uleb(a, &s, n_imports);
         for (func_imports.items, func_import_type.items) |fi, ti| {
             try nameBytes(a, &s, fi.module);
             try nameBytes(a, &s, fi.name);
             try s.append(a, 0x00); // func import
             try uleb(a, &s, ti); // type index
+        }
+        for (table_imports.items) |t| {
+            try nameBytes(a, &s, t.module);
+            try nameBytes(a, &s, t.name);
+            try s.append(a, 0x01); // table import
+            try s.append(a, @intFromEnum(t.elem)); // element reftype
+            try emitLimits(a, &s, t.min, t.max);
+        }
+        for (mem_imports.items) |m| {
+            try nameBytes(a, &s, m.module);
+            try nameBytes(a, &s, m.name);
+            try s.append(a, 0x02); // memory import
+            try emitLimits(a, &s, m.min, m.max);
         }
         for (global_imports.items) |g| {
             try nameBytes(a, &s, g.module);
@@ -283,29 +327,16 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         try uleb(a, &s, tables.items.len);
         for (tables.items) |t| {
             try s.append(a, @intFromEnum(t.elem)); // element reftype (funcref / externref)
-            if (t.max) |mx| {
-                try s.append(a, 0x01);
-                try uleb(a, &s, t.min);
-                try uleb(a, &s, mx);
-            } else {
-                try s.append(a, 0x00);
-                try uleb(a, &s, t.min);
-            }
+            try emitLimits(a, &s, t.min, t.max);
         }
         try emitSection(a, &out, 4, s.items);
     }
-    // Memory section (5)
+    // Memory section (5) — a *defined* memory only (an imported one lives in the
+    // import section).
     if (mem_min) |mn| {
         var s: List(u8) = .empty;
         try uleb(a, &s, 1);
-        if (mem_max) |mx| {
-            try s.append(a, 0x01);
-            try uleb(a, &s, mn);
-            try uleb(a, &s, mx);
-        } else {
-            try s.append(a, 0x00);
-            try uleb(a, &s, mn);
-        }
+        try emitLimits(a, &s, mn, mem_max);
         try emitSection(a, &out, 5, s.items);
     }
     // Global section (6)
@@ -1299,6 +1330,18 @@ fn valTypeVec(a: std.mem.Allocator, out: *List(u8), vts: []const V) Error!void {
 fn nameBytes(a: std.mem.Allocator, out: *List(u8), name: []const u8) Error!void {
     try uleb(a, out, name.len);
     try out.appendSlice(a, name);
+}
+
+/// Emit a `limits` (§5.3.7): flag byte (0x01 if a max is present) then min[, max].
+fn emitLimits(a: std.mem.Allocator, out: *List(u8), min: u32, max: ?u32) Error!void {
+    if (max) |mx| {
+        try out.append(a, 0x01);
+        try uleb(a, out, min);
+        try uleb(a, out, mx);
+    } else {
+        try out.append(a, 0x00);
+        try uleb(a, out, min);
+    }
 }
 
 fn emitSection(a: std.mem.Allocator, out: *List(u8), id: u8, payload: []const u8) Error!void {

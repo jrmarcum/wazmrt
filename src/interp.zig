@@ -24,7 +24,7 @@ const V = types.ValType;
 const Op = opcode.Op;
 
 /// WebAssembly linear-memory page size (64 KiB).
-const page_size = 64 * 1024;
+pub const page_size = 64 * 1024;
 
 /// A runtime value: a raw 64-bit slot reinterpreted per the (validated) type.
 pub const Value = u64;
@@ -71,6 +71,8 @@ pub const Error = Module.Error || error{
     UndefinedFunc,
     /// Calling an imported (host) function — not yet supported.
     UnsupportedImportCall,
+    /// An imported table/memory was declared but no host backing was supplied.
+    MissingImport,
     /// An opcode this interpreter slice does not execute yet (e.g. an unhandled
     /// const-expr opcode, or a `0xFC`/SIMD op with no runtime support).
     UnsupportedInstruction,
@@ -136,22 +138,32 @@ pub const Instance = struct {
     /// Backing callables for imported functions (index-aligned with the first
     /// `imported_funcs` entries of the function index space).
     import_funcs: []const HostFunc,
-    /// Linear memory bytes (length is a multiple of `page_size`), or null if the
-    /// module has no memory. Allocated with `gpa` (grows via realloc).
-    memory: ?[]u8,
-    /// Maximum memory size in pages, if bounded.
-    mem_max: ?u32,
-    /// Reference tables, one per module table, as `Value` slots (`null_ref` =
-    /// uninitialized). Each is `gpa`-allocated (and re-allocated by `table.grow`);
-    /// the outer slice too.
-    tables: [][]Value,
-    /// Maximum length of each table, if bounded (for `table.grow`).
-    table_max: []const ?u32,
+    /// Linear memory (shared object so an imported memory reflects the exporter's
+    /// growth), or null if the module has neither a defined nor imported memory.
+    memory: ?*Memory,
+    /// True if `memory` is borrowed from an import (owned/freed by the exporter).
+    imported_memory: bool,
+    /// Reference tables, one shared `*Table` per module table (imports first, so
+    /// an imported table reflects the exporter's growth). The outer slice is
+    /// `gpa`-owned; `tables[0..imported_tables]` are borrowed objects.
+    tables: []*Table,
+    /// Count of leading imported tables (borrowed; not freed by this instance).
+    imported_tables: u32,
     /// Evaluated reference values of each element segment (for `table.init`);
     /// `elem_dropped[i]` marks a segment consumed (active/declarative at init, or
     /// `elem.drop`), after which it behaves as an empty segment.
     elem_values: []const []Value,
     elem_dropped: []bool,
+
+    /// Shared linear memory. A single object is referenced by the defining
+    /// instance and every importer, so `memory.grow` (which updates `bytes`) is
+    /// visible across the module boundary.
+    pub const Memory = struct { bytes: []u8, max: ?u32 };
+
+    /// Shared reference table (funcref/externref `Value` slots; `null_ref` =
+    /// uninitialized). Referenced by the definer and importers; `table.grow`
+    /// updates `entries` in place so all sharers observe it.
+    pub const Table = struct { entries: []Value, max: ?u32 };
 
     /// A callable backing an imported function: another instance's exported
     /// function (module linking) or a native host function.
@@ -160,12 +172,14 @@ pub const Instance = struct {
         native: *const fn (args: []const Value, results: []Value) void,
     };
 
-    /// Host-supplied backing for a module's imports, in module-import order:
-    /// `funcs` for imported functions, `globals` for imported global values.
-    /// Imported tables/memories remain unbacked.
+    /// Host-supplied backing for a module's imports, in per-kind import order:
+    /// `funcs`/`globals`/`memories`/`tables` each align with the module's
+    /// imports of that kind (imports occupy the low indices of their space).
     pub const Imports = struct {
         funcs: []const HostFunc = &.{},
         globals: []const Value = &.{},
+        memories: []const *Memory = &.{},
+        tables: []const *Table = &.{},
     };
 
     pub fn init(gpa: std.mem.Allocator, module: *const Module) Error!Instance {
@@ -206,44 +220,63 @@ pub const Instance = struct {
         for (module.global_inits, 0..) |init_expr, gi|
             globals[defined_start + gi] = try evalConstExpr(globals[0 .. defined_start + gi], init_expr);
 
-        // Linear memory: allocate the declared minimum, then apply active data
-        // segments. (An imported memory is self-provided here — no host yet.)
-        var memory: ?[]u8 = null;
-        var mem_max: ?u32 = null;
+        // Linear memory: an imported memory (index 0 when present) borrows the
+        // host-supplied shared object; a defined memory allocates its own. Active
+        // data segments then initialize whichever memory backs index 0.
+        const imported_memory = module.importedMemoryCount() > 0;
+        var memory: ?*Memory = null;
         if (module.memories.len > 0) {
-            const mt = module.memories[0];
-            const buf = try gpa.alloc(u8, @as(usize, mt.limits.min) * page_size);
-            errdefer gpa.free(buf);
-            @memset(buf, 0);
+            if (imported_memory) {
+                if (imports.memories.len == 0) return error.MissingImport;
+                memory = imports.memories[0];
+            } else {
+                const mt = module.memories[0];
+                const buf = try gpa.alloc(u8, @as(usize, mt.limits.min) * page_size);
+                errdefer gpa.free(buf);
+                @memset(buf, 0);
+                const mem_obj = try gpa.create(Memory);
+                mem_obj.* = .{ .bytes = buf, .max = mt.limits.max };
+                memory = mem_obj;
+            }
+            const bytes = memory.?.bytes;
             for (module.data) |seg| {
                 if (!seg.active) continue;
                 const offset = try evalConstOffset(module, globals, seg.offset_expr);
-                if (@as(u64, offset) + seg.bytes.len > buf.len) return error.MemoryOutOfBounds;
-                @memcpy(buf[offset..][0..seg.bytes.len], seg.bytes);
+                if (@as(u64, offset) + seg.bytes.len > bytes.len) return error.MemoryOutOfBounds;
+                @memcpy(bytes[offset..][0..seg.bytes.len], seg.bytes);
             }
-            memory = buf;
-            mem_max = mt.limits.max;
         }
-        // Cover errors raised after the memory block (table alloc / element init);
-        // the inner `errdefer gpa.free(buf)` only covers the data-segment loop.
-        errdefer if (memory) |m| gpa.free(m);
+        // Cover errors after the memory block; a *defined* memory object is owned.
+        errdefer if (!imported_memory) if (memory) |m| {
+            gpa.free(m.bytes);
+            gpa.destroy(m);
+        };
 
-        // Tables: allocate each declared table's minimum, then apply active
-        // element segments to their target table. Entries are `Value` slots
+        // Tables: imported tables (the low indices) borrow host-supplied shared
+        // objects; defined tables allocate their own. Entries are `Value` slots
         // (`null_ref` = uninitialized; a funcref is its function index; an
         // externref is its host value) so funcref *and* externref tables share one
         // representation.
-        const tables = try gpa.alloc([]Value, module.tables.len);
+        const n_imported_tables = module.importedTableCount();
+        const tables = try gpa.alloc(*Table, module.tables.len);
         errdefer gpa.free(tables);
-        const table_max = try gpa.alloc(?u32, module.tables.len);
-        errdefer gpa.free(table_max);
-        var n_tables_alloc: usize = 0;
-        errdefer for (tables[0..n_tables_alloc]) |t| gpa.free(t);
-        for (tables, table_max, module.tables) |*t, *tmax, tt| {
-            t.* = try gpa.alloc(Value, tt.limits.min);
-            n_tables_alloc += 1;
-            @memset(t.*, null_ref);
-            tmax.* = tt.limits.max;
+        var n_tables_init: usize = 0;
+        errdefer for (tables[0..n_tables_init], 0..) |t, k| if (k >= n_imported_tables) {
+            gpa.free(t.entries);
+            gpa.destroy(t);
+        };
+        for (tables, module.tables, 0..) |*t, tt, k| {
+            if (k < n_imported_tables) {
+                if (k >= imports.tables.len) return error.MissingImport;
+                t.* = imports.tables[k];
+            } else {
+                const entries = try gpa.alloc(Value, tt.limits.min);
+                @memset(entries, null_ref);
+                const tab = try gpa.create(Table);
+                tab.* = .{ .entries = entries, .max = tt.limits.max };
+                t.* = tab;
+            }
+            n_tables_init += 1;
         }
         // Evaluate every element segment's reference values. Active segments are
         // applied to their table and then dropped; passive segments stay
@@ -263,7 +296,7 @@ pub const Instance = struct {
             dropped.* = elem.mode != .passive;
             if (elem.mode == .active) {
                 if (elem.table_index >= tables.len) return error.NoTable;
-                const tbl = tables[elem.table_index];
+                const tbl = tables[elem.table_index].entries;
                 const offset = try evalConstOffset(module, globals, elem.offset_expr);
                 for (vals, 0..) |v, k| {
                     if (@as(u64, offset) + k >= tbl.len) return error.TableOutOfBounds;
@@ -281,22 +314,29 @@ pub const Instance = struct {
             .imported_funcs = module.importedFuncCount(),
             .import_funcs = imports.funcs,
             .memory = memory,
-            .mem_max = mem_max,
+            .imported_memory = imported_memory,
             .tables = tables,
-            .table_max = table_max,
+            .imported_tables = n_imported_tables,
             .elem_values = elem_values,
             .elem_dropped = elem_dropped,
         };
     }
 
     pub fn deinit(self: *Instance) void {
-        if (self.memory) |m| self.gpa.free(m);
+        // Free only owned (defined) memory/tables; imported ones belong to the
+        // exporting instance.
+        if (!self.imported_memory) if (self.memory) |m| {
+            self.gpa.free(m.bytes);
+            self.gpa.destroy(m);
+        };
         for (self.elem_values) |ev| self.gpa.free(ev);
         self.gpa.free(self.elem_values);
         self.gpa.free(self.elem_dropped);
-        for (self.tables) |t| self.gpa.free(t);
+        for (self.tables, 0..) |t, k| if (k >= self.imported_tables) {
+            self.gpa.free(t.entries);
+            self.gpa.destroy(t);
+        };
         self.gpa.free(self.tables);
-        self.gpa.free(self.table_max);
         self.arena.deinit();
         self.* = undefined;
     }
@@ -531,7 +571,7 @@ const Frame = struct {
                 .call_indirect => {
                     const ci = instr.imm.call_indirect;
                     if (ci.table >= self.inst.tables.len) return error.NoTable;
-                    const table = self.inst.tables[ci.table];
+                    const table = self.inst.tables[ci.table].entries;
                     const slot = @as(u32, @bitCast(self.popI32())); // table element index (top of stack)
                     if (slot >= table.len) return error.TableOutOfBounds;
                     if (table[slot] == null_ref) return error.UninitializedElement;
@@ -549,14 +589,14 @@ const Frame = struct {
 
                 // --- Table access ---
                 .table_get => {
-                    const t = self.inst.tables[instr.imm.table];
+                    const t = self.inst.tables[instr.imm.table].entries;
                     const i = @as(u32, @bitCast(self.popI32()));
                     if (i >= t.len) return error.TableOutOfBounds;
                     try self.pushU64(t[i]);
                     pc += 1;
                 },
                 .table_set => {
-                    const t = self.inst.tables[instr.imm.table];
+                    const t = self.inst.tables[instr.imm.table].entries;
                     const v = self.pop();
                     const i = @as(u32, @bitCast(self.popI32()));
                     if (i >= t.len) return error.TableOutOfBounds;
@@ -564,16 +604,16 @@ const Frame = struct {
                     pc += 1;
                 },
                 .table_size => {
-                    try self.pushI32(@bitCast(@as(u32, @intCast(self.inst.tables[instr.imm.table].len))));
+                    try self.pushI32(@bitCast(@as(u32, @intCast(self.inst.tables[instr.imm.table].entries.len))));
                     pc += 1;
                 },
                 .table_grow => {
-                    const ti = instr.imm.table;
+                    const tab = self.inst.tables[instr.imm.table];
                     const delta = @as(u32, @bitCast(self.popI32()));
                     const init_val = self.pop();
-                    const old = self.inst.tables[ti];
+                    const old = tab.entries;
                     const new_len = @as(u64, old.len) + delta;
-                    const max = self.inst.table_max[ti] orelse std.math.maxInt(u32);
+                    const max = tab.max orelse std.math.maxInt(u32);
                     if (new_len > max) {
                         try self.pushI32(-1); // growth refused
                     } else {
@@ -583,13 +623,13 @@ const Frame = struct {
                             continue;
                         };
                         @memset(grown[old.len..], init_val);
-                        self.inst.tables[ti] = grown;
+                        tab.entries = grown; // shared object → visible to importers
                         try self.pushI32(@bitCast(@as(u32, @intCast(old.len))));
                     }
                     pc += 1;
                 },
                 .table_fill => {
-                    const t = self.inst.tables[instr.imm.table];
+                    const t = self.inst.tables[instr.imm.table].entries;
                     const n = @as(u32, @bitCast(self.popI32()));
                     const val = self.pop();
                     const dst = @as(u32, @bitCast(self.popI32()));
@@ -598,7 +638,7 @@ const Frame = struct {
                     pc += 1;
                 },
                 .table_init => {
-                    const t = self.inst.tables[instr.imm.table_init.table];
+                    const t = self.inst.tables[instr.imm.table_init.table].entries;
                     const seg: []const Value = if (self.inst.elem_dropped[instr.imm.table_init.elem]) &.{} else self.inst.elem_values[instr.imm.table_init.elem];
                     const n = @as(u32, @bitCast(self.popI32()));
                     const src = @as(u32, @bitCast(self.popI32()));
@@ -612,8 +652,8 @@ const Frame = struct {
                     pc += 1;
                 },
                 .table_copy => {
-                    const dt = self.inst.tables[instr.imm.table_copy.dst];
-                    const st = self.inst.tables[instr.imm.table_copy.src];
+                    const dt = self.inst.tables[instr.imm.table_copy.dst].entries;
+                    const st = self.inst.tables[instr.imm.table_copy.src].entries;
                     const n = @as(u32, @bitCast(self.popI32()));
                     const src = @as(u32, @bitCast(self.popI32()));
                     const dst = @as(u32, @bitCast(self.popI32()));
@@ -924,7 +964,7 @@ const Frame = struct {
     fn load(self: *Frame, comptime T: type, ma: opcode.MemArg) Error!T {
         const n = @sizeOf(T);
         const base: u32 = @bitCast(self.popI32());
-        const mem = self.inst.memory orelse return error.NoMemory;
+        const mem = (self.inst.memory orelse return error.NoMemory).bytes;
         const ea = @as(u64, base) + ma.offset;
         if (ea + n > mem.len) return error.MemoryOutOfBounds;
         return std.mem.readInt(T, mem[@intCast(ea)..][0..n], .little);
@@ -935,7 +975,7 @@ const Frame = struct {
     fn store(self: *Frame, comptime T: type, ma: opcode.MemArg, value: T) Error!void {
         const n = @sizeOf(T);
         const base: u32 = @bitCast(self.popI32());
-        const mem = self.inst.memory orelse return error.NoMemory;
+        const mem = (self.inst.memory orelse return error.NoMemory).bytes;
         const ea = @as(u64, base) + ma.offset;
         if (ea + n > mem.len) return error.MemoryOutOfBounds;
         std.mem.writeInt(T, mem[@intCast(ea)..][0..n], value, .little);
@@ -943,14 +983,15 @@ const Frame = struct {
 
     fn memoryGrow(self: *Frame) Error!void {
         const delta: u64 = @as(u32, @bitCast(self.popI32()));
-        const old = self.inst.memory orelse return error.NoMemory;
+        const m = self.inst.memory orelse return error.NoMemory;
+        const old = m.bytes;
         const old_pages: u64 = old.len / page_size;
-        const limit: u64 = self.inst.mem_max orelse 65536; // wasm32 hard cap
+        const limit: u64 = m.max orelse 65536; // wasm32 hard cap
         if (old_pages + delta > limit) return self.pushI32(-1);
         const new_buf = self.inst.gpa.realloc(old, @intCast((old_pages + delta) * page_size)) catch
             return self.pushI32(-1);
         @memset(new_buf[old.len..], 0);
-        self.inst.memory = new_buf;
+        m.bytes = new_buf; // shared object → visible to importers
         try self.pushI32(@intCast(old_pages));
     }
 
@@ -958,7 +999,7 @@ const Frame = struct {
         // memory.size / memory.grow carry a reserved-byte immediate, not a memarg.
         switch (instr.op) {
             .memory_size => {
-                const mem = self.inst.memory orelse return error.NoMemory;
+                const mem = (self.inst.memory orelse return error.NoMemory).bytes;
                 return self.pushI32(@intCast(mem.len / page_size));
             },
             .memory_grow => return self.memoryGrow(),

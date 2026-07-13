@@ -54,6 +54,10 @@ const Runner = struct {
     current: ?*interp.Instance = null,
     /// Registered modules (`(register "name")`), for cross-module imports.
     modules: std.StringHashMapUnmanaged(*interp.Instance) = .{},
+    /// The standard `spectest` shared memory (1 page, max 2) and table (10
+    /// funcref, max 20), created lazily and shared by every importer.
+    spectest_memory: ?*interp.Instance.Memory = null,
+    spectest_table: ?*interp.Instance.Table = null,
     summary: Summary = .{},
 
     fn fail(self: *Runner, comptime fmt: []const u8, args: anytype) void {
@@ -99,17 +103,21 @@ const Runner = struct {
         return inst;
     }
 
-    /// Resolve a module's imports: functions to `HostFunc`s (a registered
-    /// module's export or a `spectest` native), globals to values.
+    /// Resolve a module's imports: functions to `HostFunc`s, globals to values,
+    /// and memories/tables to shared objects (a registered module's export or the
+    /// `spectest` stub), each in per-kind import order.
     fn resolveImports(self: *Runner, m: *const Module) !interp.Instance.Imports {
         var fs: std.ArrayList(HostFunc) = .empty;
         var gs: std.ArrayList(Value) = .empty;
+        var ms: std.ArrayList(*interp.Instance.Memory) = .empty;
+        var ts: std.ArrayList(*interp.Instance.Table) = .empty;
         for (m.imports) |imp| switch (imp.type) {
             .func => try fs.append(self.a, try self.resolveFuncImport(imp.module, imp.name)),
             .global => try gs.append(self.a, spectestGlobal(imp.module, imp.name) orelse 0),
-            else => {}, // imported tables/memories not yet backed
+            .memory => try ms.append(self.a, try self.resolveMemoryImport(imp.module, imp.name)),
+            .table => try ts.append(self.a, try self.resolveTableImport(imp.module, imp.name)),
         };
-        return .{ .funcs = fs.items, .globals = gs.items };
+        return .{ .funcs = fs.items, .globals = gs.items, .memories = ms.items, .tables = ts.items };
     }
 
     fn resolveFuncImport(self: *Runner, module: []const u8, name: []const u8) !HostFunc {
@@ -120,6 +128,44 @@ const Runner = struct {
             if (exportedFuncIndex(inst.module, name)) |fi| return .{ .wasm = .{ .instance = inst, .func_index = fi } };
         }
         return error.UnresolvedImport;
+    }
+
+    fn resolveMemoryImport(self: *Runner, module: []const u8, name: []const u8) !*interp.Instance.Memory {
+        if (std.mem.eql(u8, module, "spectest") and std.mem.eql(u8, name, "memory")) return self.spectestMemory();
+        if (self.modules.get(module)) |inst| {
+            if (exportedMemory(inst, name)) |mem| return mem;
+        }
+        return error.UnresolvedImport;
+    }
+
+    fn resolveTableImport(self: *Runner, module: []const u8, name: []const u8) !*interp.Instance.Table {
+        if (std.mem.eql(u8, module, "spectest") and std.mem.eql(u8, name, "table")) return self.spectestTable();
+        if (self.modules.get(module)) |inst| {
+            if (exportedTable(inst, name)) |tbl| return tbl;
+        }
+        return error.UnresolvedImport;
+    }
+
+    /// The shared `spectest` memory / table, allocated on first use (from the
+    /// runner arena, so they outlive every instance that borrows them).
+    fn spectestMemory(self: *Runner) !*interp.Instance.Memory {
+        if (self.spectest_memory) |m| return m;
+        const buf = try self.a.alloc(u8, interp.page_size); // 1 page
+        @memset(buf, 0);
+        const m = try self.a.create(interp.Instance.Memory);
+        m.* = .{ .bytes = buf, .max = 2 };
+        self.spectest_memory = m;
+        return m;
+    }
+
+    fn spectestTable(self: *Runner) !*interp.Instance.Table {
+        if (self.spectest_table) |t| return t;
+        const entries = try self.a.alloc(Value, 10); // 10 funcref
+        @memset(entries, null_ref);
+        const t = try self.a.create(interp.Instance.Table);
+        t.* = .{ .entries = entries, .max = 20 };
+        self.spectest_table = t;
+        return t;
     }
 
     fn moduleBinary(self: *Runner, form: []const Sexpr) ![]const u8 {
@@ -271,6 +317,23 @@ const null_ref: Value = std.math.maxInt(u64);
 fn exportedFuncIndex(m: *const Module, name: []const u8) ?u32 {
     for (m.exports) |e| {
         if (e.type == .func and std.mem.eql(u8, e.name, name)) return e.index;
+    }
+    return null;
+}
+
+/// The shared memory an instance exports under `name` (single memory → index 0).
+fn exportedMemory(inst: *interp.Instance, name: []const u8) ?*interp.Instance.Memory {
+    for (inst.module.exports) |e| {
+        if (e.type == .memory and std.mem.eql(u8, e.name, name)) return inst.memory;
+    }
+    return null;
+}
+
+/// The shared table object an instance exports under `name`.
+fn exportedTable(inst: *interp.Instance, name: []const u8) ?*interp.Instance.Table {
+    for (inst.module.exports) |e| {
+        if (e.type == .table and std.mem.eql(u8, e.name, name) and e.index < inst.tables.len)
+            return inst.tables[e.index];
     }
     return null;
 }
