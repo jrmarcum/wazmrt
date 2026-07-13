@@ -133,6 +133,9 @@ pub const Instance = struct {
     func_bodies: []FuncBody,
     globals: []Value,
     imported_funcs: u32,
+    /// Backing callables for imported functions (index-aligned with the first
+    /// `imported_funcs` entries of the function index space).
+    import_funcs: []const HostFunc,
     /// Linear memory bytes (length is a multiple of `page_size`), or null if the
     /// module has no memory. Allocated with `gpa` (grows via realloc).
     memory: ?[]u8,
@@ -145,10 +148,18 @@ pub const Instance = struct {
     /// Maximum length of each table, if bounded (for `table.grow`).
     table_max: []const ?u32,
 
-    /// Host-supplied values for a module's imports. Today only imported globals
-    /// are backed (in module-import order); imported functions/tables/memories
-    /// remain unbacked (calling one traps).
+    /// A callable backing an imported function: another instance's exported
+    /// function (module linking) or a native host function.
+    pub const HostFunc = union(enum) {
+        wasm: struct { instance: *Instance, func_index: u32 },
+        native: *const fn (args: []const Value, results: []Value) void,
+    };
+
+    /// Host-supplied backing for a module's imports, in module-import order:
+    /// `funcs` for imported functions, `globals` for imported global values.
+    /// Imported tables/memories remain unbacked.
     pub const Imports = struct {
+        funcs: []const HostFunc = &.{},
         globals: []const Value = &.{},
     };
 
@@ -254,6 +265,7 @@ pub const Instance = struct {
             .func_bodies = bodies,
             .globals = globals,
             .imported_funcs = module.importedFuncCount(),
+            .import_funcs = imports.funcs,
             .memory = memory,
             .mem_max = mem_max,
             .tables = tables,
@@ -295,7 +307,19 @@ pub const Instance = struct {
 
     fn callFunction(self: *Instance, a: std.mem.Allocator, func_index: u32, args: []const Value, depth: usize) Error![]Value {
         if (depth > max_call_depth) return error.CallStackExhausted;
-        if (func_index < self.imported_funcs) return error.UnsupportedImportCall;
+        if (func_index < self.imported_funcs) {
+            if (func_index >= self.import_funcs.len) return error.UnsupportedImportCall;
+            switch (self.import_funcs[func_index]) {
+                // Cross-module call: run in the exporting instance's context.
+                .wasm => |w| return w.instance.callFunction(a, w.func_index, args, depth + 1),
+                .native => |f| {
+                    const ft = self.module.funcType(func_index) orelse return error.UndefinedFunc;
+                    const results = try a.alloc(Value, ft.results.len);
+                    f(args, results);
+                    return results;
+                },
+            }
+        }
         const defined = func_index - self.imported_funcs;
         if (defined >= self.func_bodies.len) return error.UndefinedFunc;
         const body = &self.func_bodies[defined];

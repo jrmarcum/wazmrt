@@ -47,9 +47,13 @@ pub fn runScript(gpa: std.mem.Allocator, src: []const u8) Error!Summary {
     return r.summary;
 }
 
+const HostFunc = interp.Instance.HostFunc;
+
 const Runner = struct {
     a: std.mem.Allocator,
-    current: ?interp.Instance = null,
+    current: ?*interp.Instance = null,
+    /// Registered modules (`(register "name")`), for cross-module imports.
+    modules: std.StringHashMapUnmanaged(*interp.Instance) = .{},
     summary: Summary = .{},
 
     fn fail(self: *Runner, comptime fmt: []const u8, args: anytype) void {
@@ -74,30 +78,48 @@ const Runner = struct {
             try self.assertExhaustion(cmd.asList().?);
         } else if (std.mem.eql(u8, kw, "assert_invalid") or std.mem.eql(u8, kw, "assert_malformed")) {
             try self.assertRejected(cmd.asList().?);
+        } else if (std.mem.eql(u8, kw, "register")) {
+            // (register "name" $id?) — expose the current module's exports under "name".
+            const list = cmd.asList().?;
+            if (self.current) |inst| try self.modules.put(self.a, list[1].string, inst);
         } else if (std.mem.eql(u8, kw, "invoke")) {
             _ = self.runAction(cmd) catch |e| self.fail("invoke trapped: {s}", .{@errorName(e)});
         } else {
-            self.summary.skipped += 1; // register, get, (module quote …), …
+            self.summary.skipped += 1; // get, (module quote …), …
         }
     }
 
-    fn buildModule(self: *Runner, form: []const Sexpr) !interp.Instance {
+    fn buildModule(self: *Runner, form: []const Sexpr) !*interp.Instance {
         const bin = try self.moduleBinary(form);
         const m = try self.a.create(Module);
         m.* = try Module.decode(self.a, bin);
         try validate(self.a, m);
-        return interp.Instance.initWithImports(self.a, m, try self.resolveImports(m));
+        const inst = try self.a.create(interp.Instance);
+        inst.* = try interp.Instance.initWithImports(self.a, m, try self.resolveImports(m));
+        return inst;
     }
 
-    /// Provide host values for a module's imported globals. Only the standard
-    /// `spectest` globals are backed; anything else defaults to zero.
+    /// Resolve a module's imports: functions to `HostFunc`s (a registered
+    /// module's export or a `spectest` native), globals to values.
     fn resolveImports(self: *Runner, m: *const Module) !interp.Instance.Imports {
+        var fs: std.ArrayList(HostFunc) = .empty;
         var gs: std.ArrayList(Value) = .empty;
-        for (m.imports) |imp| {
-            if (imp.type != .global) continue;
-            try gs.append(self.a, spectestGlobal(imp.module, imp.name) orelse 0);
+        for (m.imports) |imp| switch (imp.type) {
+            .func => try fs.append(self.a, try self.resolveFuncImport(imp.module, imp.name)),
+            .global => try gs.append(self.a, spectestGlobal(imp.module, imp.name) orelse 0),
+            else => {}, // imported tables/memories not yet backed
+        };
+        return .{ .funcs = fs.items, .globals = gs.items };
+    }
+
+    fn resolveFuncImport(self: *Runner, module: []const u8, name: []const u8) !HostFunc {
+        if (std.mem.eql(u8, module, "spectest")) {
+            if (spectestFunc(name)) |nf| return .{ .native = nf };
         }
-        return .{ .globals = gs.items };
+        if (self.modules.get(module)) |inst| {
+            if (exportedFuncIndex(inst.module, name)) |fi| return .{ .wasm = .{ .instance = inst, .func_index = fi } };
+        }
+        return error.UnresolvedImport;
     }
 
     fn moduleBinary(self: *Runner, form: []const Sexpr) ![]const u8 {
@@ -231,6 +253,25 @@ fn isRuntimeTrap(e: anyerror) bool {
 
 /// Null reference sentinel — must match `interp`'s `null_ref` on the value stack.
 const null_ref: Value = std.math.maxInt(u64);
+
+/// The index (into a module's function index space) of an exported function.
+fn exportedFuncIndex(m: *const Module, name: []const u8) ?u32 {
+    for (m.exports) |e| {
+        if (e.type == .func and std.mem.eql(u8, e.name, name)) return e.index;
+    }
+    return null;
+}
+
+/// A `spectest` host function. The standard ones (`print*`) are side-effect-only
+/// with no results, so a single no-op backs them all.
+fn spectestFunc(name: []const u8) ?*const fn ([]const Value, []Value) void {
+    if (std.mem.startsWith(u8, name, "print")) return spectestNoop;
+    return null;
+}
+fn spectestNoop(args: []const Value, results: []Value) void {
+    _ = args;
+    _ = results; // print funcs return nothing
+}
 
 /// The standard testsuite `spectest` host globals (immutable), as their raw slot
 /// bits. Modules import these to test imported-global handling.

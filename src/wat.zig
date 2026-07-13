@@ -48,9 +48,15 @@ const Func = struct {
     exports: List([]const u8) = .empty,
     /// `(type $t)` reference, if the function declares its type by index.
     type_ref: ?Sexpr = null,
+    /// Inline import (`(func $id (import "m" "n") typeuse)`) — no body.
+    import: ?struct { module: []const u8, name: []const u8 } = null,
     /// Body instruction forms (everything after the param/result/local headers).
     body: []const Sexpr = &.{},
 };
+
+/// An imported function (top-level `(import "m" "n" (func …))` or inline
+/// `(func (import "m" "n") …)`); its type is `type_ref` or the inline sig.
+const ImportedFunc = struct { module: []const u8, name: []const u8, type_ref: ?Sexpr, params: []const V, results: []const V };
 
 const ExportDef = struct { name: []const u8, kind: u8, index: u32 };
 const DataSeg = struct { offset: i64, bytes: []const u8 };
@@ -100,6 +106,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     var globals: List(GlobalDef) = .empty;
     var global_imports: List(ImportedGlobal) = .empty;
     var global_names: List(?[]const u8) = .empty;
+    var func_imports: List(ImportedFunc) = .empty;
     var mem_min: ?u32 = null;
     var mem_max: ?u32 = null;
 
@@ -117,9 +124,13 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         const items = field.asList().?;
         if (std.mem.eql(u8, kw, "func")) {
             const f = try parseFunc(a, items);
-            const idx: u32 = @intCast(funcs.items.len);
+            const idx: u32 = @intCast(func_names.items.len); // func-space index (imports first)
             for (f.exports.items) |name| try exports.append(a, .{ .name = name, .kind = 0, .index = idx });
-            try funcs.append(a, f);
+            if (f.import) |m| {
+                try func_imports.append(a, .{ .module = m.module, .name = m.name, .type_ref = f.type_ref, .params = f.params.items, .results = f.results.items });
+            } else {
+                try funcs.append(a, f);
+            }
             try func_names.append(a, f.name);
         } else if (std.mem.eql(u8, kw, "export")) {
             // (export "name" (func|table|memory|global $id|N))
@@ -162,8 +173,16 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         } else if (std.mem.eql(u8, kw, "elem")) {
             try parseElem(a, items, &elems, table_names.items);
         } else if (std.mem.eql(u8, kw, "import")) {
-            // (import "m" "n" (global $id? type)) — only global imports today.
-            try parseImport(a, items, &global_imports, &global_names);
+            // (import "m" "n" (func …) | (global …)) — func + global imports.
+            const desc = items[3].asList() orelse return error.BadModuleField;
+            const dkw = desc[0].asAtom() orelse return error.BadModuleField;
+            if (std.mem.eql(u8, dkw, "func")) {
+                const f = try parseFunc(a, desc); // reuse: parses $id + typeuse
+                try func_imports.append(a, .{ .module = items[1].string, .name = items[2].string, .type_ref = f.type_ref, .params = f.params.items, .results = f.results.items });
+                try func_names.append(a, f.name);
+            } else {
+                try parseImport(a, items, &global_imports, &global_names); // global (table/memory error)
+            }
         } else {
             // `type` handled in the pre-pass; `start` deferred.
         }
@@ -172,6 +191,13 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // Function type indices (`(type $t)` reference, else intern the inline sig),
     // then pre-encode bodies (which may intern block-type sigs / resolve
     // call_indirect type refs), so the type section is complete before emit.
+    // Imported-function type indices (for the import section).
+    var func_import_type: List(u32) = .empty;
+    for (func_imports.items) |fi| {
+        const ti = if (fi.type_ref) |tr| try resolveType(type_names.items, tr) else try internSig(a, &sigs, fi.params, fi.results);
+        try func_import_type.append(a, ti);
+    }
+
     var func_type: List(u32) = .empty;
     for (funcs.items) |*f| {
         const ti = if (f.type_ref) |tr| try resolveType(type_names.items, tr) else try internSig(a, &sigs, f.params.items, f.results.items);
@@ -207,10 +233,16 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         }
         try emitSection(a, &out, 1, s.items);
     }
-    // Import section (2) — imported globals (funcs/tables/memories not yet assembled)
-    if (global_imports.items.len != 0) {
+    // Import section (2) — imported functions + globals (tables/memories not yet assembled)
+    if (func_imports.items.len != 0 or global_imports.items.len != 0) {
         var s: List(u8) = .empty;
-        try uleb(a, &s, global_imports.items.len);
+        try uleb(a, &s, func_imports.items.len + global_imports.items.len);
+        for (func_imports.items, func_import_type.items) |fi, ti| {
+            try nameBytes(a, &s, fi.module);
+            try nameBytes(a, &s, fi.name);
+            try s.append(a, 0x00); // func import
+            try uleb(a, &s, ti); // type index
+        }
         for (global_imports.items) |g| {
             try nameBytes(a, &s, g.module);
             try nameBytes(a, &s, g.name);
@@ -592,6 +624,8 @@ fn parseFunc(a: std.mem.Allocator, form: []const Sexpr) Error!Func {
         const list = form[i].asList().?;
         if (std.mem.eql(u8, kw, "export")) {
             try f.exports.append(a, list[1].string);
+        } else if (std.mem.eql(u8, kw, "import")) {
+            f.import = .{ .module = list[1].string, .name = list[2].string }; // (import "m" "n")
         } else if (std.mem.eql(u8, kw, "type")) {
             f.type_ref = list[1]; // (type $t)
         } else if (std.mem.eql(u8, kw, "param")) {
@@ -1498,6 +1532,27 @@ test "reads an imported global from the host value" {
     try std.testing.expectEqual(@as(i32, 777), interp.asI32((try inst.invoke("get-x", &.{}))[0]));
     // A defined global's init may read the imported one: 777 + 1.
     try std.testing.expectEqual(@as(i32, 778), interp.asI32((try inst.invoke("get-y", &.{}))[0]));
+}
+
+fn hostAdd(args: []const interp.Value, results: []interp.Value) void {
+    results[0] = interp.i32Value(interp.asI32(args[0]) +% interp.asI32(args[1]));
+}
+
+test "calls an imported (host) function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bin = try assemble(a,
+        \\(module
+        \\  (import "env" "add" (func $add (param i32 i32) (result i32)))
+        \\  (func (export "call-add") (param i32 i32) (result i32)
+        \\    (call $add (local.get 0) (local.get 1))))
+    );
+    var m = try Module.decode(a, bin);
+    const imports: interp.Instance.Imports = .{ .funcs = &.{.{ .native = hostAdd }} };
+    var inst = try interp.Instance.initWithImports(a, &m, imports);
+    // The imported func occupies index 0; call-add dispatches to the host adder.
+    try std.testing.expectEqual(@as(i32, 7), interp.asI32((try inst.invoke("call-add", &.{ interp.i32Value(3), interp.i32Value(4) }))[0]));
 }
 
 test "active element-expression segment (ref.func / ref.null)" {
