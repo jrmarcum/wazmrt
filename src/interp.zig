@@ -97,8 +97,9 @@ pub const Error = Module.Error || error{
 };
 
 /// Null reference sentinel — on the value stack (`ref.null`) and as an
-/// uninitialized table entry, distinct from any real function index or host
-/// externref payload.
+/// uninitialized table entry. A funcref value is a function index (always small),
+/// and host externref values are boxed to small non-sentinel handles at the host
+/// boundary (see the WAST runner's `internExtern`, #9), so neither collides.
 const null_ref: Value = std.math.maxInt(u64);
 
 fn funcTypeEqual(x: Module.FuncType, y: Module.FuncType) bool {

@@ -58,6 +58,11 @@ const Runner = struct {
     /// funcref, max 20), created lazily and shared by every importer.
     spectest_memory: ?*interp.Instance.Memory = null,
     spectest_table: ?*interp.Instance.Table = null,
+    /// Interned host externref payloads. A `(ref.extern N)` value is represented
+    /// on the value stack as its *index* here (a small integer, never the
+    /// `null_ref` = maxInt sentinel), so an externref of any payload — including
+    /// one equal to the sentinel — is never misclassified as null (#9).
+    extern_pool: std.ArrayList(u64) = .empty,
     summary: Summary = .{},
 
     fn fail(self: *Runner, comptime fmt: []const u8, args: anytype) void {
@@ -239,7 +244,7 @@ const Runner = struct {
         if (!std.mem.eql(u8, list[0].asAtom() orelse "", "invoke")) return error.BadCommand;
         const name = list[1].string;
         const args = try self.a.alloc(Value, list.len - 2);
-        for (list[2..], args) |arg, *dst| dst.* = try parseConst(arg);
+        for (list[2..], args) |arg, *dst| dst.* = try self.parseConst(arg);
         if (self.current == null) return error.BadCommand;
         return self.current.?.invoke(name, args);
     }
@@ -260,12 +265,69 @@ const Runner = struct {
         }
         const action_name: []const u8 = if (form[1].asList()) |l| (if (l.len > 1) l[1].string else "?") else "?";
         for (results, expected) |got, exp_form| {
-            if (!try matches(got, exp_form)) {
+            if (!try self.matches(got, exp_form)) {
                 self.fail("assert_return \"{s}\": result mismatch (got 0x{x})", .{ action_name, got });
                 return;
             }
         }
         self.summary.passed += 1;
+    }
+
+    /// Intern a host externref payload → its stack representation (a small index,
+    /// never the `null_ref` sentinel). Equal payloads get the same value so an
+    /// externref round-trips through the module and compares equal (#9).
+    fn internExtern(self: *Runner, payload: u64) Error!Value {
+        for (self.extern_pool.items, 0..) |p, i| if (p == payload) return @intCast(i);
+        const idx: Value = @intCast(self.extern_pool.items.len);
+        try self.extern_pool.append(self.a, payload);
+        return idx;
+    }
+
+    /// Parse a concrete value literal (for invoke arguments): `(TYPE.const literal)`
+    /// or a reference literal (`(ref.null …)`, `(ref.extern N)`, `(ref.func N)`).
+    fn parseConst(self: *Runner, form: Sexpr) Error!Value {
+        const list = form.asList() orelse return error.BadValue;
+        const kw = list[0].asAtom() orelse return error.BadValue;
+        // `ref.null` carries an ignorable heaptype; `ref.func` payload is a func
+        // index (used directly); `ref.extern` payload is a host value (interned).
+        if (std.mem.eql(u8, kw, "ref.null")) return null_ref;
+        if (std.mem.eql(u8, kw, "ref.extern")) {
+            if (list.len < 2) return self.internExtern(0); // bare `(ref.extern)` — any non-null
+            return self.internExtern(@bitCast(try parseInt(list[1].asAtom() orelse return error.BadValue)));
+        }
+        if (std.mem.eql(u8, kw, "ref.func")) {
+            if (list.len < 2) return null_ref -% 1; // bare `(ref.func)` — any non-null
+            return @intCast(try parseInt(list[1].asAtom() orelse return error.BadValue));
+        }
+        const lit = list[1].asAtom() orelse return error.BadValue;
+        if (std.mem.eql(u8, kw, "i32.const")) return interp.i32Value(@truncate(try parseInt(lit)));
+        if (std.mem.eql(u8, kw, "i64.const")) return interp.i64Value(try parseInt(lit));
+        if (std.mem.eql(u8, kw, "f32.const")) return @as(u32, try parseFloatBits(f32, lit));
+        if (std.mem.eql(u8, kw, "f64.const")) return try parseFloatBits(f64, lit);
+        return error.BadValue;
+    }
+
+    /// Does an actual result value match an expected `(TYPE.const …)` form? Handles
+    /// the `nan:canonical` / `nan:arithmetic` matchers for floats and references.
+    fn matches(self: *Runner, got: Value, exp_form: Sexpr) Error!bool {
+        const list = exp_form.asList() orelse return error.BadValue;
+        const kw = list[0].asAtom() orelse return error.BadValue;
+        // Reference matchers: `(ref.null …)` ⇒ null; a bare `(ref.func)` /
+        // `(ref.extern)` ⇒ any non-null; with a payload ⇒ exact.
+        if (std.mem.eql(u8, kw, "ref.null")) return got == null_ref;
+        if (std.mem.eql(u8, kw, "ref.extern")) {
+            if (list.len < 2) return got != null_ref;
+            return got == try self.internExtern(@bitCast(try parseInt(list[1].asAtom() orelse return error.BadValue)));
+        }
+        if (std.mem.eql(u8, kw, "ref.func")) {
+            if (list.len < 2) return got != null_ref;
+            return got == @as(Value, @intCast(try parseInt(list[1].asAtom() orelse return error.BadValue)));
+        }
+        const lit = list[1].asAtom() orelse return error.BadValue;
+        if (std.mem.eql(u8, kw, "f32.const")) return floatMatches(f32, got, lit);
+        if (std.mem.eql(u8, kw, "f64.const")) return floatMatches(f64, got, lit);
+        // Integers: exact bit comparison.
+        return got == try self.parseConst(exp_form);
     }
 
     fn assertTrap(self: *Runner, form: []const Sexpr) Error!void {
@@ -444,45 +506,6 @@ fn spectestGlobal(module: []const u8, name: []const u8) ?Value {
     return null;
 }
 
-/// Parse a concrete value literal (for invoke arguments): `(TYPE.const literal)`
-/// or a reference literal (`(ref.null …)`, `(ref.extern N)`, `(ref.func N)`).
-fn parseConst(form: Sexpr) Error!Value {
-    const list = form.asList() orelse return error.BadValue;
-    const kw = list[0].asAtom() orelse return error.BadValue;
-    // Reference literals: `ref.null` carries an ignorable heaptype; `ref.extern`
-    // / `ref.func` carry an integer payload (the func index / host value).
-    if (std.mem.eql(u8, kw, "ref.null")) return null_ref;
-    if (std.mem.eql(u8, kw, "ref.extern") or std.mem.eql(u8, kw, "ref.func")) {
-        if (list.len < 2) return null_ref; // bare `(ref.func)` — any non-null; use 0 sentinel
-        return @intCast(try parseInt(list[1].asAtom() orelse return error.BadValue));
-    }
-    const lit = list[1].asAtom() orelse return error.BadValue;
-    if (std.mem.eql(u8, kw, "i32.const")) return interp.i32Value(@truncate(try parseInt(lit)));
-    if (std.mem.eql(u8, kw, "i64.const")) return interp.i64Value(try parseInt(lit));
-    if (std.mem.eql(u8, kw, "f32.const")) return @as(u32, try parseFloatBits(f32, lit));
-    if (std.mem.eql(u8, kw, "f64.const")) return try parseFloatBits(f64, lit);
-    return error.BadValue;
-}
-
-/// Does an actual result value match an expected `(TYPE.const …)` form? Handles
-/// the `nan:canonical` / `nan:arithmetic` matchers for floats.
-fn matches(got: Value, exp_form: Sexpr) Error!bool {
-    const list = exp_form.asList() orelse return error.BadValue;
-    const kw = list[0].asAtom() orelse return error.BadValue;
-    // Reference matchers: `(ref.null …)` ⇒ null; a bare `(ref.func)` / `(ref.extern)`
-    // ⇒ any non-null; with a payload ⇒ exact.
-    if (std.mem.eql(u8, kw, "ref.null")) return got == null_ref;
-    if (std.mem.eql(u8, kw, "ref.func") or std.mem.eql(u8, kw, "ref.extern")) {
-        if (list.len < 2) return got != null_ref;
-        return got == @as(Value, @intCast(try parseInt(list[1].asAtom() orelse return error.BadValue)));
-    }
-    const lit = list[1].asAtom() orelse return error.BadValue;
-    if (std.mem.eql(u8, kw, "f32.const")) return floatMatches(f32, got, lit);
-    if (std.mem.eql(u8, kw, "f64.const")) return floatMatches(f64, got, lit);
-    // Integers: exact bit comparison.
-    return got == try parseConst(exp_form);
-}
-
 fn floatMatches(comptime F: type, got: Value, lit: []const u8) Error!bool {
     if (std.mem.eql(u8, lit, "nan:canonical")) return isCanonicalNan(F, got);
     if (std.mem.eql(u8, lit, "nan:arithmetic")) return isArithmeticNan(F, got);
@@ -591,6 +614,23 @@ test "float results incl. nan:canonical" {
     ;
     const s = try runScript(std.testing.allocator, src);
     try std.testing.expectEqual(@as(usize, 2), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "externref payload equal to the null sentinel is not null (#9)" {
+    const src =
+        \\(module
+        \\  (table $t 1 externref)
+        \\  (func (export "isnull") (param externref) (result i32) (ref.is_null (local.get 0)))
+        \\  (func (export "roundtrip") (param externref) (result externref)
+        \\    (table.set $t (i32.const 0) (local.get 0))
+        \\    (table.get $t (i32.const 0))))
+        \\(assert_return (invoke "isnull" (ref.extern 0xFFFFFFFFFFFFFFFF)) (i32.const 0))
+        \\(assert_return (invoke "isnull" (ref.null extern)) (i32.const 1))
+        \\(assert_return (invoke "roundtrip" (ref.extern 0xFFFFFFFFFFFFFFFF)) (ref.extern 0xFFFFFFFFFFFFFFFF))
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 3), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
 
