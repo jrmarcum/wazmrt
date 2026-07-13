@@ -175,13 +175,15 @@ param's index. `(func (type $sig) (local $var i32) (local.get $var))` returned t
 of the uninitialized local (0). Fixed in `assembleModule`: prepend anonymous local names for the
 type's params (bounds-checked against `sigs`). `func.wast` 169/2 → **171/0**.
 
-### #15 — Table & element *initializer expressions* not assembled — LOW (feature)
-`(table $t N funcref (global.get $g))` (per-table init expr) and `(elem (table $t) (offset) funcref
-(ref.func $f) …)` (element *expression* form, vs the plain func-index list) are parsed loosely by
-`parseTable`/`parseElem`, which drop the trailing const-exprs. Consequence: invalid init exprs aren't
-validated (global.wast's last over-acceptance) and the linking-heavy `elem` forms don't assemble.
-**Surfaces when:** the reference-types element/table-init-expression tests, and the `register` module in
-`global.wast`. **Fix:** parse the init/element expressions and run them through `validateConstExpr`.
+### #15 — Element init expressions — **MOSTLY DONE (`82d0213`, `4ffa2e8`)**
+The element-segment **const-expr form** (`(elem … funcref (ref.func $f) (ref.null func) …)`, incl. the
+`(item …)` wrapper), **all 8 segment flag variants** (active/passive/declarative × func-index/expr),
+and **const-expr offsets** (`(global.get $g)`, `(offset …)`) are now assembled, decoded, validated
+(each element must produce the segment's element type), and applied at instantiation. `elem.wast`
+3/54 → **38/28**. **Still open:** passive elements + `table.init`/`elem.drop` (bulk table ops — a
+distinct feature; ~4 elem fails + `table_init.wast` 730 skipped), const-expr **data** offsets (kept
+literal-only — generalizing them regressed `data.wast`), and table initializer expressions
+(`(table $t N funcref (expr))`, a GC-proposal form — global.wast's last over-acceptance).
 
 ### #16 — Decoder is lenient on malformed binaries — **LEB PART DONE (`10aca3b`); rest LOW**
 **Done:** the LEB128 readers (`readVarU32`/`readVarI32`/`readVarI64`) are now spec-correct — accept
