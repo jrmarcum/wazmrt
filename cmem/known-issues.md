@@ -43,10 +43,9 @@ Still open: #1, #3, #4, #9, #10, #11, #12, #13, plus the "Discovered 2026-07-09"
 
 ## Grouped by the integration that trips them
 
-- **`register` / multi-module linking + imported functions** (host imports → WASI): #1 (top-level
-  `(import …)` dropped), #4 (non-spectest imported global → 0), #10 (global index order). This is the
-  big one — `table_copy.wast` (1650 skipped), `table_init.wast` (730), and most linking tests use
-  top-level func imports and `register`.
+- **`register` / multi-module linking + imported functions** (host imports → WASI): #1 **stage 1 DONE**
+  (imported funcs + register; `table_copy`/`table_init`/`func_ptrs` unblocked). Stage 2/3 (imported
+  tables/memories) + #4 (non-spectest imported global → 0) + #10 (global index order) remain.
 - **`assert_invalid` / `assert_malformed` support in the WAST runner**: #2 (validator
   over-acceptance, all sub-items), #7 (const-expr `global.get` strictness), #6 (invalid valtype byte),
   #8 (`align=` non-power-of-two). These are *soundness / spec-strictness* gaps — invisible until the
@@ -63,16 +62,19 @@ Still open: #1, #3, #4, #9, #10, #11, #12, #13, plus the "Discovered 2026-07-09"
 
 ## The list
 
-### #1 — Assembler silently drops top-level `(import …)` and `(start …)` — HIGH (fall-through)
-`src/wat.zig` — `assembleModule` Pass-1 `else {}` (~line 143). Any module field the assembler doesn't
-handle is dropped with no error. Two that matter: a top-level `(import "m" "n" (func …))` is dropped,
-which **shifts every defined function index** (defined funcs are expected to follow imports) → a
-wrong-but-decodable module; and `(start $f)` produces a binary with no start section.
-**Surfaces when:** imported functions + `register`/module-linking lands (host imports / WASI); or a
-start-function module is assembled. **Fix:** handle top-level `(import … (global …))` (route to the
-existing imported-global path), add func/table/memory imports when those land, emit a start section,
-and `return error.BadModuleField` for genuinely-unknown keywords (excluding `type`, handled in the
-pre-pass). NOTE: a blanket error here regresses `global.wast` (its top-level import-global module is
+### #1 — Host imports / `register` — **STAGE 1 DONE (`bcf3a11`); tables/memories remain**
+Imported **functions** + **`register`** / module-linking landed: `Instance.HostFunc`
+(`wasm{instance,func_index}` | `native fn`) dispatched from `callFunction`; the WAST runner keeps a
+module registry and wires imported funcs to a registered module's export or a `spectest` native
+(`print*` no-ops), imported globals to values; the assembler emits the import section for top-level
+`(import … (func …))` and inline `(func (import …) …)` (imports take the low func indices, types
+interned). `func_ptrs` 29/2 → **32/0**, `table_copy` 0 → **120**, `table_init` 0 → **67**.
+**Still open (stage 2/3):** imported **tables & memories** across modules (shared mutable state), the
+full `spectest` table/memory, `(register $id)` targeting a non-current module, and `(start …)` (still
+dropped by the assembler / ignored by the decoder — see #3). `imports.wast` (26/56) needs the
+table/memory imports. **Legacy note (resolved part):** the old fall-through was — a top-level
+`(import "m" "n" (func …))` was dropped, shifting func indices; that is now handled. NOTE: a blanket
+`else {}` → error still regresses `global.wast` (its top-level import-global module is
 currently neutral) — so *handle*, don't just reject.
 
 ### #2 — Validator over-acceptance (soundness) — MED
