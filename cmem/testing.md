@@ -241,6 +241,21 @@ imported-globals-only (satisfies data.wast:89 valid *and* global.wast:674 `"unkn
 if 240, align 140, address 256, const 320/56, table_get/set/fill/size, unreached-invalid 121 all
 identical). **All remaining `data`/`elem` failures are imported memories/tables → #1 stage 2.**
 
+**Update 2026-07-13 — host imports #1 stages 2 & 3 (imported tables/memories + link type-checking)**
+(commits `78c6b2b`, `1d6d9f2`). **Stage 2:** linear memory and tables became shared objects
+(`*Memory`/`*Table`) so an imported one borrows the exporter's storage and observes its `grow`; the
+runner backs `spectest.memory`/`spectest.table`; the assembler emits `(import … (table|memory …))`.
+`data.wast` 31 → **34/0/0** (fully passing), `elem.wast` 47 → **52**. **Stage 3:** the runner
+type-checks every import at link time (funcs by signature, globals by content+mutability, tables/
+memories by element type + limits subtyping) and executes `assert_unlinkable` — an unknown name or type
+mismatch is a link error. `imports.wast` 26 → **132/32/7** (the 93 previously-skipped `assert_unlinkable`
+now run). Fixed #4 (non-spectest imported global no longer defaults to 0). Verified: cross-module shared
+memory read, imported-memory grow visibility, imported-table `call_indirect`. **No core regressions**
+(full HEAD-baselined sweep identical). `linking.wast` (19/84) and `memory.wast` (66/13) complete only
+under ReleaseFast — debug is too slow on their large grow tests (pre-existing). Remaining imports/linking
+gaps are separate features: invoke-by-module-name, inline `(table (export …) …)` (#11), tags, memory64,
+`(start …)` (#3).
+
 ## What this tells the roadmap
 
 1. **First execution milestone = the `module/wasm_mod` corpus + its `.test.json` files** — fully
