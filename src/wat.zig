@@ -426,9 +426,16 @@ fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef
         const et = try parseValType(items[i]);
         i += 1;
         if (i < items.len and eqKw(items[i], "elem")) {
-            const funcs = items[i].asList().?[1..];
-            try tables.append(a, .{ .min = @intCast(funcs.len), .max = @intCast(funcs.len), .elem = et });
-            try elems.append(a, .{ .mode = .active, .table_index = table_index, .offset_form = null, .elem_type = .funcref, .expr_form = false, .funcs = funcs, .exprs = &.{} });
+            // Inline active elem at offset 0. Items are either bare func indices
+            // (`(elem $f $g)`) or const-expr forms (`(elem (ref.func $f) …)`).
+            const inner = items[i].asList().?[1..];
+            const count: u32 = @intCast(inner.len);
+            try tables.append(a, .{ .min = count, .max = count, .elem = et });
+            if (inner.len != 0 and inner[0].asList() != null) {
+                try elems.append(a, .{ .mode = .active, .table_index = table_index, .offset_form = null, .elem_type = et, .expr_form = true, .funcs = &.{}, .exprs = inner });
+            } else {
+                try elems.append(a, .{ .mode = .active, .table_index = table_index, .offset_form = null, .elem_type = .funcref, .expr_form = false, .funcs = inner, .exprs = &.{} });
+            }
             try elem_names.append(a, null);
         } else {
             try tables.append(a, .{ .min = 0, .max = null, .elem = et });
@@ -441,7 +448,20 @@ fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef
             max = try parseIndex(items[i]);
             i += 1;
         }
-        try tables.append(a, .{ .min = min, .max = max, .elem = try parseValType(items[i]) });
+        const et = try parseValType(items[i]);
+        i += 1;
+        try tables.append(a, .{ .min = min, .max = max, .elem = et });
+        // Table initializer expression `(table N reftype initexpr)`: fill all N
+        // slots with the value. We synthesize an active elem of N copies at
+        // offset 0 — observably identical table state (a distinct 0x40 binary
+        // encoding is not required for the execution assertions).
+        if (i < items.len and items[i].asList() != null) {
+            const init_expr = items[i];
+            const copies = try a.alloc(Sexpr, min);
+            for (copies) |*c| c.* = init_expr;
+            try elems.append(a, .{ .mode = .active, .table_index = table_index, .offset_form = null, .elem_type = et, .expr_form = true, .funcs = &.{}, .exprs = copies });
+            try elem_names.append(a, null);
+        }
     }
 }
 
