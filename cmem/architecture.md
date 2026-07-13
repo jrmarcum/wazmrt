@@ -47,10 +47,12 @@ bytes ──► DECODE ──► VALIDATE ──► INSTANTIATE ──► EXECUT
   tables**, **reference types** (`ref.null`/`ref.is_null`/`ref.func`, funcref/externref values), the
   **reference-type table ops** (`table.get`/`.set`/`.size`/`.grow`/`.fill`; tables are `[]Value` slots
   so funcref + externref share one representation), **linear memory** (allocate min pages + active
-  data-segment init; load/store all widths, `memory.size`/`grow`), and traps (`unreachable`,
-  div-by-zero, overflow, call-depth, invalid-float→int, out-of-bounds memory/table, uninitialized/
-  mismatched indirect call). **Deferred (trap / unbuilt):** imported *function* calls, passive element
-  segments + `table.init`/`.copy`, `register`/module-linking. **Verified on real modules:** `Instance.invoke` runs the whole `wasm_mod` corpus
+  data-segment init; load/store all widths, `memory.size`/`grow`), element segments (func-index +
+  const-expr forms), **imported functions** (`HostFunc`: a cross-module `wasm` call runs in the
+  exporting instance, or a `native` host fn), and traps (`unreachable`, div-by-zero, overflow,
+  call-depth, invalid-float→int, out-of-bounds memory/table, uninitialized/mismatched indirect call).
+  **Deferred (trap / unbuilt):** imported *tables/memories*, bulk table ops (`table.init`/`.copy`/
+  `elem.drop`), passive element segments. **Verified on real modules:** `Instance.invoke` runs the whole `wasm_mod` corpus
   to its `.test.json` expected values (`fib(20)=6765`, `fac(7)=5040`, `sieve(30)=10` via memory) — the
   CLI gained a run mode `wazmrt <file.wasm> <export> [args…]`.
 

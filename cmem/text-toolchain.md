@@ -49,7 +49,8 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
   `assert_exhaustion`, `assert_invalid`/`assert_malformed` (the inner module must be rejected)**,
   `invoke`; value literals incl. `nan:canonical`/`nan:arithmetic` + references; drives an `Instance` and
   compares (NaN-aware). CLI `.wast` mode. **Passes thousands of positive + negative official-testsuite
-  assertions** (see `testing.md`). Deferred: `register`/multi-module linking, `get`, `(module quote …)`.
+  assertions** (see `testing.md`). Handles `(register "name")` + cross-module imports. Deferred:
+  `(register $id)` targeting a non-current module, `get`, `(module quote …)`.
 
 ## Staged plan
 
@@ -107,6 +108,17 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
     function local-indexing bug (`func.wast` 171/0). Thousands of skips → pass/fail; malformed
     over-acceptance ~zero. **Next:** `register`/linking + imported functions (host imports / WASI), then
     table/element init expressions. See `known-issues.md` for the remaining ledger.
+12. ~~Element init expressions~~ **DONE 2026-07-09** (`82d0213`/`4ffa2e8`). Element const-expr form
+    (`(elem … funcref (ref.func $f) (ref.null func) …)`, `(item …)` wrapper) + all 8 segment flag
+    variants (active/passive/declarative × func-index/expr) + const-expr offsets, across
+    decode/interp/validate/assemble. `elem.wast` 3/54 → **38/28**.
+13. ~~Host imports stage 1: imported functions + `register`~~ **DONE 2026-07-09** (`bcf3a11`).
+    `Instance.HostFunc` (cross-module `wasm` call or `native` fn) dispatched from `callFunction`; the
+    runner keeps a module registry + `(register "name")`, wiring imported funcs to a registered export
+    or a `spectest` native and imported globals to values; the assembler emits the import section for
+    top-level/inline func imports (imports take the low func indices). `func_ptrs` 32/0, `table_copy`
+    0 → **120**, `table_init` 0 → **67**. **Next:** imported tables/memories, bulk table ops
+    (`table.init`/`.copy`/`elem.drop`), passive elements. See `known-issues.md` #1.
 
 ## Notes / invariants
 

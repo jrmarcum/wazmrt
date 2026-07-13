@@ -12,14 +12,15 @@ compliance process, and for the ledger of any reused code.
 
 > **Status:** early but running. wazmrt decodes, validates, and **executes**
 > WebAssembly — integer/float arithmetic, control flow, `call`/`call_indirect`
-> (multi-table), linear memory, globals, reference types, and the reference-type
-> table ops — and runs a corpus of real modules to their expected values
-> (`fib(20)=6765`, `sieve(30)=10`, …). It ships a native **WAT text assembler**
-> (`.wat` → wasm) and a **WAST script runner** (`wazmrt file.wast`) that runs the
-> official WebAssembly spec testsuite (positive assertions plus
-> `assert_invalid`/`assert_malformed`/`assert_trap`). **Host imports / WASI** and
-> multi-module `register` linking are the main features still in progress.
-> Requires Zig 0.16.
+> (multi-table), linear memory, globals, reference types, the reference-type
+> table ops, element segments, and **imported functions** with cross-module
+> `register` linking — and runs a corpus of real modules to their expected
+> values (`fib(20)=6765`, `sieve(30)=10`, …). It ships a native **WAT text
+> assembler** (`.wat` → wasm) and a **WAST script runner** (`wazmrt file.wast`)
+> that runs the official WebAssembly spec testsuite (positive assertions plus
+> `assert_invalid`/`assert_malformed`/`assert_trap`). **Imported tables/memories,
+> bulk table ops, and WASI** are the main features still in progress. Requires
+> Zig 0.16.
 
 ## Build
 

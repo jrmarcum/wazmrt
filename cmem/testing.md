@@ -216,6 +216,14 @@ cross-checks label types). Remaining testsuite fails are feature gaps — **host
 24/58, `func_ptrs`, `table_copy`/`table_init` = thousands skipped) and table/element **init
 expressions** (#15) — not correctness holes. **63 unit tests.**
 
+**Update 2026-07-09 — element init expressions (#15) + host imports stage 1 (#1):** `elem.wast` 3/54 →
+**38/28** (element const-expr form + all 8 segment flag variants + const-expr offsets; commits
+`82d0213`/`4ffa2e8`). **Imported functions + `register`/module-linking** (`bcf3a11`): the runner keeps a
+module registry, cross-module calls run in the exporting instance, `spectest` funcs are native no-ops —
+`func_ptrs` 29/2 → **32/0**, `table_copy` 0 → **120**, `table_init` 0 → **67**. Remaining fails are
+`table.copy`/`.init`/`elem.drop` (bulk table ops), passive elements, and imported **tables/memories**
+(`imports.wast` 26/56). **65 unit tests.** No regressions across the numeric/control/reference suites.
+
 ## What this tells the roadmap
 
 1. **First execution milestone = the `module/wasm_mod` corpus + its `.test.json` files** — fully

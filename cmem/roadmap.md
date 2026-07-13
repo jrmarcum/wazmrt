@@ -14,13 +14,14 @@ the **WAST script runner** (`wast.zig`) is next.
 - **Text toolchain** — `sexpr.zig` + `wat.zig` (WAT→wasm binary) + **`wast.zig` (WAST runner)**. Runs
   the **official spec testsuite** via `wazmrt <file.wast>`, both positive *and* negative conformance
   (`assert_invalid`/`assert_malformed`/`assert_exhaustion`; `assert_trap` gated on a real trap).
-  Reference types, multi-table, imported globals, extended-const, and the reference-type table ops all
-  land; the validator/decoder now correctly reject invalid/malformed modules (2026-07-09 post-audit).
+  Reference types, multi-table, imported globals, extended-const, reference-type table ops, element
+  init expressions, and **imported functions + `register`/module-linking** all land; the
+  validator/decoder correctly reject invalid/malformed modules (2026-07-09 post-audit).
   Representative: i32 **459/0**, i64 **415/0**, block **222/0**, if **240/0**, call_indirect **169/0**,
-  select **154/0**, func **171/0**, align **140/0**, custom **8/0**, binary-leb128 **58/1**, global
-  108/2 (see `testing.md`). **63 unit tests.** Remaining gaps: `register`/module-linking + imported
-  functions (host imports → WASI; `imports.wast` 24/58), table/element init expressions, passive
-  element segments + `table.init`/`.copy`.
+  select **154/0**, func **171/0**, align **140/0**, custom **8/0**, binary-leb128 **58/1**, elem
+  **38/28**, func_ptrs **32/0**, table_copy **120**, table_init **67**, global 108/2 (see `testing.md`).
+  **65 unit tests.** Remaining gaps: imported **tables/memories** (`imports.wast` 26/56), bulk table ops
+  (`table.init`/`.copy`/`elem.drop`), passive element segments.
 - **Licensing baseline** (git `888b87e`): dual `MIT OR Apache-2.0` (`LICENSE-MIT` + `LICENSE-APACHE`),
   `NOTICE`, and the compliance scaffold `third_party/LICENSES.md` (obligations table + Adoption
   Checklist + Component Ledger + verified SPDX inventory). README license section + SPDX + contribution
@@ -37,15 +38,14 @@ the **WAST script runner** (`wast.zig`) is next.
   (`env.add`) and export (`run`, params=2 results=1). Retired the ad-hoc `wazmrt_module_*` ABI.
 - **cmem/ project memory** established (this folder), mirroring the wasmtk setup.
 
-**Remaining:** `register`/module-linking + imported functions/tables/memories (host imports → WASI —
-the single highest-leverage item, gates `imports.wast`/`func_ptrs`/`table_copy`/`table_init`); table &
-element **init expressions**; passive element segments + `table.init`/`.copy` + `elem.drop`; growing the
-wasm-c-api past introspection; first `universalWasmLoader-*` integration. Still **100% original runtime
-code** — no reference-project code adopted yet (only the vendored `wasm.h`). `call_indirect` + tables +
-globals + type-ref block types + **reference types** + **multi-table** + NaN-payload float literals +
-**imported globals** + extended-const init exprs + **reference-type table ops** + **negative-conformance
-+ validator/decoder strictness** (assert_invalid/malformed, const-expr/element/alignment validation,
-spec-correct LEB128, custom-name/data-count) **DONE 2026-07-09**. See `known-issues.md` for the
+**Remaining:** imported **tables/memories** across modules (host imports stage 2/3 → WASI; gates
+`imports.wast`); bulk table ops (`table.init`/`.copy`/`elem.drop`) + passive element/data segments;
+`(start …)`; growing the wasm-c-api past introspection; first `universalWasmLoader-*` integration. Still
+**100% original runtime code** — no reference-project code adopted yet (only the vendored `wasm.h`).
+`call_indirect` + tables + globals + type-ref block types + **reference types** + **multi-table** +
+NaN-payload float literals + **imported globals** + extended-const + **reference-type table ops** +
+**negative-conformance + validator/decoder strictness** + **element init expressions** + **imported
+functions + `register`** (host imports stage 1) **DONE 2026-07-09**. See `known-issues.md` for the
 post-audit fix ledger.
 
 ## Next increments (rough order)
