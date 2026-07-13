@@ -118,6 +118,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     var func_imports: List(ImportedFunc) = .empty;
     var mem_min: ?u32 = null;
     var mem_max: ?u32 = null;
+    var start_ref: ?Sexpr = null;
 
     const start: usize = if (module.len > 1 and isId(module[1])) 2 else 1; // skip optional module $name
 
@@ -160,12 +161,34 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         } else if (std.mem.eql(u8, kw, "memory")) {
             var mi: usize = 1;
             if (mi < items.len and isId(items[mi])) mi += 1; // optional $name
-            while (mi < items.len and items[mi].keyword() != null) : (mi += 1) {
-                if (std.mem.eql(u8, items[mi].keyword().?, "export"))
-                    try exports.append(a, .{ .name = items[mi].asList().?[1].string, .kind = 2, .index = 0 });
+            while (mi < items.len and eqKw(items[mi], "export")) : (mi += 1)
+                try exports.append(a, .{ .name = items[mi].asList().?[1].string, .kind = 2, .index = 0 });
+            if (mi < items.len and eqKw(items[mi], "import")) {
+                // (memory (export …)* (import "m" "n") min max?)
+                const imp = items[mi].asList().?;
+                mi += 1;
+                const mmin = try parseIndex(items[mi]);
+                const mmax: ?u32 = if (mi + 1 < items.len) try parseIndex(items[mi + 1]) else null;
+                try mem_imports.append(a, .{ .module = imp[1].string, .name = imp[2].string, .min = mmin, .max = mmax });
+            } else if (mi < items.len and eqKw(items[mi], "data")) {
+                // (memory (data "…")) — size the memory to the bytes and append an
+                // active data segment at offset 0.
+                var bytes: List(u8) = .empty;
+                for (items[mi].asList().?[1..]) |it| switch (it) {
+                    .string => |sbytes| try bytes.appendSlice(a, sbytes),
+                    else => {},
+                };
+                const pages: u32 = @intCast((bytes.items.len + 65535) / 65536);
+                mem_min = pages;
+                mem_max = pages;
+                const off = try a.alloc(Sexpr, 2);
+                off[0] = .{ .atom = "i32.const" };
+                off[1] = .{ .atom = "0" };
+                try datas.append(a, .{ .mem_index = 0, .offset_form = .{ .list = off }, .bytes = bytes.items });
+            } else {
+                mem_min = try parseIndex(items[mi]);
+                if (mi + 1 < items.len) mem_max = try parseIndex(items[mi + 1]);
             }
-            mem_min = try parseIndex(items[mi]);
-            if (mi + 1 < items.len) mem_max = try parseIndex(items[mi + 1]);
         } else if (std.mem.eql(u8, kw, "data")) {
             // (data $id? (memory idx)? offset-expr? "bytes"…) — active when an
             // offset is present, else passive. Only memory 0 is supported, so a
@@ -191,7 +214,34 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             };
             try datas.append(a, .{ .mem_index = 0, .offset_form = offset_form, .bytes = bytes.items });
         } else if (std.mem.eql(u8, kw, "table")) {
-            try parseTable(a, items, &tables, &table_names, &elems, &elem_names);
+            // Inline import `(table $id? (export …)* (import "m" "n") min max? reftype)`
+            // is handled here; a defined table goes to `parseTable`.
+            var ti: usize = 1;
+            var tname: ?[]const u8 = null;
+            if (ti < items.len and isId(items[ti])) {
+                tname = items[ti].atom;
+                ti += 1;
+            }
+            const exp_start = ti;
+            while (ti < items.len and eqKw(items[ti], "export")) ti += 1;
+            if (ti < items.len and eqKw(items[ti], "import")) {
+                const imp = items[ti].asList().?;
+                const tidx: u32 = @intCast(table_names.items.len);
+                for (items[exp_start..ti]) |ex|
+                    try exports.append(a, .{ .name = ex.asList().?[1].string, .kind = 1, .index = tidx });
+                ti += 1;
+                const tmin = try parseIndex(items[ti]);
+                ti += 1;
+                var tmax: ?u32 = null;
+                if (ti < items.len and !isRefType(items[ti])) {
+                    tmax = try parseIndex(items[ti]);
+                    ti += 1;
+                }
+                try table_imports.append(a, .{ .module = imp[1].string, .name = imp[2].string, .min = tmin, .max = tmax, .elem = try parseValType(items[ti]) });
+                try table_names.append(a, tname);
+            } else {
+                try parseTable(a, items, &tables, &table_names, &elems, &elem_names);
+            }
         } else if (std.mem.eql(u8, kw, "elem")) {
             try parseElem(a, items, &elems, &elem_names, table_names.items);
         } else if (std.mem.eql(u8, kw, "import")) {
@@ -231,8 +281,12 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             } else {
                 try parseImport(a, items, &global_imports, &global_names); // global
             }
+        } else if (std.mem.eql(u8, kw, "start")) {
+            // (start $f | N) — resolve after the func index space is complete.
+            if (items.len < 2) return error.BadModuleField;
+            start_ref = items[1];
         } else {
-            // `type` handled in the pre-pass; `start` deferred.
+            // `type` handled in the pre-pass.
         }
     }
 
@@ -360,6 +414,12 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             try uleb(a, &s, e.index);
         }
         try emitSection(a, &out, 7, s.items);
+    }
+    // Start section (8) — the funcidx to run at instantiation.
+    if (start_ref) |ref| {
+        var s: List(u8) = .empty;
+        try uleb(a, &s, try resolveByName(func_names.items, ref));
+        try emitSection(a, &out, 8, s.items);
     }
     // Element section (9) — all 8 flag variants (active/passive/declarative ×
     // func-index/const-expr forms).

@@ -102,6 +102,7 @@ const Runner = struct {
         try validate(self.a, m);
         const inst = try self.a.create(interp.Instance);
         inst.* = try interp.Instance.initWithImports(self.a, m, try self.resolveImports(m));
+        try inst.runStart(); // §4.5.5 — a trap here means instantiation failed
         return inst;
     }
 

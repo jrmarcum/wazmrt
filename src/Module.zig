@@ -144,6 +144,8 @@ tables: []const TableType,
 data: []const DataSegment,
 /// Element segments (element section), for initializing tables.
 elements: []const Element,
+/// The start function's index (start section §5.5.11), run at instantiation.
+start: ?u32,
 
 pub const Error = types.DecodeError || std.mem.Allocator.Error;
 
@@ -180,6 +182,7 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
     var code: []const Code = &.{};
     var data: []const DataSegment = &.{};
     var elements: []const Element = &.{};
+    var start: ?u32 = null;
 
     var data_count: ?u32 = null;
 
@@ -211,6 +214,7 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
             .code => code = try decodeCodeSection(&d, &sub),
             .data => data = try decodeDataSection(&d, &sub),
             .data_count => data_count = try sub.readVarU32(),
+            .start => start = try sub.readVarU32(),
             else => {},
         }
     }
@@ -229,6 +233,7 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
         .code = code,
         .data = data,
         .elements = elements,
+        .start = start,
         .globals = try d.global_space.toOwnedSlice(a),
         .global_inits = try d.global_init_space.toOwnedSlice(a),
         .memories = try d.mem_space.toOwnedSlice(a),

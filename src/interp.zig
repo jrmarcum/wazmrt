@@ -341,6 +341,15 @@ pub const Instance = struct {
         self.* = undefined;
     }
 
+    /// Run the module's start function (§4.5.5), if declared. The embedder calls
+    /// this right after instantiation; a trap here means instantiation failed.
+    pub fn runStart(self: *Instance) Error!void {
+        const si = self.module.start orelse return;
+        var scratch = std.heap.ArenaAllocator.init(self.gpa);
+        defer scratch.deinit();
+        _ = try self.callFunction(scratch.allocator(), si, &.{}, 0);
+    }
+
     /// Invoke an exported function by name. The returned result slice is owned
     /// by the caller (allocated with the instance's gpa).
     pub fn invoke(self: *Instance, name: []const u8, args: []const Value) Error![]Value {

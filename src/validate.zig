@@ -35,6 +35,7 @@ pub const Error = Module.Error || error{
     UndefinedType,
     UndefinedTable,
     UndefinedElem,
+    InvalidStartFunction,
     ConstantExpressionRequired,
     InvalidAlignment,
     MissingMemory,
@@ -79,6 +80,12 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
         if (!seg.active) continue;
         if (seg.mem_index >= module.memories.len) return error.MissingMemory;
         try validateConstExpr(module, seg.offset_expr, .i32, all_globals);
+    }
+
+    // Start function (§3.5.5): must be a defined/imported function of type [] → [].
+    if (module.start) |si| {
+        const ft = module.funcType(si) orelse return error.UndefinedFunc;
+        if (ft.params.len != 0 or ft.results.len != 0) return error.InvalidStartFunction;
     }
 
     var arena = std.heap.ArenaAllocator.init(gpa);

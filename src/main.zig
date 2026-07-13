@@ -139,6 +139,11 @@ fn runFunction(
     };
     defer inst.deinit();
 
+    inst.runStart() catch |e| {
+        try out.print("trap: start: {s}\n", .{@errorName(e)});
+        return;
+    };
+
     const results = inst.invoke(name, call_args) catch |e| {
         try out.print("trap: {s}\n", .{@errorName(e)});
         return;
