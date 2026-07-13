@@ -52,6 +52,13 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
         try validateConstExpr(module, init_expr, module.globals[self_index].content, self_index);
     }
 
+    // Active-segment *offset* const-exprs may reference any immutable global —
+    // imported or defined (globals precede the element/data sections). But the
+    // ref-producing *element expressions* (and table initializers, lowered to
+    // them) follow the stricter rule of referencing only imported globals, so a
+    // `global.get` of a defined global there is rejected as "unknown global".
+    const all_globals: u32 = @intCast(module.globals.len);
+
     // Element segments: every referenced function index must exist; each
     // element const-expr must produce the segment's element type; an active
     // segment targets an existing type-compatible table with a valid i32 offset.
@@ -62,8 +69,16 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
             if (elem.table_index >= module.tables.len) return error.UndefinedTable;
             const tet = module.tables[elem.table_index].element;
             if (tet != elem.elem_type) return error.TypeMismatch;
-            try validateConstExpr(module, elem.offset_expr, .i32, n_imported_globals);
+            try validateConstExpr(module, elem.offset_expr, .i32, all_globals);
         }
+    }
+
+    // Data segments: an active segment targets an existing memory (only memory 0
+    // is supported) and its offset const-expr must produce an i32.
+    for (module.data) |seg| {
+        if (!seg.active) continue;
+        if (seg.mem_index >= module.memories.len) return error.MissingMemory;
+        try validateConstExpr(module, seg.offset_expr, .i32, all_globals);
     }
 
     var arena = std.heap.ArenaAllocator.init(gpa);

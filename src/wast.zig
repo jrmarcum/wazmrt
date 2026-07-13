@@ -177,6 +177,19 @@ const Runner = struct {
     }
 
     fn assertTrap(self: *Runner, form: []const Sexpr) Error!void {
+        // `assert_trap (module …)` — instantiation itself must trap (e.g. an
+        // active data/element segment out of bounds). Build it in isolation and
+        // require a genuine runtime trap; it does not become the current module.
+        if (form[1].asList()) |inner| {
+            if (std.mem.eql(u8, inner[0].asAtom() orelse "", "module")) {
+                if (self.buildModule(inner)) |_| {
+                    self.fail("assert_trap: module instantiated without trapping", .{});
+                } else |e| {
+                    if (isRuntimeTrap(e)) self.summary.passed += 1 else self.fail("assert_trap: non-trap error {s}", .{@errorName(e)});
+                }
+                return;
+            }
+        }
         if (self.current == null) {
             self.summary.skipped += 1;
             return;

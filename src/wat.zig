@@ -59,7 +59,11 @@ const Func = struct {
 const ImportedFunc = struct { module: []const u8, name: []const u8, type_ref: ?Sexpr, params: []const V, results: []const V };
 
 const ExportDef = struct { name: []const u8, kind: u8, index: u32 };
-const DataSeg = struct { offset: i64, bytes: []const u8 };
+/// A parsed data segment: `offset_form == null` is passive; otherwise active
+/// (at `mem_index`, always 0 — the single supported memory) with that offset
+/// const-expr. `offset_form` may be `(offset …)`, a folded `(i32.const …)`, or
+/// `(global.get …)`.
+const DataSeg = struct { mem_index: u32, offset_form: ?Sexpr, bytes: []const u8 };
 /// A function type (for the type section): params → results.
 const Sig = struct { params: []const V, results: []const V };
 const TableDef = struct { min: u32, max: ?u32, elem: V = .funcref };
@@ -159,16 +163,29 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             mem_min = try parseIndex(items[mi]);
             if (mi + 1 < items.len) mem_max = try parseIndex(items[mi + 1]);
         } else if (std.mem.eql(u8, kw, "data")) {
-            // (data offset-expr "bytes"…)  — active, memory 0
-            if (items.len < 2) return error.BadModuleField;
-            var bytes: List(u8) = .empty;
-            for (items[2..]) |it| {
-                if (it.asAtom() == null) switch (it) {
-                    .string => |sbytes| try bytes.appendSlice(a, sbytes),
-                    else => {},
-                };
+            // (data $id? (memory idx)? offset-expr? "bytes"…) — active when an
+            // offset is present, else passive. Only memory 0 is supported, so a
+            // `(memory …)` prefix is parsed but folds to index 0.
+            var di: usize = 1;
+            if (di < items.len and isId(items[di])) di += 1; // $id
+            if (di < items.len) if (items[di].asList()) |l| {
+                if (l.len >= 1 and eqAtom(l[0], "memory")) di += 1; // (memory idx) — single memory
+            };
+            // The offset is any leading list (`(offset …)` or a folded const-expr
+            // like `(i32.const N)` / `(global.get $g)` — even a malformed one, so
+            // the validator can reject it); data bytes are always strings. Absent
+            // → passive.
+            var offset_form: ?Sexpr = null;
+            if (di < items.len and items[di].asList() != null) {
+                offset_form = items[di];
+                di += 1;
             }
-            try datas.append(a, .{ .offset = try extractI32Const(items[1]), .bytes = bytes.items });
+            var bytes: List(u8) = .empty;
+            for (items[di..]) |it| switch (it) {
+                .string => |sbytes| try bytes.appendSlice(a, sbytes),
+                else => {},
+            };
+            try datas.append(a, .{ .mem_index = 0, .offset_form = offset_form, .bytes = bytes.items });
         } else if (std.mem.eql(u8, kw, "table")) {
             try parseTable(a, items, &tables, &table_names, &elems, &elem_names);
         } else if (std.mem.eql(u8, kw, "elem")) {
@@ -364,10 +381,12 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         var s: List(u8) = .empty;
         try uleb(a, &s, datas.items.len);
         for (datas.items) |seg| {
-            try s.append(a, 0x00); // active, memory 0
-            try s.append(a, @intFromEnum(Op.i32_const)); // offset const-expr
-            try sleb(a, &s, seg.offset);
-            try s.append(a, @intFromEnum(Op.end));
+            if (seg.offset_form == null) {
+                try s.append(a, 0x01); // passive
+            } else {
+                try s.append(a, 0x00); // active, memory 0
+                try emitOffsetExpr(a, &s, &sigs, type_names.items, global_names.items, seg.offset_form);
+            }
             try uleb(a, &s, seg.bytes.len);
             try s.appendSlice(a, seg.bytes);
         }
@@ -375,17 +394,6 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     }
 
     return out.items;
-}
-
-/// Extract the constant from a data-segment offset form: `(i32.const N)` or
-/// `(offset (i32.const N))`.
-fn extractI32Const(form: Sexpr) Error!i64 {
-    const list = form.asList() orelse return error.BadImmediate;
-    if (list.len < 2) return error.BadImmediate;
-    const kw = list[0].asAtom() orelse return error.BadImmediate;
-    if (std.mem.eql(u8, kw, "offset")) return extractI32Const(list[1]);
-    if (std.mem.eql(u8, kw, "i32.const")) return parseWatI32(list[1]);
-    return error.UnsupportedInstr;
 }
 
 // --- Module-field parsing --------------------------------------------------
