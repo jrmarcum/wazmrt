@@ -42,8 +42,10 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
   block-type references DONE 2026-07-09.** **Reference types (`ref.null`/`ref.is_null`/`ref.func`,
   `(ref null? func|extern)` value types) + multi-table (per-table `elem`, `call_indirect $t`) +
   NaN-payload float literals (`nan:canonical`/`nan:arithmetic`/`nan:0x…`) DONE 2026-07-09.**
-  **Deferred in wat.zig:** `start` section, imports, `table.get`/`.set`, passive/declarative element
-  segments beyond the `ref.func` forward-decl.
+  **Bulk table ops + data-segment generalization DONE 2026-07-13** (`table.init`/`table.copy`/`elem.drop`
+  with element-segment names; inline const-expr table elems + `(table N reftype initexpr)`; passive +
+  `(memory idx)`-prefixed + const-expr-offset `(data …)`). **Deferred in wat.zig:** `start` section,
+  imported tables/memories.
 - **`src/wast.zig`** (DONE 2026-07-02, extended 2026-07-09) — WAST script runner: `(module …)` text +
   `(module binary …)`, `assert_return`, **`assert_trap` (genuine runtime traps only — `isRuntimeTrap`),
   `assert_exhaustion`, `assert_invalid`/`assert_malformed` (the inner module must be rejected)**,
@@ -119,6 +121,18 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
     top-level/inline func imports (imports take the low func indices). `func_ptrs` 32/0, `table_copy`
     0 → **120**, `table_init` 0 → **67**. **Next:** imported tables/memories, bulk table ops
     (`table.init`/`.copy`/`elem.drop`), passive elements. See `known-issues.md` #1.
+14. ~~Bulk table ops + table-init exprs + const-expr data offsets~~ **DONE 2026-07-13** (`b256a86`,
+    `6087eac`, `c0c7de2`; closes #15). `table.init`/`table.copy`/`elem.drop` (`0xFC` 0x0c/0x0e/0x0d) end
+    to end + runtime passive-element storage (`elem_values`/`elem_dropped`): `table_init` 67 →
+    **729/0/0**, `table_copy` 120 → **1649/0/0**. Assembler gained element-segment names (`elem_names`)
+    + a shared `emitBulkTableImm` (handles the `table.init tableidx? elemidx` → elem-then-table wire
+    swap). Inline const-expr table elems + `(table N reftype initexpr)` (lowered to an active elem of N
+    copies). Data segments generalized: `(data $id? (memory idx)? offset? "bytes"…)`, any-leading-list
+    offset, passive form, and active-data-offset validation; `assert_trap (module …)` requires a real
+    instantiation trap. `data` 12 → **31**, `elem` 38 → **47**, `global` 108 → **109**. Const-expr
+    `global.get` scope split: active-segment offsets allow any immutable global, ref-producing element
+    exprs / table inits stay imported-only. **Next:** imported tables/memories (#1 stage 2) — the only
+    remaining `data`/`elem` blocker.
 
 ## Notes / invariants
 

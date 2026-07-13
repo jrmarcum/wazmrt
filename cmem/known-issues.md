@@ -38,14 +38,17 @@ Third pass (commit `c535de0`):
   `br_table` label *value types* (not just arity) even in polymorphic code. Verified empirically —
   different-typed labels are rejected, same-typed accepted. No change needed.
 
-Still open: #1, #3, #4, #9, #10, #11, #12, #13, plus the "Discovered 2026-07-09" items below (#15,
-#16). #14 is resolved (see below).
+Still open: #1 (stage 2/3), #3, #4, #9, #10, #11, #12, #13, plus #16 (rest, LOW). #14 and **#15 are
+resolved** (see below); #5 is resolved (`assert_trap` is runtime-trap-only and now handles the
+`(module …)` instantiation-trap form).
 
 ## Grouped by the integration that trips them
 
 - **`register` / multi-module linking + imported functions** (host imports → WASI): #1 **stage 1 DONE**
   (imported funcs + register; `table_copy`/`table_init`/`func_ptrs` unblocked). Stage 2/3 (imported
-  tables/memories) + #4 (non-spectest imported global → 0) + #10 (global index order) remain.
+  tables/memories) + #4 (non-spectest imported global → 0) + #10 (global index order) remain. **This is
+  now the top blocker**: all remaining `data.wast` (16) and `elem.wast` (28) failures are
+  imported-memory/table modules, and `imports.wast` is gated on it entirely.
 - **`assert_invalid` / `assert_malformed` support in the WAST runner**: #2 (validator
   over-acceptance, all sub-items), #7 (const-expr `global.get` strictness), #6 (invalid valtype byte),
   #8 (`align=` non-power-of-two). These are *soundness / spec-strictness* gaps — invisible until the
@@ -108,12 +111,12 @@ pass/fail. **Surfaces when:** `register`/multi-module linking lands (a prior mod
 later module imports). **Fix:** resolve imports against registered modules, not just the `spectest`
 stub.
 
-### #5 — `assert_trap` counts ANY error as the expected trap — MED (test fidelity, ACTIVE NOW)
-`src/wast.zig` — `assertTrap` `else |_| { passed += 1 }` (~158). No check of trap kind/message: an
-assembler bug, a decode error, or `error.UnsupportedInstruction` from the interpreter all count as a
-passing trap. This **green-washes real producer/decoder bugs today** — the one deferred item that hurts
-right now, because it undermines the conformance signal the audit relies on. **Fix:** at minimum
-distinguish "runtime trap" from "build/decode/assemble error"; ideally match the expected trap text.
+### #5 — `assert_trap` fidelity — **RESOLVED (`645874c`, extended `c0c7de2`)**
+`src/wast.zig` `assertTrap` now accepts only a genuine runtime trap (`isRuntimeTrap` — an
+assemble/decode/`UnsupportedInstr` error no longer green-washes as a trap). The `c0c7de2` pass added the
+`assert_trap (module …)` form: it builds the inner module in isolation and requires an
+instantiation-time runtime trap (e.g. an out-of-bounds active data/element segment). Matching the
+expected trap *text* is still not done (LOW — no test depends on it).
 
 ### #6 — Invalid value-type bytes decode silently — MED/LOW
 `src/Module.zig` (`readValTypes`, `readTableType`, `readGlobalType`, `decodeLocals`) and `src/opcode.zig`
@@ -177,15 +180,32 @@ param's index. `(func (type $sig) (local $var i32) (local.get $var))` returned t
 of the uninitialized local (0). Fixed in `assembleModule`: prepend anonymous local names for the
 type's params (bounds-checked against `sigs`). `func.wast` 169/2 → **171/0**.
 
-### #15 — Element init expressions — **MOSTLY DONE (`82d0213`, `4ffa2e8`)**
-The element-segment **const-expr form** (`(elem … funcref (ref.func $f) (ref.null func) …)`, incl. the
-`(item …)` wrapper), **all 8 segment flag variants** (active/passive/declarative × func-index/expr),
-and **const-expr offsets** (`(global.get $g)`, `(offset …)`) are now assembled, decoded, validated
-(each element must produce the segment's element type), and applied at instantiation. `elem.wast`
-3/54 → **38/28**. **Still open:** passive elements + `table.init`/`elem.drop` (bulk table ops — a
-distinct feature; ~4 elem fails + `table_init.wast` 730 skipped), const-expr **data** offsets (kept
-literal-only — generalizing them regressed `data.wast`), and table initializer expressions
-(`(table $t N funcref (expr))`, a GC-proposal form — global.wast's last over-acceptance).
+### #15 — Element init expressions + bulk table ops + data offsets — **DONE 2026-07-13**
+Landed in four passes:
+- **Element init expressions (`82d0213`, `4ffa2e8`)** — the const-expr element form
+  (`(elem … funcref (ref.func $f) (ref.null func) …)`, incl. `(item …)`), all 8 segment flag variants,
+  and const-expr offsets, across assemble/decode/validate/instantiate. `elem.wast` 3/54 → 38/28.
+- **Bulk table ops (`b256a86`)** — `table.init`/`table.copy`/`elem.drop` (`0xFC` 0x0c/0x0e/0x0d) end to
+  end, plus runtime passive-element storage (each segment evaluated to `[]Value` with an `elem_dropped`
+  flag; active/declarative dropped after init, passive kept). `table_init` 67 → **729/0/0**, `table_copy`
+  120 → **1649/0/0**. Assembler tracks element-segment names (`elem_names`) and a shared
+  `emitBulkTableImm` handles the text→binary operand-order swap (`table.init tableidx? elemidx` encoded
+  elem-then-table).
+- **Table initializer expressions (`6087eac`)** — inline const-expr table elems
+  (`(table reftype (elem (ref.func $f) …))`) and `(table N reftype initexpr)`, the latter lowered to an
+  active elem of N copies at offset 0 (observably identical; the 0x40 binary form isn't needed for
+  execution assertions). `table.wast` 15 → 17, `global.wast` 108 → 109.
+- **Const-expr data offsets (`c0c7de2`)** — `(data $id? (memory idx)? offset? "bytes"…)`; the offset is
+  any leading list (`(offset …)` / folded `(i32.const N)` / `(global.get $g)`), absent → passive.
+  Offsets emit through the shared const-expr path; added active-data-offset validation (memory presence
+  + i32 offset). `assert_trap (module …)` now requires a genuine instantiation-time trap. `data.wast`
+  12 → **31**, `elem.wast` → **47**.
+Two bugs fixed en route: (1) the generalized data assembler mis-parsed non-`i32.const` offsets as
+*passive* (offset silently dropped) — any leading list is now the offset so the validator can reject
+bad ones; (2) const-expr `global.get` scope — active-segment **offsets** (data + element) may reference
+any immutable global, but ref-producing element exprs / table initializers stay imported-globals-only
+(matches data.wast:89 valid *and* global.wast:674 `"unknown global"`). **Remaining `data`/`elem`
+failures are all imported memories/tables → #1 stage 2, not #15.**
 
 ### #16 — Decoder is lenient on malformed binaries — **LEB PART DONE (`10aca3b`); rest LOW**
 **Done:** the LEB128 readers (`readVarU32`/`readVarI32`/`readVarI64`) are now spec-correct — accept

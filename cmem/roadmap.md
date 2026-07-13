@@ -39,14 +39,16 @@ the **WAST script runner** (`wast.zig`) is next.
 - **cmem/ project memory** established (this folder), mirroring the wasmtk setup.
 
 **Remaining:** imported **tables/memories** across modules (host imports stage 2/3 → WASI; gates
-`imports.wast`); bulk table ops (`table.init`/`.copy`/`elem.drop`) + passive element/data segments;
-`(start …)`; growing the wasm-c-api past introspection; first `universalWasmLoader-*` integration. Still
-**100% original runtime code** — no reference-project code adopted yet (only the vendored `wasm.h`).
+`imports.wast` — and now the *only* blocker for the rest of `data.wast`/`elem.wast`); `(start …)`;
+growing the wasm-c-api past introspection; first `universalWasmLoader-*` integration. Still **100%
+original runtime code** — no reference-project code adopted yet (only the vendored `wasm.h`).
 `call_indirect` + tables + globals + type-ref block types + **reference types** + **multi-table** +
 NaN-payload float literals + **imported globals** + extended-const + **reference-type table ops** +
 **negative-conformance + validator/decoder strictness** + **element init expressions** + **imported
-functions + `register`** (host imports stage 1) **DONE 2026-07-09**. See `known-issues.md` for the
-post-audit fix ledger.
+functions + `register`** (host imports stage 1) **DONE 2026-07-09**. **Bulk table ops
+(`table.init`/`.copy`/`elem.drop`) + passive element segments + table initializer expressions +
+const-expr/passive data segments DONE 2026-07-13** (`table_init` 729/0, `table_copy` 1649/0, `data`
+12→31; #15 fully closed). See `known-issues.md` for the post-audit fix ledger.
 
 ## Next increments (rough order)
 

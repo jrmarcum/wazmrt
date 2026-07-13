@@ -224,6 +224,23 @@ module registry, cross-module calls run in the exporting instance, `spectest` fu
 `table.copy`/`.init`/`elem.drop` (bulk table ops), passive elements, and imported **tables/memories**
 (`imports.wast` 26/56). **65 unit tests.** No regressions across the numeric/control/reference suites.
 
+**Update 2026-07-13 — #15 finished: bulk table ops + table-init exprs + const-expr data offsets**
+(commits `b256a86`, `6087eac`, `c0c7de2`). **Bulk table ops** — `table.init`/`table.copy`/`elem.drop`
+end to end + runtime passive-element storage (segments evaluated to `[]Value` with an `elem_dropped`
+flag): `table_init.wast` 67 → **729/0/0**, `table_copy.wast` 120 → **1649/0/0**. **Table initializer
+expressions** — inline const-expr table elems + `(table N reftype initexpr)` (lowered to an active elem
+of N copies): `table.wast` 15 → **17**. **Const-expr data offsets** — `(data (memory idx)? offset?
+"bytes"…)` with any-leading-list offset (`(offset …)`/folded `(i32.const)`/`(global.get)`), passive
+segments, active-data-offset validation (memory presence + i32); `assert_trap (module …)` now requires
+a real instantiation-time trap: `data.wast` 12 → **31**, `elem.wast` 38 → **47**, `global.wast` 108 →
+**109/1**. Two bugs fixed: the generalized data assembler had mis-parsed non-`i32.const` offsets as
+passive (offset dropped); and const-expr `global.get` scope was split — active-segment **offsets** may
+reference any immutable global, but ref-producing element exprs / table initializers stay
+imported-globals-only (satisfies data.wast:89 valid *and* global.wast:674 `"unknown global"`).
+**No core regressions** (HEAD-baselined: i32 459, i64 415, call_indirect 169, func 171, block 222,
+if 240, align 140, address 256, const 320/56, table_get/set/fill/size, unreached-invalid 121 all
+identical). **All remaining `data`/`elem` failures are imported memories/tables → #1 stage 2.**
+
 ## What this tells the roadmap
 
 1. **First execution milestone = the `module/wasm_mod` corpus + its `.test.json` files** — fully
