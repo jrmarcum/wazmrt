@@ -82,6 +82,8 @@ const Runner = struct {
             try self.assertExhaustion(cmd.asList().?);
         } else if (std.mem.eql(u8, kw, "assert_invalid") or std.mem.eql(u8, kw, "assert_malformed")) {
             try self.assertRejected(cmd.asList().?);
+        } else if (std.mem.eql(u8, kw, "assert_unlinkable")) {
+            try self.assertUnlinkable(cmd.asList().?);
         } else if (std.mem.eql(u8, kw, "register")) {
             // (register "name" $id?) — expose the current module's exports under "name".
             const list = cmd.asList().?;
@@ -103,45 +105,88 @@ const Runner = struct {
         return inst;
     }
 
-    /// Resolve a module's imports: functions to `HostFunc`s, globals to values,
-    /// and memories/tables to shared objects (a registered module's export or the
-    /// `spectest` stub), each in per-kind import order.
+    /// Resolve and *link* a module's imports: each is matched to a registered
+    /// module's export or a `spectest` stub, and its declared type is checked
+    /// against the provider's actual type. An unknown name → `UnresolvedImport`,
+    /// a type mismatch → `IncompatibleImportType` (both = "unlinkable").
     fn resolveImports(self: *Runner, m: *const Module) !interp.Instance.Imports {
         var fs: std.ArrayList(HostFunc) = .empty;
         var gs: std.ArrayList(Value) = .empty;
         var ms: std.ArrayList(*interp.Instance.Memory) = .empty;
         var ts: std.ArrayList(*interp.Instance.Table) = .empty;
         for (m.imports) |imp| switch (imp.type) {
-            .func => try fs.append(self.a, try self.resolveFuncImport(imp.module, imp.name)),
-            .global => try gs.append(self.a, spectestGlobal(imp.module, imp.name) orelse 0),
-            .memory => try ms.append(self.a, try self.resolveMemoryImport(imp.module, imp.name)),
-            .table => try ts.append(self.a, try self.resolveTableImport(imp.module, imp.name)),
+            .func => |want| try fs.append(self.a, try self.resolveFuncImport(imp.module, imp.name, want)),
+            .global => |want| try gs.append(self.a, try self.resolveGlobalImport(imp.module, imp.name, want)),
+            .memory => |want| try ms.append(self.a, try self.resolveMemoryImport(imp.module, imp.name, want)),
+            .table => |want| try ts.append(self.a, try self.resolveTableImport(imp.module, imp.name, want)),
         };
         return .{ .funcs = fs.items, .globals = gs.items, .memories = ms.items, .tables = ts.items };
     }
 
-    fn resolveFuncImport(self: *Runner, module: []const u8, name: []const u8) !HostFunc {
+    fn resolveFuncImport(self: *Runner, module: []const u8, name: []const u8, want: Module.FuncType) !HostFunc {
         if (std.mem.eql(u8, module, "spectest")) {
-            if (spectestFunc(name)) |nf| return .{ .native = nf };
+            const got = spectestFuncType(name) orelse return error.UnresolvedImport;
+            if (!funcTypeEq(got, want)) return error.IncompatibleImportType;
+            return .{ .native = spectestNoop };
         }
         if (self.modules.get(module)) |inst| {
-            if (exportedFuncIndex(inst.module, name)) |fi| return .{ .wasm = .{ .instance = inst, .func_index = fi } };
+            for (inst.module.exports) |e| {
+                if (e.type == .func and std.mem.eql(u8, e.name, name)) {
+                    if (!funcTypeEq(e.type.func, want)) return error.IncompatibleImportType;
+                    return .{ .wasm = .{ .instance = inst, .func_index = e.index } };
+                }
+            }
         }
         return error.UnresolvedImport;
     }
 
-    fn resolveMemoryImport(self: *Runner, module: []const u8, name: []const u8) !*interp.Instance.Memory {
-        if (std.mem.eql(u8, module, "spectest") and std.mem.eql(u8, name, "memory")) return self.spectestMemory();
+    fn resolveGlobalImport(self: *Runner, module: []const u8, name: []const u8, want: Module.GlobalType) !Value {
+        if (std.mem.eql(u8, module, "spectest")) {
+            const gt = spectestGlobalType(name) orelse return error.UnresolvedImport;
+            if (gt.content != want.content or gt.mutable != want.mutable) return error.IncompatibleImportType;
+            return spectestGlobal(module, name).?;
+        }
         if (self.modules.get(module)) |inst| {
-            if (exportedMemory(inst, name)) |mem| return mem;
+            for (inst.module.exports) |e| {
+                if (e.type == .global and std.mem.eql(u8, e.name, name)) {
+                    const gt = e.type.global;
+                    if (gt.content != want.content or gt.mutable != want.mutable) return error.IncompatibleImportType;
+                    return inst.globals[e.index];
+                }
+            }
         }
         return error.UnresolvedImport;
     }
 
-    fn resolveTableImport(self: *Runner, module: []const u8, name: []const u8) !*interp.Instance.Table {
-        if (std.mem.eql(u8, module, "spectest") and std.mem.eql(u8, name, "table")) return self.spectestTable();
+    fn resolveMemoryImport(self: *Runner, module: []const u8, name: []const u8, want: Module.MemoryType) !*interp.Instance.Memory {
+        if (std.mem.eql(u8, module, "spectest") and std.mem.eql(u8, name, "memory")) {
+            if (!limitsFit(.{ .min = 1, .max = 2 }, want.limits)) return error.IncompatibleImportType;
+            return self.spectestMemory();
+        }
         if (self.modules.get(module)) |inst| {
-            if (exportedTable(inst, name)) |tbl| return tbl;
+            for (inst.module.exports) |e| {
+                if (e.type == .memory and std.mem.eql(u8, e.name, name)) {
+                    if (!limitsFit(e.type.memory.limits, want.limits)) return error.IncompatibleImportType;
+                    return inst.memory orelse error.UnresolvedImport;
+                }
+            }
+        }
+        return error.UnresolvedImport;
+    }
+
+    fn resolveTableImport(self: *Runner, module: []const u8, name: []const u8, want: Module.TableType) !*interp.Instance.Table {
+        if (std.mem.eql(u8, module, "spectest") and std.mem.eql(u8, name, "table")) {
+            if (want.element != .funcref or !limitsFit(.{ .min = 10, .max = 20 }, want.limits)) return error.IncompatibleImportType;
+            return self.spectestTable();
+        }
+        if (self.modules.get(module)) |inst| {
+            for (inst.module.exports) |e| {
+                if (e.type == .table and std.mem.eql(u8, e.name, name)) {
+                    const tt = e.type.table;
+                    if (tt.element != want.element or !limitsFit(tt.limits, want.limits)) return error.IncompatibleImportType;
+                    if (e.index < inst.tables.len) return inst.tables[e.index];
+                }
+            }
         }
         return error.UnresolvedImport;
     }
@@ -287,7 +332,33 @@ const Runner = struct {
         m.* = try Module.decode(self.a, bin);
         try validate(self.a, m);
     }
+
+    /// `assert_unlinkable (module …) "reason"` — the module is valid but must fail
+    /// to *link*: an import with no matching export ("unknown import") or a type
+    /// mismatch ("incompatible import type"). Passing = we rejected it at link
+    /// time; a non-link error (decode/validate/runtime) does not count. Does not
+    /// touch `self.current`.
+    fn assertUnlinkable(self: *Runner, form: []const Sexpr) Error!void {
+        const inner = form[1].asList() orelse {
+            self.fail("assert_unlinkable: malformed command", .{});
+            return;
+        };
+        if (self.buildModule(inner)) |_| {
+            self.fail("assert_unlinkable: module linked (should be rejected)", .{});
+        } else |e| {
+            if (isLinkError(e)) self.summary.passed += 1 else self.fail("assert_unlinkable: non-link error {s}", .{@errorName(e)});
+        }
+    }
 };
+
+/// True for the errors that mean a module failed to *link* (import resolution),
+/// as opposed to decode/validate or a runtime trap.
+fn isLinkError(e: anyerror) bool {
+    return switch (e) {
+        error.UnresolvedImport, error.MissingImport, error.IncompatibleImportType => true,
+        else => false,
+    };
+}
 
 /// True only for genuine wasm runtime traps (§4.2). Engine limitations, decode/
 /// assemble errors, and setup errors are explicitly excluded so `assert_trap` /
@@ -313,44 +384,56 @@ fn isRuntimeTrap(e: anyerror) bool {
 /// Null reference sentinel — must match `interp`'s `null_ref` on the value stack.
 const null_ref: Value = std.math.maxInt(u64);
 
-/// The index (into a module's function index space) of an exported function.
-fn exportedFuncIndex(m: *const Module, name: []const u8) ?u32 {
-    for (m.exports) |e| {
-        if (e.type == .func and std.mem.eql(u8, e.name, name)) return e.index;
+// --- Import linking: type compatibility ------------------------------------
+
+fn funcTypeEq(a: Module.FuncType, b: Module.FuncType) bool {
+    return valTypesEq(a.params, b.params) and valTypesEq(a.results, b.results);
+}
+fn valTypesEq(a: []const types.ValType, b: []const types.ValType) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (x != y) return false;
+    return true;
+}
+/// True if a provided limits range satisfies (is a subtype of) the required one:
+/// provided.min ≥ required.min and, if required is bounded, provided is bounded
+/// no higher (§4.5.3 limits matching).
+fn limitsFit(provided: Module.Limits, required: Module.Limits) bool {
+    if (provided.min < required.min) return false;
+    if (required.max) |rmax| {
+        const pmax = provided.max orelse return false;
+        if (pmax > rmax) return false;
     }
-    return null;
+    return true;
 }
 
-/// The shared memory an instance exports under `name` (single memory → index 0).
-fn exportedMemory(inst: *interp.Instance, name: []const u8) ?*interp.Instance.Memory {
-    for (inst.module.exports) |e| {
-        if (e.type == .memory and std.mem.eql(u8, e.name, name)) return inst.memory;
-    }
-    return null;
-}
-
-/// The shared table object an instance exports under `name`.
-fn exportedTable(inst: *interp.Instance, name: []const u8) ?*interp.Instance.Table {
-    for (inst.module.exports) |e| {
-        if (e.type == .table and std.mem.eql(u8, e.name, name) and e.index < inst.tables.len)
-            return inst.tables[e.index];
-    }
-    return null;
-}
-
-/// A `spectest` host function. The standard ones (`print*`) are side-effect-only
-/// with no results, so a single no-op backs them all.
-fn spectestFunc(name: []const u8) ?*const fn ([]const Value, []Value) void {
-    if (std.mem.startsWith(u8, name, "print")) return spectestNoop;
-    return null;
-}
 fn spectestNoop(args: []const Value, results: []Value) void {
     _ = args;
     _ = results; // print funcs return nothing
 }
 
-/// The standard testsuite `spectest` host globals (immutable), as their raw slot
-/// bits. Modules import these to test imported-global handling.
+/// The signature of a standard `spectest` `print*` function, or null if unknown.
+fn spectestFuncType(name: []const u8) ?Module.FuncType {
+    const T = struct {
+        const none: []const V = &.{};
+        const i32_: []const V = &.{.i32};
+        const i64_: []const V = &.{.i64};
+        const f32_: []const V = &.{.f32};
+        const f64_: []const V = &.{.f64};
+        const i32_f32: []const V = &.{ .i32, .f32 };
+        const f64_f64: []const V = &.{ .f64, .f64 };
+    };
+    const p: []const V = if (std.mem.eql(u8, name, "print")) T.none else if (std.mem.eql(u8, name, "print_i32")) T.i32_ else if (std.mem.eql(u8, name, "print_i64")) T.i64_ else if (std.mem.eql(u8, name, "print_f32")) T.f32_ else if (std.mem.eql(u8, name, "print_f64")) T.f64_ else if (std.mem.eql(u8, name, "print_i32_f32")) T.i32_f32 else if (std.mem.eql(u8, name, "print_f64_f64")) T.f64_f64 else return null;
+    return .{ .params = p, .results = T.none };
+}
+
+/// The type of a standard `spectest` global (all immutable), or null if unknown.
+fn spectestGlobalType(name: []const u8) ?Module.GlobalType {
+    const content: V = if (std.mem.eql(u8, name, "global_i32")) .i32 else if (std.mem.eql(u8, name, "global_i64")) .i64 else if (std.mem.eql(u8, name, "global_f32")) .f32 else if (std.mem.eql(u8, name, "global_f64")) .f64 else return null;
+    return .{ .content = content, .mutable = false };
+}
+
+/// The standard testsuite `spectest` host global values (immutable), as their raw
+/// slot bits.
 fn spectestGlobal(module: []const u8, name: []const u8) ?Value {
     if (!std.mem.eql(u8, module, "spectest")) return null;
     if (std.mem.eql(u8, name, "global_i32")) return interp.i32Value(666);
