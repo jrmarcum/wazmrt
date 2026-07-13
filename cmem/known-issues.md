@@ -38,10 +38,11 @@ Third pass (commit `c535de0`):
   `br_table` label *value types* (not just arity) even in polymorphic code. Verified empirically —
   different-typed labels are rejected, same-typed accepted. No change needed.
 
-Still open: #3 (start-function), #9, #10, #11, #12, #13, plus #16 (rest, LOW). **#1 (all 3 stages),
-#4, #5, #14, #15 are resolved** (see below). Next tractable wins: #3 `(start …)`, #11 inline
-`(table (export …) …)`, and invoke-by-module-name in the WAST runner (all block more of
-`linking.wast`/`imports.wast`).
+Still open: #9, #10, #11 (defined-table inline export only), #12, #13, plus #16 (rest, LOW). **#1 (all 3
+stages), #3, #4, #5, #14, #15 are resolved** (see below). Next tractable wins: invoke-by-module-name in
+the WAST runner (blocks more of `linking.wast`), #11's defined-table inline export, then the LOW items.
+Larger out-of-scope boundaries surfaced by the suite: the **multi-memory** proposal (`start0`) and
+exception-handling **tags** (`imports` "test" module).
 
 ## Grouped by the integration that trips them
 
@@ -54,10 +55,11 @@ Still open: #3 (start-function), #9, #10, #11, #12, #13, plus #16 (rest, LOW). *
   over-acceptance, all sub-items), #7 (const-expr `global.get` strictness), #6 (invalid valtype byte),
   #8 (`align=` non-power-of-two). These are *soundness / spec-strictness* gaps — invisible until the
   runner actually executes the negative tests (today they're counted as `skipped`).
-- **Start-function support**: #3 (assembler drops `(start …)`, decoder ignores the start section).
+- **Start-function support**: #3 **DONE** (`07dd244`).
 - **Host externref values** (embedding API passes real externrefs): #9 (`null_ref` collision).
-- **Arbitrary / hand-written WAT** (beyond the testsuite's shape): #11 (inline `(table (export …))`),
-  #12 (`align=` malformed), #10 (import-after-def ordering).
+- **Arbitrary / hand-written WAT** (beyond the testsuite's shape): #11 (inline `(table (export …))` on a
+  *defined* table — the imported-table case is done), #12 (`align=` malformed), #10 (import-after-def
+  ordering).
 - **Any future extended-const op that interns a signature**: #13 (type-section ordering, latent).
 - **Test fidelity, always-on**: #5 (`assert_trap` accepts any error — silently green-washes producer
   bugs *now*).
@@ -106,10 +108,15 @@ the gaps are invisible). **Fix:** tighten each rule; verify against the `*.wast`
 blocks once the runner supports them (and re-baseline — stricter validation could reject a module that
 currently builds if the check is wrong).
 
-### #3 — Decoder records but never acts on the start section — MED
-`src/Module.zig` — decode section switch `else {}` (~199) ignores `SectionId.start` (and
-`data_count`). Benign for `custom`/`data_count`; for `start` it means the start function never runs.
-**Surfaces when:** start-function support is added (pairs with #1's assembler side).
+### #3 — Start function — **DONE (`07dd244`, 2026-07-13)**
+Implemented end to end: `Module.decode` reads the start section (id 8) into `start: ?u32`; `validate`
+checks the start func exists and has type `[] → []` (`UndefinedFunc` / `InvalidStartFunction`);
+`interp.Instance.runStart()` runs it (no args) right after instantiation — called by the WAST runner and
+CLI, so a trap during start fails instantiation; the assembler emits `(start $f|N)` as section 8. Also
+added the `(memory (data "…"))` abbreviation and inline `(memory (import …))` / `(table (import …))`
+imports (the memory export-skip loop had silently mis-parsed an inline import as a *defined* memory).
+`start.wast` 0 → **11/0/0**, `imports` 132 → 137, `memory` 66 → 69. **Out of scope:** `start0.wast`'s
+3 fails are the **multi-memory** proposal (memory-indexed loads `i32.load8_u $n` on a >1 memory space).
 
 ### #4 — Non-`spectest` imported global silently defaults to 0 — **RESOLVED (`1d6d9f2`, #1 stage 3)**
 `resolveGlobalImport` now resolves a global import to a registered module's exported global (its live
@@ -156,11 +163,13 @@ assumption for the func index space, but wat emits no function imports yet.) **S
 func imports land, or hand-written WAT violates imports-first ordering. **Fix:** enforce or reorder
 (imports first) when building the index spaces.
 
-### #11 — `parseTable` ignores an inline `(export …)` — LOW (missing feature, fails loud)
-`src/wat.zig` — `parseTable` (~334) doesn't handle `(table (export "t") 1 funcref)`; the `(export …)`
-list falls into `parseIndex` → `error.BadImmediate`. Errors out (not wrong bytes). **Surfaces when:**
-a module uses the inline table-export form (`table.wast` does). **Fix:** parse leading inline
-`(export …)` in `parseTable` like `parseGlobal` already does.
+### #11 — inline `(table (export …) …)` on a *defined* table — LOW (PARTIAL, fails loud)
+`src/wat.zig` — the `(table …)` module-field branch now handles inline `(export …)` on an *imported*
+table (the `07dd244` inline-import path), but a **defined** table with an inline export
+(`(table (export "t") 1 funcref)`) still falls through to `parseTable`, whose `(export …)` list hits
+`parseIndex` → `error.BadImmediate`. Errors out (not wrong bytes). **Fix:** thread the leading inline
+`(export …)` forms parsed in the branch into `parseTable` (or handle the whole defined-table case in the
+branch, mirroring the import path). `table.wast` still has a few of these.
 
 ### #12 — Latent: global-init const-exprs encoded after the type section — LOW
 `src/wat.zig` — the global section (with `emitConstExpr`) is emitted *after* the type section, but with

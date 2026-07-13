@@ -38,9 +38,10 @@ the **WAST script runner** (`wast.zig`) is next.
   (`env.add`) and export (`run`, params=2 results=1). Retired the ad-hoc `wazmrt_module_*` ABI.
 - **cmem/ project memory** established (this folder), mirroring the wasmtk setup.
 
-**Remaining:** `(start …)` (#3); the WAST runner's invoke-by-module-name + inline `(table (export …))`
-(#11) to unlock more of `linking.wast`; growing the wasm-c-api past introspection; first
-`universalWasmLoader-*` integration; then WASI. Still **100% original runtime code** — no
+**Remaining:** the WAST runner's invoke-by-module-name + `(table (export …))` on a defined table (#11)
+to unlock more of `linking.wast`; growing the wasm-c-api past introspection; first
+`universalWasmLoader-*` integration; then WASI. **Start function (#3) DONE 2026-07-13.** Still **100%
+original runtime code** — no
 reference-project code adopted yet (only the vendored `wasm.h`). `call_indirect` + tables + globals +
 type-ref block types + **reference types** + **multi-table** + NaN-payload float literals + **imported
 globals** + extended-const + **reference-type table ops** + **negative-conformance + validator/decoder
@@ -48,8 +49,9 @@ strictness** + **element init expressions** + **imported functions + `register`*
 **DONE 2026-07-09**. **Bulk table ops + passive elements + table initializer expressions +
 const-expr/passive data segments DONE 2026-07-13** (#15 closed). **Host imports #1 COMPLETE — imported
 tables/memories via shared objects (stage 2) + link-time import type-checking + `assert_unlinkable`
-(stage 3), 2026-07-13** (`data` 12→34, `elem` 38→52, `imports` 26→132). See `known-issues.md` for the
-fix ledger.
+(stage 3), 2026-07-13** (`data` 12→34, `elem` 38→52, `imports` 26→137). **Start function (#3) + inline
+memory-data / memory-table imports DONE 2026-07-13** (`start` 0→11). See `known-issues.md` for the fix
+ledger.
 
 ## Next increments (rough order)
 

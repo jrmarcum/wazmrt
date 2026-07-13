@@ -21,8 +21,10 @@ compliance process, and for the ledger of any reused code.
 > (`.wat` → wasm) and a **WAST script runner** (`wazmrt file.wast`) that runs the
 > official WebAssembly spec testsuite (positive assertions plus
 > `assert_invalid`/`assert_malformed`/`assert_trap`/`assert_unlinkable`) — e.g.
-> `table_init` 729/0, `table_copy` 1649/0, `imports` 132. **The start function
-> and WASI** are the main features still in progress. Requires Zig 0.16.
+> `table_init` 729/0, `table_copy` 1649/0, `imports` 137, `start` 11/0. It runs a
+> module's **start function** at instantiation. **WASI** and a few text
+> abbreviations (multi-memory, exception-handling tags) are the main things still
+> in progress. Requires Zig 0.16.
 
 ## Build
 

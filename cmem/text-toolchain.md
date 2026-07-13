@@ -46,7 +46,9 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
   with element-segment names; inline const-expr table elems + `(table N reftype initexpr)`; passive +
   `(memory idx)`-prefixed + const-expr-offset `(data …)`). **Imported tables/memories DONE 2026-07-13**
   (`(import … (table|memory …))` → import section kinds 0x01/0x02; imports take the low indices).
-  **Deferred in wat.zig:** `start` section, inline `(table (export …) …)` (#11), tag imports.
+  **Start section (`(start $f|N)`), `(memory (data …))`, and inline `(memory|table (import …))` DONE
+  2026-07-13.** **Deferred in wat.zig:** inline `(table (export …) …)` on a *defined* table (#11), tag
+  imports, multi-memory.
 - **`src/wast.zig`** (DONE 2026-07-02, extended 2026-07-09) — WAST script runner: `(module …)` text +
   `(module binary …)`, `assert_return`, **`assert_trap` (genuine runtime traps only — `isRuntimeTrap`),
   `assert_exhaustion`, `assert_invalid`/`assert_malformed` (the inner module must be rejected)**,

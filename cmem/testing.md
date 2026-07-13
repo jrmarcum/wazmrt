@@ -256,6 +256,13 @@ under ReleaseFast — debug is too slow on their large grow tests (pre-existing)
 gaps are separate features: invoke-by-module-name, inline `(table (export …) …)` (#11), tags, memory64,
 `(start …)` (#3).
 
+**Update 2026-07-13 — start function (#3) + inline abbreviations** (`07dd244`). Start section decoded
++ validated (`[] → []`, else "unknown function"/"start function") + run at instantiation (a trap fails
+instantiation). Also: `(memory (data "…"))` abbreviation and inline `(memory|table (import …))` imports.
+`start.wast` 0 → **11/0/0**, `imports` 132 → **137**, `memory` 66 → **69** (ReleaseFast), `table` 17/10
+→ 17/9. **No core regressions** (i32 459, i64 415, table_init 729, table_copy 1649, call_indirect 169,
+func 171, global 109/1, … all HEAD-identical). `start0.wast` (3/3) needs multi-memory (out of scope).
+
 ## What this tells the roadmap
 
 1. **First execution milestone = the `module/wasm_mod` corpus + its `.test.json` files** — fully
