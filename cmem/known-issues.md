@@ -40,10 +40,16 @@ Third pass (commit `c535de0`):
 
 **The 2026-07-09 audit ledger is FULLY cleared (2026-07-13): every item #1–#16 is resolved.** No open
 correctness/soundness/dead-code/spec-strictness items remain. The real frontiers are now new *features*,
-not ledger debt: growing the wasm-c-api past introspection (instance/func/call), and WASI. (WAST-runner
-invoke-by-module-name landed `9745ecb` — `linking.wast` 29 → 100.) Larger out-of-scope proposals surfaced
-by the suite (now the main sources of remaining `.wast` failures): **typed/GC references** (`(ref null
-$t)`), **multi-memory** (`start0`), and exception-handling **tags** (`imports`).
+not ledger debt: growing the wasm-c-api past introspection (instance/func/call), and **WASI preview 1**
+(in scope; preview 2/3 deferred until browser-standard, mirroring wasmtk). Since cleared: WAST-runner
+invoke-by-module-name (`9745ecb`, `linking.wast` 29 → 100) and the **function-references proposal**
+(P1/P2/P2.5 — typed-ref value types, `call_ref`/`ref.as_non_null`/`br_on_null`, non-null refs +
+local-init; ~+130 ref-file passes, `func` 171/0). Remaining frontier proposals (the main sources of the
+rest of the `.wast` failures): full **GC** (i31/struct/array heap objects, `ref.test`/`ref.cast` — a
+heap-requiring surface, likely against the smallest-binary vision), **multi-memory** (`start0`), and
+exception-handling **tags** (`imports`). A residual limitation: concrete typed refs (`(ref null $t)`)
+collapse to `funcref` in the untyped-slot model, so a general funcref passed where a specific `(ref $t)`
+is expected isn't caught (`local_tee` 96/1).
 
 ## Grouped by the integration that trips them
 

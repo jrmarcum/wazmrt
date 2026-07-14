@@ -137,6 +137,18 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
     `global.get` scope split: active-segment offsets allow any immutable global, ref-producing element
     exprs / table inits stay imported-only. **Next:** imported tables/memories (#1 stage 2) — the only
     remaining `data`/`elem` blocker.
+15. ~~Host imports stages 2/3 + start (#3) + audit-ledger closeout + invoke-by-module-name~~ **DONE
+    2026-07-13** (`78c6b2b`/`1d6d9f2`/`07dd244`/`9745ecb` + the #8–#13 fixes). Imported tables/memories
+    (shared objects), link-time import type-checking + `assert_unlinkable`, the start section, and the
+    WAST runner's `(invoke $M …)`/`(get …)`/`(register "x" $M)` by module name (`linking` 29 → 100).
+16. ~~Function-references proposal (typed refs)~~ **DONE 2026-07-13** (P1 `87ac6a7`, P2 `7ebfd1e`, P2.5
+    `446b61b`). Assembler + decoder accept all typed/GC reference *value-type* forms (`(ref null? ht)`,
+    `anyref`/`eqref`/`i31ref`/…, collapsing to two opaque ref slots), with distinct non-null variants
+    (`funcref_nn`/`externref_nn`, synthetic bytes 0x67/0x68). `call_ref`/`return_call_ref` (immediate is
+    a *type* index), `ref.as_non_null`, `br_on_null`/`br_on_non_null`. Validator adds ref subtyping
+    (`(ref t) <: (ref null t)`) and local-init tracking. Fixed a latent bug: `ref.func $f` in a
+    global-init/offset const-expr (threaded `func_names` into `emitConstExpr`). ~+130 ref-file passes.
+    **Deferred:** full **GC** (i31/struct/array heap objects, `ref.test`/`ref.cast`) — heap-requiring.
 
 ## Notes / invariants
 

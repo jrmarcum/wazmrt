@@ -64,6 +64,17 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
     Exotic middle for the compile-to-wasm mode: emit specialized *wasm* for hot regions and let the host
     engine JIT it — very speculative.
 
+- **Proposal scope (owner, 2026-07-13).** Track the core spec + the proposals that are (or are becoming)
+  browser-standard; defer the rest until they are, mirroring wasmtk.
+  - **In scope / done:** MVP, reference types, multi-table, bulk table ops, extended-const, and the
+    **function-references proposal** (typed refs, `call_ref`, non-null refs + local-init — DONE
+    2026-07-13). **WASI preview 1** is in scope (not yet built). Growing the wasm-c-api + the loaders.
+  - **Deferred (until browser-standard):** **WASI preview 2/3** (component-model based). Full **GC**
+    (i31/struct/array heap objects, `ref.test`/`ref.cast`) — heap-requiring, and it conflicts with the
+    smallest-binary vision, so it waits. **Multi-memory**, **exception-handling tags**, **SIMD** as the
+    real corpus (`wasm_wasi`) demands. Typed/GC reference *value types* are still *accepted* (P1) so such
+    modules build; only the heap semantics are deferred.
+
 ## Zig 0.16 API notes (this project targets 0.16.0)
 
 The 0.16 stdlib differs from older docs — verified against the installed stdlib this session:

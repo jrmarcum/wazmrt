@@ -39,8 +39,13 @@ the **WAST script runner** (`wast.zig`) is next.
 - **cmem/ project memory** established (this folder), mirroring the wasmtk setup.
 
 **Remaining:** growing the wasm-c-api past introspection (instance/func/call) so the runtime is
-embeddable end-to-end; first `universalWasmLoader-*` integration; the Deno/V8 benchmark; then WASI.
-(The WAST runner's invoke-by-module-name landed `9745ecb` — `linking.wast` 29 → 100.) **Start function (#3) DONE 2026-07-13; the 2026-07-09
+embeddable end-to-end; first `universalWasmLoader-*` integration; the Deno/V8 benchmark; then **WASI
+preview 1** (in scope; preview 2/3 deferred until browser-standard, per wasmtk). **The
+function-references proposal is essentially complete** (typed-ref value types, `call_ref`/
+`return_call_ref`/`ref.as_non_null`/`br_on_null`, non-null refs + local-init tracking, P1/P2/P2.5
+2026-07-13 — ~+130 ref-file passes). Full **GC** (i31/struct/array heap objects, `ref.test`/`ref.cast`)
+is a heap-requiring surface that likely conflicts with the smallest-binary vision — deferred. (The WAST
+runner's invoke-by-module-name landed `9745ecb` — `linking.wast` 29 → 100.) **Start function (#3) DONE 2026-07-13; the 2026-07-09
 audit ledger is now FULLY cleared — every item #1–#16 resolved** (externref boxing #9, import-after-def
 rejection #10, const-expr section ordering #12, dead-code cleanup #13, non-power-of-two `align=` #8,
 defined-table inline export #11). Still **100% original runtime code** — no

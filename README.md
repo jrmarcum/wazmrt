@@ -14,17 +14,20 @@ compliance process, and for the ledger of any reused code.
 > WebAssembly — integer/float arithmetic, control flow, `call`/`call_indirect`
 > (multi-table), linear memory, globals, reference types, the reference-type
 > table ops, **bulk table ops** (`table.init`/`table.copy`/`elem.drop`), element
-> segments (active/passive/declarative), and **imported functions, tables,
-> memories, and globals** with cross-module `register` linking and full import
-> type-checking — and runs a corpus of real modules to their expected values
+> segments (active/passive/declarative), **imported functions, tables, memories,
+> and globals** with cross-module `register` linking and full import type-checking,
+> and the **function-references proposal** (typed function refs, `call_ref`,
+> `ref.as_non_null`, `br_on_null`, non-null refs with local-initialization
+> checking) — and runs a corpus of real modules to their expected values
 > (`fib(20)=6765`, `sieve(30)=10`, …). It ships a native **WAT text assembler**
 > (`.wat` → wasm) and a **WAST script runner** (`wazmrt file.wast`) that runs the
 > official WebAssembly spec testsuite (positive assertions plus
 > `assert_invalid`/`assert_malformed`/`assert_trap`/`assert_unlinkable`) — e.g.
-> `table_init` 729/0, `table_copy` 1649/0, `imports` 137, `start` 11/0. It runs a
-> module's **start function** at instantiation. **WASI** and a few text
-> abbreviations (multi-memory, exception-handling tags) are the main things still
-> in progress. Requires Zig 0.16.
+> `table_init` 729/0, `table_copy` 1649/0, `imports` 137, `call_ref` 30, `start`
+> 11/0. It runs a module's **start function** at instantiation. **WASI preview 1**
+> is the main feature still to come; full **GC** (struct/array/i31),
+> multi-memory, and exception-handling tags are out of current scope. Requires
+> Zig 0.16.
 
 ## Build
 

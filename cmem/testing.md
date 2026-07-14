@@ -281,6 +281,25 @@ current one); `(get …)` reads an exported global; a missing target → `NoTarg
 `linking.wast` 29/108 → **100/37** (+71 passes — named invokes were the blocker for most of it),
 `elem.wast` 52/26 → **63/17** (+11). No core regressions; passes strictly up. **70 unit tests.**
 
+**Update 2026-07-13 — typed/GC references, function-references tier (P1/P2/P2.5;** `87ac6a7`, `7ebfd1e`,
+`446b61b`**).** Built in three tested increments (the "wasmtk way"):
+- **P1 value-type acceptance** — the decoder + assembler accept every typed/GC reference *value-type*
+  form (`(ref null? func|extern|$t|any|eq|i31|struct|array|exn)`, `anyref`/`eqref`/`i31ref`/… ) and
+  collapse them to the runtime's two opaque ref slots. `ref_null` 0 → **32/0**, `ref_is_null` 2 → 18.
+- **P2 function-references execution** — `call_ref`/`return_call_ref` (dispatch through a typed func
+  ref; null traps), `ref.as_non_null`, `br_on_null`/`br_on_non_null`. `call_ref` 4 → **30/1**,
+  `return_call_ref` 0 → **34→38**. Also fixed a latent bug: `ref.func $f` in a global-init/offset
+  const-expr couldn't resolve (empty `func_names` in `emitConstExpr`).
+- **P2.5 non-null refs + local-init** — distinct `funcref_nn`/`externref_nn` value types + subtyping
+  (`(ref t) <: (ref null t)`) + local-initialization tracking (a non-defaultable local must be set
+  before use; block/if snapshot+restore). `local_init` 5 → **8/0**, `func` 170/1 → **171/0**,
+  `ref_as_non_null` 4 → **5/0**. Full git-stash A/B confirmed **zero regressions**.
+Net ~**+130 passes** across the ref files from near-zero. The **function-references proposal is
+essentially complete**; only full **GC** (i31/struct/array heap objects, `ref.test`/`ref.cast`) remains
+of the reference-type frontier — a heap-requiring surface deferred (see `roadmap.md`). **73 unit tests.**
+The lone pre-existing `local_tee` 96/1 / `unreached-valid` 9/1 are concrete-type-collapse limitations
+(`(ref null $t)` is indistinguishable from `funcref` in our untyped-slot model), not regressions.
+
 ## What this tells the roadmap
 
 1. **First execution milestone = the `module/wasm_mod` corpus + its `.test.json` files** — fully
