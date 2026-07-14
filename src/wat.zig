@@ -251,7 +251,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 try table_imports.append(a, .{ .module = imp[1].string, .name = imp[2].string, .min = tmin, .max = tmax, .elem = try parseValType(items[ti]) });
                 try table_names.append(a, tname);
             } else {
-                try parseTable(a, items, &tables, &table_names, &elems, &elem_names);
+                try parseTable(a, items, &tables, &table_names, &elems, &elem_names, &exports);
             }
         } else if (std.mem.eql(u8, kw, "elem")) {
             try parseElem(a, items, &elems, &elem_names, table_names.items);
@@ -569,7 +569,7 @@ fn parseTypeDef(a: std.mem.Allocator, items: []const Sexpr, sigs: *List(Sig), ty
 
 /// `(table $name? reftype (elem …))` or `(table $name? <min> <max>? reftype)`,
 /// where reftype is `funcref` / `externref` / `(ref null? …)`.
-fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef), table_names: *List(?[]const u8), elems: *List(ElemDef), elem_names: *List(?[]const u8)) Error!void {
+fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef), table_names: *List(?[]const u8), elems: *List(ElemDef), elem_names: *List(?[]const u8), exports: *List(ExportDef)) Error!void {
     const table_index: u32 = @intCast(tables.items.len);
     var i: usize = 1;
     var name: ?[]const u8 = null;
@@ -577,6 +577,9 @@ fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef
         name = items[i].atom;
         i += 1;
     }
+    // Inline exports: `(table $id? (export "x")* …)`.
+    while (i < items.len and eqKw(items[i], "export")) : (i += 1)
+        try exports.append(a, .{ .name = items[i].asList().?[1].string, .kind = 1, .index = table_index });
     try table_names.append(a, name);
     if (isRefType(items[i])) {
         // (table reftype (elem …))
@@ -1807,6 +1810,19 @@ test "calls an imported (host) function" {
     var inst = try interp.Instance.initWithImports(a, &m, imports);
     // The imported func occupies index 0; call-add dispatches to the host adder.
     try std.testing.expectEqual(@as(i32, 7), interp.asI32((try inst.invoke("call-add", &.{ interp.i32Value(3), interp.i32Value(4) }))[0]));
+}
+
+test "inline export on a defined table (#11)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bin = try assemble(a, "(module (table (export \"t\") 2 funcref))");
+    var m = try Module.decode(a, bin);
+    try validate(a, &m);
+    try std.testing.expectEqual(@as(usize, 1), m.exports.len);
+    try std.testing.expectEqualStrings("t", m.exports[0].name);
+    try std.testing.expectEqual(types.ExternKind.table, m.exports[0].type.kind());
+    try std.testing.expectEqual(@as(u32, 0), m.exports[0].index);
 }
 
 test "active element-expression segment (ref.func / ref.null)" {
