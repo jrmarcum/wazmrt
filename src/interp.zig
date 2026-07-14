@@ -86,6 +86,9 @@ pub const Error = Module.Error || error{
     UndefinedGlobal,
     /// `call_indirect` in a module with no table.
     NoTable,
+    /// A null reference where a non-null one is required (`call_ref` /
+    /// `ref.as_non_null` on null).
+    NullReference,
     /// A table access (or element-segment init) outside the table bounds.
     TableOutOfBounds,
     /// `call_indirect` hit an uninitialized (null) table element.
@@ -601,6 +604,46 @@ const Frame = struct {
                     self.vstack.shrinkRetainingCapacity(self.vstack.items.len - np);
                     for (results) |r| try self.pushU64(r);
                     pc += 1;
+                },
+                .call_ref, .return_call_ref => {
+                    // The function reference (a function index) is on top of the
+                    // stack; a null ref traps.
+                    const f_ref = self.pop();
+                    if (f_ref == null_ref) return error.NullReference;
+                    const f: u32 = @intCast(f_ref);
+                    const ft = self.inst.module.funcType(f) orelse return error.UndefinedFunc;
+                    const np = ft.params.len;
+                    const args = self.vstack.items[self.vstack.items.len - np ..];
+                    const results = try self.inst.callFunction(self.a, f, args, self.depth + 1);
+                    self.vstack.shrinkRetainingCapacity(self.vstack.items.len - np);
+                    for (results) |r| try self.pushU64(r);
+                    // return_call_ref is a tail call: the callee's results become
+                    // ours (the epilogue takes the top `results.len`).
+                    pc = if (instr.op == .return_call_ref) ir.len else pc + 1;
+                },
+                .ref_as_non_null => {
+                    const r = self.pop();
+                    if (r == null_ref) return error.NullReference;
+                    try self.pushU64(r);
+                    pc += 1;
+                },
+                .br_on_null => {
+                    const r = self.pop();
+                    if (r == null_ref) {
+                        pc = self.branch(instr.imm.label); // null → branch (ref dropped)
+                    } else {
+                        try self.pushU64(r); // non-null → keep the ref, fall through
+                        pc += 1;
+                    }
+                },
+                .br_on_non_null => {
+                    const r = self.pop();
+                    if (r != null_ref) {
+                        try self.pushU64(r); // non-null → keep the ref for the label
+                        pc = self.branch(instr.imm.label);
+                    } else {
+                        pc += 1; // null → ref consumed, fall through
+                    }
                 },
 
                 // --- Table access ---

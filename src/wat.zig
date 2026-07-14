@@ -336,9 +336,9 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // exprs/offsets) BEFORE the type section, mirroring the function-body path, so
     // any signature they might intern lands in section 1. Const-exprs can't intern
     // a signature today, but this keeps the invariant structural, not incidental.
-    const global_pay = try encodeGlobalSection(a, globals.items, &sigs, type_names.items, global_names.items);
+    const global_pay = try encodeGlobalSection(a, globals.items, &sigs, type_names.items, global_names.items, func_names.items);
     const elem_pay = try encodeElementSection(a, elems.items, &sigs, type_names.items, global_names.items, func_names.items);
-    const data_pay = try encodeDataSection(a, datas.items, &sigs, type_names.items, global_names.items);
+    const data_pay = try encodeDataSection(a, datas.items, &sigs, type_names.items, global_names.items, func_names.items);
 
     var out: List(u8) = .empty;
     try out.appendSlice(a, &.{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 }); // header
@@ -452,14 +452,14 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
 /// Encode the global section (6) payload: `(valtype, mut, init-const-expr)` per
 /// global. Const-exprs are encoded here (pre-type-section) so any interning lands
 /// in section 1.
-fn encodeGlobalSection(a: std.mem.Allocator, globals: []const GlobalDef, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8) Error![]const u8 {
+fn encodeGlobalSection(a: std.mem.Allocator, globals: []const GlobalDef, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8) Error![]const u8 {
     if (globals.len == 0) return &.{};
     var s: List(u8) = .empty;
     try uleb(a, &s, globals.len);
     for (globals) |g| {
         try s.append(a, @intFromEnum(g.valtype));
         try s.append(a, if (g.mutable) 0x01 else 0x00);
-        try emitConstExpr(a, &s, sigs, type_names, global_names, g.init);
+        try emitConstExpr(a, &s, sigs, type_names, global_names, func_names, g.init);
     }
     return s.items;
 }
@@ -483,7 +483,7 @@ fn encodeElementSection(a: std.mem.Allocator, elems: []const ElemDef, sigs: *Lis
         if (e.expr_form) flag |= 0b100;
         try s.append(a, flag);
         if (explicit_table) try uleb(a, &s, e.table_index);
-        if (e.mode == .active) try emitOffsetExpr(a, &s, sigs, type_names, global_names, e.offset_form);
+        if (e.mode == .active) try emitOffsetExpr(a, &s, sigs, type_names, global_names, func_names, e.offset_form);
         // The leading kind byte: elemkind (0x00) for non-flag-0 func-index
         // variants, reftype for non-flag-4 const-expr variants.
         if (!e.expr_form and flag != 0) {
@@ -504,7 +504,7 @@ fn encodeElementSection(a: std.mem.Allocator, elems: []const ElemDef, sigs: *Lis
 
 /// Encode the data section (11) payload: active (flag 0x00, offset const-expr) or
 /// passive (flag 0x01) segments, memory 0.
-fn encodeDataSection(a: std.mem.Allocator, datas: []const DataSeg, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8) Error![]const u8 {
+fn encodeDataSection(a: std.mem.Allocator, datas: []const DataSeg, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8) Error![]const u8 {
     if (datas.len == 0) return &.{};
     var s: List(u8) = .empty;
     try uleb(a, &s, datas.len);
@@ -513,7 +513,7 @@ fn encodeDataSection(a: std.mem.Allocator, datas: []const DataSeg, sigs: *List(S
             try s.append(a, 0x01); // passive
         } else {
             try s.append(a, 0x00); // active, memory 0
-            try emitOffsetExpr(a, &s, sigs, type_names, global_names, seg.offset_form);
+            try emitOffsetExpr(a, &s, sigs, type_names, global_names, func_names, seg.offset_form);
         }
         try uleb(a, &s, seg.bytes.len);
         try s.appendSlice(a, seg.bytes);
@@ -756,12 +756,12 @@ fn parseImport(a: std.mem.Allocator, items: []const Sexpr, global_imports: *List
 /// Emit an active segment's offset const-expr + `end`. Unwraps `(offset …)`,
 /// accepts a folded const-expr (`(i32.const N)` / `(global.get $g)`), and emits
 /// an implicit `i32.const 0` when no offset form is present.
-fn emitOffsetExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, form: ?Sexpr) Error!void {
+fn emitOffsetExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, form: ?Sexpr) Error!void {
     if (form) |f| {
         if (f.asList()) |l| {
-            if (l.len != 0 and eqAtom(l[0], "offset")) return emitConstExpr(a, out, sigs, type_names, global_names, l[1..]);
+            if (l.len != 0 and eqAtom(l[0], "offset")) return emitConstExpr(a, out, sigs, type_names, global_names, func_names, l[1..]);
         }
-        return emitConstExpr(a, out, sigs, type_names, global_names, &[_]Sexpr{f});
+        return emitConstExpr(a, out, sigs, type_names, global_names, func_names, &[_]Sexpr{f});
     }
     try out.append(a, @intFromEnum(Op.i32_const));
     try sleb(a, out, 0);
@@ -784,8 +784,8 @@ fn emitElementExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), type_
 }
 
 /// Emit a constant init expression (a sequence of instruction forms) + `end`.
-fn emitConstExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, exprs: []const Sexpr) Error!void {
-    var ctx: Ctx = .{ .a = a, .out = out, .local_names = &.{}, .func_names = &.{}, .sigs = sigs, .type_names = type_names, .global_names = global_names };
+fn emitConstExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, exprs: []const Sexpr) Error!void {
+    var ctx: Ctx = .{ .a = a, .out = out, .local_names = &.{}, .func_names = func_names, .sigs = sigs, .type_names = type_names, .global_names = global_names };
     try emitSeq(&ctx, exprs);
     try out.append(a, @intFromEnum(Op.end));
 }
@@ -1292,6 +1292,12 @@ fn emitBulkTableImm(ctx: *Ctx, op: Op, idxs: []const Sexpr) Error!void {
 
 fn emitInstr(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
     try emitOpcode(ctx, op);
+    // call_ref / return_call_ref carry a *type* index (the ref's signature), not
+    // a func index — resolve it against the type names.
+    if (op == .call_ref or op == .return_call_ref) {
+        try uleb(ctx.a, ctx.out, try resolveType(ctx.type_names, try imm0(immediates)));
+        return;
+    }
     switch (opcode.immediateKind(op)) {
         .none => {},
         .local => try uleb(ctx.a, ctx.out, try resolveLocal(ctx, try imm0(immediates))),

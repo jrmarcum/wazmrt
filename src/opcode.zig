@@ -36,11 +36,17 @@ pub const Op = enum(u8) {
     @"return" = 0x0f,
     call = 0x10,
     call_indirect = 0x11,
+    // Typed function references (function-references proposal).
+    call_ref = 0x14, // immediate: a type index (the func ref's signature)
+    return_call_ref = 0x15,
 
     // Reference
     ref_null = 0xd0, // immediate: a heaptype byte (func / extern)
     ref_is_null = 0xd1,
     ref_func = 0xd2, // immediate: a function index
+    ref_as_non_null = 0xd4,
+    br_on_null = 0xd5, // immediate: a label index
+    br_on_non_null = 0xd6,
 
     // Parametric
     drop = 0x1a,
@@ -336,6 +342,8 @@ pub fn immediateKind(op: Op) ImmKind {
         0x0e => .br_table,
         0x10 => .func,
         0x11 => .call_indirect,
+        0x14, 0x15 => .func, // call_ref / return_call_ref — imm.func = type index
+        0xd5, 0xd6 => .label, // br_on_null / br_on_non_null
         0x20, 0x21, 0x22 => .local,
         0x23, 0x24 => .global,
         0x25, 0x26, 0xe3, 0xe4, 0xe5 => .table, // table.get/set + table.grow/size/fill
@@ -352,7 +360,7 @@ pub fn immediateKind(op: Op) ImmKind {
         0xd0 => .ref_type, // ref.null <heaptype>
         0xd2 => .func, // ref.func <funcidx>
         // Everything else in the core-MVP range has no immediate.
-        0x00, 0x01, 0x05, 0x0b, 0x0f, 0x1a, 0x1b, 0xd1, 0x45...0xc4 => .none,
+        0x00, 0x01, 0x05, 0x0b, 0x0f, 0x1a, 0x1b, 0xd1, 0xd4, 0x45...0xc4 => .none,
         else => .unsupported,
     };
 }

@@ -468,6 +468,7 @@ fn isRuntimeTrap(e: anyerror) bool {
         error.TableOutOfBounds,
         error.UninitializedElement,
         error.IndirectTypeMismatch,
+        error.NullReference,
         error.CallStackExhausted,
         => true,
         else => false,
@@ -633,6 +634,31 @@ test "runs assert_return and assert_trap over a module" {
         \\(assert_return (invoke "add" (i32.const -5) (i32.const 3)) (i32.const -2))
         \\(assert_return (invoke "div" (i32.const 9) (i32.const 3)) (i32.const 3))
         \\(assert_trap (invoke "div" (i32.const 1) (i32.const 0)) "integer divide by zero")
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 4), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "call_ref / return_call_ref / ref.as_non_null (P2)" {
+    const src =
+        \\(module
+        \\  (type $ii (func (param i32) (result i32)))
+        \\  (func $sq (type $ii) (i32.mul (local.get 0) (local.get 0)))
+        \\  (elem declare func $sq)
+        \\  (global $g (ref $ii) (ref.func $sq))
+        \\  (func (export "call") (param i32) (result i32)
+        \\    (call_ref $ii (local.get 0) (global.get $g)))
+        \\  (func (export "asnn") (param i32) (result i32)
+        \\    (call_ref $ii (local.get 0) (ref.as_non_null (global.get $g))))
+        \\  (func (export "tail") (param i32) (result i32)
+        \\    (return_call_ref $ii (local.get 0) (global.get $g)))
+        \\  (func (export "trap") (result i32)
+        \\    (call_ref $ii (i32.const 1) (ref.null $ii))))
+        \\(assert_return (invoke "call" (i32.const 5)) (i32.const 25))
+        \\(assert_return (invoke "asnn" (i32.const 6)) (i32.const 36))
+        \\(assert_return (invoke "tail" (i32.const 7)) (i32.const 49))
+        \\(assert_trap (invoke "trap") "null reference")
     ;
     const s = try runScript(std.testing.allocator, src);
     try std.testing.expectEqual(@as(usize, 4), s.passed);

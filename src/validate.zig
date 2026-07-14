@@ -236,6 +236,15 @@ const FuncValidator = struct {
             _ = try self.popExpect(ts[i]);
         }
     }
+    /// Pop a value that must be a reference type (or polymorphic `unknown`).
+    fn popRef(self: *FuncValidator) Error!StackType {
+        const st = try self.popVal();
+        switch (st) {
+            .val => |v| if (v != .funcref and v != .externref) return error.TypeMismatch,
+            .unknown => {},
+        }
+        return st;
+    }
 
     fn pushCtrl(self: *FuncValidator, kind: FrameKind, start: []const V, end: []const V) Error!void {
         try self.ctrls.append(self.a, .{
@@ -465,6 +474,42 @@ const FuncValidator = struct {
                 try self.pushValT(.funcref);
             },
 
+            // Typed function references (function-references proposal). A typed
+            // func ref collapses to `funcref` in our model (see the decoder P1).
+            .call_ref => {
+                if (instr.imm.func >= self.module.func_types.len) return error.UndefinedType;
+                const ft = self.module.func_types[instr.imm.func];
+                _ = try self.popExpect(.funcref); // the function reference (top)
+                try self.popVals(ft.params);
+                try self.pushVals(ft.results);
+            },
+            .return_call_ref => {
+                if (instr.imm.func >= self.module.func_types.len) return error.UndefinedType;
+                const ft = self.module.func_types[instr.imm.func];
+                _ = try self.popExpect(.funcref);
+                try self.popVals(ft.params);
+                if (!valTypesEqual(ft.results, self.results)) return error.TypeMismatch;
+                self.setUnreachable();
+            },
+            .ref_as_non_null => try self.pushVal(try self.popRef()),
+            .br_on_null => {
+                // Pop the ref; on branch pass [t*] to the label, on fall-through
+                // keep the (now non-null) ref.
+                const r = try self.popRef();
+                const lt = try self.labelTypesAt(instr.imm.label);
+                try self.popVals(lt);
+                try self.pushVals(lt);
+                try self.pushVal(r);
+            },
+            .br_on_non_null => {
+                // The label expects [t* ref]; on fall-through the ref is consumed.
+                const lt = try self.labelTypesAt(instr.imm.label);
+                if (lt.len == 0 or (lt[lt.len - 1] != .funcref and lt[lt.len - 1] != .externref)) return error.TypeMismatch;
+                try self.popVals(lt);
+                try self.pushVals(lt);
+                _ = try self.popRef();
+            },
+
             .local_get => try self.pushValT(try self.localAt(instr.imm.local)),
             .local_set => _ = try self.popExpect(try self.localAt(instr.imm.local)),
             .local_tee => {
@@ -503,6 +548,12 @@ fn naturalAlignLog2(op: Op) u32 {
         .i64_load, .f64_load, .i64_store, .f64_store => 3,
         else => 0,
     };
+}
+
+fn valTypesEqual(a: []const V, b: []const V) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (x != y) return false;
+    return true;
 }
 
 /// True if an abstract stack entry is a concrete reference type (funcref /
