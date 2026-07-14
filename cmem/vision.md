@@ -47,6 +47,14 @@ now.** The measurement: native wazmrt vs Deno/V8 on wasmtk's own outputs, timing
 wall-clock and steady-state throughput separately** so we know which regime wasmtk lives in. See the
 `design-decisions.md` interpreter-architecture entry and `roadmap.md` size/speed-baseline item.
 
+**First measurement (2026-07-14) — thesis confirmed.** `zig build bench` + a cross-process run (see
+`testing.md`): native wazmrt beats Deno/V8 on **cold-start wall-clock — 2.4× on a trivial call, 1.5× on
+`sum(1e6)`** (Deno pays ~110 ms of V8 init + wasm JIT-compile + JS marshalling every run; wazmrt's own
+work is sub-µs to tens-of-ms). Steady-state interpreter throughput is ~264 Mops/s — a JIT wins that
+regime, so the win is exactly where the vision predicted: **short-lived / native-FFI programs (wasmtk's
+compiler-test outputs), not sustained hot loops.** Option A stays; A→B waits for a real compute-bound
+workload. First datapoint on one dev box, not a tuned benchmark.
+
 ## Integration goal — wazmrt as wasmtk's wasm execution backend (owner, 2026-07-02)
 
 The concrete productization target: **wasmtk runs its wasm through native wazmrt instead of Deno/V8**,

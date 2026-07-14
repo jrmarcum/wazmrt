@@ -116,6 +116,29 @@ pub fn build(b: *std.Build) void {
         csmoke_step.dependOn(&run_csmoke.step);
     }
 
+    // ---- Interpreter microbenchmark (`zig build bench`) --------------------
+    // In-process cold-path + steady-state timing, always ReleaseFast so the
+    // numbers reflect the real interpreter, not a Debug build.
+    {
+        const bench = b.addExecutable(.{
+            .name = "bench",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("bench/bench.zig"),
+                .target = target,
+                .optimize = .ReleaseFast,
+                .imports = &.{.{ .name = "wazmrt", .module = b.createModule(.{
+                    .root_source_file = b.path("src/root.zig"),
+                    .target = target,
+                    .optimize = .ReleaseFast,
+                }) }},
+            }),
+        });
+        const run_bench = b.addRunArtifact(bench);
+        if (b.args) |args| run_bench.addArgs(args); // `zig build bench -- out.wasm` emits the module
+        const bench_step = b.step("bench", "Run the interpreter microbenchmark (ReleaseFast)");
+        bench_step.dependOn(&run_bench.step);
+    }
+
     // ---- Tests -------------------------------------------------------------
     const mod_tests = b.addTest(.{ .root_module = mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);

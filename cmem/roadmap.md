@@ -79,9 +79,13 @@ read it back via `wasm_memory_data`, and `wasm_memory_grow`. **Deferred:** `wasm
 `examples/deno_ffi.mjs` (run by `zig build ffi-demo`) has **Deno `Deno.dlopen` the DLL and drive the
 standard wasm-c-api** (decode → instantiate → call) → `answer()=42`. This validates the vision's
 "native FFI → the C-ABI shared library" path (the `universalWasmLoader-*` ports themselves are WIT/
-component-model + wasmtime-based, so they're a separate, larger effort). **Next C-ABI step:
-`wasm_table_get`/`set`/`grow` + a `wasm_ref_t` model, then more host-language FFI bindings; then (3) the
-Deno/V8 benchmark.**
+component-model + wasmtime-based, so they're a separate, larger effort). **(3) Deno/V8 benchmark — first
+measurement DONE 2026-07-14** (`zig build bench` + a documented cross-process run; see `testing.md`):
+native wazmrt beats Deno/V8 on **cold-start wall-clock — 2.4× on a trivial call, 1.5× on `sum(1e6)`** —
+because Deno pays ~110 ms of V8 init + JIT + JS marshalling every run while wazmrt's own work is
+sub-µs to tens-of-ms. Steady-state hot-loop throughput ~264 Mops/s (a JIT wins that regime — the
+Option A→B trigger). **The vision's core thesis is confirmed: win short-lived / native FFI, lose
+sustained hot loops.**
 **(3)** the Deno/V8 benchmark. **(4) WASI preview 1** (preview 2/3 deferred until browser-standard, per
 wasmtk). **The function-references proposal is complete** (typed-ref value types, `call_ref`/
 `return_call_ref`/`ref.as_non_null`/`br_on_null`, non-null refs + local-init tracking, P1/P2/P2.5

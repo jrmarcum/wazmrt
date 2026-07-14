@@ -46,6 +46,7 @@ zig build wasm                     # build the runtime itself as a wasm module
 zig build dll                      # C-ABI shared library (for FFI: Deno, ctypes, …)
 zig build c-smoke                  # build + run the C example (needs no external deps)
 zig build ffi-demo                 # build the DLL + run examples/deno_ffi.mjs (needs deno)
+zig build bench                    # interpreter microbenchmark (ReleaseFast)
 ```
 
 The runtime loads over FFI from any host language: `zig build dll` produces a

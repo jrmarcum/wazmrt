@@ -409,6 +409,28 @@ the standard wasm-c-api by symbol (engine/store → `wasm_byte_vec_new` → `was
 `wasm_val_vec`/`wasm_extern_vec` struct plumbing with `DataView` + `Deno.UnsafePointer`, so it exercises
 the real ABI layout, not a convenience shim. Requires `deno` on PATH (2.x; FFI is stable).
 
+## Performance gate — native wazmrt vs Deno/V8 (2026-07-14, first measurement)
+
+The vision's central question (`vision.md`): does native wazmrt beat Deno/V8 on **cold-start wall-clock**
+for short-lived programs, accepting it loses steady-state hot-loop throughput to V8's JIT? **Yes,
+measured.** (Windows dev box; ReleaseFast; PowerShell `Measure-Command`, 40 runs each — process-spawn
+floor included, which both pay.)
+
+- **In-process microbench** (`zig build bench`, ReleaseFast):
+  - **cold** decode + instantiate + call: **~0.93 µs/run** — the runtime's own per-run cost is negligible.
+  - **steady** `sum(1e6)` hot loop: **~30 ns/loop-iter, ~264 Mops/s** (switch interpreter; a JIT is
+    ~10–50× faster here — the Option A→B trigger if a compute-bound workload appears).
+- **Cross-process cold-start** (`wazmrt.exe file.wasm export …` vs `deno run harness.js file.wasm`):
+  - trivial `answer()`: **wazmrt 78 ms/run vs Deno/V8 191 ms/run → 2.4× faster**.
+  - compute `sum(1e6)`: **wazmrt 135 ms/run vs Deno/V8 199 ms/run → 1.5× faster**.
+- **Reading it:** wazmrt's real work is sub-µs (trivial) to tens-of-ms (1e6 loop); the per-run wall-clock
+  is dominated by the OS spawn floor (~78 ms, shared with Deno) plus, for Deno, ~110 ms of V8
+  init + wasm JIT-compile + JS marshalling *every run*. So wazmrt wins the short-lived / compute-light
+  regime — exactly wasmtk's compiler-test outputs. V8 only overtakes once a sustained hot loop is large
+  enough that the interpreter's per-iteration cost exceeds Deno's ~110 ms startup tax (well beyond
+  `sum(1e6)`). **Binary size** (ReleaseFast): CLI exe ~1.13 MB (mostly Zig std + OS glue). Numbers are a
+  first datapoint, not a tuned benchmark — rerun on the target hardware before acting on Option A→B.
+
 ## What this tells the roadmap
 
 1. **First execution milestone = the `module/wasm_mod` corpus + its `.test.json` files** — fully
