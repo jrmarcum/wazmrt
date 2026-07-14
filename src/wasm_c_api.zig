@@ -550,18 +550,27 @@ const HostCallback = struct {
     finalizer: ?Finalizer = null,
 };
 
-/// Backs both `wasm_extern_t*` and `wasm_func_t*`. Either an instance-export
-/// handle (`instance` set) or a standalone host function created by
-/// `wasm_func_new` (`host` + `functype` set, `instance` null).
+/// A standalone host global created by `wasm_global_new`.
+const HostGlobal = struct { value: interp.Value, content: Valkind, mutable: bool };
+
+/// Backs every `wasm_extern_t*` / `wasm_func_t*` / `wasm_global_t*` /
+/// `wasm_table_t*` / `wasm_memory_t*`. Either an instance-export handle
+/// (`instance` set, `index` locates the object in its space) or a standalone
+/// host object created by `wasm_*_new` (one of the `host_*` fields set).
 const Ref = struct {
     kind: Externkind,
     instance: ?*Instance = null,
-    /// Index in the export's kind space (the function index for a func export).
+    /// Index in the export's kind space (function/global/table for exports).
     index: u32 = 0,
     host: ?HostCallback = null,
     /// Owned signature copy for a host function (arg/result conversion).
     functype: ?*FuncType = null,
+    host_global: ?*HostGlobal = null,
+    host_memory: ?*interp.Instance.Memory = null,
+    host_table: ?*interp.Instance.Table = null,
 };
+
+const wasm_page_size: usize = 65536;
 
 const Trap = struct { message: ByteVec };
 
@@ -794,22 +803,37 @@ export fn wasm_instance_new(store: ?*Store, module: ?*const Module, imports: ?*c
     if (trap_out) |t| t.* = null;
     const m = module orelse return null;
 
-    // Build the interpreter's func imports from the supplied externs. The imports
-    // vec aligns with `wasm_module_imports` (import-section order, mixed kinds);
-    // we map each func import to a host trampoline. (Global/table/memory imports
-    // are a later slice — a module needing them will fail to instantiate.)
+    // Map the supplied externs (in `wasm_module_imports` order — mixed kinds) to
+    // the interpreter's per-kind import arrays. Func imports become host
+    // trampolines (`funcs`, borrowed by the instance for its lifetime); global
+    // values are copied in; memories/tables are borrowed shared objects. The
+    // per-kind arrays other than `funcs` are only read during init, so they're
+    // freed right after.
     var host_funcs: std.ArrayList(interp.Instance.HostFunc) = .empty;
+    var gvals: std.ArrayList(interp.Value) = .empty;
+    var mems: std.ArrayList(*interp.Instance.Memory) = .empty;
+    var tbls: std.ArrayList(*interp.Instance.Table) = .empty;
+    defer gvals.deinit(alloc);
+    defer mems.deinit(alloc);
+    defer tbls.deinit(alloc);
     for (m.inner.imports, 0..) |imp, i| {
-        if (imp.type != .func) continue;
         const ext: ?*Ref = if (imports) |v| (if (i < v.size) v.data[i] else null) else null;
-        const hf: interp.Instance.HostFunc = if (ext != null and ext.?.host != null)
-            .{ .native_env = .{ .ctx = ext.?, .call = hostTrampoline } }
-        else
-            .{ .native_env = .{ .ctx = &unbacked_marker, .call = unbackedTrap } };
-        host_funcs.append(alloc, hf) catch {
-            host_funcs.deinit(alloc);
-            return null;
-        };
+        switch (imp.type) {
+            .func => {
+                const hf: interp.Instance.HostFunc = if (ext != null and ext.?.host != null)
+                    .{ .native_env = .{ .ctx = ext.?, .call = hostTrampoline } }
+                else
+                    .{ .native_env = .{ .ctx = &unbacked_marker, .call = unbackedTrap } };
+                host_funcs.append(alloc, hf) catch return null;
+            },
+            .global => gvals.append(alloc, if (ext) |e| (if (e.host_global) |hg| hg.value else 0) else 0) catch return null,
+            .memory => if (ext) |e| {
+                if (e.host_memory) |mem| mems.append(alloc, mem) catch return null;
+            },
+            .table => if (ext) |e| {
+                if (e.host_table) |tbl| tbls.append(alloc, tbl) catch return null;
+            },
+        }
     }
 
     const wi = alloc.create(Instance) catch {
@@ -822,7 +846,12 @@ export fn wasm_instance_new(store: ?*Store, module: ?*const Module, imports: ?*c
         return null;
     };
     wi.host_funcs = funcs;
-    wi.inst = root.Instance.initWithImports(alloc, &m.inner, .{ .funcs = funcs }) catch |e| {
+    wi.inst = root.Instance.initWithImports(alloc, &m.inner, .{
+        .funcs = funcs,
+        .globals = gvals.items,
+        .memories = mems.items,
+        .tables = tbls.items,
+    }) catch |e| {
         alloc.free(funcs);
         alloc.destroy(wi);
         if (trap_out) |t| t.* = makeTrap(@errorName(e));
@@ -865,12 +894,16 @@ export fn wasm_extern_kind(e: ?*const Ref) Externkind {
 
 export fn wasm_extern_type(e: ?*const Ref) ?*anyopaque {
     const r = e orelse return null;
-    if (r.kind != EXTERN_FUNC) return null; // only func externs are typed today
-    if (r.instance) |wi| {
-        const ft = wi.inst.module.funcType(r.index) orelse return null;
-        return makeExternType(.{ .func = ft });
+    switch (r.kind) {
+        EXTERN_FUNC => {
+            if (r.instance) |wi| return makeExternType(.{ .func = wi.inst.module.funcType(r.index) orelse return null });
+            return @ptrCast(copyFuncType(r.functype));
+        },
+        EXTERN_GLOBAL => return @ptrCast(wasm_global_type(r)),
+        EXTERN_TABLE => return @ptrCast(wasm_table_type(r)),
+        EXTERN_MEMORY => return @ptrCast(wasm_memory_type(r)),
+        else => return null,
     }
-    return @ptrCast(copyFuncType(r.functype)); // host func
 }
 
 export fn wasm_extern_as_func(e: ?*Ref) ?*Ref {
@@ -889,6 +922,51 @@ export fn wasm_func_as_extern(f: ?*Ref) ?*Ref {
 
 export fn wasm_func_as_extern_const(f: ?*const Ref) ?*const Ref {
     return f;
+}
+
+fn asKind(e: ?*Ref, want: Externkind) ?*Ref {
+    const r = e orelse return null;
+    return if (r.kind == want) r else null;
+}
+
+export fn wasm_extern_as_global(e: ?*Ref) ?*Ref {
+    return asKind(e, EXTERN_GLOBAL);
+}
+export fn wasm_extern_as_table(e: ?*Ref) ?*Ref {
+    return asKind(e, EXTERN_TABLE);
+}
+export fn wasm_extern_as_memory(e: ?*Ref) ?*Ref {
+    return asKind(e, EXTERN_MEMORY);
+}
+export fn wasm_extern_as_global_const(e: ?*const Ref) ?*const Ref {
+    const r = e orelse return null;
+    return if (r.kind == EXTERN_GLOBAL) r else null;
+}
+export fn wasm_extern_as_table_const(e: ?*const Ref) ?*const Ref {
+    const r = e orelse return null;
+    return if (r.kind == EXTERN_TABLE) r else null;
+}
+export fn wasm_extern_as_memory_const(e: ?*const Ref) ?*const Ref {
+    const r = e orelse return null;
+    return if (r.kind == EXTERN_MEMORY) r else null;
+}
+export fn wasm_global_as_extern(g: ?*Ref) ?*Ref {
+    return g;
+}
+export fn wasm_table_as_extern(t: ?*Ref) ?*Ref {
+    return t;
+}
+export fn wasm_memory_as_extern(m: ?*Ref) ?*Ref {
+    return m;
+}
+export fn wasm_global_as_extern_const(g: ?*const Ref) ?*const Ref {
+    return g;
+}
+export fn wasm_table_as_extern_const(t: ?*const Ref) ?*const Ref {
+    return t;
+}
+export fn wasm_memory_as_extern_const(m: ?*const Ref) ?*const Ref {
+    return m;
 }
 
 // ---- Functions ------------------------------------------------------------
@@ -952,6 +1030,216 @@ export fn wasm_func_call(func: ?*const Ref, args: ?*const ValVec, results: ?*Val
         for (0..m) |i| out.data[i] = slotToVal(ft.results[i], res[i]);
     }
     return null; // success
+}
+
+// ---- Globals --------------------------------------------------------------
+
+fn valTypeFromKind(k: Valkind) types.ValType {
+    return switch (k) {
+        0 => .i32,
+        1 => .i64,
+        2 => .f32,
+        3 => .f64,
+        129 => .funcref,
+        else => .externref,
+    };
+}
+
+/// The storage slot of a global (instance export or standalone host global).
+fn globalStorage(r: *Ref) ?*interp.Value {
+    if (r.instance) |wi| return if (r.index < wi.inst.globals.len) &wi.inst.globals[r.index] else null;
+    if (r.host_global) |hg| return &hg.value;
+    return null;
+}
+fn globalKind(r: *const Ref) Valkind {
+    if (r.instance) |wi| return if (r.index < wi.inst.module.globals.len) valkindOf(wi.inst.module.globals[r.index].content) else 0;
+    return if (r.host_global) |hg| hg.content else 0;
+}
+fn globalMutable(r: *const Ref) bool {
+    if (r.instance) |wi| return r.index < wi.inst.module.globals.len and wi.inst.module.globals[r.index].mutable;
+    return if (r.host_global) |hg| hg.mutable else false;
+}
+
+export fn wasm_global_new(store: ?*Store, gt: ?*const GlobalType, val: ?*const Val) ?*Ref {
+    _ = store;
+    const g = gt orelse return null;
+    const hg = alloc.create(HostGlobal) catch return null;
+    hg.* = .{
+        .value = if (val) |v| valToSlot(v.*) else 0,
+        .content = if (g.content) |c| c.kind else 0,
+        .mutable = g.mutability != 0,
+    };
+    const r = alloc.create(Ref) catch {
+        alloc.destroy(hg);
+        return null;
+    };
+    r.* = .{ .kind = EXTERN_GLOBAL, .host_global = hg };
+    return r;
+}
+
+export fn wasm_global_get(g: ?*const Ref, out: ?*Val) void {
+    const o = out orelse return;
+    const r = @constCast(g orelse {
+        o.* = .{ .kind = 0, .of = .{ .i32 = 0 } };
+        return;
+    });
+    const s = globalStorage(r) orelse {
+        o.* = .{ .kind = 0, .of = .{ .i32 = 0 } };
+        return;
+    };
+    o.* = slotToValKind(globalKind(r), s.*);
+}
+
+export fn wasm_global_set(g: ?*Ref, val: ?*const Val) void {
+    const r = g orelse return;
+    if (!globalMutable(r)) return;
+    const s = globalStorage(r) orelse return;
+    if (val) |v| s.* = valToSlot(v.*);
+}
+
+export fn wasm_global_type(g: ?*const Ref) ?*GlobalType {
+    const r = g orelse return null;
+    const ext = makeExternType(.{ .global = .{ .content = valTypeFromKind(globalKind(r)), .mutable = globalMutable(r) } }) orelse return null;
+    return @ptrCast(@alignCast(ext));
+}
+
+export fn wasm_global_delete(g: ?*Ref) void {
+    const r = g orelse return;
+    if (r.instance != null) return; // export handle: freed by the extern vec
+    if (r.host_global) |hg| alloc.destroy(hg);
+    alloc.destroy(r);
+}
+
+// ---- Memories -------------------------------------------------------------
+
+fn memObj(r: *const Ref) ?*interp.Instance.Memory {
+    if (r.instance) |wi| return wi.inst.memory; // MVP: single memory (index 0)
+    return r.host_memory;
+}
+
+export fn wasm_memory_new(store: ?*Store, mt: ?*const MemoryType) ?*Ref {
+    _ = store;
+    const t = mt orelse return null;
+    const bytes = alloc.alloc(u8, @as(usize, t.limits.min) * wasm_page_size) catch return null;
+    @memset(bytes, 0);
+    const mem = alloc.create(interp.Instance.Memory) catch {
+        alloc.free(bytes);
+        return null;
+    };
+    mem.* = .{ .bytes = bytes, .max = if (t.limits.max == 0xffff_ffff) null else t.limits.max };
+    const r = alloc.create(Ref) catch {
+        alloc.free(bytes);
+        alloc.destroy(mem);
+        return null;
+    };
+    r.* = .{ .kind = EXTERN_MEMORY, .host_memory = mem };
+    return r;
+}
+
+export fn wasm_memory_data(m: ?*Ref) [*c]u8 {
+    const r = m orelse return null;
+    return (memObj(r) orelse return null).bytes.ptr;
+}
+
+export fn wasm_memory_data_size(m: ?*const Ref) usize {
+    const r = m orelse return 0;
+    return (memObj(r) orelse return 0).bytes.len;
+}
+
+export fn wasm_memory_size(m: ?*const Ref) u32 {
+    const r = m orelse return 0;
+    return @intCast((memObj(r) orelse return 0).bytes.len / wasm_page_size);
+}
+
+export fn wasm_memory_grow(m: ?*Ref, delta: u32) bool {
+    const r = m orelse return false;
+    const mem = memObj(r) orelse return false;
+    const old_len = mem.bytes.len;
+    const old_pages: u32 = @intCast(old_len / wasm_page_size);
+    const new_pages = @as(u64, old_pages) + delta;
+    const max = mem.max orelse 0x1_0000; // wasm32: at most 65536 pages
+    if (new_pages > max) return false;
+    const grown = alloc.realloc(mem.bytes, @as(usize, @intCast(new_pages)) * wasm_page_size) catch return false;
+    @memset(grown[old_len..], 0);
+    mem.bytes = grown;
+    return true;
+}
+
+export fn wasm_memory_type(m: ?*const Ref) ?*MemoryType {
+    const r = m orelse return null;
+    const mem = memObj(r) orelse return null;
+    const min: u32 = @intCast(mem.bytes.len / wasm_page_size);
+    const ext = makeExternType(.{ .memory = .{ .limits = .{ .min = min, .max = mem.max } } }) orelse return null;
+    return @ptrCast(@alignCast(ext));
+}
+
+export fn wasm_memory_delete(m: ?*Ref) void {
+    const r = m orelse return;
+    if (r.instance != null) return; // export handle: interp owns the memory
+    if (r.host_memory) |mem| {
+        alloc.free(mem.bytes);
+        alloc.destroy(mem);
+    }
+    alloc.destroy(r);
+}
+
+// ---- Tables ---------------------------------------------------------------
+// new/type/size + the extern casts. Element get/set/grow need a `wasm_ref_t`
+// object model (funcref/externref handles), which is a later slice.
+
+fn tableObj(r: *const Ref) ?*interp.Instance.Table {
+    if (r.instance) |wi| return if (r.index < wi.inst.tables.len) wi.inst.tables[r.index] else null;
+    return r.host_table;
+}
+
+export fn wasm_table_new(store: ?*Store, tt: ?*const TableType, init: ?*Ref) ?*Ref {
+    _ = store;
+    _ = init; // entries start uninitialized (null) — typed-init is a later slice
+    const t = tt orelse return null;
+    const entries = alloc.alloc(interp.Value, t.limits.min) catch return null;
+    @memset(entries, std.math.maxInt(u64)); // null_ref
+    const tbl = alloc.create(interp.Instance.Table) catch {
+        alloc.free(entries);
+        return null;
+    };
+    tbl.* = .{ .entries = entries, .max = if (t.limits.max == 0xffff_ffff) null else t.limits.max };
+    const r = alloc.create(Ref) catch {
+        alloc.free(entries);
+        alloc.destroy(tbl);
+        return null;
+    };
+    r.* = .{ .kind = EXTERN_TABLE, .host_table = tbl };
+    return r;
+}
+
+export fn wasm_table_size(t: ?*const Ref) u32 {
+    const r = t orelse return 0;
+    return @intCast((tableObj(r) orelse return 0).entries.len);
+}
+
+export fn wasm_table_type(t: ?*const Ref) ?*TableType {
+    const r = t orelse return null;
+    var elem: types.ValType = .funcref;
+    var maxv: ?u32 = null;
+    if (r.instance) |wi| {
+        if (r.index < wi.inst.module.tables.len) {
+            elem = wi.inst.module.tables[r.index].element;
+            maxv = wi.inst.module.tables[r.index].limits.max;
+        }
+    } else if (r.host_table) |tbl| maxv = tbl.max;
+    const min: u32 = @intCast((tableObj(r) orelse return null).entries.len);
+    const ext = makeExternType(.{ .table = .{ .element = elem, .limits = .{ .min = min, .max = maxv } } }) orelse return null;
+    return @ptrCast(@alignCast(ext));
+}
+
+export fn wasm_table_delete(t: ?*Ref) void {
+    const r = t orelse return;
+    if (r.instance != null) return; // export handle: interp owns the table
+    if (r.host_table) |tbl| {
+        alloc.free(tbl.entries);
+        alloc.destroy(tbl);
+    }
+    alloc.destroy(r);
 }
 
 // ---- Traps ----------------------------------------------------------------

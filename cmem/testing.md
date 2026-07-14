@@ -392,9 +392,12 @@ decode + import/export introspection (unchanged), then **instantiate a no-import
 exports → `wasm_extern_as_func` → `wasm_func_call(40, 2)` → `42`**, plus the bad-magic reject. It also
 covers **host-function imports**: build a `wasm_functype_new` + `wasm_func_new(host_add)`, pass it in the
 imports vec to `wasm_instance_new`, and call a `run` whose body is `call $env.add` → `run(40,2)=42`
-through the C callback. Prints `OK`, exit 0. Gotcha caught while writing it: a code-section entry must
-start with the **locals-count byte** (`00` for none) before the instructions, else the decoder reads an
-opcode as a local type (`BadValType`).
+through the C callback. It also covers **exported global + memory** objects: a module exporting a
+`(mut i32)` global, a memory, and a `store` func — from C, `wasm_global_get`→7, `wasm_global_set`→99,
+call `store(0, 0x12345678)`, read it back via `wasm_memory_data`, and `wasm_memory_grow` (1→2 pages).
+Prints `OK`, exit 0. Gotcha caught while writing it: a code-section entry must start with the
+**locals-count byte** (`00` for none) before the instructions, else the decoder reads an opcode as a
+local type (`BadValType`).
 
 ## What this tells the roadmap
 

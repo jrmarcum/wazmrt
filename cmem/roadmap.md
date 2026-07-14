@@ -69,9 +69,13 @@ end-to-end (`tests/c_smoke.c`, run by `zig build c-smoke`: `add(40,2)=42`). **Ho
 DONE 2026-07-14**: `wasm_func_new[_with_env]` + `wasm_functype_new` + `wasm_valtype_vec_*`; a new interp
 `HostFunc.native_env` variant + a C `hostTrampoline` bridge a module's func import to a C callback
 (`error.HostTrap` on a returned trap). Verified: a module whose body is `call $env.add` returns
-`run(40,2)=42` through a host callback. **Next C-ABI step: global/table/memory runtime objects**
-(`wasm_global_get/set`, `wasm_table_*`, `wasm_memory_*` — so modules importing/exporting those work),
-then the first `universalWasmLoader-*` integration.
+`run(40,2)=42` through a host callback. **Global/table/memory runtime objects DONE 2026-07-14**:
+`wasm_global_new`/`get`/`set`/`type`, `wasm_memory_new`/`data`/`size`/`grow`/`type`, `wasm_table_new`/
+`type`/`size`, all extern↔object casts, and import wiring for globals (value-copy) / memories+tables
+(shared object). Verified from C: read/write an exported global, `store` into an exported memory then
+read it back via `wasm_memory_data`, and `wasm_memory_grow`. **Deferred:** `wasm_table_get`/`set`/`grow`
+(need a `wasm_ref_t` model) and shared-mutable imported globals. **Next C-ABI step: the first
+`universalWasmLoader-*` integration** (prove the static lib loads from a host language end-to-end).
 **(3)** the Deno/V8 benchmark. **(4) WASI preview 1** (preview 2/3 deferred until browser-standard, per
 wasmtk). **The function-references proposal is complete** (typed-ref value types, `call_ref`/
 `return_call_ref`/`ref.as_non_null`/`br_on_null`, non-null refs + local-init tracking, P1/P2/P2.5

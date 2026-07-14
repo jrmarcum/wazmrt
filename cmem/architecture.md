@@ -128,6 +128,11 @@ adds only the wazmrt handshake.
                            wasm_extern_vec_* / wasm_func_delete
 /* host funcs (imports) */ wasm_func_new[_with_env], wasm_functype_new,
                            wasm_valtype_vec_new[_empty|_uninitialized]/_copy/_delete
+/* globals */              wasm_global_new/type/get/set/delete, extern<->global casts
+/* memories */             wasm_memory_new/type/data/data_size/size/grow/delete,
+                           extern<->memory casts
+/* tables */               wasm_table_new/type/size/delete, extern<->table casts
+                           (get/set/grow need a wasm_ref_t model — a later slice)
 /* traps */                wasm_trap_new/message/delete
 /* wazmrt extension */     wazmrt_abi_version(void), wazmrt_version_string(void)
 ```
@@ -155,10 +160,20 @@ stub. The C `Instance` wrapper owns the `HostFunc` slice (interp borrows it); th
 host funcs alive until after `wasm_instance_delete`. **Verified from C** (`zig build c-smoke`):
 `run(40,2)` whose body is `call $env.add` returns 42 through the host callback.
 
-**Deferred:** global/table/memory *runtime objects* and `wasm_global_get/set` / `wasm_table_*` /
-`wasm_memory_*` (a module importing those still fails to instantiate); type `_copy` constructors;
-module sharable-ref extras. An undefined symbol in a static lib only errors if a consumer references it,
-so partial implementation is honest and safe.
+**Global / table / memory runtime objects (DONE 2026-07-14).** The internal `Ref` now backs these too —
+either an instance-export handle (`instance` + `index` locate the object in `inst.globals`/`inst.memory`/
+`inst.tables`) or a standalone host object from `wasm_*_new` (`host_global`/`host_memory`/`host_table`).
+`wasm_instance_new` maps every import kind: func → host trampoline, **global → value copied in, memory/
+table → borrowed shared object** (`interp.Imports.globals`/`memories`/`tables`). Globals: `_get`/`_set`
+(mutability-checked) read/write the live slot. Memory: `_data`/`_data_size`/`_size`/`_grow` on the shared
+`Instance.Memory` — growing an *exported* memory reallocs the interp's shared bytes, so the running module
+observes it. **Verified from C** (`zig build c-smoke`): read/write an exported global, `store` into memory
+then read it back via `wasm_memory_data`, and `wasm_memory_grow`. **Deferred:** `wasm_table_get`/`_set`/
+`_grow` (need a `wasm_ref_t` funcref/externref object model); a *shared mutable* imported global (the
+interpreter value-copies imported globals rather than sharing a pointer, so post-instantiation
+`wasm_global_set` on the host global doesn't reach the instance); type `_copy` constructors; module
+sharable-ref extras. An undefined symbol in a static lib only errors if a consumer references it, so
+partial implementation is honest and safe.
 
 **Conventions (from the standard):** opaque `struct wasm_*_t*` handles; `own`/delete ownership; vectors
 are `{ size_t size; T* data; }` the caller owns. **Windows:** consumers compile with `-DLIBWASM_STATIC`

@@ -237,6 +237,76 @@ int main(void) {
     }
     wasm_byte_vec_delete(&impbin);
 
+    /*
+     * Exported global + memory: read/write the module's state from C.
+     *   (global (export "g") (mut i32) (i32.const 7))
+     *   (memory (export "mem") 1)
+     *   (func (export "store") (param i32 i32) (i32.store (local.get 0) (local.get 1)))
+     */
+    const unsigned char gmmod[] = {
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x06, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x00,       /* type (i32,i32)->() */
+        0x03, 0x02, 0x01, 0x00,                               /* func 0 : type 0    */
+        0x05, 0x03, 0x01, 0x00, 0x01,                         /* memory min 1       */
+        0x06, 0x06, 0x01, 0x7f, 0x01, 0x41, 0x07, 0x0b,       /* global (mut i32)=7 */
+        0x07, 0x13, 0x03, 0x01, 'g', 0x03, 0x00,              /* export g   global 0*/
+        0x03, 'm', 'e', 'm', 0x02, 0x00,                      /* export mem memory 0*/
+        0x05, 's', 't', 'o', 'r', 'e', 0x00, 0x00,            /* export store func 0*/
+        0x0a, 0x0b, 0x01, 0x09, 0x00, 0x20, 0x00, 0x20, 0x01, 0x36, 0x02, 0x00, 0x0b, /* code */
+    };
+    wasm_byte_vec_t gmbin;
+    wasm_byte_vec_new(&gmbin, sizeof(gmmod), (const wasm_byte_t *)gmmod);
+    wasm_module_t *gmmodule = wasm_module_new(store, &gmbin);
+    if (!gmmodule) {
+        printf("FAIL: global/memory module decode\n");
+        failures++;
+    } else {
+        wasm_extern_vec_t noimp2;
+        wasm_extern_vec_new_empty(&noimp2);
+        wasm_instance_t *gi = wasm_instance_new(store, gmmodule, &noimp2, NULL);
+        wasm_extern_vec_t gex;
+        wasm_instance_exports(gi, &gex);
+        /* export order matches the export section: g, mem, store */
+        wasm_global_t *g = wasm_extern_as_global(gex.data[0]);
+        wasm_memory_t *mem = wasm_extern_as_memory(gex.data[1]);
+        wasm_func_t *storefn = wasm_extern_as_func(gex.data[2]);
+
+        wasm_val_t gv;
+        wasm_global_get(g, &gv);
+        printf("global g:        %d\n", gv.of.i32);
+        if (gv.of.i32 != 7) failures++;
+        wasm_val_t nv;
+        nv.kind = WASM_I32; nv.of.i32 = 99;
+        wasm_global_set(g, &nv);
+        wasm_global_get(g, &gv);
+        if (gv.of.i32 != 99) failures++;
+
+        wasm_val_t sa[2];
+        sa[0].kind = WASM_I32; sa[0].of.i32 = 0;
+        sa[1].kind = WASM_I32; sa[1].of.i32 = 0x12345678;
+        wasm_val_vec_t sargs, sres;
+        wasm_val_vec_new(&sargs, 2, sa);
+        wasm_val_vec_new_empty(&sres);
+        wasm_func_call(storefn, &sargs, &sres);
+
+        byte_t *data = wasm_memory_data(mem);
+        int32_t mv = 0;
+        memcpy(&mv, data, 4);
+        printf("mem[0]:          0x%08x (size=%u)\n", (unsigned)mv, wasm_memory_size(mem));
+        if ((unsigned)mv != 0x12345678u) failures++;
+
+        bool grew = wasm_memory_grow(mem, 1);
+        printf("mem grow +1:     %s (size=%u)\n", grew ? "ok" : "no", wasm_memory_size(mem));
+        if (!grew || wasm_memory_size(mem) != 2) failures++;
+
+        wasm_val_vec_delete(&sargs);
+        wasm_val_vec_delete(&sres);
+        wasm_extern_vec_delete(&gex);
+        wasm_instance_delete(gi);
+        wasm_module_delete(gmmodule);
+    }
+    wasm_byte_vec_delete(&gmbin);
+
     /* Negative: a bad magic must fail to validate. */
     const unsigned char bad[] = { 'n', 'o', 'p', 'e', 1, 0, 0, 0 };
     wasm_byte_vec_t badv;

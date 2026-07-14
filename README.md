@@ -84,10 +84,11 @@ Implemented today: engine/store/config lifecycle, byte vectors, module
 (`wasm_module_imports`/`exports` + the `valtype`/`functype`/`externtype`/
 `importtype`/`exporttype` object system), **instantiate + call**
 (`wasm_instance_new`/`exports`, `wasm_extern_as_func`, `wasm_func_call`,
-`wasm_val_t`, `wasm_trap_*`), and **host-function imports**
+`wasm_val_t`, `wasm_trap_*`), **host-function imports**
 (`wasm_func_new`/`wasm_functype_new` — supply a C callback for a module's
-imported function). Global/table/memory runtime objects follow next.
-`zig build c-smoke` builds and runs the C example.
+imported function), and **global/table/memory objects** (`wasm_global_get`/
+`set`, `wasm_memory_data`/`size`/`grow`, `wasm_table_size`, `wasm_*_new` for
+imports). `zig build c-smoke` builds and runs the C example.
 On Windows, compile consumers with `-DLIBWASM_STATIC` (wazmrt ships a static
 library). See [`tests/c_smoke.c`](tests/c_smoke.c) for a complete example.
 
