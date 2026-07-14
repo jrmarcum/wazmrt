@@ -38,13 +38,12 @@ Third pass (commit `c535de0`):
   `br_table` label *value types* (not just arity) even in polymorphic code. Verified empirically —
   different-typed labels are rejected, same-typed accepted. No change needed.
 
-**The audit ledger is effectively cleared (2026-07-13): #1–#7, #9, #10, #12–#16 are resolved.** The
-only remainders are two LOW cosmetic gaps that **no test exercises and that fail loud (never wrong
-bytes)**: #8's non-power-of-two `align=` assembler check (over-natural alignment is already validated),
-and #11's defined-table inline `(export …)`. No open correctness/soundness/dead-code items remain. The
-real frontiers are new *features*, not ledger debt: invoke-by-module-name in the WAST runner (blocks
-more of `linking.wast`), growing the wasm-c-api past introspection, and WASI. Larger out-of-scope
-proposals surfaced by the suite: **multi-memory** (`start0`) and exception-handling **tags** (`imports`).
+**The audit ledger is cleared (2026-07-13): #1–#10 and #12–#16 are resolved.** The only remainder is
+**#11** — a *defined*-table inline `(export …)` — LOW, fails loud (never wrong bytes), and the imported-
+table case is already done. No open correctness/soundness/dead-code items remain. The real frontiers are
+new *features*, not ledger debt: invoke-by-module-name in the WAST runner (blocks more of
+`linking.wast`), growing the wasm-c-api past introspection, and WASI. Larger out-of-scope proposals
+surfaced by the suite: **multi-memory** (`start0`) and exception-handling **tags** (`imports`).
 
 ## Grouped by the integration that trips them
 
@@ -53,17 +52,14 @@ proposals surfaced by the suite: **multi-memory** (`start0`) and exception-handl
   shared `Memory`/`Table` objects; stage 3 link-time import type-checking + `assert_unlinkable`. #4
   (non-spectest imported global → 0) **also resolved** by stage 3. Only #10 (global index order, LOW)
   remains in this group. `imports.wast` 26 → **132**.
-- **`assert_invalid` / `assert_malformed` support in the WAST runner**: #2 (validator
-  over-acceptance, all sub-items), #7 (const-expr `global.get` strictness), #6 (invalid valtype byte),
-  #8 (`align=` non-power-of-two). These are *soundness / spec-strictness* gaps — invisible until the
-  runner actually executes the negative tests (today they're counted as `skipped`).
+- **`assert_invalid` / `assert_malformed` support in the WAST runner**: #2, #6, #7, #8 — **all DONE**.
+  These were *soundness / spec-strictness* gaps; the runner now executes the negative tests.
 - **Start-function support**: #3 **DONE** (`07dd244`).
 - **Host externref values** (embedding API passes real externrefs): #9 **DONE** (`994ee23`) — externrefs
   are boxed to non-sentinel handles.
 - **Arbitrary / hand-written WAT** (beyond the testsuite's shape): #10 **DONE** (`3a50f75`, import-after-
-  def rejected); #12 (const-expr section ordering) **DONE** (`e500a51`); #11 PARTIAL (defined-table inline
-  `(export …)` still fails loud). The old #12 "`align=` malformed" note was a mislabel — `align=`
-  non-power-of-two is #8 (LOW, still open, no test exercises it).
+  def rejected); #12 (const-expr section ordering) **DONE** (`e500a51`); #8 (`align=` non-power-of-two)
+  **DONE** (`00bceb4`); #11 PARTIAL (defined-table inline `(export …)` still fails loud).
 - **Test fidelity, always-on**: #5 (`assert_trap`) **DONE**.
 - **Dead code / duplication**: #13 **DONE** (`78647f6`).
 
@@ -145,10 +141,11 @@ which *do* guard). **Surfaces when:** `assert_malformed` support, or any untrust
 const-expr `global.get` to *imported* globals. Bounds-checked, so no crash/wrong-value — a strictness
 gap only. **Surfaces when:** `assert_invalid` support.
 
-### #8 — `align=` non-power-of-two silently `@ctz`'d — LOW
-`src/wat.zig` — `emitMemArg` (~911): `align_log2 = @ctz(bytes)` with no power-of-two check, so
-`align=3` encodes `@ctz(3)=0` instead of erroring. **Surfaces when:** malformed hand-written WAT or
-`assert_malformed`. **Fix:** reject non-power-of-two alignment.
+### #8 — `align=` non-power-of-two silently `@ctz`'d — **RESOLVED (`00bceb4`, 2026-07-13)**
+`emitMemArg` now rejects a zero or non-power-of-two `align=` with `error.BadImmediate` before the
+`@ctz` (§6.5.8), instead of encoding a bogus log2 (`align=3` → 0, `align=0` → 32). No conformance delta
+(the testsuite's `align=0`/`align=7` cases arrive via `(module quote …)`, still `BadCommand`); verified
+directly + new `expectInvalid` unit cases. Over-natural alignment was already a validation error.
 
 ### #9 — externref/`null_ref` sentinel collision — **RESOLVED (`994ee23`, 2026-07-13)**
 The value stack is untyped `u64` with `null_ref = maxInt(u64)`; a host externref payload could equal it

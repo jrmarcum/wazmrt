@@ -268,9 +268,9 @@ Robustness/cleanup fixes with no conformance delta (all HEAD-identical): #9 boxe
 payload collides with `null_ref` (+2 new unit tests: externref-sentinel round-trip, import-after-def
 rejection); #10 rejects import-after-definition (`error.ImportAfterDefinition`) instead of silently
 mis-indexing; #12 pre-encodes the const-expr sections before the type section (byte-identical output);
-#13 removes the `funcTypeOf` duplicate + a redundant export re-resolution. **67 unit tests.** The
-2026-07-09 audit ledger is now effectively cleared — only #8 (non-power-of-two `align=`) and #11
-(defined-table inline export) remain, both LOW, fail-loud, and untested by the suite.
+#13 removes the `funcTypeOf` duplicate + a redundant export re-resolution; #8 (`00bceb4`) rejects a
+zero/non-power-of-two `align=` in the assembler. **67 unit tests.** The 2026-07-09 audit ledger is now
+cleared — only #11 (defined-table inline export) remains, LOW, fail-loud, and untested by the suite.
 
 ## What this tells the roadmap
 
