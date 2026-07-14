@@ -332,6 +332,14 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     var bodies: List([]const u8) = .empty;
     for (funcs.items) |f| try bodies.append(a, try encodeBody(a, f, func_names.items, &sigs, type_names.items, global_names.items, table_names.items, elem_names.items));
 
+    // Pre-encode every const-expr-bearing section (global inits, element and data
+    // exprs/offsets) BEFORE the type section, mirroring the function-body path, so
+    // any signature they might intern lands in section 1. Const-exprs can't intern
+    // a signature today, but this keeps the invariant structural, not incidental.
+    const global_pay = try encodeGlobalSection(a, globals.items, &sigs, type_names.items, global_names.items);
+    const elem_pay = try encodeElementSection(a, elems.items, &sigs, type_names.items, global_names.items, func_names.items);
+    const data_pay = try encodeDataSection(a, datas.items, &sigs, type_names.items, global_names.items);
+
     var out: List(u8) = .empty;
     try out.appendSlice(a, &.{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 }); // header
 
@@ -404,17 +412,8 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         try emitLimits(a, &s, mn, mem_max);
         try emitSection(a, &out, 5, s.items);
     }
-    // Global section (6)
-    if (globals.items.len != 0) {
-        var s: List(u8) = .empty;
-        try uleb(a, &s, globals.items.len);
-        for (globals.items) |g| {
-            try s.append(a, @intFromEnum(g.valtype));
-            try s.append(a, if (g.mutable) 0x01 else 0x00);
-            try emitConstExpr(a, &s, &sigs, type_names.items, global_names.items, g.init);
-        }
-        try emitSection(a, &out, 6, s.items);
-    }
+    // Global section (6) — pre-encoded above (before the type section).
+    if (globals.items.len != 0) try emitSection(a, &out, 6, global_pay);
     // Export section (7)
     if (exports.items.len != 0) {
         var s: List(u8) = .empty;
@@ -432,42 +431,8 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         try uleb(a, &s, try resolveByName(func_names.items, ref));
         try emitSection(a, &out, 8, s.items);
     }
-    // Element section (9) — all 8 flag variants (active/passive/declarative ×
-    // func-index/const-expr forms).
-    if (elems.items.len != 0) {
-        var s: List(u8) = .empty;
-        try uleb(a, &s, elems.items.len);
-        for (elems.items) |e| {
-            // flag bits: bit0 = passive/declarative, bit1 = declarative-or-explicit-table,
-            // bit2 = const-expr form.
-            const explicit_table = e.mode == .active and e.table_index != 0;
-            var flag: u8 = 0;
-            switch (e.mode) {
-                .active => flag |= if (explicit_table) 0b010 else 0,
-                .passive => flag |= 0b001,
-                .declarative => flag |= 0b011,
-            }
-            if (e.expr_form) flag |= 0b100;
-            try s.append(a, flag);
-            if (explicit_table) try uleb(a, &s, e.table_index);
-            if (e.mode == .active) try emitOffsetExpr(a, &s, &sigs, type_names.items, global_names.items, e.offset_form);
-            // The leading kind byte: elemkind (0x00) for non-flag-0 func-index
-            // variants, reftype for non-flag-4 const-expr variants.
-            if (!e.expr_form and flag != 0) {
-                try s.append(a, 0x00); // elemkind funcref
-            } else if (e.expr_form and flag != 4) {
-                try s.append(a, @intFromEnum(e.elem_type)); // reftype
-            }
-            if (e.expr_form) {
-                try uleb(a, &s, e.exprs.len);
-                for (e.exprs) |ex| try emitElementExpr(a, &s, &sigs, type_names.items, global_names.items, func_names.items, ex);
-            } else {
-                try uleb(a, &s, e.funcs.len);
-                for (e.funcs) |ref| try uleb(a, &s, try resolveByName(func_names.items, ref));
-            }
-        }
-        try emitSection(a, &out, 9, s.items);
-    }
+    // Element section (9) — pre-encoded above (before the type section).
+    if (elems.items.len != 0) try emitSection(a, &out, 9, elem_pay);
     // Code section (10) — pre-encoded bodies
     {
         var s: List(u8) = .empty;
@@ -478,24 +443,82 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         }
         try emitSection(a, &out, 10, s.items);
     }
-    // Data section (11)
-    if (datas.items.len != 0) {
-        var s: List(u8) = .empty;
-        try uleb(a, &s, datas.items.len);
-        for (datas.items) |seg| {
-            if (seg.offset_form == null) {
-                try s.append(a, 0x01); // passive
-            } else {
-                try s.append(a, 0x00); // active, memory 0
-                try emitOffsetExpr(a, &s, &sigs, type_names.items, global_names.items, seg.offset_form);
-            }
-            try uleb(a, &s, seg.bytes.len);
-            try s.appendSlice(a, seg.bytes);
-        }
-        try emitSection(a, &out, 11, s.items);
-    }
+    // Data section (11) — pre-encoded above (before the type section).
+    if (datas.items.len != 0) try emitSection(a, &out, 11, data_pay);
 
     return out.items;
+}
+
+/// Encode the global section (6) payload: `(valtype, mut, init-const-expr)` per
+/// global. Const-exprs are encoded here (pre-type-section) so any interning lands
+/// in section 1.
+fn encodeGlobalSection(a: std.mem.Allocator, globals: []const GlobalDef, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8) Error![]const u8 {
+    if (globals.len == 0) return &.{};
+    var s: List(u8) = .empty;
+    try uleb(a, &s, globals.len);
+    for (globals) |g| {
+        try s.append(a, @intFromEnum(g.valtype));
+        try s.append(a, if (g.mutable) 0x01 else 0x00);
+        try emitConstExpr(a, &s, sigs, type_names, global_names, g.init);
+    }
+    return s.items;
+}
+
+/// Encode the element section (9) payload — all 8 flag variants
+/// (active/passive/declarative × func-index/const-expr forms).
+fn encodeElementSection(a: std.mem.Allocator, elems: []const ElemDef, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8) Error![]const u8 {
+    if (elems.len == 0) return &.{};
+    var s: List(u8) = .empty;
+    try uleb(a, &s, elems.len);
+    for (elems) |e| {
+        // flag bits: bit0 = passive/declarative, bit1 = declarative-or-explicit-table,
+        // bit2 = const-expr form.
+        const explicit_table = e.mode == .active and e.table_index != 0;
+        var flag: u8 = 0;
+        switch (e.mode) {
+            .active => flag |= if (explicit_table) 0b010 else 0,
+            .passive => flag |= 0b001,
+            .declarative => flag |= 0b011,
+        }
+        if (e.expr_form) flag |= 0b100;
+        try s.append(a, flag);
+        if (explicit_table) try uleb(a, &s, e.table_index);
+        if (e.mode == .active) try emitOffsetExpr(a, &s, sigs, type_names, global_names, e.offset_form);
+        // The leading kind byte: elemkind (0x00) for non-flag-0 func-index
+        // variants, reftype for non-flag-4 const-expr variants.
+        if (!e.expr_form and flag != 0) {
+            try s.append(a, 0x00); // elemkind funcref
+        } else if (e.expr_form and flag != 4) {
+            try s.append(a, @intFromEnum(e.elem_type)); // reftype
+        }
+        if (e.expr_form) {
+            try uleb(a, &s, e.exprs.len);
+            for (e.exprs) |ex| try emitElementExpr(a, &s, sigs, type_names, global_names, func_names, ex);
+        } else {
+            try uleb(a, &s, e.funcs.len);
+            for (e.funcs) |ref| try uleb(a, &s, try resolveByName(func_names, ref));
+        }
+    }
+    return s.items;
+}
+
+/// Encode the data section (11) payload: active (flag 0x00, offset const-expr) or
+/// passive (flag 0x01) segments, memory 0.
+fn encodeDataSection(a: std.mem.Allocator, datas: []const DataSeg, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8) Error![]const u8 {
+    if (datas.len == 0) return &.{};
+    var s: List(u8) = .empty;
+    try uleb(a, &s, datas.len);
+    for (datas) |seg| {
+        if (seg.offset_form == null) {
+            try s.append(a, 0x01); // passive
+        } else {
+            try s.append(a, 0x00); // active, memory 0
+            try emitOffsetExpr(a, &s, sigs, type_names, global_names, seg.offset_form);
+        }
+        try uleb(a, &s, seg.bytes.len);
+        try s.appendSlice(a, seg.bytes);
+    }
+    return s.items;
 }
 
 // --- Module-field parsing --------------------------------------------------
