@@ -38,11 +38,13 @@ Third pass (commit `c535de0`):
   `br_table` label *value types* (not just arity) even in polymorphic code. Verified empirically —
   different-typed labels are rejected, same-typed accepted. No change needed.
 
-Still open: #9, #10, #11 (defined-table inline export only), #12, #13, plus #16 (rest, LOW). **#1 (all 3
-stages), #3, #4, #5, #14, #15 are resolved** (see below). Next tractable wins: invoke-by-module-name in
-the WAST runner (blocks more of `linking.wast`), #11's defined-table inline export, then the LOW items.
-Larger out-of-scope boundaries surfaced by the suite: the **multi-memory** proposal (`start0`) and
-exception-handling **tags** (`imports` "test" module).
+**The audit ledger is effectively cleared (2026-07-13): #1–#7, #9, #10, #12–#16 are resolved.** The
+only remainders are two LOW cosmetic gaps that **no test exercises and that fail loud (never wrong
+bytes)**: #8's non-power-of-two `align=` assembler check (over-natural alignment is already validated),
+and #11's defined-table inline `(export …)`. No open correctness/soundness/dead-code items remain. The
+real frontiers are new *features*, not ledger debt: invoke-by-module-name in the WAST runner (blocks
+more of `linking.wast`), growing the wasm-c-api past introspection, and WASI. Larger out-of-scope
+proposals surfaced by the suite: **multi-memory** (`start0`) and exception-handling **tags** (`imports`).
 
 ## Grouped by the integration that trips them
 
@@ -56,13 +58,14 @@ exception-handling **tags** (`imports` "test" module).
   #8 (`align=` non-power-of-two). These are *soundness / spec-strictness* gaps — invisible until the
   runner actually executes the negative tests (today they're counted as `skipped`).
 - **Start-function support**: #3 **DONE** (`07dd244`).
-- **Host externref values** (embedding API passes real externrefs): #9 (`null_ref` collision).
-- **Arbitrary / hand-written WAT** (beyond the testsuite's shape): #11 (inline `(table (export …))` on a
-  *defined* table — the imported-table case is done), #12 (`align=` malformed), #10 (import-after-def
-  ordering).
-- **Any future extended-const op that interns a signature**: #13 (type-section ordering, latent).
-- **Test fidelity, always-on**: #5 (`assert_trap` accepts any error — silently green-washes producer
-  bugs *now*).
+- **Host externref values** (embedding API passes real externrefs): #9 **DONE** (`994ee23`) — externrefs
+  are boxed to non-sentinel handles.
+- **Arbitrary / hand-written WAT** (beyond the testsuite's shape): #10 **DONE** (`3a50f75`, import-after-
+  def rejected); #12 (const-expr section ordering) **DONE** (`e500a51`); #11 PARTIAL (defined-table inline
+  `(export …)` still fails loud). The old #12 "`align=` malformed" note was a mislabel — `align=`
+  non-power-of-two is #8 (LOW, still open, no test exercises it).
+- **Test fidelity, always-on**: #5 (`assert_trap`) **DONE**.
+- **Dead code / duplication**: #13 **DONE** (`78647f6`).
 
 ---
 
@@ -147,21 +150,24 @@ gap only. **Surfaces when:** `assert_invalid` support.
 `align=3` encodes `@ctz(3)=0` instead of erroring. **Surfaces when:** malformed hand-written WAT or
 `assert_malformed`. **Fix:** reject non-power-of-two alignment.
 
-### #9 — externref value can collide with the `null_ref` sentinel — LOW (by design today)
-`src/interp.zig` — `null_ref = maxInt(u64)` doubles as "uninitialized table entry" and the `ref.null`
-value. A host externref whose payload is exactly `2^64-1` is misclassified by `ref.is_null` and the
-`call_indirect` uninitialized-element check. Funcrefs (function indices) can never hit this.
-**Surfaces when:** a real host passes externref values through the embedding API (none exist yet).
-**Fix:** represent refs as a tagged pair, or reserve the sentinel out of the host-value space.
+### #9 — externref/`null_ref` sentinel collision — **RESOLVED (`994ee23`, 2026-07-13)**
+The value stack is untyped `u64` with `null_ref = maxInt(u64)`; a host externref payload could equal it
+and be misread as null. The WAST runner is the sole minter of externref values (`(ref.extern N)` is a
+runner literal, not an instruction), so the fix is contained there: it interns each payload into a
+per-run pool and represents an externref as its pool *index* (a small integer, never the sentinel).
+Equal payloads intern to the same value, so an externref round-trips and compares equal. `parseConst`/
+`matches` became Runner methods; funcref values still use their index directly. New wast.zig unit test
+proves `(ref.extern 0xFFFFFFFFFFFFFFFF)` is non-null and round-trips.
 
-### #10 — Global index space assigned in textual order (no imports-first enforcement) — LOW
-`src/wat.zig` — `parseGlobal` assigns `global_names` indices in textual order; the binary always places
-imported globals (import section) before defined globals (global section). If a *defined* global
-textually precedes an *imported* one, textual index ≠ binary index and every `$name`→index resolution
-/ global export is off. Well-formed WAT requires imports first, so defensible. (Same structural
-assumption for the func index space, but wat emits no function imports yet.) **Surfaces when:** #1's
-func imports land, or hand-written WAT violates imports-first ordering. **Fix:** enforce or reorder
-(imports first) when building the index spaces.
+### #10 — import-after-definition mis-indexing — **RESOLVED (`3a50f75`, 2026-07-13)**
+The assembler built func/table/global name→index maps in textual order, but the binary places imports
+first; a def-before-import module (malformed per §6.6.13, and the testsuite has `assert_malformed`
+"import after function/global/table" for it) was silently mis-indexed. `assembleModule` now tracks
+whether any func/table/memory/global definition has been seen and rejects a later import (top-level or
+inline) with `error.ImportAfterDefinition` (small `fieldIsImport`/`isDefKind` classifiers). **Enforce,
+not reorder** — reordering would wrongly accept the malformed cases. No conformance delta (the
+testsuite's cases arrive via `(module quote …)`, still `BadCommand`); new wat.zig unit test + verified
+valid imports-first resolves correctly.
 
 ### #11 — inline `(table (export …) …)` on a *defined* table — LOW (PARTIAL, fails loud)
 `src/wat.zig` — the `(table …)` module-field branch now handles inline `(export …)` on an *imported*
@@ -171,19 +177,23 @@ table (the `07dd244` inline-import path), but a **defined** table with an inline
 `(export …)` forms parsed in the branch into `parseTable` (or handle the whole defined-table case in the
 branch, mirroring the import path). `table.wast` still has a few of these.
 
-### #12 — Latent: global-init const-exprs encoded after the type section — LOW
-`src/wat.zig` — the global section (with `emitConstExpr`) is emitted *after* the type section, but with
-a live `sigs` pointer. Safe today because valid const-exprs never intern a signature. **Surfaces when:**
-a future extended-const construct interns a new sig during global-init encoding → the already-written
-type section is stale. **Fix:** pre-encode global inits before emitting the type section (mirror the
-function-body path, which interns first).
+### #12 — const-expr sections encoded after the type section — **RESOLVED (`e500a51`, 2026-07-13)**
+The type section (1) was emitted before the global (6), element (9), and data (11) sections, which
+encode const-exprs against the same live `sigs` list — safe only because const-exprs can't intern a
+signature. Extracted `encodeGlobalSection`/`encodeElementSection`/`encodeDataSection` and call them right
+after the function bodies are pre-encoded (before the type section), so any interned signature lands in
+section 1 by construction. Pure reordering — output byte-identical, full regression sweep unchanged.
 
-### #13 — Dead code / duplication (not bugs) — LOW
-- `src/validate.zig` `funcTypeOf` (~339) duplicates `Module.funcType`; could delegate.
-- `src/opcode.zig` `Imm.select_types` / `Imm.mem_reserved` payloads are decoded but never *read* (the
-  tags are needed to skip bytes; persisting the values is wasted).
-- `src/main.zig` `runFunction` re-resolves the export that `Instance.invoke` resolves again.
-Harmless; clean up opportunistically.
+### #13 — Dead code / duplication — **RESOLVED (`78647f6`, 2026-07-13)**
+- `validate.zig`'s `funcTypeOf` was a byte-for-byte duplicate of `Module.funcType` — deleted, the four
+  callers now use `module.funcType`. Also changed `Module.funcType` to a `*const Module` receiver so it
+  no longer copies the whole Module struct by value per call.
+- `main.zig`'s `runFunction` re-resolved the export `invoke` resolves again — added
+  `Instance.invokeIndex(func_index, args)` (invoke delegates to it) and main calls it with the index it
+  already has.
+- **Stale/kept:** `Imm.select_types`' payload IS read now (the validator checks the annotation, #2), so
+  it is not dead; `Imm.mem_reserved`'s byte is retained deliberately (documents the reserved wire byte,
+  leaves room to validate it must be 0).
 
 ## Discovered 2026-07-09 (while adding assert_invalid support)
 

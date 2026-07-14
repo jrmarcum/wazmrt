@@ -263,6 +263,15 @@ instantiation). Also: `(memory (data "…"))` abbreviation and inline `(memory|t
 → 17/9. **No core regressions** (i32 459, i64 415, table_init 729, table_copy 1649, call_indirect 169,
 func 171, global 109/1, … all HEAD-identical). `start0.wast` (3/3) needs multi-memory (out of scope).
 
+**Update 2026-07-13 — audit ledger closeout (#9/#10/#12/#13)** (`994ee23`/`3a50f75`/`e500a51`/`78647f6`).
+Robustness/cleanup fixes with no conformance delta (all HEAD-identical): #9 boxes host externrefs so no
+payload collides with `null_ref` (+2 new unit tests: externref-sentinel round-trip, import-after-def
+rejection); #10 rejects import-after-definition (`error.ImportAfterDefinition`) instead of silently
+mis-indexing; #12 pre-encodes the const-expr sections before the type section (byte-identical output);
+#13 removes the `funcTypeOf` duplicate + a redundant export re-resolution. **67 unit tests.** The
+2026-07-09 audit ledger is now effectively cleared — only #8 (non-power-of-two `align=`) and #11
+(defined-table inline export) remain, both LOW, fail-loud, and untested by the suite.
+
 ## What this tells the roadmap
 
 1. **First execution milestone = the `module/wasm_mod` corpus + its `.test.json` files** — fully
