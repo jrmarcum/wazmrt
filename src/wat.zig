@@ -700,13 +700,19 @@ fn parseGlobal(a: std.mem.Allocator, items: []const Sexpr, globals: *List(Global
         imp = .{ .module = l[1].string, .name = l[2].string };
         i += 1;
     }
-    // Global type: `valtype` or `(mut valtype)`.
+    // Global type: `valtype` or `(mut valtype)`. A list may be either the
+    // mutability wrapper `(mut …)` or a reference type `(ref null? ht)` — the
+    // latter is itself the valtype.
     if (i >= items.len) return error.BadModuleField;
     var mutable = false;
     var valtype: V = undefined;
     if (items[i].asList()) |gt| {
-        mutable = eqAtom(gt[0], "mut");
-        valtype = try parseValType(gt[gt.len - 1]);
+        if (eqAtom(gt[0], "mut")) {
+            mutable = true;
+            valtype = try parseValType(gt[gt.len - 1]);
+        } else {
+            valtype = try parseValType(items[i]);
+        }
     } else {
         valtype = try parseValType(items[i]);
     }
@@ -857,19 +863,31 @@ fn parseValType(s: Sexpr) Error!V {
     return stringToValType(atom) orelse error.BadValType;
 }
 
-/// A heap type (`func` / `extern`, or the `funcref` / `externref` aliases) → the
-/// corresponding reference value type.
+/// A heap type → an opaque reference slot (typed/GC-ref acceptance, P1). A
+/// concrete `$t` type reference and the `func`/`nofunc` families → `funcref`;
+/// every other heap type (`extern`/`any`/`eq`/`i31`/`struct`/`array`/`none`/
+/// `noextern`/`exn`) → `externref`. Precise typing is deferred to later passes.
 fn heapTypeToValType(s: Sexpr) Error!V {
     const atom = s.asAtom() orelse return error.BadValType;
-    if (std.mem.eql(u8, atom, "func") or std.mem.eql(u8, atom, "funcref")) return .funcref;
-    if (std.mem.eql(u8, atom, "extern") or std.mem.eql(u8, atom, "externref")) return .externref;
+    if (atom.len != 0 and atom[0] == '$') return .funcref; // concrete `(ref $t)`
+    if (std.mem.eql(u8, atom, "func") or std.mem.eql(u8, atom, "funcref") or std.mem.eql(u8, atom, "nofunc")) return .funcref;
+    inline for (.{ "extern", "externref", "any", "eq", "i31", "struct", "array", "none", "noextern", "exn", "noexn" }) |ht| {
+        if (std.mem.eql(u8, atom, ht)) return .externref;
+    }
     return error.BadValType;
 }
 
 fn stringToValType(atom: []const u8) ?V {
     const map = .{
-        .{ "i32", V.i32 }, .{ "i64", V.i64 }, .{ "f32", V.f32 }, .{ "f64", V.f64 },
-        .{ "v128", V.v128 }, .{ "funcref", V.funcref }, .{ "externref", V.externref },
+        .{ "i32", V.i32 },           .{ "i64", V.i64 },   .{ "f32", V.f32 },
+        .{ "f64", V.f64 },           .{ "v128", V.v128 },
+        // Reference-type shorthands collapse to the two opaque slots.
+        .{ "funcref", V.funcref },   .{ "nullfuncref", V.funcref },
+        .{ "externref", V.externref }, .{ "nullexternref", V.externref },
+        .{ "anyref", V.externref },  .{ "eqref", V.externref },
+        .{ "i31ref", V.externref },  .{ "structref", V.externref },
+        .{ "arrayref", V.externref }, .{ "nullref", V.externref },
+        .{ "exnref", V.externref },  .{ "nullexnref", V.externref },
     };
     inline for (map) |m| {
         if (std.mem.eql(u8, atom, m[0])) return m[1];

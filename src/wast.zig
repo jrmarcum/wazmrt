@@ -639,6 +639,26 @@ test "runs assert_return and assert_trap over a module" {
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
 
+test "typed/GC reference value types are accepted (P1)" {
+    // anyref/eqref/i31ref/(ref null $t) collapse to the opaque ref slots; a module
+    // merely using them in signatures/globals builds and ref.null round-trips.
+    const src =
+        \\(module
+        \\  (type $t (func))
+        \\  (global $g eqref (ref.null eq))
+        \\  (func (export "a") (result anyref) (ref.null any))
+        \\  (func (export "i") (result i31ref) (ref.null i31))
+        \\  (func (export "r") (result (ref null $t)) (ref.null $t))
+        \\  (func (export "isnull") (param externref) (result i32) (ref.is_null (local.get 0))))
+        \\(assert_return (invoke "a") (ref.null any))
+        \\(assert_return (invoke "i") (ref.null i31))
+        \\(assert_return (invoke "isnull" (ref.null extern)) (i32.const 1))
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 3), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
 test "invoke / get by module name + register $id" {
     const src =
         \\(module $A (func (export "f") (result i32) (i32.const 11)) (global (export "g") i32 (i32.const 22)))

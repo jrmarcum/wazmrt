@@ -300,11 +300,33 @@ pub fn funcType(self: *const Module, index: u32) ?FuncType {
 
 // --- Low-level readers -----------------------------------------------------
 
-/// Read one value-type byte, rejecting undefined encodings.
+/// Read one value type. Numeric types are themselves; every reference form
+/// (abstract heap-type shorthands, and `(ref null? ht)` = 0x63/0x64 + heaptype)
+/// collapses to the runtime's two opaque reference slots — func-family →
+/// `funcref`, everything else → `externref` (typed/GC-ref acceptance, P1).
 fn readValType(r: *Reader) Error!types.ValType {
-    const v: types.ValType = @enumFromInt(try r.readByte());
-    if (!v.isValid()) return error.BadValType;
-    return v;
+    const b = try r.readByte();
+    return switch (b) {
+        0x7f, 0x7e, 0x7d, 0x7c, 0x7b => @enumFromInt(b), // i32 i64 f32 f64 v128
+        0x70, 0x73 => .funcref, // funcref, nullfuncref (nofunc)
+        // externref, anyref, eqref, i31ref, structref, arrayref, nullref,
+        // nullexternref, exnref, nullexnref → opaque reference.
+        0x6f, 0x6e, 0x6d, 0x6c, 0x6b, 0x6a, 0x71, 0x72, 0x69, 0x74 => .externref,
+        0x63, 0x64 => try readHeapTypeRef(r), // (ref null? ht)
+        else => error.BadValType,
+    };
+}
+
+/// Map a `heaptype` (following a `0x63`/`0x64` ref prefix) to an opaque slot: a
+/// non-negative `s33` is a type index (a concrete — hence func — reference);
+/// negative encodings are abstract heap types.
+fn readHeapTypeRef(r: *Reader) Error!types.ValType {
+    const ht = try r.readVarI64(); // s33
+    if (ht >= 0) return .funcref; // concrete `(ref $t)` — treated as funcref
+    return switch (ht) {
+        -0x10, -0x0d => .funcref, // func (0x70), nofunc (0x73)
+        else => .externref, // extern/any/eq/i31/struct/array/none/noextern/exn
+    };
 }
 
 fn readValTypes(a: std.mem.Allocator, r: *Reader) Error![]const types.ValType {
@@ -607,9 +629,10 @@ test "rejects an unsupported version" {
 }
 
 test "rejects an undefined value-type byte" {
-    // type section: one func type with a single param byte 0x6d (not a valtype).
+    // type section: one func type with a single param byte 0x50 (not a valtype;
+    // 0x69–0x74 are now the GC/ref-type bytes, so pick one well outside that).
     const bytes = types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
-        [_]u8{ 0x01, 0x05, 0x01, 0x60, 0x01, 0x6d, 0x00 };
+        [_]u8{ 0x01, 0x05, 0x01, 0x60, 0x01, 0x50, 0x00 };
     try std.testing.expectError(error.BadValType, Module.decode(std.testing.allocator, &bytes));
 }
 
