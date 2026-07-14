@@ -144,7 +144,7 @@ fn runFunction(
         return;
     };
 
-    const results = inst.invoke(name, call_args) catch |e| {
+    const results = inst.invokeIndex(fi, call_args) catch |e| {
         try out.print("trap: {s}\n", .{@errorName(e)});
         return;
     };

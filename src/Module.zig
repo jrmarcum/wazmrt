@@ -283,7 +283,7 @@ pub fn importedMemoryCount(self: Module) u32 {
 
 /// Resolve a function index (imports first, then defined) to its signature,
 /// or null if out of range.
-pub fn funcType(self: Module, index: u32) ?FuncType {
+pub fn funcType(self: *const Module, index: u32) ?FuncType {
     var i: u32 = 0;
     for (self.imports) |imp| {
         if (imp.type == .func) {

@@ -64,7 +64,7 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
     // element const-expr must produce the segment's element type; an active
     // segment targets an existing type-compatible table with a valid i32 offset.
     for (module.elements) |elem| {
-        for (elem.funcs) |fi| if (funcTypeOf(module, fi) == null) return error.UndefinedFunc;
+        for (elem.funcs) |fi| if (module.funcType(fi) == null) return error.UndefinedFunc;
         for (elem.exprs) |ex| try validateConstExpr(module, ex, elem.elem_type, n_imported_globals);
         if (elem.mode == .active) {
             if (elem.table_index >= module.tables.len) return error.UndefinedTable;
@@ -145,7 +145,7 @@ fn validateConstExpr(module: *const Module, expr: []const u8, expected: V, self_
             },
             0xd2 => { // ref.func x
                 const fi = try r.readVarU32();
-                if (funcTypeOf(module, fi) == null) return error.UndefinedFunc;
+                if (module.funcType(fi) == null) return error.UndefinedFunc;
                 try push(&stack, &sp, .funcref);
             },
             0x6a, 0x6b, 0x6c => { // i32 add/sub/mul (extended-const)
@@ -363,7 +363,7 @@ const FuncValidator = struct {
             },
 
             .call => {
-                const ft = funcTypeOf(self.module, instr.imm.func) orelse return error.UndefinedFunc;
+                const ft = self.module.funcType(instr.imm.func) orelse return error.UndefinedFunc;
                 try self.popVals(ft.params);
                 try self.pushVals(ft.results);
             },
@@ -461,7 +461,7 @@ const FuncValidator = struct {
                 try self.pushValT(.i32);
             },
             .ref_func => {
-                if (funcTypeOf(self.module, instr.imm.func) == null) return error.UndefinedFunc;
+                if (self.module.funcType(instr.imm.func) == null) return error.UndefinedFunc;
                 try self.pushValT(.funcref);
             },
 
@@ -503,22 +503,6 @@ fn naturalAlignLog2(op: Op) u32 {
         .i64_load, .f64_load, .i64_store, .f64_store => 3,
         else => 0,
     };
-}
-
-/// Resolve a function index (imports first, then defined) to its signature.
-fn funcTypeOf(module: *const Module, index: u32) ?Module.FuncType {
-    var i: u32 = 0;
-    for (module.imports) |imp| {
-        if (imp.type == .func) {
-            if (i == index) return imp.type.func;
-            i += 1;
-        }
-    }
-    const defined = index - i;
-    if (defined >= module.functions.len) return null;
-    const ti = module.functions[defined];
-    if (ti >= module.func_types.len) return null;
-    return module.func_types[ti];
 }
 
 /// True if an abstract stack entry is a concrete reference type (funcref /

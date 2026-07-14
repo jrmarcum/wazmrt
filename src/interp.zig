@@ -355,6 +355,12 @@ pub const Instance = struct {
     /// by the caller (allocated with the instance's gpa).
     pub fn invoke(self: *Instance, name: []const u8, args: []const Value) Error![]Value {
         const func_index = self.findExportedFunc(name) orelse return error.UndefinedExport;
+        return self.invokeIndex(func_index, args);
+    }
+
+    /// Invoke a function by its index in the function index space. Useful when the
+    /// caller has already resolved the export (avoids re-resolving by name).
+    pub fn invokeIndex(self: *Instance, func_index: u32, args: []const Value) Error![]Value {
         const ft = self.module.funcType(func_index) orelse return error.UndefinedFunc;
         if (args.len != ft.params.len) return error.BadArgCount;
 
