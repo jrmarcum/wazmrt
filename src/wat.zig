@@ -35,6 +35,9 @@ pub const Error = sexpr.Error || error{
     UnknownIdentifier,
     BadImmediate,
     UnsupportedInstr,
+    /// An `import` (top-level or inline) after a func/table/memory/global
+    /// definition — malformed: imports must precede all definitions (§6.6.13).
+    ImportAfterDefinition,
 } || std.mem.Allocator.Error;
 
 const Func = struct {
@@ -128,10 +131,18 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             try parseTypeDef(a, field.asList().?, &sigs, &type_names);
     }
 
-    // Pass 1: collect the remaining definitions (MVP: no imports).
+    // Pass 1: collect the remaining definitions. Imports (top-level or inline)
+    // must precede every func/table/memory/global definition (§6.6.13), so an
+    // import after a definition is rejected rather than silently mis-indexed.
+    var seen_definition = false;
     for (module[start..]) |field| {
         const kw = field.keyword() orelse return error.BadModuleField;
         const items = field.asList().?;
+        if (fieldIsImport(kw, items)) {
+            if (seen_definition) return error.ImportAfterDefinition;
+        } else if (isDefKind(kw)) {
+            seen_definition = true;
+        }
         if (std.mem.eql(u8, kw, "func")) {
             const f = try parseFunc(a, items);
             const idx: u32 = @intCast(func_names.items.len); // func-space index (imports first)
@@ -488,6 +499,30 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
 }
 
 // --- Module-field parsing --------------------------------------------------
+
+/// A module field that defines an index-space entry (func/table/memory/global).
+fn isDefKind(kw: []const u8) bool {
+    return std.mem.eql(u8, kw, "func") or std.mem.eql(u8, kw, "table") or
+        std.mem.eql(u8, kw, "memory") or std.mem.eql(u8, kw, "global");
+}
+
+/// True if `field` is an import: a top-level `(import …)` or a def-kind field with
+/// an inline `(import "m" "n")` (allowed only among the leading `$id`/`(export …)`
+/// forms, before the type/limits/body).
+fn fieldIsImport(kw: []const u8, items: []const Sexpr) bool {
+    if (std.mem.eql(u8, kw, "import")) return true;
+    if (!isDefKind(kw)) return false;
+    var i: usize = 1;
+    while (i < items.len) : (i += 1) {
+        if (items[i].asAtom() != null) continue; // $id
+        const l = items[i].asList() orelse return false;
+        const h = l[0].asAtom() orelse return false;
+        if (std.mem.eql(u8, h, "import")) return true;
+        if (std.mem.eql(u8, h, "export")) continue;
+        return false; // reached the type/limits/body — no inline import
+    }
+    return false;
+}
 
 /// `(type $name? (func (param …)(result …)))` — append the signature + name.
 fn parseTypeDef(a: std.mem.Allocator, items: []const Sexpr, sigs: *List(Sig), type_names: *List(?[]const u8)) Error!void {
@@ -1802,6 +1837,24 @@ test "assembles a funcref-typed select" {
     try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "sel", &.{interp.i32Value(1)})));
     // cond=0 → picks ref.null → is_null = 1.
     try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(src, "sel", &.{interp.i32Value(0)})));
+}
+
+test "rejects an import after a definition (#10)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // A def-before-import module would silently mis-index (imports take the low
+    // indices in the binary); it must be rejected instead.
+    try std.testing.expectError(error.ImportAfterDefinition, assemble(a,
+        \\(module (func) (import "m" "n" (func)))
+    ));
+    try std.testing.expectError(error.ImportAfterDefinition, assemble(a,
+        \\(module (global i32 (i32.const 0)) (import "m" "n" (global f32)))
+    ));
+    // Valid imports-first assembles fine.
+    _ = try assemble(a,
+        \\(module (import "m" "n" (func)) (func))
+    );
 }
 
 test "assembles multi-value function results" {
