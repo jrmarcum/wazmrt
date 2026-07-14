@@ -469,6 +469,7 @@ fn isRuntimeTrap(e: anyerror) bool {
         error.UninitializedElement,
         error.IndirectTypeMismatch,
         error.NullReference,
+        error.GcOutOfBounds,
         error.CallStackExhausted,
         => true,
         else => false,

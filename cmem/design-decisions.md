@@ -76,20 +76,43 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
     benchmark.** It needs a GC heap + object model + RTTs — a size cost accepted despite the
     smallest-binary lean (likely gated to a native/opt-in build). Build it in tested parts (the wasmtk
     way): i31 first, then struct/array, then the cast/test ops. **WASI preview 1** follows.
-    - **i31 slice DONE 2026-07-14** (first tested part). The WasmGC `any` internal hierarchy is now
-      modeled as *distinct* `ValType`s (`anyref`/`eqref`/`i31ref`/`structref`/`arrayref`/`nullref` +
-      non-null `*_nn` synthetic tags) instead of collapsing to `externref` — so `refHeap()` +
-      `RefHeap.sub()` in `types.zig` drive real GC subtyping (i31/struct/array <: eq <: any; `none`
-      bottom; func/extern disjoint), and `validate.subtypeOf` combines heap-subtype with nullability.
-      **`i31` is unboxed** — the 31-bit payload lives directly in the interpreter's `u64` value slot
-      (range `0..2^31-1`, so it can never alias the `null_ref = maxInt(u64)` sentinel); **no heap yet**.
-      Ops `ref.i31`/`i31.get_s`/`i31.get_u` decode under the **`0xFB` prefix** (internal `Op` tags
-      `0xf0..0xf2` via `gcSubOpcode`, mirroring the `0xFC` table-op scheme), assemble+run, and `i31.get`
-      on a null ref traps (`error.NullReference`). `structref`/`arrayref` exist as *types* (subtyping
-      only) — their `struct.*`/`array.*` ops are still `error.UnsupportedOpcode` (the next slice).
-      **Known gap carried in:** a nullable-ref local still defaults to `0`, not `null_ref`
-      (`interp.callFunction` `@memset(locals, 0)`) — latent, unchanged this slice; non-null refs are
-      non-defaultable so validation already guards the common case.
+    - **i31 slice DONE 2026-07-14** (first tested part, git `0f1e0c2`). The WasmGC `any` internal
+      hierarchy is now modeled as *distinct* `ValType`s (`anyref`/`eqref`/`i31ref`/`structref`/
+      `arrayref`/`nullref` + non-null `*_nn` synthetic tags) instead of collapsing to `externref` — so
+      `refHeap()` + `RefHeap.sub()` in `types.zig` drive real GC subtyping (i31/struct/array <: eq <:
+      any; `none` bottom; func/extern disjoint), and `validate.subtypeOf` combines heap-subtype with
+      nullability. **`i31` is unboxed** — the 31-bit payload lives directly in the interpreter's `u64`
+      value slot (range `0..2^31-1`, so it can never alias the `null_ref = maxInt(u64)` sentinel).
+      Ops `ref.i31`/`i31.get_s`/`i31.get_u` decode under the **`0xFB` prefix** (internal `Op` tags via
+      `gcSubOpcode`, mirroring the `0xFC` table-op scheme), assemble+run, `i31.get` on null traps.
+      *Cleanup (git `7cba25f`):* a nullable-ref local now defaults to `null_ref`, not `0`
+      (`FuncBody.local_defaults`, memcpy'd at entry) — fixed the pre-existing `@memset(locals, 0)` gap.
+    - **struct/array slice DONE 2026-07-14** (git `bec0cf7` type-space refactor 2a + the runtime 2b).
+      - **2a — type space is now a composite-type table.** `Module.func_types` (`[]FuncType`) →
+        `comp_types` (`[]CompType` = func | struct(`[]FieldType`) | array(`FieldType`)) + `supertypes`
+        (kept for later cast). Accessors `funcSig`/`structFields`/`arrayField` gate by kind so a struct
+        type in a func position (`call_indirect`/`call_ref`/block type) *errors* (`error.BadType`),
+        never reads a bogus signature. `decodeTypeSection` decodes the full GC type grammar: rec groups
+        (`0x4e`), sub types (`0x50`/`0x4f`, ≤1 supertype), struct (`0x5f`)/array (`0x5e`)/func (`0x60`)
+        comptypes, packed `i8`/`i16` storage. A **cheap kind pre-scan** runs first so a `(ref $t)` field
+        collapses to the right family even when `$t` forward-references a later type in the same rec
+        group (`Reader.peekByte` added).
+      - **2b — heap + ops.** `Instance.gc_heap: ArrayList([]Value)` — one field/element slice per object,
+        **arena-backed, no collector** (leak-until-instance-dies; size cost accepted, likely opt-in
+        later). A struct/array **reference value is the object's heap index** (small, never aliases
+        `null_ref`). Ops (all `0xFB`-prefixed except `ref.eq`=`0xd3`): `struct.new`/`new_default`/
+        `get`/`get_s`/`get_u`/`set`, `array.new`/`new_default`/`new_fixed`/`get`/`get_s`/`get_u`/`set`/
+        `len`, `ref.eq`. Packed fields store masked (`packField`) and widen on read (`unpackField`:
+        `_s` sign-extends, `_u` zero-extends). Null access traps `NullReference`; OOB field/index traps
+        the new `error.GcOutOfBounds` (a runtime backstop for the collapse gap below).
+      - **Collapse limitation (documented, deferred to the cast slice).** Concrete `(ref $t)` still
+        collapses to its family *head* (`structref`/`arrayref`/`funcref`) — exact inter-struct typing is
+        lost, so `struct.get $t` accepts *any* struct ref; the object carries its real fields and the
+        runtime **bounds-checks the field/element index** (→ `GcOutOfBounds`) so a mismatch can't read
+        out of bounds. The **WAT assembler cannot emit concrete `(ref $t)` value types** (single-byte
+        valtype emission → `funcref`); struct/array **field and local types use the abstract heads**
+        (`structref`/`arrayref`/`eqref`/`anyref`) in `.wat`. Concrete-ref precision is a later concern
+        (needs value-types that carry a type index) and pairs with `ref.test`/`ref.cast`.
   - **Deferred (until browser-standard):** **WASI preview 2/3** (component-model based), **multi-memory**,
     exception-handling **tags**, **SIMD** — pulled in as the real corpus (`wasm_wasi`) demands. Typed/GC
     reference *value types* are already *accepted* (P1) so such modules build.

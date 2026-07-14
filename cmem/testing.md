@@ -313,8 +313,25 @@ a hand-written `i31.wast`** run through the CLI. Results:
 - **Hand-written `i31.wast`: 11/0** via `wazmrt <file.wast>` (assert_return + assert_trap for null i31).
 - **No regressions** — `zig build test` green; `zig build` (CLI + C lib) and `zig build wasm`
   (freestanding) both build. The `any` hierarchy is now distinct value types with real subtyping; i31 is
-  unboxed in the `u64` slot (no heap yet). `struct.*`/`array.*` remain `error.UnsupportedOpcode` (next
-  slice). See `design-decisions.md` for the representation.
+  unboxed in the `u64` slot (no heap yet). See `design-decisions.md` for the representation.
+
+### full GC — P3, struct/array slice (2026-07-14)
+
+Second tested part (git `bec0cf7` type-space refactor 2a + the runtime 2b). Same gating as i31 — in-repo
+unit tests + a hand-written `.wast` (the official GC corpus isn't in this tree). Results:
+
+- **2a fixtures (+2)**: a hand-built binary with a struct (`(mut i32)`, `i64`) + a packed-`i8` array
+  decodes to `comp_types`; a rec group whose struct field forward-refs a later struct collapses the
+  `(ref 1)` to `structref` (the kind pre-scan).
+- **2b (+7 unit tests)**: struct new/get/set (numeric); packed-`i8` `get_s`/`get_u` extension; array
+  new/get/set/len; `array.new_fixed`; `ref.eq` identity (same/distinct/null); null-access + OOB **traps**
+  (`NullReference` / `GcOutOfBounds`); a struct field holding a nested `arrayref` read back through the
+  struct. **87 unit tests total.**
+- **`gc_struct_array.wast`: 11/0** via the CLI (`assert_return` for struct/array/packed/`ref.eq` +
+  `assert_trap` for null and out-of-bounds; `GcOutOfBounds` added to the runner's trap set).
+- **No regressions**; `zig build test`/`build`/`wasm` all green. **Assembler limitation:** struct/array
+  field and local types use the abstract heads (`structref`/`arrayref`/…), not concrete `(ref $t)` —
+  see `design-decisions.md`. `ref.test`/`ref.cast`/`br_on_cast` are the next slice.
 
 ## What this tells the roadmap
 

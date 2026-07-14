@@ -69,6 +69,15 @@ const ExportDef = struct { name: []const u8, kind: u8, index: u32 };
 const DataSeg = struct { mem_index: u32, offset_form: ?Sexpr, bytes: []const u8 };
 /// A function type (for the type section): params → results.
 const Sig = struct { params: []const V, results: []const V };
+
+/// A GC struct field / array element (assembler side): storage type + mutability.
+const GcStorage = union(enum) { val: V, i8, i16 };
+const GcField = struct { storage: GcStorage, mutable: bool };
+/// The composite kind of a named `(type …)` definition. Func types keep their
+/// signature in the parallel `sigs` list (index-aligned); struct/array carry
+/// their fields here. Interned block-type/func sigs (beyond the named types)
+/// are implicitly `.func`.
+const GcTypeDef = union(enum) { func, @"struct": []const GcField, array: GcField };
 const TableDef = struct { min: u32, max: ?u32, elem: V = .funcref };
 /// An element segment. `funcs` (func-index form) OR `exprs` (const-expr form) —
 /// exactly one is non-empty. `offset` applies only to active segments.
@@ -113,6 +122,9 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     var elem_names: List(?[]const u8) = .empty;
     var sigs: List(Sig) = .empty;
     var type_names: List(?[]const u8) = .empty;
+    // GC composite kinds, index-aligned with the leading named `(type …)` defs
+    // in `sigs`; struct/array carry their fields (func types use `sigs`).
+    var gc_types: List(GcTypeDef) = .empty;
     var globals: List(GlobalDef) = .empty;
     var global_imports: List(ImportedGlobal) = .empty;
     var table_imports: List(ImportedTable) = .empty;
@@ -126,9 +138,18 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     const start: usize = if (module.len > 1 and isId(module[1])) 2 else 1; // skip optional module $name
 
     // Pre-pass: `(type …)` definitions occupy the first type indices, in order.
+    // A `(rec (type …) …)` group flattens to consecutive types (the assembler
+    // emits them ungrouped — the decoder flattens rec groups the same way).
     for (module[start..]) |field| {
-        if (std.mem.eql(u8, field.keyword() orelse continue, "type"))
-            try parseTypeDef(a, field.asList().?, &sigs, &type_names);
+        const kw = field.keyword() orelse continue;
+        if (std.mem.eql(u8, kw, "type")) {
+            try parseTypeDef(a, field.asList().?, &sigs, &type_names, &gc_types);
+        } else if (std.mem.eql(u8, kw, "rec")) {
+            for (field.asList().?[1..]) |t| {
+                if (std.mem.eql(u8, t.keyword() orelse continue, "type"))
+                    try parseTypeDef(a, t.asList().?, &sigs, &type_names, &gc_types);
+            }
+        }
     }
 
     // Pass 1: collect the remaining definitions. Imports (top-level or inline)
@@ -343,14 +364,30 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     var out: List(u8) = .empty;
     try out.appendSlice(a, &.{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 }); // header
 
-    // Type section (1) — complete (function sigs + multi-value block-type sigs)
+    // Type section (1) — func sigs (named + interned block-type sigs) plus GC
+    // struct/array composite types. `gc_types` covers the leading named defs;
+    // any index beyond it is an interned func signature.
     {
         var s: List(u8) = .empty;
         try uleb(a, &s, sigs.items.len);
-        for (sigs.items) |sig| {
-            try s.append(a, 0x60);
-            try valTypeVec(a, &s, sig.params);
-            try valTypeVec(a, &s, sig.results);
+        for (sigs.items, 0..) |sig, ti| {
+            const def: GcTypeDef = if (ti < gc_types.items.len) gc_types.items[ti] else .func;
+            switch (def) {
+                .func => {
+                    try s.append(a, 0x60);
+                    try valTypeVec(a, &s, sig.params);
+                    try valTypeVec(a, &s, sig.results);
+                },
+                .@"struct" => |fs| {
+                    try s.append(a, 0x5f);
+                    try uleb(a, &s, fs.len);
+                    for (fs) |f| try emitGcField(a, &s, f);
+                },
+                .array => |f| {
+                    try s.append(a, 0x5e);
+                    try emitGcField(a, &s, f);
+                },
+            }
         }
         try emitSection(a, &out, 1, s.items);
     }
@@ -547,24 +584,83 @@ fn fieldIsImport(kw: []const u8, items: []const Sexpr) bool {
     return false;
 }
 
-/// `(type $name? (func (param …)(result …)))` — append the signature + name.
-fn parseTypeDef(a: std.mem.Allocator, items: []const Sexpr, sigs: *List(Sig), type_names: *List(?[]const u8)) Error!void {
+/// `(type $name? <comptype>)` where comptype is `(func …)` / `(struct …)` /
+/// `(array …)`, optionally wrapped in `(sub $super? <comptype>)` (GC). Appends
+/// the func signature (to `sigs`) or the struct/array fields (to `gc_types`) at
+/// the next type index; both lists stay index-aligned with `type_names`.
+fn parseTypeDef(a: std.mem.Allocator, items: []const Sexpr, sigs: *List(Sig), type_names: *List(?[]const u8), gc_types: *List(GcTypeDef)) Error!void {
     var i: usize = 1;
     var name: ?[]const u8 = null;
     if (i < items.len and isId(items[i])) {
         name = items[i].atom;
         i += 1;
     }
-    const func_form = items[i].asList() orelse return error.BadModuleField;
-    var params: List(V) = .empty;
-    var results: List(V) = .empty;
-    for (func_form[1..]) |part| {
-        const kw = part.keyword() orelse continue;
-        if (std.mem.eql(u8, kw, "param")) try parseDecls(a, part.asList().?, &params, null);
-        if (std.mem.eql(u8, kw, "result")) try parseDecls(a, part.asList().?, &results, null);
+    var body = items[i].asList() orelse return error.BadModuleField;
+    // Unwrap a `(sub final? $super* <comptype>)` — the assembler ignores the
+    // declared supertype (the inner comptype is always the last element).
+    if (body.len >= 2 and eqAtom(body[0], "sub")) {
+        body = body[body.len - 1].asList() orelse return error.BadModuleField;
     }
-    try sigs.append(a, .{ .params = params.items, .results = results.items });
+
+    const kw = body[0].asAtom() orelse return error.BadModuleField;
+    if (std.mem.eql(u8, kw, "func")) {
+        var params: List(V) = .empty;
+        var results: List(V) = .empty;
+        for (body[1..]) |part| {
+            const pk = part.keyword() orelse continue;
+            if (std.mem.eql(u8, pk, "param")) try parseDecls(a, part.asList().?, &params, null);
+            if (std.mem.eql(u8, pk, "result")) try parseDecls(a, part.asList().?, &results, null);
+        }
+        try sigs.append(a, .{ .params = params.items, .results = results.items });
+        try gc_types.append(a, .func);
+    } else if (std.mem.eql(u8, kw, "struct")) {
+        var fields: List(GcField) = .empty;
+        for (body[1..]) |part| {
+            if (std.mem.eql(u8, part.keyword() orelse continue, "field"))
+                try parseFieldGroup(a, part.asList().?, &fields);
+        }
+        try sigs.append(a, .{ .params = &.{}, .results = &.{} }); // placeholder
+        try gc_types.append(a, .{ .@"struct" = fields.items });
+    } else if (std.mem.eql(u8, kw, "array")) {
+        if (body.len < 2) return error.BadModuleField;
+        // `(array <fieldtype>)` — exactly one element field. The element may be a
+        // `(field <ft>)` wrapper or a bare field type (`i32` / `(mut …)` / `i8`).
+        const is_field_form = std.mem.eql(u8, body[1].keyword() orelse "", "field");
+        const elem: GcField = if (is_field_form) blk: {
+            var fields: List(GcField) = .empty;
+            try parseFieldGroup(a, body[1].asList().?, &fields);
+            if (fields.items.len != 1) return error.BadModuleField;
+            break :blk fields.items[0];
+        } else try parseFieldElem(body[1]);
+        try sigs.append(a, .{ .params = &.{}, .results = &.{} }); // placeholder
+        try gc_types.append(a, .{ .array = elem });
+    } else return error.BadModuleField;
     try type_names.append(a, name);
+}
+
+/// Parse a `(field …)` group: an optional `$id` then one-or-more field types
+/// (`(field $x i32)` / `(field i32 (mut i64))`), appending each to `out`.
+fn parseFieldGroup(a: std.mem.Allocator, list: []const Sexpr, out: *List(GcField)) Error!void {
+    var i: usize = 1;
+    if (i < list.len and isId(list[i])) i += 1; // a named field is a single field
+    while (i < list.len) : (i += 1) try out.append(a, try parseFieldElem(list[i]));
+}
+
+/// Parse one field type: `(mut <storage>)` or a bare `<storage>`, where storage
+/// is `i8` / `i16` (packed) or a value type.
+fn parseFieldElem(s: Sexpr) Error!GcField {
+    if (s.asList()) |l| {
+        if (l.len == 2 and eqAtom(l[0], "mut")) return .{ .storage = try parseStorage(l[1]), .mutable = true };
+    }
+    return .{ .storage = try parseStorage(s), .mutable = false };
+}
+
+fn parseStorage(s: Sexpr) Error!GcStorage {
+    if (s.asAtom()) |atom| {
+        if (std.mem.eql(u8, atom, "i8")) return .i8;
+        if (std.mem.eql(u8, atom, "i16")) return .i16;
+    }
+    return .{ .val = try parseValType(s) };
 }
 
 /// `(table $name? reftype (elem …))` or `(table $name? <min> <max>? reftype)`,
@@ -1335,6 +1431,18 @@ fn emitInstr(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
         .ref_type => try ctx.out.append(ctx.a, @intFromEnum(try heapTypeToValType(try imm0(immediates), true))), // ref.null → nullable
         .br_table => try emitBrTable(ctx, immediates),
         .table_init, .elem, .table_copy => try emitBulkTableImm(ctx, op, immediates),
+        // GC: a type index, optionally followed by a field index / element count.
+        .gc_type => try uleb(ctx.a, ctx.out, try resolveType(ctx.type_names, try imm0(immediates))),
+        .gc_field => {
+            if (immediates.len < 2) return error.BadImmediate;
+            try uleb(ctx.a, ctx.out, try resolveType(ctx.type_names, immediates[0]));
+            try uleb(ctx.a, ctx.out, try resolveByName(&.{}, immediates[1])); // field index (numeric)
+        },
+        .gc_type_n => {
+            if (immediates.len < 2) return error.BadImmediate;
+            try uleb(ctx.a, ctx.out, try resolveType(ctx.type_names, immediates[0]));
+            try uleb(ctx.a, ctx.out, try resolveByName(&.{}, immediates[1])); // element count
+        },
         else => return error.UnsupportedInstr, // block_type (handled structurally), call_indirect
     }
 }
@@ -1392,7 +1500,8 @@ fn imm0(immediates: []const Sexpr) Error!Sexpr {
 /// How many flat immediate atoms an opcode consumes (MVP-supported kinds).
 fn flatImmCount(op: Op) usize {
     return switch (opcode.immediateKind(op)) {
-        .local, .global, .func, .label, .i32c, .i64c, .f32c, .f64c, .ref_type => 1,
+        .local, .global, .func, .label, .i32c, .i64c, .f32c, .f64c, .ref_type, .gc_type => 1,
+        .gc_field, .gc_type_n => 2,
         else => 0,
     };
 }
@@ -1494,6 +1603,17 @@ fn internSig(a: std.mem.Allocator, sigs: *List(Sig), params: []const V, results:
 fn valTypeVec(a: std.mem.Allocator, out: *List(u8), vts: []const V) Error!void {
     try uleb(a, out, vts.len);
     for (vts) |v| try out.append(a, @intFromEnum(v));
+}
+
+/// Emit a GC field type: a storage-type byte (packed i8=0x78 / i16=0x77, else
+/// the value-type byte) followed by a mutability byte.
+fn emitGcField(a: std.mem.Allocator, out: *List(u8), f: GcField) Error!void {
+    switch (f.storage) {
+        .val => |v| try out.append(a, @intFromEnum(v)),
+        .i8 => try out.append(a, 0x78),
+        .i16 => try out.append(a, 0x77),
+    }
+    try out.append(a, if (f.mutable) 0x01 else 0x00);
 }
 
 fn nameBytes(a: std.mem.Allocator, out: *List(u8), name: []const u8) Error!void {
@@ -2066,4 +2186,126 @@ test "GC i31: validator rejects i31.get on a non-i31 reference" {
     var mbad3 = try Module.decode(a, bad3);
     // anyref is a *super*type of i31ref, so it must not satisfy the i31.get operand.
     try std.testing.expectError(error.TypeMismatch, validate(a, &mbad3));
+}
+
+test "GC struct: new + get + set with numeric fields" {
+    const src =
+        \\(module
+        \\  (type $pt (struct (field (mut i32)) (field (mut i32))))
+        \\  (func (export "sum") (param i32 i32) (result i32)
+        \\    (local $p structref)
+        \\    (local.set $p (struct.new $pt (local.get 0) (local.get 1)))
+        \\    (i32.add (struct.get $pt 0 (local.get $p))
+        \\             (struct.get $pt 1 (local.get $p))))
+        \\  (func (export "setget") (param i32) (result i32)
+        \\    (local $p structref)
+        \\    (local.set $p (struct.new_default $pt))
+        \\    (struct.set $pt 1 (local.get $p) (local.get 0))
+        \\    (struct.get $pt 1 (local.get $p))))
+    ;
+    try std.testing.expectEqual(@as(i32, 7), interp.asI32(try assembleAndRun(src, "sum", &.{ interp.i32Value(3), interp.i32Value(4) })));
+    // new_default zeroes both fields; set field 1 = 99, read it back.
+    try std.testing.expectEqual(@as(i32, 99), interp.asI32(try assembleAndRun(src, "setget", &.{interp.i32Value(99)})));
+}
+
+test "GC struct: packed i8 field sign/zero-extends on get_s/get_u" {
+    const src =
+        \\(module
+        \\  (type $b (struct (field (mut i8))))
+        \\  (func (export "s") (param i32) (result i32)
+        \\    (struct.get_s $b 0 (struct.new $b (local.get 0))))
+        \\  (func (export "u") (param i32) (result i32)
+        \\    (struct.get_u $b 0 (struct.new $b (local.get 0)))))
+    ;
+    // 0xff stored in an i8 field: get_s -> -1, get_u -> 255.
+    try std.testing.expectEqual(@as(i32, -1), interp.asI32(try assembleAndRun(src, "s", &.{interp.i32Value(0xff)})));
+    try std.testing.expectEqual(@as(i32, 255), interp.asI32(try assembleAndRun(src, "u", &.{interp.i32Value(0xff)})));
+    // 200 truncates to a byte then sign-extends: 200 = 0xc8 -> -56 signed.
+    try std.testing.expectEqual(@as(i32, -56), interp.asI32(try assembleAndRun(src, "s", &.{interp.i32Value(200)})));
+}
+
+test "GC array: new + get + set + len" {
+    const src =
+        \\(module
+        \\  (type $arr (array (mut i32)))
+        \\  (func (export "t") (param i32) (result i32)
+        \\    (local $a arrayref)
+        \\    (local.set $a (array.new $arr (i32.const 5) (i32.const 3)))
+        \\    (array.set $arr (local.get $a) (i32.const 1) (local.get 0))
+        \\    (i32.add (array.get $arr (local.get $a) (i32.const 1))
+        \\             (i32.mul (array.len (local.get $a)) (i32.const 10)))))
+    ;
+    // array [5,5,5]; set a[1]=param; result = a[1] + len*10 = param + 30.
+    try std.testing.expectEqual(@as(i32, 42), interp.asI32(try assembleAndRun(src, "t", &.{interp.i32Value(12)})));
+}
+
+test "GC array: array.new_fixed builds from operands" {
+    const src =
+        \\(module
+        \\  (type $arr (array i32))
+        \\  (func (export "third") (result i32)
+        \\    (array.get $arr
+        \\      (array.new_fixed $arr 3 (i32.const 10) (i32.const 20) (i32.const 30))
+        \\      (i32.const 2))))
+    ;
+    try std.testing.expectEqual(@as(i32, 30), interp.asI32(try assembleAndRun(src, "third", &.{})));
+}
+
+test "GC ref.eq: identity of struct references" {
+    const src =
+        \\(module
+        \\  (type $pt (struct (field i32)))
+        \\  (func (export "same") (result i32)
+        \\    (local $a structref)
+        \\    (local.set $a (struct.new $pt (i32.const 1)))
+        \\    (ref.eq (local.get $a) (local.get $a)))
+        \\  (func (export "diff") (result i32)
+        \\    (ref.eq (struct.new $pt (i32.const 1)) (struct.new $pt (i32.const 1))))
+        \\  (func (export "null_eq") (result i32)
+        \\    (ref.eq (ref.null struct) (ref.null struct))))
+    ;
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(src, "same", &.{})));
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "diff", &.{}))); // distinct objects
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(src, "null_eq", &.{})));
+}
+
+test "GC struct/array traps: null access and out-of-bounds" {
+    const src =
+        \\(module
+        \\  (type $pt (struct (field i32)))
+        \\  (type $arr (array (mut i32)))
+        \\  (func (export "null_get") (result i32)
+        \\    (struct.get $pt 0 (ref.null struct)))
+        \\  (func (export "oob") (result i32)
+        \\    (local $a arrayref)
+        \\    (local.set $a (array.new_default $arr (i32.const 2)))
+        \\    (array.get $arr (local.get $a) (i32.const 5))))
+    ;
+    try std.testing.expectError(error.NullReference, assembleAndRun(src, "null_get", &.{}));
+    try std.testing.expectError(error.GcOutOfBounds, assembleAndRun(src, "oob", &.{}));
+}
+
+test "GC struct: a struct field holds a nested array (GC refs stored in fields)" {
+    // A struct whose second field is an arrayref: build an array, store it, then
+    // read an element and the length back *through* the struct field. The field
+    // type is the abstract `arrayref`, so array.get/len apply without a cast.
+    const src =
+        \\(module
+        \\  (type $arr (array (mut i32)))
+        \\  (type $box (struct (field (mut i32)) (field (mut arrayref))))
+        \\  (func (export "elem0") (param i32) (result i32)
+        \\    (local $b structref)
+        \\    (local.set $b (struct.new $box (i32.const 7)
+        \\                    (array.new $arr (local.get 0) (i32.const 4))))
+        \\    (array.get $arr (struct.get $box 1 (local.get $b)) (i32.const 0)))
+        \\  (func (export "boxed_len") (result i32)
+        \\    (local $b structref)
+        \\    (local.set $b (struct.new $box (i32.const 7)
+        \\                    (array.new_default $arr (i32.const 6))))
+        \\    (array.len (struct.get $box 1 (local.get $b)))))
+    ;
+    // elem0: array of 4 copies of param; element 0 == param.
+    try std.testing.expectEqual(@as(i32, 55), interp.asI32(try assembleAndRun(src, "elem0", &.{interp.i32Value(55)})));
+    // boxed_len: the stored array has length 6.
+    try std.testing.expectEqual(@as(i32, 6), interp.asI32(try assembleAndRun(src, "boxed_len", &.{})));
 }

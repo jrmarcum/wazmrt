@@ -38,6 +38,13 @@ pub const Error = Module.Error || error{
     UndefinedType,
     UndefinedTable,
     UndefinedElem,
+    /// A struct/array field index out of range for its type (GC).
+    UndefinedField,
+    /// A `struct.set`/`array.set` on an immutable field (GC).
+    ImmutableField,
+    /// `struct.get`/`array.get` on a packed field (must use `_s`/`_u`), or the
+    /// `_s`/`_u` form on an unpacked field (GC).
+    BadFieldPacking,
     InvalidStartFunction,
     ConstantExpressionRequired,
     InvalidAlignment,
@@ -527,6 +534,87 @@ const FuncValidator = struct {
                 try self.pushValT(.i32);
             },
 
+            // GC: eq references compare by identity.
+            .ref_eq => {
+                _ = try self.popExpect(.eqref);
+                _ = try self.popExpect(.eqref);
+                try self.pushValT(.i32);
+            },
+
+            // GC: struct objects (full GC, P3). Concrete `(ref $t)` operands
+            // collapse to `structref` in our model; the exact type index rides in
+            // the immediate (fields/mutability come from it).
+            .struct_new => {
+                const fields = self.module.structFields(instr.imm.gc_type) orelse return error.UndefinedType;
+                var i = fields.len;
+                while (i > 0) { // operands are pushed field 0 first → pop in reverse
+                    i -= 1;
+                    _ = try self.popExpect(fields[i].storage.unpacked());
+                }
+                try self.pushValT(.structref_nn);
+            },
+            .struct_new_default => {
+                const fields = self.module.structFields(instr.imm.gc_type) orelse return error.UndefinedType;
+                for (fields) |f| if (f.storage.unpacked().isNonNullRef()) return error.TypeMismatch; // not defaultable
+                try self.pushValT(.structref_nn);
+            },
+            .struct_get, .struct_get_s, .struct_get_u => {
+                const gf = instr.imm.gc_field;
+                const fields = self.module.structFields(gf.type_index) orelse return error.UndefinedType;
+                if (gf.field >= fields.len) return error.UndefinedField;
+                const field = fields[gf.field];
+                try requirePacking(instr.op == .struct_get, field.storage);
+                _ = try self.popExpect(.structref); // (ref null $t)
+                try self.pushValT(field.storage.unpacked());
+            },
+            .struct_set => {
+                const gf = instr.imm.gc_field;
+                const fields = self.module.structFields(gf.type_index) orelse return error.UndefinedType;
+                if (gf.field >= fields.len) return error.UndefinedField;
+                if (!fields[gf.field].mutable) return error.ImmutableField;
+                _ = try self.popExpect(fields[gf.field].storage.unpacked());
+                _ = try self.popExpect(.structref);
+            },
+
+            // GC: array objects. `t'` is the (unpacked) element type.
+            .array_new => {
+                const f = self.module.arrayField(instr.imm.gc_type) orelse return error.UndefinedType;
+                _ = try self.popExpect(.i32); // length
+                _ = try self.popExpect(f.storage.unpacked()); // init value
+                try self.pushValT(.arrayref_nn);
+            },
+            .array_new_default => {
+                const f = self.module.arrayField(instr.imm.gc_type) orelse return error.UndefinedType;
+                if (f.storage.unpacked().isNonNullRef()) return error.TypeMismatch; // not defaultable
+                _ = try self.popExpect(.i32); // length
+                try self.pushValT(.arrayref_nn);
+            },
+            .array_new_fixed => {
+                const tn = instr.imm.gc_type_n;
+                const f = self.module.arrayField(tn.type_index) orelse return error.UndefinedType;
+                var k: u32 = 0;
+                while (k < tn.n) : (k += 1) _ = try self.popExpect(f.storage.unpacked());
+                try self.pushValT(.arrayref_nn);
+            },
+            .array_get, .array_get_s, .array_get_u => {
+                const f = self.module.arrayField(instr.imm.gc_type) orelse return error.UndefinedType;
+                try requirePacking(instr.op == .array_get, f.storage);
+                _ = try self.popExpect(.i32); // index
+                _ = try self.popExpect(.arrayref); // (ref null $t)
+                try self.pushValT(f.storage.unpacked());
+            },
+            .array_set => {
+                const f = self.module.arrayField(instr.imm.gc_type) orelse return error.UndefinedType;
+                if (!f.mutable) return error.ImmutableField;
+                _ = try self.popExpect(f.storage.unpacked()); // value
+                _ = try self.popExpect(.i32); // index
+                _ = try self.popExpect(.arrayref);
+            },
+            .array_len => {
+                _ = try self.popExpect(.arrayref); // (ref null array)
+                try self.pushValT(.i32);
+            },
+
             .ref_as_non_null => try self.pushVal(try self.popRef()),
             .br_on_null => {
                 // Pop the ref; on branch pass [t*] to the label, on fall-through
@@ -609,6 +697,12 @@ fn valTypesEqual(a: []const V, b: []const V) bool {
 /// disjoint) combined with nullability: a non-null reference is a subtype of the
 /// nullable form (`(ref t) <: (ref null t)`), so a non-null value satisfies a
 /// nullable expectation but not the reverse.
+/// Enforce the packed/unpacked rule for a field accessor: the plain `*.get`
+/// forms require an unpacked field; the `_s`/`_u` forms require a packed one.
+fn requirePacking(is_plain_get: bool, storage: Module.StorageType) Error!void {
+    if (is_plain_get == storage.isPacked()) return error.BadFieldPacking;
+}
+
 fn subtypeOf(sub: V, sup: V) bool {
     if (sub == sup) return true;
     if (!sub.isRef() or !sup.isRef()) return false;

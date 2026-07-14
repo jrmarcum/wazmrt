@@ -44,6 +44,7 @@ pub const Op = enum(u8) {
     ref_null = 0xd0, // immediate: a heaptype byte (func / extern)
     ref_is_null = 0xd1,
     ref_func = 0xd2, // immediate: a function index
+    ref_eq = 0xd3, // GC: [eqref eqref] -> [i32]
     ref_as_non_null = 0xd4,
     br_on_null = 0xd5, // immediate: a label index
     br_on_non_null = 0xd6,
@@ -249,12 +250,28 @@ pub const Op = enum(u8) {
     table_size = 0xe4, // 0xFC 0x10
     table_fill = 0xe5, // 0xFC 0x11
 
-    // GC ops carried under the `0xFB` prefix (full GC proposal, P3). Like the
-    // table ops above, these enum values are INTERNAL tags in an unused byte
-    // range — the wire encoding is `0xFB` + a LEB sub-opcode (see `gcSubOpcode`).
+    // GC array ops carried under the `0xFB` prefix (full GC proposal, P3).
+    array_new = 0xe6, // 0xFB 0x06: [t' i32] -> [(ref $t)]
+    array_new_default = 0xe7, // 0xFB 0x07: [i32] -> [(ref $t)]
+    array_new_fixed = 0xe8, // 0xFB 0x08: [t'^n] -> [(ref $t)]
+    array_get = 0xe9, // 0xFB 0x0b: [(ref null $t) i32] -> [t']
+    array_get_s = 0xea, // 0xFB 0x0c (packed)
+    array_get_u = 0xeb, // 0xFB 0x0d (packed)
+    array_set = 0xec, // 0xFB 0x0e: [(ref null $t) i32 t'] -> []
+    array_len = 0xed, // 0xFB 0x0f: [(ref null array)] -> [i32]
+
+    // GC ops carried under the `0xFB` prefix. Like the table ops above, these
+    // enum values are INTERNAL tags in an unused byte range — the wire encoding
+    // is `0xFB` + a LEB sub-opcode (see `gcSubOpcode`).
     ref_i31 = 0xf0, // 0xFB 0x1c: [i32] -> [(ref i31)]
     i31_get_s = 0xf1, // 0xFB 0x1d: [(ref null i31)] -> [i32]
     i31_get_u = 0xf2, // 0xFB 0x1e: [(ref null i31)] -> [i32]
+    struct_new = 0xf3, // 0xFB 0x00: [t'*] -> [(ref $t)]
+    struct_new_default = 0xf4, // 0xFB 0x01: [] -> [(ref $t)]
+    struct_get = 0xf5, // 0xFB 0x02: [(ref null $t)] -> [t']
+    struct_get_s = 0xf6, // 0xFB 0x03 (packed)
+    struct_get_u = 0xf7, // 0xFB 0x04 (packed)
+    struct_set = 0xf8, // 0xFB 0x05: [(ref null $t) t'] -> []
 
     _,
 };
@@ -275,6 +292,20 @@ pub fn fcSubOpcode(op: Op) ?u8 {
 /// The `0xFB` sub-opcode for an internal GC-op tag, or null for a normal op.
 pub fn gcSubOpcode(op: Op) ?u8 {
     return switch (op) {
+        .struct_new => 0x00,
+        .struct_new_default => 0x01,
+        .struct_get => 0x02,
+        .struct_get_s => 0x03,
+        .struct_get_u => 0x04,
+        .struct_set => 0x05,
+        .array_new => 0x06,
+        .array_new_default => 0x07,
+        .array_new_fixed => 0x08,
+        .array_get => 0x0b,
+        .array_get_s => 0x0c,
+        .array_get_u => 0x0d,
+        .array_set => 0x0e,
+        .array_len => 0x0f,
         .ref_i31 => 0x1c,
         .i31_get_s => 0x1d,
         .i31_get_u => 0x1e,
@@ -322,6 +353,12 @@ pub const Imm = union(enum) {
     select_types: []const types.ValType,
     /// Heap type of `ref.null` (`0xd0`) — as a `funcref` / `externref` value type.
     ref_type: types.ValType,
+    /// A GC type index (`struct.new`/`array.new`/`array.get`/…).
+    gc_type: u32,
+    /// A GC struct type index + field index (`struct.get`/`struct.set`/…).
+    gc_field: struct { type_index: u32, field: u32 },
+    /// A GC array type index + element count (`array.new_fixed`).
+    gc_type_n: struct { type_index: u32, n: u32 },
 };
 
 pub const Instr = struct { op: Op, imm: Imm };
@@ -347,6 +384,9 @@ const ImmKind = enum {
     f64c,
     select_types,
     ref_type,
+    gc_type,
+    gc_field,
+    gc_type_n,
     unsupported,
 };
 
@@ -377,9 +417,15 @@ pub fn immediateKind(op: Op) ImmKind {
         0xd0 => .ref_type, // ref.null <heaptype>
         0xd2 => .func, // ref.func <funcidx>
         // Everything else in the core-MVP range has no immediate.
-        0x00, 0x01, 0x05, 0x0b, 0x0f, 0x1a, 0x1b, 0xd1, 0xd4, 0x45...0xc4 => .none,
-        // GC ops with no immediate (internal 0xFB tags): ref.i31/i31.get_s/i31.get_u.
-        0xf0, 0xf1, 0xf2 => .none,
+        0x00, 0x01, 0x05, 0x0b, 0x0f, 0x1a, 0x1b, 0xd1, 0xd3, 0xd4, 0x45...0xc4 => .none,
+        // GC ops with no immediate: ref.i31/i31.get_s/i31.get_u, array.len.
+        0xf0, 0xf1, 0xf2, 0xed => .none,
+        // GC ops with a single type index.
+        0xe6, 0xe7, 0xe9, 0xea, 0xeb, 0xec, 0xf3, 0xf4 => .gc_type,
+        // GC struct ops with a type index + field index.
+        0xf5, 0xf6, 0xf7, 0xf8 => .gc_field,
+        // array.new_fixed: type index + element count.
+        0xe8 => .gc_type_n,
         else => .unsupported,
     };
 }
@@ -410,6 +456,13 @@ fn readBlockType(r: *Reader) DecodeError!BlockType {
     };
 }
 
+/// Read a GC struct-op immediate: a struct type index followed by a field index.
+fn readGcField(r: *Reader) DecodeError!Imm {
+    const ti = try r.readVarU32();
+    const f = try r.readVarU32();
+    return .{ .gc_field = .{ .type_index = ti, .field = f } };
+}
+
 /// Decode a function body's raw bytes into a flat instruction list. The result
 /// is allocated from `a` (typically the module's arena). Nesting and branch
 /// targets are left to validation.
@@ -421,14 +474,29 @@ pub fn decodeBody(a: std.mem.Allocator, body: []const u8) (DecodeError || std.me
     while (!r.atEnd()) {
         const b0 = try r.readByte();
         if (b0 == 0xfb) {
-            // 0xFB-prefixed GC op: a LEB sub-opcode picks the internal Op tag.
-            const op: Op = switch (try r.readVarU32()) {
-                0x1c => .ref_i31,
-                0x1d => .i31_get_s,
-                0x1e => .i31_get_u,
+            // 0xFB-prefixed GC op: a LEB sub-opcode picks the internal Op tag,
+            // then its immediates (a type index, a type+field, or a type+count).
+            const instr: Instr = switch (try r.readVarU32()) {
+                0x00 => .{ .op = .struct_new, .imm = .{ .gc_type = try r.readVarU32() } },
+                0x01 => .{ .op = .struct_new_default, .imm = .{ .gc_type = try r.readVarU32() } },
+                0x02 => .{ .op = .struct_get, .imm = try readGcField(&r) },
+                0x03 => .{ .op = .struct_get_s, .imm = try readGcField(&r) },
+                0x04 => .{ .op = .struct_get_u, .imm = try readGcField(&r) },
+                0x05 => .{ .op = .struct_set, .imm = try readGcField(&r) },
+                0x06 => .{ .op = .array_new, .imm = .{ .gc_type = try r.readVarU32() } },
+                0x07 => .{ .op = .array_new_default, .imm = .{ .gc_type = try r.readVarU32() } },
+                0x08 => .{ .op = .array_new_fixed, .imm = .{ .gc_type_n = .{ .type_index = try r.readVarU32(), .n = try r.readVarU32() } } },
+                0x0b => .{ .op = .array_get, .imm = .{ .gc_type = try r.readVarU32() } },
+                0x0c => .{ .op = .array_get_s, .imm = .{ .gc_type = try r.readVarU32() } },
+                0x0d => .{ .op = .array_get_u, .imm = .{ .gc_type = try r.readVarU32() } },
+                0x0e => .{ .op = .array_set, .imm = .{ .gc_type = try r.readVarU32() } },
+                0x0f => .{ .op = .array_len, .imm = .none },
+                0x1c => .{ .op = .ref_i31, .imm = .none },
+                0x1d => .{ .op = .i31_get_s, .imm = .none },
+                0x1e => .{ .op = .i31_get_u, .imm = .none },
                 else => return error.UnsupportedOpcode,
             };
-            try list.append(a, .{ .op = op, .imm = .none });
+            try list.append(a, instr);
             continue;
         }
         if (b0 == 0xfc) {
@@ -484,7 +552,9 @@ pub fn decodeBody(a: std.mem.Allocator, body: []const u8) (DecodeError || std.me
             .ref_type => .{ .ref_type = @enumFromInt(try r.readByte()) },
             // These are `0xFC`-prefixed ops decoded via the interception above;
             // reaching here means a raw synthetic-tag byte, which is malformed.
-            .elem, .table_init, .table_copy => return error.UnsupportedOpcode,
+            // 0xFB/0xFC-prefixed ops are decoded via the prefix interceptions
+            // above; reaching here means a raw synthetic-tag byte (malformed).
+            .elem, .table_init, .table_copy, .gc_type, .gc_field, .gc_type_n => return error.UnsupportedOpcode,
             .unsupported => return error.UnsupportedOpcode,
         };
         try list.append(a, .{ .op = op, .imm = imm });

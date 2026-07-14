@@ -54,6 +54,26 @@ pub fn asF64(v: Value) f64 {
     return @bitCast(v);
 }
 
+/// Narrow a value to a GC field's storage width before storing (packed i8/i16
+/// keep only their low bits; unpacked stores verbatim).
+fn packField(storage: Module.StorageType, v: Value) Value {
+    return switch (storage) {
+        .val => v,
+        .i8 => v & 0xff,
+        .i16 => v & 0xffff,
+    };
+}
+
+/// Widen a stored GC field value back to an i32 slot: `_s` sign-extends a packed
+/// field, `_u` zero-extends; an unpacked field is returned verbatim.
+fn unpackField(storage: Module.StorageType, v: Value, signed: bool) Value {
+    return switch (storage) {
+        .val => v,
+        .i8 => if (signed) i32Value(@as(i8, @bitCast(@as(u8, @truncate(v))))) else i32Value(@as(i32, @as(u8, @truncate(v)))),
+        .i16 => if (signed) i32Value(@as(i16, @bitCast(@as(u16, @truncate(v))))) else i32Value(@as(i32, @as(u16, @truncate(v)))),
+    };
+}
+
 pub const Error = Module.Error || error{
     /// `unreachable` executed.
     Unreachable,
@@ -97,6 +117,10 @@ pub const Error = Module.Error || error{
     IndirectTypeMismatch,
     /// A type index out of range.
     UndefinedType,
+    /// A GC struct field / array element access outside the object's bounds
+    /// (`array.get`/`.set` past the length, or a field index beyond a collapsed
+    /// object's fields). Traps.
+    GcOutOfBounds,
 };
 
 /// Null reference sentinel — on the value stack (`ref.null`) and as an
@@ -163,6 +187,11 @@ pub const Instance = struct {
     /// `elem.drop`), after which it behaves as an empty segment.
     elem_values: []const []Value,
     elem_dropped: []bool,
+    /// GC heap (full GC, P3): one `[]Value` per allocated struct/array object; a
+    /// GC reference value is the object's index here. Objects live for the
+    /// instance's lifetime (arena-backed slices; no collector yet — a size cost
+    /// accepted per the proposal-scope decision). `gpa`-owned outer list.
+    gc_heap: std.ArrayList([]Value) = .empty,
 
     /// Shared linear memory. A single object is referenced by the defining
     /// instance and every importer, so `memory.grow` (which updates `bytes`) is
@@ -358,6 +387,7 @@ pub const Instance = struct {
             self.gpa.destroy(t);
         };
         self.gpa.free(self.tables);
+        self.gc_heap.deinit(self.gpa); // object slices are arena-backed (freed below)
         self.arena.deinit();
         self.* = undefined;
     }
@@ -398,6 +428,22 @@ pub const Instance = struct {
             if (e.type.kind() == .func and std.mem.eql(u8, e.name, name)) return e.index;
         }
         return null;
+    }
+
+    /// Allocate a GC object (struct fields / array elements, `fields` arena-
+    /// backed) and return its reference value — an index into `gc_heap`. Object
+    /// indices start at 0 and stay small, so they never collide with the
+    /// `null_ref` sentinel.
+    fn allocObject(self: *Instance, fields: []Value) Error!Value {
+        const idx = self.gc_heap.items.len;
+        try self.gc_heap.append(self.gpa, fields);
+        return @intCast(idx);
+    }
+
+    /// The field/element slice of a non-null GC reference, or a trap on null.
+    fn gcObject(self: *Instance, ref: Value) Error![]Value {
+        if (ref == null_ref) return error.NullReference;
+        return self.gc_heap.items[@intCast(ref)];
     }
 
     fn callFunction(self: *Instance, a: std.mem.Allocator, func_index: u32, args: []const Value, depth: usize) Error![]Value {
@@ -579,6 +625,100 @@ const Frame = struct {
                     const r = self.pop();
                     if (r == null_ref) return error.NullReference;
                     try self.pushI32(@bitCast(@as(u32, @truncate(r)) & 0x7fff_ffff));
+                    pc += 1;
+                },
+
+                // --- GC: eq comparison ---
+                .ref_eq => {
+                    const b = self.pop();
+                    const av = self.pop();
+                    try self.pushI32(if (av == b) 1 else 0);
+                    pc += 1;
+                },
+
+                // --- GC: struct objects ---
+                .struct_new => {
+                    const sf = self.inst.module.structFields(instr.imm.gc_type).?;
+                    const obj = try self.inst.arena.allocator().alloc(Value, sf.len);
+                    const base = self.vstack.items.len - sf.len;
+                    for (sf, 0..) |f, k| obj[k] = packField(f.storage, self.vstack.items[base + k]);
+                    self.vstack.shrinkRetainingCapacity(base);
+                    try self.pushU64(try self.inst.allocObject(obj));
+                    pc += 1;
+                },
+                .struct_new_default => {
+                    const sf = self.inst.module.structFields(instr.imm.gc_type).?;
+                    const obj = try self.inst.arena.allocator().alloc(Value, sf.len);
+                    for (sf, 0..) |f, k| obj[k] = if (f.storage.unpacked().isRef()) null_ref else 0;
+                    try self.pushU64(try self.inst.allocObject(obj));
+                    pc += 1;
+                },
+                .struct_get, .struct_get_s, .struct_get_u => {
+                    const gf = instr.imm.gc_field;
+                    const obj = try self.inst.gcObject(self.pop());
+                    if (gf.field >= obj.len) return error.GcOutOfBounds;
+                    const storage = self.inst.module.structFields(gf.type_index).?[gf.field].storage;
+                    try self.pushU64(unpackField(storage, obj[gf.field], instr.op == .struct_get_s));
+                    pc += 1;
+                },
+                .struct_set => {
+                    const gf = instr.imm.gc_field;
+                    const v = self.pop();
+                    const obj = try self.inst.gcObject(self.pop());
+                    if (gf.field >= obj.len) return error.GcOutOfBounds;
+                    const storage = self.inst.module.structFields(gf.type_index).?[gf.field].storage;
+                    obj[gf.field] = packField(storage, v);
+                    pc += 1;
+                },
+
+                // --- GC: array objects ---
+                .array_new => {
+                    const f = self.inst.module.arrayField(instr.imm.gc_type).?;
+                    const len = @as(u32, @bitCast(self.popI32()));
+                    const init_v = packField(f.storage, self.pop());
+                    const obj = try self.inst.arena.allocator().alloc(Value, len);
+                    @memset(obj, init_v);
+                    try self.pushU64(try self.inst.allocObject(obj));
+                    pc += 1;
+                },
+                .array_new_default => {
+                    const f = self.inst.module.arrayField(instr.imm.gc_type).?;
+                    const len = @as(u32, @bitCast(self.popI32()));
+                    const obj = try self.inst.arena.allocator().alloc(Value, len);
+                    @memset(obj, if (f.storage.unpacked().isRef()) null_ref else 0);
+                    try self.pushU64(try self.inst.allocObject(obj));
+                    pc += 1;
+                },
+                .array_new_fixed => {
+                    const tn = instr.imm.gc_type_n;
+                    const f = self.inst.module.arrayField(tn.type_index).?;
+                    const obj = try self.inst.arena.allocator().alloc(Value, tn.n);
+                    const base = self.vstack.items.len - tn.n;
+                    for (0..tn.n) |k| obj[k] = packField(f.storage, self.vstack.items[base + k]);
+                    self.vstack.shrinkRetainingCapacity(base);
+                    try self.pushU64(try self.inst.allocObject(obj));
+                    pc += 1;
+                },
+                .array_get, .array_get_s, .array_get_u => {
+                    const f = self.inst.module.arrayField(instr.imm.gc_type).?;
+                    const idx = @as(u32, @bitCast(self.popI32()));
+                    const obj = try self.inst.gcObject(self.pop());
+                    if (idx >= obj.len) return error.GcOutOfBounds;
+                    try self.pushU64(unpackField(f.storage, obj[idx], instr.op == .array_get_s));
+                    pc += 1;
+                },
+                .array_set => {
+                    const f = self.inst.module.arrayField(instr.imm.gc_type).?;
+                    const v = self.pop();
+                    const idx = @as(u32, @bitCast(self.popI32()));
+                    const obj = try self.inst.gcObject(self.pop());
+                    if (idx >= obj.len) return error.GcOutOfBounds;
+                    obj[idx] = packField(f.storage, v);
+                    pc += 1;
+                },
+                .array_len => {
+                    const obj = try self.inst.gcObject(self.pop());
+                    try self.pushI32(@bitCast(@as(u32, @intCast(obj.len))));
                     pc += 1;
                 },
 
