@@ -38,9 +38,9 @@ the **WAST script runner** (`wast.zig`) is next.
   (`env.add`) and export (`run`, params=2 results=1). Retired the ad-hoc `wazmrt_module_*` ABI.
 - **cmem/ project memory** established (this folder), mirroring the wasmtk setup.
 
-**Remaining:** the WAST runner's invoke-by-module-name + `(table (export …))` on a defined table (#11)
-to unlock more of `linking.wast`; growing the wasm-c-api past introspection; first
-`universalWasmLoader-*` integration; then WASI. **Start function (#3) DONE 2026-07-13; the 2026-07-09
+**Remaining:** growing the wasm-c-api past introspection (instance/func/call) so the runtime is
+embeddable end-to-end; first `universalWasmLoader-*` integration; the Deno/V8 benchmark; then WASI.
+(The WAST runner's invoke-by-module-name landed `9745ecb` — `linking.wast` 29 → 100.) **Start function (#3) DONE 2026-07-13; the 2026-07-09
 audit ledger is now FULLY cleared — every item #1–#16 resolved** (externref boxing #9, import-after-def
 rejection #10, const-expr section ordering #12, dead-code cleanup #13, non-power-of-two `align=` #8,
 defined-table inline export #11). Still **100% original runtime code** — no

@@ -54,8 +54,9 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
   `assert_exhaustion`, `assert_invalid`/`assert_malformed` (the inner module must be rejected)**,
   `invoke`; value literals incl. `nan:canonical`/`nan:arithmetic` + references; drives an `Instance` and
   compares (NaN-aware). CLI `.wast` mode. **Passes thousands of positive + negative official-testsuite
-  assertions** (see `testing.md`). Handles `(register "name")` + cross-module imports. Deferred:
-  `(register $id)` targeting a non-current module, `get`, `(module quote …)`.
+  assertions** (see `testing.md`). Handles `(register "name" $id?)` + cross-module imports, **module
+  `$name` tracking so `(invoke $M …)` / `(get $M …)` / `(register "x" $M)` target a named (non-current)
+  module** (`9745ecb`), and the `(get …)` action (reads an exported global). Deferred: `(module quote …)`.
 
 ## Staged plan
 

@@ -40,10 +40,10 @@ Third pass (commit `c535de0`):
 
 **The 2026-07-09 audit ledger is FULLY cleared (2026-07-13): every item #1–#16 is resolved.** No open
 correctness/soundness/dead-code/spec-strictness items remain. The real frontiers are now new *features*,
-not ledger debt: invoke-by-module-name in the WAST runner (blocks more of `linking.wast`), growing the
-wasm-c-api past introspection (instance/func/call), and WASI. Larger out-of-scope proposals surfaced by
-the suite (now the main sources of remaining `.wast` failures): **typed/GC references** (`(ref null $t)`),
-**multi-memory** (`start0`), and exception-handling **tags** (`imports`).
+not ledger debt: growing the wasm-c-api past introspection (instance/func/call), and WASI. (WAST-runner
+invoke-by-module-name landed `9745ecb` — `linking.wast` 29 → 100.) Larger out-of-scope proposals surfaced
+by the suite (now the main sources of remaining `.wast` failures): **typed/GC references** (`(ref null
+$t)`), **multi-memory** (`start0`), and exception-handling **tags** (`imports`).
 
 ## Grouped by the integration that trips them
 

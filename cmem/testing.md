@@ -275,6 +275,12 @@ stable, new failures are newly-run assertions hitting typed-ref gaps). **68 unit
 audit ledger is now FULLY cleared — every item #1–#16 resolved.** Remaining `.wast` gaps are new
 proposals (typed/GC refs, multi-memory, EH tags), not ledger debt.
 
+**Update 2026-07-13 — invoke-by-module-name** (`9745ecb`). The WAST runner tracks each `(module $M …)`
+by name and resolves `(invoke $M …)` / `(get $M …)` / `(register "x" $M)` to that module (else the
+current one); `(get …)` reads an exported global; a missing target → `NoTarget` → the assertion skips.
+`linking.wast` 29/108 → **100/37** (+71 passes — named invokes were the blocker for most of it),
+`elem.wast` 52/26 → **63/17** (+11). No core regressions; passes strictly up. **70 unit tests.**
+
 ## What this tells the roadmap
 
 1. **First execution milestone = the `module/wasm_mod` corpus + its `.test.json` files** — fully
