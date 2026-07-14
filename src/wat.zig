@@ -1315,6 +1315,9 @@ fn emitMemArg(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
             offset = std.fmt.parseInt(u64, atom[7..], 0) catch return error.BadImmediate;
         } else if (std.mem.startsWith(u8, atom, "align=")) {
             const bytes = std.fmt.parseInt(u32, atom[6..], 0) catch return error.BadImmediate;
+            // Alignment must be a non-zero power of two (§6.5.8); otherwise
+            // `@ctz` would silently encode a bogus log2 (e.g. align=3 → 0).
+            if (bytes == 0 or (bytes & (bytes - 1)) != 0) return error.BadImmediate;
             align_log2 = @ctz(bytes);
         }
     }
@@ -1522,6 +1525,9 @@ test "validation rejects invalid modules" {
     try expectInvalid("(module (type (func)) (func (call_indirect (type 0) (i32.const 0))))");
     // Over-aligned load (align=2 on load8).
     try expectInvalid("(module (memory 0) (func (drop (i32.load8_u align=2 (i32.const 0)))))");
+    // Non-power-of-two / zero alignment (#8) — rejected at assembly.
+    try expectInvalid("(module (memory 0) (func (drop (i32.load align=3 (i32.const 0)))))");
+    try expectInvalid("(module (memory 0) (func (drop (i32.load align=0 (i32.const 0)))))");
     // Load with no memory at all.
     try expectInvalid("(module (func (drop (i32.load (i32.const 0)))))");
     // ref.is_null on a non-reference operand.
