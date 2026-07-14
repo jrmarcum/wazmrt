@@ -140,20 +140,27 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
 
     const start: usize = if (module.len > 1 and isId(module[1])) 2 else 1; // skip optional module $name
 
-    // Pre-pass: `(type …)` definitions occupy the first type indices, in order.
-    // A `(rec (type …) …)` group flattens to consecutive types (the assembler
-    // emits them ungrouped — the decoder flattens rec groups the same way).
+    // Pre-pass A: collect every `(type …)` name first (a concrete `(ref $t)` in a
+    // field/param may forward-reference a later type, e.g. within a `(rec …)`
+    // group — the assembler emits them ungrouped, the decoder flattens the same).
+    var type_forms: List([]const Sexpr) = .empty;
     for (module[start..]) |field| {
         const kw = field.keyword() orelse continue;
         if (std.mem.eql(u8, kw, "type")) {
-            try parseTypeDef(a, field.asList().?, &sigs, &type_names, &gc_types, &gc_supers);
+            try type_names.append(a, typeDefName(field.asList().?));
+            try type_forms.append(a, field.asList().?);
         } else if (std.mem.eql(u8, kw, "rec")) {
             for (field.asList().?[1..]) |t| {
-                if (std.mem.eql(u8, t.keyword() orelse continue, "type"))
-                    try parseTypeDef(a, t.asList().?, &sigs, &type_names, &gc_types, &gc_supers);
+                if (std.mem.eql(u8, t.keyword() orelse continue, "type")) {
+                    try type_names.append(a, typeDefName(t.asList().?));
+                    try type_forms.append(a, t.asList().?);
+                }
             }
         }
     }
+    // Pre-pass B: parse the bodies now that all type names resolve.
+    for (type_forms.items) |form|
+        try parseTypeBody(a, form, type_names.items, &sigs, &gc_types, &gc_supers);
 
     // Pass 1: collect the remaining definitions. Imports (top-level or inline)
     // must precede every func/table/memory/global definition (§6.6.13), so an
@@ -168,7 +175,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             seen_definition = true;
         }
         if (std.mem.eql(u8, kw, "func")) {
-            const f = try parseFunc(a, items);
+            const f = try parseFunc(a, items, type_names.items);
             const idx: u32 = @intCast(func_names.items.len); // func-space index (imports first)
             for (f.exports.items) |name| try exports.append(a, .{ .name = name, .kind = 0, .index = idx });
             if (f.import) |m| {
@@ -192,7 +199,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             };
             try exports.append(a, .{ .name = name, .kind = kind, .index = idx });
         } else if (std.mem.eql(u8, kw, "global")) {
-            try parseGlobal(a, items, &globals, &global_imports, &global_names, &exports);
+            try parseGlobal(a, items, &globals, &global_imports, &global_names, &exports, type_names.items);
         } else if (std.mem.eql(u8, kw, "memory")) {
             var mi: usize = 1;
             if (mi < items.len and isId(items[mi])) mi += 1; // optional $name
@@ -272,19 +279,19 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                     tmax = try parseIndex(items[ti]);
                     ti += 1;
                 }
-                try table_imports.append(a, .{ .module = imp[1].string, .name = imp[2].string, .min = tmin, .max = tmax, .elem = try parseValType(items[ti]) });
+                try table_imports.append(a, .{ .module = imp[1].string, .name = imp[2].string, .min = tmin, .max = tmax, .elem = try parseValType(items[ti], type_names.items) });
                 try table_names.append(a, tname);
             } else {
-                try parseTable(a, items, &tables, &table_names, &elems, &elem_names, &exports);
+                try parseTable(a, items, &tables, &table_names, &elems, &elem_names, &exports, type_names.items);
             }
         } else if (std.mem.eql(u8, kw, "elem")) {
-            try parseElem(a, items, &elems, &elem_names, table_names.items);
+            try parseElem(a, items, &elems, &elem_names, table_names.items, type_names.items);
         } else if (std.mem.eql(u8, kw, "import")) {
             // (import "m" "n" (func …) | (global …)) — func + global imports.
             const desc = items[3].asList() orelse return error.BadModuleField;
             const dkw = desc[0].asAtom() orelse return error.BadModuleField;
             if (std.mem.eql(u8, dkw, "func")) {
-                const f = try parseFunc(a, desc); // reuse: parses $id + typeuse
+                const f = try parseFunc(a, desc, type_names.items); // reuse: parses $id + typeuse
                 try func_imports.append(a, .{ .module = items[1].string, .name = items[2].string, .type_ref = f.type_ref, .params = f.params.items, .results = f.results.items });
                 try func_names.append(a, f.name);
             } else if (std.mem.eql(u8, dkw, "table")) {
@@ -303,7 +310,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                     tmax = try parseIndex(desc[ti]);
                     ti += 1;
                 }
-                try table_imports.append(a, .{ .module = items[1].string, .name = items[2].string, .min = tmin, .max = tmax, .elem = try parseValType(desc[ti]) });
+                try table_imports.append(a, .{ .module = items[1].string, .name = items[2].string, .min = tmin, .max = tmax, .elem = try parseValType(desc[ti], type_names.items) });
                 try table_names.append(a, tname);
             } else if (std.mem.eql(u8, dkw, "memory")) {
                 // (import "m" "n" (memory $id? min max?)) — the single memory 0.
@@ -314,7 +321,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 const mmax: ?u32 = if (mi2 < desc.len) try parseIndex(desc[mi2]) else null;
                 try mem_imports.append(a, .{ .module = items[1].string, .name = items[2].string, .min = mmin, .max = mmax });
             } else {
-                try parseImport(a, items, &global_imports, &global_names); // global
+                try parseImport(a, items, &global_imports, &global_names, type_names.items); // global
             }
         } else if (std.mem.eql(u8, kw, "start")) {
             // (start $f | N) — resolve after the func index space is complete.
@@ -417,7 +424,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             try nameBytes(a, &s, t.module);
             try nameBytes(a, &s, t.name);
             try s.append(a, 0x01); // table import
-            try s.append(a, @intFromEnum(t.elem)); // element reftype
+            try emitValType(a, &s, t.elem); // element reftype
             try emitLimits(a, &s, t.min, t.max);
         }
         for (mem_imports.items) |m| {
@@ -430,7 +437,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             try nameBytes(a, &s, g.module);
             try nameBytes(a, &s, g.name);
             try s.append(a, 0x03); // global import
-            try s.append(a, @intFromEnum(g.valtype));
+            try emitValType(a, &s, g.valtype);
             try s.append(a, if (g.mutable) 0x01 else 0x00);
         }
         try emitSection(a, &out, 2, s.items);
@@ -447,7 +454,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         var s: List(u8) = .empty;
         try uleb(a, &s, tables.items.len);
         for (tables.items) |t| {
-            try s.append(a, @intFromEnum(t.elem)); // element reftype (funcref / externref)
+            try emitValType(a, &s, t.elem); // element reftype (funcref / externref)
             try emitLimits(a, &s, t.min, t.max);
         }
         try emitSection(a, &out, 4, s.items);
@@ -505,7 +512,7 @@ fn encodeGlobalSection(a: std.mem.Allocator, globals: []const GlobalDef, sigs: *
     var s: List(u8) = .empty;
     try uleb(a, &s, globals.len);
     for (globals) |g| {
-        try s.append(a, @intFromEnum(g.valtype));
+        try emitValType(a, &s, g.valtype);
         try s.append(a, if (g.mutable) 0x01 else 0x00);
         try emitConstExpr(a, &s, sigs, type_names, global_names, func_names, g.init);
     }
@@ -537,7 +544,7 @@ fn encodeElementSection(a: std.mem.Allocator, elems: []const ElemDef, sigs: *Lis
         if (!e.expr_form and flag != 0) {
             try s.append(a, 0x00); // elemkind funcref
         } else if (e.expr_form and flag != 4) {
-            try s.append(a, @intFromEnum(e.elem_type)); // reftype
+            try emitValType(a, &s, e.elem_type); // reftype
         }
         if (e.expr_form) {
             try uleb(a, &s, e.exprs.len);
@@ -595,18 +602,19 @@ fn fieldIsImport(kw: []const u8, items: []const Sexpr) bool {
     return false;
 }
 
-/// `(type $name? <comptype>)` where comptype is `(func …)` / `(struct …)` /
-/// `(array …)`, optionally wrapped in `(sub final? $super? <comptype>)` (GC).
-/// Appends the func signature (to `sigs`) or the struct/array fields (to
-/// `gc_types`) plus the declared supertype (to `gc_supers`, resolved at emit)
-/// at the next type index; all three stay index-aligned with `type_names`.
-fn parseTypeDef(a: std.mem.Allocator, items: []const Sexpr, sigs: *List(Sig), type_names: *List(?[]const u8), gc_types: *List(GcTypeDef), gc_supers: *List(?Sexpr)) Error!void {
+/// The `$name` of a `(type $name? …)` definition, or null.
+fn typeDefName(items: []const Sexpr) ?[]const u8 {
+    return if (items.len >= 2 and isId(items[1])) items[1].atom else null;
+}
+
+/// Parse a `(type $name? <comptype>)` body (`(func …)`/`(struct …)`/`(array …)`,
+/// optionally `(sub final? $super? <comptype>)`). Appends the func signature (to
+/// `sigs`) or the struct/array fields (to `gc_types`) plus the declared supertype
+/// (to `gc_supers`, resolved at emit) at the next type index — all index-aligned
+/// with `type_names` (already fully populated, so concrete `(ref $t)` resolves).
+fn parseTypeBody(a: std.mem.Allocator, items: []const Sexpr, type_names: []const ?[]const u8, sigs: *List(Sig), gc_types: *List(GcTypeDef), gc_supers: *List(?Sexpr)) Error!void {
     var i: usize = 1;
-    var name: ?[]const u8 = null;
-    if (i < items.len and isId(items[i])) {
-        name = items[i].atom;
-        i += 1;
-    }
+    if (i < items.len and isId(items[i])) i += 1; // skip $name (already collected)
     var body = items[i].asList() orelse return error.BadModuleField;
     // Unwrap a `(sub final? $super? <comptype>)`: the inner comptype is the last
     // element; a supertype id among the middle elements (skipping `final`) is
@@ -629,8 +637,8 @@ fn parseTypeDef(a: std.mem.Allocator, items: []const Sexpr, sigs: *List(Sig), ty
         var results: List(V) = .empty;
         for (body[1..]) |part| {
             const pk = part.keyword() orelse continue;
-            if (std.mem.eql(u8, pk, "param")) try parseDecls(a, part.asList().?, &params, null);
-            if (std.mem.eql(u8, pk, "result")) try parseDecls(a, part.asList().?, &results, null);
+            if (std.mem.eql(u8, pk, "param")) try parseDecls(a, part.asList().?, &params, null, type_names);
+            if (std.mem.eql(u8, pk, "result")) try parseDecls(a, part.asList().?, &results, null, type_names);
         }
         try sigs.append(a, .{ .params = params.items, .results = results.items });
         try gc_types.append(a, .func);
@@ -638,7 +646,7 @@ fn parseTypeDef(a: std.mem.Allocator, items: []const Sexpr, sigs: *List(Sig), ty
         var fields: List(GcField) = .empty;
         for (body[1..]) |part| {
             if (std.mem.eql(u8, part.keyword() orelse continue, "field"))
-                try parseFieldGroup(a, part.asList().?, &fields);
+                try parseFieldGroup(a, part.asList().?, &fields, type_names);
         }
         try sigs.append(a, .{ .params = &.{}, .results = &.{} }); // placeholder
         try gc_types.append(a, .{ .@"struct" = fields.items });
@@ -649,44 +657,43 @@ fn parseTypeDef(a: std.mem.Allocator, items: []const Sexpr, sigs: *List(Sig), ty
         const is_field_form = std.mem.eql(u8, body[1].keyword() orelse "", "field");
         const elem: GcField = if (is_field_form) blk: {
             var fields: List(GcField) = .empty;
-            try parseFieldGroup(a, body[1].asList().?, &fields);
+            try parseFieldGroup(a, body[1].asList().?, &fields, type_names);
             if (fields.items.len != 1) return error.BadModuleField;
             break :blk fields.items[0];
-        } else try parseFieldElem(body[1]);
+        } else try parseFieldElem(body[1], type_names);
         try sigs.append(a, .{ .params = &.{}, .results = &.{} }); // placeholder
         try gc_types.append(a, .{ .array = elem });
     } else return error.BadModuleField;
-    try type_names.append(a, name);
 }
 
 /// Parse a `(field …)` group: an optional `$id` then one-or-more field types
 /// (`(field $x i32)` / `(field i32 (mut i64))`), appending each to `out`.
-fn parseFieldGroup(a: std.mem.Allocator, list: []const Sexpr, out: *List(GcField)) Error!void {
+fn parseFieldGroup(a: std.mem.Allocator, list: []const Sexpr, out: *List(GcField), type_names: []const ?[]const u8) Error!void {
     var i: usize = 1;
     if (i < list.len and isId(list[i])) i += 1; // a named field is a single field
-    while (i < list.len) : (i += 1) try out.append(a, try parseFieldElem(list[i]));
+    while (i < list.len) : (i += 1) try out.append(a, try parseFieldElem(list[i], type_names));
 }
 
 /// Parse one field type: `(mut <storage>)` or a bare `<storage>`, where storage
 /// is `i8` / `i16` (packed) or a value type.
-fn parseFieldElem(s: Sexpr) Error!GcField {
+fn parseFieldElem(s: Sexpr, type_names: []const ?[]const u8) Error!GcField {
     if (s.asList()) |l| {
-        if (l.len == 2 and eqAtom(l[0], "mut")) return .{ .storage = try parseStorage(l[1]), .mutable = true };
+        if (l.len == 2 and eqAtom(l[0], "mut")) return .{ .storage = try parseStorage(l[1], type_names), .mutable = true };
     }
-    return .{ .storage = try parseStorage(s), .mutable = false };
+    return .{ .storage = try parseStorage(s, type_names), .mutable = false };
 }
 
-fn parseStorage(s: Sexpr) Error!GcStorage {
+fn parseStorage(s: Sexpr, type_names: []const ?[]const u8) Error!GcStorage {
     if (s.asAtom()) |atom| {
         if (std.mem.eql(u8, atom, "i8")) return .i8;
         if (std.mem.eql(u8, atom, "i16")) return .i16;
     }
-    return .{ .val = try parseValType(s) };
+    return .{ .val = try parseValType(s, type_names) };
 }
 
 /// `(table $name? reftype (elem …))` or `(table $name? <min> <max>? reftype)`,
 /// where reftype is `funcref` / `externref` / `(ref null? …)`.
-fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef), table_names: *List(?[]const u8), elems: *List(ElemDef), elem_names: *List(?[]const u8), exports: *List(ExportDef)) Error!void {
+fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef), table_names: *List(?[]const u8), elems: *List(ElemDef), elem_names: *List(?[]const u8), exports: *List(ExportDef), type_names: []const ?[]const u8) Error!void {
     const table_index: u32 = @intCast(tables.items.len);
     var i: usize = 1;
     var name: ?[]const u8 = null;
@@ -700,7 +707,7 @@ fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef
     try table_names.append(a, name);
     if (isRefType(items[i])) {
         // (table reftype (elem …))
-        const et = try parseValType(items[i]);
+        const et = try parseValType(items[i], type_names);
         i += 1;
         if (i < items.len and eqKw(items[i], "elem")) {
             // Inline active elem at offset 0. Items are either bare func indices
@@ -725,7 +732,7 @@ fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef
             max = try parseIndex(items[i]);
             i += 1;
         }
-        const et = try parseValType(items[i]);
+        const et = try parseValType(items[i], type_names);
         i += 1;
         try tables.append(a, .{ .min = min, .max = max, .elem = et });
         // Table initializer expression `(table N reftype initexpr)`: fill all N
@@ -751,7 +758,7 @@ fn isRefType(s: Sexpr) bool {
 /// `(elem $id? mode? tableuse? offset? kind item*)` — active / passive /
 /// declarative, in either the func-index (`func $f …`) or const-expr
 /// (`funcref (ref.func $f) …`) form.
-fn parseElem(a: std.mem.Allocator, items: []const Sexpr, elems: *List(ElemDef), elem_names: *List(?[]const u8), table_names: []const ?[]const u8) Error!void {
+fn parseElem(a: std.mem.Allocator, items: []const Sexpr, elems: *List(ElemDef), elem_names: *List(?[]const u8), table_names: []const ?[]const u8, type_names: []const ?[]const u8) Error!void {
     var i: usize = 1;
     var name: ?[]const u8 = null;
     if (i < items.len and isId(items[i])) {
@@ -782,7 +789,7 @@ fn parseElem(a: std.mem.Allocator, items: []const Sexpr, elems: *List(ElemDef), 
     if (i < items.len and eqAtom(items[i], "func")) {
         try elems.append(a, .{ .mode = mode, .table_index = table_index, .offset_form = offset_form, .elem_type = .funcref, .expr_form = false, .funcs = items[i + 1 ..], .exprs = &.{} });
     } else if (i < items.len and isRefType(items[i])) {
-        const et = try parseValType(items[i]);
+        const et = try parseValType(items[i], type_names);
         try elems.append(a, .{ .mode = mode, .table_index = table_index, .offset_form = offset_form, .elem_type = et, .expr_form = true, .funcs = &.{}, .exprs = items[i + 1 ..] });
     } else {
         try elems.append(a, .{ .mode = mode, .table_index = table_index, .offset_form = offset_form, .elem_type = .funcref, .expr_form = false, .funcs = items[i..], .exprs = &.{} });
@@ -799,7 +806,7 @@ fn isOffsetForm(s: Sexpr) bool {
 }
 
 /// `(global $name? (export "x")* (import "m" "n")? (mut? valtype) init-expr?)`.
-fn parseGlobal(a: std.mem.Allocator, items: []const Sexpr, globals: *List(GlobalDef), global_imports: *List(ImportedGlobal), global_names: *List(?[]const u8), exports: *List(ExportDef)) Error!void {
+fn parseGlobal(a: std.mem.Allocator, items: []const Sexpr, globals: *List(GlobalDef), global_imports: *List(ImportedGlobal), global_names: *List(?[]const u8), exports: *List(ExportDef), type_names: []const ?[]const u8) Error!void {
     var i: usize = 1;
     var name: ?[]const u8 = null;
     if (i < items.len and isId(items[i])) {
@@ -826,12 +833,12 @@ fn parseGlobal(a: std.mem.Allocator, items: []const Sexpr, globals: *List(Global
     if (items[i].asList()) |gt| {
         if (eqAtom(gt[0], "mut")) {
             mutable = true;
-            valtype = try parseValType(gt[gt.len - 1]);
+            valtype = try parseValType(gt[gt.len - 1], type_names);
         } else {
-            valtype = try parseValType(items[i]);
+            valtype = try parseValType(items[i], type_names);
         }
     } else {
-        valtype = try parseValType(items[i]);
+        valtype = try parseValType(items[i], type_names);
     }
     i += 1;
     if (imp) |m| {
@@ -846,7 +853,7 @@ fn parseGlobal(a: std.mem.Allocator, items: []const Sexpr, globals: *List(Global
 
 /// Top-level `(import "m" "n" (global $id? (mut? valtype)))`. Only global imports
 /// are assembled today; a func/table/memory import errors (honest, not silent).
-fn parseImport(a: std.mem.Allocator, items: []const Sexpr, global_imports: *List(ImportedGlobal), global_names: *List(?[]const u8)) Error!void {
+fn parseImport(a: std.mem.Allocator, items: []const Sexpr, global_imports: *List(ImportedGlobal), global_names: *List(?[]const u8), type_names: []const ?[]const u8) Error!void {
     const module = items[1].string;
     const name = items[2].string;
     const desc = items[3].asList() orelse return error.BadModuleField;
@@ -862,9 +869,9 @@ fn parseImport(a: std.mem.Allocator, items: []const Sexpr, global_imports: *List
     var valtype: V = undefined;
     if (desc[di].asList()) |gt| {
         mutable = eqAtom(gt[0], "mut");
-        valtype = try parseValType(gt[gt.len - 1]);
+        valtype = try parseValType(gt[gt.len - 1], type_names);
     } else {
-        valtype = try parseValType(desc[di]);
+        valtype = try parseValType(desc[di], type_names);
     }
     try global_imports.append(a, .{ .module = module, .name = name, .valtype = valtype, .mutable = mutable });
     try global_names.append(a, gname);
@@ -922,7 +929,7 @@ fn eqAtom(s: Sexpr, atom: []const u8) bool {
     return if (s.asAtom()) |a| std.mem.eql(u8, a, atom) else false;
 }
 
-fn parseFunc(a: std.mem.Allocator, form: []const Sexpr) Error!Func {
+fn parseFunc(a: std.mem.Allocator, form: []const Sexpr, type_names: []const ?[]const u8) Error!Func {
     var f: Func = .{};
     var i: usize = 1;
     if (i < form.len and isId(form[i])) {
@@ -939,11 +946,11 @@ fn parseFunc(a: std.mem.Allocator, form: []const Sexpr) Error!Func {
         } else if (std.mem.eql(u8, kw, "type")) {
             f.type_ref = list[1]; // (type $t)
         } else if (std.mem.eql(u8, kw, "param")) {
-            try parseDecls(a, list, &f.params, &f.local_names);
+            try parseDecls(a, list, &f.params, &f.local_names, type_names);
         } else if (std.mem.eql(u8, kw, "result")) {
-            try parseDecls(a, list, &f.results, null);
+            try parseDecls(a, list, &f.results, null, type_names);
         } else if (std.mem.eql(u8, kw, "local")) {
-            try parseDecls(a, list, &f.locals, &f.local_names);
+            try parseDecls(a, list, &f.locals, &f.local_names, type_names);
         } else break; // body starts (e.g. a folded instruction)
     }
     f.body = form[i..];
@@ -952,13 +959,13 @@ fn parseFunc(a: std.mem.Allocator, form: []const Sexpr) Error!Func {
 
 /// Parse a `(param …)` / `(result …)` / `(local …)` group. Handles the named
 /// single form `(param $x i32)` and the anonymous multi form `(param i32 i32)`.
-fn parseDecls(a: std.mem.Allocator, list: []const Sexpr, out_types: *List(V), out_names: ?*List(?[]const u8)) Error!void {
+fn parseDecls(a: std.mem.Allocator, list: []const Sexpr, out_types: *List(V), out_names: ?*List(?[]const u8), type_names: []const ?[]const u8) Error!void {
     if (list.len >= 3 and isId(list[1])) {
-        try out_types.append(a, try parseValType(list[2]));
+        try out_types.append(a, try parseValType(list[2], type_names));
         if (out_names) |n| try n.append(a, list[1].atom);
     } else {
         for (list[1..]) |t| {
-            try out_types.append(a, try parseValType(t));
+            try out_types.append(a, try parseValType(t, type_names));
             if (out_names) |n| try n.append(a, null);
         }
     }
@@ -970,12 +977,15 @@ fn isId(s: Sexpr) bool {
     return atom.len != 0 and atom[0] == '$';
 }
 
-fn parseValType(s: Sexpr) Error!V {
+/// Parse a value type. `type_names` resolves a concrete `(ref null? $t)` /
+/// `(ref null? <index>)` to its type index (pass `&.{}` where concrete refs
+/// can't occur).
+fn parseValType(s: Sexpr, type_names: []const ?[]const u8) Error!V {
     // Reference type spelled as a list: `(ref null? ht)` — `null` marks nullable.
     if (s.asList()) |l| {
         if (l.len >= 2 and eqAtom(l[0], "ref")) {
             const nullable = l.len >= 3 and eqAtom(l[1], "null");
-            return heapTypeToValType(l[l.len - 1], nullable);
+            return heapTypeToValType(l[l.len - 1], nullable, type_names);
         }
         return error.BadValType;
     }
@@ -983,13 +993,18 @@ fn parseValType(s: Sexpr) Error!V {
     return stringToValType(atom) orelse error.BadValType;
 }
 
-/// A heap type → a reference value type. A concrete `$t` and the `func`/`nofunc`
-/// families → the func slot; the WasmGC `any` hierarchy (`any`/`eq`/`i31`/
-/// `struct`/`array`/`none`) → its own value types; `extern`/`noextern`/`exn` →
-/// the opaque extern slot. `nullable` picks the nullable vs non-null variant.
-fn heapTypeToValType(s: Sexpr, nullable: bool) Error!V {
+/// A heap type → a reference value type. A concrete `$t` / numeric index → a
+/// concrete typed reference carrying that type index; the `func`/`nofunc`
+/// families → the func head; the WasmGC `any` hierarchy → its own value types;
+/// `extern`/`noextern`/`exn` → the opaque extern head. `nullable` picks the
+/// nullable vs non-null variant. (The kind bits of a concrete ref are a
+/// placeholder — the assembler only emits its index; the decoder re-derives the
+/// family via its kind pre-scan.)
+fn heapTypeToValType(s: Sexpr, nullable: bool, type_names: []const ?[]const u8) Error!V {
     const atom = s.asAtom() orelse return error.BadValType;
-    if (atom.len != 0 and atom[0] == '$') return if (nullable) .funcref else .funcref_nn;
+    // A `$name` or a bare numeric index is a concrete type reference.
+    if ((atom.len != 0 and atom[0] == '$') or (atom.len != 0 and std.ascii.isDigit(atom[0])))
+        return V.concreteRef(nullable, .@"struct", try resolveType(type_names, s));
     const pair: ?[2]V = if (std.mem.eql(u8, atom, "func") or std.mem.eql(u8, atom, "funcref") or std.mem.eql(u8, atom, "nofunc"))
         .{ .funcref, .funcref_nn }
     else if (std.mem.eql(u8, atom, "extern") or std.mem.eql(u8, atom, "externref") or std.mem.eql(u8, atom, "noextern") or std.mem.eql(u8, atom, "exn") or std.mem.eql(u8, atom, "noexn"))
@@ -1062,7 +1077,7 @@ fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, si
     try uleb(a, &body, f.locals.items.len);
     for (f.locals.items) |t| {
         try uleb(a, &body, 1);
-        try body.append(a, @intFromEnum(t));
+        try emitValType(a, &body, t);
     }
     var ctx: Ctx = .{ .a = a, .out = &body, .local_names = f.local_names.items, .func_names = func_names, .sigs = sigs, .type_names = type_names, .global_names = global_names, .table_names = table_names, .elem_names = elem_names };
     try emitSeq(&ctx, f.body);
@@ -1142,7 +1157,7 @@ fn parseCallIndirectType(ctx: *Ctx, items: []const Sexpr, start: usize) Error!st
     var results: List(V) = .empty;
     while (j < items.len and items[j].keyword() != null) : (j += 1) {
         const kw = items[j].keyword().?;
-        if (std.mem.eql(u8, kw, "type")) type_ref = items[j].asList().?[1] else if (std.mem.eql(u8, kw, "param")) try parseDecls(ctx.a, items[j].asList().?, &params, null) else if (std.mem.eql(u8, kw, "result")) try parseDecls(ctx.a, items[j].asList().?, &results, null) else break;
+        if (std.mem.eql(u8, kw, "type")) type_ref = items[j].asList().?[1] else if (std.mem.eql(u8, kw, "param")) try parseDecls(ctx.a, items[j].asList().?, &params, null, ctx.type_names) else if (std.mem.eql(u8, kw, "result")) try parseDecls(ctx.a, items[j].asList().?, &results, null, ctx.type_names) else break;
     }
     const idx = if (type_ref) |tr| try resolveType(ctx.type_names, tr) else try internSig(ctx.a, ctx.sigs, params.items, results.items);
     return .{ .idx = idx, .table = table, .next = j };
@@ -1165,7 +1180,7 @@ fn emitCallIndirect(ctx: *Ctx, type_index: u32, table: u32) Error!void {
 fn emitFoldedSelect(ctx: *Ctx, l: []const Sexpr) Error!void {
     var j: usize = 1;
     var tys: List(V) = .empty;
-    while (j < l.len and eqKw(l[j], "result")) : (j += 1) try parseDecls(ctx.a, l[j].asList().?, &tys, null);
+    while (j < l.len and eqKw(l[j], "result")) : (j += 1) try parseDecls(ctx.a, l[j].asList().?, &tys, null, ctx.type_names);
     while (j < l.len) j = try emitOne(ctx, l, j); // operands
     try emitSelect(ctx, tys.items);
 }
@@ -1176,7 +1191,7 @@ fn emitSelect(ctx: *Ctx, tys: []const V) Error!void {
     } else {
         try ctx.out.append(ctx.a, @intFromEnum(Op.select_t));
         try uleb(ctx.a, ctx.out, tys.len);
-        for (tys) |t| try ctx.out.append(ctx.a, @intFromEnum(t));
+        for (tys) |t| try emitValType(ctx.a, ctx.out, t);
     }
 }
 
@@ -1272,7 +1287,7 @@ fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Erro
         .select => {
             var j = i + 1;
             var tys: List(V) = .empty;
-            while (j < items.len and eqKw(items[j], "result")) : (j += 1) try parseDecls(ctx.a, items[j].asList().?, &tys, null);
+            while (j < items.len and eqKw(items[j], "result")) : (j += 1) try parseDecls(ctx.a, items[j].asList().?, &tys, null, ctx.type_names);
             try emitSelect(ctx, tys.items);
             return j;
         },
@@ -1382,9 +1397,9 @@ fn parseBlockTypeSig(ctx: *Ctx, l: []const Sexpr, j: *usize) Error!BlockTy {
         if (std.mem.eql(u8, kw, "type")) {
             type_ref = try resolveType(ctx.type_names, l[j.*].asList().?[1]);
         } else if (std.mem.eql(u8, kw, "param")) {
-            try parseDecls(ctx.a, l[j.*].asList().?, &params, null);
+            try parseDecls(ctx.a, l[j.*].asList().?, &params, null, ctx.type_names);
         } else if (std.mem.eql(u8, kw, "result")) {
-            try parseDecls(ctx.a, l[j.*].asList().?, &results, null);
+            try parseDecls(ctx.a, l[j.*].asList().?, &results, null, ctx.type_names);
         } else break;
         j.* += 1;
     }
@@ -1402,8 +1417,11 @@ fn emitBlockTypeSig(ctx: *Ctx, bt: BlockTy) Error!void {
     const sig = bt.sig;
     if (sig.params.len == 0 and sig.results.len == 0) {
         try ctx.out.append(ctx.a, 0x40);
-    } else if (sig.params.len == 0 and sig.results.len == 1) {
-        try ctx.out.append(ctx.a, @intFromEnum(sig.results[0]));
+    } else if (sig.params.len == 0 and sig.results.len == 1 and !sig.results[0].isConcrete()) {
+        // Single non-concrete result → the value-type byte form. A concrete ref
+        // can't use the single-byte form (its `0x64 ti` would be misread as an
+        // s33 block type), so it falls through to an interned type index.
+        try ctx.out.append(ctx.a, @intCast(@intFromEnum(sig.results[0])));
     } else {
         try sleb(ctx.a, ctx.out, try internSig(ctx.a, ctx.sigs, sig.params, sig.results));
     }
@@ -1546,7 +1564,17 @@ fn emitInstr(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
         .f64c => try floatBits(ctx, u64, try imm0(immediates)),
         .mem => try emitMemArg(ctx, op, immediates),
         .mem_reserved => try ctx.out.append(ctx.a, 0x00),
-        .ref_type => try ctx.out.append(ctx.a, @intFromEnum(try heapTypeToValType(try imm0(immediates), true))), // ref.null → nullable
+        // ref.null takes a heap type as an `s33`: an abstract head code, or a
+        // concrete `$t` / index (so `ref.null $t` is typed `(ref null $t)`).
+        .ref_type => {
+            const ht = try imm0(immediates);
+            const atom = ht.asAtom() orelse return error.BadImmediate;
+            if (abstractHeapCode(atom)) |code| {
+                try sleb(ctx.a, ctx.out, code);
+            } else {
+                try sleb(ctx.a, ctx.out, @intCast(try resolveType(ctx.type_names, ht)));
+            }
+        },
         .br_table => try emitBrTable(ctx, immediates),
         .table_init, .elem, .table_copy => try emitBulkTableImm(ctx, op, immediates),
         // GC: a type index, optionally followed by a field index / element count.
@@ -1718,16 +1746,27 @@ fn internSig(a: std.mem.Allocator, sigs: *List(Sig), params: []const V, results:
     return @intCast(sigs.items.len - 1);
 }
 
+/// Emit one value type. A numeric/abstract type is its single byte; a concrete
+/// typed reference `(ref null? $t)` is `0x63`/`0x64` + the type index (`s33`).
+fn emitValType(a: std.mem.Allocator, out: *List(u8), v: V) Error!void {
+    if (v.isConcrete()) {
+        try out.append(a, if (v.isNonNullRef()) 0x64 else 0x63);
+        try sleb(a, out, v.concreteIndex());
+    } else {
+        try out.append(a, @intCast(@intFromEnum(v)));
+    }
+}
+
 fn valTypeVec(a: std.mem.Allocator, out: *List(u8), vts: []const V) Error!void {
     try uleb(a, out, vts.len);
-    for (vts) |v| try out.append(a, @intFromEnum(v));
+    for (vts) |v| try emitValType(a, out, v);
 }
 
 /// Emit a GC field type: a storage-type byte (packed i8=0x78 / i16=0x77, else
-/// the value-type byte) followed by a mutability byte.
+/// the value type) followed by a mutability byte.
 fn emitGcField(a: std.mem.Allocator, out: *List(u8), f: GcField) Error!void {
     switch (f.storage) {
-        .val => |v| try out.append(a, @intFromEnum(v)),
+        .val => |v| try emitValType(a, out, v),
         .i8 => try out.append(a, 0x78),
         .i16 => try out.append(a, 0x77),
     }
@@ -2556,4 +2595,49 @@ test "GC declared subtyping: (sub $base ...) drives ref.test / ref.cast" {
     try std.testing.expectEqual(@as(i32, 42), interp.asI32(try assembleAndRun(src, "cast_up_get", &.{})));
     // Downcasting a plain $base to (ref $sub) traps.
     try std.testing.expectError(error.CastFailure, assembleAndRun(src, "cast_down_fail", &.{}));
+}
+
+test "GC concrete value types: (ref t) params carry the exact type" {
+    // A param typed `(ref $pt)` accepts a `struct.new $pt` (same concrete type)…
+    const ok =
+        \\(module
+        \\  (type $pt (struct (field i32)))
+        \\  (func $take (param (ref $pt)) (result i32) (struct.get $pt 0 (local.get 0)))
+        \\  (func (export "run") (result i32) (call $take (struct.new $pt (i32.const 5)))))
+    ;
+    try std.testing.expectEqual(@as(i32, 5), interp.asI32(try assembleAndRun(ok, "run", &.{})));
+
+    // …but validation *rejects* a `struct.new $qt` of a different concrete type
+    // (previously both collapsed to `structref` and this slipped through).
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bad = try assemble(a,
+        \\(module
+        \\  (type $pt (struct (field i32)))
+        \\  (type $qt (struct (field i32) (field i32)))
+        \\  (func $take (param (ref $pt)) (result i32) (struct.get $pt 0 (local.get 0)))
+        \\  (func (export "bad") (result i32)
+        \\    (call $take (struct.new $qt (i32.const 5) (i32.const 6)))))
+    );
+    var m = try Module.decode(a, bad);
+    try std.testing.expectError(error.TypeMismatch, validate(a, &m));
+}
+
+test "GC concrete value types: a self-referential linked list traverses a (ref null node) field" {
+    const src =
+        \\(module
+        \\  (type $node (struct (field i32) (field (ref null $node))))
+        \\  (func (export "sum2") (result i32)
+        \\    (local $head (ref null $node))
+        \\    (local.set $head
+        \\      (struct.new $node (i32.const 10)
+        \\        (struct.new $node (i32.const 20) (ref.null $node))))
+        \\    (i32.add
+        \\      (struct.get $node 0 (local.get $head))
+        \\      (struct.get $node 0 (struct.get $node 1 (local.get $head))))))
+    ;
+    // The `next` field is the concrete `(ref null $node)`, so struct.get returns a
+    // node ref you can struct.get again: 10 + 20 = 30.
+    try std.testing.expectEqual(@as(i32, 30), interp.asI32(try assembleAndRun(src, "sum2", &.{})));
 }

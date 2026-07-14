@@ -366,6 +366,22 @@ and casts walk it. **+1 unit test (93 total)** + **`gc_subtype.wast` 5/0** — `
 → 0; `ref.cast` up then `struct.get $base 0` reads the shared field (42); downcasting a plain `$base` to
 `(ref $sub)` traps. All build surfaces green.
 
+### full GC — P3, concrete `(ref $t)` value types (2026-07-14) — collapse limitation resolved
+
+`ValType` widened to `enum(u32)` (concrete refs in the high bits); `(ref $t)` now carries its exact type
+through params/fields/locals/globals; producers (`struct.new`/`array.new`/`ref.func`/`ref.cast`/
+`ref.null $t`) push concrete refs; `subtypeOf` uses `Module.isSubtype` for concrete↔concrete. This was
+the largest single change — it briefly broke the P1/P2 ref tests (producers pushing abstract heads into
+concrete slots) until the producers were made concrete-aware and `ref.null` took a heap-type immediate.
+
+- **+2 unit tests (95 total)** + the updated rec-group decode fixture (now asserts a concrete ref, not a
+  collapsed `structref_nn`): a `(ref $pt)` param **accepts** `struct.new $pt` but validation **rejects**
+  `struct.new $qt` (different concrete type — previously slipped through); a self-referential
+  `(ref null $node)` field traverses a linked list (10+20=30).
+- **`gc_concrete.wast`: 2/0** via the CLI — a 3-node concrete linked list (sum 60) + `call_ref` through a
+  concrete `(ref $ii)` global. All four prior GC `.wast` scripts still pass (11/11/4/5). All build
+  surfaces green.
+
 ## What this tells the roadmap
 
 1. **First execution milestone = the `module/wasm_mod` corpus + its `.test.json` files** — fully

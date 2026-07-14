@@ -382,8 +382,9 @@ pub const Imm = union(enum) {
     f64: u64,
     /// Result types of a typed `select` (`0x1c`).
     select_types: []const types.ValType,
-    /// Heap type of `ref.null` (`0xd0`) — as a `funcref` / `externref` value type.
-    ref_type: types.ValType,
+    /// Heap type of `ref.null` (`0xd0`) — abstract head or a concrete type index;
+    /// the validator resolves it to a (possibly concrete) nullable value type.
+    ref_type: HeapType,
     /// A GC type index (`struct.new`/`array.new`/`array.get`/…).
     gc_type: u32,
     /// A GC struct type index + field index (`struct.get`/`struct.set`/…).
@@ -527,7 +528,7 @@ fn readBrCast(r: *Reader) DecodeError!Imm {
 
 /// Read a heap type (§ GC binary format): a non-negative `s33` is a concrete
 /// type index; negative values are the abstract heap-type codes.
-fn readHeapType(r: *Reader) DecodeError!HeapType {
+pub fn readHeapType(r: *Reader) DecodeError!HeapType {
     const v = try r.readVarI64(); // s33
     if (v >= 0) return .{ .concrete = @intCast(v) };
     return switch (v) {
@@ -637,7 +638,7 @@ pub fn decodeBody(a: std.mem.Allocator, body: []const u8) (DecodeError || std.me
                 for (tys) |*t| t.* = @enumFromInt(try r.readByte());
                 break :blk .{ .select_types = tys };
             },
-            .ref_type => .{ .ref_type = @enumFromInt(try r.readByte()) },
+            .ref_type => .{ .ref_type = try readHeapType(&r) },
             // These are `0xFC`-prefixed ops decoded via the interception above;
             // reaching here means a raw synthetic-tag byte, which is malformed.
             // 0xFB/0xFC-prefixed ops are decoded via the prefix interceptions

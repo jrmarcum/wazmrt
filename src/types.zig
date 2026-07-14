@@ -31,10 +31,15 @@ pub const SectionId = enum(u8) {
     pub const max: u8 = 12;
 };
 
-/// WebAssembly value types (§5.3.1), encoded by their binary opcode byte.
-/// Non-exhaustive: an unrecognized byte decodes rather than crashing; a later
-/// validation pass rejects it.
-pub const ValType = enum(u8) {
+/// WebAssembly value types (§5.3.1). Numeric and abstract-reference types keep
+/// their single binary byte (< 0x100). A **concrete typed reference** `(ref null?
+/// $t)` (GC) is encoded in the high bits — bit 31 marks concrete, bit 30 marks
+/// nullable, bits 28–29 the family (func/struct/array), bits 0–27 the type index
+/// — so `ValType` stays a single comparable scalar (backed by `u32`). This lets
+/// `(ref $t)` flow through params/fields/locals with its exact type instead of
+/// collapsing to a family head. Non-exhaustive: an unrecognized byte decodes
+/// rather than crashing; a later validation pass rejects it.
+pub const ValType = enum(u32) {
     i32 = 0x7f,
     i64 = 0x7e,
     f32 = 0x7d,
@@ -67,9 +72,41 @@ pub const ValType = enum(u8) {
     nullref_nn = 0x58, // (ref none) — uninhabited but syntactically valid
     _,
 
-    /// True only for the defined value-type bytes (rejects garbage decoded via
-    /// `@enumFromInt`).
+    // --- Concrete typed-reference encoding (high bits of the u32) -------------
+    const concrete_bit: u32 = 0x8000_0000;
+    const nullable_bit: u32 = 0x4000_0000;
+    const kind_shift: u5 = 28;
+    const kind_mask: u32 = 0x3 << kind_shift;
+    const index_mask: u32 = 0x0fff_ffff; // 28 bits — up to ~268M types
+
+    /// Build a concrete typed reference `(ref null? $ti)` for family `kind`
+    /// (must be `.func`/`.@"struct"`/`.array`).
+    pub fn concreteRef(is_nullable: bool, kind: RefHeap, ti: u32) ValType {
+        const k: u32 = switch (kind) {
+            .func => 0,
+            .@"struct" => 1,
+            .array => 2,
+            else => unreachable,
+        };
+        return @enumFromInt(concrete_bit |
+            (if (is_nullable) nullable_bit else 0) |
+            (k << kind_shift) |
+            (ti & index_mask));
+    }
+
+    /// True if this is a concrete typed reference (carries a type index).
+    pub fn isConcrete(self: ValType) bool {
+        return @intFromEnum(self) & concrete_bit != 0;
+    }
+
+    /// The type index of a concrete reference (asserts `isConcrete`).
+    pub fn concreteIndex(self: ValType) u32 {
+        return @intFromEnum(self) & index_mask;
+    }
+
+    /// True only for the defined value types (rejects garbage `@enumFromInt`).
     pub fn isValid(self: ValType) bool {
+        if (self.isConcrete()) return true;
         return switch (self) {
             .i32, .i64, .f32, .f64, .v128 => true,
             else => self.isRef(),
@@ -78,6 +115,7 @@ pub const ValType = enum(u8) {
 
     /// True for any reference type (nullable or not).
     pub fn isRef(self: ValType) bool {
+        if (self.isConcrete()) return true;
         return switch (self) {
             .funcref, .externref, .anyref, .eqref, .i31ref, .structref, .arrayref, .nullref => true,
             .funcref_nn, .externref_nn, .anyref_nn, .eqref_nn, .i31ref_nn, .structref_nn, .arrayref_nn, .nullref_nn => true,
@@ -87,6 +125,7 @@ pub const ValType = enum(u8) {
 
     /// True for a non-nullable reference (a non-defaultable local type).
     pub fn isNonNullRef(self: ValType) bool {
+        if (self.isConcrete()) return @intFromEnum(self) & nullable_bit == 0;
         return switch (self) {
             .funcref_nn, .externref_nn, .anyref_nn, .eqref_nn, .i31ref_nn, .structref_nn, .arrayref_nn, .nullref_nn => true,
             else => false,
@@ -95,6 +134,7 @@ pub const ValType = enum(u8) {
 
     /// The nullable form of a reference type (non-null → nullable; others as-is).
     pub fn nullable(self: ValType) ValType {
+        if (self.isConcrete()) return @enumFromInt(@intFromEnum(self) | nullable_bit);
         return switch (self) {
             .funcref_nn => .funcref,
             .externref_nn => .externref,
@@ -159,8 +199,15 @@ pub const ValType = enum(u8) {
         }
     };
 
-    /// The heap type of a reference value type (asserts `isRef`).
+    /// The heap type of a reference value type (asserts `isRef`). A concrete ref
+    /// reads its family from the kind bits.
     pub fn refHeap(self: ValType) RefHeap {
+        if (self.isConcrete()) return switch ((@intFromEnum(self) & kind_mask) >> kind_shift) {
+            0 => .func,
+            1 => .@"struct",
+            2 => .array,
+            else => unreachable,
+        };
         return switch (self) {
             .funcref, .funcref_nn => .func,
             .externref, .externref_nn => .extern_,

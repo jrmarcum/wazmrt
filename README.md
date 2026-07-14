@@ -18,12 +18,13 @@ compliance process, and for the ledger of any reused code.
 > and globals** with cross-module `register` linking and full import type-checking,
 > the **function-references proposal** (typed function refs, `call_ref`,
 > `ref.as_non_null`, `br_on_null`, non-null refs with local-initialization
-> checking), and a growing slice of **WasmGC** — `i31` references (`ref.i31`,
-> `i31.get_s`/`i31.get_u`), **struct and array** heap objects (`struct.new`/
-> `get`/`set`, `array.new`/`new_fixed`/`get`/`set`/`len`, `ref.eq`, packed
-> `i8`/`i16` fields), and casts (`ref.test`/`ref.cast`, `br_on_cast`/
-> `br_on_cast_fail`) over the `any`/`eq`/`i31`/`struct`/`array` reference
-> hierarchy and its subtyping — and runs a corpus of real modules to their
+> checking), and **WasmGC** — `i31` references (`ref.i31`, `i31.get_s`/`_u`),
+> **struct and array** heap objects (`struct.new`/`get`/`set`, `array.new`/
+> `new_fixed`/`get`/`set`/`len`, `ref.eq`, packed `i8`/`i16` fields), casts
+> (`ref.test`/`ref.cast`, `br_on_cast`/`br_on_cast_fail`), **concrete
+> `(ref $t)` references** (self-referential structs, exact-type params), and
+> declared subtyping (`(sub $super …)`) over the `any`/`eq`/`i31`/`struct`/
+> `array` reference hierarchy — and runs a corpus of real modules to their
 > expected values
 > (`fib(20)=6765`, `sieve(30)=10`, …). It ships a native **WAT text assembler**
 > (`.wat` → wasm) and a **WAST script runner** (`wazmrt file.wast`) that runs the

@@ -54,12 +54,14 @@ concrete via `Module.isSubtype`); `CastFailure` traps. **`br_on_cast`/`br_on_cas
 2026-07-14** (`0xFB` 0x18/0x19; peek-ref + `refMatches` + `branch()`; validation checks `dst <: src`
 and the label carry type; block-type decoder extended for non-null tags). **WasmGC op coverage is now
 complete** (i31, struct, array, `ref.eq`, `ref.test`/`ref.cast`, `br_on_cast`/`br_on_cast_fail`).
-**Assembler `(sub $super …)` supertype emission DONE 2026-07-14** — declared subtyping now round-trips
-(assembler emits the sub form → decoder records `supertypes` → casts walk it transitively via
-`Module.isSubtype`). 93 unit tests + `gc_struct_array.wast` 11/0 + `gc_cast.wast` 11/0 + `gc_br_cast.wast`
-4/0 + `gc_subtype.wast` 5/0. **P3 wrap-up left:** only concrete `(ref $t)` *value types* (the remaining
-collapse limitation in `design-decisions.md`) — optional; otherwise **P3 → done, next is (2) the
-wasm-c-api** (instance/func/call). **(2)** grow the wasm-c-api past
+**Assembler `(sub $super …)` supertype emission DONE 2026-07-14** — declared subtyping round-trips.
+**Concrete `(ref $t)` value types DONE 2026-07-14** — `ValType` widened to `enum(u32)` (concrete refs in
+the high bits); `(ref $t)` flows with its exact type through params/fields/locals/globals; producers push
+concrete refs; `subtypeOf` uses `Module.isSubtype` for concrete↔concrete; `ref.null` takes a heap type.
+The **collapse limitation is resolved** (see `design-decisions.md`). **P3 / full GC is COMPLETE** — every
+WasmGC op + the full type system + concrete refs + declared subtyping, all tested. 95 unit tests +
+`gc_struct_array.wast` 11/0 + `gc_cast.wast` 11/0 + `gc_br_cast.wast` 4/0 + `gc_subtype.wast` 5/0 +
+`gc_concrete.wast` 2/0. **Next: (2) the wasm-c-api** (instance/func/call). **(2)** grow the wasm-c-api past
 introspection (instance/func/call) → embeddable end-to-end + first `universalWasmLoader-*` integration.
 **(3)** the Deno/V8 benchmark. **(4) WASI preview 1** (preview 2/3 deferred until browser-standard, per
 wasmtk). **The function-references proposal is complete** (typed-ref value types, `call_ref`/

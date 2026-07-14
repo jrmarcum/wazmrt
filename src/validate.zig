@@ -152,13 +152,17 @@ fn validateConstExpr(module: *const Module, expr: []const u8, expected: V, self_
                 try push(&stack, &sp, module.globals[gi].content);
             },
             0xd0 => { // ref.null <heaptype>
-                const ht: V = @enumFromInt(try r.readByte());
-                try push(&stack, &sp, ht);
+                const heap = opcode.readHeapType(&r) catch return error.ConstantExpressionRequired;
+                try push(&stack, &sp, try refTypeValType(module, .{ .nullable = true, .heap = heap }));
             },
             0xd2 => { // ref.func x
                 const fi = try r.readVarU32();
                 if (module.funcType(fi) == null) return error.UndefinedFunc;
-                try push(&stack, &sp, .funcref_nn); // a function reference is non-null
+                // Concrete `(ref $ftype)` for a defined func; abstract for imports.
+                if (module.funcTypeIndex(fi)) |ti|
+                    try push(&stack, &sp, V.concreteRef(false, .func, ti))
+                else
+                    try push(&stack, &sp, .funcref_nn);
             },
             0x6a, 0x6b, 0x6c => { // i32 add/sub/mul (extended-const)
                 if (sp < 2 or stack[sp - 1] != .i32 or stack[sp - 2] != .i32) return error.TypeMismatch;
@@ -171,7 +175,7 @@ fn validateConstExpr(module: *const Module, expr: []const u8, expected: V, self_
             else => return error.ConstantExpressionRequired,
         }
     }
-    if (sp != 1 or !subtypeOf(stack[0], expected)) return error.TypeMismatch;
+    if (sp != 1 or !subtypeOf(module, stack[0], expected)) return error.TypeMismatch;
 }
 
 fn validateFunction(a: std.mem.Allocator, module: *const Module, ft: Module.FuncType, code: Module.Code) Error!void {
@@ -250,7 +254,7 @@ const FuncValidator = struct {
         const actual = try self.popVal();
         switch (actual) {
             .unknown => {},
-            .val => |t| if (!subtypeOf(t, expect)) return error.TypeMismatch,
+            .val => |t| if (!subtypeOf(self.module, t, expect)) return error.TypeMismatch,
         }
         return actual;
     }
@@ -495,7 +499,7 @@ const FuncValidator = struct {
                 _ = try self.popExpect(.i32); // dst
             },
 
-            .ref_null => try self.pushValT(instr.imm.ref_type),
+            .ref_null => try self.pushValT(try refTypeValType(self.module, .{ .nullable = true, .heap = instr.imm.ref_type })),
             .ref_is_null => {
                 switch (try self.popVal()) { // requires a reference type (or polymorphic)
                     .val => |v| if (!v.isRef()) return error.TypeMismatch,
@@ -505,7 +509,13 @@ const FuncValidator = struct {
             },
             .ref_func => {
                 if (self.module.funcType(instr.imm.func) == null) return error.UndefinedFunc;
-                try self.pushValT(.funcref_nn); // a function reference is non-null
+                // A function reference is non-null and, for a defined function,
+                // carries its concrete type (`(ref $ftype)`); imported funcs fall
+                // back to the abstract funcref head (no type index kept).
+                if (self.module.funcTypeIndex(instr.imm.func)) |ti|
+                    try self.pushValT(V.concreteRef(false, .func, ti))
+                else
+                    try self.pushValT(.funcref_nn);
             },
 
             // Typed function references (function-references proposal). A typed
@@ -551,12 +561,12 @@ const FuncValidator = struct {
                     i -= 1;
                     _ = try self.popExpect(fields[i].storage.unpacked());
                 }
-                try self.pushValT(.structref_nn);
+                try self.pushValT(V.concreteRef(false, .@"struct", instr.imm.gc_type));
             },
             .struct_new_default => {
                 const fields = self.module.structFields(instr.imm.gc_type) orelse return error.UndefinedType;
                 for (fields) |f| if (f.storage.unpacked().isNonNullRef()) return error.TypeMismatch; // not defaultable
-                try self.pushValT(.structref_nn);
+                try self.pushValT(V.concreteRef(false, .@"struct", instr.imm.gc_type));
             },
             .struct_get, .struct_get_s, .struct_get_u => {
                 const gf = instr.imm.gc_field;
@@ -581,20 +591,20 @@ const FuncValidator = struct {
                 const f = self.module.arrayField(instr.imm.gc_type) orelse return error.UndefinedType;
                 _ = try self.popExpect(.i32); // length
                 _ = try self.popExpect(f.storage.unpacked()); // init value
-                try self.pushValT(.arrayref_nn);
+                try self.pushValT(V.concreteRef(false, .array, instr.imm.gc_type));
             },
             .array_new_default => {
                 const f = self.module.arrayField(instr.imm.gc_type) orelse return error.UndefinedType;
                 if (f.storage.unpacked().isNonNullRef()) return error.TypeMismatch; // not defaultable
                 _ = try self.popExpect(.i32); // length
-                try self.pushValT(.arrayref_nn);
+                try self.pushValT(V.concreteRef(false, .array, instr.imm.gc_type));
             },
             .array_new_fixed => {
                 const tn = instr.imm.gc_type_n;
                 const f = self.module.arrayField(tn.type_index) orelse return error.UndefinedType;
                 var k: u32 = 0;
                 while (k < tn.n) : (k += 1) _ = try self.popExpect(f.storage.unpacked());
-                try self.pushValT(.arrayref_nn);
+                try self.pushValT(V.concreteRef(false, .array, tn.type_index));
             },
             .array_get, .array_get_s, .array_get_u => {
                 const f = self.module.arrayField(instr.imm.gc_type) orelse return error.UndefinedType;
@@ -624,8 +634,7 @@ const FuncValidator = struct {
             },
             .ref_cast => {
                 _ = try self.popRef();
-                const head = try self.module.refHead(instr.imm.ref_cast.heap);
-                try self.pushValT(head.valType(instr.imm.ref_cast.nullable));
+                try self.pushValT(try refTypeValType(self.module, instr.imm.ref_cast));
             },
 
             // GC cast-branches. The label carries `[t* rt]` (the ref plus a prefix
@@ -634,15 +643,15 @@ const FuncValidator = struct {
             // `br_on_cast_fail` is the mirror. `dst` must be a subtype of `src`.
             .br_on_cast, .br_on_cast_fail => {
                 const bc = instr.imm.br_cast;
-                const src_vt = (try self.module.refHead(bc.src.heap)).valType(bc.src.nullable);
-                const dst_vt = (try self.module.refHead(bc.dst.heap)).valType(bc.dst.nullable);
-                if (!subtypeOf(dst_vt, src_vt)) return error.TypeMismatch; // a downcast
+                const src_vt = try refTypeValType(self.module, bc.src);
+                const dst_vt = try refTypeValType(self.module, bc.dst);
+                if (!subtypeOf(self.module, dst_vt, src_vt)) return error.TypeMismatch; // a downcast
                 const lt = try self.labelTypesAt(bc.label); // [t* carried]
                 if (lt.len == 0) return error.TypeMismatch;
                 // The type carried to the label: `dst` for br_on_cast (the branch
                 // fires on a match), `src` for br_on_cast_fail (fires on a miss).
                 const carried = if (instr.op == .br_on_cast) dst_vt else src_vt;
-                if (!subtypeOf(carried, lt[lt.len - 1])) return error.TypeMismatch;
+                if (!subtypeOf(self.module, carried, lt[lt.len - 1])) return error.TypeMismatch;
                 const prefix = lt[0 .. lt.len - 1]; // t*
                 _ = try self.popExpect(src_vt); // the ref operand (top)
                 try self.popVals(prefix);
@@ -740,12 +749,32 @@ fn requirePacking(is_plain_get: bool, storage: Module.StorageType) Error!void {
     if (is_plain_get == storage.isPacked()) return error.BadFieldPacking;
 }
 
-fn subtypeOf(sub: V, sup: V) bool {
+/// The value type of a cast target reference type — a concrete `(ref null? $t)`
+/// keeps its type index; an abstract target uses its family head.
+fn refTypeValType(module: *const Module, rt: opcode.RefType) Error!V {
+    const head = try module.refHead(rt.heap);
+    return switch (rt.heap) {
+        .concrete => |ti| V.concreteRef(rt.nullable, head, ti),
+        else => head.valType(rt.nullable),
+    };
+}
+
+fn subtypeOf(module: *const Module, sub: V, sup: V) bool {
     if (sub == sup) return true;
     if (!sub.isRef() or !sup.isRef()) return false;
-    if (!sub.refHeap().sub(sup.refHeap())) return false;
     // A nullable sub cannot satisfy a non-null expectation.
-    return sup.isNonNullRef() == false or sub.isNonNullRef();
+    if (sup.isNonNullRef() and !sub.isNonNullRef()) return false;
+    // Concrete → concrete: walk the declared supertype chain (the collapsed
+    // heads alone would wrongly accept any two structs / any two arrays).
+    if (sub.isConcrete() and sup.isConcrete())
+        return module.isSubtype(sub.concreteIndex(), sup.concreteIndex());
+    // Abstract sup (or abstract sub): compare on the family hierarchy. A concrete
+    // sub matches an abstract sup by its family head (`(ref $struct)` <: structref
+    // / eqref / anyref); an abstract sub only satisfies a concrete sup when it is
+    // the bottom `none`.
+    if (sub.isConcrete()) return sub.refHeap().sub(sup.refHeap());
+    if (sup.isConcrete()) return sub.refHeap() == .none;
+    return sub.refHeap().sub(sup.refHeap());
 }
 
 /// True if an abstract stack entry is a concrete reference type (funcref /

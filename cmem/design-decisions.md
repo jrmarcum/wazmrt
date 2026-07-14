@@ -105,15 +105,23 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
         `len`, `ref.eq`. Packed fields store masked (`packField`) and widen on read (`unpackField`:
         `_s` sign-extends, `_u` zero-extends). Null access traps `NullReference`; OOB field/index traps
         the new `error.GcOutOfBounds` (a runtime backstop for the collapse gap below).
-      - **Collapse limitation (documented).** Concrete `(ref $t)` still collapses to its family *head*
-        (`structref`/`arrayref`/`funcref`) in *value types* — exact inter-struct static typing is lost,
-        so `struct.get $t` accepts *any* struct ref; the object carries its real fields (see the RTT
-        below) and the runtime **bounds-checks the field/element index** (→ `GcOutOfBounds`) so a
-        mismatch can't read out of bounds. The **WAT assembler cannot emit concrete `(ref $t)` value
-        types** (single-byte valtype emission → `funcref`); struct/array **field and local types use the
-        abstract heads** (`structref`/`arrayref`/`eqref`/`anyref`) in `.wat`. Note `ref.test`/`ref.cast`
-        targets are *unaffected* — their heap type is an `s33` immediate (not a valtype byte), so the
-        assembler emits concrete `$t` targets fine (see below).
+      - **Concrete `(ref $t)` value types DONE 2026-07-14 — the collapse limitation is resolved.**
+        `ValType` widened from `enum(u8)` to `enum(u32)`: numeric/abstract types keep their single byte
+        (< 0x100); a **concrete typed reference is encoded in the high bits** — bit 31 concrete, bit 30
+        nullable, bits 28–29 the family (func/struct/array), bits 0–27 the type index — so `ValType`
+        stays a single comparable scalar (no tagged-union rewrite). `(ref $t)` now flows through
+        params/results/fields/locals/globals/table-elems with its exact type; `struct.new`/`array.new`/
+        `ref.func`/`ref.cast`/`ref.null $t` (and the const-expr forms) **produce concrete refs**, and
+        `validate.subtypeOf` takes the module: concrete↔concrete uses `Module.isSubtype` (the collapsed
+        heads alone would wrongly accept any two structs), concrete↔abstract uses the family head, and
+        an abstract sub satisfies a concrete sup only when it is bottom `none`. Binary emission centralizes
+        in `wat.emitValType` (`0x64`/`0x63` + `s33`); **`ref.null`'s immediate became a heap type**
+        (`s33`, so `ref.null $t` is typed `(ref null $t)` — decoder/validator/`skipConstExpr`/assembler
+        all updated). The assembler's concrete-ref *kind* bits are a **placeholder** — it only emits the
+        index; the decoder re-derives the family via its kind pre-scan (a two-pass type pre-pass collects
+        all names first so a `(ref $t)` field can forward-reference). Imported-func `ref.func` still falls
+        back to the abstract `funcref` head (no type index kept). The runtime is untyped, so this is a
+        pure **validation-precision + assembler-expressiveness** gain over the already-correct interp.
     - **ref.test / ref.cast slice DONE 2026-07-14.** Adds runtime type identity to GC:
       - **Heap objects carry an RTT.** `Instance.HeapObject = { type_index: u32, fields: []Value }` — so
         a reference knows its actual composite type at runtime. `ref.test`/`ref.cast` (`0xFB` 0x14–0x17,

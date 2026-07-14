@@ -354,6 +354,16 @@ pub fn funcType(self: *const Module, index: u32) ?FuncType {
     return self.funcSig(self.functions[defined]);
 }
 
+/// The type index of a function (imports first, then defined), or null for an
+/// imported function (our import table keeps the signature, not the type index).
+pub fn funcTypeIndex(self: *const Module, func_index: u32) ?u32 {
+    const imported = self.importedFuncCount();
+    if (func_index < imported) return null;
+    const defined = func_index - imported;
+    if (defined >= self.functions.len) return null;
+    return self.functions[defined];
+}
+
 /// The function signature at type index `ti`, or null if `ti` is out of range
 /// or names a non-function (struct/array) composite type.
 pub fn funcSig(self: *const Module, ti: u32) ?FuncType {
@@ -460,15 +470,17 @@ fn readValType(r: *Reader, kinds: []const CompKind) Error!types.ValType {
 /// abstract heap types. `nullable` picks the nullable vs non-null variant.
 fn readHeapTypeRef(r: *Reader, nullable: bool, kinds: []const CompKind) Error!types.ValType {
     const ht = try r.readVarI64(); // s33
-    const both: [2]types.ValType = if (ht >= 0) blk: {
-        const ti: usize = @intCast(ht);
+    if (ht >= 0) {
+        const ti: u32 = @intCast(ht);
         if (ti >= kinds.len) return error.IndexOutOfRange;
-        break :blk switch (kinds[ti]) {
-            .func => .{ .funcref, .funcref_nn },
-            .@"struct" => .{ .structref, .structref_nn },
-            .array => .{ .arrayref, .arrayref_nn },
+        const head: types.ValType.RefHeap = switch (kinds[ti]) {
+            .func => .func,
+            .@"struct" => .@"struct",
+            .array => .array,
         };
-    } else switch (ht) {
+        return types.ValType.concreteRef(nullable, head, ti);
+    }
+    const both: [2]types.ValType = switch (ht) {
         -0x10, -0x0d => .{ .funcref, .funcref_nn }, // func, nofunc
         -0x11, -0x0e => .{ .externref, .externref_nn }, // extern, noextern
         -0x12 => .{ .anyref, .anyref_nn }, // any
@@ -554,7 +566,7 @@ fn skipConstExpr(r: *Reader) Error!void {
             0x42 => try r.skipLeb(10), // i64.const (64-bit LEB)
             0x43 => _ = try r.readBytes(4), // f32.const
             0x44 => _ = try r.readBytes(8), // f64.const
-            0xd0 => _ = try r.readByte(), // ref.null (heaptype)
+            0xd0 => _ = try r.readVarI64(), // ref.null (heaptype s33)
             else => {}, // other zero-operand ops
         }
     }
@@ -1001,7 +1013,7 @@ test "decodes GC struct and array composite types (packed fields)" {
     try std.testing.expectEqual(types.ValType.i32, arr.storage.unpacked()); // projects to i32
 }
 
-test "GC rec group: a struct field forward-references a later type (ref collapses to structref)" {
+test "GC rec group: a struct field forward-references a later type (concrete ref)" {
     // (rec (struct (field (ref 1))) (struct (field i32)))
     //   01                 ; 1 rectype
     //   4e 02              ; rec group of 2 sub types
@@ -1015,8 +1027,13 @@ test "GC rec group: a struct field forward-references a later type (ref collapse
     defer m.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), m.comp_types.len);
-    // The forward `(ref 1)` collapses to a non-null structref (type 1 is a struct).
-    try std.testing.expectEqual(StorageType{ .val = .structref_nn }, m.structFields(0).?[0].storage);
+    // The forward `(ref 1)` decodes to a non-null concrete reference to type 1
+    // (the kind pre-scan sees type 1 is a struct → the struct family head).
+    const f0 = m.structFields(0).?[0].storage.val;
+    try std.testing.expect(f0.isConcrete());
+    try std.testing.expect(f0.isNonNullRef());
+    try std.testing.expectEqual(@as(u32, 1), f0.concreteIndex());
+    try std.testing.expectEqual(types.ValType.RefHeap.@"struct", f0.refHeap());
     try std.testing.expectEqual(StorageType{ .val = .i32 }, m.structFields(1).?[0].storage);
 }
 
