@@ -25,7 +25,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const path = args[1];
-    const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 << 20)) catch |e| {
+    var bytes: []const u8 = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 << 20)) catch |e| {
         try out.print("error: cannot read '{s}': {s}\n", .{ path, @errorName(e) });
         return;
     };
@@ -41,6 +41,14 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // .wat text: assemble to a binary, then treat it like a .wasm.
+    if (std.mem.endsWith(u8, path, ".wat")) {
+        bytes = wazmrt.wat.assemble(arena, bytes) catch |e| {
+            try out.print("error: cannot assemble '{s}': {s}\n", .{ path, @errorName(e) });
+            return;
+        };
+    }
+
     var module = wazmrt.decode(arena, bytes) catch |e| {
         try out.print("error: cannot decode '{s}': {s}\n", .{ path, @errorName(e) });
         return;
@@ -50,6 +58,17 @@ pub fn main(init: std.process.Init) !void {
     // Run mode: `wazmrt <module.wasm> <export> [args...]` — invoke and print.
     if (args.len >= 3) {
         try runFunction(arena, out, &module, args[2], args[3..]);
+        return;
+    }
+
+    // WASI command: `wazmrt <module.wasm> [wasi-args...]` runs `_start` with the
+    // core `wasi_snapshot_preview1` host imports wired up.
+    if (findExport(&module, "_start")) |start_index| {
+        const code = runWasi(arena, io, out, &module, path, start_index, args[2..]) catch |e| {
+            try out.print("trap: {s}\n", .{@errorName(e)});
+            return;
+        };
+        if (code != 0) try out.print("(exit {d})\n", .{code});
         return;
     }
 
@@ -90,6 +109,72 @@ pub fn main(init: std.process.Init) !void {
         return;
     };
     try out.print("  validation: OK\n", .{});
+}
+
+/// Function index of the exported function `name`, or null.
+fn findExport(module: *const wazmrt.Module, name: []const u8) ?u32 {
+    for (module.exports) |e| {
+        if (e.type.kind() == .func and std.mem.eql(u8, e.name, name)) return e.index;
+    }
+    return null;
+}
+
+/// Run a WASI command module: wire the `wasi_snapshot_preview1` host imports,
+/// instantiate, and invoke `_start`. Returns the process exit code (0 unless
+/// `proc_exit` set one). `wasi_args` become argv[1..]; argv[0] is the path.
+fn runWasi(
+    arena: std.mem.Allocator,
+    io: Io,
+    out: *Io.Writer,
+    module: *const wazmrt.Module,
+    path: []const u8,
+    start_index: u32,
+    wasi_args: []const [:0]const u8,
+) !u32 {
+    const interp = wazmrt.interp;
+
+    var stderr_buffer: [4096]u8 = undefined;
+    var stderr_file_writer: Io.File.Writer = .init(.stderr(), io, &stderr_buffer);
+    const err_w = &stderr_file_writer.interface;
+    defer err_w.flush() catch {};
+
+    const seed: u64 = @intCast(@max(Io.Timestamp.now(io, .awake).nanoseconds, 0));
+    var wasi = wazmrt.wasi.Wasi.init(io, out, err_w, seed);
+
+    // argv: the module path, then any trailing CLI args.
+    const argv = try arena.alloc([]const u8, 1 + wasi_args.len);
+    argv[0] = path;
+    for (wasi_args, argv[1..]) |src, *dst| dst.* = src;
+    wasi.args = argv;
+
+    // Back every imported function: `wasi_snapshot_preview1.*` from WASI, any
+    // other import with a trap-on-call stub.
+    var funcs: std.ArrayList(interp.Instance.HostFunc) = .empty;
+    for (module.imports) |imp| {
+        if (imp.type != .func) continue;
+        if (std.mem.eql(u8, imp.module, "wasi_snapshot_preview1"))
+            try funcs.append(arena, wasi.hostFunc(imp.name))
+        else
+            try funcs.append(arena, .{ .native_env = .{ .ctx = &wasi, .call = unresolvedImport } });
+    }
+
+    var inst = try interp.Instance.initWithImports(arena, module, .{ .funcs = funcs.items });
+    defer inst.deinit();
+    wasi.memory = inst.memory; // module memory now exists
+
+    _ = inst.invokeIndex(start_index, &.{}) catch |e| {
+        // `proc_exit` unwinds via HostTrap with the code recorded — a clean exit.
+        if (e == error.HostTrap and wasi.exit_code != null) return wasi.exit_code.?;
+        return e;
+    };
+    return wasi.exit_code orelse 0;
+}
+
+fn unresolvedImport(ctx: *anyopaque, args: []const wazmrt.interp.Value, results: []wazmrt.interp.Value) bool {
+    _ = ctx;
+    _ = args;
+    _ = results;
+    return false; // -> error.HostTrap
 }
 
 /// Instantiate `module`, invoke exported function `name` with `arg_strings`

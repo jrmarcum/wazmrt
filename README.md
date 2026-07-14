@@ -31,15 +31,20 @@ compliance process, and for the ledger of any reused code.
 > official WebAssembly spec testsuite (positive assertions plus
 > `assert_invalid`/`assert_malformed`/`assert_trap`/`assert_unlinkable`) — e.g.
 > `table_init` 729/0, `table_copy` 1649/0, `imports` 137, `call_ref` 30, `start`
-> 11/0. It runs a module's **start function** at instantiation. Coming next: a
-> growing C ABI (instance/func/call) and **WASI preview 1**; multi-memory and
-> exception-handling tags follow as needed. Requires Zig 0.16.
+> 11/0. It runs a module's **start function** at instantiation, embeds through
+> the **standard wasm-c-api** (instantiate/call, host-function imports,
+> global/memory/table objects — loadable over FFI, see below), and runs **WASI
+> preview 1** command modules (`fd_write`, args/environ, clocks, random,
+> `proc_exit`; filesystem/sockets deferred). Coming next: the rest of WASI (a
+> filesystem), plus multi-memory and exception-handling tags as needed. Requires
+> Zig 0.16.
 
 ## Build
 
 ```
 zig build                          # CLI + C-ABI static library (+ headers)
-zig build run -- <file.wasm>       # summarize a module's sections/exports
+zig build run -- <file.wasm>       # summarize, or run _start (WASI command)
+zig build run -- <file.wat>        # assemble .wat, then the same
 zig build run -- <file.wasm> <export> [args…]   # run an exported function
 zig build test                     # unit tests
 zig build wasm                     # build the runtime itself as a wasm module

@@ -86,8 +86,17 @@ because Deno pays ~110 ms of V8 init + JIT + JS marshalling every run while wazm
 sub-µs to tens-of-ms. Steady-state hot-loop throughput ~264 Mops/s (a JIT wins that regime — the
 Option A→B trigger). **The vision's core thesis is confirmed: win short-lived / native FFI, lose
 sustained hot loops.**
-**(3)** the Deno/V8 benchmark. **(4) WASI preview 1** (preview 2/3 deferred until browser-standard, per
-wasmtk). **The function-references proposal is complete** (typed-ref value types, `call_ref`/
+**(3)** the Deno/V8 benchmark. **(4) WASI preview 1 — first slice DONE 2026-07-14** (preview 2/3 deferred
+until browser-standard, per wasmtk): `src/wasi.zig` implements the core `wasi_snapshot_preview1` host
+imports — `fd_write` (stdout/stderr), `fd_read`/`fd_close`/`fd_seek`/`fd_fdstat_get`/`fd_prestat_get`,
+`args_sizes_get`/`args_get`, `environ_sizes_get`/`environ_get`, `clock_time_get`, `random_get`,
+`sched_yield`, `proc_exit` — with a `NOTSUP` stub for the rest, so a command module instantiates and
+runs. No interpreter changes: WASI is just native host imports (`HostFunc.native_env`) whose `memory`
+pointer is filled in post-instantiation. The **CLI runs command modules**: `wazmrt <file>` (or `.wat`,
+now assembled by the CLI) sees the exported `_start`, wires WASI, and runs it; `proc_exit` unwinds via
+`HostTrap` carrying the exit code. Verified end-to-end: `examples/hello_wasi.wat` → `hello from wasi`,
+exit 0; +3 unit tests (98 total). **Deferred:** the filesystem (`path_open`, preopened dirs), stdin
+(`fd_read` reports EOF), sockets, `poll_oneoff`. **The function-references proposal is complete** (typed-ref value types, `call_ref`/
 `return_call_ref`/`ref.as_non_null`/`br_on_null`, non-null refs + local-init tracking, P1/P2/P2.5
 2026-07-13 — ~+130 ref-file passes). (The WAST runner's invoke-by-module-name landed `9745ecb` —
 `linking.wast` 29 → 100.) **Start function (#3) DONE 2026-07-13; the 2026-07-09

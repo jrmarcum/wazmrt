@@ -16,6 +16,7 @@ pub const Instance = interp.Instance;
 pub const sexpr = @import("sexpr.zig");
 pub const wat = @import("wat.zig");
 pub const wast = @import("wast.zig");
+pub const wasi = @import("wasi.zig");
 
 /// Human-readable library version (keep in sync with build.zig.zon).
 pub const version: [:0]const u8 = "0.1.0";

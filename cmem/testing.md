@@ -431,6 +431,18 @@ floor included, which both pay.)
   `sum(1e6)`). **Binary size** (ReleaseFast): CLI exe ~1.13 MB (mostly Zig std + OS glue). Numbers are a
   first datapoint, not a tuned benchmark — rerun on the target hardware before acting on Option A→B.
 
+## WASI preview 1 — first slice (2026-07-14)
+
+`src/wasi.zig` (core `wasi_snapshot_preview1`). WASI is wired as native host imports (no interpreter
+changes), so it's tested two ways:
+
+- **+3 unit tests (98 total)**: `fd_write` gathers iovecs from memory to the target stream (and reports
+  EBADF for a bad fd); `proc_exit` records the code and traps; `args_sizes_get`/`args_get` round-trip
+  `argv` (pointer array + NUL-terminated strings) into linear memory.
+- **CLI end-to-end**: `wazmrt examples/hello_wasi.wat` (the CLI assembles the `.wat`, sees `_start`,
+  wires WASI, runs it) → prints `hello from wasi`, exit 0. `proc_exit(7)` → the CLI reports `(exit 7)`.
+  A non-WASI module (no `_start`) still prints the section summary (no regression).
+
 ## What this tells the roadmap
 
 1. **First execution milestone = the `module/wasm_mod` corpus + its `.test.json` files** — fully
