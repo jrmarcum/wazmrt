@@ -269,8 +269,11 @@ payload collides with `null_ref` (+2 new unit tests: externref-sentinel round-tr
 rejection); #10 rejects import-after-definition (`error.ImportAfterDefinition`) instead of silently
 mis-indexing; #12 pre-encodes the const-expr sections before the type section (byte-identical output);
 #13 removes the `funcTypeOf` duplicate + a redundant export re-resolution; #8 (`00bceb4`) rejects a
-zero/non-power-of-two `align=` in the assembler. **67 unit tests.** The 2026-07-09 audit ledger is now
-cleared — only #11 (defined-table inline export) remains, LOW, fail-loud, and untested by the suite.
+zero/non-power-of-two `align=`; #11 (`ff3de4a`) assembles inline `(export …)` on a defined table
+(`imports` 137/31 → 137/17, `linking` 19/84 → 29/108 with +10 passes, `elem` 52/15 → 52/26 — passes
+stable, new failures are newly-run assertions hitting typed-ref gaps). **68 unit tests. The 2026-07-09
+audit ledger is now FULLY cleared — every item #1–#16 resolved.** Remaining `.wast` gaps are new
+proposals (typed/GC refs, multi-memory, EH tags), not ledger debt.
 
 ## What this tells the roadmap
 

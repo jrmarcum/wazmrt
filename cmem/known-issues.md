@@ -38,12 +38,12 @@ Third pass (commit `c535de0`):
   `br_table` label *value types* (not just arity) even in polymorphic code. Verified empirically —
   different-typed labels are rejected, same-typed accepted. No change needed.
 
-**The audit ledger is cleared (2026-07-13): #1–#10 and #12–#16 are resolved.** The only remainder is
-**#11** — a *defined*-table inline `(export …)` — LOW, fails loud (never wrong bytes), and the imported-
-table case is already done. No open correctness/soundness/dead-code items remain. The real frontiers are
-new *features*, not ledger debt: invoke-by-module-name in the WAST runner (blocks more of
-`linking.wast`), growing the wasm-c-api past introspection, and WASI. Larger out-of-scope proposals
-surfaced by the suite: **multi-memory** (`start0`) and exception-handling **tags** (`imports`).
+**The 2026-07-09 audit ledger is FULLY cleared (2026-07-13): every item #1–#16 is resolved.** No open
+correctness/soundness/dead-code/spec-strictness items remain. The real frontiers are now new *features*,
+not ledger debt: invoke-by-module-name in the WAST runner (blocks more of `linking.wast`), growing the
+wasm-c-api past introspection (instance/func/call), and WASI. Larger out-of-scope proposals surfaced by
+the suite (now the main sources of remaining `.wast` failures): **typed/GC references** (`(ref null $t)`),
+**multi-memory** (`start0`), and exception-handling **tags** (`imports`).
 
 ## Grouped by the integration that trips them
 
@@ -59,7 +59,7 @@ surfaced by the suite: **multi-memory** (`start0`) and exception-handling **tags
   are boxed to non-sentinel handles.
 - **Arbitrary / hand-written WAT** (beyond the testsuite's shape): #10 **DONE** (`3a50f75`, import-after-
   def rejected); #12 (const-expr section ordering) **DONE** (`e500a51`); #8 (`align=` non-power-of-two)
-  **DONE** (`00bceb4`); #11 PARTIAL (defined-table inline `(export …)` still fails loud).
+  **DONE** (`00bceb4`); #11 (defined-table inline `(export …)`) **DONE** (`ff3de4a`).
 - **Test fidelity, always-on**: #5 (`assert_trap`) **DONE**.
 - **Dead code / duplication**: #13 **DONE** (`78647f6`).
 
@@ -166,13 +166,14 @@ not reorder** — reordering would wrongly accept the malformed cases. No confor
 testsuite's cases arrive via `(module quote …)`, still `BadCommand`); new wat.zig unit test + verified
 valid imports-first resolves correctly.
 
-### #11 — inline `(table (export …) …)` on a *defined* table — LOW (PARTIAL, fails loud)
-`src/wat.zig` — the `(table …)` module-field branch now handles inline `(export …)` on an *imported*
-table (the `07dd244` inline-import path), but a **defined** table with an inline export
-(`(table (export "t") 1 funcref)`) still falls through to `parseTable`, whose `(export …)` list hits
-`parseIndex` → `error.BadImmediate`. Errors out (not wrong bytes). **Fix:** thread the leading inline
-`(export …)` forms parsed in the branch into `parseTable` (or handle the whole defined-table case in the
-branch, mirroring the import path). `table.wast` still has a few of these.
+### #11 — inline `(table (export …) …)` on a *defined* table — **RESOLVED (`ff3de4a`, 2026-07-13)**
+`parseTable` now skips and registers leading inline `(export "x")*` forms (kind 1, current table index)
+after the optional `$id`, mirroring `parseGlobal`; the imported-table case was already done (`07dd244`).
+No-op for tables without an inline export, so every core file is byte-identical; modules using the form
+previously failed to assemble (no passing assertion to lose) and now build: `imports` 137/31 → **137/17**
+(14 fewer build failures), `linking` 19/84 → **29/108** (+10 passes), `elem` 52/15 → **52/26** (passes
+stable; the new failures are newly-run assertions hitting *other* gaps — typed refs / value-literal
+parsing). New wat.zig unit test.
 
 ### #12 — const-expr sections encoded after the type section — **RESOLVED (`e500a51`, 2026-07-13)**
 The type section (1) was emitted before the global (6), element (9), and data (11) sections, which

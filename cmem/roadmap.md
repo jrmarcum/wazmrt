@@ -41,9 +41,9 @@ the **WAST script runner** (`wast.zig`) is next.
 **Remaining:** the WAST runner's invoke-by-module-name + `(table (export …))` on a defined table (#11)
 to unlock more of `linking.wast`; growing the wasm-c-api past introspection; first
 `universalWasmLoader-*` integration; then WASI. **Start function (#3) DONE 2026-07-13; the 2026-07-09
-audit ledger is now effectively cleared (#9/#10/#12/#13 done — externref boxing, import-after-def
-rejection, const-expr section ordering, dead-code cleanup).** Still **100%
-original runtime code** — no
+audit ledger is now FULLY cleared — every item #1–#16 resolved** (externref boxing #9, import-after-def
+rejection #10, const-expr section ordering #12, dead-code cleanup #13, non-power-of-two `align=` #8,
+defined-table inline export #11). Still **100% original runtime code** — no
 reference-project code adopted yet (only the vendored `wasm.h`). `call_indirect` + tables + globals +
 type-ref block types + **reference types** + **multi-table** + NaN-payload float literals + **imported
 globals** + extended-const + **reference-type table ops** + **negative-conformance + validator/decoder
