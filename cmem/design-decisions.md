@@ -130,8 +130,17 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
       - **Supertype chains are decoded but the WAT assembler emits none** (it drops `(sub $super …)`),
         so today concrete subtyping is effectively **exact type-index match** for assembled modules
         (hand-built binaries with sub types get the full chain). Real declared-subtype casts wait for
-        assembler sub-type emission. **`br_on_cast`/`br_on_cast_fail` are the remaining GC ops** (a
-        branch fusing test+cast) — next.
+        assembler sub-type emission.
+    - **br_on_cast / br_on_cast_fail slice DONE 2026-07-14 — WasmGC op coverage is now complete.**
+      `0xFB` 0x18/0x19; immediate = a flags byte (bit 0 src-nullable, bit 1 dst-nullable) + label +
+      src & dst heap types (`s33`). `br_on_cast $l src dst` branches to `$l` (delivering the ref as
+      `dst`) when the ref casts to `dst`, else falls through with the ref as `src`; `br_on_cast_fail`
+      is the mirror (branch on miss carrying `src`, fall through as `dst`). The runtime just re-uses
+      `refMatches` + `branch()` — the `u64` value is unchanged, only its static type differs (a
+      validation concern), so the exec cases *peek* the ref and branch/advance. Validation checks
+      `dst <: src` and that the label's last type accepts the carried ref. Also completed the
+      block-type decoder for the non-null synthetic tags (`readBlockType` gained anyref_nn…nullref_nn),
+      needed for `(block (result (ref i31)) …)` around a cast-branch.
   - **Deferred (until browser-standard):** **WASI preview 2/3** (component-model based), **multi-memory**,
     exception-handling **tags**, **SIMD** — pulled in as the real corpus (`wasm_wasi`) demands. Typed/GC
     reference *value types* are already *accepted* (P1) so such modules build.

@@ -628,6 +628,30 @@ const FuncValidator = struct {
                 try self.pushValT(head.valType(instr.imm.ref_cast.nullable));
             },
 
+            // GC cast-branches. The label carries `[t* rt]` (the ref plus a prefix
+            // `t*`); the operand is `[t* src]`. `br_on_cast` branches when the ref
+            // matches `dst` (passing it as `dst`) and falls through otherwise;
+            // `br_on_cast_fail` is the mirror. `dst` must be a subtype of `src`.
+            .br_on_cast, .br_on_cast_fail => {
+                const bc = instr.imm.br_cast;
+                const src_vt = (try self.module.refHead(bc.src.heap)).valType(bc.src.nullable);
+                const dst_vt = (try self.module.refHead(bc.dst.heap)).valType(bc.dst.nullable);
+                if (!subtypeOf(dst_vt, src_vt)) return error.TypeMismatch; // a downcast
+                const lt = try self.labelTypesAt(bc.label); // [t* carried]
+                if (lt.len == 0) return error.TypeMismatch;
+                // The type carried to the label: `dst` for br_on_cast (the branch
+                // fires on a match), `src` for br_on_cast_fail (fires on a miss).
+                const carried = if (instr.op == .br_on_cast) dst_vt else src_vt;
+                if (!subtypeOf(carried, lt[lt.len - 1])) return error.TypeMismatch;
+                const prefix = lt[0 .. lt.len - 1]; // t*
+                _ = try self.popExpect(src_vt); // the ref operand (top)
+                try self.popVals(prefix);
+                try self.pushVals(prefix);
+                // Fall-through leaves the ref: `src` for br_on_cast (not dst),
+                // narrowed to `dst` for br_on_cast_fail (it is dst).
+                try self.pushValT(if (instr.op == .br_on_cast) src_vt else dst_vt);
+            },
+
             .ref_as_non_null => try self.pushVal(try self.popRef()),
             .br_on_null => {
                 // Pop the ref; on branch pass [t*] to the label, on fall-through

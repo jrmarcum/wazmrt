@@ -1090,6 +1090,15 @@ fn emitFoldedOne(ctx: *Ctx, l: []const Sexpr, i: usize) Error!usize {
             while (j < l.len) j = try emitOne(ctx, l, j); // operand(s)
             try emitRefCast(ctx, op, rt);
         },
+        .br_on_cast, .br_on_cast_fail => {
+            if (l.len < 4) return error.BadImmediate;
+            const label = try resolveLabel(ctx, l[1]);
+            const t1 = try parseRefTypeTarget(ctx, l[2]);
+            const t2 = try parseRefTypeTarget(ctx, l[3]);
+            var j: usize = 4;
+            while (j < l.len) j = try emitOne(ctx, l, j); // operand(s)
+            try emitBrCast(ctx, op, label, t1, t2);
+        },
         else => try emitFoldedPlain(ctx, op, l),
     }
     return i + 1;
@@ -1255,6 +1264,14 @@ fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Erro
             if (i + 1 >= items.len) return error.BadImmediate;
             try emitRefCast(ctx, op, try parseRefTypeTarget(ctx, items[i + 1]));
             return i + 2;
+        },
+        .br_on_cast, .br_on_cast_fail => {
+            if (i + 3 >= items.len) return error.BadImmediate;
+            const label = try resolveLabel(ctx, items[i + 1]);
+            const t1 = try parseRefTypeTarget(ctx, items[i + 2]);
+            const t2 = try parseRefTypeTarget(ctx, items[i + 3]);
+            try emitBrCast(ctx, op, label, t1, t2);
+            return i + 4;
         },
         .table_get, .table_set, .table_grow, .table_size, .table_fill => {
             try emitOpcode(ctx, op);
@@ -1445,6 +1462,19 @@ fn emitRefCast(ctx: *Ctx, op: Op, t: RefTypeTarget) Error!void {
     };
     try ctx.out.append(ctx.a, sub);
     try sleb(ctx.a, ctx.out, t.code);
+}
+
+/// Emit a `br_on_cast`/`br_on_cast_fail`: `0xFB`, the sub-opcode, a flags byte
+/// (bit 0 = src nullable, bit 1 = dst nullable), the label, then src & dst heap
+/// types as `s33`.
+fn emitBrCast(ctx: *Ctx, op: Op, label: u32, src: RefTypeTarget, dst: RefTypeTarget) Error!void {
+    try ctx.out.append(ctx.a, 0xfb);
+    try ctx.out.append(ctx.a, if (op == .br_on_cast) 0x18 else 0x19);
+    const flags: u8 = (@as(u8, @intFromBool(src.nullable))) | (@as(u8, @intFromBool(dst.nullable)) << 1);
+    try ctx.out.append(ctx.a, flags);
+    try uleb(ctx.a, ctx.out, label);
+    try sleb(ctx.a, ctx.out, src.code);
+    try sleb(ctx.a, ctx.out, dst.code);
 }
 
 /// Emit the immediate operands of a bulk table op from its leading index atoms
@@ -2449,4 +2479,34 @@ test "GC ref.cast: success flows the value, failure and null trap" {
     // A nullable cast accepts null; a non-null cast of null traps.
     _ = try assembleAndRun(src, "cast_null_ok", &.{});
     try std.testing.expectError(error.CastFailure, assembleAndRun(src, "cast_null_trap", &.{}));
+}
+
+test "GC br_on_cast / br_on_cast_fail: branch on a successful/failed downcast" {
+    const src =
+        \\(module
+        \\  (type $pt (struct (field i32)))
+        \\  ;; sel!=0 -> an i31; sel==0 -> a struct, stored as anyref.
+        \\  (func $mk (param i32) (result anyref)
+        \\    (if (result anyref) (local.get 0)
+        \\      (then (ref.i31 (i32.const 7)))
+        \\      (else (struct.new $pt (i32.const 5)))))
+        \\  ;; br_on_cast: branch (and keep the (ref i31)) when the value is an i31.
+        \\  (func (export "hits") (param i32) (result i32)
+        \\    (block $yes (result (ref i31))
+        \\      (br_on_cast $yes anyref (ref i31) (call $mk (local.get 0)))
+        \\      (return (i32.const -1)))      ;; fall-through: not an i31
+        \\    (i31.get_s))                     ;; branch: extract the i31 payload
+        \\  ;; br_on_cast_fail: branch (carrying anyref) when NOT an i31.
+        \\  (func (export "misses") (param i32) (result i32)
+        \\    (block $no (result anyref)
+        \\      (br_on_cast_fail $no anyref (ref i31) (call $mk (local.get 0)))
+        \\      (drop) (return (i32.const 100)))  ;; fall-through: is an i31
+        \\    (drop) (i32.const 200)))            ;; branch: not an i31
+    ;
+    // hits: i31 -> branch -> i31.get_s = 7; struct -> fall-through -> -1.
+    try std.testing.expectEqual(@as(i32, 7), interp.asI32(try assembleAndRun(src, "hits", &.{interp.i32Value(1)})));
+    try std.testing.expectEqual(@as(i32, -1), interp.asI32(try assembleAndRun(src, "hits", &.{interp.i32Value(0)})));
+    // misses: i31 -> fall-through -> 100; struct -> branch -> 200.
+    try std.testing.expectEqual(@as(i32, 100), interp.asI32(try assembleAndRun(src, "misses", &.{interp.i32Value(1)})));
+    try std.testing.expectEqual(@as(i32, 200), interp.asI32(try assembleAndRun(src, "misses", &.{interp.i32Value(0)})));
 }

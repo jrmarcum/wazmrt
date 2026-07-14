@@ -798,6 +798,15 @@ const Frame = struct {
                     if (!self.inst.refMatches(v, instr.imm.ref_cast)) return error.CastFailure;
                     pc += 1; // value stays on the stack with its new (validated) type
                 },
+                .br_on_cast => {
+                    // The ref stays on the stack in both paths; branch iff it casts.
+                    const v = self.vstack.items[self.vstack.items.len - 1];
+                    pc = if (self.inst.refMatches(v, instr.imm.br_cast.dst)) self.branch(instr.imm.br_cast.label) else pc + 1;
+                },
+                .br_on_cast_fail => {
+                    const v = self.vstack.items[self.vstack.items.len - 1];
+                    pc = if (!self.inst.refMatches(v, instr.imm.br_cast.dst)) self.branch(instr.imm.br_cast.label) else pc + 1;
+                },
 
                 // --- Structured control flow ---
                 .block => {

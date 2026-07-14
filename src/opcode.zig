@@ -278,6 +278,8 @@ pub const Op = enum(u8) {
     // internal tag distinguished by the decoded `RefType.nullable`.
     ref_test = 0xee, // 0xFB 0x14 (non-null) / 0x15 (null): [ref] -> [i32]
     ref_cast = 0xef, // 0xFB 0x16 (non-null) / 0x17 (null): [ref] -> [ref]
+    br_on_cast = 0xf9, // 0xFB 0x18: branch if the ref casts to dst
+    br_on_cast_fail = 0xfa, // 0xFB 0x19: branch if the ref does NOT cast to dst
 
     _,
 };
@@ -333,6 +335,8 @@ pub fn gcSubOpcode(op: Op) ?u8 {
         .array_len => 0x0f,
         .ref_test => 0x14, // non-null form; the null form (0x15) is chosen at emit
         .ref_cast => 0x16, // non-null form; the null form (0x17) is chosen at emit
+        .br_on_cast => 0x18,
+        .br_on_cast_fail => 0x19,
         .ref_i31 => 0x1c,
         .i31_get_s => 0x1d,
         .i31_get_u => 0x1e,
@@ -388,6 +392,9 @@ pub const Imm = union(enum) {
     gc_type_n: struct { type_index: u32, n: u32 },
     /// A GC cast target reference type (`ref.test` / `ref.cast`).
     ref_cast: RefType,
+    /// A GC cast-branch (`br_on_cast` / `br_on_cast_fail`): a label + the source
+    /// and destination reference types.
+    br_cast: struct { label: u32, src: RefType, dst: RefType },
 };
 
 pub const Instr = struct { op: Op, imm: Imm };
@@ -417,6 +424,7 @@ const ImmKind = enum {
     gc_field,
     gc_type_n,
     ref_cast,
+    br_cast,
     unsupported,
 };
 
@@ -458,6 +466,8 @@ pub fn immediateKind(op: Op) ImmKind {
         0xe8 => .gc_type_n,
         // ref.test / ref.cast: a target reference type.
         0xee, 0xef => .ref_cast,
+        // br_on_cast / br_on_cast_fail: a label + source & destination ref types.
+        0xf9, 0xfa => .br_cast,
         else => .unsupported,
     };
 }
@@ -482,8 +492,14 @@ fn readBlockType(r: *Reader) DecodeError!BlockType {
         -21 => .{ .value = .structref }, // 0x6b
         -22 => .{ .value = .arrayref }, // 0x6a
         -15 => .{ .value = .nullref }, // 0x71 (none)
-        -24 => .{ .value = .funcref_nn }, // 0x68 (our synthetic non-null tag)
+        -24 => .{ .value = .funcref_nn }, // 0x68 (our synthetic non-null tags)
         -25 => .{ .value = .externref_nn }, // 0x67
+        -26 => .{ .value = .anyref_nn }, // 0x66
+        -27 => .{ .value = .eqref_nn }, // 0x65
+        -30 => .{ .value = .i31ref_nn }, // 0x62
+        -31 => .{ .value = .structref_nn }, // 0x61
+        -39 => .{ .value = .arrayref_nn }, // 0x59
+        -40 => .{ .value = .nullref_nn }, // 0x58
         else => error.UnsupportedOpcode,
     };
 }
@@ -493,6 +509,20 @@ fn readGcField(r: *Reader) DecodeError!Imm {
     const ti = try r.readVarU32();
     const f = try r.readVarU32();
     return .{ .gc_field = .{ .type_index = ti, .field = f } };
+}
+
+/// Read a `br_on_cast`/`br_on_cast_fail` immediate: a flags byte (bit 0 = src
+/// nullable, bit 1 = dst nullable), a label index, then the src & dst heap types.
+fn readBrCast(r: *Reader) DecodeError!Imm {
+    const flags = try r.readByte();
+    const label = try r.readVarU32();
+    const src_ht = try readHeapType(r);
+    const dst_ht = try readHeapType(r);
+    return .{ .br_cast = .{
+        .label = label,
+        .src = .{ .nullable = flags & 0b01 != 0, .heap = src_ht },
+        .dst = .{ .nullable = flags & 0b10 != 0, .heap = dst_ht },
+    } };
 }
 
 /// Read a heap type (§ GC binary format): a non-negative `s33` is a concrete
@@ -547,6 +577,8 @@ pub fn decodeBody(a: std.mem.Allocator, body: []const u8) (DecodeError || std.me
                 0x15 => .{ .op = .ref_test, .imm = .{ .ref_cast = .{ .nullable = true, .heap = try readHeapType(&r) } } },
                 0x16 => .{ .op = .ref_cast, .imm = .{ .ref_cast = .{ .nullable = false, .heap = try readHeapType(&r) } } },
                 0x17 => .{ .op = .ref_cast, .imm = .{ .ref_cast = .{ .nullable = true, .heap = try readHeapType(&r) } } },
+                0x18 => .{ .op = .br_on_cast, .imm = try readBrCast(&r) },
+                0x19 => .{ .op = .br_on_cast_fail, .imm = try readBrCast(&r) },
                 0x1c => .{ .op = .ref_i31, .imm = .none },
                 0x1d => .{ .op = .i31_get_s, .imm = .none },
                 0x1e => .{ .op = .i31_get_u, .imm = .none },
@@ -610,7 +642,7 @@ pub fn decodeBody(a: std.mem.Allocator, body: []const u8) (DecodeError || std.me
             // reaching here means a raw synthetic-tag byte, which is malformed.
             // 0xFB/0xFC-prefixed ops are decoded via the prefix interceptions
             // above; reaching here means a raw synthetic-tag byte (malformed).
-            .elem, .table_init, .table_copy, .gc_type, .gc_field, .gc_type_n, .ref_cast => return error.UnsupportedOpcode,
+            .elem, .table_init, .table_copy, .gc_type, .gc_field, .gc_type_n, .ref_cast, .br_cast => return error.UnsupportedOpcode,
             .unsupported => return error.UnsupportedOpcode,
         };
         try list.append(a, .{ .op = op, .imm = imm });

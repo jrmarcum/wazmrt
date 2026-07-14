@@ -345,8 +345,18 @@ hierarchy is runtime-distinguishable). Same gating — unit tests + a hand-writt
 - **`gc_cast.wast`: 11/0** via the CLI (`assert_return` for test/cast + `assert_trap` for cast failures;
   `CastFailure` added to the runner's trap set).
 - **No regressions**; all three build surfaces green. Concrete subtyping is exact type-index match for
-  assembled modules (the assembler emits no `(sub …)` supertypes yet); `br_on_cast`/`br_on_cast_fail`
-  are the remaining GC ops.
+  assembled modules (the assembler emits no `(sub …)` supertypes yet).
+
+### full GC — P3, br_on_cast / br_on_cast_fail slice (2026-07-14) — GC ops complete
+
+The cast-branches, fusing test + cast + branch. Completes WasmGC op coverage.
+
+- **+1 unit test (92 total)**: `hits` (br_on_cast: i31 → branch → `i31.get_s` = 7; struct → fall-through
+  → -1) and `misses` (br_on_cast_fail: i31 → fall-through → 100; struct → branch → 200) over an `anyref`
+  built as either an i31 or a struct.
+- **`gc_br_cast.wast`: 4/0** via the CLI.
+- Fixed `readBlockType` to decode the non-null synthetic tags (`(block (result (ref i31)) …)` around a
+  cast-branch). **No regressions**; all three build surfaces green.
 
 ## What this tells the roadmap
 

@@ -21,18 +21,18 @@ compliance process, and for the ledger of any reused code.
 > checking), and a growing slice of **WasmGC** — `i31` references (`ref.i31`,
 > `i31.get_s`/`i31.get_u`), **struct and array** heap objects (`struct.new`/
 > `get`/`set`, `array.new`/`new_fixed`/`get`/`set`/`len`, `ref.eq`, packed
-> `i8`/`i16` fields), and downcasts (`ref.test`/`ref.cast`) over the
-> `any`/`eq`/`i31`/`struct`/`array` reference hierarchy and its subtyping — and
-> runs a corpus of real modules to their expected values
+> `i8`/`i16` fields), and casts (`ref.test`/`ref.cast`, `br_on_cast`/
+> `br_on_cast_fail`) over the `any`/`eq`/`i31`/`struct`/`array` reference
+> hierarchy and its subtyping — and runs a corpus of real modules to their
+> expected values
 > (`fib(20)=6765`, `sieve(30)=10`, …). It ships a native **WAT text assembler**
 > (`.wat` → wasm) and a **WAST script runner** (`wazmrt file.wast`) that runs the
 > official WebAssembly spec testsuite (positive assertions plus
 > `assert_invalid`/`assert_malformed`/`assert_trap`/`assert_unlinkable`) — e.g.
 > `table_init` 729/0, `table_copy` 1649/0, `imports` 137, `call_ref` 30, `start`
-> 11/0. It runs a module's **start function** at instantiation. Coming next: the
-> rest of **GC** (WasmGC — `br_on_cast` and concrete-type references), then a
-> growing C ABI and **WASI preview 1**; multi-memory and exception-handling tags
-> follow as needed. Requires Zig 0.16.
+> 11/0. It runs a module's **start function** at instantiation. Coming next: a
+> growing C ABI (instance/func/call) and **WASI preview 1**; multi-memory and
+> exception-handling tags follow as needed. Requires Zig 0.16.
 
 ## Build
 

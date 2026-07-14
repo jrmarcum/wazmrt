@@ -50,9 +50,14 @@ array + rec/sub/packed decode with a forward-ref kind pre-scan); an arena-backed
 array/field …))`. **`ref.test`/`ref.cast` slice DONE 2026-07-14**: heap objects carry an RTT
 (`HeapObject.type_index`), i31 values are tagged (bit 63) so the `any` hierarchy is runtime-
 distinguishable, `ref.test`/`ref.cast` dispatch on the target's hierarchy (abstract via `RefHeap.sub`,
-concrete via `Module.isSubtype`); `CastFailure` traps. 90 unit tests + `gc_struct_array.wast` 11/0 +
-`gc_cast.wast` 11/0. **Next P3 part: `br_on_cast`/`br_on_cast_fail`** (a branch fusing test+cast), then
-assembler sub-type emission for real declared-subtype casts. **(2)** grow the wasm-c-api past
+concrete via `Module.isSubtype`); `CastFailure` traps. **`br_on_cast`/`br_on_cast_fail` slice DONE
+2026-07-14** (`0xFB` 0x18/0x19; peek-ref + `refMatches` + `branch()`; validation checks `dst <: src`
+and the label carry type; block-type decoder extended for non-null tags). **WasmGC op coverage is now
+complete** (i31, struct, array, `ref.eq`, `ref.test`/`ref.cast`, `br_on_cast`/`br_on_cast_fail`).
+92 unit tests + `gc_struct_array.wast` 11/0 + `gc_cast.wast` 11/0 + `gc_br_cast.wast` 4/0. **P3 wrap-up
+left:** assembler `(sub …)` supertype emission for real declared-subtype casts, and concrete `(ref $t)`
+*value types* (both are the collapse limitation in `design-decisions.md`); otherwise **P3 → done, next is
+(2) the wasm-c-api** (instance/func/call). **(2)** grow the wasm-c-api past
 introspection (instance/func/call) → embeddable end-to-end + first `universalWasmLoader-*` integration.
 **(3)** the Deno/V8 benchmark. **(4) WASI preview 1** (preview 2/3 deferred until browser-standard, per
 wasmtk). **The function-references proposal is complete** (typed-ref value types, `call_ref`/
