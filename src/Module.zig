@@ -31,6 +31,52 @@ pub const FuncType = struct {
     results: []const types.ValType,
 };
 
+/// A struct/array field's storage type (GC, §5.3.6). Packed `i8`/`i16` store
+/// narrow and widen on read (`*.get_s` sign-extends, `*.get_u` zero-extends);
+/// an unpacked field holds an ordinary value type.
+pub const StorageType = union(enum) {
+    val: types.ValType,
+    i8, // packed
+    i16, // packed
+
+    /// The value type this field projects onto the operand stack (packed → i32).
+    pub fn unpacked(self: StorageType) types.ValType {
+        return switch (self) {
+            .val => |v| v,
+            .i8, .i16 => .i32,
+        };
+    }
+    pub fn isPacked(self: StorageType) bool {
+        return self != .val;
+    }
+};
+
+/// A struct field / array element type (GC): storage type + mutability.
+pub const FieldType = struct { storage: StorageType, mutable: bool };
+
+/// The composite-type kind of a type-section entry (GC). Determined by the
+/// leading composite-type byte, so it can be pre-scanned before fields (which
+/// may forward-reference later types in a rec group) are decoded.
+pub const CompKind = enum { func, @"struct", array };
+
+/// A composite type from the type section (§5.3): a function signature, a struct
+/// (a vector of fields), or an array (a single element field). Rec/sub wrappers
+/// are decoded structurally; the declared supertype (if any) is kept for later
+/// cast/subtyping support.
+pub const CompType = union(enum) {
+    func: FuncType,
+    @"struct": []const FieldType,
+    array: FieldType,
+
+    pub fn kind(self: CompType) CompKind {
+        return switch (self) {
+            .func => .func,
+            .@"struct" => .@"struct",
+            .array => .array,
+        };
+    }
+};
+
 /// Resizable-range limits shared by tables and memories (§5.3.7).
 pub const Limits = struct { min: u32, max: ?u32 };
 
@@ -121,7 +167,12 @@ pub const Code = struct {
 arena: std.heap.ArenaAllocator,
 version: u32,
 sections: []const Section,
-func_types: []const FuncType,
+/// The type index space (§5.3): func / struct / array composite types, in
+/// declaration order (rec groups flattened into consecutive indices).
+comp_types: []const CompType,
+/// Declared supertype of each type index (GC sub types), or null. Kept for
+/// future `ref.cast`/subtyping; unused by the current slice.
+supertypes: []const ?u32,
 /// Type index of each *defined* function (function section), in order.
 functions: []const u32,
 imports: []const Import,
@@ -154,7 +205,12 @@ pub const Error = types.DecodeError || std.mem.Allocator.Error;
 /// resolve export indices.
 const Decoder = struct {
     a: std.mem.Allocator,
-    func_types: []const FuncType = &.{},
+    comp_types: []const CompType = &.{},
+    supertypes: []const ?u32 = &.{},
+    /// Composite kind of each type index, pre-scanned before bodies are decoded
+    /// so a `(ref $t)` value type can collapse to the right family (func /
+    /// struct / array) even when `$t` is a forward reference in a rec group.
+    type_kinds: []const CompKind = &.{},
     func_space: std.ArrayList(FuncType) = .empty,
     table_space: std.ArrayList(TableType) = .empty,
     mem_space: std.ArrayList(MemoryType) = .empty,
@@ -203,7 +259,7 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
                 const nlen = try sub.readVarU32();
                 _ = try sub.readBytes(nlen);
             },
-            .type => d.func_types = try decodeTypeSection(&d, &sub),
+            .type => try decodeTypeSection(&d, &sub),
             .import => imports = try decodeImportSection(&d, &sub),
             .function => functions = try decodeFunctionSection(&d, &sub),
             .table => try decodeTableSection(&d, &sub),
@@ -226,7 +282,8 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
         .arena = arena,
         .version = version,
         .sections = try sections.toOwnedSlice(a),
-        .func_types = d.func_types,
+        .comp_types = d.comp_types,
+        .supertypes = d.supertypes,
         .functions = functions,
         .imports = imports,
         .exports = exports,
@@ -293,18 +350,45 @@ pub fn funcType(self: *const Module, index: u32) ?FuncType {
     }
     const defined = index - i;
     if (defined >= self.functions.len) return null;
-    const ti = self.functions[defined];
-    if (ti >= self.func_types.len) return null;
-    return self.func_types[ti];
+    return self.funcSig(self.functions[defined]);
+}
+
+/// The function signature at type index `ti`, or null if `ti` is out of range
+/// or names a non-function (struct/array) composite type.
+pub fn funcSig(self: *const Module, ti: u32) ?FuncType {
+    if (ti >= self.comp_types.len) return null;
+    return switch (self.comp_types[ti]) {
+        .func => |f| f,
+        else => null,
+    };
+}
+
+/// The struct field vector at type index `ti`, or null if `ti` is not a struct.
+pub fn structFields(self: *const Module, ti: u32) ?[]const FieldType {
+    if (ti >= self.comp_types.len) return null;
+    return switch (self.comp_types[ti]) {
+        .@"struct" => |fs| fs,
+        else => null,
+    };
+}
+
+/// The array element field at type index `ti`, or null if `ti` is not an array.
+pub fn arrayField(self: *const Module, ti: u32) ?FieldType {
+    if (ti >= self.comp_types.len) return null;
+    return switch (self.comp_types[ti]) {
+        .array => |f| f,
+        else => null,
+    };
 }
 
 // --- Low-level readers -----------------------------------------------------
 
-/// Read one value type. Numeric types are themselves; every reference form
-/// (abstract heap-type shorthands, and `(ref null? ht)` = 0x63/0x64 + heaptype)
-/// collapses to the runtime's two opaque reference slots — func-family →
-/// `funcref`, everything else → `externref` (typed/GC-ref acceptance, P1).
-fn readValType(r: *Reader) Error!types.ValType {
+/// Read one value type. Numeric types are themselves; abstract reference
+/// shorthands map to their family head, and `(ref null? ht)` = 0x63/0x64 +
+/// heaptype resolves a concrete `$t` to its family (func / struct / array) via
+/// the pre-scanned `kinds`. Non-null synthetic tags (0x58–0x68) round-trip our
+/// own assembler output.
+fn readValType(r: *Reader, kinds: []const CompKind) Error!types.ValType {
     const b = try r.readByte();
     return switch (b) {
         0x7f, 0x7e, 0x7d, 0x7c, 0x7b => @enumFromInt(b), // i32 i64 f32 f64 v128
@@ -327,20 +411,28 @@ fn readValType(r: *Reader) Error!types.ValType {
         0x61 => .structref_nn,
         0x59 => .arrayref_nn,
         0x58 => .nullref_nn,
-        0x63 => try readHeapTypeRef(r, true), // (ref null ht)
-        0x64 => try readHeapTypeRef(r, false), // (ref ht) — non-nullable
+        0x63 => try readHeapTypeRef(r, true, kinds), // (ref null ht)
+        0x64 => try readHeapTypeRef(r, false, kinds), // (ref ht) — non-nullable
         else => error.BadValType,
     };
 }
 
 /// Map a `heaptype` (following a `0x63`/`0x64` ref prefix) to a reference value
-/// type: a non-negative `s33` is a type index (a concrete — hence func —
-/// reference); negative encodings are the abstract heap types. `nullable` picks
-/// the nullable vs non-null variant.
-fn readHeapTypeRef(r: *Reader, nullable: bool) Error!types.ValType {
+/// type. A non-negative `s33` is a concrete type index: it collapses to its
+/// composite family's head (func → `funcref`, struct → `structref`, array →
+/// `arrayref`) using the pre-scanned `kinds`. Negative encodings are the
+/// abstract heap types. `nullable` picks the nullable vs non-null variant.
+fn readHeapTypeRef(r: *Reader, nullable: bool, kinds: []const CompKind) Error!types.ValType {
     const ht = try r.readVarI64(); // s33
-    if (ht >= 0) return if (nullable) .funcref else .funcref_nn; // concrete typeidx → func family
-    const both: [2]types.ValType = switch (ht) {
+    const both: [2]types.ValType = if (ht >= 0) blk: {
+        const ti: usize = @intCast(ht);
+        if (ti >= kinds.len) return error.IndexOutOfRange;
+        break :blk switch (kinds[ti]) {
+            .func => .{ .funcref, .funcref_nn },
+            .@"struct" => .{ .structref, .structref_nn },
+            .array => .{ .arrayref, .arrayref_nn },
+        };
+    } else switch (ht) {
         -0x10, -0x0d => .{ .funcref, .funcref_nn }, // func, nofunc
         -0x11, -0x0e => .{ .externref, .externref_nn }, // extern, noextern
         -0x12 => .{ .anyref, .anyref_nn }, // any
@@ -354,10 +446,10 @@ fn readHeapTypeRef(r: *Reader, nullable: bool) Error!types.ValType {
     return if (nullable) both[0] else both[1];
 }
 
-fn readValTypes(a: std.mem.Allocator, r: *Reader) Error![]const types.ValType {
+fn readValTypes(a: std.mem.Allocator, r: *Reader, kinds: []const CompKind) Error![]const types.ValType {
     const n = try r.readVarU32();
     const vts = try a.alloc(types.ValType, n);
-    for (vts) |*v| v.* = try readValType(r);
+    for (vts) |*v| v.* = try readValType(r, kinds);
     return vts;
 }
 
@@ -378,16 +470,40 @@ fn readLimits(r: *Reader) Error!Limits {
     return .{ .min = min, .max = max };
 }
 
-fn readTableType(r: *Reader) Error!TableType {
-    const element = try readValType(r);
+fn readTableType(r: *Reader, kinds: []const CompKind) Error!TableType {
+    const element = try readValType(r, kinds);
     return .{ .element = element, .limits = try readLimits(r) };
 }
 
-fn readGlobalType(r: *Reader) Error!GlobalType {
-    const content = try readValType(r);
+fn readGlobalType(r: *Reader, kinds: []const CompKind) Error!GlobalType {
+    const content = try readValType(r, kinds);
     const mut = try r.readByte();
     if (mut > 0x01) return error.MalformedFlag; // only 0x00 (const) / 0x01 (var)
     return .{ .content = content, .mutable = mut != 0 };
+}
+
+/// Read a field type (GC §5.3.6): a storage type + a mutability byte.
+fn readFieldType(r: *Reader, kinds: []const CompKind) Error!FieldType {
+    const st = try readStorageType(r, kinds);
+    const mut = try r.readByte();
+    if (mut > 0x01) return error.MalformedFlag;
+    return .{ .storage = st, .mutable = mut != 0 };
+}
+
+/// Read a storage type: a packed `i8` (0x78) / `i16` (0x77), else a value type.
+fn readStorageType(r: *Reader, kinds: []const CompKind) Error!StorageType {
+    const b = try r.peekByte();
+    return switch (b) {
+        0x78 => {
+            _ = try r.readByte();
+            return .i8;
+        },
+        0x77 => {
+            _ = try r.readByte();
+            return .i16;
+        },
+        else => .{ .val = try readValType(r, kinds) },
+    };
 }
 
 /// Skip a constant init expression (§5.4.9): a short instruction sequence
@@ -410,20 +526,141 @@ fn skipConstExpr(r: *Reader) Error!void {
 
 // --- Section decoders ------------------------------------------------------
 
-fn decodeTypeSection(d: *Decoder, r: *Reader) Error![]const FuncType {
-    const count = try r.readVarU32();
-    const list = try d.a.alloc(FuncType, count);
-    for (list) |*ft| {
-        if (try r.readByte() != 0x60) return error.BadFuncType;
-        ft.params = try readValTypes(d.a, r);
-        ft.results = try readValTypes(d.a, r);
+/// Decode the type section (§5.5.4, GC §5.3): a vector of *rec types*, each a
+/// bare composite type or a `0x4e` rec group of sub types. Rec groups flatten
+/// into consecutive type indices. Runs a cheap kind pre-scan first so a
+/// `(ref $t)` inside a field can collapse to the right family even when `$t`
+/// forward-references a later type in the same group.
+fn decodeTypeSection(d: *Decoder, r: *Reader) Error!void {
+    var scan = r.*; // Reader is a value cursor — copy for the pre-scan pass.
+    d.type_kinds = try prescanTypeKinds(d.a, &scan);
+
+    var comp: std.ArrayList(CompType) = .empty;
+    var supers: std.ArrayList(?u32) = .empty;
+    var nrec = try r.readVarU32();
+    while (nrec > 0) : (nrec -= 1) {
+        if (try r.peekByte() == 0x4e) {
+            _ = try r.readByte(); // rec group
+            var k = try r.readVarU32();
+            while (k > 0) : (k -= 1) try decodeSubType(d, r, &comp, &supers);
+        } else {
+            try decodeSubType(d, r, &comp, &supers);
+        }
     }
-    return list;
+    d.comp_types = try comp.toOwnedSlice(d.a);
+    d.supertypes = try supers.toOwnedSlice(d.a);
+}
+
+/// Decode one sub type: an optional `0x50`/`0x4f` (non-final / final) wrapper
+/// carrying a supertype list (GC MVP: at most one), then a composite type.
+fn decodeSubType(d: *Decoder, r: *Reader, comp: *std.ArrayList(CompType), supers: *std.ArrayList(?u32)) Error!void {
+    var super: ?u32 = null;
+    const tag = try r.peekByte();
+    if (tag == 0x50 or tag == 0x4f) {
+        _ = try r.readByte();
+        const ns = try r.readVarU32();
+        if (ns > 1) return error.BadType; // MVP allows at most one supertype
+        if (ns == 1) super = try r.readVarU32();
+    }
+    try comp.append(d.a, try decodeCompType(d, r));
+    try supers.append(d.a, super);
+}
+
+/// Decode a composite type: `0x60` func / `0x5f` struct / `0x5e` array.
+fn decodeCompType(d: *Decoder, r: *Reader) Error!CompType {
+    return switch (try r.readByte()) {
+        0x60 => .{ .func = .{
+            .params = try readValTypes(d.a, r, d.type_kinds),
+            .results = try readValTypes(d.a, r, d.type_kinds),
+        } },
+        0x5f => blk: {
+            var n = try r.readVarU32();
+            const fs = try d.a.alloc(FieldType, n);
+            var i: usize = 0;
+            while (n > 0) : (n -= 1) {
+                fs[i] = try readFieldType(r, d.type_kinds);
+                i += 1;
+            }
+            break :blk .{ .@"struct" = fs };
+        },
+        0x5e => .{ .array = try readFieldType(r, d.type_kinds) },
+        else => error.BadType,
+    };
+}
+
+// --- Type-kind pre-scan (pass A) -------------------------------------------
+// Walk the type section structurally, recording each type's composite kind
+// without resolving inner reference types (whose family may forward-reference a
+// later type). Deliberately mirrors the pass-B structure above.
+
+fn prescanTypeKinds(a: std.mem.Allocator, r: *Reader) Error![]const CompKind {
+    var kinds: std.ArrayList(CompKind) = .empty;
+    var nrec = try r.readVarU32();
+    while (nrec > 0) : (nrec -= 1) {
+        if (try r.peekByte() == 0x4e) {
+            _ = try r.readByte();
+            var k = try r.readVarU32();
+            while (k > 0) : (k -= 1) try scanSubType(a, r, &kinds);
+        } else {
+            try scanSubType(a, r, &kinds);
+        }
+    }
+    return kinds.toOwnedSlice(a);
+}
+
+fn scanSubType(a: std.mem.Allocator, r: *Reader, kinds: *std.ArrayList(CompKind)) Error!void {
+    const tag = try r.peekByte();
+    if (tag == 0x50 or tag == 0x4f) {
+        _ = try r.readByte();
+        var ns = try r.readVarU32();
+        while (ns > 0) : (ns -= 1) _ = try r.readVarU32(); // supertype indices
+    }
+    switch (try r.readByte()) {
+        0x60 => {
+            try skipValTypeVec(r);
+            try skipValTypeVec(r);
+            try kinds.append(a, .func);
+        },
+        0x5f => {
+            var n = try r.readVarU32();
+            while (n > 0) : (n -= 1) try skipFieldType(r);
+            try kinds.append(a, .@"struct");
+        },
+        0x5e => {
+            try skipFieldType(r);
+            try kinds.append(a, .array);
+        },
+        else => return error.BadType,
+    }
+}
+
+fn skipValTypeVec(r: *Reader) Error!void {
+    var n = try r.readVarU32();
+    while (n > 0) : (n -= 1) try skipValType(r);
+}
+
+/// Advance past one value type without resolving it (bytes only).
+fn skipValType(r: *Reader) Error!void {
+    const b = try r.readByte();
+    if (b == 0x63 or b == 0x64) _ = try r.readVarI64(); // (ref null? ht): + heaptype s33
+}
+
+fn skipFieldType(r: *Reader) Error!void {
+    const b = try r.peekByte();
+    if (b == 0x77 or b == 0x78) {
+        _ = try r.readByte(); // packed i16 / i8
+    } else {
+        try skipValType(r);
+    }
+    _ = try r.readByte(); // mutability
 }
 
 fn funcTypeAt(d: *Decoder, type_index: u32) Error!FuncType {
-    if (type_index >= d.func_types.len) return error.IndexOutOfRange;
-    return d.func_types[type_index];
+    if (type_index >= d.comp_types.len) return error.IndexOutOfRange;
+    return switch (d.comp_types[type_index]) {
+        .func => |f| f,
+        else => error.BadType, // a struct/array type used where a func type is required
+    };
 }
 
 fn decodeImportSection(d: *Decoder, r: *Reader) Error![]const Import {
@@ -440,7 +677,7 @@ fn decodeImportSection(d: *Decoder, r: *Reader) Error![]const Import {
                 break :blk .{ .func = ft };
             },
             .table => blk: {
-                const tt = try readTableType(r);
+                const tt = try readTableType(r, d.type_kinds);
                 try d.table_space.append(d.a, tt);
                 break :blk .{ .table = tt };
             },
@@ -450,7 +687,7 @@ fn decodeImportSection(d: *Decoder, r: *Reader) Error![]const Import {
                 break :blk .{ .memory = mt };
             },
             .global => blk: {
-                const gt = try readGlobalType(r);
+                const gt = try readGlobalType(r, d.type_kinds);
                 try d.global_space.append(d.a, gt);
                 break :blk .{ .global = gt };
             },
@@ -472,7 +709,7 @@ fn decodeFunctionSection(d: *Decoder, r: *Reader) Error![]const u32 {
 
 fn decodeTableSection(d: *Decoder, r: *Reader) Error!void {
     var count = try r.readVarU32();
-    while (count > 0) : (count -= 1) try d.table_space.append(d.a, try readTableType(r));
+    while (count > 0) : (count -= 1) try d.table_space.append(d.a, try readTableType(r, d.type_kinds));
 }
 
 fn decodeMemorySection(d: *Decoder, r: *Reader) Error!void {
@@ -483,7 +720,7 @@ fn decodeMemorySection(d: *Decoder, r: *Reader) Error!void {
 fn decodeGlobalSection(d: *Decoder, r: *Reader) Error!void {
     var count = try r.readVarU32();
     while (count > 0) : (count -= 1) {
-        try d.global_space.append(d.a, try readGlobalType(r));
+        try d.global_space.append(d.a, try readGlobalType(r, d.type_kinds));
         try d.global_init_space.append(d.a, try readConstExprBytes(d.a, r)); // init expression
     }
 }
@@ -511,12 +748,12 @@ fn spaceAt(comptime T: type, space: std.ArrayList(T), index: u32) Error!T {
     return space.items[index];
 }
 
-fn decodeLocals(a: std.mem.Allocator, r: *Reader) Error![]const Local {
+fn decodeLocals(a: std.mem.Allocator, r: *Reader, kinds: []const CompKind) Error![]const Local {
     const n = try r.readVarU32();
     const locals = try a.alloc(Local, n);
     for (locals) |*l| {
         l.count = try r.readVarU32();
-        l.type = try readValType(r);
+        l.type = try readValType(r, kinds);
     }
     return locals;
 }
@@ -582,7 +819,7 @@ fn decodeElementSection(d: *Decoder, r: *Reader) Error![]const Element {
             e.funcs = try readFuncVec(d.a, r);
         } else {
             // Const-expr form. Non-flag-4 variants carry a leading reftype byte.
-            if (flags != 4) e.elem_type = try readValType(r);
+            if (flags != 4) e.elem_type = try readValType(r, d.type_kinds);
             e.exprs = try readExprVec(d.a, r);
         }
     }
@@ -611,7 +848,7 @@ fn decodeCodeSection(d: *Decoder, r: *Reader) Error![]const Code {
         // so a malformed local vector can't run past the entry.
         const entry = try r.readBytes(try r.readVarU32());
         var er = Reader.init(entry);
-        c.locals = try decodeLocals(d.a, &er);
+        c.locals = try decodeLocals(d.a, &er, d.type_kinds);
         const rest = entry[er.pos..]; // instruction bytes, incl. terminating end
         const owned = try d.a.alloc(u8, rest.len);
         @memcpy(owned, rest);
@@ -628,7 +865,7 @@ test "decodes an empty module (header only)" {
     defer m.deinit();
     try std.testing.expectEqual(@as(u32, 1), m.version);
     try std.testing.expectEqual(@as(usize, 0), m.sections.len);
-    try std.testing.expectEqual(@as(usize, 0), m.func_types.len);
+    try std.testing.expectEqual(@as(usize, 0), m.comp_types.len);
 }
 
 test "indexes a single custom section" {
@@ -682,9 +919,9 @@ test "decodes and resolves type/import/function/export sections" {
     defer m.deinit();
 
     try std.testing.expectEqual(@as(usize, 4), m.sections.len);
-    try std.testing.expectEqual(@as(usize, 1), m.func_types.len);
-    try std.testing.expectEqualSlices(types.ValType, &.{ .i32, .i32 }, m.func_types[0].params);
-    try std.testing.expectEqualSlices(types.ValType, &.{.i32}, m.func_types[0].results);
+    try std.testing.expectEqual(@as(usize, 1), m.comp_types.len);
+    try std.testing.expectEqualSlices(types.ValType, &.{ .i32, .i32 }, m.comp_types[0].func.params);
+    try std.testing.expectEqualSlices(types.ValType, &.{.i32}, m.comp_types[0].func.results);
 
     try std.testing.expectEqual(@as(usize, 1), m.imports.len);
     try std.testing.expectEqualStrings("env", m.imports[0].module);
@@ -701,6 +938,50 @@ test "decodes and resolves type/import/function/export sections" {
     // export "run" resolves to the (i32,i32)->i32 signature of defined func 1.
     try std.testing.expectEqualSlices(types.ValType, &.{ .i32, .i32 }, m.exports[0].type.func.params);
     try std.testing.expectEqualSlices(types.ValType, &.{.i32}, m.exports[0].type.func.results);
+}
+
+test "decodes GC struct and array composite types (packed fields)" {
+    // type section, 2 types:
+    //   0: (struct (field (mut i32)) (field i64))     -> 5f 02  7f 01  7e 00
+    //   1: (array (field (mut i8)))                   -> 5e  78 01
+    const payload = [_]u8{ 0x02, 0x5f, 0x02, 0x7f, 0x01, 0x7e, 0x00, 0x5e, 0x78, 0x01 };
+    const bytes = types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+        [_]u8{ 0x01, payload.len } ++ payload;
+
+    var m = try Module.decode(std.testing.allocator, &bytes);
+    defer m.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), m.comp_types.len);
+    const st = m.structFields(0).?;
+    try std.testing.expectEqual(@as(usize, 2), st.len);
+    try std.testing.expectEqual(StorageType{ .val = .i32 }, st[0].storage);
+    try std.testing.expect(st[0].mutable);
+    try std.testing.expectEqual(StorageType{ .val = .i64 }, st[1].storage);
+    try std.testing.expect(!st[1].mutable);
+    const arr = m.arrayField(1).?;
+    try std.testing.expectEqual(StorageType.i8, arr.storage); // packed
+    try std.testing.expect(arr.mutable);
+    try std.testing.expect(arr.storage.isPacked());
+    try std.testing.expectEqual(types.ValType.i32, arr.storage.unpacked()); // projects to i32
+}
+
+test "GC rec group: a struct field forward-references a later type (ref collapses to structref)" {
+    // (rec (struct (field (ref 1))) (struct (field i32)))
+    //   01                 ; 1 rectype
+    //   4e 02              ; rec group of 2 sub types
+    //   5f 01  64 01 00    ; struct{ (ref $1) }  -- forward ref to type 1
+    //   5f 01  7f 00       ; struct{ i32 }
+    const payload = [_]u8{ 0x01, 0x4e, 0x02, 0x5f, 0x01, 0x64, 0x01, 0x00, 0x5f, 0x01, 0x7f, 0x00 };
+    const bytes = types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+        [_]u8{ 0x01, payload.len } ++ payload;
+
+    var m = try Module.decode(std.testing.allocator, &bytes);
+    defer m.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), m.comp_types.len);
+    // The forward `(ref 1)` collapses to a non-null structref (type 1 is a struct).
+    try std.testing.expectEqual(StorageType{ .val = .structref_nn }, m.structFields(0).?[0].storage);
+    try std.testing.expectEqual(StorageType{ .val = .i32 }, m.structFields(1).?[0].storage);
 }
 
 test "decodes a code section with locals and a body" {

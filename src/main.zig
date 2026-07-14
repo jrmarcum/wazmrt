@@ -61,7 +61,7 @@ pub fn main(init: std.process.Init) !void {
     var code_bytes: usize = 0;
     for (module.code) |c| code_bytes += c.body.len;
     try out.print("  types={d} imports={d} functions={d} exports={d} code={d} ({d} body bytes)\n", .{
-        module.func_types.len, module.imports.len, module.functions.len,
+        module.comp_types.len, module.imports.len, module.functions.len,
         module.exports.len,    module.code.len,    code_bytes,
     });
     for (module.imports) |i| {

@@ -176,6 +176,9 @@ pub const DecodeError = error{
     InvalidSectionId,
     /// A function type did not begin with the 0x60 form byte.
     BadFuncType,
+    /// A type-section entry was not a valid composite type (func/struct/array),
+    /// or a GC sub type declared more than one supertype.
+    BadType,
     /// An import/export descriptor used an unknown kind byte.
     UnknownExternKind,
     /// A type/function/extern index referred outside the decoded space.

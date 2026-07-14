@@ -97,8 +97,8 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
     defer arena.deinit();
 
     for (module.functions, module.code) |type_index, code| {
-        if (type_index >= module.func_types.len) return error.UndefinedType;
-        try validateFunction(arena.allocator(), module, module.func_types[type_index], code);
+        const ft = module.funcSig(type_index) orelse return error.UndefinedType;
+        try validateFunction(arena.allocator(), module, ft, code);
         _ = arena.reset(.retain_capacity);
     }
 }
@@ -325,8 +325,7 @@ const FuncValidator = struct {
                 break :blk .{ .pop = empty, .push = r };
             },
             .type_index => |i| blk: {
-                if (i >= self.module.func_types.len) return error.UndefinedType;
-                const ft = self.module.func_types[i];
+                const ft = self.module.funcSig(i) orelse return error.UndefinedType;
                 break :blk .{ .pop = ft.params, .push = ft.results };
             },
         };
@@ -409,8 +408,7 @@ const FuncValidator = struct {
                 const ci = instr.imm.call_indirect;
                 if (ci.table >= self.module.tables.len) return error.UndefinedTable;
                 if (self.module.tables[ci.table].element != .funcref) return error.TypeMismatch;
-                if (ci.type_index >= self.module.func_types.len) return error.UndefinedType;
-                const ft = self.module.func_types[ci.type_index];
+                const ft = self.module.funcSig(ci.type_index) orelse return error.UndefinedType;
                 _ = try self.popExpect(.i32);
                 try self.popVals(ft.params);
                 try self.pushVals(ft.results);
@@ -506,15 +504,13 @@ const FuncValidator = struct {
             // Typed function references (function-references proposal). A typed
             // func ref collapses to `funcref` in our model (see the decoder P1).
             .call_ref => {
-                if (instr.imm.func >= self.module.func_types.len) return error.UndefinedType;
-                const ft = self.module.func_types[instr.imm.func];
+                const ft = self.module.funcSig(instr.imm.func) orelse return error.UndefinedType;
                 _ = try self.popExpect(.funcref); // the function reference (top)
                 try self.popVals(ft.params);
                 try self.pushVals(ft.results);
             },
             .return_call_ref => {
-                if (instr.imm.func >= self.module.func_types.len) return error.UndefinedType;
-                const ft = self.module.func_types[instr.imm.func];
+                const ft = self.module.funcSig(instr.imm.func) orelse return error.UndefinedType;
                 _ = try self.popExpect(.funcref);
                 try self.popVals(ft.params);
                 if (!valTypesEqual(ft.results, self.results)) return error.TypeMismatch;

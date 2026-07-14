@@ -28,6 +28,12 @@ pub fn readByte(self: *Reader) types.DecodeError!u8 {
     return self.bytes[self.pos];
 }
 
+/// Read the next byte without advancing (one-byte lookahead).
+pub fn peekByte(self: *Reader) types.DecodeError!u8 {
+    if (self.pos >= self.bytes.len) return error.UnexpectedEof;
+    return self.bytes[self.pos];
+}
+
 /// Borrow `n` bytes from the current position without copying.
 pub fn readBytes(self: *Reader, n: usize) types.DecodeError![]const u8 {
     if (self.remaining() < n) return error.UnexpectedEof;

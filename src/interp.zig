@@ -202,7 +202,7 @@ pub const Instance = struct {
 
         const bodies = try a.alloc(FuncBody, module.functions.len);
         for (module.functions, module.code, bodies) |type_index, code, *body| {
-            const ft = module.func_types[type_index];
+            const ft = module.funcSig(type_index) orelse return error.UndefinedType;
             var num_locals: usize = ft.params.len;
             for (code.locals) |l| num_locals += l.count;
 
@@ -517,7 +517,11 @@ const Frame = struct {
         return switch (bt) {
             .empty => 0,
             .value => if (want_params) 0 else 1,
-            .type_index => |i| @intCast(if (want_params) self.inst.module.func_types[i].params.len else self.inst.module.func_types[i].results.len),
+            // Validated code guarantees a func type at this index.
+            .type_index => |i| blk: {
+                const ft = self.inst.module.funcSig(i).?;
+                break :blk @intCast(if (want_params) ft.params.len else ft.results.len);
+            },
         };
     }
 
@@ -635,9 +639,9 @@ const Frame = struct {
                     if (slot >= table.len) return error.TableOutOfBounds;
                     if (table[slot] == null_ref) return error.UninitializedElement;
                     const f: u32 = @intCast(table[slot]); // funcref value = function index
-                    if (ci.type_index >= self.inst.module.func_types.len) return error.UndefinedType;
+                    const want = self.inst.module.funcSig(ci.type_index) orelse return error.UndefinedType;
                     const ft = self.inst.module.funcType(f) orelse return error.UndefinedFunc;
-                    if (!funcTypeEqual(self.inst.module.func_types[ci.type_index], ft)) return error.IndirectTypeMismatch;
+                    if (!funcTypeEqual(want, ft)) return error.IndirectTypeMismatch;
                     const np = ft.params.len;
                     const args = self.vstack.items[self.vstack.items.len - np ..];
                     const results = try self.inst.callFunction(self.a, f, args, self.depth + 1);
