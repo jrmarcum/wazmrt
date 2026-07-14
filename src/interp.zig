@@ -125,6 +125,11 @@ const Label = struct {
 const FuncBody = struct {
     type: Module.FuncType,
     num_locals: usize, // params + declared locals
+    /// Default value of every local slot at function entry: `null_ref` for a
+    /// reference-typed local (a nullable ref defaults to null; a non-null ref is
+    /// non-defaultable, so validation forbids reading it before a set — the value
+    /// is immaterial), `0` for a numeric local. Params are overwritten by args.
+    local_defaults: []const Value,
     ir: []const opcode.Instr,
     /// For each `block`/`loop`/`if`/`else` index: the matching `end` index.
     end_of: []const usize,
@@ -203,9 +208,21 @@ pub const Instance = struct {
 
             const ir = try opcode.decodeBody(a, code.body);
             const cf = try precomputeControlFlow(a, ir);
+
+            // Per-slot entry defaults: a reference local starts null, numeric 0.
+            const defaults = try a.alloc(Value, num_locals);
+            for (ft.params, 0..) |p, i| defaults[i] = if (p.isRef()) null_ref else 0;
+            var slot: usize = ft.params.len;
+            for (code.locals) |l| {
+                const d: Value = if (l.type.isRef()) null_ref else 0;
+                @memset(defaults[slot..][0..l.count], d);
+                slot += l.count;
+            }
+
             body.* = .{
                 .type = ft,
                 .num_locals = num_locals,
+                .local_defaults = defaults,
                 .ir = ir,
                 .end_of = cf.end_of,
                 .else_of = cf.else_of,
@@ -403,7 +420,7 @@ pub const Instance = struct {
         const body = &self.func_bodies[defined];
 
         const locals = try a.alloc(Value, body.num_locals);
-        @memset(locals, 0);
+        @memcpy(locals, body.local_defaults); // ref locals → null, numeric → 0
         @memcpy(locals[0..args.len], args);
 
         var frame: Frame = .{ .inst = self, .a = a, .body = body, .locals = locals, .depth = depth };

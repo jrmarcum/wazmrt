@@ -1996,6 +1996,18 @@ test "GC i31: i31ref is non-null; ref.null i31 reports null" {
     try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "isnull", &.{interp.i32Value(0)})));
 }
 
+test "a nullable-ref local defaults to null (not 0)" {
+    // Read an unset (externref) local: it must be null, so ref.is_null → 1.
+    // Before the cleanup, locals were memset to 0, which reads as a non-null ref.
+    const src =
+        \\(module
+        \\  (func (export "unset_is_null") (result i32)
+        \\    (local $r externref)
+        \\    (ref.is_null (local.get $r))))
+    ;
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(src, "unset_is_null", &.{})));
+}
+
 test "GC i31: i31.get_s on a null i31 ref traps" {
     const src =
         \\(module
