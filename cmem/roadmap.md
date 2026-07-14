@@ -65,9 +65,13 @@ WasmGC op + the full type system + concrete refs + declared subtyping, all teste
 val/extern vecs, `wasm_instance_new`/`exports`/`delete`, `wasm_extern_*`/`wasm_func_*` (shared `Ref`;
 `as_func`, `param_arity`/`result_arity`, `wasm_func_call`), `wasm_trap_new`/`message`/`delete`. A C
 consumer now decodes → instantiates → gets exports → **calls an exported function and reads the result**
-end-to-end (`tests/c_smoke.c`, run by `zig build c-smoke`: `add(40,2)=42`). **Next C-ABI step: host-
-function import wiring** (`wasm_func_new` callback → interp `HostFunc`, so modules that import a func can
-be called), then global/table/memory runtime objects, then the first `universalWasmLoader-*` integration.
+end-to-end (`tests/c_smoke.c`, run by `zig build c-smoke`: `add(40,2)=42`). **Host-function import wiring
+DONE 2026-07-14**: `wasm_func_new[_with_env]` + `wasm_functype_new` + `wasm_valtype_vec_*`; a new interp
+`HostFunc.native_env` variant + a C `hostTrampoline` bridge a module's func import to a C callback
+(`error.HostTrap` on a returned trap). Verified: a module whose body is `call $env.add` returns
+`run(40,2)=42` through a host callback. **Next C-ABI step: global/table/memory runtime objects**
+(`wasm_global_get/set`, `wasm_table_*`, `wasm_memory_*` — so modules importing/exporting those work),
+then the first `universalWasmLoader-*` integration.
 **(3)** the Deno/V8 benchmark. **(4) WASI preview 1** (preview 2/3 deferred until browser-standard, per
 wasmtk). **The function-references proposal is complete** (typed-ref value types, `call_ref`/
 `return_call_ref`/`ref.as_non_null`/`br_on_null`, non-null refs + local-init tracking, P1/P2/P2.5

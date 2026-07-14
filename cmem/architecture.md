@@ -126,6 +126,8 @@ adds only the wazmrt handshake.
                            wasm_func_as_extern[_const], wasm_func_type/param_arity/result_arity,
                            wasm_func_call(func, &args, &results) -> own wasm_trap_t* | NULL,
                            wasm_extern_vec_* / wasm_func_delete
+/* host funcs (imports) */ wasm_func_new[_with_env], wasm_functype_new,
+                           wasm_valtype_vec_new[_empty|_uninitialized]/_copy/_delete
 /* traps */                wasm_trap_new/message/delete
 /* wazmrt extension */     wazmrt_abi_version(void), wazmrt_version_string(void)
 ```
@@ -136,16 +138,27 @@ are pointer casts and `wasm_externtype_kind` reads the first byte. Every import/
 the decoder to its full `Extern` type (see below), so the returned vectors are complete.
 
 **Runtime objects (instantiate + call, DONE 2026-07-14).** `wasm_instance_t` wraps the interpreter's
-`Instance`; `wasm_extern_t` and `wasm_func_t` share one internal `Ref` (kind + owning instance + func
-index) so `wasm_extern_as_func` is a checked pointer cast. `wasm_val_t` crosses the boundary; the
+`Instance`; `wasm_extern_t` and `wasm_func_t` share one internal `Ref` (either an instance-export handle
+= kind + instance + func index, or a standalone host func from `wasm_func_new` = callback + owned
+functype copy) so `wasm_extern_as_func` is a checked pointer cast. `wasm_val_t` crosses the boundary; the
 interpreter's untyped `u64` slots convert per the (validated) signature — numeric kinds fully, refs as
 pass-through host pointers. `wasm_func_call` runs `Instance.invokeIndex`; a runtime trap returns a
-`wasm_trap_t` carrying the error name. **No-import modules instantiate + call end-to-end** (verified from
-C — see `testing.md`, `zig build c-smoke`). **Deferred:** host-function *import wiring* (a module that
-imports a func instantiates but traps if that import is called — `wasm_func_new` callback → interp
-`HostFunc` is the next slice); global/table/memory runtime objects and `wasm_global_get/set` etc.; type
-`_copy`/`_new` constructors; module sharable-ref extras. An undefined symbol in a static lib only errors
-if a consumer references it, so partial implementation is honest and safe.
+`wasm_trap_t` carrying the error name.
+
+**Host-function imports (DONE 2026-07-14).** `wasm_func_new[_with_env]` + `wasm_functype_new` +
+`wasm_valtype_vec_*` let an embedder supply a C callback for a module's func import.
+`wasm_instance_new` maps each func import (in `wasm_module_imports` order) to an `interp.HostFunc`: a
+new `native_env` variant carrying a context + a `hostTrampoline` that converts the `u64` args to
+`wasm_val_t` (typed by the host func's signature), invokes the callback, converts results back, and
+turns a returned `wasm_trap_t` into `error.HostTrap`. An unbacked func import wires a trap-on-call
+stub. The C `Instance` wrapper owns the `HostFunc` slice (interp borrows it); the embedder keeps the
+host funcs alive until after `wasm_instance_delete`. **Verified from C** (`zig build c-smoke`):
+`run(40,2)` whose body is `call $env.add` returns 42 through the host callback.
+
+**Deferred:** global/table/memory *runtime objects* and `wasm_global_get/set` / `wasm_table_*` /
+`wasm_memory_*` (a module importing those still fails to instantiate); type `_copy` constructors;
+module sharable-ref extras. An undefined symbol in a static lib only errors if a consumer references it,
+so partial implementation is honest and safe.
 
 **Conventions (from the standard):** opaque `struct wasm_*_t*` handles; `own`/delete ownership; vectors
 are `{ size_t size; T* data; }` the caller owns. **Windows:** consumers compile with `-DLIBWASM_STATIC`

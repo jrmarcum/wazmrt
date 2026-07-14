@@ -471,6 +471,7 @@ fn isRuntimeTrap(e: anyerror) bool {
         error.NullReference,
         error.GcOutOfBounds,
         error.CastFailure,
+        error.HostTrap,
         error.CallStackExhausted,
         => true,
         else => false,

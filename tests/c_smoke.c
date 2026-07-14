@@ -16,6 +16,13 @@
 #include <stdio.h>
 #include <string.h>
 
+/* A host function supplied to a module's import: env.add(i32,i32) -> i32. */
+static wasm_trap_t *host_add(const wasm_val_vec_t *args, wasm_val_vec_t *results) {
+    results->data[0].kind = WASM_I32;
+    results->data[0].of.i32 = args->data[0].of.i32 + args->data[1].of.i32;
+    return NULL;
+}
+
 int main(void) {
     int failures = 0;
 
@@ -160,6 +167,75 @@ int main(void) {
         wasm_module_delete(addmodule);
     }
     wasm_byte_vec_delete(&addbin);
+
+    /*
+     * Host-function import: a module that imports env.add and calls it.
+     *   (import "env" "add" (func (param i32 i32) (result i32)))
+     *   (func (export "run") (param i32 i32) (result i32)
+     *     local.get 0  local.get 1  call 0)
+     */
+    const unsigned char impmod[] = {
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f,          /* type 0 */
+        0x02, 0x0b, 0x01, 0x03, 'e','n','v', 0x03, 'a','d','d', 0x00, 0x00, /* import env.add */
+        0x03, 0x02, 0x01, 0x00,                                        /* func 1 : type 0 */
+        0x07, 0x07, 0x01, 0x03, 'r','u','n', 0x00, 0x01,               /* export "run" func 1 */
+        0x0a, 0x0a, 0x01, 0x08, 0x00, 0x20, 0x00, 0x20, 0x01, 0x10, 0x00, 0x0b, /* code: call 0 */
+    };
+    wasm_byte_vec_t impbin;
+    wasm_byte_vec_new(&impbin, sizeof(impmod), (const wasm_byte_t *)impmod);
+    wasm_module_t *impmodule = wasm_module_new(store, &impbin);
+    if (!impmodule) {
+        printf("FAIL: import module decode\n");
+        failures++;
+    } else {
+        /* Build a functype and the host function backing the import. */
+        wasm_valtype_t *pt[2] = { wasm_valtype_new(WASM_I32), wasm_valtype_new(WASM_I32) };
+        wasm_valtype_t *rt[1] = { wasm_valtype_new(WASM_I32) };
+        wasm_valtype_vec_t pvec, rvec;
+        wasm_valtype_vec_new(&pvec, 2, pt);
+        wasm_valtype_vec_new(&rvec, 1, rt);
+        wasm_functype_t *addtype = wasm_functype_new(&pvec, &rvec);
+        wasm_func_t *hostfn = wasm_func_new(store, addtype, host_add);
+
+        wasm_extern_t *import_arr[1] = { wasm_func_as_extern(hostfn) };
+        wasm_extern_vec_t import_vec = { 1, import_arr };
+
+        wasm_trap_t *trap = NULL;
+        wasm_instance_t *inst = wasm_instance_new(store, impmodule, &import_vec, &trap);
+        printf("import_instance: %s\n", inst ? "ok" : "null");
+        if (!inst) {
+            failures++;
+        } else {
+            wasm_extern_vec_t exps;
+            wasm_instance_exports(inst, &exps);
+            wasm_func_t *run = wasm_extern_as_func(exps.data[0]);
+
+            wasm_val_t a[2];
+            a[0].kind = WASM_I32; a[0].of.i32 = 40;
+            a[1].kind = WASM_I32; a[1].of.i32 = 2;
+            wasm_val_vec_t ca, cr;
+            wasm_val_vec_new(&ca, 2, a);
+            wasm_val_vec_new_uninitialized(&cr, 1);
+            wasm_trap_t *rtrap = wasm_func_call(run, &ca, &cr);
+            if (rtrap) {
+                printf("FAIL: run trapped\n");
+                wasm_trap_delete(rtrap);
+                failures++;
+            } else {
+                printf("run(40,2)[host]: %d\n", cr.data[0].of.i32);
+                if (cr.data[0].of.i32 != 42) failures++;
+            }
+            wasm_val_vec_delete(&ca);
+            wasm_val_vec_delete(&cr);
+            wasm_extern_vec_delete(&exps);
+            wasm_instance_delete(inst);
+        }
+        wasm_func_delete(hostfn);       /* frees the host func (owns its functype copy) */
+        wasm_functype_delete(addtype);
+        wasm_module_delete(impmodule);
+    }
+    wasm_byte_vec_delete(&impbin);
 
     /* Negative: a bad magic must fail to validate. */
     const unsigned char bad[] = { 'n', 'o', 'p', 'e', 1, 0, 0, 0 };

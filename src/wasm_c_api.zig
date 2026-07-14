@@ -298,7 +298,44 @@ export fn wasm_valtype_kind(vt: ?*const ValType) Valkind {
     return (vt orelse return 0).kind;
 }
 
+export fn wasm_valtype_vec_new_empty(out: *ValTypeVec) void {
+    out.* = .{ .size = 0, .data = null };
+}
+
+export fn wasm_valtype_vec_new_uninitialized(out: *ValTypeVec, size: usize) void {
+    if (size == 0) return wasm_valtype_vec_new_empty(out);
+    const arr = alloc.alloc(?*ValType, size) catch return wasm_valtype_vec_new_empty(out);
+    @memset(arr, null);
+    out.* = .{ .size = size, .data = arr.ptr };
+}
+
+export fn wasm_valtype_vec_new(out: *ValTypeVec, size: usize, data: [*c]const ?*ValType) void {
+    if (size == 0 or data == null) return wasm_valtype_vec_new_empty(out);
+    const arr = alloc.alloc(?*ValType, size) catch return wasm_valtype_vec_new_empty(out);
+    @memcpy(arr, data[0..size]);
+    out.* = .{ .size = size, .data = arr.ptr };
+}
+
+export fn wasm_valtype_vec_copy(out: *ValTypeVec, src: *const ValTypeVec) void {
+    copyValTypeVec(out, src);
+}
+
+export fn wasm_valtype_vec_delete(vec: *ValTypeVec) void {
+    freeValTypeVec(vec);
+}
+
 // ---- Function types -------------------------------------------------------
+
+/// Construct a functype, taking ownership of the two valtype vecs (moved in).
+export fn wasm_functype_new(params: ?*ValTypeVec, results: ?*ValTypeVec) ?*FuncType {
+    const ft = alloc.create(FuncType) catch return null;
+    ft.ekind = EXTERN_FUNC;
+    ft.params = if (params) |p| p.* else .{ .size = 0, .data = null };
+    ft.results = if (results) |r| r.* else .{ .size = 0, .data = null };
+    if (params) |p| p.* = .{ .size = 0, .data = null }; // moved out
+    if (results) |r| r.* = .{ .size = 0, .data = null };
+    return ft;
+}
 
 export fn wasm_functype_delete(ft: ?*FuncType) void {
     freeExternType(@ptrCast(ft));
@@ -497,14 +534,33 @@ export fn wasm_module_exports(module: ?*const Module, out: *ExportTypeVec) void 
 
 const interp = root.interp;
 
-const Instance = struct { inst: root.Instance };
+/// `interp.Instance.import_funcs` borrows its slice, so the wrapper owns
+/// `host_funcs` for the instance's lifetime.
+const Instance = struct { inst: root.Instance, host_funcs: []interp.Instance.HostFunc = &.{} };
 
-/// Backs both `wasm_extern_t*` and `wasm_func_t*`: a runtime export handle.
+const FuncCallback = *const fn (args: ?*const ValVec, results: ?*ValVec) callconv(.c) ?*Trap;
+const FuncCallbackWithEnv = *const fn (env: ?*anyopaque, args: ?*const ValVec, results: ?*ValVec) callconv(.c) ?*Trap;
+const Finalizer = *const fn (?*anyopaque) callconv(.c) void;
+
+/// A host callback registered via `wasm_func_new[_with_env]`.
+const HostCallback = struct {
+    plain: ?FuncCallback = null,
+    with_env: ?FuncCallbackWithEnv = null,
+    env: ?*anyopaque = null,
+    finalizer: ?Finalizer = null,
+};
+
+/// Backs both `wasm_extern_t*` and `wasm_func_t*`. Either an instance-export
+/// handle (`instance` set) or a standalone host function created by
+/// `wasm_func_new` (`host` + `functype` set, `instance` null).
 const Ref = struct {
     kind: Externkind,
-    instance: *Instance,
-    /// Index in the export's kind space (the function index for a func).
-    index: u32,
+    instance: ?*Instance = null,
+    /// Index in the export's kind space (the function index for a func export).
+    index: u32 = 0,
+    host: ?HostCallback = null,
+    /// Owned signature copy for a host function (arg/result conversion).
+    functype: ?*FuncType = null,
 };
 
 const Trap = struct { message: ByteVec };
@@ -550,6 +606,54 @@ fn slotToVal(t: types.ValType, x: interp.Value) Val {
         .f64 => .{ .kind = 3, .of = .{ .f64 = interp.asF64(x) } },
         else => .{ .kind = valkindOf(t), .of = .{ .ref = @ptrFromInt(x) } },
     };
+}
+
+/// Build a C value of the given valkind from an interpreter slot (used when the
+/// target type is only known as a `wasm_valkind_t`, e.g. a host callback's args).
+fn slotToValKind(kind: Valkind, x: interp.Value) Val {
+    return switch (kind) {
+        0 => .{ .kind = 0, .of = .{ .i32 = interp.asI32(x) } },
+        1 => .{ .kind = 1, .of = .{ .i64 = interp.asI64(x) } },
+        2 => .{ .kind = 2, .of = .{ .f32 = interp.asF32(x) } },
+        3 => .{ .kind = 3, .of = .{ .f64 = interp.asF64(x) } },
+        else => .{ .kind = kind, .of = .{ .ref = @ptrFromInt(x) } },
+    };
+}
+
+/// The valkind of a functype param / result slot (defaults to i32 if absent).
+fn valTypeVecKind(vec: *const ValTypeVec, i: usize) Valkind {
+    if (i >= vec.size or vec.data == null) return 0;
+    return if (vec.data[i]) |vt| vt.kind else 0;
+}
+
+fn copyValTypeVec(out: *ValTypeVec, src: *const ValTypeVec) void {
+    if (src.size == 0 or src.data == null) {
+        out.* = .{ .size = 0, .data = null };
+        return;
+    }
+    const arr = alloc.alloc(?*ValType, src.size) catch {
+        out.* = .{ .size = 0, .data = null };
+        return;
+    };
+    for (arr, 0..) |*slot, i| {
+        slot.* = null;
+        if (src.data[i]) |vt| {
+            const c = alloc.create(ValType) catch continue;
+            c.* = .{ .kind = vt.kind };
+            slot.* = c;
+        }
+    }
+    out.* = .{ .size = src.size, .data = arr.ptr };
+}
+
+/// Deep-copy a functype (the caller keeps ownership of the one passed in).
+fn copyFuncType(src: ?*const FuncType) ?*FuncType {
+    const s = src orelse return null;
+    const dst = alloc.create(FuncType) catch return null;
+    dst.ekind = EXTERN_FUNC;
+    copyValTypeVec(&dst.params, &s.params);
+    copyValTypeVec(&dst.results, &s.results);
+    return dst;
 }
 
 /// Allocate a trap carrying a NUL-terminated copy of `msg`.
@@ -629,15 +733,97 @@ export fn wasm_extern_vec_delete(vec: *ExternVec) void {
     vec.* = .{ .size = 0, .data = null };
 }
 
+// ---- Host functions (wasm_func_new) ---------------------------------------
+
+/// Non-null `ctx` sentinel for a func import the embedder left unbacked; calling
+/// it traps.
+var unbacked_marker: u8 = 0;
+
+fn unbackedTrap(ctx: *anyopaque, args: []const interp.Value, results: []interp.Value) bool {
+    _ = ctx;
+    _ = args;
+    _ = results;
+    return false;
+}
+
+/// Bridge an interpreter call to a C host callback: convert the untyped `u64`
+/// args to `wasm_val_t` (typed by the host func's signature), invoke the C
+/// callback, and convert the results back. Returns false (→ `error.HostTrap`)
+/// if the callback returns a trap.
+fn hostTrampoline(ctx: *anyopaque, args: []const interp.Value, results: []interp.Value) bool {
+    const ref: *Ref = @ptrCast(@alignCast(ctx));
+    const hc = ref.host orelse return false;
+    const ft = ref.functype orelse return false;
+
+    var argvec: ValVec = undefined;
+    wasm_val_vec_new_uninitialized(&argvec, args.len);
+    defer wasm_val_vec_delete(&argvec);
+    for (0..args.len) |i| argvec.data[i] = slotToValKind(valTypeVecKind(&ft.params, i), args[i]);
+
+    var resvec: ValVec = undefined;
+    wasm_val_vec_new_uninitialized(&resvec, results.len);
+    defer wasm_val_vec_delete(&resvec);
+
+    const trap = if (hc.with_env) |cb| cb(hc.env, &argvec, &resvec) else if (hc.plain) |cb| cb(&argvec, &resvec) else return false;
+    if (trap) |t| {
+        wasm_trap_delete(t);
+        return false;
+    }
+    for (0..results.len) |i| results[i] = valToSlot(resvec.data[i]);
+    return true;
+}
+
+export fn wasm_func_new(store: ?*Store, ft: ?*const FuncType, callback: FuncCallback) ?*Ref {
+    _ = store;
+    const r = alloc.create(Ref) catch return null;
+    r.* = .{ .kind = EXTERN_FUNC, .host = .{ .plain = callback }, .functype = copyFuncType(ft) };
+    return r;
+}
+
+export fn wasm_func_new_with_env(store: ?*Store, ft: ?*const FuncType, callback: FuncCallbackWithEnv, env: ?*anyopaque, finalizer: ?Finalizer) ?*Ref {
+    _ = store;
+    const r = alloc.create(Ref) catch return null;
+    r.* = .{ .kind = EXTERN_FUNC, .host = .{ .with_env = callback, .env = env, .finalizer = finalizer }, .functype = copyFuncType(ft) };
+    return r;
+}
+
 // ---- Instances ------------------------------------------------------------
 
 export fn wasm_instance_new(store: ?*Store, module: ?*const Module, imports: ?*const ExternVec, trap_out: ?*?*Trap) ?*Instance {
     _ = store;
-    _ = imports; // host-import wiring is a later slice (no-import modules for now)
     if (trap_out) |t| t.* = null;
     const m = module orelse return null;
-    const wi = alloc.create(Instance) catch return null;
-    wi.inst = root.Instance.init(alloc, &m.inner) catch |e| {
+
+    // Build the interpreter's func imports from the supplied externs. The imports
+    // vec aligns with `wasm_module_imports` (import-section order, mixed kinds);
+    // we map each func import to a host trampoline. (Global/table/memory imports
+    // are a later slice — a module needing them will fail to instantiate.)
+    var host_funcs: std.ArrayList(interp.Instance.HostFunc) = .empty;
+    for (m.inner.imports, 0..) |imp, i| {
+        if (imp.type != .func) continue;
+        const ext: ?*Ref = if (imports) |v| (if (i < v.size) v.data[i] else null) else null;
+        const hf: interp.Instance.HostFunc = if (ext != null and ext.?.host != null)
+            .{ .native_env = .{ .ctx = ext.?, .call = hostTrampoline } }
+        else
+            .{ .native_env = .{ .ctx = &unbacked_marker, .call = unbackedTrap } };
+        host_funcs.append(alloc, hf) catch {
+            host_funcs.deinit(alloc);
+            return null;
+        };
+    }
+
+    const wi = alloc.create(Instance) catch {
+        host_funcs.deinit(alloc);
+        return null;
+    };
+    const funcs = host_funcs.toOwnedSlice(alloc) catch {
+        host_funcs.deinit(alloc);
+        alloc.destroy(wi);
+        return null;
+    };
+    wi.host_funcs = funcs;
+    wi.inst = root.Instance.initWithImports(alloc, &m.inner, .{ .funcs = funcs }) catch |e| {
+        alloc.free(funcs);
         alloc.destroy(wi);
         if (trap_out) |t| t.* = makeTrap(@errorName(e));
         return null;
@@ -648,6 +834,7 @@ export fn wasm_instance_new(store: ?*Store, module: ?*const Module, imports: ?*c
 export fn wasm_instance_delete(instance: ?*Instance) void {
     const wi = instance orelse return;
     wi.inst.deinit();
+    if (wi.host_funcs.len != 0) alloc.free(wi.host_funcs);
     alloc.destroy(wi);
 }
 
@@ -679,8 +866,11 @@ export fn wasm_extern_kind(e: ?*const Ref) Externkind {
 export fn wasm_extern_type(e: ?*const Ref) ?*anyopaque {
     const r = e orelse return null;
     if (r.kind != EXTERN_FUNC) return null; // only func externs are typed today
-    const ft = r.instance.inst.module.funcType(r.index) orelse return null;
-    return makeExternType(.{ .func = ft });
+    if (r.instance) |wi| {
+        const ft = wi.inst.module.funcType(r.index) orelse return null;
+        return makeExternType(.{ .func = ft });
+    }
+    return @ptrCast(copyFuncType(r.functype)); // host func
 }
 
 export fn wasm_extern_as_func(e: ?*Ref) ?*Ref {
@@ -704,33 +894,48 @@ export fn wasm_func_as_extern_const(f: ?*const Ref) ?*const Ref {
 // ---- Functions ------------------------------------------------------------
 
 export fn wasm_func_delete(f: ?*Ref) void {
-    // A func obtained from `wasm_extern_as_func` is borrowed (freed by the
-    // extern vec); a standalone func would be freed here. We only vend borrowed
-    // funcs today, so this is a no-op to avoid a double free.
-    _ = f;
+    const r = f orelse return;
+    // An export handle (`instance` set) is borrowed — freed by the extern vec.
+    // A standalone host func from `wasm_func_new` is owned and freed here.
+    if (r.instance != null) return;
+    if (r.host) |hc| if (hc.finalizer) |fin| fin(hc.env);
+    if (r.functype) |ft| freeExternType(@ptrCast(ft));
+    alloc.destroy(r);
 }
 
 export fn wasm_func_type(f: ?*const Ref) ?*FuncType {
     const r = f orelse return null;
-    const ft = r.instance.inst.module.funcType(r.index) orelse return null;
-    return @ptrCast(@alignCast(makeExternType(.{ .func = ft }) orelse return null));
+    if (r.instance) |wi| {
+        const ft = wi.inst.module.funcType(r.index) orelse return null;
+        return @ptrCast(@alignCast(makeExternType(.{ .func = ft }) orelse return null));
+    }
+    return copyFuncType(r.functype); // host func
 }
 
 export fn wasm_func_param_arity(f: ?*const Ref) usize {
     const r = f orelse return 0;
-    const ft = r.instance.inst.module.funcType(r.index) orelse return 0;
-    return ft.params.len;
+    if (r.instance) |wi| return (wi.inst.module.funcType(r.index) orelse return 0).params.len;
+    return if (r.functype) |ft| ft.params.size else 0;
 }
 
 export fn wasm_func_result_arity(f: ?*const Ref) usize {
     const r = f orelse return 0;
-    const ft = r.instance.inst.module.funcType(r.index) orelse return 0;
-    return ft.results.len;
+    if (r.instance) |wi| return (wi.inst.module.funcType(r.index) orelse return 0).results.len;
+    return if (r.functype) |ft| ft.results.size else 0;
 }
 
 export fn wasm_func_call(func: ?*const Ref, args: ?*const ValVec, results: ?*ValVec) ?*Trap {
     const r = func orelse return makeTrap("null function");
-    const ft = r.instance.inst.module.funcType(r.index) orelse return makeTrap("undefined function");
+
+    // A standalone host func: invoke its callback directly.
+    if (r.instance == null) {
+        const hc = r.host orelse return makeTrap("undefined function");
+        if (hc.with_env) |cb| return cb(hc.env, args, results);
+        if (hc.plain) |cb| return cb(args, results);
+        return makeTrap("undefined function");
+    }
+    const wi = r.instance.?;
+    const ft = wi.inst.module.funcType(r.index) orelse return makeTrap("undefined function");
 
     const n = if (args) |a| a.size else 0;
     const argv = alloc.alloc(interp.Value, n) catch return makeTrap("out of memory");
@@ -739,7 +944,7 @@ export fn wasm_func_call(func: ?*const Ref, args: ?*const ValVec, results: ?*Val
         slot.* = valToSlot(a.data[i]);
     };
 
-    const res = r.instance.inst.invokeIndex(r.index, argv) catch |e| return makeTrap(@errorName(e));
+    const res = wi.inst.invokeIndex(r.index, argv) catch |e| return makeTrap(@errorName(e));
     defer alloc.free(res);
 
     if (results) |out| {

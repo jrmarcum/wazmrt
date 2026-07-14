@@ -123,6 +123,8 @@ pub const Error = Module.Error || error{
     GcOutOfBounds,
     /// `ref.cast` to a type the value is not an instance of. Traps.
     CastFailure,
+    /// A host-function import callback signaled a trap (C ABI `wasm_func_new`).
+    HostTrap,
 };
 
 /// Null reference sentinel — on the value stack (`ref.null`) and as an
@@ -218,10 +220,16 @@ pub const Instance = struct {
     pub const Table = struct { entries: []Value, max: ?u32 };
 
     /// A callable backing an imported function: another instance's exported
-    /// function (module linking) or a native host function.
+    /// function (module linking), a plain native host function, or a native
+    /// host callback with a context that may trap (`false` → `error.HostTrap`).
+    /// The C ABI's `wasm_func_new` callbacks bind via `native_env`.
     pub const HostFunc = union(enum) {
         wasm: struct { instance: *Instance, func_index: u32 },
         native: *const fn (args: []const Value, results: []Value) void,
+        native_env: struct {
+            ctx: *anyopaque,
+            call: *const fn (ctx: *anyopaque, args: []const Value, results: []Value) bool,
+        },
     };
 
     /// Host-supplied backing for a module's imports, in per-kind import order:
@@ -520,6 +528,12 @@ pub const Instance = struct {
                     const ft = self.module.funcType(func_index) orelse return error.UndefinedFunc;
                     const results = try a.alloc(Value, ft.results.len);
                     f(args, results);
+                    return results;
+                },
+                .native_env => |ne| {
+                    const ft = self.module.funcType(func_index) orelse return error.UndefinedFunc;
+                    const results = try a.alloc(Value, ft.results.len);
+                    if (!ne.call(ne.ctx, args, results)) return error.HostTrap;
                     return results;
                 },
             }
