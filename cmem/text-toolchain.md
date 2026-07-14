@@ -148,7 +148,8 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
     a *type* index), `ref.as_non_null`, `br_on_null`/`br_on_non_null`. Validator adds ref subtyping
     (`(ref t) <: (ref null t)`) and local-init tracking. Fixed a latent bug: `ref.func $f` in a
     global-init/offset const-expr (threaded `func_names` into `emitConstExpr`). ~+130 ref-file passes.
-    **Deferred:** full **GC** (i31/struct/array heap objects, `ref.test`/`ref.cast`) — heap-requiring.
+    **Next (P3, per the owner — ahead of the C-ABI/benchmark work):** full **GC** (i31 → struct/array →
+    `ref.test`/`ref.cast`/`br_on_cast`) — needs a GC heap + object model + RTTs; build in tested parts.
 
 ## Notes / invariants
 

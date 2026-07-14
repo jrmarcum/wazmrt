@@ -64,16 +64,21 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
     Exotic middle for the compile-to-wasm mode: emit specialized *wasm* for hot regions and let the host
     engine JIT it — very speculative.
 
-- **Proposal scope (owner, 2026-07-13).** Track the core spec + the proposals that are (or are becoming)
-  browser-standard; defer the rest until they are, mirroring wasmtk.
+- **Proposal scope (owner, 2026-07-13; GC-priority note 2026-07-13).** Track the core spec + the
+  proposals that are (or are becoming) browser-standard; defer the rest until they are, mirroring wasmtk.
   - **In scope / done:** MVP, reference types, multi-table, bulk table ops, extended-const, and the
     **function-references proposal** (typed refs, `call_ref`, non-null refs + local-init — DONE
-    2026-07-13). **WASI preview 1** is in scope (not yet built). Growing the wasm-c-api + the loaders.
-  - **Deferred (until browser-standard):** **WASI preview 2/3** (component-model based). Full **GC**
-    (i31/struct/array heap objects, `ref.test`/`ref.cast`) — heap-requiring, and it conflicts with the
-    smallest-binary vision, so it waits. **Multi-memory**, **exception-handling tags**, **SIMD** as the
-    real corpus (`wasm_wasi`) demands. Typed/GC reference *value types* are still *accepted* (P1) so such
-    modules build; only the heap semantics are deferred.
+    2026-07-13).
+  - **In scope / NEXT — full GC (P3).** **WasmGC** (i31/struct/array heap objects, `struct.new`/
+    `array.new`/field access, `ref.test`/`ref.cast`/`br_on_cast`, subtyping, rec groups) is
+    browser-standard (Chrome/Firefox 2023), so it is in scope. **Owner directive (2026-07-13): P3 is the
+    next major increment and comes BEFORE growing the wasm-c-api (instance/func/call) and the Deno/V8
+    benchmark.** It needs a GC heap + object model + RTTs — a size cost accepted despite the
+    smallest-binary lean (likely gated to a native/opt-in build). Build it in tested parts (the wasmtk
+    way): i31 first, then struct/array, then the cast/test ops. **WASI preview 1** follows.
+  - **Deferred (until browser-standard):** **WASI preview 2/3** (component-model based), **multi-memory**,
+    exception-handling **tags**, **SIMD** — pulled in as the real corpus (`wasm_wasi`) demands. Typed/GC
+    reference *value types* are already *accepted* (P1) so such modules build.
 
 ## Zig 0.16 API notes (this project targets 0.16.0)
 

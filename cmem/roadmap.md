@@ -38,14 +38,15 @@ the **WAST script runner** (`wast.zig`) is next.
   (`env.add`) and export (`run`, params=2 results=1). Retired the ad-hoc `wazmrt_module_*` ABI.
 - **cmem/ project memory** established (this folder), mirroring the wasmtk setup.
 
-**Remaining:** growing the wasm-c-api past introspection (instance/func/call) so the runtime is
-embeddable end-to-end; first `universalWasmLoader-*` integration; the Deno/V8 benchmark; then **WASI
-preview 1** (in scope; preview 2/3 deferred until browser-standard, per wasmtk). **The
-function-references proposal is essentially complete** (typed-ref value types, `call_ref`/
+**Remaining (in owner-set order):** **(1) full GC — P3, NEXT** (WasmGC: i31 → struct/array →
+`ref.test`/`ref.cast`/`br_on_cast`; browser-standard, so in scope; owner directive 2026-07-13 puts it
+*ahead* of the C-ABI/benchmark work — build in tested parts). **(2)** grow the wasm-c-api past
+introspection (instance/func/call) → embeddable end-to-end + first `universalWasmLoader-*` integration.
+**(3)** the Deno/V8 benchmark. **(4) WASI preview 1** (preview 2/3 deferred until browser-standard, per
+wasmtk). **The function-references proposal is complete** (typed-ref value types, `call_ref`/
 `return_call_ref`/`ref.as_non_null`/`br_on_null`, non-null refs + local-init tracking, P1/P2/P2.5
-2026-07-13 — ~+130 ref-file passes). Full **GC** (i31/struct/array heap objects, `ref.test`/`ref.cast`)
-is a heap-requiring surface that likely conflicts with the smallest-binary vision — deferred. (The WAST
-runner's invoke-by-module-name landed `9745ecb` — `linking.wast` 29 → 100.) **Start function (#3) DONE 2026-07-13; the 2026-07-09
+2026-07-13 — ~+130 ref-file passes). (The WAST runner's invoke-by-module-name landed `9745ecb` —
+`linking.wast` 29 → 100.) **Start function (#3) DONE 2026-07-13; the 2026-07-09
 audit ledger is now FULLY cleared — every item #1–#16 resolved** (externref boxing #9, import-after-def
 rejection #10, const-expr section ordering #12, dead-code cleanup #13, non-power-of-two `align=` #8,
 defined-table inline export #11). Still **100% original runtime code** — no

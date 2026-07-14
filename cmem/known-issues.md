@@ -45,9 +45,9 @@ not ledger debt: growing the wasm-c-api past introspection (instance/func/call),
 invoke-by-module-name (`9745ecb`, `linking.wast` 29 → 100) and the **function-references proposal**
 (P1/P2/P2.5 — typed-ref value types, `call_ref`/`ref.as_non_null`/`br_on_null`, non-null refs +
 local-init; ~+130 ref-file passes, `func` 171/0). Remaining frontier proposals (the main sources of the
-rest of the `.wast` failures): full **GC** (i31/struct/array heap objects, `ref.test`/`ref.cast` — a
-heap-requiring surface, likely against the smallest-binary vision), **multi-memory** (`start0`), and
-exception-handling **tags** (`imports`). A residual limitation: concrete typed refs (`(ref null $t)`)
+rest of the `.wast` failures): **full GC (WasmGC — the NEXT major increment per the owner, ahead of the
+C-ABI/benchmark work)** — i31/struct/array heap objects, `ref.test`/`ref.cast`; then **multi-memory**
+(`start0`) and exception-handling **tags** (`imports`), pulled in as the corpus demands. A residual limitation: concrete typed refs (`(ref null $t)`)
 collapse to `funcref` in the untyped-slot model, so a general funcref passed where a specific `(ref $t)`
 is expected isn't caught (`local_tee` 96/1).
 

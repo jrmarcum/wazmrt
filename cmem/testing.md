@@ -295,8 +295,9 @@ current one); `(get …)` reads an exported global; a missing target → `NoTarg
   before use; block/if snapshot+restore). `local_init` 5 → **8/0**, `func` 170/1 → **171/0**,
   `ref_as_non_null` 4 → **5/0**. Full git-stash A/B confirmed **zero regressions**.
 Net ~**+130 passes** across the ref files from near-zero. The **function-references proposal is
-essentially complete**; only full **GC** (i31/struct/array heap objects, `ref.test`/`ref.cast`) remains
-of the reference-type frontier — a heap-requiring surface deferred (see `roadmap.md`). **73 unit tests.**
+essentially complete**; full **GC** (i31/struct/array heap objects, `ref.test`/`ref.cast`) is the **NEXT
+major increment (P3, per the owner — ahead of the C-ABI/benchmark work)**; see `roadmap.md`. **73 unit
+tests.**
 The lone pre-existing `local_tee` 96/1 / `unreached-valid` 9/1 are concrete-type-collapse limitations
 (`(ref null $t)` is indistinguishable from `funcref` in our untyped-slot model), not regressions.
 
