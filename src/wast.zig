@@ -54,6 +54,9 @@ const Runner = struct {
     current: ?*interp.Instance = null,
     /// Registered modules (`(register "name")`), for cross-module imports.
     modules: std.StringHashMapUnmanaged(*interp.Instance) = .{},
+    /// Modules by their textual `$name` (`(module $M …)`), for `(invoke $M …)`,
+    /// `(get $M …)`, and `(register "x" $M)`.
+    module_names: std.StringHashMapUnmanaged(*interp.Instance) = .{},
     /// The standard `spectest` shared memory (1 page, max 2) and table (10
     /// funcref, max 20), created lazily and shared by every importer.
     spectest_memory: ?*interp.Instance.Memory = null,
@@ -74,11 +77,15 @@ const Runner = struct {
     fn command(self: *Runner, cmd: Sexpr) Error!void {
         const kw = cmd.keyword() orelse return error.BadCommand;
         if (std.mem.eql(u8, kw, "module")) {
-            self.current = self.buildModule(cmd.asList().?) catch |e| {
+            const list = cmd.asList().?;
+            self.current = self.buildModule(list) catch |e| {
                 self.current = null;
                 self.fail("module failed to build: {s}", .{@errorName(e)});
                 return;
             };
+            // Track by textual `$name` (`(module $M …)`) for later `$M` references.
+            if (self.current) |inst| if (list.len > 1 and isId(list[1]))
+                try self.module_names.put(self.a, list[1].atom, inst);
         } else if (std.mem.eql(u8, kw, "assert_return")) {
             try self.assertReturn(cmd.asList().?);
         } else if (std.mem.eql(u8, kw, "assert_trap")) {
@@ -90,13 +97,15 @@ const Runner = struct {
         } else if (std.mem.eql(u8, kw, "assert_unlinkable")) {
             try self.assertUnlinkable(cmd.asList().?);
         } else if (std.mem.eql(u8, kw, "register")) {
-            // (register "name" $id?) — expose the current module's exports under "name".
+            // (register "name" $id?) — expose a module's exports under "name":
+            // the `$id`-named module if given, else the current module.
             const list = cmd.asList().?;
-            if (self.current) |inst| try self.modules.put(self.a, list[1].string, inst);
-        } else if (std.mem.eql(u8, kw, "invoke")) {
-            _ = self.runAction(cmd) catch |e| self.fail("invoke trapped: {s}", .{@errorName(e)});
+            const target = if (list.len > 2 and isId(list[2])) self.module_names.get(list[2].atom) else self.current;
+            if (target) |inst| try self.modules.put(self.a, list[1].string, inst);
+        } else if (std.mem.eql(u8, kw, "invoke") or std.mem.eql(u8, kw, "get")) {
+            _ = self.runAction(cmd) catch |e| self.fail("action failed: {s}", .{@errorName(e)});
         } else {
-            self.summary.skipped += 1; // get, (module quote …), …
+            self.summary.skipped += 1; // (module quote …), assert_exception, …
         }
     }
 
@@ -238,23 +247,54 @@ const Runner = struct {
         return wat.assembleModule(self.a, form);
     }
 
-    /// Run an action; today only `(invoke "name" args…)`.
+    /// Run an action: `(invoke $M? "name" args…)` or `(get $M? "name")`. A leading
+    /// `$M` targets that named module, else the current one; `error.NoTarget` if
+    /// the target is unavailable (so assertions skip rather than spuriously fail).
     fn runAction(self: *Runner, action: Sexpr) ![]Value {
         const list = action.asList() orelse return error.BadCommand;
-        if (!std.mem.eql(u8, list[0].asAtom() orelse "", "invoke")) return error.BadCommand;
-        const name = list[1].string;
-        const args = try self.a.alloc(Value, list.len - 2);
-        for (list[2..], args) |arg, *dst| dst.* = try self.parseConst(arg);
-        if (self.current == null) return error.BadCommand;
-        return self.current.?.invoke(name, args);
+        const kw = list[0].asAtom() orelse return error.BadCommand;
+        var i: usize = 1;
+        const inst = self.actionTarget(list, &i) orelse return error.NoTarget;
+        const name = list[i].string;
+        i += 1;
+        if (std.mem.eql(u8, kw, "invoke")) {
+            const args = try self.a.alloc(Value, list.len - i);
+            for (list[i..], args) |arg, *dst| dst.* = try self.parseConst(arg);
+            return inst.invoke(name, args);
+        }
+        if (std.mem.eql(u8, kw, "get")) return self.getGlobal(inst, name);
+        return error.BadCommand;
+    }
+
+    /// Resolve an action's target: a leading `$M` module ref (consumed via `i`),
+    /// else the current module. Null if unavailable.
+    fn actionTarget(self: *Runner, list: []const Sexpr, i: *usize) ?*interp.Instance {
+        if (i.* < list.len and isId(list[i.*])) {
+            const inst = self.module_names.get(list[i.*].atom);
+            i.* += 1;
+            return inst;
+        }
+        return self.current;
+    }
+
+    /// Read an exported global's current value (`(get …)` action).
+    fn getGlobal(self: *Runner, inst: *interp.Instance, name: []const u8) ![]Value {
+        for (inst.module.exports) |e| {
+            if (e.type == .global and std.mem.eql(u8, e.name, name)) {
+                const v = try self.a.alloc(Value, 1);
+                v[0] = inst.globals[e.index];
+                return v;
+            }
+        }
+        return error.UndefinedExport;
     }
 
     fn assertReturn(self: *Runner, form: []const Sexpr) Error!void {
-        if (self.current == null) {
-            self.summary.skipped += 1; // module didn't build; can't run this assertion
-            return;
-        }
         const results = self.runAction(form[1]) catch |e| {
+            if (e == error.NoTarget) { // module didn't build / unknown $name — can't run
+                self.summary.skipped += 1;
+                return;
+            }
             self.fail("assert_return: unexpected trap {s}", .{@errorName(e)});
             return;
         };
@@ -263,7 +303,7 @@ const Runner = struct {
             self.fail("assert_return: arity {d} != expected {d}", .{ results.len, expected.len });
             return;
         }
-        const action_name: []const u8 = if (form[1].asList()) |l| (if (l.len > 1) l[1].string else "?") else "?";
+        const action_name: []const u8 = actionName(form[1]);
         for (results, expected) |got, exp_form| {
             if (!try self.matches(got, exp_form)) {
                 self.fail("assert_return \"{s}\": result mismatch (got 0x{x})", .{ action_name, got });
@@ -344,31 +384,23 @@ const Runner = struct {
                 return;
             }
         }
-        if (self.current == null) {
-            self.summary.skipped += 1;
-            return;
-        }
         if (self.runAction(form[1])) |_| {
             self.fail("assert_trap: expected a trap, got a result", .{});
         } else |e| {
             // Only a genuine wasm runtime trap counts — an engine limitation or
             // bug (UnsupportedInstruction, UndefinedFunc, a decode/assemble error)
             // must NOT be green-washed as the expected trap.
-            if (isRuntimeTrap(e)) self.summary.passed += 1 else self.fail("assert_trap: non-trap error {s}", .{@errorName(e)});
+            if (e == error.NoTarget) self.summary.skipped += 1 else if (isRuntimeTrap(e)) self.summary.passed += 1 else self.fail("assert_trap: non-trap error {s}", .{@errorName(e)});
         }
     }
 
     /// `assert_exhaustion (invoke …) "call stack exhausted"` — expects the call
     /// depth limit to trip (a runtime trap), not any other error.
     fn assertExhaustion(self: *Runner, form: []const Sexpr) Error!void {
-        if (self.current == null) {
-            self.summary.skipped += 1;
-            return;
-        }
         if (self.runAction(form[1])) |_| {
             self.fail("assert_exhaustion: expected exhaustion, got a result", .{});
         } else |e| {
-            if (e == error.CallStackExhausted) self.summary.passed += 1 else self.fail("assert_exhaustion: got {s}", .{@errorName(e)});
+            if (e == error.NoTarget) self.summary.skipped += 1 else if (e == error.CallStackExhausted) self.summary.passed += 1 else self.fail("assert_exhaustion: got {s}", .{@errorName(e)});
         }
     }
 
@@ -577,6 +609,19 @@ fn isId(s: Sexpr) bool {
     return atom.len != 0 and atom[0] == '$';
 }
 
+/// The invoked/queried name in an action form (`(invoke $M? "name" …)` /
+/// `(get $M? "name")`), for diagnostics; "?" if absent.
+fn actionName(action: Sexpr) []const u8 {
+    const l = action.asList() orelse return "?";
+    var i: usize = 1;
+    if (i < l.len and isId(l[i])) i += 1;
+    if (i < l.len) return switch (l[i]) {
+        .string => |s| s,
+        else => "?",
+    };
+    return "?";
+}
+
 // --- Tests -----------------------------------------------------------------
 
 test "runs assert_return and assert_trap over a module" {
@@ -589,6 +634,24 @@ test "runs assert_return and assert_trap over a module" {
         \\(assert_return (invoke "div" (i32.const 9) (i32.const 3)) (i32.const 3))
         \\(assert_trap (invoke "div" (i32.const 1) (i32.const 0)) "integer divide by zero")
     ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 4), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "invoke / get by module name + register $id" {
+    const src =
+        \\(module $A (func (export "f") (result i32) (i32.const 11)) (global (export "g") i32 (i32.const 22)))
+        \\(module $B (func (export "f") (result i32) (i32.const 33)))
+        \\(register "A" $A)
+        \\(module (import "A" "f" (func $af (result i32))) (func (export "call-a") (result i32) (call $af)))
+        \\(assert_return (invoke $A "f") (i32.const 11))
+        \\(assert_return (invoke $B "f") (i32.const 33))
+        \\(assert_return (get $A "g") (i32.const 22))
+        \\(assert_return (invoke "call-a") (i32.const 11))
+    ;
+    // A named `$A`/`$B` invoke targets that module; the bare `call-a` invoke uses
+    // the current (last-built) module, which imports A's `f` via `(register …)`.
     const s = try runScript(std.testing.allocator, src);
     try std.testing.expectEqual(@as(usize, 4), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
