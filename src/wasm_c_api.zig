@@ -184,9 +184,13 @@ fn valkindOf(v: types.ValType) Valkind {
         .i64 => 1,
         .f32 => 2,
         .f64 => 3,
-        .externref => 128,
-        .funcref => 129,
-        else => 0, // v128 / unknown: no base wasm-c-api valkind — default to i32
+        else => {
+            // Any reference maps to the two base wasm-c-api ref kinds by family
+            // (func → funcref, everything else → externref). Non-ref/unknown
+            // (e.g. v128) has no base valkind — default to i32.
+            if (!v.isRef()) return 0;
+            return if (v.refHeap() == .func) 129 else 128;
+        },
     };
 }
 
@@ -479,6 +483,291 @@ export fn wasm_module_exports(module: ?*const Module, out: *ExportTypeVec) void 
         slot.* = obj;
     }
     out.* = .{ .size = src.len, .data = arr.ptr };
+}
+
+// ===========================================================================
+// Runtime objects: instantiation + calls. `wasm_instance_t` wraps the
+// interpreter's `Instance`; a `wasm_extern_t` / `wasm_func_t` is a small handle
+// (kind + owning instance + index) — the two share one `Ref` struct so
+// `wasm_extern_as_func` is a checked pointer cast. Values cross the boundary as
+// `wasm_val_t`; the untyped `u64` interpreter slots convert per the (validated)
+// signature. Modules with imports instantiate but trap only if an unbacked
+// import is actually called (host-function import wiring is a later slice).
+// ===========================================================================
+
+const interp = root.interp;
+
+const Instance = struct { inst: root.Instance };
+
+/// Backs both `wasm_extern_t*` and `wasm_func_t*`: a runtime export handle.
+const Ref = struct {
+    kind: Externkind,
+    instance: *Instance,
+    /// Index in the export's kind space (the function index for a func).
+    index: u32,
+};
+
+const Trap = struct { message: ByteVec };
+
+// ---- wasm_val_t / wasm_val_vec_t ------------------------------------------
+// Layout must match C: `{ wasm_valkind_t kind; union { i32; i64; f32; f64;
+// ref; } of; }` — the 8-byte union forces `of` to offset 8.
+
+const ValOf = extern union { i32: i32, i64: i64, f32: f32, f64: f64, ref: ?*anyopaque };
+const Val = extern struct { kind: Valkind, of: ValOf };
+const ValVec = extern struct { size: usize, data: [*c]Val };
+const ExternVec = extern struct { size: usize, data: [*c]?*Ref };
+
+/// C order (func,global,table,memory,tag) from the binary order (func,table,
+/// memory,global) the decoder uses.
+fn externKindToC(k: types.ExternKind) Externkind {
+    return switch (k) {
+        .func => EXTERN_FUNC,
+        .global => EXTERN_GLOBAL,
+        .table => EXTERN_TABLE,
+        .memory => EXTERN_MEMORY,
+        else => EXTERN_FUNC,
+    };
+}
+
+/// Read a C value into an interpreter slot (per its declared kind).
+fn valToSlot(v: Val) interp.Value {
+    return switch (v.kind) {
+        0 => interp.i32Value(v.of.i32), // WASM_I32
+        1 => interp.i64Value(v.of.i64), // WASM_I64
+        2 => interp.f32Value(v.of.f32), // WASM_F32
+        3 => interp.f64Value(v.of.f64), // WASM_F64
+        else => @intFromPtr(v.of.ref), // ref: pass the host pointer through
+    };
+}
+
+/// Convert an interpreter slot to a C value, typed by its (validated) valtype.
+fn slotToVal(t: types.ValType, x: interp.Value) Val {
+    return switch (t) {
+        .i32 => .{ .kind = 0, .of = .{ .i32 = interp.asI32(x) } },
+        .i64 => .{ .kind = 1, .of = .{ .i64 = interp.asI64(x) } },
+        .f32 => .{ .kind = 2, .of = .{ .f32 = interp.asF32(x) } },
+        .f64 => .{ .kind = 3, .of = .{ .f64 = interp.asF64(x) } },
+        else => .{ .kind = valkindOf(t), .of = .{ .ref = @ptrFromInt(x) } },
+    };
+}
+
+/// Allocate a trap carrying a NUL-terminated copy of `msg`.
+fn makeTrap(msg: []const u8) ?*Trap {
+    const t = alloc.create(Trap) catch return null;
+    const buf = alloc.alloc(u8, msg.len + 1) catch {
+        alloc.destroy(t);
+        return null;
+    };
+    @memcpy(buf[0..msg.len], msg);
+    buf[msg.len] = 0;
+    t.message = .{ .size = msg.len + 1, .data = buf.ptr };
+    return t;
+}
+
+export fn wasm_val_delete(v: ?*Val) void {
+    _ = v; // scalar values own nothing; refs are borrowed host pointers
+}
+
+export fn wasm_val_copy(out: ?*Val, src: ?*const Val) void {
+    if (out) |o| o.* = (src orelse return).*;
+}
+
+export fn wasm_val_vec_new_empty(out: *ValVec) void {
+    out.* = .{ .size = 0, .data = null };
+}
+
+export fn wasm_val_vec_new_uninitialized(out: *ValVec, size: usize) void {
+    if (size == 0) return wasm_val_vec_new_empty(out);
+    const buf = alloc.alloc(Val, size) catch return wasm_val_vec_new_empty(out);
+    out.* = .{ .size = size, .data = buf.ptr };
+}
+
+export fn wasm_val_vec_new(out: *ValVec, size: usize, data: [*c]const Val) void {
+    if (size == 0 or data == null) return wasm_val_vec_new_empty(out);
+    const buf = alloc.alloc(Val, size) catch return wasm_val_vec_new_empty(out);
+    @memcpy(buf, data[0..size]);
+    out.* = .{ .size = size, .data = buf.ptr };
+}
+
+export fn wasm_val_vec_copy(out: *ValVec, src: *const ValVec) void {
+    wasm_val_vec_new(out, src.size, src.data);
+}
+
+export fn wasm_val_vec_delete(vec: *ValVec) void {
+    if (vec.data != null and vec.size != 0) alloc.free(vec.data[0..vec.size]);
+    vec.* = .{ .size = 0, .data = null };
+}
+
+// ---- wasm_extern_vec_t ----------------------------------------------------
+
+export fn wasm_extern_vec_new_empty(out: *ExternVec) void {
+    out.* = .{ .size = 0, .data = null };
+}
+
+export fn wasm_extern_vec_new_uninitialized(out: *ExternVec, size: usize) void {
+    if (size == 0) return wasm_extern_vec_new_empty(out);
+    const buf = alloc.alloc(?*Ref, size) catch return wasm_extern_vec_new_empty(out);
+    @memset(buf, null);
+    out.* = .{ .size = size, .data = buf.ptr };
+}
+
+export fn wasm_extern_vec_new(out: *ExternVec, size: usize, data: [*c]const ?*Ref) void {
+    if (size == 0 or data == null) return wasm_extern_vec_new_empty(out);
+    const buf = alloc.alloc(?*Ref, size) catch return wasm_extern_vec_new_empty(out);
+    @memcpy(buf, data[0..size]);
+    out.* = .{ .size = size, .data = buf.ptr };
+}
+
+export fn wasm_extern_vec_delete(vec: *ExternVec) void {
+    if (vec.data != null and vec.size != 0) {
+        for (vec.data[0..vec.size]) |slot| {
+            if (slot) |r| alloc.destroy(r);
+        }
+        alloc.free(vec.data[0..vec.size]);
+    }
+    vec.* = .{ .size = 0, .data = null };
+}
+
+// ---- Instances ------------------------------------------------------------
+
+export fn wasm_instance_new(store: ?*Store, module: ?*const Module, imports: ?*const ExternVec, trap_out: ?*?*Trap) ?*Instance {
+    _ = store;
+    _ = imports; // host-import wiring is a later slice (no-import modules for now)
+    if (trap_out) |t| t.* = null;
+    const m = module orelse return null;
+    const wi = alloc.create(Instance) catch return null;
+    wi.inst = root.Instance.init(alloc, &m.inner) catch |e| {
+        alloc.destroy(wi);
+        if (trap_out) |t| t.* = makeTrap(@errorName(e));
+        return null;
+    };
+    return wi;
+}
+
+export fn wasm_instance_delete(instance: ?*Instance) void {
+    const wi = instance orelse return;
+    wi.inst.deinit();
+    alloc.destroy(wi);
+}
+
+export fn wasm_instance_exports(instance: ?*const Instance, out: *ExternVec) void {
+    out.* = .{ .size = 0, .data = null };
+    const wi = instance orelse return;
+    const exps = wi.inst.module.exports;
+    if (exps.len == 0) return;
+    const arr = alloc.alloc(?*Ref, exps.len) catch return;
+    for (arr, exps) |*slot, e| {
+        const r = alloc.create(Ref) catch {
+            slot.* = null;
+            continue;
+        };
+        // Calls mutate instance state (memory/heap growth), so the handle keeps a
+        // mutable pointer despite the `const` export view.
+        r.* = .{ .kind = externKindToC(e.type.kind()), .instance = @constCast(wi), .index = e.index };
+        slot.* = r;
+    }
+    out.* = .{ .size = exps.len, .data = arr.ptr };
+}
+
+// ---- Externs --------------------------------------------------------------
+
+export fn wasm_extern_kind(e: ?*const Ref) Externkind {
+    return (e orelse return 0).kind;
+}
+
+export fn wasm_extern_type(e: ?*const Ref) ?*anyopaque {
+    const r = e orelse return null;
+    if (r.kind != EXTERN_FUNC) return null; // only func externs are typed today
+    const ft = r.instance.inst.module.funcType(r.index) orelse return null;
+    return makeExternType(.{ .func = ft });
+}
+
+export fn wasm_extern_as_func(e: ?*Ref) ?*Ref {
+    const r = e orelse return null;
+    return if (r.kind == EXTERN_FUNC) r else null;
+}
+
+export fn wasm_extern_as_func_const(e: ?*const Ref) ?*const Ref {
+    const r = e orelse return null;
+    return if (r.kind == EXTERN_FUNC) r else null;
+}
+
+export fn wasm_func_as_extern(f: ?*Ref) ?*Ref {
+    return f;
+}
+
+export fn wasm_func_as_extern_const(f: ?*const Ref) ?*const Ref {
+    return f;
+}
+
+// ---- Functions ------------------------------------------------------------
+
+export fn wasm_func_delete(f: ?*Ref) void {
+    // A func obtained from `wasm_extern_as_func` is borrowed (freed by the
+    // extern vec); a standalone func would be freed here. We only vend borrowed
+    // funcs today, so this is a no-op to avoid a double free.
+    _ = f;
+}
+
+export fn wasm_func_type(f: ?*const Ref) ?*FuncType {
+    const r = f orelse return null;
+    const ft = r.instance.inst.module.funcType(r.index) orelse return null;
+    return @ptrCast(@alignCast(makeExternType(.{ .func = ft }) orelse return null));
+}
+
+export fn wasm_func_param_arity(f: ?*const Ref) usize {
+    const r = f orelse return 0;
+    const ft = r.instance.inst.module.funcType(r.index) orelse return 0;
+    return ft.params.len;
+}
+
+export fn wasm_func_result_arity(f: ?*const Ref) usize {
+    const r = f orelse return 0;
+    const ft = r.instance.inst.module.funcType(r.index) orelse return 0;
+    return ft.results.len;
+}
+
+export fn wasm_func_call(func: ?*const Ref, args: ?*const ValVec, results: ?*ValVec) ?*Trap {
+    const r = func orelse return makeTrap("null function");
+    const ft = r.instance.inst.module.funcType(r.index) orelse return makeTrap("undefined function");
+
+    const n = if (args) |a| a.size else 0;
+    const argv = alloc.alloc(interp.Value, n) catch return makeTrap("out of memory");
+    defer alloc.free(argv);
+    if (args) |a| for (argv, 0..) |*slot, i| {
+        slot.* = valToSlot(a.data[i]);
+    };
+
+    const res = r.instance.inst.invokeIndex(r.index, argv) catch |e| return makeTrap(@errorName(e));
+    defer alloc.free(res);
+
+    if (results) |out| {
+        const m = @min(out.size, @min(res.len, ft.results.len));
+        for (0..m) |i| out.data[i] = slotToVal(ft.results[i], res[i]);
+    }
+    return null; // success
+}
+
+// ---- Traps ----------------------------------------------------------------
+
+export fn wasm_trap_new(store: ?*Store, message: ?*const ByteVec) ?*Trap {
+    _ = store;
+    const t = alloc.create(Trap) catch return null;
+    t.message = undefined;
+    if (message) |m| wasm_byte_vec_copy(&t.message, m) else t.message.empty();
+    return t;
+}
+
+export fn wasm_trap_message(trap: ?*const Trap, out: *ByteVec) void {
+    const t = trap orelse return out.empty();
+    wasm_byte_vec_copy(out, &t.message);
+}
+
+export fn wasm_trap_delete(trap: ?*Trap) void {
+    const t = trap orelse return;
+    wasm_byte_vec_delete(&t.message);
+    alloc.destroy(t);
 }
 
 // ---- wazmrt extension surface (include/wazmrt.h) --------------------------

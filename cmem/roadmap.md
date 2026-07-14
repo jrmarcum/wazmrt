@@ -61,8 +61,13 @@ concrete refs; `subtypeOf` uses `Module.isSubtype` for concrete↔concrete; `ref
 The **collapse limitation is resolved** (see `design-decisions.md`). **P3 / full GC is COMPLETE** — every
 WasmGC op + the full type system + concrete refs + declared subtyping, all tested. 95 unit tests +
 `gc_struct_array.wast` 11/0 + `gc_cast.wast` 11/0 + `gc_br_cast.wast` 4/0 + `gc_subtype.wast` 5/0 +
-`gc_concrete.wast` 2/0. **Next: (2) the wasm-c-api** (instance/func/call). **(2)** grow the wasm-c-api past
-introspection (instance/func/call) → embeddable end-to-end + first `universalWasmLoader-*` integration.
+`gc_concrete.wast` 2/0. **(2) wasm-c-api — instantiate + call slice DONE 2026-07-14**: `wasm_val_t` +
+val/extern vecs, `wasm_instance_new`/`exports`/`delete`, `wasm_extern_*`/`wasm_func_*` (shared `Ref`;
+`as_func`, `param_arity`/`result_arity`, `wasm_func_call`), `wasm_trap_new`/`message`/`delete`. A C
+consumer now decodes → instantiates → gets exports → **calls an exported function and reads the result**
+end-to-end (`tests/c_smoke.c`, run by `zig build c-smoke`: `add(40,2)=42`). **Next C-ABI step: host-
+function import wiring** (`wasm_func_new` callback → interp `HostFunc`, so modules that import a func can
+be called), then global/table/memory runtime objects, then the first `universalWasmLoader-*` integration.
 **(3)** the Deno/V8 benchmark. **(4) WASI preview 1** (preview 2/3 deferred until browser-standard, per
 wasmtk). **The function-references proposal is complete** (typed-ref value types, `call_ref`/
 `return_call_ref`/`ref.as_non_null`/`br_on_null`, non-null refs + local-init tracking, P1/P2/P2.5

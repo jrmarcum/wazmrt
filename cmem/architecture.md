@@ -118,6 +118,15 @@ adds only the wazmrt handshake.
                            + the type-object system: valtype, functype, externtype,
                            globaltype/tabletype/memorytype, importtype, exporttype
                            (kind, as_* casts, params/results, name/module/type, *_vec_delete)
+/* values */               wasm_val_t + wasm_val_vec_new[_empty|_uninitialized]/_copy/_delete,
+                           wasm_val_delete/copy
+/* instances */            wasm_instance_new(store, module, &imports, &trap) -> own wasm_instance_t*,
+                           wasm_instance_exports -> own wasm_extern_vec_t*, wasm_instance_delete
+/* externs / funcs */      wasm_extern_kind/type, wasm_extern_as_func[_const],
+                           wasm_func_as_extern[_const], wasm_func_type/param_arity/result_arity,
+                           wasm_func_call(func, &args, &results) -> own wasm_trap_t* | NULL,
+                           wasm_extern_vec_* / wasm_func_delete
+/* traps */                wasm_trap_new/message/delete
 /* wazmrt extension */     wazmrt_abi_version(void), wazmrt_version_string(void)
 ```
 
@@ -126,10 +135,17 @@ struct` whose first field is the extern kind, so `wasm_*type_as_externtype` / `w
 are pointer casts and `wasm_externtype_kind` reads the first byte. Every import/export is resolved by
 the decoder to its full `Extern` type (see below), so the returned vectors are complete.
 
-**Declared-but-deferred** (in `wasm.h`, unimplemented until instantiation/execution): instance, func,
-global, table, memory *runtime objects*, trap, val/ref, type `_copy`/`_new` constructors, and the
-module sharable-ref extras. An undefined symbol in a static lib only errors if a consumer references
-it, so partial implementation is honest and safe.
+**Runtime objects (instantiate + call, DONE 2026-07-14).** `wasm_instance_t` wraps the interpreter's
+`Instance`; `wasm_extern_t` and `wasm_func_t` share one internal `Ref` (kind + owning instance + func
+index) so `wasm_extern_as_func` is a checked pointer cast. `wasm_val_t` crosses the boundary; the
+interpreter's untyped `u64` slots convert per the (validated) signature — numeric kinds fully, refs as
+pass-through host pointers. `wasm_func_call` runs `Instance.invokeIndex`; a runtime trap returns a
+`wasm_trap_t` carrying the error name. **No-import modules instantiate + call end-to-end** (verified from
+C — see `testing.md`, `zig build c-smoke`). **Deferred:** host-function *import wiring* (a module that
+imports a func instantiates but traps if that import is called — `wasm_func_new` callback → interp
+`HostFunc` is the next slice); global/table/memory runtime objects and `wasm_global_get/set` etc.; type
+`_copy`/`_new` constructors; module sharable-ref extras. An undefined symbol in a static lib only errors
+if a consumer references it, so partial implementation is honest and safe.
 
 **Conventions (from the standard):** opaque `struct wasm_*_t*` handles; `own`/delete ownership; vectors
 are `{ size_t size; T* data; }` the caller owns. **Windows:** consumers compile with `-DLIBWASM_STATIC`

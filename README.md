@@ -62,21 +62,30 @@ wasm_byte_vec_t binary;                     /* your .wasm bytes */
 wasm_byte_vec_new_uninitialized(&binary, len);
 memcpy(binary.data, bytes, len);
 
-if (wasm_module_validate(store, &binary)) {
-    wasm_module_t *module = wasm_module_new(store, &binary);
-    /* ... */
-    wasm_module_delete(module);
-}
-wasm_byte_vec_delete(&binary);
-wasm_store_delete(store);
-wasm_engine_delete(engine);
+wasm_module_t *module = wasm_module_new(store, &binary);
+
+/* Instantiate and call an exported function. */
+wasm_trap_t *trap = NULL;
+wasm_extern_vec_t no_imports; wasm_extern_vec_new_empty(&no_imports);
+wasm_instance_t *inst = wasm_instance_new(store, module, &no_imports, &trap);
+
+wasm_extern_vec_t exports; wasm_instance_exports(inst, &exports);
+wasm_func_t *add = wasm_extern_as_func(exports.data[0]);
+
+wasm_val_t a[2] = { {.kind=WASM_I32,.of={.i32=40}}, {.kind=WASM_I32,.of={.i32=2}} };
+wasm_val_vec_t args, results;
+wasm_val_vec_new(&args, 2, a);
+wasm_val_vec_new_uninitialized(&results, 1);
+wasm_func_call(add, &args, &results);        /* -> results.data[0].of.i32 == 42 */
 ```
 
 Implemented today: engine/store/config lifecycle, byte vectors, module
-`new`/`validate`/`delete`, and **import/export introspection**
+`new`/`validate`/`delete`, **import/export introspection**
 (`wasm_module_imports`/`exports` + the `valtype`/`functype`/`externtype`/
-`importtype`/`exporttype` object system). Instance/function/call follow as
-execution lands.
+`importtype`/`exporttype` object system), and **instantiate + call**
+(`wasm_instance_new`/`exports`, `wasm_extern_as_func`, `wasm_func_call`,
+`wasm_val_t`, `wasm_trap_*`). Host-function imports and global/table/memory
+runtime objects follow next. `zig build c-smoke` builds and runs the C example.
 On Windows, compile consumers with `-DLIBWASM_STATIC` (wazmrt ships a static
 library). See [`tests/c_smoke.c`](tests/c_smoke.c) for a complete example.
 

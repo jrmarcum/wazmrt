@@ -382,6 +382,18 @@ concrete slots) until the producers were made concrete-aware and `ref.null` took
   concrete `(ref $ii)` global. All four prior GC `.wast` scripts still pass (11/11/4/5). All build
   surfaces green.
 
+### C ABI — instantiate + call from C (2026-07-14)
+
+`tests/c_smoke.c` now exercises the runtime-object surface, not just introspection, and runs
+automatically via **`zig build c-smoke`** (builds `wasm_c_api.zig` as a static lib + compiles/links/runs
+the C client, all cross-compiled to `x86_64-windows-gnu` so the C side gets a libc without MSVC — the
+native target can't link libc on this box; the wazmrt lib stays libc-free). The test: engine/store,
+decode + import/export introspection (unchanged), then **instantiate a no-import `add` module → get
+exports → `wasm_extern_as_func` → `wasm_func_call(40, 2)` → `42`**, plus the bad-magic reject. Prints
+`OK`, exit 0. Gotcha caught while writing it: a code-section entry must start with the **locals-count
+byte** (`00` for none) before the instructions, else the decoder reads an opcode as a local type
+(`BadValType`).
+
 ## What this tells the roadmap
 
 1. **First execution milestone = the `module/wasm_mod` corpus + its `.test.json` files** — fully

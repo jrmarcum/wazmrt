@@ -89,6 +89,78 @@ int main(void) {
         wasm_exporttype_vec_delete(&exports);
     }
 
+    /*
+     * Instantiate + call a self-contained module (no imports):
+     *   (func (export "add") (param i32 i32) (result i32)
+     *     local.get 0  local.get 1  i32.add)
+     */
+    const unsigned char addmod[] = {
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f, /* type (i32,i32)->i32 */
+        0x03, 0x02, 0x01, 0x00,                               /* func 0 : type 0     */
+        0x07, 0x07, 0x01, 0x03, 'a', 'd', 'd', 0x00, 0x00,    /* export "add" func 0 */
+        /* code: 1 body, size 7 = locals(00) + local.get 0, local.get 1, i32.add, end */
+        0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b,
+    };
+    wasm_byte_vec_t addbin;
+    wasm_byte_vec_new(&addbin, sizeof(addmod), (const wasm_byte_t *)addmod);
+    wasm_module_t *addmodule = wasm_module_new(store, &addbin);
+    if (!addmodule) {
+        printf("FAIL: add module decode\n");
+        failures++;
+    } else {
+        wasm_trap_t *trap = NULL;
+        wasm_extern_vec_t noimports;
+        wasm_extern_vec_new_empty(&noimports);
+        wasm_instance_t *inst = wasm_instance_new(store, addmodule, &noimports, &trap);
+        printf("instance_new:    %s\n", inst ? "ok" : "null");
+        if (!inst) {
+            failures++;
+        } else {
+            wasm_extern_vec_t exps;
+            wasm_instance_exports(inst, &exps);
+            printf("inst_exports:    %zu\n", exps.size);
+            if (exps.size != 1) failures++;
+
+            wasm_func_t *add = wasm_extern_as_func(exps.data[0]);
+            printf("as_func:         %s (params=%zu results=%zu)\n",
+                   add ? "ok" : "null",
+                   add ? wasm_func_param_arity(add) : 0,
+                   add ? wasm_func_result_arity(add) : 0);
+            if (!add || wasm_func_param_arity(add) != 2 || wasm_func_result_arity(add) != 1)
+                failures++;
+
+            wasm_val_t argsv[2];
+            argsv[0].kind = WASM_I32; argsv[0].of.i32 = 40;
+            argsv[1].kind = WASM_I32; argsv[1].of.i32 = 2;
+            wasm_val_vec_t call_args, call_results;
+            wasm_val_vec_new(&call_args, 2, argsv);
+            wasm_val_vec_new_uninitialized(&call_results, 1);
+
+            wasm_trap_t *ctrap = wasm_func_call(add, &call_args, &call_results);
+            if (ctrap) {
+                wasm_message_t msg;
+                wasm_trap_message(ctrap, &msg);
+                printf("FAIL: call trapped: %s\n", msg.data ? (const char *)msg.data : "?");
+                wasm_byte_vec_delete(&msg);
+                wasm_trap_delete(ctrap);
+                failures++;
+            } else {
+                int32_t r = call_results.data[0].of.i32;
+                printf("add(40, 2):      %d\n", r);
+                if (r != 42) failures++;
+            }
+
+            wasm_val_vec_delete(&call_args);
+            wasm_val_vec_delete(&call_results);
+            wasm_extern_vec_delete(&exps);
+            wasm_instance_delete(inst);
+        }
+        wasm_extern_vec_delete(&noimports);
+        wasm_module_delete(addmodule);
+    }
+    wasm_byte_vec_delete(&addbin);
+
     /* Negative: a bad magic must fail to validate. */
     const unsigned char bad[] = { 'n', 'o', 'p', 'e', 1, 0, 0, 0 };
     wasm_byte_vec_t badv;

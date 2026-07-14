@@ -60,6 +60,34 @@ pub fn build(b: *std.Build) void {
     const wasm_step = b.step("wasm", "Build the runtime as a freestanding wasm module");
     wasm_step.dependOn(&install_wasm.step);
 
+    // ---- C smoke test (`zig build c-smoke`) --------------------------------
+    // Compiles tests/c_smoke.c against the C ABI exactly as an embedder would and
+    // runs it: engine/store, module decode + introspection, and instantiate +
+    // call. Uses the mingw (windows-gnu) target so the C client gets a libc
+    // without MSVC (the native target can't link libc on a MSVC-less box — see
+    // cmem/design-decisions.md); the wazmrt lib itself stays libc-free.
+    {
+        const gnu = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu });
+        const cabi_gnu = b.addLibrary(.{
+            .name = "wazmrt_csmoke",
+            .linkage = .static,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/wasm_c_api.zig"),
+                .target = gnu,
+                .optimize = optimize,
+            }),
+        });
+        const csmoke_mod = b.createModule(.{ .target = gnu, .optimize = optimize, .link_libc = true });
+        csmoke_mod.addCSourceFile(.{ .file = b.path("tests/c_smoke.c"), .flags = &.{"-DLIBWASM_STATIC"} });
+        csmoke_mod.addIncludePath(b.path("include"));
+        csmoke_mod.addIncludePath(b.path("third_party/wasm-c-api/include"));
+        csmoke_mod.linkLibrary(cabi_gnu);
+        const csmoke = b.addExecutable(.{ .name = "c_smoke", .root_module = csmoke_mod });
+        const run_csmoke = b.addRunArtifact(csmoke);
+        const csmoke_step = b.step("c-smoke", "Build + run the C smoke test (wasm-c-api from C)");
+        csmoke_step.dependOn(&run_csmoke.step);
+    }
+
     // ---- Tests -------------------------------------------------------------
     const mod_tests = b.addTest(.{ .root_module = mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
