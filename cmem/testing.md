@@ -399,6 +399,16 @@ Prints `OK`, exit 0. Gotcha caught while writing it: a code-section entry must s
 **locals-count byte** (`00` for none) before the instructions, else the decoder reads an opcode as a
 local type (`BadValType`).
 
+### C ABI — host FFI over the shared library (2026-07-14)
+
+`zig build dll` builds the C ABI as a **shared library** (`zig-out/bin/wazmrt.dll`, libc-free).
+`zig build ffi-demo` then runs `examples/deno_ffi.mjs`, which has **Deno `Deno.dlopen` the DLL** and call
+the standard wasm-c-api by symbol (engine/store → `wasm_byte_vec_new` → `wasm_module_new` →
+`wasm_instance_new` → `wasm_instance_exports` → `wasm_extern_as_func` → `wasm_func_call`) to run
+`(func (export "answer") (result i32) (i32.const 42))` → prints `answer() = 42`, `OK`. The demo does the
+`wasm_val_vec`/`wasm_extern_vec` struct plumbing with `DataView` + `Deno.UnsafePointer`, so it exercises
+the real ABI layout, not a convenience shim. Requires `deno` on PATH (2.x; FFI is stable).
+
 ## What this tells the roadmap
 
 1. **First execution milestone = the `module/wasm_mod` corpus + its `.test.json` files** — fully

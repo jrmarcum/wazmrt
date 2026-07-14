@@ -43,7 +43,15 @@ zig build run -- <file.wasm>       # summarize a module's sections/exports
 zig build run -- <file.wasm> <export> [args…]   # run an exported function
 zig build test                     # unit tests
 zig build wasm                     # build the runtime itself as a wasm module
+zig build dll                      # C-ABI shared library (for FFI: Deno, ctypes, …)
+zig build c-smoke                  # build + run the C example (needs no external deps)
+zig build ffi-demo                 # build the DLL + run examples/deno_ffi.mjs (needs deno)
 ```
+
+The runtime loads over FFI from any host language: `zig build dll` produces a
+libc-free `wazmrt.dll`, and [`examples/deno_ffi.mjs`](examples/deno_ffi.mjs)
+`Deno.dlopen`s it and drives the standard wasm-c-api to instantiate and call a
+module — no wasmtime, no JS engine in the path.
 
 ## Embedding (C ABI)
 

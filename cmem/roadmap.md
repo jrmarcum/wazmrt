@@ -74,8 +74,14 @@ DONE 2026-07-14**: `wasm_func_new[_with_env]` + `wasm_functype_new` + `wasm_valt
 `type`/`size`, all extern↔object casts, and import wiring for globals (value-copy) / memories+tables
 (shared object). Verified from C: read/write an exported global, `store` into an exported memory then
 read it back via `wasm_memory_data`, and `wasm_memory_grow`. **Deferred:** `wasm_table_get`/`set`/`grow`
-(need a `wasm_ref_t` model) and shared-mutable imported globals. **Next C-ABI step: the first
-`universalWasmLoader-*` integration** (prove the static lib loads from a host language end-to-end).
+(need a `wasm_ref_t` model) and shared-mutable imported globals. **First host-FFI integration DONE
+2026-07-14**: `zig build dll` builds the C-ABI as a **shared library** (`wazmrt.dll`, libc-free), and
+`examples/deno_ffi.mjs` (run by `zig build ffi-demo`) has **Deno `Deno.dlopen` the DLL and drive the
+standard wasm-c-api** (decode → instantiate → call) → `answer()=42`. This validates the vision's
+"native FFI → the C-ABI shared library" path (the `universalWasmLoader-*` ports themselves are WIT/
+component-model + wasmtime-based, so they're a separate, larger effort). **Next C-ABI step:
+`wasm_table_get`/`set`/`grow` + a `wasm_ref_t` model, then more host-language FFI bindings; then (3) the
+Deno/V8 benchmark.**
 **(3)** the Deno/V8 benchmark. **(4) WASI preview 1** (preview 2/3 deferred until browser-standard, per
 wasmtk). **The function-references proposal is complete** (typed-ref value types, `call_ref`/
 `return_call_ref`/`ref.as_non_null`/`br_on_null`, non-null refs + local-init tracking, P1/P2/P2.5

@@ -63,6 +63,13 @@ Prerequisites before this is possible: execution complete (incl. `call_indirect`
 WASI** (wasmtk's `wasi/` corpus needs it), and the C ABI grown to expose instantiate + call. Validate
 with the size/speed benchmark first (`roadmap.md`). "We'll see if it's achieved as wazmrt develops."
 
+**The native-FFI path is now proven end-to-end (2026-07-14).** `zig build dll` builds the C ABI as a
+libc-free shared library (`wazmrt.dll`), and `examples/deno_ffi.mjs` (run by `zig build ffi-demo`) has
+**Deno `Deno.dlopen` it and drive the standard wasm-c-api** — decode → instantiate → call an exported
+function — with no wasmtime and no JS-loader in the path. This is exactly the "Deno FFI → the C-ABI
+shared library" routing above; the remaining work for the wasmtk speedup is WASI + the benchmark, not
+the binding mechanism.
+
 ## Candidate direction — wazmrt as the universalWasmLoader native backend (speculative, 2026-07-02)
 
 **Not decided; gated on wazmrt proving useful in wasmtk first.** The idea: replace the per-platform

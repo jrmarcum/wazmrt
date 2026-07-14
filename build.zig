@@ -44,6 +44,34 @@ pub fn build(b: *std.Build) void {
     cabi.installHeader(b.path("include/wazmrt.h"), "wazmrt.h");
     b.installArtifact(cabi);
 
+    // ---- C ABI *shared* library (`zig build dll`) --------------------------
+    // The same wasm-c-api implementation as a dynamic library, so host languages
+    // can load it over FFI (Deno.dlopen, Python ctypes, …) — the vision's
+    // "native FFI → the C-ABI shared library" path. Libc-free, like the static
+    // lib.
+    const dll = b.addLibrary(.{
+        .name = "wazmrt",
+        .linkage = .dynamic,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wasm_c_api.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const install_dll = b.addInstallArtifact(dll, .{});
+    const dll_step = b.step("dll", "Build the C ABI as a shared library (for FFI)");
+    dll_step.dependOn(&install_dll.step);
+
+    // ---- Deno FFI demo (`zig build ffi-demo`) ------------------------------
+    // Builds the DLL, then runs a Deno script that loads it over FFI and drives
+    // the standard wasm-c-api (decode -> instantiate -> call) — proving the
+    // native runtime binds from a host language. Requires `deno` on PATH.
+    const ffi = b.addSystemCommand(&.{ "deno", "run", "--allow-ffi", "--allow-env", "examples/deno_ffi.mjs" });
+    ffi.setEnvironmentVariable("WAZMRT_DLL", "zig-out/bin/wazmrt.dll");
+    ffi.step.dependOn(&install_dll.step);
+    const ffi_step = b.step("ffi-demo", "Build the DLL + run the Deno FFI demo (needs deno)");
+    ffi_step.dependOn(&ffi.step);
+
     // ---- Freestanding wasm build (`zig build wasm`) ------------------------
     // Proves the runtime itself compiles to WebAssembly.
     const wasm_exe = b.addExecutable(.{
