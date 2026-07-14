@@ -331,7 +331,22 @@ unit tests + a hand-written `.wast` (the official GC corpus isn't in this tree).
   `assert_trap` for null and out-of-bounds; `GcOutOfBounds` added to the runner's trap set).
 - **No regressions**; `zig build test`/`build`/`wasm` all green. **Assembler limitation:** struct/array
   field and local types use the abstract heads (`structref`/`arrayref`/…), not concrete `(ref $t)` —
-  see `design-decisions.md`. `ref.test`/`ref.cast`/`br_on_cast` are the next slice.
+  see `design-decisions.md`.
+
+### full GC — P3, ref.test / ref.cast slice (2026-07-14)
+
+Adds runtime type identity (heap objects gain an RTT; i31 values are tagged bit 63 so the `any`
+hierarchy is runtime-distinguishable). Same gating — unit tests + a hand-written `.wast`.
+
+- **+3 unit tests (90 total)**: `ref.test` distinguishing struct/array/i31/eq in an `anyref` slot;
+  `ref.test` nullability (`(ref null struct)` vs `(ref struct)` on null) + a concrete `(ref $t)` target;
+  `ref.cast` success (downcast then `struct.get`), failure **trap** (`CastFailure`), and null (nullable
+  cast accepts null, non-null cast of null traps).
+- **`gc_cast.wast`: 11/0** via the CLI (`assert_return` for test/cast + `assert_trap` for cast failures;
+  `CastFailure` added to the runner's trap set).
+- **No regressions**; all three build surfaces green. Concrete subtyping is exact type-index match for
+  assembled modules (the assembler emits no `(sub …)` supertypes yet); `br_on_cast`/`br_on_cast_fail`
+  are the remaining GC ops.
 
 ## What this tells the roadmap
 

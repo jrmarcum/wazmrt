@@ -120,6 +120,31 @@ pub const ValType = enum(u8) {
         array,
         none,
 
+        /// The value type for this heap head at the given nullability (the
+        /// collapsed reference representation — concrete refs share their head).
+        pub fn valType(self: RefHeap, is_nullable: bool) ValType {
+            return switch (self) {
+                .func => if (is_nullable) .funcref else .funcref_nn,
+                .extern_ => if (is_nullable) .externref else .externref_nn,
+                .any => if (is_nullable) .anyref else .anyref_nn,
+                .eq => if (is_nullable) .eqref else .eqref_nn,
+                .i31 => if (is_nullable) .i31ref else .i31ref_nn,
+                .@"struct" => if (is_nullable) .structref else .structref_nn,
+                .array => if (is_nullable) .arrayref else .arrayref_nn,
+                .none => if (is_nullable) .nullref else .nullref_nn,
+            };
+        }
+
+        /// The top of this head's hierarchy: `any` for the internal GC family,
+        /// else `func` / `extern`.
+        pub fn top(self: RefHeap) RefHeap {
+            return switch (self) {
+                .func => .func,
+                .extern_ => .extern_,
+                else => .any,
+            };
+        }
+
         /// Is heap `a` a subtype of heap `b` in the WasmGC hierarchy? The `func`
         /// and `extern` hierarchies are disjoint from the `any` family; within
         /// `any`, i31/struct/array <: eq <: any and `none` is the bottom.

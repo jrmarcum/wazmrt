@@ -615,6 +615,19 @@ const FuncValidator = struct {
                 try self.pushValT(.i32);
             },
 
+            // GC casts. `ref.test` consumes a reference and yields i32; `ref.cast`
+            // passes the reference through with the target's (collapsed) type,
+            // trapping at runtime on a failed cast.
+            .ref_test => {
+                _ = try self.popRef();
+                try self.pushValT(.i32);
+            },
+            .ref_cast => {
+                _ = try self.popRef();
+                const head = try self.module.refHead(instr.imm.ref_cast.heap);
+                try self.pushValT(head.valType(instr.imm.ref_cast.nullable));
+            },
+
             .ref_as_non_null => try self.pushVal(try self.popRef()),
             .br_on_null => {
                 // Pop the ref; on branch pass [t*] to the label, on fall-through

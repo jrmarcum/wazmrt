@@ -1083,6 +1083,13 @@ fn emitFoldedOne(ctx: *Ctx, l: []const Sexpr, i: usize) Error!usize {
             while (j < l.len) j = try emitOne(ctx, l, j); // operands
             try emitCallIndirect(ctx, ann.idx, ann.table);
         },
+        .ref_test, .ref_cast => {
+            if (l.len < 2) return error.BadImmediate;
+            const rt = try parseRefTypeTarget(ctx, l[1]);
+            var j: usize = 2;
+            while (j < l.len) j = try emitOne(ctx, l, j); // operand(s)
+            try emitRefCast(ctx, op, rt);
+        },
         else => try emitFoldedPlain(ctx, op, l),
     }
     return i + 1;
@@ -1244,6 +1251,11 @@ fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Erro
             try emitCallIndirect(ctx, ann.idx, ann.table);
             return ann.next;
         },
+        .ref_test, .ref_cast => {
+            if (i + 1 >= items.len) return error.BadImmediate;
+            try emitRefCast(ctx, op, try parseRefTypeTarget(ctx, items[i + 1]));
+            return i + 2;
+        },
         .table_get, .table_set, .table_grow, .table_size, .table_fill => {
             try emitOpcode(ctx, op);
             // Optional explicit table index/id; a `$name` or numeric atom (a
@@ -1378,6 +1390,61 @@ fn emitOpcode(ctx: *Ctx, op: Op) Error!void {
     } else {
         try ctx.out.append(ctx.a, @intFromEnum(op));
     }
+}
+
+/// A parsed `ref.test`/`ref.cast` target: nullability + the heap-type `s33`
+/// code to emit (negative = abstract head, non-negative = a type index).
+const RefTypeTarget = struct { nullable: bool, code: i64 };
+
+/// Parse a `ref.test`/`ref.cast` target reference type: a shorthand atom
+/// (`anyref`/`structref`/…) or a `(ref null? ht)` list whose heap type is an
+/// abstract head or a concrete `$t`/index.
+fn parseRefTypeTarget(ctx: *Ctx, s: Sexpr) Error!RefTypeTarget {
+    if (s.asAtom()) |atom| return shorthandRefType(atom) orelse error.BadValType;
+    const l = s.asList() orelse return error.BadValType;
+    if (l.len < 2 or !eqAtom(l[0], "ref")) return error.BadValType;
+    const nullable = l.len >= 3 and eqAtom(l[1], "null");
+    const ht = l[l.len - 1];
+    const atom = ht.asAtom() orelse return error.BadValType;
+    if (abstractHeapCode(atom)) |c| return .{ .nullable = nullable, .code = c };
+    return .{ .nullable = nullable, .code = @intCast(try resolveType(ctx.type_names, ht)) };
+}
+
+/// The `s33` heap-type code for an abstract heap-type atom, or null.
+fn abstractHeapCode(atom: []const u8) ?i64 {
+    const map = .{
+        .{ "any", -0x12 },  .{ "eq", -0x13 },     .{ "i31", -0x14 },
+        .{ "struct", -0x15 }, .{ "array", -0x16 }, .{ "none", -0x0f },
+        .{ "func", -0x10 }, .{ "extern", -0x11 }, .{ "nofunc", -0x0d },
+        .{ "noextern", -0x0e },
+    };
+    inline for (map) |m| if (std.mem.eql(u8, atom, m[0])) return m[1];
+    return null;
+}
+
+/// A shorthand reference-type atom (`anyref`/…) → nullable target + code.
+fn shorthandRefType(atom: []const u8) ?RefTypeTarget {
+    const map = .{
+        .{ "anyref", -0x12 },  .{ "eqref", -0x13 },      .{ "i31ref", -0x14 },
+        .{ "structref", -0x15 }, .{ "arrayref", -0x16 }, .{ "nullref", -0x0f },
+        .{ "funcref", -0x10 }, .{ "externref", -0x11 },  .{ "nullfuncref", -0x0d },
+        .{ "nullexternref", -0x0e },
+    };
+    inline for (map) |m| if (std.mem.eql(u8, atom, m[0])) return .{ .nullable = true, .code = m[1] };
+    return null;
+}
+
+/// Emit a `ref.test`/`ref.cast`: `0xFB`, the null/non-null sub-opcode, then the
+/// target heap type as an `s33`.
+fn emitRefCast(ctx: *Ctx, op: Op, t: RefTypeTarget) Error!void {
+    try ctx.out.append(ctx.a, 0xfb);
+    const sub: u8 = switch (op) {
+        .ref_test => if (t.nullable) 0x15 else 0x14,
+        .ref_cast => if (t.nullable) 0x17 else 0x16,
+        else => unreachable,
+    };
+    try ctx.out.append(ctx.a, sub);
+    try sleb(ctx.a, ctx.out, t.code);
 }
 
 /// Emit the immediate operands of a bulk table op from its leading index atoms
@@ -2308,4 +2375,78 @@ test "GC struct: a struct field holds a nested array (GC refs stored in fields)"
     try std.testing.expectEqual(@as(i32, 55), interp.asI32(try assembleAndRun(src, "elem0", &.{interp.i32Value(55)})));
     // boxed_len: the stored array has length 6.
     try std.testing.expectEqual(@as(i32, 6), interp.asI32(try assembleAndRun(src, "boxed_len", &.{})));
+}
+
+test "GC ref.test: distinguishes struct / array / i31 in an anyref slot" {
+    const src =
+        \\(module
+        \\  (type $pt (struct (field i32)))
+        \\  (type $arr (array i32))
+        \\  (func (export "is") (param i32) (result i32)
+        \\    (local $a anyref)
+        \\    ;; sel 0 -> a struct, 1 -> an i31, 2 -> an array
+        \\    (local.set $a
+        \\      (if (result anyref) (i32.eq (local.get 0) (i32.const 0))
+        \\        (then (struct.new $pt (i32.const 5)))
+        \\        (else (if (result anyref) (i32.eq (local.get 0) (i32.const 1))
+        \\          (then (ref.i31 (i32.const 9)))
+        \\          (else (array.new $arr (i32.const 0) (i32.const 2)))))))
+        \\    ;; pack four ref.test results into one int: struct|array|i31|eq bits
+        \\    (i32.or
+        \\      (i32.or (ref.test (ref struct) (local.get $a))
+        \\              (i32.mul (ref.test (ref array) (local.get $a)) (i32.const 2)))
+        \\      (i32.or (i32.mul (ref.test (ref i31) (local.get $a)) (i32.const 4))
+        \\              (i32.mul (ref.test (ref eq) (local.get $a)) (i32.const 8))))))
+    ;
+    // struct: struct(1) + eq(8) = 9
+    try std.testing.expectEqual(@as(i32, 9), interp.asI32(try assembleAndRun(src, "is", &.{interp.i32Value(0)})));
+    // i31: i31(4) + eq(8) = 12
+    try std.testing.expectEqual(@as(i32, 12), interp.asI32(try assembleAndRun(src, "is", &.{interp.i32Value(1)})));
+    // array: array(2) + eq(8) = 10
+    try std.testing.expectEqual(@as(i32, 10), interp.asI32(try assembleAndRun(src, "is", &.{interp.i32Value(2)})));
+}
+
+test "GC ref.test: nullability and concrete type index" {
+    const src =
+        \\(module
+        \\  (type $pt (struct (field i32)))
+        \\  (func (export "null_nullable") (result i32)
+        \\    (ref.test (ref null struct) (ref.null struct)))
+        \\  (func (export "null_nonnull") (result i32)
+        \\    (ref.test (ref struct) (ref.null struct)))
+        \\  (func (export "concrete") (result i32)
+        \\    (local $a anyref)
+        \\    (local.set $a (struct.new $pt (i32.const 1)))
+        \\    (ref.test (ref $pt) (local.get $a))))
+    ;
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(src, "null_nullable", &.{}))); // null matches nullable
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "null_nonnull", &.{}))); // null fails non-null
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(src, "concrete", &.{}))); // matches its own type
+}
+
+test "GC ref.cast: success flows the value, failure and null trap" {
+    const src =
+        \\(module
+        \\  (type $pt (struct (field (mut i32))))
+        \\  (type $arr (array i32))
+        \\  (func (export "cast_get") (param i32) (result i32)
+        \\    (local $a anyref)
+        \\    (local.set $a (struct.new $pt (local.get 0)))
+        \\    (struct.get $pt 0 (ref.cast (ref $pt) (local.get $a))))
+        \\  (func (export "cast_fail") (result arrayref)
+        \\    (local $a anyref)
+        \\    (local.set $a (struct.new $pt (i32.const 1)))
+        \\    (ref.cast (ref $arr) (local.get $a)))
+        \\  (func (export "cast_null_ok") (result structref)
+        \\    (ref.cast (ref null struct) (ref.null struct)))
+        \\  (func (export "cast_null_trap") (result structref)
+        \\    (ref.cast (ref struct) (ref.null struct))))
+    ;
+    // A successful downcast lets struct.get read the field.
+    try std.testing.expectEqual(@as(i32, 77), interp.asI32(try assembleAndRun(src, "cast_get", &.{interp.i32Value(77)})));
+    // Casting a struct to an array type traps.
+    try std.testing.expectError(error.CastFailure, assembleAndRun(src, "cast_fail", &.{}));
+    // A nullable cast accepts null; a non-null cast of null traps.
+    _ = try assembleAndRun(src, "cast_null_ok", &.{});
+    try std.testing.expectError(error.CastFailure, assembleAndRun(src, "cast_null_trap", &.{}));
 }

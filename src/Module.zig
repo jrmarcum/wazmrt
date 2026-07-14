@@ -14,6 +14,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const Reader = @import("Reader.zig");
+const opcode = @import("opcode.zig");
 
 const Module = @This();
 
@@ -379,6 +380,41 @@ pub fn arrayField(self: *const Module, ti: u32) ?FieldType {
         .array => |f| f,
         else => null,
     };
+}
+
+/// Resolve a GC heap type to a reference-hierarchy head, mapping a concrete type
+/// index to its composite family (func / struct / array). Errors if a concrete
+/// index is out of range.
+pub fn refHead(self: *const Module, ht: opcode.HeapType) Error!types.ValType.RefHeap {
+    return switch (ht) {
+        .func, .nofunc => .func,
+        .extern_, .noextern => .extern_,
+        .any => .any,
+        .eq => .eq,
+        .i31 => .i31,
+        .@"struct" => .@"struct",
+        .array => .array,
+        .none => .none,
+        .concrete => |ti| blk: {
+            if (ti >= self.comp_types.len) return error.IndexOutOfRange;
+            break :blk switch (self.comp_types[ti].kind()) {
+                .func => .func,
+                .@"struct" => .@"struct",
+                .array => .array,
+            };
+        },
+    };
+}
+
+/// Is type index `a` a (reflexive/transitive) subtype of `b`, walking the
+/// declared GC supertype chain?
+pub fn isSubtype(self: *const Module, a: u32, b: u32) bool {
+    var cur: ?u32 = a;
+    while (cur) |c| {
+        if (c == b) return true;
+        cur = if (c < self.supertypes.len) self.supertypes[c] else null;
+    }
+    return false;
 }
 
 // --- Low-level readers -----------------------------------------------------

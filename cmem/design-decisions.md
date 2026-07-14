@@ -105,14 +105,33 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
         `len`, `ref.eq`. Packed fields store masked (`packField`) and widen on read (`unpackField`:
         `_s` sign-extends, `_u` zero-extends). Null access traps `NullReference`; OOB field/index traps
         the new `error.GcOutOfBounds` (a runtime backstop for the collapse gap below).
-      - **Collapse limitation (documented, deferred to the cast slice).** Concrete `(ref $t)` still
-        collapses to its family *head* (`structref`/`arrayref`/`funcref`) — exact inter-struct typing is
-        lost, so `struct.get $t` accepts *any* struct ref; the object carries its real fields and the
-        runtime **bounds-checks the field/element index** (→ `GcOutOfBounds`) so a mismatch can't read
-        out of bounds. The **WAT assembler cannot emit concrete `(ref $t)` value types** (single-byte
-        valtype emission → `funcref`); struct/array **field and local types use the abstract heads**
-        (`structref`/`arrayref`/`eqref`/`anyref`) in `.wat`. Concrete-ref precision is a later concern
-        (needs value-types that carry a type index) and pairs with `ref.test`/`ref.cast`.
+      - **Collapse limitation (documented).** Concrete `(ref $t)` still collapses to its family *head*
+        (`structref`/`arrayref`/`funcref`) in *value types* — exact inter-struct static typing is lost,
+        so `struct.get $t` accepts *any* struct ref; the object carries its real fields (see the RTT
+        below) and the runtime **bounds-checks the field/element index** (→ `GcOutOfBounds`) so a
+        mismatch can't read out of bounds. The **WAT assembler cannot emit concrete `(ref $t)` value
+        types** (single-byte valtype emission → `funcref`); struct/array **field and local types use the
+        abstract heads** (`structref`/`arrayref`/`eqref`/`anyref`) in `.wat`. Note `ref.test`/`ref.cast`
+        targets are *unaffected* — their heap type is an `s33` immediate (not a valtype byte), so the
+        assembler emits concrete `$t` targets fine (see below).
+    - **ref.test / ref.cast slice DONE 2026-07-14.** Adds runtime type identity to GC:
+      - **Heap objects carry an RTT.** `Instance.HeapObject = { type_index: u32, fields: []Value }` — so
+        a reference knows its actual composite type at runtime. `ref.test`/`ref.cast` (`0xFB` 0x14–0x17,
+        target heap type as an `s33`) return i32 / pass-through-or-trap (`error.CastFailure`).
+      - **i31 is now tagged.** A `ref.i31` result sets **bit 63** (`i31_tag`) so within the `any`
+        hierarchy a value is unambiguously **null** (`== null_ref`, checked first), **i31** (bit 63
+        set), or a **heap-object index** (bit 63 clear). `i31.get_*` mask the low 31 bits (tag ignored);
+        `ref.eq` compares tagged slots directly. This is the key enabler — an untyped `u64` slot
+        otherwise can't tell an i31 from a struct index.
+      - **Runtime dispatch on the *target's* top hierarchy.** Validation guarantees the operand shares
+        the target's hierarchy, so `refMatches` reads the value as i31/heap-index for an `any` target, a
+        func index for a `func` target, an extern handle for `extern`. Abstract targets use
+        `RefHeap.sub`; concrete `$t` targets use `Module.isSubtype` over the declared supertype chain.
+      - **Supertype chains are decoded but the WAT assembler emits none** (it drops `(sub $super …)`),
+        so today concrete subtyping is effectively **exact type-index match** for assembled modules
+        (hand-built binaries with sub types get the full chain). Real declared-subtype casts wait for
+        assembler sub-type emission. **`br_on_cast`/`br_on_cast_fail` are the remaining GC ops** (a
+        branch fusing test+cast) — next.
   - **Deferred (until browser-standard):** **WASI preview 2/3** (component-model based), **multi-memory**,
     exception-handling **tags**, **SIMD** — pulled in as the real corpus (`wasm_wasi`) demands. Typed/GC
     reference *value types* are already *accepted* (P1) so such modules build.

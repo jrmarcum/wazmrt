@@ -47,9 +47,12 @@ type-space refactor + runtime): `Module.func_types`→`comp_types` composite-typ
 array + rec/sub/packed decode with a forward-ref kind pre-scan); an arena-backed GC heap
 (`Instance.gc_heap`, no collector yet); `struct.new`/`new_default`/`get`(`_s`/`_u`)/`set`, `array.new`/
 `new_default`/`new_fixed`/`get`(`_s`/`_u`)/`set`/`len`, `ref.eq`; WAT assembler parses `(type (struct/
-array/field …))`. 87 unit tests + a `gc_struct_array.wast` 11/0. **Next P3 part: `ref.test`/`ref.cast`/
-`br_on_cast`** (needs value types that carry a concrete type index — the collapse limitation noted in
-`design-decisions.md`). **(2)** grow the wasm-c-api past
+array/field …))`. **`ref.test`/`ref.cast` slice DONE 2026-07-14**: heap objects carry an RTT
+(`HeapObject.type_index`), i31 values are tagged (bit 63) so the `any` hierarchy is runtime-
+distinguishable, `ref.test`/`ref.cast` dispatch on the target's hierarchy (abstract via `RefHeap.sub`,
+concrete via `Module.isSubtype`); `CastFailure` traps. 90 unit tests + `gc_struct_array.wast` 11/0 +
+`gc_cast.wast` 11/0. **Next P3 part: `br_on_cast`/`br_on_cast_fail`** (a branch fusing test+cast), then
+assembler sub-type emission for real declared-subtype casts. **(2)** grow the wasm-c-api past
 introspection (instance/func/call) → embeddable end-to-end + first `universalWasmLoader-*` integration.
 **(3)** the Deno/V8 benchmark. **(4) WASI preview 1** (preview 2/3 deferred until browser-standard, per
 wasmtk). **The function-references proposal is complete** (typed-ref value types, `call_ref`/

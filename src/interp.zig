@@ -121,6 +121,8 @@ pub const Error = Module.Error || error{
     /// (`array.get`/`.set` past the length, or a field index beyond a collapsed
     /// object's fields). Traps.
     GcOutOfBounds,
+    /// `ref.cast` to a type the value is not an instance of. Traps.
+    CastFailure,
 };
 
 /// Null reference sentinel — on the value stack (`ref.null`) and as an
@@ -128,6 +130,12 @@ pub const Error = Module.Error || error{
 /// and host externref values are boxed to small non-sentinel handles at the host
 /// boundary (see the WAST runner's `internExtern`, #9), so neither collides.
 const null_ref: Value = std.math.maxInt(u64);
+
+/// Tag bit marking a value slot as an unboxed i31 (full GC). Set on `ref.i31`
+/// results so `ref.test`/`ref.cast` can distinguish an i31 from a heap-object
+/// index (bit 63 clear) within the `any` hierarchy. `null_ref` (all bits set)
+/// is checked before this bit, so the two never confuse.
+const i31_tag: Value = @as(Value, 1) << 63;
 
 fn funcTypeEqual(x: Module.FuncType, y: Module.FuncType) bool {
     return std.mem.eql(V, x.params, y.params) and std.mem.eql(V, y.results, x.results);
@@ -187,11 +195,17 @@ pub const Instance = struct {
     /// `elem.drop`), after which it behaves as an empty segment.
     elem_values: []const []Value,
     elem_dropped: []bool,
-    /// GC heap (full GC, P3): one `[]Value` per allocated struct/array object; a
-    /// GC reference value is the object's index here. Objects live for the
-    /// instance's lifetime (arena-backed slices; no collector yet — a size cost
-    /// accepted per the proposal-scope decision). `gpa`-owned outer list.
-    gc_heap: std.ArrayList([]Value) = .empty,
+    /// GC heap (full GC, P3): one object per allocated struct/array; a GC
+    /// reference value is the object's index here (its runtime type — the type
+    /// index — rides in the object, so `ref.test`/`ref.cast` can check it).
+    /// Objects live for the instance's lifetime (arena-backed field slices; no
+    /// collector yet — a size cost accepted per the proposal-scope decision).
+    /// `gpa`-owned outer list.
+    gc_heap: std.ArrayList(HeapObject) = .empty,
+
+    /// A heap-allocated GC object: its declared type index (RTT) and its struct
+    /// fields / array elements (arena-backed).
+    pub const HeapObject = struct { type_index: u32, fields: []Value };
 
     /// Shared linear memory. A single object is referenced by the defining
     /// instance and every importer, so `memory.grow` (which updates `bytes`) is
@@ -430,20 +444,69 @@ pub const Instance = struct {
         return null;
     }
 
-    /// Allocate a GC object (struct fields / array elements, `fields` arena-
-    /// backed) and return its reference value — an index into `gc_heap`. Object
-    /// indices start at 0 and stay small, so they never collide with the
-    /// `null_ref` sentinel.
-    fn allocObject(self: *Instance, fields: []Value) Error!Value {
+    /// Allocate a GC object of type `type_index` (`fields` arena-backed) and
+    /// return its reference value — an index into `gc_heap`. Object indices start
+    /// at 0 and stay small, so a heap reference (bit 63 clear) never collides
+    /// with the `null_ref` sentinel or a tagged i31 (bit 63 set).
+    fn allocObject(self: *Instance, type_index: u32, fields: []Value) Error!Value {
         const idx = self.gc_heap.items.len;
-        try self.gc_heap.append(self.gpa, fields);
+        try self.gc_heap.append(self.gpa, .{ .type_index = type_index, .fields = fields });
         return @intCast(idx);
     }
 
     /// The field/element slice of a non-null GC reference, or a trap on null.
     fn gcObject(self: *Instance, ref: Value) Error![]Value {
         if (ref == null_ref) return error.NullReference;
-        return self.gc_heap.items[@intCast(ref)];
+        return self.gc_heap.items[@intCast(ref)].fields;
+    }
+
+    /// Does GC reference value `v` match target reference type `rt`
+    /// (`ref.test`/`ref.cast`)? The value is interpreted by the target's top
+    /// hierarchy — validation guarantees the operand shares it: `any` values are
+    /// null / tagged-i31 / heap-object index; `func`/`extern` are null / handle.
+    fn refMatches(self: *Instance, v: Value, rt: opcode.RefType) bool {
+        if (v == null_ref) return rt.nullable;
+        const target_head = self.module.refHead(rt.heap) catch return false;
+        switch (target_head.top()) {
+            .any => {
+                if (v & i31_tag != 0) return self.headMatches(.i31, null, rt.heap);
+                const idx: usize = @intCast(v);
+                if (idx >= self.gc_heap.items.len) return false; // defensive
+                const obj = self.gc_heap.items[idx];
+                const kind: types.ValType.RefHeap = switch (self.module.comp_types[obj.type_index].kind()) {
+                    .@"struct" => .@"struct",
+                    .array => .array,
+                    .func => .func,
+                };
+                return self.headMatches(kind, obj.type_index, rt.heap);
+            },
+            .func => return self.headMatches(.func, self.definedFuncType(v), rt.heap),
+            else => return self.headMatches(.extern_, null, rt.heap),
+        }
+    }
+
+    /// Match a value's actual heap head (`actual`, and concrete type index
+    /// `actual_ti` when known) against a target heap type — abstract targets use
+    /// the hierarchy relation, concrete targets the declared subtype chain.
+    fn headMatches(self: *Instance, actual: types.ValType.RefHeap, actual_ti: ?u32, target: opcode.HeapType) bool {
+        switch (target) {
+            .concrete => |t| return actual_ti != null and self.module.isSubtype(actual_ti.?, t),
+            else => {
+                const th = self.module.refHead(target) catch return false;
+                return actual.sub(th);
+            },
+        }
+    }
+
+    /// The type index of a *defined* function (for `ref.cast` of a funcref to a
+    /// concrete func type); null for an imported function (no type index kept).
+    fn definedFuncType(self: *Instance, findex: Value) ?u32 {
+        const fi: u32 = @intCast(findex);
+        const imported = self.module.importedFuncCount();
+        if (fi < imported) return null;
+        const d = fi - imported;
+        if (d >= self.module.functions.len) return null;
+        return self.module.functions[d];
     }
 
     fn callFunction(self: *Instance, a: std.mem.Allocator, func_index: u32, args: []const Value, depth: usize) Error![]Value {
@@ -606,17 +669,19 @@ const Frame = struct {
                 },
 
                 // --- GC: i31 references (full GC, P3) ---
-                // An i31 is unboxed: the 31-bit payload lives directly in the value
-                // slot (0..2^31-1, so it can never collide with `null_ref`).
+                // An i31 is unboxed: the 31-bit payload lives in the low bits and
+                // `i31_tag` (bit 63) marks the slot as an i31 — so within the `any`
+                // hierarchy `ref.test`/`ref.cast` can tell it from a heap index
+                // (bit 63 clear) and from `null_ref` (all bits set; checked first).
                 .ref_i31 => {
                     const x: u32 = @bitCast(self.popI32());
-                    try self.pushU64(x & 0x7fff_ffff); // wrap to 31 bits, non-null
+                    try self.pushU64(i31_tag | (x & 0x7fff_ffff)); // wrap to 31 bits, non-null
                     pc += 1;
                 },
                 .i31_get_s => {
                     const r = self.pop();
                     if (r == null_ref) return error.NullReference;
-                    // Sign-extend bit 30 to a full i32.
+                    // Sign-extend bit 30 of the 31-bit payload to a full i32.
                     const n: u32 = @truncate(r);
                     try self.pushI32(@as(i32, @bitCast(n << 1)) >> 1);
                     pc += 1;
@@ -643,14 +708,14 @@ const Frame = struct {
                     const base = self.vstack.items.len - sf.len;
                     for (sf, 0..) |f, k| obj[k] = packField(f.storage, self.vstack.items[base + k]);
                     self.vstack.shrinkRetainingCapacity(base);
-                    try self.pushU64(try self.inst.allocObject(obj));
+                    try self.pushU64(try self.inst.allocObject(instr.imm.gc_type, obj));
                     pc += 1;
                 },
                 .struct_new_default => {
                     const sf = self.inst.module.structFields(instr.imm.gc_type).?;
                     const obj = try self.inst.arena.allocator().alloc(Value, sf.len);
                     for (sf, 0..) |f, k| obj[k] = if (f.storage.unpacked().isRef()) null_ref else 0;
-                    try self.pushU64(try self.inst.allocObject(obj));
+                    try self.pushU64(try self.inst.allocObject(instr.imm.gc_type, obj));
                     pc += 1;
                 },
                 .struct_get, .struct_get_s, .struct_get_u => {
@@ -678,7 +743,7 @@ const Frame = struct {
                     const init_v = packField(f.storage, self.pop());
                     const obj = try self.inst.arena.allocator().alloc(Value, len);
                     @memset(obj, init_v);
-                    try self.pushU64(try self.inst.allocObject(obj));
+                    try self.pushU64(try self.inst.allocObject(instr.imm.gc_type, obj));
                     pc += 1;
                 },
                 .array_new_default => {
@@ -686,7 +751,7 @@ const Frame = struct {
                     const len = @as(u32, @bitCast(self.popI32()));
                     const obj = try self.inst.arena.allocator().alloc(Value, len);
                     @memset(obj, if (f.storage.unpacked().isRef()) null_ref else 0);
-                    try self.pushU64(try self.inst.allocObject(obj));
+                    try self.pushU64(try self.inst.allocObject(instr.imm.gc_type, obj));
                     pc += 1;
                 },
                 .array_new_fixed => {
@@ -696,7 +761,7 @@ const Frame = struct {
                     const base = self.vstack.items.len - tn.n;
                     for (0..tn.n) |k| obj[k] = packField(f.storage, self.vstack.items[base + k]);
                     self.vstack.shrinkRetainingCapacity(base);
-                    try self.pushU64(try self.inst.allocObject(obj));
+                    try self.pushU64(try self.inst.allocObject(tn.type_index, obj));
                     pc += 1;
                 },
                 .array_get, .array_get_s, .array_get_u => {
@@ -720,6 +785,18 @@ const Frame = struct {
                     const obj = try self.inst.gcObject(self.pop());
                     try self.pushI32(@bitCast(@as(u32, @intCast(obj.len))));
                     pc += 1;
+                },
+
+                // --- GC: casts ---
+                .ref_test => {
+                    const v = self.pop();
+                    try self.pushI32(if (self.inst.refMatches(v, instr.imm.ref_cast)) 1 else 0);
+                    pc += 1;
+                },
+                .ref_cast => {
+                    const v = self.vstack.items[self.vstack.items.len - 1]; // peek
+                    if (!self.inst.refMatches(v, instr.imm.ref_cast)) return error.CastFailure;
+                    pc += 1; // value stays on the stack with its new (validated) type
                 },
 
                 // --- Structured control flow ---

@@ -470,6 +470,7 @@ fn isRuntimeTrap(e: anyerror) bool {
         error.IndirectTypeMismatch,
         error.NullReference,
         error.GcOutOfBounds,
+        error.CastFailure,
         error.CallStackExhausted,
         => true,
         else => false,
