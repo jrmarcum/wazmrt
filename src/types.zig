@@ -261,8 +261,11 @@ pub const DecodeError = error{
     BadValType,
     /// The data-count section disagreed with the number of data segments.
     DataCountMismatch,
-    /// An instruction opcode wazmrt does not yet decode (SIMD `0xFD`, the
-    /// unimplemented `0xFC` ops — bulk-memory, `table.init`/`.copy`, saturating
-    /// truncation — for now).
+    /// An instruction opcode wazmrt does not yet decode. Remaining gaps: SIMD
+    /// (`0xFD`), and the `0xFC` sub-ops `0x00–0x07` (saturating float→int) and
+    /// `0x08–0x0b` (bulk memory: `memory.init`/`copy`/`fill`, `data.drop`) —
+    /// which LLVM/Zig emit by default, so they block running compiled modules
+    /// (see the `roadmap.md` "run a fully compiled WASI program" plan). The
+    /// `0xFC` table ops (`0x0c–0x11`) and the `0xFB` GC ops are implemented.
     UnsupportedOpcode,
 };

@@ -114,6 +114,47 @@ tables/memories via shared objects (stage 2) + link-time import type-checking + 
 memory-data / memory-table imports DONE 2026-07-13** (`start` 0→11). See `known-issues.md` for the fix
 ledger.
 
+## Track — run a fully compiled WASI program (planned 2026-07-14)
+
+**Recon finding (evidence-based, the key insight).** Compiled a real Zig `wasm32-wasi` hello-world
+(`zig build-exe -target wasm32-wasi -O ReleaseSmall`, 46 KB) and ran it in wazmrt. Result:
+- **It instantiated fine** — every `wasi_snapshot_preview1` import resolved. A hello-world imports the
+  *entire* WASI surface (`path_open`, `fd_readdir`, `poll_oneoff`, `fd_pread`, `path_*`, …, ~40 funcs)
+  but only **calls** a handful (environ init, `fd_write`, `proc_exit`). The unimplemented ones fell
+  through to the `NOTSUP` stub and were never called — the stub design handles this exactly.
+- **It then trapped `UnsupportedOpcode`.** So **the blocker to running a compiled program is the
+  INTERPRETER, not WASI.** wazmrt's `0xFC` decode only covers table ops (`0x0c–0x11`); LLVM/Zig emit
+  `0xFC 0x08–0x0b` (**bulk memory**: `memory.copy`/`fill`/`init`, `data.drop`) and `0xFC 0x00–0x07`
+  (**saturating float→int**) **by default** — both unimplemented.
+- **Critical path:** `run a compiled stdout program = [interpreter: 0xFC 0x00–0x0b] + [only the WASI
+  funcs it CALLS (mostly already have)]`. File-touching programs additionally need the WASI filesystem.
+
+**Phase 1 — finish the `0xFC` prefix (the immediate blocker; also unblocks non-WASI compiled modules).**
+Decode + execute + validate `0xFC 0x00–0x07` (saturating truncation: NaN→0, ±inf/out-of-range→min/max,
+no traps) and `0xFC 0x08–0x0b` (`memory.init`=copy from a passive/active data segment, `data.drop`=mark
+consumed, `memory.copy`=bounds-checked memmove, `memory.fill`=memset). Reuse the existing passive-data +
+`data_count`-section plumbing. Assembler names + tests, then **rerun `hello.wasm` → should print**.
+*This is the milestone: a real LLVM-compiled program runs and prints. Small, high-leverage, low risk.*
+
+**Phase 2 — WASI core for stdout/args/env/compute programs.** `clock_res_get`; `poll_oneoff` (support
+clock-subscription sleep; real event polling stubbed); real **stdin** `fd_read` (fd 0 ← process stdin);
+`proc_raise`→trap. After this wazmrt runs the whole **compute + stdout + args** class — exactly wasmtk's
+compiler-test-output regime (`vision.md`).
+
+**Phase 3 — WASI filesystem (the big one; for programs that touch files; independent of 1/2).** A
+`--dir <host>[:<guest>]` CLI flag preopens a host dir as fd 3+ (`fd_prestat_get`/`_dir_name` enumerate).
+A **host-fd table** in the `Wasi` context (guest fd → host handle + rights + offset), path resolution
+**sandboxed to a preopen** (reject `..` escapes). `path_open` honoring oflags/rights, then real
+`fd_read`/`write`/`seek`/`tell`/`close`/`sync`/`pread`/`pwrite`; metadata + dir ops (`fd_fdstat_get`
+real, `path_filestat_get`/`fd_filestat_get`, `fd_readdir`, `path_create_directory`/`unlink_file`/
+`remove_directory`/`rename`, remaining `path_*`). Host side rides the libc-free Zig-0.16 `Io.Dir`/
+`Io.File` API. Main risk surface.
+
+**Phase 4 — ergonomics + conformance.** CLI `--dir` / `--env KEY=VAL` / `-- <guest args>`. A reproducible
+`zig build`-driven gate that compiles a real Zig `wasm32-wasi` program and runs it in wazmrt (Zig is the
+toolchain we already have). Broaden to compiled **C (wasi-sdk), Rust (wasm32-wasi), Zig** programs
+covering stdout/args/env/files/clocks; fill the long tail of actually-called functions.
+
 ## Next increments (rough order)
 
 1. ~~Decode the type/function/import/export sections~~ **DONE 2026-07-02** (also table/memory/global +
