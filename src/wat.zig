@@ -125,6 +125,9 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // GC composite kinds, index-aligned with the leading named `(type …)` defs
     // in `sigs`; struct/array carry their fields (func types use `sigs`).
     var gc_types: List(GcTypeDef) = .empty;
+    // Declared supertype (`(sub $super …)`) of each named type, or null; resolved
+    // against `type_names` at type-section emission.
+    var gc_supers: List(?Sexpr) = .empty;
     var globals: List(GlobalDef) = .empty;
     var global_imports: List(ImportedGlobal) = .empty;
     var table_imports: List(ImportedTable) = .empty;
@@ -143,11 +146,11 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     for (module[start..]) |field| {
         const kw = field.keyword() orelse continue;
         if (std.mem.eql(u8, kw, "type")) {
-            try parseTypeDef(a, field.asList().?, &sigs, &type_names, &gc_types);
+            try parseTypeDef(a, field.asList().?, &sigs, &type_names, &gc_types, &gc_supers);
         } else if (std.mem.eql(u8, kw, "rec")) {
             for (field.asList().?[1..]) |t| {
                 if (std.mem.eql(u8, t.keyword() orelse continue, "type"))
-                    try parseTypeDef(a, t.asList().?, &sigs, &type_names, &gc_types);
+                    try parseTypeDef(a, t.asList().?, &sigs, &type_names, &gc_types, &gc_supers);
             }
         }
     }
@@ -372,6 +375,14 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         try uleb(a, &s, sigs.items.len);
         for (sigs.items, 0..) |sig, ti| {
             const def: GcTypeDef = if (ti < gc_types.items.len) gc_types.items[ti] else .func;
+            // A declared supertype emits the sub form (`0x50` = sub, non-final) +
+            // a one-element supertype vector before the composite type. Finality
+            // is not tracked (unused by the decoder/validator).
+            if (ti < gc_supers.items.len) if (gc_supers.items[ti]) |sr| {
+                try s.append(a, 0x50);
+                try uleb(a, &s, 1);
+                try uleb(a, &s, try resolveType(type_names.items, sr));
+            };
             switch (def) {
                 .func => {
                     try s.append(a, 0x60);
@@ -585,10 +596,11 @@ fn fieldIsImport(kw: []const u8, items: []const Sexpr) bool {
 }
 
 /// `(type $name? <comptype>)` where comptype is `(func …)` / `(struct …)` /
-/// `(array …)`, optionally wrapped in `(sub $super? <comptype>)` (GC). Appends
-/// the func signature (to `sigs`) or the struct/array fields (to `gc_types`) at
-/// the next type index; both lists stay index-aligned with `type_names`.
-fn parseTypeDef(a: std.mem.Allocator, items: []const Sexpr, sigs: *List(Sig), type_names: *List(?[]const u8), gc_types: *List(GcTypeDef)) Error!void {
+/// `(array …)`, optionally wrapped in `(sub final? $super? <comptype>)` (GC).
+/// Appends the func signature (to `sigs`) or the struct/array fields (to
+/// `gc_types`) plus the declared supertype (to `gc_supers`, resolved at emit)
+/// at the next type index; all three stay index-aligned with `type_names`.
+fn parseTypeDef(a: std.mem.Allocator, items: []const Sexpr, sigs: *List(Sig), type_names: *List(?[]const u8), gc_types: *List(GcTypeDef), gc_supers: *List(?Sexpr)) Error!void {
     var i: usize = 1;
     var name: ?[]const u8 = null;
     if (i < items.len and isId(items[i])) {
@@ -596,11 +608,20 @@ fn parseTypeDef(a: std.mem.Allocator, items: []const Sexpr, sigs: *List(Sig), ty
         i += 1;
     }
     var body = items[i].asList() orelse return error.BadModuleField;
-    // Unwrap a `(sub final? $super* <comptype>)` — the assembler ignores the
-    // declared supertype (the inner comptype is always the last element).
+    // Unwrap a `(sub final? $super? <comptype>)`: the inner comptype is the last
+    // element; a supertype id among the middle elements (skipping `final`) is
+    // captured so the type section can emit the sub form (GC MVP: ≤1 supertype).
+    var super_ref: ?Sexpr = null;
     if (body.len >= 2 and eqAtom(body[0], "sub")) {
+        for (body[1 .. body.len - 1]) |part| {
+            if (isId(part) or (part.asAtom() != null and !eqAtom(part, "final"))) {
+                super_ref = part;
+                break;
+            }
+        }
         body = body[body.len - 1].asList() orelse return error.BadModuleField;
     }
+    try gc_supers.append(a, super_ref);
 
     const kw = body[0].asAtom() orelse return error.BadModuleField;
     if (std.mem.eql(u8, kw, "func")) {
@@ -2509,4 +2530,30 @@ test "GC br_on_cast / br_on_cast_fail: branch on a successful/failed downcast" {
     // misses: i31 -> fall-through -> 100; struct -> branch -> 200.
     try std.testing.expectEqual(@as(i32, 100), interp.asI32(try assembleAndRun(src, "misses", &.{interp.i32Value(1)})));
     try std.testing.expectEqual(@as(i32, 200), interp.asI32(try assembleAndRun(src, "misses", &.{interp.i32Value(0)})));
+}
+
+test "GC declared subtyping: (sub $base ...) drives ref.test / ref.cast" {
+    // $sub extends $base (width subtyping — field 0 aligns). The assembler now
+    // emits the sub form, so the decoder records the supertype and casts walk it.
+    const src =
+        \\(module
+        \\  (type $base (struct (field i32)))
+        \\  (type $sub (sub $base (struct (field i32) (field i32))))
+        \\  (func (export "sub_is_base") (result i32)
+        \\    (ref.test (ref $base) (struct.new $sub (i32.const 1) (i32.const 2))))
+        \\  (func (export "base_is_not_sub") (result i32)
+        \\    (ref.test (ref $sub) (struct.new $base (i32.const 1))))
+        \\  (func (export "cast_up_get") (result i32)
+        \\    (struct.get $base 0
+        \\      (ref.cast (ref $base) (struct.new $sub (i32.const 42) (i32.const 99)))))
+        \\  (func (export "cast_down_fail") (result structref)
+        \\    (ref.cast (ref $sub) (struct.new $base (i32.const 1)))))
+    ;
+    // A $sub IS a $base (declared supertype); a $base is NOT a $sub.
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(src, "sub_is_base", &.{})));
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "base_is_not_sub", &.{})));
+    // Upcast then read the shared field 0 through $base.
+    try std.testing.expectEqual(@as(i32, 42), interp.asI32(try assembleAndRun(src, "cast_up_get", &.{})));
+    // Downcasting a plain $base to (ref $sub) traps.
+    try std.testing.expectError(error.CastFailure, assembleAndRun(src, "cast_down_fail", &.{}));
 }

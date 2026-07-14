@@ -127,10 +127,15 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
         the target's hierarchy, so `refMatches` reads the value as i31/heap-index for an `any` target, a
         func index for a `func` target, an extern handle for `extern`. Abstract targets use
         `RefHeap.sub`; concrete `$t` targets use `Module.isSubtype` over the declared supertype chain.
-      - **Supertype chains are decoded but the WAT assembler emits none** (it drops `(sub $super …)`),
-        so today concrete subtyping is effectively **exact type-index match** for assembled modules
-        (hand-built binaries with sub types get the full chain). Real declared-subtype casts wait for
-        assembler sub-type emission.
+      - **Declared subtyping is emitted end-to-end (2026-07-14).** The WAT assembler now parses
+        `(type $t (sub final? $super? <comptype>))`, captures the supertype, and emits the sub form
+        (`0x50` + a one-element supertype vector + the comptype); the decoder records it in
+        `Module.supertypes` and `ref.test`/`ref.cast`/`br_on_cast` walk it via `Module.isSubtype`
+        (transitively). Finality isn't tracked (unused), and the validator does **not** check
+        field-width compatibility between a subtype and its supertype (a valid module lays them out
+        compatibly — field 0 aligns — and the runtime bounds-checks accesses). Concrete `(ref $t)`
+        *value types* still collapse to their head (the remaining limitation); cast *targets* and now
+        supertypes carry the concrete index.
     - **br_on_cast / br_on_cast_fail slice DONE 2026-07-14 — WasmGC op coverage is now complete.**
       `0xFB` 0x18/0x19; immediate = a flags byte (bit 0 src-nullable, bit 1 dst-nullable) + label +
       src & dst heap types (`s33`). `br_on_cast $l src dst` branches to `$l` (delivering the ref as

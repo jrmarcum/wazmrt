@@ -358,6 +358,14 @@ The cast-branches, fusing test + cast + branch. Completes WasmGC op coverage.
 - Fixed `readBlockType` to decode the non-null synthetic tags (`(block (result (ref i31)) …)` around a
   cast-branch). **No regressions**; all three build surfaces green.
 
+### full GC — P3, assembler `(sub $super …)` supertype emission (2026-07-14)
+
+Closes the declared-subtyping loop: the assembler emits the sub form, the decoder records the supertype,
+and casts walk it. **+1 unit test (93 total)** + **`gc_subtype.wast` 5/0** — `$sub`/`$sub2` extend
+`$base`; `ref.test (ref $base)` on a `$sub`/`$sub2` object → 1 (transitive), on a `$base` for `(ref $sub)`
+→ 0; `ref.cast` up then `struct.get $base 0` reads the shared field (42); downcasting a plain `$base` to
+`(ref $sub)` traps. All build surfaces green.
+
 ## What this tells the roadmap
 
 1. **First execution milestone = the `module/wasm_mod` corpus + its `.test.json` files** — fully
