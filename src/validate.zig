@@ -29,6 +29,9 @@ pub const Error = Module.Error || error{
     UnknownLabel,
     MismatchedElse,
     UndefinedLocal,
+    /// A `local.get` of a non-defaultable (non-nullable ref) local before it was
+    /// set (function-references local initialization, §3.3.5).
+    UninitializedLocal,
     UndefinedGlobal,
     ImmutableGlobal,
     UndefinedFunc,
@@ -69,7 +72,9 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
         if (elem.mode == .active) {
             if (elem.table_index >= module.tables.len) return error.UndefinedTable;
             const tet = module.tables[elem.table_index].element;
-            if (tet != elem.elem_type) return error.TypeMismatch;
+            // Family match (nullable-normalized) — non-nullability isn't enforced
+            // on segment application, and the flag-4 binary form can't carry it.
+            if (elem.elem_type.nullable() != tet.nullable()) return error.TypeMismatch;
             try validateConstExpr(module, elem.offset_expr, .i32, all_globals);
         }
     }
@@ -146,7 +151,7 @@ fn validateConstExpr(module: *const Module, expr: []const u8, expected: V, self_
             0xd2 => { // ref.func x
                 const fi = try r.readVarU32();
                 if (module.funcType(fi) == null) return error.UndefinedFunc;
-                try push(&stack, &sp, .funcref);
+                try push(&stack, &sp, .funcref_nn); // a function reference is non-null
             },
             0x6a, 0x6b, 0x6c => { // i32 add/sub/mul (extended-const)
                 if (sp < 2 or stack[sp - 1] != .i32 or stack[sp - 2] != .i32) return error.TypeMismatch;
@@ -159,7 +164,7 @@ fn validateConstExpr(module: *const Module, expr: []const u8, expected: V, self_
             else => return error.ConstantExpressionRequired,
         }
     }
-    if (sp != 1 or stack[0] != expected) return error.TypeMismatch;
+    if (sp != 1 or !subtypeOf(stack[0], expected)) return error.TypeMismatch;
 }
 
 fn validateFunction(a: std.mem.Allocator, module: *const Module, ft: Module.FuncType, code: Module.Code) Error!void {
@@ -173,7 +178,14 @@ fn validateFunction(a: std.mem.Allocator, module: *const Module, ft: Module.Func
 
     const instrs = try opcode.decodeBody(a, code.body);
 
-    var v: FuncValidator = .{ .a = a, .module = module, .locals = locals.items, .results = ft.results };
+    // Local-init: parameters are always initialized; a *declared* defaultable
+    // local starts initialized, but a non-nullable-ref one is non-defaultable and
+    // starts uninitialized.
+    const n_params = ft.params.len;
+    const local_init = try a.alloc(bool, locals.items.len);
+    for (local_init, locals.items, 0..) |*init, t, i| init.* = i < n_params or !t.isNonNullRef();
+
+    var v: FuncValidator = .{ .a = a, .module = module, .locals = locals.items, .results = ft.results, .local_init = local_init };
     // The whole body is an implicit block of type [] -> results; its trailing
     // `end` closes this frame.
     try v.pushCtrl(.block, empty, ft.results);
@@ -193,6 +205,9 @@ const Frame = struct {
     end: []const V,
     height: usize,
     is_unreachable: bool,
+    /// Local-init state at this frame's entry; a structured control instruction
+    /// restores it on `else`/`end` (inner sets don't escape the construct).
+    init_snapshot: []bool,
 };
 
 const FuncValidator = struct {
@@ -200,6 +215,9 @@ const FuncValidator = struct {
     module: *const Module,
     locals: []const V,
     results: []const V,
+    /// Whether each local is currently known-initialized (params + defaultable
+    /// locals start true; non-nullable-ref locals start false).
+    local_init: []bool,
     vals: std.ArrayList(StackType) = .empty,
     ctrls: std.ArrayList(Frame) = .empty,
 
@@ -225,7 +243,7 @@ const FuncValidator = struct {
         const actual = try self.popVal();
         switch (actual) {
             .unknown => {},
-            .val => |t| if (t != expect) return error.TypeMismatch,
+            .val => |t| if (!subtypeOf(t, expect)) return error.TypeMismatch,
         }
         return actual;
     }
@@ -240,10 +258,15 @@ const FuncValidator = struct {
     fn popRef(self: *FuncValidator) Error!StackType {
         const st = try self.popVal();
         switch (st) {
-            .val => |v| if (v != .funcref and v != .externref) return error.TypeMismatch,
+            .val => |v| if (!v.isRef()) return error.TypeMismatch,
             .unknown => {},
         }
         return st;
+    }
+
+    /// True if the innermost control frame is in unreachable (polymorphic) code.
+    fn topUnreachable(self: *FuncValidator) bool {
+        return self.ctrls.items.len != 0 and self.ctrls.items[self.ctrls.items.len - 1].is_unreachable;
     }
 
     fn pushCtrl(self: *FuncValidator, kind: FrameKind, start: []const V, end: []const V) Error!void {
@@ -253,6 +276,7 @@ const FuncValidator = struct {
             .end = end,
             .height = self.vals.items.len,
             .is_unreachable = false,
+            .init_snapshot = try self.a.dupe(bool, self.local_init),
         });
         try self.pushVals(start);
     }
@@ -333,6 +357,9 @@ const FuncValidator = struct {
             .@"else" => {
                 const frame = try self.popCtrl();
                 if (frame.kind != .if_) return error.MismatchedElse;
+                // The else branch starts from the if's entry init state (sets in
+                // the then branch don't carry over).
+                @memcpy(self.local_init, frame.init_snapshot);
                 try self.pushCtrl(.else_, frame.start, frame.end);
             },
             .end => {
@@ -340,6 +367,8 @@ const FuncValidator = struct {
                 // An `if` closed without an `else` has an implicit identity else
                 // branch, which requires the param and result types to match.
                 if (frame.kind == .if_ and !std.mem.eql(V, frame.start, frame.end)) return error.TypeMismatch;
+                // Restore the entry init state — inner sets don't escape (§3.3.5).
+                @memcpy(self.local_init, frame.init_snapshot);
                 try self.pushVals(frame.end);
             },
 
@@ -464,14 +493,14 @@ const FuncValidator = struct {
             .ref_null => try self.pushValT(instr.imm.ref_type),
             .ref_is_null => {
                 switch (try self.popVal()) { // requires a reference type (or polymorphic)
-                    .val => |v| if (v != .funcref and v != .externref) return error.TypeMismatch,
+                    .val => |v| if (!v.isRef()) return error.TypeMismatch,
                     .unknown => {},
                 }
                 try self.pushValT(.i32);
             },
             .ref_func => {
                 if (self.module.funcType(instr.imm.func) == null) return error.UndefinedFunc;
-                try self.pushValT(.funcref);
+                try self.pushValT(.funcref_nn); // a function reference is non-null
             },
 
             // Typed function references (function-references proposal). A typed
@@ -510,11 +539,22 @@ const FuncValidator = struct {
                 _ = try self.popRef();
             },
 
-            .local_get => try self.pushValT(try self.localAt(instr.imm.local)),
-            .local_set => _ = try self.popExpect(try self.localAt(instr.imm.local)),
+            .local_get => {
+                const t = try self.localAt(instr.imm.local);
+                // A non-defaultable local must have been set on this path (unless
+                // we're already in unreachable/polymorphic code).
+                if (t.isNonNullRef() and !self.local_init[instr.imm.local] and !self.topUnreachable())
+                    return error.UninitializedLocal;
+                try self.pushValT(t);
+            },
+            .local_set => {
+                _ = try self.popExpect(try self.localAt(instr.imm.local));
+                self.local_init[instr.imm.local] = true;
+            },
             .local_tee => {
                 const t = try self.localAt(instr.imm.local);
                 _ = try self.popExpect(t);
+                self.local_init[instr.imm.local] = true;
                 try self.pushValT(t);
             },
             .global_get => try self.pushValT((try self.globalAt(instr.imm.global)).content),
@@ -556,11 +596,20 @@ fn valTypesEqual(a: []const V, b: []const V) bool {
     return true;
 }
 
+/// Is `sub` a subtype of `sup` (for operand matching)? Identical types match; a
+/// non-nullable reference is a subtype of its nullable form (`(ref t) <: (ref
+/// null t)`), so a non-null value satisfies a nullable expectation but not the
+/// reverse.
+fn subtypeOf(sub: V, sup: V) bool {
+    if (sub == sup) return true;
+    return sub.isNonNullRef() and sub.nullable() == sup;
+}
+
 /// True if an abstract stack entry is a concrete reference type (funcref /
 /// externref). Unknown (polymorphic) entries are not — they can't be pinned.
 fn isRefStack(st: StackType) bool {
     return switch (st) {
-        .val => |v| v == .funcref or v == .externref,
+        .val => |v| v.isRef(),
         .unknown => false,
     };
 }

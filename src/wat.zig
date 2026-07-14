@@ -854,25 +854,29 @@ fn isId(s: Sexpr) bool {
 }
 
 fn parseValType(s: Sexpr) Error!V {
-    // Reference type spelled as a list: `(ref null? func|extern)`.
+    // Reference type spelled as a list: `(ref null? ht)` — `null` marks nullable.
     if (s.asList()) |l| {
-        if (l.len >= 2 and eqAtom(l[0], "ref")) return heapTypeToValType(l[l.len - 1]);
+        if (l.len >= 2 and eqAtom(l[0], "ref")) {
+            const nullable = l.len >= 3 and eqAtom(l[1], "null");
+            return heapTypeToValType(l[l.len - 1], nullable);
+        }
         return error.BadValType;
     }
     const atom = s.asAtom() orelse return error.BadValType;
     return stringToValType(atom) orelse error.BadValType;
 }
 
-/// A heap type → an opaque reference slot (typed/GC-ref acceptance, P1). A
-/// concrete `$t` type reference and the `func`/`nofunc` families → `funcref`;
-/// every other heap type (`extern`/`any`/`eq`/`i31`/`struct`/`array`/`none`/
-/// `noextern`/`exn`) → `externref`. Precise typing is deferred to later passes.
-fn heapTypeToValType(s: Sexpr) Error!V {
+/// A heap type → a reference slot. A concrete `$t` and the `func`/`nofunc`
+/// families → the func slot; every other heap type (`extern`/`any`/`eq`/`i31`/
+/// `struct`/`array`/`none`/`noextern`/`exn`) → the extern (opaque) slot.
+/// `nullable` picks the nullable vs non-null variant.
+fn heapTypeToValType(s: Sexpr, nullable: bool) Error!V {
     const atom = s.asAtom() orelse return error.BadValType;
-    if (atom.len != 0 and atom[0] == '$') return .funcref; // concrete `(ref $t)`
-    if (std.mem.eql(u8, atom, "func") or std.mem.eql(u8, atom, "funcref") or std.mem.eql(u8, atom, "nofunc")) return .funcref;
+    const is_func = (atom.len != 0 and atom[0] == '$') or
+        std.mem.eql(u8, atom, "func") or std.mem.eql(u8, atom, "funcref") or std.mem.eql(u8, atom, "nofunc");
+    if (is_func) return if (nullable) .funcref else .funcref_nn;
     inline for (.{ "extern", "externref", "any", "eq", "i31", "struct", "array", "none", "noextern", "exn", "noexn" }) |ht| {
-        if (std.mem.eql(u8, atom, ht)) return .externref;
+        if (std.mem.eql(u8, atom, ht)) return if (nullable) .externref else .externref_nn;
     }
     return error.BadValType;
 }
@@ -1311,7 +1315,7 @@ fn emitInstr(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
         .f64c => try floatBits(ctx, u64, try imm0(immediates)),
         .mem => try emitMemArg(ctx, op, immediates),
         .mem_reserved => try ctx.out.append(ctx.a, 0x00),
-        .ref_type => try ctx.out.append(ctx.a, @intFromEnum(try heapTypeToValType(try imm0(immediates)))),
+        .ref_type => try ctx.out.append(ctx.a, @intFromEnum(try heapTypeToValType(try imm0(immediates), true))), // ref.null → nullable
         .br_table => try emitBrTable(ctx, immediates),
         .table_init, .elem, .table_copy => try emitBulkTableImm(ctx, op, immediates),
         else => return error.UnsupportedInstr, // block_type (handled structurally), call_indirect

@@ -42,14 +42,43 @@ pub const ValType = enum(u8) {
     v128 = 0x7b,
     funcref = 0x70,
     externref = 0x6f,
+    // Non-nullable reference types (`(ref func)` / `(ref extern)`, function-
+    // references proposal). Synthetic internal tags in an otherwise-unused
+    // valtype-byte range — our assembler/decoder round-trip them, and an external
+    // binary's `0x64 ht` maps here. All other typed/GC refs collapse to the
+    // nullable slots (see `Module.readValType`).
+    funcref_nn = 0x68,
+    externref_nn = 0x67,
     _,
 
     /// True only for the defined value-type bytes (rejects garbage decoded via
     /// `@enumFromInt`).
     pub fn isValid(self: ValType) bool {
         return switch (self) {
-            .i32, .i64, .f32, .f64, .v128, .funcref, .externref => true,
+            .i32, .i64, .f32, .f64, .v128, .funcref, .externref, .funcref_nn, .externref_nn => true,
             _ => false,
+        };
+    }
+
+    /// True for any reference type (nullable or not).
+    pub fn isRef(self: ValType) bool {
+        return switch (self) {
+            .funcref, .externref, .funcref_nn, .externref_nn => true,
+            else => false,
+        };
+    }
+
+    /// True for a non-nullable reference (a non-defaultable local type).
+    pub fn isNonNullRef(self: ValType) bool {
+        return self == .funcref_nn or self == .externref_nn;
+    }
+
+    /// The nullable form of a reference type (non-null → nullable; others as-is).
+    pub fn nullable(self: ValType) ValType {
+        return switch (self) {
+            .funcref_nn => .funcref,
+            .externref_nn => .externref,
+            else => self,
         };
     }
 };

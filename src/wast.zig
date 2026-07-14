@@ -640,6 +640,41 @@ test "runs assert_return and assert_trap over a module" {
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
 
+fn buildAndValidate(a: std.mem.Allocator, src: []const u8) !void {
+    const bin = try wat.assemble(a, src);
+    var m = try Module.decode(a, bin);
+    try validate(a, &m);
+}
+
+test "non-null refs: subtyping + uninitialized-local rejection (P2.5)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // A non-nullable local read before being set → invalid.
+    try std.testing.expectError(error.UninitializedLocal, buildAndValidate(a,
+        \\(module (func (local $x (ref extern)) (drop (local.get $x))))
+    ));
+    // Passing a nullable null to a non-null param → type mismatch (subtyping).
+    try std.testing.expectError(error.TypeMismatch, buildAndValidate(a,
+        \\(module (type $t (func))
+        \\  (func $g (param (ref $t)))
+        \\  (func (call $g (ref.null $t))))
+    ));
+    // Set-before-get with a non-null local, and a non-null value into a nullable
+    // slot (subtype), are valid.
+    const ok =
+        \\(module
+        \\  (func (export "ok") (param $p (ref extern)) (result externref)
+        \\    (local $x (ref extern))
+        \\    (local.set $x (local.get $p))
+        \\    (local.get $x)))
+        \\(assert_return (invoke "ok" (ref.extern 7)) (ref.extern 7))
+    ;
+    const s = try runScript(std.testing.allocator, ok);
+    try std.testing.expectEqual(@as(usize, 1), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
 test "call_ref / return_call_ref / ref.as_non_null (P2)" {
     const src =
         \\(module

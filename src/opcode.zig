@@ -379,6 +379,8 @@ fn readBlockType(r: *Reader) DecodeError!BlockType {
         -5 => .{ .value = .v128 },
         -16 => .{ .value = .funcref },
         -17 => .{ .value = .externref },
+        -24 => .{ .value = .funcref_nn }, // 0x68 (our synthetic non-null tag)
+        -25 => .{ .value = .externref_nn }, // 0x67
         else => error.UnsupportedOpcode,
     };
 }
