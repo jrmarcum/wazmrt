@@ -38,9 +38,13 @@ the **WAST script runner** (`wast.zig`) is next.
   (`env.add`) and export (`run`, params=2 results=1). Retired the ad-hoc `wazmrt_module_*` ABI.
 - **cmem/ project memory** established (this folder), mirroring the wasmtk setup.
 
-**Remaining (in owner-set order):** **(1) full GC — P3, NEXT** (WasmGC: i31 → struct/array →
+**Remaining (in owner-set order):** **(1) full GC — P3, IN PROGRESS** (WasmGC: i31 → struct/array →
 `ref.test`/`ref.cast`/`br_on_cast`; browser-standard, so in scope; owner directive 2026-07-13 puts it
-*ahead* of the C-ABI/benchmark work — build in tested parts). **(2)** grow the wasm-c-api past
+*ahead* of the C-ABI/benchmark work — build in tested parts). **i31 slice DONE 2026-07-14** — the `any`
+reference hierarchy is now distinct value types with real subtyping (`types.RefHeap.sub`), unboxed i31
+in the `u64` slot, `ref.i31`/`i31.get_s`/`i31.get_u` under the `0xFB` prefix (assemble→run→trap-on-null),
++5 unit tests (77 total). **Next P3 part: struct/array** (heap objects — needs the GC heap + type-section
+rec/sub groups + field access), then `ref.test`/`ref.cast`/`br_on_cast`. **(2)** grow the wasm-c-api past
 introspection (instance/func/call) → embeddable end-to-end + first `universalWasmLoader-*` integration.
 **(3)** the Deno/V8 benchmark. **(4) WASI preview 1** (preview 2/3 deferred until browser-standard, per
 wasmtk). **The function-references proposal is complete** (typed-ref value types, `call_ref`/

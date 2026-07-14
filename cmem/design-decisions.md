@@ -69,13 +69,27 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   - **In scope / done:** MVP, reference types, multi-table, bulk table ops, extended-const, and the
     **function-references proposal** (typed refs, `call_ref`, non-null refs + local-init — DONE
     2026-07-13).
-  - **In scope / NEXT — full GC (P3).** **WasmGC** (i31/struct/array heap objects, `struct.new`/
+  - **In scope / IN PROGRESS — full GC (P3).** **WasmGC** (i31/struct/array heap objects, `struct.new`/
     `array.new`/field access, `ref.test`/`ref.cast`/`br_on_cast`, subtyping, rec groups) is
     browser-standard (Chrome/Firefox 2023), so it is in scope. **Owner directive (2026-07-13): P3 is the
     next major increment and comes BEFORE growing the wasm-c-api (instance/func/call) and the Deno/V8
     benchmark.** It needs a GC heap + object model + RTTs — a size cost accepted despite the
     smallest-binary lean (likely gated to a native/opt-in build). Build it in tested parts (the wasmtk
     way): i31 first, then struct/array, then the cast/test ops. **WASI preview 1** follows.
+    - **i31 slice DONE 2026-07-14** (first tested part). The WasmGC `any` internal hierarchy is now
+      modeled as *distinct* `ValType`s (`anyref`/`eqref`/`i31ref`/`structref`/`arrayref`/`nullref` +
+      non-null `*_nn` synthetic tags) instead of collapsing to `externref` — so `refHeap()` +
+      `RefHeap.sub()` in `types.zig` drive real GC subtyping (i31/struct/array <: eq <: any; `none`
+      bottom; func/extern disjoint), and `validate.subtypeOf` combines heap-subtype with nullability.
+      **`i31` is unboxed** — the 31-bit payload lives directly in the interpreter's `u64` value slot
+      (range `0..2^31-1`, so it can never alias the `null_ref = maxInt(u64)` sentinel); **no heap yet**.
+      Ops `ref.i31`/`i31.get_s`/`i31.get_u` decode under the **`0xFB` prefix** (internal `Op` tags
+      `0xf0..0xf2` via `gcSubOpcode`, mirroring the `0xFC` table-op scheme), assemble+run, and `i31.get`
+      on a null ref traps (`error.NullReference`). `structref`/`arrayref` exist as *types* (subtyping
+      only) — their `struct.*`/`array.*` ops are still `error.UnsupportedOpcode` (the next slice).
+      **Known gap carried in:** a nullable-ref local still defaults to `0`, not `null_ref`
+      (`interp.callFunction` `@memset(locals, 0)`) — latent, unchanged this slice; non-null refs are
+      non-defaultable so validation already guards the common case.
   - **Deferred (until browser-standard):** **WASI preview 2/3** (component-model based), **multi-memory**,
     exception-handling **tags**, **SIMD** — pulled in as the real corpus (`wasm_wasi`) demands. Typed/GC
     reference *value types* are already *accepted* (P1) so such modules build.

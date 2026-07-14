@@ -866,32 +866,46 @@ fn parseValType(s: Sexpr) Error!V {
     return stringToValType(atom) orelse error.BadValType;
 }
 
-/// A heap type → a reference slot. A concrete `$t` and the `func`/`nofunc`
-/// families → the func slot; every other heap type (`extern`/`any`/`eq`/`i31`/
-/// `struct`/`array`/`none`/`noextern`/`exn`) → the extern (opaque) slot.
-/// `nullable` picks the nullable vs non-null variant.
+/// A heap type → a reference value type. A concrete `$t` and the `func`/`nofunc`
+/// families → the func slot; the WasmGC `any` hierarchy (`any`/`eq`/`i31`/
+/// `struct`/`array`/`none`) → its own value types; `extern`/`noextern`/`exn` →
+/// the opaque extern slot. `nullable` picks the nullable vs non-null variant.
 fn heapTypeToValType(s: Sexpr, nullable: bool) Error!V {
     const atom = s.asAtom() orelse return error.BadValType;
-    const is_func = (atom.len != 0 and atom[0] == '$') or
-        std.mem.eql(u8, atom, "func") or std.mem.eql(u8, atom, "funcref") or std.mem.eql(u8, atom, "nofunc");
-    if (is_func) return if (nullable) .funcref else .funcref_nn;
-    inline for (.{ "extern", "externref", "any", "eq", "i31", "struct", "array", "none", "noextern", "exn", "noexn" }) |ht| {
-        if (std.mem.eql(u8, atom, ht)) return if (nullable) .externref else .externref_nn;
-    }
-    return error.BadValType;
+    if (atom.len != 0 and atom[0] == '$') return if (nullable) .funcref else .funcref_nn;
+    const pair: ?[2]V = if (std.mem.eql(u8, atom, "func") or std.mem.eql(u8, atom, "funcref") or std.mem.eql(u8, atom, "nofunc"))
+        .{ .funcref, .funcref_nn }
+    else if (std.mem.eql(u8, atom, "extern") or std.mem.eql(u8, atom, "externref") or std.mem.eql(u8, atom, "noextern") or std.mem.eql(u8, atom, "exn") or std.mem.eql(u8, atom, "noexn"))
+        .{ .externref, .externref_nn }
+    else if (std.mem.eql(u8, atom, "any") or std.mem.eql(u8, atom, "anyref"))
+        .{ .anyref, .anyref_nn }
+    else if (std.mem.eql(u8, atom, "eq") or std.mem.eql(u8, atom, "eqref"))
+        .{ .eqref, .eqref_nn }
+    else if (std.mem.eql(u8, atom, "i31") or std.mem.eql(u8, atom, "i31ref"))
+        .{ .i31ref, .i31ref_nn }
+    else if (std.mem.eql(u8, atom, "struct") or std.mem.eql(u8, atom, "structref"))
+        .{ .structref, .structref_nn }
+    else if (std.mem.eql(u8, atom, "array") or std.mem.eql(u8, atom, "arrayref"))
+        .{ .arrayref, .arrayref_nn }
+    else if (std.mem.eql(u8, atom, "none") or std.mem.eql(u8, atom, "nullref"))
+        .{ .nullref, .nullref_nn }
+    else
+        null;
+    const p = pair orelse return error.BadValType;
+    return if (nullable) p[0] else p[1];
 }
 
 fn stringToValType(atom: []const u8) ?V {
     const map = .{
-        .{ "i32", V.i32 },           .{ "i64", V.i64 },   .{ "f32", V.f32 },
-        .{ "f64", V.f64 },           .{ "v128", V.v128 },
-        // Reference-type shorthands collapse to the two opaque slots.
-        .{ "funcref", V.funcref },   .{ "nullfuncref", V.funcref },
+        .{ "i32", V.i32 },             .{ "i64", V.i64 },             .{ "f32", V.f32 },
+        .{ "f64", V.f64 },             .{ "v128", V.v128 },
+        .{ "funcref", V.funcref },     .{ "nullfuncref", V.funcref },
         .{ "externref", V.externref }, .{ "nullexternref", V.externref },
-        .{ "anyref", V.externref },  .{ "eqref", V.externref },
-        .{ "i31ref", V.externref },  .{ "structref", V.externref },
-        .{ "arrayref", V.externref }, .{ "nullref", V.externref },
-        .{ "exnref", V.externref },  .{ "nullexnref", V.externref },
+        // The WasmGC `any` hierarchy — each shorthand its own value type.
+        .{ "anyref", V.anyref },       .{ "eqref", V.eqref },
+        .{ "i31ref", V.i31ref },       .{ "structref", V.structref },
+        .{ "arrayref", V.arrayref },   .{ "nullref", V.nullref },
+        .{ "exnref", V.externref },    .{ "nullexnref", V.externref },
     };
     inline for (map) |m| {
         if (std.mem.eql(u8, atom, m[0])) return m[1];
@@ -1256,11 +1270,14 @@ fn emitBrTable(ctx: *Ctx, labels: []const Sexpr) Error!void {
     try uleb(ctx.a, ctx.out, try resolveLabel(ctx, labels[labels.len - 1]));
 }
 
-/// Emit an opcode's bytes: a `0xFC`-prefixed pair for table ops, else the single
-/// enum byte.
+/// Emit an opcode's bytes: a `0xFC`-prefixed pair for table ops, a `0xFB`-prefixed
+/// pair for GC ops, else the single enum byte.
 fn emitOpcode(ctx: *Ctx, op: Op) Error!void {
     if (opcode.fcSubOpcode(op)) |sub| {
         try ctx.out.append(ctx.a, 0xfc);
+        try uleb(ctx.a, ctx.out, sub);
+    } else if (opcode.gcSubOpcode(op)) |sub| {
+        try ctx.out.append(ctx.a, 0xfb);
         try uleb(ctx.a, ctx.out, sub);
     } else {
         try ctx.out.append(ctx.a, @intFromEnum(op));
@@ -1944,4 +1961,97 @@ test "assembles multi-value function results" {
     try std.testing.expectEqual(@as(usize, 2), r.len);
     try std.testing.expectEqual(@as(i32, 7), interp.asI32(r[0]));
     try std.testing.expectEqual(@as(i32, 3), interp.asI32(r[1]));
+}
+
+test "GC i31: ref.i31 round-trips through i31.get_s / i31.get_u" {
+    // roundtrip(x) = i31.get_s(ref.i31 x); u(x) = i31.get_u(ref.i31 x).
+    const src =
+        \\(module
+        \\  (func (export "s") (param i32) (result i32)
+        \\    (i31.get_s (ref.i31 (local.get 0))))
+        \\  (func (export "u") (param i32) (result i32)
+        \\    (i31.get_u (ref.i31 (local.get 0)))))
+    ;
+    // Small positive: identity both ways.
+    try std.testing.expectEqual(@as(i32, 42), interp.asI32(try assembleAndRun(src, "s", &.{interp.i32Value(42)})));
+    try std.testing.expectEqual(@as(i32, 42), interp.asI32(try assembleAndRun(src, "u", &.{interp.i32Value(42)})));
+    // -1 wraps to the 31-bit pattern 0x7fffffff: get_s sign-extends → -1,
+    // get_u zero-extends → 0x7fffffff (2147483647).
+    try std.testing.expectEqual(@as(i32, -1), interp.asI32(try assembleAndRun(src, "s", &.{interp.i32Value(-1)})));
+    try std.testing.expectEqual(@as(i32, 2147483647), interp.asI32(try assembleAndRun(src, "u", &.{interp.i32Value(-1)})));
+    // Bit 30 set (0x40000000) is the i31 sign bit: get_s → negative.
+    try std.testing.expectEqual(@as(i32, -1073741824), interp.asI32(try assembleAndRun(src, "s", &.{interp.i32Value(0x40000000)})));
+    try std.testing.expectEqual(@as(i32, 0x40000000), interp.asI32(try assembleAndRun(src, "u", &.{interp.i32Value(0x40000000)})));
+}
+
+test "GC i31: i31ref is non-null; ref.null i31 reports null" {
+    const src =
+        \\(module
+        \\  (func (export "isnull") (param i32) (result i32)
+        \\    (if (result i32) (local.get 0)
+        \\      (then (ref.is_null (ref.null i31)))
+        \\      (else (ref.is_null (ref.i31 (i32.const 7)))))))
+    ;
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(src, "isnull", &.{interp.i32Value(1)})));
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "isnull", &.{interp.i32Value(0)})));
+}
+
+test "GC i31: i31.get_s on a null i31 ref traps" {
+    const src =
+        \\(module
+        \\  (func (export "trap") (result i32)
+        \\    (i31.get_s (ref.null i31))))
+    ;
+    try std.testing.expectError(error.NullReference, assembleAndRun(src, "trap", &.{}));
+}
+
+test "GC i31: (ref i31) flows into an anyref local and an eqref result (subtyping)" {
+    // A non-null (ref i31) must validate against an anyref-typed local (set) and
+    // an eqref function result — exercises the WasmGC subtype hierarchy
+    // (i31 <: eq <: any) plus non-null <: nullable in the validator.
+    const src =
+        \\(module
+        \\  (func (export "up") (param i32) (result eqref)
+        \\    (local $a anyref)
+        \\    (local.set $a (ref.i31 (local.get 0)))
+        \\    (ref.i31 (local.get 0))))
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bin = try assemble(a, src);
+    var m = try Module.decode(a, bin);
+    try validate(a, &m); // must type-check: (ref i31) <: anyref and <: eqref
+}
+
+test "GC i31: validator rejects i31.get on a non-i31 reference" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // i31.get_s wants (ref null i31); a funcref is a disjoint hierarchy.
+    const bad = try assemble(a,
+        \\(module (func $f)
+        \\  (func (export "x") (result i32) (i31.get_s (ref.func $f))))
+    );
+    var mbad = try Module.decode(a, bad);
+    try std.testing.expectError(error.TypeMismatch, validate(a, &mbad));
+
+    // ref.i31 wants an i32 operand, not a reference.
+    const bad2 = try assemble(a,
+        \\(module (func (export "y") (result i32)
+        \\  (i31.get_s (ref.i31 (ref.null i31)))))
+    );
+    var mbad2 = try Module.decode(a, bad2);
+    try std.testing.expectError(error.TypeMismatch, validate(a, &mbad2));
+
+    // A nullable i31ref must NOT satisfy a non-null (ref i31) expectation:
+    // ref.as_non_null keeps refs, but feeding a plain nullable where non-null is
+    // required is caught by subtyping — checked here via anyref (super) → i31ref.
+    const bad3 = try assemble(a,
+        \\(module (func (export "z") (param anyref) (result i32)
+        \\  (i31.get_s (local.get 0))))
+    );
+    var mbad3 = try Module.decode(a, bad3);
+    // anyref is a *super*type of i31ref, so it must not satisfy the i31.get operand.
+    try std.testing.expectError(error.TypeMismatch, validate(a, &mbad3));
 }

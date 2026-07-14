@@ -249,6 +249,13 @@ pub const Op = enum(u8) {
     table_size = 0xe4, // 0xFC 0x10
     table_fill = 0xe5, // 0xFC 0x11
 
+    // GC ops carried under the `0xFB` prefix (full GC proposal, P3). Like the
+    // table ops above, these enum values are INTERNAL tags in an unused byte
+    // range — the wire encoding is `0xFB` + a LEB sub-opcode (see `gcSubOpcode`).
+    ref_i31 = 0xf0, // 0xFB 0x1c: [i32] -> [(ref i31)]
+    i31_get_s = 0xf1, // 0xFB 0x1d: [(ref null i31)] -> [i32]
+    i31_get_u = 0xf2, // 0xFB 0x1e: [(ref null i31)] -> [i32]
+
     _,
 };
 
@@ -261,6 +268,16 @@ pub fn fcSubOpcode(op: Op) ?u8 {
         .table_grow => 0x0f,
         .table_size => 0x10,
         .table_fill => 0x11,
+        else => null,
+    };
+}
+
+/// The `0xFB` sub-opcode for an internal GC-op tag, or null for a normal op.
+pub fn gcSubOpcode(op: Op) ?u8 {
+    return switch (op) {
+        .ref_i31 => 0x1c,
+        .i31_get_s => 0x1d,
+        .i31_get_u => 0x1e,
         else => null,
     };
 }
@@ -361,6 +378,8 @@ pub fn immediateKind(op: Op) ImmKind {
         0xd2 => .func, // ref.func <funcidx>
         // Everything else in the core-MVP range has no immediate.
         0x00, 0x01, 0x05, 0x0b, 0x0f, 0x1a, 0x1b, 0xd1, 0xd4, 0x45...0xc4 => .none,
+        // GC ops with no immediate (internal 0xFB tags): ref.i31/i31.get_s/i31.get_u.
+        0xf0, 0xf1, 0xf2 => .none,
         else => .unsupported,
     };
 }
@@ -377,8 +396,14 @@ fn readBlockType(r: *Reader) DecodeError!BlockType {
         -3 => .{ .value = .f32 },
         -4 => .{ .value = .f64 },
         -5 => .{ .value = .v128 },
-        -16 => .{ .value = .funcref },
-        -17 => .{ .value = .externref },
+        -16 => .{ .value = .funcref }, // 0x70
+        -17 => .{ .value = .externref }, // 0x6f
+        -18 => .{ .value = .anyref }, // 0x6e
+        -19 => .{ .value = .eqref }, // 0x6d
+        -20 => .{ .value = .i31ref }, // 0x6c
+        -21 => .{ .value = .structref }, // 0x6b
+        -22 => .{ .value = .arrayref }, // 0x6a
+        -15 => .{ .value = .nullref }, // 0x71 (none)
         -24 => .{ .value = .funcref_nn }, // 0x68 (our synthetic non-null tag)
         -25 => .{ .value = .externref_nn }, // 0x67
         else => error.UnsupportedOpcode,
@@ -395,6 +420,17 @@ pub fn decodeBody(a: std.mem.Allocator, body: []const u8) (DecodeError || std.me
 
     while (!r.atEnd()) {
         const b0 = try r.readByte();
+        if (b0 == 0xfb) {
+            // 0xFB-prefixed GC op: a LEB sub-opcode picks the internal Op tag.
+            const op: Op = switch (try r.readVarU32()) {
+                0x1c => .ref_i31,
+                0x1d => .i31_get_s,
+                0x1e => .i31_get_u,
+                else => return error.UnsupportedOpcode,
+            };
+            try list.append(a, .{ .op = op, .imm = .none });
+            continue;
+        }
         if (b0 == 0xfc) {
             // 0xFC-prefixed op: a LEB sub-opcode picks the internal Op tag.
             const imm: Instr = switch (try r.readVarU32()) {

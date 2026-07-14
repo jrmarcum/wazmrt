@@ -308,26 +308,50 @@ fn readValType(r: *Reader) Error!types.ValType {
     const b = try r.readByte();
     return switch (b) {
         0x7f, 0x7e, 0x7d, 0x7c, 0x7b => @enumFromInt(b), // i32 i64 f32 f64 v128
-        0x70, 0x73 => .funcref, // funcref, nullfuncref (nofunc)
-        // externref, anyref, eqref, i31ref, structref, arrayref, nullref,
-        // nullexternref, exnref, nullexnref → opaque reference.
-        0x6f, 0x6e, 0x6d, 0x6c, 0x6b, 0x6a, 0x71, 0x72, 0x69, 0x74 => .externref,
+        0x70, 0x73 => .funcref, // funcref, nullfuncref (nofunc) → func family head
+        0x6f, 0x72 => .externref, // externref, nullexternref (noextern)
+        // The WasmGC `any` internal hierarchy (full GC, P3): each abstract head is
+        // its own value type, encoded by its real valtype byte.
+        0x6e => .anyref,
+        0x6d => .eqref,
+        0x6c => .i31ref,
+        0x6b => .structref,
+        0x6a => .arrayref,
+        0x71 => .nullref, // none
+        0x69, 0x74 => .externref, // exnref, nullexnref (EH — opaque, out of scope)
         0x68 => .funcref_nn, // our synthetic non-null tags (assembler round-trip)
         0x67 => .externref_nn,
+        0x66 => .anyref_nn,
+        0x65 => .eqref_nn,
+        0x62 => .i31ref_nn,
+        0x61 => .structref_nn,
+        0x59 => .arrayref_nn,
+        0x58 => .nullref_nn,
         0x63 => try readHeapTypeRef(r, true), // (ref null ht)
         0x64 => try readHeapTypeRef(r, false), // (ref ht) — non-nullable
         else => error.BadValType,
     };
 }
 
-/// Map a `heaptype` (following a `0x63`/`0x64` ref prefix) to a reference slot: a
-/// non-negative `s33` is a type index (a concrete — hence func — reference);
-/// negative encodings are abstract heap types. `nullable` selects the slot.
+/// Map a `heaptype` (following a `0x63`/`0x64` ref prefix) to a reference value
+/// type: a non-negative `s33` is a type index (a concrete — hence func —
+/// reference); negative encodings are the abstract heap types. `nullable` picks
+/// the nullable vs non-null variant.
 fn readHeapTypeRef(r: *Reader, nullable: bool) Error!types.ValType {
     const ht = try r.readVarI64(); // s33
-    const is_func = ht >= 0 or ht == -0x10 or ht == -0x0d; // typeidx, func, nofunc
-    if (is_func) return if (nullable) .funcref else .funcref_nn;
-    return if (nullable) .externref else .externref_nn;
+    if (ht >= 0) return if (nullable) .funcref else .funcref_nn; // concrete typeidx → func family
+    const both: [2]types.ValType = switch (ht) {
+        -0x10, -0x0d => .{ .funcref, .funcref_nn }, // func, nofunc
+        -0x11, -0x0e => .{ .externref, .externref_nn }, // extern, noextern
+        -0x12 => .{ .anyref, .anyref_nn }, // any
+        -0x13 => .{ .eqref, .eqref_nn }, // eq
+        -0x14 => .{ .i31ref, .i31ref_nn }, // i31
+        -0x15 => .{ .structref, .structref_nn }, // struct
+        -0x16 => .{ .arrayref, .arrayref_nn }, // array
+        -0x0f => .{ .nullref, .nullref_nn }, // none
+        else => .{ .externref, .externref_nn }, // exn/other → opaque
+    };
+    return if (nullable) both[0] else both[1];
 }
 
 fn readValTypes(a: std.mem.Allocator, r: *Reader) Error![]const types.ValType {

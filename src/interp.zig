@@ -538,6 +538,29 @@ const Frame = struct {
                     pc += 1;
                 },
 
+                // --- GC: i31 references (full GC, P3) ---
+                // An i31 is unboxed: the 31-bit payload lives directly in the value
+                // slot (0..2^31-1, so it can never collide with `null_ref`).
+                .ref_i31 => {
+                    const x: u32 = @bitCast(self.popI32());
+                    try self.pushU64(x & 0x7fff_ffff); // wrap to 31 bits, non-null
+                    pc += 1;
+                },
+                .i31_get_s => {
+                    const r = self.pop();
+                    if (r == null_ref) return error.NullReference;
+                    // Sign-extend bit 30 to a full i32.
+                    const n: u32 = @truncate(r);
+                    try self.pushI32(@as(i32, @bitCast(n << 1)) >> 1);
+                    pc += 1;
+                },
+                .i31_get_u => {
+                    const r = self.pop();
+                    if (r == null_ref) return error.NullReference;
+                    try self.pushI32(@bitCast(@as(u32, @truncate(r)) & 0x7fff_ffff));
+                    pc += 1;
+                },
+
                 // --- Structured control flow ---
                 .block => {
                     const params = self.blockArity(instr.imm.block_type, true);

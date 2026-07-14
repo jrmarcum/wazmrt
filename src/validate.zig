@@ -520,6 +520,17 @@ const FuncValidator = struct {
                 if (!valTypesEqual(ft.results, self.results)) return error.TypeMismatch;
                 self.setUnreachable();
             },
+            // GC: i31 references (full GC, P3). `ref.i31` boxes an i32 into a
+            // non-null i31 ref; `i31.get_s`/`_u` project it back (traps on null).
+            .ref_i31 => {
+                _ = try self.popExpect(.i32);
+                try self.pushValT(.i31ref_nn);
+            },
+            .i31_get_s, .i31_get_u => {
+                _ = try self.popExpect(.i31ref); // (ref null i31) and its subtypes
+                try self.pushValT(.i32);
+            },
+
             .ref_as_non_null => try self.pushVal(try self.popRef()),
             .br_on_null => {
                 // Pop the ref; on branch pass [t*] to the label, on fall-through
@@ -596,13 +607,18 @@ fn valTypesEqual(a: []const V, b: []const V) bool {
     return true;
 }
 
-/// Is `sub` a subtype of `sup` (for operand matching)? Identical types match; a
-/// non-nullable reference is a subtype of its nullable form (`(ref t) <: (ref
-/// null t)`), so a non-null value satisfies a nullable expectation but not the
-/// reverse.
+/// Is `sub` a subtype of `sup` (for operand matching)? Identical types match.
+/// Reference subtyping follows the WasmGC hierarchy on the heap type
+/// (`RefHeap.sub`: i31/struct/array <: eq <: any; `none` the bottom; func/extern
+/// disjoint) combined with nullability: a non-null reference is a subtype of the
+/// nullable form (`(ref t) <: (ref null t)`), so a non-null value satisfies a
+/// nullable expectation but not the reverse.
 fn subtypeOf(sub: V, sup: V) bool {
     if (sub == sup) return true;
-    return sub.isNonNullRef() and sub.nullable() == sup;
+    if (!sub.isRef() or !sup.isRef()) return false;
+    if (!sub.refHeap().sub(sup.refHeap())) return false;
+    // A nullable sub cannot satisfy a non-null expectation.
+    return sup.isNonNullRef() == false or sub.isNonNullRef();
 }
 
 /// True if an abstract stack entry is a concrete reference type (funcref /

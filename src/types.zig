@@ -40,37 +40,57 @@ pub const ValType = enum(u8) {
     f32 = 0x7d,
     f64 = 0x7c,
     v128 = 0x7b,
+    // Abstract nullable heap-type shorthands, encoded by their real valtype bytes.
+    // `funcref`/`externref` head their own hierarchies; the `any` family (anyref →
+    // eqref → i31ref/structref/arrayref, with `nullref` the bottom) is the WasmGC
+    // internal hierarchy (full GC, P3). Concrete typed refs still collapse to the
+    // matching family head (see `Module.readValType`).
     funcref = 0x70,
     externref = 0x6f,
-    // Non-nullable reference types (`(ref func)` / `(ref extern)`, function-
-    // references proposal). Synthetic internal tags in an otherwise-unused
-    // valtype-byte range — our assembler/decoder round-trip them, and an external
-    // binary's `0x64 ht` maps here. All other typed/GC refs collapse to the
-    // nullable slots (see `Module.readValType`).
+    anyref = 0x6e,
+    eqref = 0x6d,
+    i31ref = 0x6c,
+    structref = 0x6b,
+    arrayref = 0x6a,
+    nullref = 0x71, // (ref null none) — bottom of the `any` hierarchy
+    // Non-nullable reference types (`(ref func)`/`(ref i31)`/…, function-references
+    // + GC proposals). Synthetic internal tags in an otherwise-unused valtype-byte
+    // range — our assembler/decoder round-trip them, and an external binary's
+    // `0x64 ht` maps here.
     funcref_nn = 0x68,
     externref_nn = 0x67,
+    anyref_nn = 0x66,
+    eqref_nn = 0x65,
+    i31ref_nn = 0x62,
+    structref_nn = 0x61,
+    arrayref_nn = 0x59,
+    nullref_nn = 0x58, // (ref none) — uninhabited but syntactically valid
     _,
 
     /// True only for the defined value-type bytes (rejects garbage decoded via
     /// `@enumFromInt`).
     pub fn isValid(self: ValType) bool {
         return switch (self) {
-            .i32, .i64, .f32, .f64, .v128, .funcref, .externref, .funcref_nn, .externref_nn => true,
-            _ => false,
+            .i32, .i64, .f32, .f64, .v128 => true,
+            else => self.isRef(),
         };
     }
 
     /// True for any reference type (nullable or not).
     pub fn isRef(self: ValType) bool {
         return switch (self) {
-            .funcref, .externref, .funcref_nn, .externref_nn => true,
+            .funcref, .externref, .anyref, .eqref, .i31ref, .structref, .arrayref, .nullref => true,
+            .funcref_nn, .externref_nn, .anyref_nn, .eqref_nn, .i31ref_nn, .structref_nn, .arrayref_nn, .nullref_nn => true,
             else => false,
         };
     }
 
     /// True for a non-nullable reference (a non-defaultable local type).
     pub fn isNonNullRef(self: ValType) bool {
-        return self == .funcref_nn or self == .externref_nn;
+        return switch (self) {
+            .funcref_nn, .externref_nn, .anyref_nn, .eqref_nn, .i31ref_nn, .structref_nn, .arrayref_nn, .nullref_nn => true,
+            else => false,
+        };
     }
 
     /// The nullable form of a reference type (non-null → nullable; others as-is).
@@ -78,7 +98,54 @@ pub const ValType = enum(u8) {
         return switch (self) {
             .funcref_nn => .funcref,
             .externref_nn => .externref,
+            .anyref_nn => .anyref,
+            .eqref_nn => .eqref,
+            .i31ref_nn => .i31ref,
+            .structref_nn => .structref,
+            .arrayref_nn => .arrayref,
+            .nullref_nn => .nullref,
             else => self,
+        };
+    }
+
+    /// The heap type a reference points at, ignoring nullability. Used to decide
+    /// reference subtyping (`RefHeap.sub`). Non-reference types have no heap.
+    pub const RefHeap = enum {
+        func,
+        extern_,
+        any,
+        eq,
+        i31,
+        @"struct",
+        array,
+        none,
+
+        /// Is heap `a` a subtype of heap `b` in the WasmGC hierarchy? The `func`
+        /// and `extern` hierarchies are disjoint from the `any` family; within
+        /// `any`, i31/struct/array <: eq <: any and `none` is the bottom.
+        pub fn sub(a: RefHeap, b: RefHeap) bool {
+            if (a == b) return true;
+            return switch (a) {
+                .none => b == .i31 or b == .@"struct" or b == .array or b == .eq or b == .any,
+                .i31, .@"struct", .array => b == .eq or b == .any,
+                .eq => b == .any,
+                else => false, // func/extern/any have no proper supertype here
+            };
+        }
+    };
+
+    /// The heap type of a reference value type (asserts `isRef`).
+    pub fn refHeap(self: ValType) RefHeap {
+        return switch (self) {
+            .funcref, .funcref_nn => .func,
+            .externref, .externref_nn => .extern_,
+            .anyref, .anyref_nn => .any,
+            .eqref, .eqref_nn => .eq,
+            .i31ref, .i31ref_nn => .i31,
+            .structref, .structref_nn => .@"struct",
+            .arrayref, .arrayref_nn => .array,
+            .nullref, .nullref_nn => .none,
+            else => unreachable,
         };
     }
 };

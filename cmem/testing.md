@@ -296,10 +296,25 @@ current one); `(get …)` reads an exported global; a missing target → `NoTarg
   `ref_as_non_null` 4 → **5/0**. Full git-stash A/B confirmed **zero regressions**.
 Net ~**+130 passes** across the ref files from near-zero. The **function-references proposal is
 essentially complete**; full **GC** (i31/struct/array heap objects, `ref.test`/`ref.cast`) is the **NEXT
-major increment (P3, per the owner — ahead of the C-ABI/benchmark work)**; see `roadmap.md`. **73 unit
-tests.**
+major increment (P3, per the owner — ahead of the C-ABI/benchmark work)**; see `roadmap.md`.
 The lone pre-existing `local_tee` 96/1 / `unreached-valid` 9/1 are concrete-type-collapse limitations
 (`(ref null $t)` is indistinguishable from `funcref` in our untyped-slot model), not regressions.
+
+### full GC — P3, i31 slice (2026-07-14)
+
+First tested part of WasmGC. The official spec `i31.wast` corpus isn't present in this tree (the
+`module/` conformance folder lives on removable media), so this slice is gated by **in-repo unit tests +
+a hand-written `i31.wast`** run through the CLI. Results:
+
+- **+5 unit tests → 77 total** (in `wat.zig`): `ref.i31`→`i31.get_s`/`_u` round-trip (incl. 31-bit sign
+  wrap of `-1` and bit-30), `i31ref` non-null vs `ref.null i31`, `i31.get` on null **traps**
+  (`NullReference`), `(ref i31)` up-casts into `anyref`/`eqref` slots (subtyping), and validator
+  **rejections** (i31.get on a funcref; ref.i31 on a ref; `anyref` super not accepted where i31 wanted).
+- **Hand-written `i31.wast`: 11/0** via `wazmrt <file.wast>` (assert_return + assert_trap for null i31).
+- **No regressions** — `zig build test` green; `zig build` (CLI + C lib) and `zig build wasm`
+  (freestanding) both build. The `any` hierarchy is now distinct value types with real subtyping; i31 is
+  unboxed in the `u64` slot (no heap yet). `struct.*`/`array.*` remain `error.UnsupportedOpcode` (next
+  slice). See `design-decisions.md` for the representation.
 
 ## What this tells the roadmap
 
