@@ -428,8 +428,30 @@ floor included, which both pay.)
   init + wasm JIT-compile + JS marshalling *every run*. So wazmrt wins the short-lived / compute-light
   regime — exactly wasmtk's compiler-test outputs. V8 only overtakes once a sustained hot loop is large
   enough that the interpreter's per-iteration cost exceeds Deno's ~110 ms startup tax (well beyond
-  `sum(1e6)`). **Binary size** (ReleaseFast): CLI exe ~1.13 MB (mostly Zig std + OS glue). Numbers are a
-  first datapoint, not a tuned benchmark — rerun on the target hardware before acting on Option A→B.
+  `sum(1e6)`). Numbers are a first datapoint, not a tuned benchmark — rerun on the target hardware
+  before acting on Option A→B.
+
+### ReleaseSmall vs ReleaseFast (2026-07-14) — ship the *distributed* artifacts as ReleaseSmall
+
+Measured the trade because the `universalWasmLoader-*` ports link the C-ABI lib/dll, and "smallest binary"
+is a vision goal. **The size win is large; the runtime cost is negligible — and the metric wazmrt wins on
+(cold-start) is unaffected.**
+
+| Artifact / metric | ReleaseFast | ReleaseSmall | Δ |
+| --- | --- | --- | --- |
+| C-ABI static lib (`.lib`) | 1015 KB | **123 KB** | **−88%** |
+| C-ABI shared lib (`.dll`) | 311 KB | **130 KB** | **−58%** |
+| CLI exe | 1166 KB | **699 KB** | **−40%** |
+| steady-state (`sum(1e6)`) | ~260 Mops/s | ~247 Mops/s | ~5% slower |
+| cold decode+instantiate (in-proc) | 0.76 µs/run | 1.30 µs/run | +0.5 µs (sub-2 µs) |
+| **cross-process cold-start** (vs Deno) | 87.4 ms/run | 86.7 ms/run | **no change** |
+
+Cross-process cold-start is **spawn-floor bound**, so ReleaseSmall keeps the full 2.4×/1.5×-vs-Deno
+advantage; the only cost (~5% steady throughput) lands in the hot-loop regime wazmrt already cedes to
+V8. **Decision:** build the shipped `.lib`/`.dll` (and the freestanding wasm — already ReleaseSmall) with
+**ReleaseSmall**; reserve ReleaseFast for a specifically compute-bound embedder. See
+`design-decisions.md`. (Caveat: single machine; sizes + steady-state are solid, the µs/ms cold numbers
+are ±10% noisy.)
 
 ## WASI preview 1 — first slice (2026-07-14)
 

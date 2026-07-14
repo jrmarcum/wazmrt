@@ -11,6 +11,15 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   one allocator strategy across targets. If a future feature genuinely needs libc, add it as an opt-in
   `-Dlibc` build flag — never the default. See "Windows gotchas" for why this also unbroke the build.
 
+- **Distributed artifacts ship as `ReleaseSmall` (measured 2026-07-14).** The C-ABI `.lib`/`.dll` (what
+  the `universalWasmLoader-*` ports link) and the freestanding wasm build should be built `ReleaseSmall`,
+  not `ReleaseFast`. Benchmark data (`testing.md`): `ReleaseSmall` shrinks the static lib **−88%**
+  (1015→123 KB) and the DLL **−58%** (311→130 KB) for only ~5% steady-state throughput and +0.5 µs
+  instantiate — and the metric wazmrt actually wins on, **cross-process cold-start, is unchanged** (it's
+  OS-spawn-floor bound, not size bound). The ~5% cost lands only in sustained hot loops, the regime
+  wazmrt already cedes to a JIT. Reserve `ReleaseFast` for a specifically compute-bound embedder.
+  Aligns with the "smallest binary" goal at ~no cost to the win.
+
 - **Integration ABI = the standard wasm-c-api (2026-07-02).** The C ABI **is** the vendored standard
   `wasm.h` (Apache-2.0, `third_party/wasm-c-api/`); `include/wazmrt.h` is only a thin extension. Do NOT
   reinvent module/engine/store signatures — implement the standard ones (`src/wasm_c_api.zig`).
