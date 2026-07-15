@@ -171,6 +171,21 @@ const FuncBody = struct {
     else_of: []const usize,
 };
 
+/// One frame of a trap's call stack: where execution was when it trapped.
+pub const TrapFrame = struct {
+    /// Index in the *function index space* (imports included), so it lines up
+    /// with the name section and with `call` immediates.
+    func_index: u32,
+    /// Index of the trapping instruction in the decoded IR — not a byte offset
+    /// into the original body.
+    pc: usize,
+};
+
+/// How many frames of a trap's stack we keep. A fixed buffer, deliberately:
+/// recording a trap must not allocate (we may be unwinding an OOM) and must not
+/// fail. Deep recursion overflows this, so `trap_depth` records the true depth.
+pub const max_trap_frames = 16;
+
 pub const Instance = struct {
     gpa: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -201,6 +216,15 @@ pub const Instance = struct {
     /// dropped once instantiation copies them in (§4.5.4), and `data.drop` marks
     /// a passive one; a dropped segment behaves as empty for `memory.init`.
     data_dropped: []bool,
+    /// Where the last trap happened, innermost frame first. Written only while
+    /// unwinding a trap (see `Frame.run`'s `errdefer`) and reset at the start of
+    /// each `invokeIndex`, so it always describes the most recent failed call.
+    /// Read it with `trapFrames()`.
+    trap_frames: [max_trap_frames]TrapFrame = undefined,
+    trap_len: usize = 0,
+    /// True call depth at the trap; exceeds `trap_len` when the stack was deeper
+    /// than `max_trap_frames`, so a truncated backtrace can say it was truncated.
+    trap_depth: usize = 0,
     /// GC heap (full GC, P3): one object per allocated struct/array; a GC
     /// reference value is the object's index here (its runtime type — the type
     /// index — rides in the object, so `ref.test`/`ref.cast` can check it).
@@ -448,6 +472,10 @@ pub const Instance = struct {
         const ft = self.module.funcType(func_index) orelse return error.UndefinedFunc;
         if (args.len != ft.params.len) return error.BadArgCount;
 
+        // Any trace left over describes an older call, not this one.
+        self.trap_len = 0;
+        self.trap_depth = 0;
+
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
         const results = try self.callFunction(scratch.allocator(), func_index, args, 0);
@@ -455,6 +483,27 @@ pub const Instance = struct {
         const owned = try self.gpa.alloc(Value, results.len);
         @memcpy(owned, results);
         return owned;
+    }
+
+    /// The call stack of the most recent trap, innermost frame first. Empty if
+    /// nothing has trapped, or if the failure never reached wasm code (a bad
+    /// argument count, say). Pair it with `Module.funcName` to name the frames.
+    pub fn trapFrames(self: *const Instance) []const TrapFrame {
+        return self.trap_frames[0..self.trap_len];
+    }
+
+    /// True when the trap stack was deeper than we kept.
+    pub fn trapTruncated(self: *const Instance) bool {
+        return self.trap_depth > self.trap_len;
+    }
+
+    /// Append a frame to the trap trace. Called only while unwinding, from
+    /// `Frame.run`'s `errdefer`, so the innermost frame lands first.
+    fn recordTrap(self: *Instance, func_index: u32, pc: usize) void {
+        self.trap_depth += 1;
+        if (self.trap_len == max_trap_frames) return; // keep the innermost frames
+        self.trap_frames[self.trap_len] = .{ .func_index = func_index, .pc = pc };
+        self.trap_len += 1;
     }
 
     fn findExportedFunc(self: *Instance, name: []const u8) ?u32 {
@@ -558,7 +607,7 @@ pub const Instance = struct {
         @memcpy(locals, body.local_defaults); // ref locals → null, numeric → 0
         @memcpy(locals[0..args.len], args);
 
-        var frame: Frame = .{ .inst = self, .a = a, .body = body, .locals = locals, .depth = depth };
+        var frame: Frame = .{ .inst = self, .a = a, .body = body, .locals = locals, .depth = depth, .func_index = func_index };
         try frame.labels.append(a, .{
             .is_loop = false,
             .arity = @intCast(body.type.results.len),
@@ -603,6 +652,9 @@ const Frame = struct {
     body: *const FuncBody,
     locals: []Value,
     depth: usize,
+    /// This frame's index in the function index space — carried so a trap can
+    /// name where it happened. Set once per call; never read while executing.
+    func_index: u32,
     vstack: std.ArrayList(Value) = .empty,
     labels: std.ArrayList(Label) = .empty,
 
@@ -663,6 +715,11 @@ const Frame = struct {
     fn run(self: *Frame) Error!void {
         const ir = self.body.ir;
         var pc: usize = 0;
+        // Note where we were if anything below traps. `errdefer` emits code on
+        // the error path only, so the interpreter loop is untouched — and since
+        // it fires as the error unwinds through each frame, the trace builds
+        // itself innermost-first with no explicit plumbing.
+        errdefer self.inst.recordTrap(self.func_index, pc);
         while (pc < ir.len) {
             const instr = ir[pc];
             switch (instr.op) {
@@ -1730,6 +1787,66 @@ test "runs a nested call (quad = double(double(x)))" {
     const r = try inst.invoke("quad", &.{i32Value(5)});
     defer std.testing.allocator.free(r);
     try std.testing.expectEqual(@as(i32, 20), asI32(r[0]));
+}
+
+test "a trap records where it happened, innermost frame first" {
+    // func0 boom() = unreachable ; func1 outer() = call boom
+    // Mirrors the real shape this exists for: a 2-instruction body whose first
+    // instruction traps is exactly a wasm-ld stub (see known-issues #19).
+    const bytes =
+        types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+        [_]u8{ 0x01, 0x04, 0x01, 0x60, 0x00, 0x00 } ++ // one type ()->()
+        [_]u8{ 0x03, 0x03, 0x02, 0x00, 0x00 } ++ // two funcs
+        [_]u8{ 0x07, 0x09, 0x01, 0x05, 'o', 'u', 't', 'e', 'r', 0x00, 0x01 } ++
+        // code: size 12 = count(1) + [len(1)+4] + [len(1)+5].
+        // boom body(4) = 00 locals, nop, unreachable, end -> traps at pc 1.
+        // outer body(5) = 00 locals, nop, call 0, end     -> calls at pc 1.
+        [_]u8{ 0x0a, 0x0c, 0x02, 0x04, 0x00, 0x01, 0x00, 0x0b, 0x05, 0x00, 0x01, 0x10, 0x00, 0x0b };
+    var inst = try instantiate(&bytes);
+    defer destroy(&inst);
+
+    try std.testing.expectError(error.Unreachable, inst.invoke("outer", &.{}));
+
+    const frames = inst.trapFrames();
+    try std.testing.expectEqual(@as(usize, 2), frames.len);
+    // innermost first: the `unreachable` at pc 1 of func 0 ...
+    try std.testing.expectEqual(@as(u32, 0), frames[0].func_index);
+    try std.testing.expectEqual(@as(usize, 1), frames[0].pc);
+    // ... reached from the `call` at pc 1 of func 1.
+    try std.testing.expectEqual(@as(u32, 1), frames[1].func_index);
+    try std.testing.expectEqual(@as(usize, 1), frames[1].pc);
+    try std.testing.expect(!inst.trapTruncated());
+}
+
+test "the trap trace resets per invoke and survives a deeper-than-buffer stack" {
+    // A self-recursive function that traps at the bottom: depth blows past
+    // max_trap_frames, so the trace must truncate rather than overrun.
+    // func0 f(x) = if x==0 { unreachable } else { f(x-1) }
+    const bytes =
+        types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+        [_]u8{ 0x01, 0x05, 0x01, 0x60, 0x01, 0x7f, 0x00 } ++ // (i32)->()
+        [_]u8{ 0x03, 0x02, 0x01, 0x00 } ++
+        [_]u8{ 0x07, 0x05, 0x01, 0x01, 'f', 0x00, 0x00 } ++
+        // body (17 bytes): 00 locals; local.get0; i32.eqz; if void; unreachable;
+        // else; local.get0; i32.const 1; i32.sub; call 0; end; end
+        [_]u8{
+            0x0a, 0x13, 0x01, 0x11, 0x00,
+            0x20, 0x00, 0x45, 0x04, 0x40, 0x00, 0x05,
+            0x20, 0x00, 0x41, 0x01, 0x6b, 0x10, 0x00, 0x0b, 0x0b,
+        };
+    var inst = try instantiate(&bytes);
+    defer destroy(&inst);
+
+    try std.testing.expectError(error.Unreachable, inst.invoke("f", &.{i32Value(40)}));
+    try std.testing.expectEqual(max_trap_frames, inst.trapFrames().len);
+    try std.testing.expect(inst.trapTruncated());
+    try std.testing.expectEqual(@as(usize, 41), inst.trap_depth); // 40 recursions + the base
+    for (inst.trapFrames()) |f| try std.testing.expectEqual(@as(u32, 0), f.func_index);
+
+    // A shallower trap must report its own depth, not the previous one's.
+    try std.testing.expectError(error.Unreachable, inst.invoke("f", &.{i32Value(2)}));
+    try std.testing.expectEqual(@as(usize, 3), inst.trapFrames().len);
+    try std.testing.expect(!inst.trapTruncated());
 }
 
 test "runs a br out of a block" {

@@ -190,12 +190,19 @@ advisory), and real fd-readiness in `poll_oneoff`. All still resolve to the `NOT
 this order.** None of 4.1–4.3 *block* 4.4; the owner scheduled them ahead of it deliberately, so treat
 this sequence as binding rather than re-deriving it.
 
-**4.1 — `known-issues.md` #19: trap diagnostics. FIRST.** Today a trap says `trap: Unreachable` and
-nothing more — no function, no pc, no name. That is precisely what made the Phase 3 `bitcast_invalid`
-hunt cost hours, and everything after this step multiplies the number of guests that can trap in
-unfamiliar ways. Carry `func_index` onto `Frame` (already available at the `callFunction` call site),
-report `fn[i] (+pc)` on any trap, and decode the `name` custom section to print the symbol. Error-path
-only, nothing hot. It pays for itself on the first failure in 4.3/4.4 — and 4.2 will lean on it too.
+**4.1 — `known-issues.md` #19: trap diagnostics. DONE 2026-07-15.** Traps now report a named
+backtrace, innermost frame first — on the exact binary from the Phase 3 hunt:
+`at fn[31] <.Lfd_write|wasi_snapshot_preview1_bitcast_invalid> +0` / `by fn[30] <min.main> +22` / … —
+and hint to rebuild unstripped when a module carries no names. `Frame` carries `func_index`; `Frame.run`
+records via **`errdefer`**, which emits code on the error path only, so the dispatch loop is untouched
+and the trace assembles itself innermost-first as the error unwinds. Frames land in a fixed
+`[16]TrapFrame` on `Instance` — recording a trap must not allocate (we may be unwinding an OOM) or fail
+— with `trap_depth` keeping the true depth so truncation is visible, reset per `invokeIndex`. Names are
+decoded **lazily** from a kept copy of the name section's function-name subsection; a malformed one
+degrades to "no names" rather than erroring on the path already reporting an error. +4 unit tests
+(**110**). Bench 266/268 vs 249 Mops/s baseline on the same box — no regression, as designed.
+*Left undone:* the C ABI's `wasm_trap_t` still carries only the message; the trace is on `Instance` but
+isn't surfaced through `wasm.h` yet.
 
 **4.2 — `known-issues.md` #17: close the symlink hole (make the sandbox real, not lexical).**
 *Budget for this: it is the biggest item in Phase 4, not a cleanup.* `resolve()` stops a guest *naming*

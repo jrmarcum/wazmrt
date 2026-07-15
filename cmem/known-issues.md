@@ -11,29 +11,42 @@ This file tracks only what's left.
 
 Line numbers are hints (they drift) — the function/construct name is the durable anchor.
 
-## #19 — Traps carry no location: `trap: Unreachable` and nothing else — OPEN (2026-07-15)
+## #19 — Traps carry no location: `trap: Unreachable` and nothing else — **DONE 2026-07-15 (Phase 4.1)**
 
-**What:** every trap surfaces as a bare `trap: <ErrorName>`. No function index, no name, no pc. When a
-compiled guest traps, there is nothing to go on.
+**Was:** every trap surfaced as a bare `trap: <ErrorName>` — no function, no name, no pc. That gap is
+what turned the Phase 3 `bitcast_invalid` diagnosis into hours.
 
-**Cost paid:** this is what turned the Phase 3 `bitcast_invalid` diagnosis (#18) into hours. The fix
-took ~10 lines of throwaway instrumentation: print `func_index` + `pc` + `ir.len` at the `unreachable`
-arm, which immediately said "pc=0 of a 2-instruction body" — i.e. a trap stub — and a ~50-line name
-section parser then named it. **All of that got thrown away.** Make it permanent instead.
+**Now:** traps report a named backtrace, innermost frame first. The exact binary from that hunt:
 
-**Shape of the fix:** carry `func_index` on `Frame` (it's already at the `callFunction` call site);
-report `fn[i] (+pc)` on any trap; decode the `name` custom section when present and print the symbol.
-Optionally keep the frame chain for a backtrace. None of it is on a hot path — it is error-path only.
+```
+trap: Unreachable
+  at fn[31] <.Lfd_write|wasi_snapshot_preview1_bitcast_invalid> +0
+  by fn[30] <min.main> +22
+  by fn[33] <start.startWasi> +2151
+```
 
-**Surfaces when:** running unfamiliar compiled guests — i.e. **Phase 4 by definition** (C/wasi-sdk,
-Rust, Zig conformance). Every one of those that traps costs the same hours again.
+**How:** `Frame` carries `func_index`; `Frame.run` has `errdefer self.inst.recordTrap(func_index, pc)`
+— **`errdefer` emits code on the error path only**, so the dispatch loop is untouched and the trace
+builds itself innermost-first as the error unwinds, with no plumbing through call sites. Frames land in
+a **fixed `[16]TrapFrame` on `Instance`**: recording a trap must not allocate (we may be unwinding an
+OOM) and must not fail. `trap_depth` keeps the true depth, so a truncated backtrace says so. Reset per
+`invokeIndex`, so it always describes the latest failed call. Read via `trapFrames()`/`trapTruncated()`.
+Names come from `Module.funcName` — decode keeps only the name section's function-name subsection
+(§7.4.2), copied, and scans it **lazily**: a module that never traps pays one `dupe`. A malformed name
+section degrades to "no names", never an error — it must not fail the report that is already reporting
+a failure.
 
-**SCHEDULED: Phase 4 step 4.1 — do this FIRST** (owner's order, 2026-07-15: #19 → #17 → Phase 3
-leftovers → the Phase 4 items proper; see `roadmap.md`). Not a blocker; sequenced deliberately because
-everything after it gets cheaper to debug once traps name a function.
+**Verified:** 4 unit tests (110 total) — innermost-first ordering with exact pc; deep recursion
+truncating at 16 with `trap_depth = 41`; reset between invokes; name lookup incl. gaps/past-the-end and
+a truncated section. Plus the real guest above. **No hot-path cost:** bench with the change 266/268
+Mops/s vs 249 baseline on the same box — at or above, i.e. run-to-run variance, no regression.
 
-**Anchor:** `Frame.run`'s `.@"unreachable"` arm + `Instance.callFunction` in `src/interp.zig`;
-`runWasi`'s `trap: {s}` print in `src/main.zig`.
+**Anchor:** `Frame.run`'s `errdefer` + `Instance.recordTrap`/`trapFrames` (`src/interp.zig`);
+`Module.funcName`/`findFuncNameSubsection` (`src/Module.zig`); `printTrap` (`src/main.zig`).
+
+**Left undone (deliberate):** the C ABI (`wasm_trap_t`) still carries only the message — the trace is
+reachable from `Instance` but not surfaced through `wasm.h`. Do it when an embedder asks; the data is
+already there.
 
 ## #18 — Zig 0.16 std bug: `openFile(.follow_symlinks=false)` on Windows crashes the host — WORKED AROUND (2026-07-15)
 

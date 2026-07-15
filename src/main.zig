@@ -67,7 +67,7 @@ pub fn main(init: std.process.Init) !void {
     // runs `_start` with the `wasi_snapshot_preview1` host imports wired up.
     if (findExport(&module, "_start")) |start_index| {
         const code = runWasi(arena, io, out, &module, path, start_index, args[2..]) catch |e| {
-            try out.print("trap: {s}\n", .{@errorName(e)});
+            if (e != AlreadyReported) try out.print("trap: {s}\n", .{@errorName(e)});
             return;
         };
         if (code != 0) try out.print("(exit {d})\n", .{code});
@@ -112,6 +112,39 @@ pub fn main(init: std.process.Init) !void {
     };
     try out.print("  validation: OK\n", .{});
 }
+
+/// Report a trap with the location it actually happened at, innermost frame
+/// first, naming each frame from the module's name section when it has one.
+///
+/// Without this a trap is just `trap: Unreachable`, which says nothing about
+/// where — the gap that made the Phase 3 `bitcast_invalid` hunt cost hours
+/// (`cmem/known-issues.md` #19). A 2-instruction body trapping at +0 is the
+/// signature of a wasm-ld stub, and the name says which import it stubbed.
+fn printTrap(
+    out: *Io.Writer,
+    module: *const wazmrt.Module,
+    inst: *const wazmrt.interp.Instance,
+    e: anyerror,
+) !void {
+    try out.print("trap: {s}\n", .{@errorName(e)});
+    const frames = inst.trapFrames();
+    if (frames.len == 0) return; // never reached wasm code (bad arity, say)
+
+    for (frames, 0..) |f, i| {
+        const lead = if (i == 0) "at" else "by";
+        if (module.funcName(f.func_index)) |n|
+            try out.print("  {s} fn[{d}] <{s}> +{d}\n", .{ lead, f.func_index, n, f.pc })
+        else
+            try out.print("  {s} fn[{d}] +{d}\n", .{ lead, f.func_index, f.pc });
+    }
+    if (inst.trapTruncated())
+        try out.print("  ... {d} more frame(s)\n", .{inst.trap_depth - frames.len});
+    if (module.func_names == null)
+        try out.print("  (no name section: rebuild the guest unstripped for symbols)\n", .{});
+}
+
+/// `runWasi` already reported the trap in full; the caller must not print again.
+const AlreadyReported = error.AlreadyReported;
 
 /// Function index of the exported function `name`, or null.
 fn findExport(module: *const wazmrt.Module, name: []const u8) ?u32 {
@@ -192,7 +225,8 @@ fn runWasi(
     _ = inst.invokeIndex(start_index, &.{}) catch |e| {
         // `proc_exit` unwinds via HostTrap with the code recorded — a clean exit.
         if (e == error.HostTrap and wasi.exit_code != null) return wasi.exit_code.?;
-        return e;
+        try printTrap(out, module, &inst, e);
+        return AlreadyReported;
     };
     return wasi.exit_code orelse 0;
 }
@@ -252,12 +286,13 @@ fn runFunction(
     defer inst.deinit();
 
     inst.runStart() catch |e| {
-        try out.print("trap: start: {s}\n", .{@errorName(e)});
+        try out.print("trap: start: ", .{});
+        try printTrap(out, module, &inst, e);
         return;
     };
 
     const results = inst.invokeIndex(fi, call_args) catch |e| {
-        try out.print("trap: {s}\n", .{@errorName(e)});
+        try printTrap(out, module, &inst, e);
         return;
     };
 

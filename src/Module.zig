@@ -198,6 +198,11 @@ data: []const DataSegment,
 elements: []const Element,
 /// The start function's index (start section §5.5.11), run at instantiation.
 start: ?u32,
+/// Raw `vec(nameassoc)` payload of the name section's function-name subsection
+/// (§7.4.2), arena-owned, or null when the module carries no names (a stripped
+/// or release build). Read it through `funcName` — it is only consulted when
+/// reporting a trap.
+func_names: ?[]const u8 = null,
 
 pub const Error = types.DecodeError || std.mem.Allocator.Error;
 
@@ -242,6 +247,7 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
     var start: ?u32 = null;
 
     var data_count: ?u32 = null;
+    var func_names: ?[]const u8 = null;
 
     while (!r.atEnd()) {
         const raw_id = try r.readByte();
@@ -258,7 +264,12 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
             // section (no name) or an over-long name length is malformed.
             .custom => {
                 const nlen = try sub.readVarU32();
-                _ = try sub.readBytes(nlen);
+                const cname = try sub.readBytes(nlen);
+                // Keep the "name" section's function-name subsection (§7.4.2) so
+                // traps can report a symbol instead of a bare index. We copy the
+                // bytes and scan them lazily — a module that never traps pays
+                // only the copy, and one built with `-fstrip` has none at all.
+                if (std.mem.eql(u8, cname, "name")) func_names = findFuncNameSubsection(a, &sub) catch null;
             },
             .type => try decodeTypeSection(&d, &sub),
             .import => imports = try decodeImportSection(&d, &sub),
@@ -296,7 +307,45 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
         .global_inits = try d.global_init_space.toOwnedSlice(a),
         .memories = try d.mem_space.toOwnedSlice(a),
         .tables = try d.table_space.toOwnedSlice(a),
+        .func_names = func_names,
     };
+}
+
+/// Find the function-name subsection (id 1) inside a `name` custom section and
+/// return an arena-owned copy of its `vec(nameassoc)` payload (§7.4.2).
+///
+/// The name section is a *convention*, not part of validation: a malformed one
+/// must never fail the module. Every error here degrades to "no names".
+fn findFuncNameSubsection(a: std.mem.Allocator, sub: *Reader) !?[]const u8 {
+    while (!sub.atEnd()) {
+        const kind = try sub.readByte();
+        const size = try sub.readVarU32();
+        const payload = try sub.readBytes(size);
+        if (kind == 1) return try a.dupe(u8, payload); // 1 = function names
+        if (kind > 1) break; // subsections are ordered; 2+ means we passed it
+    }
+    return null;
+}
+
+/// The name recorded for function `index` in the name section, if any.
+///
+/// Scans linearly rather than building a map: this is only ever called while
+/// reporting a trap, so a module that runs clean pays nothing. A malformed
+/// entry just ends the scan — a bad name section must not turn into an error
+/// on the path that is already reporting an error.
+pub fn funcName(self: *const Module, index: u32) ?[]const u8 {
+    const bytes = self.func_names orelse return null;
+    var r = Reader.init(bytes);
+    const count = r.readVarU32() catch return null;
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const idx = r.readVarU32() catch return null;
+        const len = r.readVarU32() catch return null;
+        const name = r.readBytes(len) catch return null;
+        if (idx == index) return name;
+        if (idx > index) return null; // the vec is sorted by index
+    }
+    return null;
 }
 
 pub fn deinit(self: *Module) void {
@@ -1076,4 +1125,44 @@ test "resolves a memory export with limits" {
     try std.testing.expectEqual(types.ExternKind.memory, m.exports[0].type.kind());
     try std.testing.expectEqual(@as(u32, 1), m.exports[0].type.memory.limits.min);
     try std.testing.expectEqual(@as(?u32, 2), m.exports[0].type.memory.limits.max);
+}
+
+test "reads function names from the name section" {
+    // custom section "name": subsection 1 (function names) = [ (0,"hi"), (3,"bye") ].
+    //   nameassoc vec: count=2, then (idx, len, bytes) each.
+    const namemap = [_]u8{ 0x02, 0x00, 0x02, 'h', 'i', 0x03, 0x03, 'b', 'y', 'e' };
+    const bytes =
+        types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+        // custom section payload = namelen(1) + "name"(4) + sub0(5) + sub1(12) = 22.
+        [_]u8{ 0x00, 0x16, 0x04, 'n', 'a', 'm', 'e' } ++
+        [_]u8{ 0x00, 0x03, 0x02, 'm', 'd' } ++ // subsection 0 (module name) — skipped
+        [_]u8{ 0x01, 0x0a } ++ namemap; // subsection 1 (function names), size 10
+
+    var m = try Module.decode(std.testing.allocator, &bytes);
+    defer m.deinit();
+
+    try std.testing.expectEqualStrings("hi", m.funcName(0).?);
+    try std.testing.expectEqualStrings("bye", m.funcName(3).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), m.funcName(1)); // gap in the vec
+    try std.testing.expectEqual(@as(?[]const u8, null), m.funcName(9)); // past the end
+}
+
+test "a module without a name section has no names, and a malformed one is not an error" {
+    // No custom section at all.
+    const plain = types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 };
+    var m1 = try Module.decode(std.testing.allocator, &plain);
+    defer m1.deinit();
+    try std.testing.expectEqual(@as(?[]const u8, null), m1.func_names);
+    try std.testing.expectEqual(@as(?[]const u8, null), m1.funcName(0));
+
+    // A name section whose function subsection is truncated mid-entry. The name
+    // section is a convention, not validation: it must never fail the module,
+    // and must not fail the trap report that is already reporting a failure.
+    const truncated =
+        types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+        [_]u8{ 0x00, 0x0b, 0x04, 'n', 'a', 'm', 'e' } ++
+        [_]u8{ 0x01, 0x04, 0x02, 0x00, 0x05, 'h' }; // claims 2 entries + a 5-byte name, has 1 byte
+    var m2 = try Module.decode(std.testing.allocator, &truncated);
+    defer m2.deinit();
+    try std.testing.expectEqual(@as(?[]const u8, null), m2.funcName(0)); // degrades to "no name"
 }

@@ -453,6 +453,25 @@ V8. **Decision:** build the shipped `.lib`/`.dll` (and the freestanding wasm —
 `design-decisions.md`. (Caveat: single machine; sizes + steady-state are solid, the µs/ms cold numbers
 are ±10% noisy.)
 
+## Trap diagnostics — Phase 4.1 (2026-07-15)
+
+- **+4 unit tests (110 total).** `interp`: a trap records innermost-frame-first with exact pc (a
+  nop/`unreachable` body called from a nop/`call` body — deliberately the same shape as the wasm-ld
+  stub this exists for); and a self-recursive trap at depth 41 truncates at `max_trap_frames = 16`
+  while `trap_depth` still reports 41, with a following shallower trap reporting 3 — i.e. the trace
+  resets per `invokeIndex` rather than accreting. `Module`: `funcName` resolves names, returns null for
+  an index gap and past-the-end, and a **truncated name section degrades to "no names" instead of
+  erroring** (it must not fail the report that is already reporting a failure).
+- **Real-guest check:** the exact `minsafe.wasm` from the Phase 3 hunt now prints the answer that took
+  hours to find (see "The `bitcast_invalid` trap" below), and the stripped `min.wasm` prints
+  `at fn[49] +0` + the rebuild-unstripped hint.
+- **No hot-path cost — measured, not assumed:** `zig build bench` at 266/268 Mops/s with the change vs
+  **249** on the same box without it (git stash, same session). At or above baseline, so the difference
+  is run-to-run variance, not a win — the point is the absence of a regression. That is the design:
+  `errdefer` emits code on the error path only, and `Frame.func_index` is written once per call.
+  **When touching `Frame.run`, re-run this comparison in one session** — the recorded ~264 Mops/s from
+  2026-07-14 is not a valid baseline across days/machines.
+
 ## WASI Phase 3 — the sandboxed filesystem (2026-07-15)
 
 - **+3 unit tests (106 total).** The load-bearing one is **`resolve` contains guest paths inside the
@@ -478,8 +497,15 @@ reconcile them, so it points the call at a generated stub named
 `.Lfd_write|wasi_snapshot_preview1_bitcast_invalid` whose entire body is `unreachable`. **No warning at
 compile time.** It only fires if that code path runs, which is why trivial guests seemed fine and
 `--dir` (which makes std's `Preopens.init` run) appeared to "break" things.
-**Tell:** the trap is at `pc=0` of a **2-instruction body** (`unreachable; end`) — dump the wasm name
-section at that function index and the name says it outright.
+**Tell:** since Phase 4.1 the runtime just tells you — the trap names the frame:
+```
+trap: Unreachable
+  at fn[31] <.Lfd_write|wasi_snapshot_preview1_bitcast_invalid> +0
+  by fn[30] <min.main> +22
+```
+`+0` of a stub is the giveaway even on a stripped build (`at fn[49] +0` with no name). If the guest is
+stripped and you need the symbol, rebuild it `-O ReleaseSafe`/`Debug` — names come from the wasm name
+section, which ReleaseSmall drops.
 **Rule: examples must call WASI through `std.os.wasi`, never hand-rolled `extern`s.**
 
 ### The `openFile(.follow_symlinks = false)` host crash (a real Zig 0.16 std bug)
