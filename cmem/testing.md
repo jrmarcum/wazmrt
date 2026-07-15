@@ -453,6 +453,25 @@ V8. **Decision:** build the shipped `.lib`/`.dll` (and the freestanding wasm —
 `design-decisions.md`. (Caveat: single machine; sizes + steady-state are solid, the µs/ms cold numbers
 are ±10% noisy.)
 
+## Bulk memory + saturating truncation — the `0xFC` completion (Phase 1, 2026-07-14)
+
+**Milestone: a real LLVM-compiled `wasm32-wasi` program runs and prints in wazmrt.**
+
+- **+3 unit tests (101 total)**: saturating truncation (in-range truncation, NaN→0, ±inf→min/max,
+  unsigned negatives→0 — all where the trapping form errors); bulk memory (`memory.fill`,
+  `memory.copy` incl. an **overlapping** move behaving like memmove, `memory.init` from a passive
+  segment, and `data.drop` making a segment read as empty → OOB); OOB `fill`/`copy` trap.
+- **Compiled-program gate**: `examples/hello_compiled.zig` built with
+  `zig build-exe -target wasm32-wasi -O ReleaseSmall` and run by `wazmrt hello.wasm` prints
+  `Hello from a compiled WASI program!` / `bulk-memory memcpy works` / `saturating truncation works` —
+  real compiled code whose `@memcpy` lowers to `memory.copy` and whose float→int lowers to
+  `i32.trunc_sat_f64_s`, calling wazmrt's WASI `fd_write`.
+- **Guest-side finding:** Zig 0.16's new `Io`-model file writer never issues `fd_write(1)` for stdout
+  (traced by instrumenting the WASI dispatch: the *only* call was `fd_fdstat_get(2)`), so it fails
+  before syscalling — a **guest toolchain gap, not a runtime bug**. stderr and a direct `fd_write`
+  import both work, so the example imports `fd_write` directly.
+- All surfaces green (`test`/`build`/`wasm`/`c-smoke`).
+
 ## WASI preview 1 — first slice (2026-07-14)
 
 `src/wasi.zig` (core `wasi_snapshot_preview1`). WASI is wired as native host imports (no interpreter

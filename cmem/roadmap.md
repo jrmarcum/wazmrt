@@ -129,12 +129,19 @@ ledger.
 - **Critical path:** `run a compiled stdout program = [interpreter: 0xFC 0x00–0x0b] + [only the WASI
   funcs it CALLS (mostly already have)]`. File-touching programs additionally need the WASI filesystem.
 
-**Phase 1 — finish the `0xFC` prefix (the immediate blocker; also unblocks non-WASI compiled modules).**
-Decode + execute + validate `0xFC 0x00–0x07` (saturating truncation: NaN→0, ±inf/out-of-range→min/max,
-no traps) and `0xFC 0x08–0x0b` (`memory.init`=copy from a passive/active data segment, `data.drop`=mark
-consumed, `memory.copy`=bounds-checked memmove, `memory.fill`=memset). Reuse the existing passive-data +
-`data_count`-section plumbing. Assembler names + tests, then **rerun `hello.wasm` → should print**.
-*This is the milestone: a real LLVM-compiled program runs and prints. Small, high-leverage, low risk.*
+**Phase 1 — finish the `0xFC` prefix. DONE 2026-07-14 — MILESTONE HIT: a real LLVM-compiled program
+runs and prints.** Decoded + executed + validated `0xFC 0x00–0x07` (saturating truncation: NaN→0,
+±inf/out-of-range→min/max, never traps — `truncSatS`/`truncSatU`) and `0xFC 0x08–0x0b` (`memory.init`
+copies from a passive segment, `data.drop` marks consumed, `memory.copy` = bounds-checked memmove
+(overlap-safe), `memory.fill` = memset). `Instance.data_dropped` mirrors `elem_dropped` (active segments
+start dropped per §4.5.4). Assembler + validator + 3 unit tests (101 total).
+**`examples/hello_compiled.zig` → `zig build-exe -target wasm32-wasi` → `wazmrt hello.wasm` prints:**
+`Hello from a compiled WASI program!` / `bulk-memory memcpy works` / `saturating truncation works` —
+i.e. real compiled code exercising `memory.copy` (`@memcpy`) and `trunc_sat` drives wazmrt's WASI
+`fd_write`. **Guest-side gotcha found:** Zig 0.16's new `Io`-model file writer doesn't drive WASI
+`fd_write` for stdout (it fails *before* issuing the syscall — no `fd_write(1)` is ever made; traced by
+instrumenting the WASI dispatch). That's a **guest toolchain gap, not a runtime one** — stderr and a
+direct `fd_write` import both work, so the example calls `fd_write` directly.
 
 **Phase 2 — WASI core for stdout/args/env/compute programs.** `clock_res_get`; `poll_oneoff` (support
 clock-subscription sleep; real event polling stubbed); real **stdin** `fd_read` (fd 0 ← process stdin);

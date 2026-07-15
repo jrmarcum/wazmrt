@@ -240,6 +240,25 @@ pub const Op = enum(u8) {
     i64_extend16_s = 0xc3,
     i64_extend32_s = 0xc4,
 
+    // Saturating (non-trapping) float→int truncation, carried under the `0xFC`
+    // prefix. LLVM/Zig emit these by default (`+nontrapping-fptoint`), so a
+    // compiled module needs them. Internal tags (wire = `0xFC` + sub-opcode).
+    i32_trunc_sat_f32_s = 0xc5, // 0xFC 0x00
+    i32_trunc_sat_f32_u = 0xc6, // 0xFC 0x01
+    i32_trunc_sat_f64_s = 0xc7, // 0xFC 0x02
+    i32_trunc_sat_f64_u = 0xc8, // 0xFC 0x03
+    i64_trunc_sat_f32_s = 0xc9, // 0xFC 0x04
+    i64_trunc_sat_f32_u = 0xca, // 0xFC 0x05
+    i64_trunc_sat_f64_s = 0xcb, // 0xFC 0x06
+    i64_trunc_sat_f64_u = 0xcc, // 0xFC 0x07
+
+    // Bulk memory (`0xFC` prefix). LLVM/Zig emit `memory.copy`/`memory.fill` for
+    // memcpy/memset by default (`+bulk-memory`).
+    memory_init = 0xd7, // 0xFC 0x08: [dst src n] -> [] (from a data segment)
+    data_drop = 0xd8, // 0xFC 0x09: mark a data segment consumed
+    memory_copy = 0xd9, // 0xFC 0x0a: [dst src n] -> []
+    memory_fill = 0xda, // 0xFC 0x0b: [dst byte n] -> []
+
     // Table ops carried under the `0xFC` prefix. These enum values are INTERNAL
     // tags in an otherwise-unused byte range — the wire encoding is `0xFC` + a
     // LEB sub-opcode (see `fcSubOpcode` / `decodeBody`), not this byte.
@@ -303,9 +322,22 @@ pub const HeapType = union(enum) {
 /// A reference type: a heap type plus nullability (`(ref null? ht)`).
 pub const RefType = struct { nullable: bool, heap: HeapType };
 
-/// The `0xFC` sub-opcode for an internal table-op tag, or null for a normal op.
+/// The `0xFC` sub-opcode for an internal saturating-truncation / bulk-memory /
+/// table-op tag, or null for a normal op.
 pub fn fcSubOpcode(op: Op) ?u8 {
     return switch (op) {
+        .i32_trunc_sat_f32_s => 0x00,
+        .i32_trunc_sat_f32_u => 0x01,
+        .i32_trunc_sat_f64_s => 0x02,
+        .i32_trunc_sat_f64_u => 0x03,
+        .i64_trunc_sat_f32_s => 0x04,
+        .i64_trunc_sat_f32_u => 0x05,
+        .i64_trunc_sat_f64_s => 0x06,
+        .i64_trunc_sat_f64_u => 0x07,
+        .memory_init => 0x08,
+        .data_drop => 0x09,
+        .memory_copy => 0x0a,
+        .memory_fill => 0x0b,
         .table_init => 0x0c,
         .elem_drop => 0x0d,
         .table_copy => 0x0e,
@@ -368,6 +400,8 @@ pub const Imm = union(enum) {
     table: u32,
     /// `elem.drop` — a passive element-segment index.
     elem: u32,
+    /// `memory.init` / `data.drop` — a data-segment index.
+    data: u32,
     /// `table.init` — element-segment index + destination table index.
     table_init: struct { elem: u32, table: u32 },
     /// `table.copy` — destination + source table indices.
@@ -411,6 +445,12 @@ const ImmKind = enum {
     global,
     table,
     elem,
+    /// `data.drop` — a data index.
+    data,
+    /// `memory.init` — a data index + a reserved memory byte.
+    data_init,
+    /// `memory.copy` — two reserved memory bytes (dst, src).
+    mem_copy,
     table_init,
     table_copy,
     mem,
@@ -446,6 +486,10 @@ pub fn immediateKind(op: Op) ImmKind {
         0xe0 => .table_init,
         0xe1 => .elem, // elem.drop
         0xe2 => .table_copy,
+        0xd7 => .data_init, // memory.init: data index + reserved mem byte
+        0xd8 => .data, // data.drop: data index
+        0xd9 => .mem_copy, // memory.copy: two reserved mem bytes
+        0xda => .mem_reserved, // memory.fill: one reserved mem byte
         0x28...0x3e => .mem,
         0x3f, 0x40 => .mem_reserved,
         0x41 => .i32c,
@@ -455,8 +499,9 @@ pub fn immediateKind(op: Op) ImmKind {
         0x1c => .select_types,
         0xd0 => .ref_type, // ref.null <heaptype>
         0xd2 => .func, // ref.func <funcidx>
-        // Everything else in the core-MVP range has no immediate.
-        0x00, 0x01, 0x05, 0x0b, 0x0f, 0x1a, 0x1b, 0xd1, 0xd3, 0xd4, 0x45...0xc4 => .none,
+        // Everything else in the core-MVP range has no immediate; `0xc5…0xcc` are
+        // the saturating-truncation tags (also immediate-free).
+        0x00, 0x01, 0x05, 0x0b, 0x0f, 0x1a, 0x1b, 0xd1, 0xd3, 0xd4, 0x45...0xcc => .none,
         // GC ops with no immediate: ref.i31/i31.get_s/i31.get_u, array.len.
         0xf0, 0xf1, 0xf2, 0xed => .none,
         // GC ops with a single type index.
@@ -591,6 +636,29 @@ pub fn decodeBody(a: std.mem.Allocator, body: []const u8) (DecodeError || std.me
         if (b0 == 0xfc) {
             // 0xFC-prefixed op: a LEB sub-opcode picks the internal Op tag.
             const imm: Instr = switch (try r.readVarU32()) {
+                // Saturating truncation — no immediates.
+                0x00 => .{ .op = .i32_trunc_sat_f32_s, .imm = .none },
+                0x01 => .{ .op = .i32_trunc_sat_f32_u, .imm = .none },
+                0x02 => .{ .op = .i32_trunc_sat_f64_s, .imm = .none },
+                0x03 => .{ .op = .i32_trunc_sat_f64_u, .imm = .none },
+                0x04 => .{ .op = .i64_trunc_sat_f32_s, .imm = .none },
+                0x05 => .{ .op = .i64_trunc_sat_f32_u, .imm = .none },
+                0x06 => .{ .op = .i64_trunc_sat_f64_s, .imm = .none },
+                0x07 => .{ .op = .i64_trunc_sat_f64_u, .imm = .none },
+                // Bulk memory. The trailing memory indices are reserved (always 0
+                // until multi-memory); read and discard them.
+                0x08 => blk: {
+                    const d = try r.readVarU32();
+                    _ = try r.readByte(); // reserved memory index
+                    break :blk .{ .op = .memory_init, .imm = .{ .data = d } };
+                },
+                0x09 => .{ .op = .data_drop, .imm = .{ .data = try r.readVarU32() } },
+                0x0a => blk: {
+                    _ = try r.readByte(); // reserved dst memory index
+                    _ = try r.readByte(); // reserved src memory index
+                    break :blk .{ .op = .memory_copy, .imm = .none };
+                },
+                0x0b => .{ .op = .memory_fill, .imm = .{ .mem_reserved = try r.readByte() } },
                 0x0c => .{ .op = .table_init, .imm = .{ .table_init = .{ .elem = try r.readVarU32(), .table = try r.readVarU32() } } },
                 0x0d => .{ .op = .elem_drop, .imm = .{ .elem = try r.readVarU32() } },
                 0x0e => .{ .op = .table_copy, .imm = .{ .table_copy = .{ .dst = try r.readVarU32(), .src = try r.readVarU32() } } },
@@ -643,7 +711,7 @@ pub fn decodeBody(a: std.mem.Allocator, body: []const u8) (DecodeError || std.me
             // reaching here means a raw synthetic-tag byte, which is malformed.
             // 0xFB/0xFC-prefixed ops are decoded via the prefix interceptions
             // above; reaching here means a raw synthetic-tag byte (malformed).
-            .elem, .table_init, .table_copy, .gc_type, .gc_field, .gc_type_n, .ref_cast, .br_cast => return error.UnsupportedOpcode,
+            .elem, .data, .data_init, .mem_copy, .table_init, .table_copy, .gc_type, .gc_field, .gc_type_n, .ref_cast, .br_cast => return error.UnsupportedOpcode,
             .unsupported => return error.UnsupportedOpcode,
         };
         try list.append(a, .{ .op = op, .imm = imm });

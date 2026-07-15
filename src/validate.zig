@@ -38,6 +38,8 @@ pub const Error = Module.Error || error{
     UndefinedType,
     UndefinedTable,
     UndefinedElem,
+    /// A `memory.init`/`data.drop` data-segment index out of range.
+    UndefinedData,
     /// A struct/array field index out of range for its type (GC).
     UndefinedField,
     /// A `struct.set`/`array.set` on an immutable field (GC).
@@ -490,6 +492,25 @@ const FuncValidator = struct {
             .elem_drop => {
                 if (instr.imm.elem >= self.module.elements.len) return error.UndefinedElem;
             },
+
+            // Bulk memory. All three take `[dst, src|byte, n]` as i32 and need a
+            // linear memory; `memory.init`/`data.drop` also need a valid data index.
+            .memory_copy, .memory_fill => {
+                if (self.module.memories.len == 0) return error.MissingMemory;
+                _ = try self.popExpect(.i32); // n
+                _ = try self.popExpect(.i32); // src / fill byte
+                _ = try self.popExpect(.i32); // dst
+            },
+            .memory_init => {
+                if (self.module.memories.len == 0) return error.MissingMemory;
+                if (instr.imm.data >= self.module.data.len) return error.UndefinedData;
+                _ = try self.popExpect(.i32); // n
+                _ = try self.popExpect(.i32); // src (offset into the segment)
+                _ = try self.popExpect(.i32); // dst
+            },
+            .data_drop => {
+                if (instr.imm.data >= self.module.data.len) return error.UndefinedData;
+            },
             .table_copy => {
                 const dt = try self.tableElemType(instr.imm.table_copy.dst);
                 const st = try self.tableElemType(instr.imm.table_copy.src);
@@ -832,6 +853,11 @@ fn simpleSig(op: Op) ?FuncValidator.Sig {
         0xac, 0xad => sig(i32_1, i64_1), // i64.extend_i32
         0xae, 0xaf => sig(f32_1, i64_1), // i64.trunc_f32
         0xb0, 0xb1 => sig(f64_1, i64_1), // i64.trunc_f64
+        // Saturating truncation (internal tags for `0xFC 0x00–0x07`).
+        0xc5, 0xc6 => sig(f32_1, i32_1), // i32.trunc_sat_f32_s/u
+        0xc7, 0xc8 => sig(f64_1, i32_1), // i32.trunc_sat_f64_s/u
+        0xc9, 0xca => sig(f32_1, i64_1), // i64.trunc_sat_f32_s/u
+        0xcb, 0xcc => sig(f64_1, i64_1), // i64.trunc_sat_f64_s/u
         0xb2, 0xb3 => sig(i32_1, f32_1), // f32.convert_i32
         0xb4, 0xb5 => sig(i64_1, f32_1), // f32.convert_i64
         0xb6 => sig(f64_1, f32_1), // f32.demote_f64

@@ -197,6 +197,10 @@ pub const Instance = struct {
     /// `elem.drop`), after which it behaves as an empty segment.
     elem_values: []const []Value,
     elem_dropped: []bool,
+    /// `data_dropped[i]` marks a data segment consumed — active segments are
+    /// dropped once instantiation copies them in (§4.5.4), and `data.drop` marks
+    /// a passive one; a dropped segment behaves as empty for `memory.init`.
+    data_dropped: []bool,
     /// GC heap (full GC, P3): one object per allocated struct/array; a GC
     /// reference value is the object's index here (its runtime type — the type
     /// index — rides in the object, so `ref.test`/`ref.cast` can check it).
@@ -353,6 +357,12 @@ pub const Instance = struct {
         // Evaluate every element segment's reference values. Active segments are
         // applied to their table and then dropped; passive segments stay
         // available for `table.init` until `elem.drop`; declarative are dropped.
+        // Active data segments were copied into memory above and are dropped;
+        // passive ones stay available to `memory.init` until `data.drop`.
+        const data_dropped = try gpa.alloc(bool, module.data.len);
+        errdefer gpa.free(data_dropped);
+        for (module.data, data_dropped) |seg, *dropped| dropped.* = seg.active;
+
         const elem_values = try gpa.alloc([]Value, module.elements.len);
         errdefer gpa.free(elem_values);
         const elem_dropped = try gpa.alloc(bool, module.elements.len);
@@ -391,6 +401,7 @@ pub const Instance = struct {
             .imported_tables = n_imported_tables,
             .elem_values = elem_values,
             .elem_dropped = elem_dropped,
+            .data_dropped = data_dropped,
         };
     }
 
@@ -404,6 +415,7 @@ pub const Instance = struct {
         for (self.elem_values) |ev| self.gpa.free(ev);
         self.gpa.free(self.elem_values);
         self.gpa.free(self.elem_dropped);
+        self.gpa.free(self.data_dropped);
         for (self.tables, 0..) |t, k| if (k >= self.imported_tables) {
             self.gpa.free(t.entries);
             self.gpa.destroy(t);
@@ -980,6 +992,47 @@ const Frame = struct {
                     @memset(t[dst..][0..n], val);
                     pc += 1;
                 },
+                // --- Bulk memory ---
+                .memory_copy => {
+                    const mem = (self.inst.memory orelse return error.NoMemory).bytes;
+                    const n = @as(u32, @bitCast(self.popI32()));
+                    const src = @as(u32, @bitCast(self.popI32()));
+                    const dst = @as(u32, @bitCast(self.popI32()));
+                    if (@as(u64, src) + n > mem.len or @as(u64, dst) + n > mem.len) return error.MemoryOutOfBounds;
+                    // Ranges may overlap — copy in the safe direction.
+                    if (dst <= src) {
+                        std.mem.copyForwards(u8, mem[dst..][0..n], mem[src..][0..n]);
+                    } else {
+                        std.mem.copyBackwards(u8, mem[dst..][0..n], mem[src..][0..n]);
+                    }
+                    pc += 1;
+                },
+                .memory_fill => {
+                    const mem = (self.inst.memory orelse return error.NoMemory).bytes;
+                    const n = @as(u32, @bitCast(self.popI32()));
+                    const byte: u8 = @truncate(@as(u32, @bitCast(self.popI32())));
+                    const dst = @as(u32, @bitCast(self.popI32()));
+                    if (@as(u64, dst) + n > mem.len) return error.MemoryOutOfBounds;
+                    @memset(mem[dst..][0..n], byte);
+                    pc += 1;
+                },
+                .memory_init => {
+                    const mem = (self.inst.memory orelse return error.NoMemory).bytes;
+                    const di = instr.imm.data;
+                    // A dropped (or active, already-applied) segment reads as empty.
+                    const seg: []const u8 = if (self.inst.data_dropped[di]) &.{} else self.inst.module.data[di].bytes;
+                    const n = @as(u32, @bitCast(self.popI32()));
+                    const src = @as(u32, @bitCast(self.popI32()));
+                    const dst = @as(u32, @bitCast(self.popI32()));
+                    if (@as(u64, src) + n > seg.len or @as(u64, dst) + n > mem.len) return error.MemoryOutOfBounds;
+                    @memcpy(mem[dst..][0..n], seg[src..][0..n]);
+                    pc += 1;
+                },
+                .data_drop => {
+                    self.inst.data_dropped[instr.imm.data] = true;
+                    pc += 1;
+                },
+
                 .table_init => {
                     const t = self.inst.tables[instr.imm.table_init.table].entries;
                     const seg: []const Value = if (self.inst.elem_dropped[instr.imm.table_init.elem]) &.{} else self.inst.elem_values[instr.imm.table_init.elem];
@@ -1206,6 +1259,16 @@ const Frame = struct {
             .i64_trunc_f32_u => try self.pushI64(@bitCast(try truncFloatU(u64, f32, self.popF32()))),
             .i64_trunc_f64_s => try self.pushI64(try truncFloatS(i64, f64, self.popF64())),
             .i64_trunc_f64_u => try self.pushI64(@bitCast(try truncFloatU(u64, f64, self.popF64()))),
+
+            // Float → int, saturating (non-trapping): NaN → 0, out-of-range clamps.
+            .i32_trunc_sat_f32_s => try self.pushI32(truncSatS(i32, f32, self.popF32())),
+            .i32_trunc_sat_f32_u => try self.pushI32(@bitCast(truncSatU(u32, f32, self.popF32()))),
+            .i32_trunc_sat_f64_s => try self.pushI32(truncSatS(i32, f64, self.popF64())),
+            .i32_trunc_sat_f64_u => try self.pushI32(@bitCast(truncSatU(u32, f64, self.popF64()))),
+            .i64_trunc_sat_f32_s => try self.pushI64(truncSatS(i64, f32, self.popF32())),
+            .i64_trunc_sat_f32_u => try self.pushI64(@bitCast(truncSatU(u64, f32, self.popF32()))),
+            .i64_trunc_sat_f64_s => try self.pushI64(truncSatS(i64, f64, self.popF64())),
+            .i64_trunc_sat_f64_u => try self.pushI64(@bitCast(truncSatU(u64, f64, self.popF64()))),
 
             // Int → float
             .f32_convert_i32_s => try self.pushF32(@floatFromInt(self.popI32())),
@@ -1564,6 +1627,30 @@ fn truncFloatU(comptime U: type, comptime F: type, x: F) Error!U {
     const bits = @typeInfo(U).int.bits;
     const hi: F = std.math.ldexp(@as(F, 1.0), bits); // 2^bits
     if (t < 0 or t >= hi) return error.InvalidConversionToInt;
+    return @intFromFloat(t);
+}
+
+/// Saturating signed float→int truncation (`*.trunc_sat_*_s`): never traps —
+/// NaN → 0, and out-of-range clamps to the integer's min/max.
+fn truncSatS(comptime I: type, comptime F: type, x: F) I {
+    if (std.math.isNan(x)) return 0;
+    const t = @trunc(x);
+    const bits = @typeInfo(I).int.bits;
+    const hi: F = std.math.ldexp(@as(F, 1.0), bits - 1); // 2^(bits-1)
+    if (t <= -hi) return std.math.minInt(I);
+    if (t >= hi) return std.math.maxInt(I);
+    return @intFromFloat(t);
+}
+
+/// Saturating unsigned float→int truncation (`*.trunc_sat_*_u`): NaN and
+/// negatives → 0, above-range clamps to the maximum.
+fn truncSatU(comptime U: type, comptime F: type, x: F) U {
+    if (std.math.isNan(x)) return 0;
+    const t = @trunc(x);
+    const bits = @typeInfo(U).int.bits;
+    const hi: F = std.math.ldexp(@as(F, 1.0), bits); // 2^bits
+    if (t <= 0) return 0;
+    if (t >= hi) return std.math.maxInt(U);
     return @intFromFloat(t);
 }
 

@@ -1564,6 +1564,13 @@ fn emitInstr(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
         .f64c => try floatBits(ctx, u64, try imm0(immediates)),
         .mem => try emitMemArg(ctx, op, immediates),
         .mem_reserved => try ctx.out.append(ctx.a, 0x00),
+        // Bulk memory: a data index (+ reserved memory index bytes, always 0).
+        .data => try uleb(ctx.a, ctx.out, try parseIndex(try imm0(immediates))),
+        .data_init => {
+            try uleb(ctx.a, ctx.out, try parseIndex(try imm0(immediates)));
+            try ctx.out.append(ctx.a, 0x00); // reserved memory index
+        },
+        .mem_copy => try ctx.out.appendSlice(ctx.a, &.{ 0x00, 0x00 }), // reserved dst, src
         // ref.null takes a heap type as an `s33`: an abstract head code, or a
         // concrete `$t` / index (so `ref.null $t` is typed `(ref null $t)`).
         .ref_type => {
@@ -1647,6 +1654,7 @@ fn imm0(immediates: []const Sexpr) Error!Sexpr {
 fn flatImmCount(op: Op) usize {
     return switch (opcode.immediateKind(op)) {
         .local, .global, .func, .label, .i32c, .i64c, .f32c, .f64c, .ref_type, .gc_type => 1,
+        .data, .data_init => 1, // memory.init / data.drop: a data index
         .gc_field, .gc_type_n => 2,
         else => 0,
     };
@@ -2343,6 +2351,80 @@ test "GC i31: validator rejects i31.get on a non-i31 reference" {
     var mbad3 = try Module.decode(a, bad3);
     // anyref is a *super*type of i31ref, so it must not satisfy the i31.get operand.
     try std.testing.expectError(error.TypeMismatch, validate(a, &mbad3));
+}
+
+test "saturating truncation: NaN -> 0, out-of-range clamps, no trap" {
+    const src =
+        \\(module
+        \\  (func (export "s32") (param f64) (result i32) (i32.trunc_sat_f64_s (local.get 0)))
+        \\  (func (export "u32") (param f64) (result i32) (i32.trunc_sat_f64_u (local.get 0)))
+        \\  (func (export "s64") (param f32) (result i64) (i64.trunc_sat_f32_s (local.get 0))))
+    ;
+    const nan = std.math.nan(f64);
+    const inf = std.math.inf(f64);
+    // In range: plain truncation.
+    try std.testing.expectEqual(@as(i32, 3), interp.asI32(try assembleAndRun(src, "s32", &.{interp.f64Value(3.7)})));
+    try std.testing.expectEqual(@as(i32, -3), interp.asI32(try assembleAndRun(src, "s32", &.{interp.f64Value(-3.7)})));
+    // NaN -> 0 (the trapping form would error here).
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "s32", &.{interp.f64Value(nan)})));
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "u32", &.{interp.f64Value(nan)})));
+    // Out of range saturates to min/max.
+    try std.testing.expectEqual(@as(i32, std.math.maxInt(i32)), interp.asI32(try assembleAndRun(src, "s32", &.{interp.f64Value(inf)})));
+    try std.testing.expectEqual(@as(i32, std.math.minInt(i32)), interp.asI32(try assembleAndRun(src, "s32", &.{interp.f64Value(-inf)})));
+    // Unsigned: negatives clamp to 0, above-range to max.
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "u32", &.{interp.f64Value(-5.0)})));
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), @as(u32, @bitCast(interp.asI32(try assembleAndRun(src, "u32", &.{interp.f64Value(inf)})))));
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), interp.asI64(try assembleAndRun(src, "s64", &.{interp.f32Value(std.math.inf(f32))})));
+}
+
+test "bulk memory: memory.fill / memory.copy / memory.init / data.drop" {
+    const src =
+        \\(module
+        \\  (memory 1)
+        \\  (data (i32.const 0) "abcdef")
+        \\  (data "XYZ")                      ;; passive segment 1
+        \\  (func (export "fill") (param i32) (result i32)
+        \\    (memory.fill (i32.const 16) (local.get 0) (i32.const 4))
+        \\    (i32.load8_u (i32.const 18)))
+        \\  (func (export "copy") (result i32)
+        \\    (memory.copy (i32.const 32) (i32.const 0) (i32.const 6))
+        \\    (i32.load8_u (i32.const 34)))   ;; 'c'
+        \\  (func (export "overlap") (result i32)
+        \\    (memory.copy (i32.const 1) (i32.const 0) (i32.const 5))
+        \\    (i32.load8_u (i32.const 5)))    ;; overlapping move: 'e'
+        \\  (func (export "init") (result i32)
+        \\    (memory.init 1 (i32.const 64) (i32.const 0) (i32.const 3))
+        \\    (i32.load8_u (i32.const 65)))   ;; 'Y'
+        \\  (func (export "init_dropped") (result i32)
+        \\    (data.drop 1)
+        \\    (memory.init 1 (i32.const 80) (i32.const 0) (i32.const 3))
+        \\    (i32.const 0)))
+    ;
+    // fill: memory[16..20] = byte; read one back.
+    try std.testing.expectEqual(@as(i32, 0x41), interp.asI32(try assembleAndRun(src, "fill", &.{interp.i32Value(0x41)})));
+    // copy: "abcdef" -> 32; mem[34] == 'c'.
+    try std.testing.expectEqual(@as(i32, 'c'), interp.asI32(try assembleAndRun(src, "copy", &.{})));
+    // overlapping copy must behave like memmove: "abcdef" -> shift right by 1.
+    try std.testing.expectEqual(@as(i32, 'e'), interp.asI32(try assembleAndRun(src, "overlap", &.{})));
+    // init from the passive segment "XYZ": mem[65] == 'Y'.
+    try std.testing.expectEqual(@as(i32, 'Y'), interp.asI32(try assembleAndRun(src, "init", &.{})));
+    // A dropped segment reads as empty -> the 3-byte init is out of bounds.
+    try std.testing.expectError(error.MemoryOutOfBounds, assembleAndRun(src, "init_dropped", &.{}));
+}
+
+test "bulk memory: out-of-bounds fill/copy trap" {
+    const src =
+        \\(module
+        \\  (memory 1)
+        \\  (func (export "f") (result i32)
+        \\    (memory.fill (i32.const 65534) (i32.const 0) (i32.const 8))
+        \\    (i32.const 0))
+        \\  (func (export "c") (result i32)
+        \\    (memory.copy (i32.const 65535) (i32.const 0) (i32.const 4))
+        \\    (i32.const 0)))
+    ;
+    try std.testing.expectError(error.MemoryOutOfBounds, assembleAndRun(src, "f", &.{}));
+    try std.testing.expectError(error.MemoryOutOfBounds, assembleAndRun(src, "c", &.{}));
 }
 
 test "GC struct: new + get + set with numeric fields" {
