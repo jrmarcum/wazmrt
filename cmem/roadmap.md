@@ -199,10 +199,24 @@ and the trace assembles itself innermost-first as the error unwinds. Frames land
 `[16]TrapFrame` on `Instance` — recording a trap must not allocate (we may be unwinding an OOM) or fail
 — with `trap_depth` keeping the true depth so truncation is visible, reset per `invokeIndex`. Names are
 decoded **lazily** from a kept copy of the name section's function-name subsection; a malformed one
-degrades to "no names" rather than erroring on the path already reporting an error. +4 unit tests
-(**110**). Bench 266/268 vs 249 Mops/s baseline on the same box — no regression, as designed.
-*Left undone:* the C ABI's `wasm_trap_t` still carries only the message; the trace is on `Instance` but
-isn't surfaced through `wasm.h` yet.
+degrades to "no names" rather than erroring on the path already reporting an error.
+
+**4.1 also fixed a latent C ABI break it exposed.** `wasm.h` declares `wasm_trap_origin`,
+`wasm_trap_trace` and the `wasm_frame_*` family; we defined none of them, so an embedder following the
+header got a **link error** — not the "trace isn't surfaced yet" nicety this was first recorded as.
+Now implemented and guarded by `tests/c_smoke.c`, which deliberately traps and walks the backtrace
+(asserting the reported `module_offset` really lands on the `unreachable` byte). Auditing the whole
+header turned up **180** declared-but-undefined symbols, now 167 → **`known-issues.md` #20**, which
+also carries the reproducible audit command. Byte offsets are resolved **lazily** by re-decoding one
+body (`Instance.frameOffset`) — tracking them per instruction cost ~7% cold-start for a path most
+modules never take.
+
++6 unit tests (**111**). **Ended up faster than the baseline**: steady **286–288** vs **260–262**
+Mops/s, cold **0.86** vs **0.90** us/run. The route there is the durable lesson: the first cut
+regressed **14%** from an *error-path* change, because `Frame.run`'s `errdefer` expands at every `try`
+in a ~200-arm switch and inlining `recordTrap` there evicted the loop from i-cache. `noinline` fixed it
+and beat the old baseline — 4.1 had been inlining it too. Both facts are now invariants in
+`design-decisions.md`; the bisect method is in `testing.md`.
 
 **4.2 — `known-issues.md` #17: close the symlink hole (make the sandbox real, not lexical).**
 *Budget for this: it is the biggest item in Phase 4, not a cleanup.* `resolve()` stops a guest *naming*

@@ -4,6 +4,20 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
 
 ## Invariants
 
+- **`Instance.recordTrap` must stay `noinline` (2026-07-15).** `Frame.run`'s `errdefer` expands at
+  *every* `try` in a ~200-arm dispatch switch, so whatever it calls is duplicated across hundreds of
+  landing pads. Letting `recordTrap` inline bloats `Frame.run` and evicts the interpreter loop from
+  i-cache: **~14% steady-state, measured twice** (224 → 288 Mops/s just from adding `noinline`). It is
+  correctness-neutral and performance-load-bearing, which is exactly the kind of thing a later "clean
+  up the redundant noinline" pass would delete. Don't. Same reasoning applies to anything else the
+  `errdefer` ever calls. **The general rule: on an error path reached from a huge hot function, prefer
+  an out-of-line call — code size on the error path is a hot-path cost.**
+- **Trap byte offsets are resolved on demand, never tracked during execution (2026-07-15).**
+  `TrapFrame` carries `{func_index, pc}` only; `Instance.frameOffset` re-decodes that one body to map
+  pc → byte offset when a trap is *reported*. Tracking offsets at instantiate cost **~7% cold-start**
+  (0.86 → 0.96 us/run) plus 4 bytes per instruction for every module, to serve a path most modules
+  never take. Cold-start is the metric the vision competes on (`vision.md`); traps are rare and already
+  slow. If a future change wants offsets available mid-execution, weigh it against cold-start first.
 - **Libc-free core (2026-07-02).** `root.zig` and its deps link no libc, so the same code targets
   native *and* `wasm32-freestanding`. The C-ABI lib uses `std.heap.smp_allocator`; the wasm entry uses
   `std.heap.wasm_allocator`; **never `std.heap.c_allocator`** (that pulls in libc). `build.zig` must

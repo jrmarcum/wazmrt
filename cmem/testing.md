@@ -453,6 +453,23 @@ V8. **Decision:** build the shipped `.lib`/`.dll` (and the freestanding wasm —
 `design-decisions.md`. (Caveat: single machine; sizes + steady-state are solid, the µs/ms cold numbers
 are ±10% noisy.)
 
+## The C ABI audit — how 180 broken symbols stayed invisible (2026-07-15)
+
+`wasm.h` declared **180 functions we never defined**; an embedder calling one gets a link error, not a
+missing feature. Every C-ABI test we had only called what we'd implemented, so no test could see it.
+
+- **Re-run the audit after any C ABI change** — the exact command is in `known-issues.md` #20. The key
+  trick: **preprocess** the header (`zig cc -E`) before extracting names. `WASM_DECLARE_OWN`/`_VEC`/
+  `_TYPE` generate most of the API, so grepping the raw header finds only a fraction — which is
+  precisely why this hid for so long. Then reference every name from a C file and let the linker say
+  which are missing.
+- **Now 167** (4.1 defined the 13-symbol frame/trap-trace family). Deciding what to do with the rest is
+  #20.
+- **The regression guard:** `tests/c_smoke.c` now deliberately traps and walks the backtrace via
+  `wasm_trap_origin`/`wasm_trap_trace`/`wasm_frame_*`. Before it, `wasm_trap_message` was only ever
+  called on a "FAIL:" path that never fired — the trap surface was **entirely untested**. Keep that
+  section; it is what stands between us and re-shipping the same break.
+
 ## Trap diagnostics — Phase 4.1 (2026-07-15)
 
 - **+4 unit tests (110 total).** `interp`: a trap records innermost-frame-first with exact pc (a
@@ -465,12 +482,22 @@ are ±10% noisy.)
 - **Real-guest check:** the exact `minsafe.wasm` from the Phase 3 hunt now prints the answer that took
   hours to find (see "The `bitcast_invalid` trap" below), and the stripped `min.wasm` prints
   `at fn[49] +0` + the rebuild-unstripped hint.
-- **No hot-path cost — measured, not assumed:** `zig build bench` at 266/268 Mops/s with the change vs
-  **249** on the same box without it (git stash, same session). At or above baseline, so the difference
-  is run-to-run variance, not a win — the point is the absence of a regression. That is the design:
-  `errdefer` emits code on the error path only, and `Frame.func_index` is written once per call.
-  **When touching `Frame.run`, re-run this comparison in one session** — the recorded ~264 Mops/s from
-  2026-07-14 is not a valid baseline across days/machines.
+- **Perf, and the trap it set (read this before touching `Frame.run`).** The finished change is
+  **faster than the baseline it started from**: steady **286–288** vs **260–262** Mops/s, cold **0.86**
+  vs **0.90** us/run (same box, same session, `git stash` A/B/A).
+  Getting there was not smooth, and the shape of the mistake is the lesson:
+  1. First cut measured **224** — a reproducible **14% regression**, from a change that touched *no*
+     hot code. Two runs at 1787ms; not noise.
+  2. First hypothesis (a new `FuncBody` field shifting `end_of`/`else_of`, which `br_if` reads every
+     iteration) was **plausible and wrong** — moving the field off `FuncBody` changed nothing.
+  3. Bisecting the diff by file (`git stash push <paths>`) localized it to `interp.zig`, then to a
+     single call *on the error path*: `Frame.run`'s `errdefer` expands at every `try` in a ~200-arm
+     switch, so a slightly bigger `recordTrap` inlined into hundreds of landing pads and evicted the
+     loop from i-cache. **`noinline` fixed it and beat the old baseline by 10%** — 4.1 had been
+     inlining it too.
+  **Takeaways:** a hot-path regression can originate on an error path; bisect, don't theorize; and
+  always A/B against a **same-session** baseline — the ~264 Mops/s recorded 2026-07-14 is not
+  comparable across days, and run-to-run spread here is ~8%.
 
 ## WASI Phase 3 — the sandboxed filesystem (2026-07-15)
 

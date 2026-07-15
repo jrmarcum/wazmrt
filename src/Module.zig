@@ -154,6 +154,11 @@ pub const Local = struct { count: u32, type: types.ValType };
 pub const Code = struct {
     locals: []const Local,
     body: []const u8,
+    /// Absolute byte offset of `body` within the original module binary. The
+    /// bytes themselves are copied out (the input may be freed), so this is the
+    /// only way back to a position in the file — it's what lets a trap report
+    /// `wasm_frame_module_offset` truthfully.
+    body_offset: u32 = 0,
 
     /// Total number of declared locals (excludes parameters).
     pub fn localCount(self: Code) u64 {
@@ -279,7 +284,7 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
             .global => try decodeGlobalSection(&d, &sub),
             .@"export" => exports = try decodeExportSection(&d, &sub),
             .element => elements = try decodeElementSection(&d, &sub),
-            .code => code = try decodeCodeSection(&d, &sub),
+            .code => code = try decodeCodeSection(&d, &sub, offset),
             .data => data = try decodeDataSection(&d, &sub),
             .data_count => data_count = try sub.readVarU32(),
             .start => start = try sub.readVarU32(),
@@ -937,7 +942,9 @@ fn decodeDataSection(d: *Decoder, r: *Reader) Error![]const DataSegment {
     return list;
 }
 
-fn decodeCodeSection(d: *Decoder, r: *Reader) Error![]const Code {
+/// `payload_base` is the code section payload's absolute offset in the module,
+/// so each body can record where its bytes live in the original binary.
+fn decodeCodeSection(d: *Decoder, r: *Reader, payload_base: usize) Error![]const Code {
     const count = try r.readVarU32();
     const list = try d.a.alloc(Code, count);
     for (list) |*c| {
@@ -950,6 +957,9 @@ fn decodeCodeSection(d: *Decoder, r: *Reader) Error![]const Code {
         const owned = try d.a.alloc(u8, rest.len);
         @memcpy(owned, rest);
         c.body = owned;
+        // `entry` ends at r.pos, so it began at r.pos - entry.len; the body
+        // starts er.pos into it (past the locals vector).
+        c.body_offset = @intCast(payload_base + (r.pos - entry.len) + er.pos);
     }
     return list;
 }

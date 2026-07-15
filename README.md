@@ -106,9 +106,21 @@ module still instantiates and fails gracefully.
 ## Embedding (C ABI)
 
 wazmrt implements the **standard [WebAssembly C API](https://github.com/WebAssembly/wasm-c-api)**
-(`wasm.h`), so it embeds exactly like wasmtime or wasmer — the
-`universalWasmLoader-*` ports bind to the same ABI. `zig build` installs both
-`wasm.h` and the small `wazmrt.h` extension header alongside the static library.
+(`wasm.h`), so it embeds like wasmtime or wasmer — the `universalWasmLoader-*`
+ports bind to the same ABI. `zig build` installs both `wasm.h` and the small
+`wazmrt.h` extension header alongside the static library.
+
+> **Supported subset.** `wasm.h` is the upstream header, and wazmrt implements
+> the part an embedder actually drives: engine/store, module decode + validate +
+> introspection, instantiate, `wasm_func_call`, host-function imports, global /
+> memory / table objects, traps *including the `wasm_trap_origin` /
+> `wasm_trap_trace` / `wasm_frame_*` backtrace*, and the vector/type machinery
+> behind those. Not yet implemented — and therefore a **link error** if you call
+> them: the `wasm_*_copy` / `_same` / `*_host_info` boilerplate, `wasm_ref_t` and
+> the `wasm_ref_as_*` casts (which also gate `wasm_table_get`/`set`/`grow`),
+> `wasm_foreign_*`, `wasm_tagtype_*`, and module serialize/deserialize/share.
+> Tracked with a reproducible audit in `cmem/known-issues.md` (#20) — tell us
+> which you need.
 
 ```c
 #include "wazmrt.h"   /* pulls in <wasm.h> */

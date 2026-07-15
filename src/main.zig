@@ -121,6 +121,7 @@ pub fn main(init: std.process.Init) !void {
 /// (`cmem/known-issues.md` #19). A 2-instruction body trapping at +0 is the
 /// signature of a wasm-ld stub, and the name says which import it stubbed.
 fn printTrap(
+    arena: std.mem.Allocator,
     out: *Io.Writer,
     module: *const wazmrt.Module,
     inst: *const wazmrt.interp.Instance,
@@ -132,15 +133,25 @@ fn printTrap(
 
     for (frames, 0..) |f, i| {
         const lead = if (i == 0) "at" else "by";
+        // Prefer a real byte offset: it lines up with `wasm-objdump` output,
+        // where an IR index means nothing outside this runtime.
+        const off = inst.frameOffset(arena, f);
         if (module.funcName(f.func_index)) |n|
-            try out.print("  {s} fn[{d}] <{s}> +{d}\n", .{ lead, f.func_index, n, f.pc })
+            try out.print("  {s} fn[{d}] <{s}> +{d}\n", .{ lead, f.func_index, n, offOr(off, f) })
         else
-            try out.print("  {s} fn[{d}] +{d}\n", .{ lead, f.func_index, f.pc });
+            try out.print("  {s} fn[{d}] +{d}\n", .{ lead, f.func_index, offOr(off, f) });
     }
     if (inst.trapTruncated())
         try out.print("  ... {d} more frame(s)\n", .{inst.trap_depth - frames.len});
     if (module.func_names == null)
         try out.print("  (no name section: rebuild the guest unstripped for symbols)\n", .{});
+}
+
+/// The frame's byte offset within its function, falling back to the IR index
+/// when the body can't be re-decoded (a host frame, or OOM). Both are "+N" after
+/// a function name; the byte offset is the one an external tool can use.
+fn offOr(off: ?wazmrt.interp.Instance.Offsets, f: wazmrt.interp.TrapFrame) usize {
+    return if (off) |o| o.func else f.pc;
 }
 
 /// `runWasi` already reported the trap in full; the caller must not print again.
@@ -225,7 +236,7 @@ fn runWasi(
     _ = inst.invokeIndex(start_index, &.{}) catch |e| {
         // `proc_exit` unwinds via HostTrap with the code recorded — a clean exit.
         if (e == error.HostTrap and wasi.exit_code != null) return wasi.exit_code.?;
-        try printTrap(out, module, &inst, e);
+        try printTrap(arena, out, module, &inst, e);
         return AlreadyReported;
     };
     return wasi.exit_code orelse 0;
@@ -287,12 +298,12 @@ fn runFunction(
 
     inst.runStart() catch |e| {
         try out.print("trap: start: ", .{});
-        try printTrap(out, module, &inst, e);
+        try printTrap(arena, out, module, &inst, e);
         return;
     };
 
     const results = inst.invokeIndex(fi, call_args) catch |e| {
-        try printTrap(out, module, &inst, e);
+        try printTrap(arena, out, module, &inst, e);
         return;
     };
 

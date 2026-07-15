@@ -572,7 +572,32 @@ const Ref = struct {
 
 const wasm_page_size: usize = 65536;
 
-const Trap = struct { message: ByteVec };
+/// A trap's message plus the call stack it happened on. The frames are
+/// snapshotted when the trap is built — the interpreter's trace is reset by the
+/// next `invokeIndex`, and a `wasm_trap_t` outlives the call that produced it.
+const Trap = struct { message: ByteVec, frames: []Frame = &.{} };
+
+/// `wasm_frame_t`. Mirrors `interp.TrapFrame` plus the owning instance.
+///
+/// `func_offset` is a real byte offset within the function body and
+/// `module_offset` one within the module binary, per the header's contract — an
+/// IR index in either would look plausible and be wrong.
+const Frame = struct {
+    instance: ?*Instance,
+    func_index: u32,
+    func_offset: usize,
+    module_offset: usize,
+};
+
+/// `wasm_frame_vec_t` — a vector of owned `wasm_frame_t*` (WASM_DECLARE_VEC(frame, *)).
+const FrameVec = extern struct {
+    size: usize,
+    data: [*c]?*Frame,
+
+    fn empty(self: *FrameVec) void {
+        self.* = .{ .size = 0, .data = null };
+    }
+};
 
 // ---- wasm_val_t / wasm_val_vec_t ------------------------------------------
 // Layout must match C: `{ wasm_valkind_t kind; union { i32; i64; f32; f64;
@@ -665,7 +690,7 @@ fn copyFuncType(src: ?*const FuncType) ?*FuncType {
     return dst;
 }
 
-/// Allocate a trap carrying a NUL-terminated copy of `msg`.
+/// Allocate a trap carrying a NUL-terminated copy of `msg` and no frames.
 fn makeTrap(msg: []const u8) ?*Trap {
     const t = alloc.create(Trap) catch return null;
     const buf = alloc.alloc(u8, msg.len + 1) catch {
@@ -674,7 +699,35 @@ fn makeTrap(msg: []const u8) ?*Trap {
     };
     @memcpy(buf[0..msg.len], msg);
     buf[msg.len] = 0;
-    t.message = .{ .size = msg.len + 1, .data = buf.ptr };
+    t.* = .{ .message = .{ .size = msg.len + 1, .data = buf.ptr } };
+    return t;
+}
+
+/// `makeTrap`, snapshotting the call stack `wi` just trapped on.
+///
+/// The copy is the point: the interpreter's trace is reset by the next
+/// `invokeIndex`, but a `wasm_trap_t` outlives the call that produced it, so
+/// pointing at the live trace would hand the embedder a dangling read. Failing
+/// to allocate frames degrades to a message-only trap rather than losing the
+/// trap itself.
+fn makeTrapFrom(msg: []const u8, wi: *Instance) ?*Trap {
+    const t = makeTrap(msg) orelse return null;
+    const src = wi.inst.trapFrames();
+    if (src.len == 0) return t;
+
+    const frames = alloc.alloc(Frame, src.len) catch return t;
+    for (src, frames) |s, *dst| {
+        // Byte offsets are resolved here, on the error path, rather than tracked
+        // during execution (see `Instance.frameOffset`).
+        const off = wi.inst.frameOffset(alloc, s);
+        dst.* = .{
+            .instance = wi,
+            .func_index = s.func_index,
+            .func_offset = if (off) |o| o.func else 0,
+            .module_offset = if (off) |o| o.module else 0,
+        };
+    }
+    t.frames = frames;
     return t;
 }
 
@@ -1022,7 +1075,7 @@ export fn wasm_func_call(func: ?*const Ref, args: ?*const ValVec, results: ?*Val
         slot.* = valToSlot(a.data[i]);
     };
 
-    const res = wi.inst.invokeIndex(r.index, argv) catch |e| return makeTrap(@errorName(e));
+    const res = wi.inst.invokeIndex(r.index, argv) catch |e| return makeTrapFrom(@errorName(e), wi);
     defer alloc.free(res);
 
     if (results) |out| {
@@ -1260,7 +1313,111 @@ export fn wasm_trap_message(trap: ?*const Trap, out: *ByteVec) void {
 export fn wasm_trap_delete(trap: ?*Trap) void {
     const t = trap orelse return;
     wasm_byte_vec_delete(&t.message);
+    if (t.frames.len != 0) alloc.free(t.frames);
     alloc.destroy(t);
+}
+
+// ---- wasm_frame_t + the trap backtrace ------------------------------------
+// `wasm.h` declares this whole family, so an embedder that follows the header
+// and never gets it back is a link error, not a missing feature. The data comes
+// from the interpreter's trap trace (`interp.Instance.trapFrames`).
+
+/// `wasm_trap_origin` — the innermost frame, or null if the trap carries none
+/// (a host-callback trap, or one raised before any wasm code ran). Owned by the
+/// caller, per the header's `own` annotation.
+export fn wasm_trap_origin(trap: ?*const Trap) ?*Frame {
+    const t = trap orelse return null;
+    if (t.frames.len == 0) return null;
+    return copyFrame(&t.frames[0]);
+}
+
+/// `wasm_trap_trace` — the whole call stack, innermost first. Each element is
+/// owned by the caller; `wasm_frame_vec_delete` releases them.
+export fn wasm_trap_trace(trap: ?*const Trap, out: *FrameVec) void {
+    const t = trap orelse return out.empty();
+    if (t.frames.len == 0) return out.empty();
+    const buf = alloc.alloc(?*Frame, t.frames.len) catch return out.empty();
+    for (t.frames, buf) |*src, *dst| dst.* = copyFrame(src);
+    out.* = .{ .size = buf.len, .data = buf.ptr };
+}
+
+fn copyFrame(src: *const Frame) ?*Frame {
+    const f = alloc.create(Frame) catch return null;
+    f.* = src.*;
+    return f;
+}
+
+export fn wasm_frame_copy(frame: ?*const Frame) ?*Frame {
+    const f = frame orelse return null;
+    return copyFrame(f);
+}
+
+export fn wasm_frame_delete(frame: ?*Frame) void {
+    const f = frame orelse return;
+    alloc.destroy(f);
+}
+
+/// The instance the frame ran in. Borrowed — not `own` in the header.
+export fn wasm_frame_instance(frame: ?*const Frame) ?*Instance {
+    const f = frame orelse return null;
+    return f.instance;
+}
+
+export fn wasm_frame_func_index(frame: ?*const Frame) u32 {
+    const f = frame orelse return 0;
+    return f.func_index;
+}
+
+/// Byte offset of the trapping instruction within its function's body — a real
+/// offset into the original bytes, so it lines up with `wasm-objdump`.
+export fn wasm_frame_func_offset(frame: ?*const Frame) usize {
+    const f = frame orelse return 0;
+    return f.func_offset;
+}
+
+/// Byte offset of the trapping instruction within the module binary.
+export fn wasm_frame_module_offset(frame: ?*const Frame) usize {
+    const f = frame orelse return 0;
+    return f.module_offset;
+}
+
+// ---- wasm_frame_vec_t -----------------------------------------------------
+
+export fn wasm_frame_vec_new_empty(out: *FrameVec) void {
+    out.empty();
+}
+
+export fn wasm_frame_vec_new_uninitialized(out: *FrameVec, size: usize) void {
+    if (size == 0) return out.empty();
+    const buf = alloc.alloc(?*Frame, size) catch return out.empty();
+    @memset(buf, null);
+    out.* = .{ .size = size, .data = buf.ptr };
+}
+
+export fn wasm_frame_vec_new(out: *FrameVec, size: usize, data: [*c]const ?*Frame) void {
+    if (size == 0 or data == null) return out.empty();
+    const buf = alloc.alloc(?*Frame, size) catch return out.empty();
+    @memcpy(buf, data[0..size]);
+    out.* = .{ .size = size, .data = buf.ptr };
+}
+
+export fn wasm_frame_vec_copy(out: *FrameVec, src: *const FrameVec) void {
+    if (src.size == 0 or src.data == null) return out.empty();
+    const buf = alloc.alloc(?*Frame, src.size) catch return out.empty();
+    // A vec of `own` pointers: copying the vec must deep-copy the frames, or
+    // both vecs would free the same objects.
+    for (src.data[0..src.size], buf) |s, *dst| dst.* = if (s) |p| copyFrame(p) else null;
+    out.* = .{ .size = src.size, .data = buf.ptr };
+}
+
+export fn wasm_frame_vec_delete(vec: *FrameVec) void {
+    if (vec.data != null and vec.size != 0) {
+        for (vec.data[0..vec.size]) |slot| {
+            if (slot) |f| alloc.destroy(f);
+        }
+        alloc.free(vec.data[0..vec.size]);
+    }
+    vec.empty();
 }
 
 // ---- wazmrt extension surface (include/wazmrt.h) --------------------------

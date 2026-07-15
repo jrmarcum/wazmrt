@@ -11,6 +11,56 @@ This file tracks only what's left.
 
 Line numbers are hints (they drift) — the function/construct name is the durable anchor.
 
+## #20 — We ship a `wasm.h` that declares **167 functions we don't define** — OPEN (2026-07-15)
+
+**What:** `third_party/wasm-c-api/include/wasm.h` is the standard header, installed verbatim next to
+our library. An embedder that calls a declared-but-undefined symbol gets an **undefined-symbol link
+error** (static lib) or a failed `dlsym`/`Deno.dlopen` (the DLL path — i.e. our actual integration
+story, `vision.md`). This is not "a missing feature": we are advertising an API we don't have.
+
+**Found how (reproducible — re-run this after any C ABI change):**
+```sh
+zig build                                   # produces zig-out/{lib,include}
+printf '#include "wasm.h"\n' > pp.c
+zig cc -target x86_64-windows-gnu -E pp.c -I zig-out/include -o pp.i   # expand the macros
+grep -oE "\bwasm_[a-z0-9_]+[ ]*\(" pp.i | tr -d ' (' | sort -u > declared.txt
+{ echo '#include "wasm.h"'; echo 'void *refs[] = {';
+  while read n; do echo "  (void*)&$n,"; done < declared.txt;
+  echo '}; int main(void){ return refs[0]==0; }'; } > audit.c
+zig cc -target x86_64-windows-gnu audit.c -I zig-out/include -L zig-out/lib -lwazmrt -o audit.exe 2>&1 \
+  | grep -oE "undefined symbol: [a-z_]+" | sort -u
+```
+Macro-generated declarations (`WASM_DECLARE_OWN`/`_VEC`/`_TYPE`) are why the header must be
+**preprocessed** — grepping the raw header misses most of them, which is how this stayed invisible.
+
+**Was 180; now 167** — Phase 4.1 defined the 13-symbol frame/trap-trace family (#19). The rest fall in
+systematic families, mostly mechanical:
+- `wasm_*_copy` / `wasm_*_same` / `wasm_*_get_host_info` / `wasm_*_set_host_info[_with_finalizer]` —
+  the boilerplate every object type declares (~110 of the 167).
+- `wasm_ref_as_*` / `wasm_*_as_ref` casts + `wasm_ref_delete`/`copy`/`same` — needs a real `wasm_ref_t`
+  (already noted as deferred: it's what blocks `wasm_table_get`/`set`/`grow`, also on this list).
+- `wasm_foreign_*`, `wasm_tagtype_*`, `wasm_module_serialize`/`deserialize`/`share`/`obtain`,
+  `wasm_*type_new` constructors, `wasm_*_vec_copy`.
+
+**Severity:** latent but real, and it fails at *link/load* time — the embedder can't work around it.
+The reason it hasn't bitten: our own C client (`tests/c_smoke.c`) and `examples/deno_ffi.mjs` only use
+what we implement, so nothing ever asked for the rest.
+
+**Surfaces when:** any embedder written against the standard header rather than against our subset —
+`universalWasmLoader-*`, wasmtk-via-FFI, or anyone porting wasmtime/wasmer code (`vision.md` makes all
+three explicit goals). **Decide before that milestone**, since the options differ a lot in cost:
+1. implement the mechanical families (bulk, low risk, big surface);
+2. `wasm_ref_t` first (unblocks the casts *and* table get/set/grow together);
+3. ship a trimmed header declaring only what we define — honest, but forfeits drop-in compatibility,
+   which is the whole point of vendoring the standard header;
+4. leave it and document the supported subset loudly in `README.md`.
+
+**The durable fix for the *class*:** make the audit above a build step so a declared-but-undefined
+symbol fails CI instead of an embedder's link. That's the real lesson here — the gap existed since the
+C ABI landed and no test could see it, because every test only called what we'd implemented.
+
+**Anchor:** `src/wasm_c_api.zig` (all `export fn`s); `third_party/wasm-c-api/include/wasm.h`.
+
 ## #19 — Traps carry no location: `trap: Unreachable` and nothing else — **DONE 2026-07-15 (Phase 4.1)**
 
 **Was:** every trap surfaced as a bare `trap: <ErrorName>` — no function, no name, no pc. That gap is
@@ -36,17 +86,33 @@ Names come from `Module.funcName` — decode keeps only the name section's funct
 section degrades to "no names", never an error — it must not fail the report that is already reporting
 a failure.
 
-**Verified:** 4 unit tests (110 total) — innermost-first ordering with exact pc; deep recursion
+**Also through the C ABI (added 2026-07-15, same phase).** `wasm.h` *declares* `wasm_trap_origin`,
+`wasm_trap_trace` and the whole `wasm_frame_*` family — we defined none of them, so an embedder
+following the header got a **link error**. That was mis-recorded here first as "the trace isn't
+surfaced yet," i.e. a missing nicety; it was a broken promise in a header we ship. Now implemented
+(13 symbols) and covered by `tests/c_smoke.c`, which deliberately traps and walks the backtrace. Byte
+offsets are real: the C test asserts `trapmod[module_offset]` is the actual `unreachable` byte, so a
+plausible-looking-but-wrong offset fails the build. The broader header gap is **#20**.
+
+**Verified:** 6 unit tests (111 total) — innermost-first ordering with exact pc; deep recursion
 truncating at 16 with `trap_depth = 41`; reset between invokes; name lookup incl. gaps/past-the-end and
-a truncated section. Plus the real guest above. **No hot-path cost:** bench with the change 266/268
-Mops/s vs 249 baseline on the same box — at or above, i.e. run-to-run variance, no regression.
+a truncated section; and byte offsets on a body where pc and offset *diverge* (a multi-byte LEB pushes
+`unreachable` to pc 2 / byte 4), so an IR index couldn't pass by coincidence. Plus the real guest and
+the C client.
 
-**Anchor:** `Frame.run`'s `errdefer` + `Instance.recordTrap`/`trapFrames` (`src/interp.zig`);
-`Module.funcName`/`findFuncNameSubsection` (`src/Module.zig`); `printTrap` (`src/main.zig`).
+**Performance — the interesting part.** The first cut regressed steady-state **14%** (262 → 224
+Mops/s, reproducible). The cause was not what it looked like: nothing on the hot path changed. The
+`errdefer` in `Frame.run` expands at every `try` in a ~200-arm switch, so a slightly bigger
+`recordTrap` inlined into hundreds of landing pads and pushed the loop out of i-cache. `noinline` on
+`recordTrap` fixed it *and* beat the baseline — **288 Mops/s, +10% over HEAD** — because 4.1 had been
+inlining it too. Cold-start likewise ended up *better* (0.86 vs 0.90 us/run) once offsets went lazy.
+Both are now invariants in `design-decisions.md`. **Lesson: a hot-path regression can come from an
+error path.** Bisect against a same-session baseline; do not trust a recorded number from another day.
 
-**Left undone (deliberate):** the C ABI (`wasm_trap_t`) still carries only the message — the trace is
-reachable from `Instance` but not surfaced through `wasm.h`. Do it when an embedder asks; the data is
-already there.
+**Anchor:** `Frame.run`'s `errdefer` + `Instance.recordTrap`/`trapFrames`/`frameOffset`
+(`src/interp.zig`); `Module.funcName`/`findFuncNameSubsection` + `Code.body_offset` (`src/Module.zig`);
+`opcode.decodeBodyTracked`; `printTrap` (`src/main.zig`); `makeTrapFrom` + the `wasm_frame_*` exports
+(`src/wasm_c_api.zig`).
 
 ## #18 — Zig 0.16 std bug: `openFile(.follow_symlinks=false)` on Windows crashes the host — WORKED AROUND (2026-07-15)
 

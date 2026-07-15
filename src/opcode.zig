@@ -595,11 +595,29 @@ pub fn readHeapType(r: *Reader) DecodeError!HeapType {
 /// is allocated from `a` (typically the module's arena). Nesting and branch
 /// targets are left to validation.
 pub fn decodeBody(a: std.mem.Allocator, body: []const u8) (DecodeError || std.mem.Allocator.Error)![]const Instr {
+    return decodeBodyTracked(a, body, null);
+}
+
+/// `decodeBody`, additionally recording each instruction's **byte offset within
+/// `body`** into `offsets` (positionally aligned with the returned IR).
+///
+/// Decoding to an IR throws the original byte offsets away, but a trap has to
+/// report one: the C API's `wasm_frame_func_offset` is specified as a byte
+/// offset, and an IR index there would be a plausible-looking lie. Offsets live
+/// in a parallel array rather than in `Instr` so the dispatch loop's working set
+/// is unchanged — nothing reads them except a trap report.
+pub fn decodeBodyTracked(
+    a: std.mem.Allocator,
+    body: []const u8,
+    offsets: ?*std.ArrayList(u32),
+) (DecodeError || std.mem.Allocator.Error)![]const Instr {
     var r = Reader.init(body);
     var list: std.ArrayList(Instr) = .empty;
     errdefer list.deinit(a);
 
     while (!r.atEnd()) {
+        // Where this instruction starts, before its opcode byte is consumed.
+        if (offsets) |o| try o.append(a, @intCast(r.pos));
         const b0 = try r.readByte();
         if (b0 == 0xfb) {
             // 0xFB-prefixed GC op: a LEB sub-opcode picks the internal Op tag,

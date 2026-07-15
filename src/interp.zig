@@ -176,8 +176,9 @@ pub const TrapFrame = struct {
     /// Index in the *function index space* (imports included), so it lines up
     /// with the name section and with `call` immediates.
     func_index: u32,
-    /// Index of the trapping instruction in the decoded IR — not a byte offset
-    /// into the original body.
+    /// Index of the trapping instruction in the decoded IR — not a byte offset.
+    /// Resolve it to one with `Instance.frameOffset` when an external tool needs
+    /// a real position (`wasm_frame_func_offset`, `wasm-objdump`).
     pc: usize,
 };
 
@@ -499,12 +500,47 @@ pub const Instance = struct {
 
     /// Append a frame to the trap trace. Called only while unwinding, from
     /// `Frame.run`'s `errdefer`, so the innermost frame lands first.
-    fn recordTrap(self: *Instance, func_index: u32, pc: usize) void {
+    ///
+    /// **`noinline` is load-bearing, not a hint.** `Frame.run`'s `errdefer`
+    /// expands at *every* `try` in a ~200-arm dispatch switch, so anything
+    /// inlined here is duplicated across hundreds of landing pads and evicts the
+    /// interpreter loop from i-cache. Letting this inline cost ~14% steady-state
+    /// — measured, twice. Keep it out of line; it only ever runs once per frame
+    /// while a trap unwinds.
+    noinline fn recordTrap(self: *Instance, func_index: u32, pc: usize) void {
         self.trap_depth += 1;
         if (self.trap_len == max_trap_frames) return; // keep the innermost frames
         self.trap_frames[self.trap_len] = .{ .func_index = func_index, .pc = pc };
         self.trap_len += 1;
     }
+
+    /// Byte offset of `frame`'s instruction within its function body, and within
+    /// the module binary — what `wasm_frame_func_offset`/`_module_offset` mean,
+    /// and what lines up with `wasm-objdump`.
+    ///
+    /// Resolved on demand by re-decoding that one body, rather than kept per
+    /// instruction: tracking offsets at instantiate cost ~7% cold-start and 4
+    /// bytes per instruction *for every module*, to serve a path most modules
+    /// never take. Traps are rare and already slow; instantiation is the hot
+    /// path this runtime competes on. Returns null if the pc has no offset (it
+    /// can sit one past the end) or the body can't be re-decoded.
+    pub fn frameOffset(self: *const Instance, a: std.mem.Allocator, frame: TrapFrame) ?Offsets {
+        if (frame.func_index < self.imported_funcs) return null; // host func: no body
+        const defined = frame.func_index - self.imported_funcs;
+        if (defined >= self.module.code.len) return null;
+        const code = self.module.code[defined];
+
+        var offsets: std.ArrayList(u32) = .empty;
+        defer offsets.deinit(a);
+        // We want the offsets, not the IR — free the decode's other output.
+        const ir = opcode.decodeBodyTracked(a, code.body, &offsets) catch return null;
+        a.free(ir);
+        if (frame.pc >= offsets.items.len) return null;
+        const in_func = offsets.items[frame.pc];
+        return .{ .func = in_func, .module = code.body_offset + in_func };
+    }
+
+    pub const Offsets = struct { func: u32, module: u32 };
 
     fn findExportedFunc(self: *Instance, name: []const u8) ?u32 {
         for (self.module.exports) |e| {
@@ -1816,6 +1852,41 @@ test "a trap records where it happened, innermost frame first" {
     try std.testing.expectEqual(@as(u32, 1), frames[1].func_index);
     try std.testing.expectEqual(@as(usize, 1), frames[1].pc);
     try std.testing.expect(!inst.trapTruncated());
+
+    // Byte offsets into the body, resolved on demand — what
+    // wasm_frame_func_offset means. boom's body is [01 nop][00 unreachable]
+    // [0b end] (the decoder sees it past the locals count), so `unreachable` is
+    // at byte 1; outer's `call` is likewise at 1, after its nop.
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(@as(u32, 1), inst.frameOffset(a, frames[0]).?.func);
+    try std.testing.expectEqual(@as(u32, 1), inst.frameOffset(a, frames[1]).?.func);
+}
+
+test "trap frames carry real byte offsets, not IR indices" {
+    // A body where the two diverge: multi-byte instructions push later byte
+    // offsets well past their IR index, so an IR index in func_offset would be
+    // visibly wrong rather than coincidentally equal.
+    //   00 locals | i32.const 0x80 0x01 (2-byte LEB) | drop | unreachable | end
+    //   IR:          pc0                               pc1    pc2           pc3
+    //   bytes:       @0                                @3     @4            @5
+    const bytes =
+        types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+        [_]u8{ 0x01, 0x04, 0x01, 0x60, 0x00, 0x00 } ++
+        [_]u8{ 0x03, 0x02, 0x01, 0x00 } ++
+        [_]u8{ 0x07, 0x05, 0x01, 0x01, 'f', 0x00, 0x00 } ++
+        [_]u8{ 0x0a, 0x09, 0x01, 0x07, 0x00, 0x41, 0x80, 0x01, 0x1a, 0x00, 0x0b };
+    var inst = try instantiate(&bytes);
+    defer destroy(&inst);
+
+    try std.testing.expectError(error.Unreachable, inst.invoke("f", &.{}));
+    const f = inst.trapFrames()[0];
+    const off = inst.frameOffset(std.testing.allocator, f).?;
+    try std.testing.expectEqual(@as(usize, 2), f.pc); // third instruction ...
+    try std.testing.expectEqual(@as(u32, 4), off.func); // ... at byte 4 of the body
+
+    // The module offset must land on the `unreachable` byte in the real binary.
+    try std.testing.expect(off.module < bytes.len);
+    try std.testing.expectEqual(@as(u8, 0x00), bytes[off.module]);
 }
 
 test "the trap trace resets per invoke and survives a deeper-than-buffer stack" {

@@ -315,6 +315,112 @@ int main(void) {
     printf("validate(bad):   %s\n", bad_valid ? "true" : "false");
     if (bad_valid) failures++;
 
+    /*
+     * A trap, on purpose, and its backtrace through the standard API.
+     *
+     * Everything above treats a trap as a FAIL, so before this nothing ever
+     * exercised wasm_trap_message on a real trap, and wasm_trap_origin /
+     * wasm_trap_trace / wasm_frame_* were declared in wasm.h but never defined
+     * -- an embedder following the header hit a link error. Keep this test: it
+     * is the only thing standing between us and that regression.
+     *
+     *   (func $boom  unreachable)                      ; func 0
+     *   (func (export "outer")  call $boom)            ; func 1
+     */
+    const unsigned char trapmod[] = {
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,                        /* type ()->()        */
+        0x03, 0x03, 0x02, 0x00, 0x00,                              /* 2 funcs, type 0    */
+        0x07, 0x09, 0x01, 0x05, 'o','u','t','e','r', 0x00, 0x01,   /* export outer=func1 */
+        /* code: size 10 = count(1) + [len(1)+3] + [len(1)+4]
+         *       boom (3) = [00 locals][00 unreachable][0b end]
+         *       outer(4) = [00 locals][10 00 call 0] [0b end] */
+        0x0a, 0x0a, 0x02, 0x03, 0x00, 0x00, 0x0b, 0x04, 0x00, 0x10, 0x00, 0x0b,
+    };
+    wasm_byte_vec_t trapbin;
+    wasm_byte_vec_new(&trapbin, sizeof(trapmod), (const wasm_byte_t *)trapmod);
+    wasm_module_t *trapmodule = wasm_module_new(store, &trapbin);
+    if (!trapmodule) {
+        printf("FAIL: trap module decode\n");
+        failures++;
+    } else {
+        wasm_trap_t *itrap = NULL;
+        wasm_extern_vec_t noimp2;
+        wasm_extern_vec_new_empty(&noimp2);
+        wasm_instance_t *tinst = wasm_instance_new(store, trapmodule, &noimp2, &itrap);
+        if (!tinst) {
+            printf("FAIL: trap instance\n");
+            failures++;
+        } else {
+            wasm_extern_vec_t texps;
+            wasm_instance_exports(tinst, &texps);
+            wasm_func_t *outer = texps.size ? wasm_extern_as_func(texps.data[0]) : NULL;
+            wasm_val_vec_t ea, er;
+            wasm_val_vec_new_empty(&ea);
+            wasm_val_vec_new_empty(&er);
+
+            wasm_trap_t *t = wasm_func_call(outer, &ea, &er);
+            if (!t) {
+                printf("FAIL: outer did not trap\n");
+                failures++;
+            } else {
+                wasm_byte_vec_t msg;
+                wasm_trap_message(t, &msg);
+                printf("trap_message:    %s\n", msg.data ? (const char *)msg.data : "(none)");
+                if (!msg.data || !msg.size) { printf("FAIL: empty trap message\n"); failures++; }
+                wasm_byte_vec_delete(&msg);
+
+                /* origin = innermost frame = $boom (func 0), at the
+                 * `unreachable`, which is byte 0 of its body. */
+                wasm_frame_t *origin = wasm_trap_origin(t);
+                if (!origin) {
+                    printf("FAIL: trap has no origin frame\n");
+                    failures++;
+                } else {
+                    printf("trap_origin:     fn[%u] +%zu (module +%zu)\n",
+                           wasm_frame_func_index(origin),
+                           wasm_frame_func_offset(origin),
+                           wasm_frame_module_offset(origin));
+                    if (wasm_frame_func_index(origin) != 0) {
+                        printf("FAIL: origin should be func 0 ($boom)\n");
+                        failures++;
+                    }
+                    if (wasm_frame_instance(origin) != tinst) {
+                        printf("FAIL: origin frame's instance mismatch\n");
+                        failures++;
+                    }
+                    /* A module offset must land inside the binary, and on the
+                     * `unreachable` byte specifically. */
+                    size_t mo = wasm_frame_module_offset(origin);
+                    if (mo >= sizeof(trapmod) || trapmod[mo] != 0x00) {
+                        printf("FAIL: module_offset %zu doesn't point at the unreachable\n", mo);
+                        failures++;
+                    }
+                    wasm_frame_delete(origin);
+                }
+
+                /* Full backtrace: $boom called by outer. */
+                wasm_frame_vec_t frames;
+                wasm_trap_trace(t, &frames);
+                printf("trap_trace:      %zu frame(s)\n", frames.size);
+                if (frames.size != 2) {
+                    printf("FAIL: expected 2 frames\n");
+                    failures++;
+                } else if (wasm_frame_func_index(frames.data[0]) != 0 ||
+                           wasm_frame_func_index(frames.data[1]) != 1) {
+                    printf("FAIL: backtrace order should be innermost-first\n");
+                    failures++;
+                }
+                wasm_frame_vec_delete(&frames);
+                wasm_trap_delete(t);
+            }
+            wasm_extern_vec_delete(&texps);
+            wasm_instance_delete(tinst);
+        }
+        wasm_module_delete(trapmodule);
+    }
+    wasm_byte_vec_delete(&trapbin);
+
     printf("abi_version:     %u\n", wazmrt_abi_version());
     printf("version:         %s\n", wazmrt_version_string());
 
