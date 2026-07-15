@@ -16,6 +16,9 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Defined in tests/c_abi_symbols.c — the link-time completeness gate. */
+const void *wazmrt_abi_symbol_count(void);
+
 /* A host function supplied to a module's import: env.add(i32,i32) -> i32. */
 static wasm_trap_t *host_add(const wasm_val_vec_t *args, wasm_val_vec_t *results) {
     results->data[0].kind = WASM_I32;
@@ -420,6 +423,108 @@ int main(void) {
         wasm_module_delete(trapmodule);
     }
     wasm_byte_vec_delete(&trapbin);
+
+    /*
+     * The reference object model: copy / same / host_info / ref casts.
+     *
+     * Linking is not working: the gate below proves every symbol EXISTS, this
+     * proves the semantics. The one that actually bites is copy-vs-same --
+     * wasm_X_copy is `own`, but a copy must still be `same` as the original
+     * (they are references, not clones), which is why copy refcounts instead of
+     * duplicating.
+     */
+    {
+        wasm_byte_vec_t rbin;
+        wasm_byte_vec_new(&rbin, sizeof(addmod), (const wasm_byte_t *)addmod);
+        wasm_module_t *rm = wasm_module_new(store, &rbin);
+        if (!rm) { printf("FAIL: ref-model module\n"); failures++; }
+        else {
+            /* copy is another handle to the same object */
+            wasm_module_t *rm2 = wasm_module_copy(rm);
+            if (!wasm_module_same(rm, rm2)) { printf("FAIL: copy is not same\n"); failures++; }
+            wasm_module_delete(rm2);           /* refcount--, must NOT free rm */
+
+            /* host_info round-trips, and survives the copy above */
+            int marker = 0;
+            wasm_module_set_host_info(rm, &marker);
+            if (wasm_module_get_host_info(rm) != &marker) { printf("FAIL: host_info\n"); failures++; }
+
+            /* upcast is borrowed; downcast is checked */
+            wasm_ref_t *r = wasm_module_as_ref(rm);
+            if (!r || wasm_ref_as_module(r) != rm) { printf("FAIL: module<->ref round-trip\n"); failures++; }
+            if (wasm_ref_as_trap(r) != NULL) { printf("FAIL: ref_as_trap should reject a module\n"); failures++; }
+            if (wasm_ref_get_host_info(r) != &marker) { printf("FAIL: host_info via ref\n"); failures++; }
+            printf("ref_model:       copy/same/host_info/casts ok\n");
+
+            /* serialize -> deserialize round-trips into a usable module */
+            wasm_byte_vec_t ser;
+            wasm_module_serialize(rm, &ser);
+            wasm_module_t *des = wasm_module_deserialize(store, &ser);
+            if (!des) { printf("FAIL: deserialize\n"); failures++; }
+            else {
+                wasm_exporttype_vec_t dex;
+                wasm_module_exports(des, &dex);
+                if (dex.size != 1) { printf("FAIL: deserialized module lost its exports\n"); failures++; }
+                else printf("serialize:       %zu bytes -> module with %zu export(s)\n", ser.size, dex.size);
+                wasm_exporttype_vec_delete(&dex);
+                wasm_module_delete(des);
+            }
+            wasm_byte_vec_delete(&ser);
+
+            /* share/obtain crosses stores via the same binary */
+            wasm_shared_module_t *sh = wasm_module_share(rm);
+            wasm_module_t *ob = sh ? wasm_module_obtain(store, sh) : NULL;
+            if (!ob) { printf("FAIL: share/obtain\n"); failures++; }
+            else { printf("share/obtain:    ok\n"); wasm_module_delete(ob); }
+            wasm_shared_module_delete(sh);
+
+            wasm_module_delete(rm);
+        }
+        wasm_byte_vec_delete(&rbin);
+    }
+
+    /*
+     * Type-object constructors + copies. Unlike refs, these ARE values: a copy
+     * is a clone, so it must be independently deletable and not alias.
+     */
+    {
+        wasm_valtype_t *vt = wasm_valtype_new(WASM_I32);
+        wasm_globaltype_t *gt = wasm_globaltype_new(vt, WASM_VAR); /* takes vt */
+        wasm_globaltype_t *gt2 = wasm_globaltype_copy(gt);
+        int ok = gt2 && wasm_globaltype_mutability(gt2) == WASM_VAR &&
+                 wasm_valtype_kind(wasm_globaltype_content(gt2)) == WASM_I32 &&
+                 wasm_globaltype_content(gt2) != wasm_globaltype_content(gt); /* deep */
+        if (!ok) { printf("FAIL: globaltype new/copy\n"); failures++; }
+        /* as_externtype upcast keeps the kind readable */
+        if (wasm_externtype_kind(wasm_globaltype_as_externtype(gt)) != WASM_EXTERN_GLOBAL) {
+            printf("FAIL: globaltype_as_externtype\n"); failures++;
+        }
+        /* a checked downcast rejects the wrong kind */
+        if (wasm_externtype_as_memorytype(wasm_globaltype_as_externtype(gt)) != NULL) {
+            printf("FAIL: externtype_as_memorytype should reject a globaltype\n"); failures++;
+        }
+        wasm_globaltype_delete(gt2);
+        wasm_globaltype_delete(gt);
+
+        wasm_limits_t lim = { 1, 4 };
+        wasm_memorytype_t *mt = wasm_memorytype_new(&lim);
+        if (!mt || wasm_memorytype_limits(mt)->max != 4) { printf("FAIL: memorytype_new\n"); failures++; }
+        else printf("type_objects:    new/copy/casts ok\n");
+        wasm_memorytype_delete(mt);
+
+        /* tagtype: EH isn't implemented, but the type object is pure data */
+        wasm_valtype_vec_t tp, tr;
+        wasm_valtype_vec_new_empty(&tp);
+        wasm_valtype_vec_new_empty(&tr);
+        wasm_tagtype_t *tag = wasm_tagtype_new(wasm_functype_new(&tp, &tr));
+        if (!tag || !wasm_tagtype_functype(tag)) { printf("FAIL: tagtype_new\n"); failures++; }
+        wasm_tagtype_delete(tag);
+    }
+
+    /* Force the completeness gate in (tests/c_abi_symbols.c) to be linked: it
+     * references every function wasm.h declares, so if wazmrt stops defining
+     * one, THIS build fails instead of an embedder's. */
+    printf("abi_symbols:     %zu declared, all defined\n", (size_t)wazmrt_abi_symbol_count());
 
     printf("abi_version:     %u\n", wazmrt_abi_version());
     printf("version:         %s\n", wazmrt_version_string());

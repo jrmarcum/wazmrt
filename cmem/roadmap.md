@@ -73,8 +73,19 @@ DONE 2026-07-14**: `wasm_func_new[_with_env]` + `wasm_functype_new` + `wasm_valt
 `wasm_global_new`/`get`/`set`/`type`, `wasm_memory_new`/`data`/`size`/`grow`/`type`, `wasm_table_new`/
 `type`/`size`, all extern↔object casts, and import wiring for globals (value-copy) / memories+tables
 (shared object). Verified from C: read/write an exported global, `store` into an exported memory then
-read it back via `wasm_memory_data`, and `wasm_memory_grow`. **Deferred:** `wasm_table_get`/`set`/`grow`
-(need a `wasm_ref_t` model) and shared-mutable imported globals. **First host-FFI integration DONE
+read it back via `wasm_memory_data`, and `wasm_memory_grow`.
+
+**The C ABI is now COMPLETE against the header (2026-07-15, `known-issues.md` #20).** Every one of the
+**319** functions `wasm.h` declares is defined — it had been **180 short**, a link error for any
+embedder following the header, invisible because our own tests only called what we implement.
+`tests/c_abi_symbols.c` references them all and links into `c-smoke`, so a dropped symbol now fails our
+build. Landed with it: the `wasm_ref_t` object model (refcounted `copy`, `same`, `host_info` +
+finalizers, checked casts), **`wasm_table_get`/`set`/`grow`** — the long-deferred item, unblocked the
+moment `wasm_ref_t` existed — type-object constructors/copies, `wasm_foreign_t`, `wasm_tagtype_t`
+(type object only; EH stays deferred), and module serialize/deserialize/share. **Still deferred:**
+shared-mutable imported globals; and `wasm_table_get` hands back funcrefs only (an externref slot has
+no `wasm_ref_t` to return without boxing at the host boundary — it reports null rather than inventing
+one). **First host-FFI integration DONE
 2026-07-14**: `zig build dll` builds the C-ABI as a **shared library** (`wazmrt.dll`, libc-free), and
 `examples/deno_ffi.mjs` (run by `zig build ffi-demo`) has **Deno `Deno.dlopen` the DLL and drive the
 standard wasm-c-api** (decode → instantiate → call) → `answer()=42`. This validates the vision's

@@ -110,17 +110,21 @@ wazmrt implements the **standard [WebAssembly C API](https://github.com/WebAssem
 ports bind to the same ABI. `zig build` installs both `wasm.h` and the small
 `wazmrt.h` extension header alongside the static library.
 
-> **Supported subset.** `wasm.h` is the upstream header, and wazmrt implements
-> the part an embedder actually drives: engine/store, module decode + validate +
-> introspection, instantiate, `wasm_func_call`, host-function imports, global /
-> memory / table objects, traps *including the `wasm_trap_origin` /
-> `wasm_trap_trace` / `wasm_frame_*` backtrace*, and the vector/type machinery
-> behind those. Not yet implemented — and therefore a **link error** if you call
-> them: the `wasm_*_copy` / `_same` / `*_host_info` boilerplate, `wasm_ref_t` and
-> the `wasm_ref_as_*` casts (which also gate `wasm_table_get`/`set`/`grow`),
-> `wasm_foreign_*`, `wasm_tagtype_*`, and module serialize/deserialize/share.
-> Tracked with a reproducible audit in `cmem/known-issues.md` (#20) — tell us
-> which you need.
+> **Every function `wasm.h` declares is implemented** — all 319, checked at
+> link time on every build (`tests/c_abi_symbols.c` references them all, so a
+> missing one breaks our build rather than yours). That includes the pieces
+> embedders reach for and runtimes often skip: `wasm_ref_t` and the
+> `wasm_ref_as_*` casts, `wasm_table_get`/`set`/`grow`, `host_info` with
+> finalizers, trap backtraces (`wasm_trap_origin` / `wasm_trap_trace` /
+> `wasm_frame_*`), `wasm_foreign_t`, and module serialize/deserialize/share.
+>
+> Two semantics worth knowing: `wasm_*_copy` on a *reference* (module, instance,
+> func, trap, …) returns another handle to the same object — `wasm_*_same` on it
+> is true — while a copy of a *type* object is a real deep clone.
+> `wasm_module_serialize` returns the original binary: wazmrt interprets a
+> decoded IR, so there is no AOT artifact, and `wasm_module_deserialize` simply
+> re-decodes. Exception-handling tags exist as type objects only — no module can
+> produce one, since EH is deferred.
 
 ```c
 #include "wazmrt.h"   /* pulls in <wasm.h> */

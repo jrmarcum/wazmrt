@@ -131,7 +131,10 @@ pub const Error = Module.Error || error{
 /// uninitialized table entry. A funcref value is a function index (always small),
 /// and host externref values are boxed to small non-sentinel handles at the host
 /// boundary (see the WAST runner's `internExtern`, #9), so neither collides.
-const null_ref: Value = std.math.maxInt(u64);
+///
+/// Public because the C ABI speaks this model directly: `wasm_table_get`/`set`
+/// translate between table slots and `wasm_ref_t`.
+pub const null_ref: Value = std.math.maxInt(u64);
 
 /// Tag bit marking a value slot as an unboxed i31 (full GC). Set on `ref.i31`
 /// results so `ref.test`/`ref.cast` can distinguish an i31 from a heap-object

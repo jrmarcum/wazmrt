@@ -453,22 +453,33 @@ V8. **Decision:** build the shipped `.lib`/`.dll` (and the freestanding wasm —
 `design-decisions.md`. (Caveat: single machine; sizes + steady-state are solid, the µs/ms cold numbers
 are ±10% noisy.)
 
-## The C ABI audit — how 180 broken symbols stayed invisible (2026-07-15)
+## The C ABI: the link-time completeness gate (2026-07-15)
 
-`wasm.h` declared **180 functions we never defined**; an embedder calling one gets a link error, not a
-missing feature. Every C-ABI test we had only called what we'd implemented, so no test could see it.
+`wasm.h` declared **180 functions we never defined** — a link error for any embedder following the
+header, invisible to us because every C-ABI test only called what we'd already implemented. **Now 0**,
+and a gate keeps it there.
 
-- **Re-run the audit after any C ABI change** — the exact command is in `known-issues.md` #20. The key
-  trick: **preprocess** the header (`zig cc -E`) before extracting names. `WASM_DECLARE_OWN`/`_VEC`/
-  `_TYPE` generate most of the API, so grepping the raw header finds only a fraction — which is
-  precisely why this hid for so long. Then reference every name from a C file and let the linker say
-  which are missing.
-- **Now 167** (4.1 defined the 13-symbol frame/trap-trace family). Deciding what to do with the rest is
-  #20.
-- **The regression guard:** `tests/c_smoke.c` now deliberately traps and walks the backtrace via
-  `wasm_trap_origin`/`wasm_trap_trace`/`wasm_frame_*`. Before it, `wasm_trap_message` was only ever
-  called on a "FAIL:" path that never fired — the trap surface was **entirely untested**. Keep that
-  section; it is what stands between us and re-shipping the same break.
+- **`tests/c_abi_symbols.c` is the gate.** It takes the address of all **319** declared functions and
+  links into `zig build c-smoke`: drop a symbol and *our* build fails. `c_smoke.c` prints
+  `abi_symbols: 319 declared, all defined`.
+- **The gate was itself verified**, by un-exporting `wasm_table_grow` and confirming c-smoke dies with
+  `undefined symbol: wasm_table_grow`. A gate nobody has watched fail is decoration — check this when
+  you change it.
+- **Regenerate after vendoring a new `wasm.h`** — command in `known-issues.md` #20. The one trick that
+  makes it work: **preprocess** the header (`zig cc -E`) before extracting names, because
+  `WASM_DECLARE_OWN`/`_VEC`/`_TYPE` generate most of the API and a source grep finds a fraction. That
+  is precisely why the hole hid for months.
+- **Functional coverage, not just linkage** (`c_smoke.c`): linking proves the symbol exists, not that
+  it works. So the smoke test also checks the semantics that are easy to get subtly wrong —
+  `wasm_module_copy` is `same` as its original (references refcount, they don't clone), `host_info`
+  round-trips through both the object and its `wasm_ref_t`, a downcast to the *wrong* type returns null,
+  a type-object copy is a genuine deep clone (`content` pointers differ), a wrong-kind
+  `externtype_as_*` returns null, and serialize → deserialize yields a module that still has its
+  exports.
+- **The trap surface** is covered too: `c_smoke.c` deliberately traps and walks
+  `wasm_trap_origin`/`wasm_trap_trace`/`wasm_frame_*`, asserting `trapmod[module_offset]` is the real
+  `unreachable` byte. Before that, `wasm_trap_message` was only reached on a "FAIL:" path that never
+  fired — the whole trap surface was untested.
 
 ## Trap diagnostics — Phase 4.1 (2026-07-15)
 

@@ -107,6 +107,10 @@ pub fn build(b: *std.Build) void {
         });
         const csmoke_mod = b.createModule(.{ .target = gnu, .optimize = optimize, .link_libc = true });
         csmoke_mod.addCSourceFile(.{ .file = b.path("tests/c_smoke.c"), .flags = &.{"-DLIBWASM_STATIC"} });
+        // The completeness gate: references every function wasm.h declares, so a
+        // symbol we promise but don't define breaks THIS build rather than an
+        // embedder's link. See cmem/known-issues.md #20.
+        csmoke_mod.addCSourceFile(.{ .file = b.path("tests/c_abi_symbols.c"), .flags = &.{"-DLIBWASM_STATIC"} });
         csmoke_mod.addIncludePath(b.path("include"));
         csmoke_mod.addIncludePath(b.path("third_party/wasm-c-api/include"));
         csmoke_mod.linkLibrary(cabi_gnu);

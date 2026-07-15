@@ -29,7 +29,71 @@ const alloc = std.heap.smp_allocator;
 const Config = struct { _pad: u8 = 0 };
 const Engine = struct { _pad: u8 = 0 };
 const Store = struct { engine: *Engine };
-const Module = struct { inner: root.Module };
+
+// ---- The reference object model (wasm_ref_t and its subtypes) --------------
+//
+// `wasm.h` builds every ownable object out of two macros:
+//   WASM_DECLARE_REF_BASE — delete/copy/same/{get,set}_host_info
+//   WASM_DECLARE_REF      — the above + `X_as_ref` / `ref_as_X` upcasts
+// so `wasm_ref_t` is the common supertype of extern/func/global/table/memory,
+// foreign, instance, module and trap.
+//
+// **Copies are references, not clones.** `wasm_X_copy` is `own`, but
+// `wasm_X_same(copy(x), x)` must be true — so a copy is another handle to the
+// same object, i.e. a refcount bump. That is also what makes copy cheap on
+// objects (an `Instance`, a decoded `Module`) that could not be deep-copied
+// meaningfully anyway.
+//
+// The upcast is borrowed (`wasm_ref_t*`, not `own`), so it must not allocate.
+// Every object embeds `hdr` and hands out `&obj.hdr`; the downcast recovers the
+// object with `@fieldParentPtr`. That works whatever field order Zig picks —
+// no `extern struct` or offset-0 assumption.
+
+const RefTag = enum(u8) { extern_obj, foreign, instance, module, trap };
+
+/// `wasm_ref_t`: the header every ref-able object embeds.
+const RefHeader = struct {
+    tag: RefTag,
+    /// Handles to this object. `copy` bumps it; `delete` drops it and frees at 0.
+    rc: u32 = 1,
+    host_info: ?*anyopaque = null,
+    host_info_finalizer: ?Finalizer = null,
+};
+
+/// Drop one handle. Returns true when the last one went away and the caller
+/// should tear the object down.
+fn release(hdr: *RefHeader) bool {
+    if (hdr.rc > 1) {
+        hdr.rc -= 1;
+        return false;
+    }
+    if (hdr.host_info_finalizer) |f| f(hdr.host_info);
+    return true;
+}
+
+/// Take another handle. Returns the same object — see the note above.
+fn retain(hdr: *RefHeader) void {
+    hdr.rc += 1;
+}
+
+const Module = struct {
+    hdr: RefHeader = .{ .tag = .module },
+    inner: root.Module,
+    /// The binary this was decoded from, owned. `root.Module` copies out what it
+    /// needs and lets the input go, but `wasm_module_serialize` is specified to
+    /// hand back a binary, so the C ABI keeps one. It also gives `deserialize`
+    /// something to round-trip against.
+    bytes: []u8,
+};
+
+/// `wasm_foreign_t` — an opaque host object. It carries nothing but its header;
+/// the point is the `host_info` an embedder hangs on it.
+const Foreign = struct { hdr: RefHeader = .{ .tag = .foreign } };
+
+/// `wasm_shared_module_t`. Sharing is across stores, so it cannot just be the
+/// `Module` handle; it holds its own copy of the binary and `obtain` decodes a
+/// fresh module from it.
+const SharedModule = struct { bytes: []u8 };
 
 // ---- wasm_byte_vec_t ------------------------------------------------------
 // Must match the C layout exactly: `struct { size_t size; wasm_byte_t* data; }`
@@ -121,10 +185,23 @@ export fn wasm_store_delete(store: ?*Store) void {
 export fn wasm_module_new(store: ?*Store, binary: ?*const ByteVec) ?*Module {
     _ = store;
     const bin = binary orelse return null;
+    return moduleFromBytes(vecSlice(bin));
+}
+
+/// Decode `src` into a `wasm_module_t`, keeping an owned copy of the binary.
+fn moduleFromBytes(src: []const u8) ?*Module {
     const m = alloc.create(Module) catch return null;
-    m.inner = root.decode(alloc, vecSlice(bin)) catch {
+    const kept = alloc.dupe(u8, src) catch {
         alloc.destroy(m);
         return null;
+    };
+    m.* = .{
+        .inner = root.decode(alloc, kept) catch {
+            alloc.free(kept);
+            alloc.destroy(m);
+            return null;
+        },
+        .bytes = kept,
     };
     return m;
 }
@@ -139,8 +216,49 @@ export fn wasm_module_validate(store: ?*Store, binary: ?*const ByteVec) bool {
 
 export fn wasm_module_delete(module: ?*Module) void {
     const m = module orelse return;
+    if (!release(&m.hdr)) return; // another handle still holds it
     m.inner.deinit();
+    alloc.free(m.bytes);
     alloc.destroy(m);
+}
+
+// ---- Module sharing / serialization ---------------------------------------
+
+/// `wasm_module_serialize` — hand back a binary that `deserialize` accepts. We
+/// return the original bytes rather than inventing a compiled format: wazmrt
+/// interprets a decoded IR, so there is no AOT artifact to emit, and a
+/// round-trip through the original binary is both honest and correct.
+export fn wasm_module_serialize(module: ?*const Module, out: *ByteVec) void {
+    const m = module orelse return out.empty();
+    wasm_byte_vec_new(out, m.bytes.len, m.bytes.ptr);
+}
+
+export fn wasm_module_deserialize(store: ?*Store, bytes: ?*const ByteVec) ?*Module {
+    _ = store;
+    const b = bytes orelse return null;
+    return moduleFromBytes(vecSlice(b));
+}
+
+export fn wasm_module_share(module: ?*const Module) ?*SharedModule {
+    const m = module orelse return null;
+    const s = alloc.create(SharedModule) catch return null;
+    s.bytes = alloc.dupe(u8, m.bytes) catch {
+        alloc.destroy(s);
+        return null;
+    };
+    return s;
+}
+
+export fn wasm_module_obtain(store: ?*Store, shared: ?*const SharedModule) ?*Module {
+    _ = store;
+    const s = shared orelse return null;
+    return moduleFromBytes(s.bytes);
+}
+
+export fn wasm_shared_module_delete(shared: ?*SharedModule) void {
+    const s = shared orelse return;
+    alloc.free(s.bytes);
+    alloc.destroy(s);
 }
 
 // ===========================================================================
@@ -160,9 +278,16 @@ const EXTERN_FUNC: Externkind = 0;
 const EXTERN_GLOBAL: Externkind = 1;
 const EXTERN_TABLE: Externkind = 2;
 const EXTERN_MEMORY: Externkind = 3;
+/// Exception-handling tags. wazmrt doesn't implement EH (`design-decisions.md`
+/// defers it until it's browser-standard), but `wasm_tagtype_t` is pure type
+/// data an embedder can construct and inspect, and the header declares it — so
+/// the *type object* exists even though no module can produce one.
+const EXTERN_TAG: Externkind = 4;
 
 /// wasm_limits_t: `{ uint32_t min; uint32_t max; }` (max 0xffffffff == none).
 const Limits = extern struct { min: u32, max: u32 };
+/// `wasm_limits_max_default` from the header: "no maximum".
+const wasm_limits_max_default: u32 = 0xffff_ffff;
 
 const ValType = struct { kind: Valkind };
 
@@ -175,8 +300,20 @@ const GlobalType = extern struct { ekind: Externkind, content: ?*ValType, mutabi
 const TableType = extern struct { ekind: Externkind, element: ?*ValType, limits: Limits };
 const MemoryType = extern struct { ekind: Externkind, limits: Limits };
 
+/// `wasm_tagtype_t`. Same `ekind`-first shape as the other extern types, so it
+/// participates in the `externtype` tagged union.
+const TagType = extern struct { ekind: Externkind, functype: ?*FuncType };
+const TagTypeVec = extern struct { size: usize, data: [*c]?*TagType };
+
 const ImportType = struct { module: ByteVec, name: ByteVec, ext: ?*anyopaque };
 const ExportType = struct { name: ByteVec, ext: ?*anyopaque };
+const FuncTypeVec = extern struct { size: usize, data: [*c]?*FuncType };
+const GlobalTypeVec = extern struct { size: usize, data: [*c]?*GlobalType };
+const TableTypeVec = extern struct { size: usize, data: [*c]?*TableType };
+const MemoryTypeVec = extern struct { size: usize, data: [*c]?*MemoryType };
+/// `wasm_externtype_t` is opaque in C; ours is the `ekind`-first union, reached
+/// through `*anyopaque`.
+const ExternTypeVec = extern struct { size: usize, data: [*c]?*anyopaque };
 
 fn valkindOf(v: types.ValType) Valkind {
     return switch (v) {
@@ -536,7 +673,11 @@ const interp = root.interp;
 
 /// `interp.Instance.import_funcs` borrows its slice, so the wrapper owns
 /// `host_funcs` for the instance's lifetime.
-const Instance = struct { inst: root.Instance, host_funcs: []interp.Instance.HostFunc = &.{} };
+const Instance = struct {
+    hdr: RefHeader = .{ .tag = .instance },
+    inst: root.Instance,
+    host_funcs: []interp.Instance.HostFunc = &.{},
+};
 
 const FuncCallback = *const fn (args: ?*const ValVec, results: ?*ValVec) callconv(.c) ?*Trap;
 const FuncCallbackWithEnv = *const fn (env: ?*anyopaque, args: ?*const ValVec, results: ?*ValVec) callconv(.c) ?*Trap;
@@ -558,7 +699,13 @@ const HostGlobal = struct { value: interp.Value, content: Valkind, mutable: bool
 /// (`instance` set, `index` locates the object in its space) or a standalone
 /// host object created by `wasm_*_new` (one of the `host_*` fields set).
 const Ref = struct {
+    hdr: RefHeader = .{ .tag = .extern_obj },
     kind: Externkind,
+    /// True when this allocation belongs to the `wasm_extern_vec_t` that
+    /// produced it (`wasm_instance_exports`), which frees it. Explicit rather
+    /// than inferred from `instance`, because `wasm_table_get` hands back an
+    /// `own` handle that *also* names an instance — inferring would leak it.
+    vec_owned: bool = false,
     instance: ?*Instance = null,
     /// Index in the export's kind space (function/global/table for exports).
     index: u32 = 0,
@@ -575,7 +722,7 @@ const wasm_page_size: usize = 65536;
 /// A trap's message plus the call stack it happened on. The frames are
 /// snapshotted when the trap is built — the interpreter's trace is reset by the
 /// next `invokeIndex`, and a `wasm_trap_t` outlives the call that produced it.
-const Trap = struct { message: ByteVec, frames: []Frame = &.{} };
+const Trap = struct { hdr: RefHeader = .{ .tag = .trap }, message: ByteVec, frames: []Frame = &.{} };
 
 /// `wasm_frame_t`. Mirrors `interp.TrapFrame` plus the owning instance.
 ///
@@ -933,7 +1080,7 @@ export fn wasm_instance_exports(instance: ?*const Instance, out: *ExternVec) voi
         };
         // Calls mutate instance state (memory/heap growth), so the handle keeps a
         // mutable pointer despite the `const` export view.
-        r.* = .{ .kind = externKindToC(e.type.kind()), .instance = @constCast(wi), .index = e.index };
+        r.* = .{ .kind = externKindToC(e.type.kind()), .vec_owned = true, .instance = @constCast(wi), .index = e.index };
         slot.* = r;
     }
     out.* = .{ .size = exps.len, .data = arr.ptr };
@@ -1025,13 +1172,7 @@ export fn wasm_memory_as_extern_const(m: ?*const Ref) ?*const Ref {
 // ---- Functions ------------------------------------------------------------
 
 export fn wasm_func_delete(f: ?*Ref) void {
-    const r = f orelse return;
-    // An export handle (`instance` set) is borrowed — freed by the extern vec.
-    // A standalone host func from `wasm_func_new` is owned and freed here.
-    if (r.instance != null) return;
-    if (r.host) |hc| if (hc.finalizer) |fin| fin(hc.env);
-    if (r.functype) |ft| freeExternType(@ptrCast(ft));
-    alloc.destroy(r);
+    refDelete(f);
 }
 
 export fn wasm_func_type(f: ?*const Ref) ?*FuncType {
@@ -1157,10 +1298,7 @@ export fn wasm_global_type(g: ?*const Ref) ?*GlobalType {
 }
 
 export fn wasm_global_delete(g: ?*Ref) void {
-    const r = g orelse return;
-    if (r.instance != null) return; // export handle: freed by the extern vec
-    if (r.host_global) |hg| alloc.destroy(hg);
-    alloc.destroy(r);
+    refDelete(g);
 }
 
 // ---- Memories -------------------------------------------------------------
@@ -1227,13 +1365,7 @@ export fn wasm_memory_type(m: ?*const Ref) ?*MemoryType {
 }
 
 export fn wasm_memory_delete(m: ?*Ref) void {
-    const r = m orelse return;
-    if (r.instance != null) return; // export handle: interp owns the memory
-    if (r.host_memory) |mem| {
-        alloc.free(mem.bytes);
-        alloc.destroy(mem);
-    }
-    alloc.destroy(r);
+    refDelete(m);
 }
 
 // ---- Tables ---------------------------------------------------------------
@@ -1286,13 +1418,60 @@ export fn wasm_table_type(t: ?*const Ref) ?*TableType {
 }
 
 export fn wasm_table_delete(t: ?*Ref) void {
-    const r = t orelse return;
-    if (r.instance != null) return; // export handle: interp owns the table
-    if (r.host_table) |tbl| {
-        alloc.free(tbl.entries);
-        alloc.destroy(tbl);
-    }
-    alloc.destroy(r);
+    refDelete(t);
+}
+
+// `wasm_table_get`/`set`/`grow` were deferred until `wasm_ref_t` existed —
+// their whole signature is refs. Element values are interpreter `Value`s: a
+// funcref is a function index, `null_ref` an empty slot (`interp` docs).
+
+/// Build an `own wasm_ref_t*` for table slot value `v`, or null for an empty
+/// slot. The handle is standalone (`vec_owned = false`), so the caller's
+/// `wasm_ref_delete` really frees it.
+fn refFromTableValue(owner: *const Ref, v: interp.Value) ?*RefHeader {
+    if (v == interp.null_ref) return null;
+    const r = alloc.create(Ref) catch return null;
+    r.* = .{ .kind = EXTERN_FUNC, .instance = owner.instance, .index = @intCast(v) };
+    return &r.hdr;
+}
+
+export fn wasm_table_get(t: ?*const Ref, index: u32) ?*RefHeader {
+    const r = t orelse return null;
+    const tbl = tableObj(r) orelse return null;
+    if (index >= tbl.entries.len) return null;
+    return refFromTableValue(r, tbl.entries[index]);
+}
+
+export fn wasm_table_set(t: ?*Ref, index: u32, ref: ?*RefHeader) bool {
+    const r = t orelse return false;
+    const tbl = tableObj(r) orelse return false;
+    if (index >= tbl.entries.len) return false;
+    tbl.entries[index] = tableValueFromRef(ref) orelse return false;
+    return true;
+}
+
+/// The `Value` to store for `ref`: `null_ref` for a null ref, the function
+/// index for a funcref. Returns null (→ the caller reports failure) for a ref
+/// that can't live in a table, rather than storing something meaningless.
+fn tableValueFromRef(ref: ?*RefHeader) ?interp.Value {
+    const h = ref orelse return interp.null_ref;
+    if (h.tag != .extern_obj) return null;
+    const obj: *const Ref = @alignCast(@fieldParentPtr("hdr", h));
+    if (obj.kind != EXTERN_FUNC) return null;
+    return @as(interp.Value, obj.index);
+}
+
+export fn wasm_table_grow(t: ?*Ref, delta: u32, init: ?*RefHeader) bool {
+    const r = t orelse return false;
+    const tbl = tableObj(r) orelse return false;
+    const fill = tableValueFromRef(init) orelse return false;
+    const old = tbl.entries.len;
+    const new_len = std.math.add(usize, old, delta) catch return false;
+    if (tbl.max) |m| if (new_len > m) return false;
+    const grown = alloc.realloc(tbl.entries, new_len) catch return false;
+    @memset(grown[old..], fill);
+    tbl.entries = grown;
+    return true;
 }
 
 // ---- Traps ----------------------------------------------------------------
@@ -1315,6 +1494,532 @@ export fn wasm_trap_delete(trap: ?*Trap) void {
     wasm_byte_vec_delete(&t.message);
     if (t.frames.len != 0) alloc.free(t.frames);
     alloc.destroy(t);
+}
+
+// ---- Type-object constructors, copies, and casts --------------------------
+
+export fn wasm_valtype_copy(vt: ?*const ValType) ?*ValType {
+    const p = vt orelse return null;
+    const n = alloc.create(ValType) catch return null;
+    n.* = p.*;
+    return n;
+}
+
+export fn wasm_globaltype_new(content: ?*ValType, mutability: u8) ?*GlobalType {
+    const c = content orelse return null; // takes ownership of `content`
+    const gt = alloc.create(GlobalType) catch {
+        alloc.destroy(c);
+        return null;
+    };
+    gt.* = .{ .ekind = EXTERN_GLOBAL, .content = c, .mutability = mutability };
+    return gt;
+}
+
+export fn wasm_tabletype_new(element: ?*ValType, limits: ?*const Limits) ?*TableType {
+    const e = element orelse return null; // takes ownership of `element`
+    const tt = alloc.create(TableType) catch {
+        alloc.destroy(e);
+        return null;
+    };
+    tt.* = .{
+        .ekind = EXTERN_TABLE,
+        .element = e,
+        .limits = if (limits) |l| l.* else .{ .min = 0, .max = wasm_limits_max_default },
+    };
+    return tt;
+}
+
+export fn wasm_memorytype_new(limits: ?*const Limits) ?*MemoryType {
+    const mt = alloc.create(MemoryType) catch return null;
+    mt.* = .{
+        .ekind = EXTERN_MEMORY,
+        .limits = if (limits) |l| l.* else .{ .min = 0, .max = wasm_limits_max_default },
+    };
+    return mt;
+}
+
+export fn wasm_tagtype_new(ft: ?*FuncType) ?*TagType {
+    const f = ft orelse return null; // takes ownership of `ft`
+    const tt = alloc.create(TagType) catch {
+        freeExternType(@ptrCast(f));
+        return null;
+    };
+    tt.* = .{ .ekind = EXTERN_TAG, .functype = f };
+    return tt;
+}
+
+export fn wasm_tagtype_functype(tt: ?*const TagType) ?*const FuncType {
+    return (tt orelse return null).functype;
+}
+
+export fn wasm_tagtype_delete(tt: ?*TagType) void {
+    freeExternType(@ptrCast(tt));
+}
+
+export fn wasm_importtype_new(module: ?*ByteVec, name: ?*ByteVec, ext: ?*anyopaque) ?*ImportType {
+    // Takes ownership of all three.
+    const m = module orelse return null;
+    const n = name orelse return null;
+    const it = alloc.create(ImportType) catch return null;
+    it.* = .{ .module = m.*, .name = n.*, .ext = ext };
+    m.* = .{ .size = 0, .data = null }; // moved out
+    n.* = .{ .size = 0, .data = null };
+    return it;
+}
+
+export fn wasm_exporttype_new(name: ?*ByteVec, ext: ?*anyopaque) ?*ExportType {
+    const n = name orelse return null;
+    const et = alloc.create(ExportType) catch return null;
+    et.* = .{ .name = n.*, .ext = ext };
+    n.* = .{ .size = 0, .data = null }; // moved out
+    return et;
+}
+
+/// Deep-copy any `ekind`-first extern type. Type objects are values, not
+/// references — unlike `wasm_ref_t`, a copy here really is a clone.
+fn copyExternType(p: ?*const anyopaque) ?*anyopaque {
+    const src = p orelse return null;
+    return switch (externKindOf(src)) {
+        EXTERN_FUNC => blk: {
+            const ft: *const FuncType = @ptrCast(@alignCast(src));
+            const n = alloc.create(FuncType) catch break :blk null;
+            n.ekind = EXTERN_FUNC;
+            copyValTypeVec(&n.params, &ft.params);
+            copyValTypeVec(&n.results, &ft.results);
+            break :blk @ptrCast(n);
+        },
+        EXTERN_GLOBAL => blk: {
+            const gt: *const GlobalType = @ptrCast(@alignCast(src));
+            const n = alloc.create(GlobalType) catch break :blk null;
+            n.* = .{ .ekind = EXTERN_GLOBAL, .content = wasm_valtype_copy(gt.content), .mutability = gt.mutability };
+            break :blk @ptrCast(n);
+        },
+        EXTERN_TABLE => blk: {
+            const tt: *const TableType = @ptrCast(@alignCast(src));
+            const n = alloc.create(TableType) catch break :blk null;
+            n.* = .{ .ekind = EXTERN_TABLE, .element = wasm_valtype_copy(tt.element), .limits = tt.limits };
+            break :blk @ptrCast(n);
+        },
+        EXTERN_MEMORY => blk: {
+            const mt: *const MemoryType = @ptrCast(@alignCast(src));
+            const n = alloc.create(MemoryType) catch break :blk null;
+            n.* = .{ .ekind = EXTERN_MEMORY, .limits = mt.limits };
+            break :blk @ptrCast(n);
+        },
+        EXTERN_TAG => blk: {
+            const tt: *const TagType = @ptrCast(@alignCast(src));
+            const n = alloc.create(TagType) catch break :blk null;
+            n.* = .{ .ekind = EXTERN_TAG, .functype = @ptrCast(@alignCast(copyExternType(@ptrCast(tt.functype)))) };
+            break :blk @ptrCast(n);
+        },
+        else => null,
+    };
+}
+
+export fn wasm_externtype_copy(et: ?*const anyopaque) ?*anyopaque {
+    return copyExternType(et);
+}
+export fn wasm_functype_copy(ft: ?*const FuncType) ?*FuncType {
+    return @ptrCast(@alignCast(copyExternType(@ptrCast(ft))));
+}
+export fn wasm_globaltype_copy(gt: ?*const GlobalType) ?*GlobalType {
+    return @ptrCast(@alignCast(copyExternType(@ptrCast(gt))));
+}
+export fn wasm_tabletype_copy(tt: ?*const TableType) ?*TableType {
+    return @ptrCast(@alignCast(copyExternType(@ptrCast(tt))));
+}
+export fn wasm_memorytype_copy(mt: ?*const MemoryType) ?*MemoryType {
+    return @ptrCast(@alignCast(copyExternType(@ptrCast(mt))));
+}
+export fn wasm_tagtype_copy(tt: ?*const TagType) ?*TagType {
+    return @ptrCast(@alignCast(copyExternType(@ptrCast(tt))));
+}
+
+export fn wasm_importtype_copy(it: ?*const ImportType) ?*ImportType {
+    const p = it orelse return null;
+    const n = alloc.create(ImportType) catch return null;
+    n.* = .{ .module = .{ .size = 0, .data = null }, .name = .{ .size = 0, .data = null }, .ext = copyExternType(p.ext) };
+    wasm_byte_vec_copy(&n.module, &p.module);
+    wasm_byte_vec_copy(&n.name, &p.name);
+    return n;
+}
+
+export fn wasm_exporttype_copy(et: ?*const ExportType) ?*ExportType {
+    const p = et orelse return null;
+    const n = alloc.create(ExportType) catch return null;
+    n.* = .{ .name = .{ .size = 0, .data = null }, .ext = copyExternType(p.ext) };
+    wasm_byte_vec_copy(&n.name, &p.name);
+    return n;
+}
+
+// The `X_as_externtype` upcasts are pointer reinterprets: every extern type
+// starts with `ekind`, which is what `wasm_externtype_kind` reads.
+export fn wasm_globaltype_as_externtype(gt: ?*GlobalType) ?*anyopaque {
+    return @ptrCast(gt);
+}
+export fn wasm_globaltype_as_externtype_const(gt: ?*const GlobalType) ?*const anyopaque {
+    return @ptrCast(gt);
+}
+export fn wasm_tabletype_as_externtype(tt: ?*TableType) ?*anyopaque {
+    return @ptrCast(tt);
+}
+export fn wasm_tabletype_as_externtype_const(tt: ?*const TableType) ?*const anyopaque {
+    return @ptrCast(tt);
+}
+export fn wasm_memorytype_as_externtype(mt: ?*MemoryType) ?*anyopaque {
+    return @ptrCast(mt);
+}
+export fn wasm_memorytype_as_externtype_const(mt: ?*const MemoryType) ?*const anyopaque {
+    return @ptrCast(mt);
+}
+export fn wasm_tagtype_as_externtype(tt: ?*TagType) ?*anyopaque {
+    return @ptrCast(tt);
+}
+export fn wasm_tagtype_as_externtype_const(tt: ?*const TagType) ?*const anyopaque {
+    return @ptrCast(tt);
+}
+
+// The downcasts are checked against `ekind`.
+export fn wasm_externtype_as_tagtype(et: ?*anyopaque) ?*TagType {
+    const p = et orelse return null;
+    return if (externKindOf(p) == EXTERN_TAG) @ptrCast(@alignCast(p)) else null;
+}
+export fn wasm_externtype_as_tagtype_const(et: ?*const anyopaque) ?*const TagType {
+    const p = et orelse return null;
+    return if (externKindOf(p) == EXTERN_TAG) @ptrCast(@alignCast(p)) else null;
+}
+export fn wasm_externtype_as_globaltype_const(et: ?*const anyopaque) ?*const GlobalType {
+    const p = et orelse return null;
+    return if (externKindOf(p) == EXTERN_GLOBAL) @ptrCast(@alignCast(p)) else null;
+}
+export fn wasm_externtype_as_tabletype_const(et: ?*const anyopaque) ?*const TableType {
+    const p = et orelse return null;
+    return if (externKindOf(p) == EXTERN_TABLE) @ptrCast(@alignCast(p)) else null;
+}
+export fn wasm_externtype_as_memorytype_const(et: ?*const anyopaque) ?*const MemoryType {
+    const p = et orelse return null;
+    return if (externKindOf(p) == EXTERN_MEMORY) @ptrCast(@alignCast(p)) else null;
+}
+
+// ---- Generated vector families --------------------------------------------
+//
+// `WASM_DECLARE_VEC(name, *)` gives each type five functions with identical
+// bodies modulo the element type and its deleter/copier. Same reasoning as the
+// ref API: generate them so a typo can't hide in the bulk.
+//
+// The elements are `own` pointers, so `delete` deletes each one and `copy`
+// clones each one — a shallow vec copy would double-free.
+
+fn VecApi(
+    comptime Vec: type,
+    comptime Elem: type,
+    comptime elemDelete: fn (?*Elem) callconv(.c) void,
+    comptime elemCopy: fn (?*const Elem) callconv(.c) ?*Elem,
+) type {
+    return struct {
+        fn newEmpty(out: *Vec) callconv(.c) void {
+            out.* = .{ .size = 0, .data = null };
+        }
+
+        fn newUninitialized(out: *Vec, size: usize) callconv(.c) void {
+            if (size == 0) return newEmpty(out);
+            const buf = alloc.alloc(?*Elem, size) catch return newEmpty(out);
+            @memset(buf, null);
+            out.* = .{ .size = size, .data = buf.ptr };
+        }
+
+        fn new(out: *Vec, size: usize, data: [*c]const ?*Elem) callconv(.c) void {
+            if (size == 0 or data == null) return newEmpty(out);
+            const buf = alloc.alloc(?*Elem, size) catch return newEmpty(out);
+            // Takes ownership of the caller's elements (they are `own`).
+            @memcpy(buf, data[0..size]);
+            out.* = .{ .size = size, .data = buf.ptr };
+        }
+
+        fn copy(out: *Vec, src: *const Vec) callconv(.c) void {
+            if (src.size == 0 or src.data == null) return newEmpty(out);
+            const buf = alloc.alloc(?*Elem, src.size) catch return newEmpty(out);
+            for (src.data[0..src.size], buf) |s, *dst| dst.* = if (s) |p| elemCopy(p) else null;
+            out.* = .{ .size = src.size, .data = buf.ptr };
+        }
+
+        fn delete(vec: *Vec) callconv(.c) void {
+            if (vec.data != null and vec.size != 0) {
+                for (vec.data[0..vec.size]) |slot| elemDelete(slot);
+                alloc.free(vec.data[0..vec.size]);
+            }
+            vec.* = .{ .size = 0, .data = null };
+        }
+    };
+}
+
+/// `wasm_externtype_t` is reached as `*anyopaque`; give it callconv-C shims so
+/// it can go through the same generator as the concrete types.
+fn externTypeDelete(p: ?*anyopaque) callconv(.c) void {
+    freeExternType(p);
+}
+fn externTypeCopy(p: ?*const anyopaque) callconv(.c) ?*anyopaque {
+    return copyExternType(p);
+}
+
+comptime {
+    const vecs = .{
+        .{ "functype", FuncTypeVec, FuncType, wasm_functype_delete, wasm_functype_copy },
+        .{ "globaltype", GlobalTypeVec, GlobalType, wasm_globaltype_delete, wasm_globaltype_copy },
+        .{ "tabletype", TableTypeVec, TableType, wasm_tabletype_delete, wasm_tabletype_copy },
+        .{ "memorytype", MemoryTypeVec, MemoryType, wasm_memorytype_delete, wasm_memorytype_copy },
+        .{ "tagtype", TagTypeVec, TagType, wasm_tagtype_delete, wasm_tagtype_copy },
+        .{ "externtype", ExternTypeVec, anyopaque, externTypeDelete, externTypeCopy },
+        .{ "importtype", ImportTypeVec, ImportType, wasm_importtype_delete, wasm_importtype_copy },
+        .{ "exporttype", ExportTypeVec, ExportType, wasm_exporttype_delete, wasm_exporttype_copy },
+    };
+    for (vecs) |v| {
+        const api = VecApi(v[1], v[2], v[3], v[4]);
+        const n = "wasm_" ++ v[0] ++ "_vec_";
+        @export(&api.newEmpty, .{ .name = n ++ "new_empty" });
+        @export(&api.newUninitialized, .{ .name = n ++ "new_uninitialized" });
+        @export(&api.new, .{ .name = n ++ "new" });
+        @export(&api.copy, .{ .name = n ++ "copy" });
+        // importtype/exporttype already export a hand-written `_vec_delete`.
+        if (!std.mem.eql(u8, v[0], "importtype") and !std.mem.eql(u8, v[0], "exporttype"))
+            @export(&api.delete, .{ .name = n ++ "delete" });
+    }
+}
+
+/// `wasm_extern_vec_copy` — externs are *references*, so unlike the type vecs
+/// above this bumps refcounts rather than cloning objects.
+export fn wasm_extern_vec_copy(out: *ExternVec, src: *const ExternVec) void {
+    if (src.size == 0 or src.data == null) return wasm_extern_vec_new_empty(out);
+    const buf = alloc.alloc(?*Ref, src.size) catch return wasm_extern_vec_new_empty(out);
+    for (src.data[0..src.size], buf) |s, *dst| {
+        dst.* = s;
+        if (s) |r| retain(&r.hdr);
+    }
+    out.* = .{ .size = src.size, .data = buf.ptr };
+}
+
+// ---- wasm_ref_t: the shared reference API ---------------------------------
+//
+// `wasm.h` gives every ref-able object the same five entry points plus two
+// upcasts and two downcasts. Writing those out by hand is ~86 near-identical
+// functions — the kind of bulk where one copy-paste slip (a `global` body under
+// a `memory` name) compiles fine and is invisible until an embedder hits it.
+// Generating them from one table makes that class of bug unrepresentable.
+
+/// The ref-able object types, in `wasm.h`'s terms. `kind` narrows the ones that
+/// share our `Ref` struct: `wasm_ref_as_func` must reject a global, and only
+/// `Externkind` can tell them apart.
+const RefType = struct {
+    name: []const u8,
+    T: type,
+    tag: RefTag,
+    kind: ?Externkind = null,
+};
+
+const ref_types = [_]RefType{
+    .{ .name = "extern", .T = Ref, .tag = .extern_obj },
+    .{ .name = "func", .T = Ref, .tag = .extern_obj, .kind = EXTERN_FUNC },
+    .{ .name = "global", .T = Ref, .tag = .extern_obj, .kind = EXTERN_GLOBAL },
+    .{ .name = "table", .T = Ref, .tag = .extern_obj, .kind = EXTERN_TABLE },
+    .{ .name = "memory", .T = Ref, .tag = .extern_obj, .kind = EXTERN_MEMORY },
+    .{ .name = "foreign", .T = Foreign, .tag = .foreign },
+    .{ .name = "instance", .T = Instance, .tag = .instance },
+    .{ .name = "module", .T = Module, .tag = .module },
+    .{ .name = "trap", .T = Trap, .tag = .trap },
+};
+
+/// Generate the `WASM_DECLARE_REF` surface for one object type.
+fn RefApi(comptime rt: RefType) type {
+    const T = rt.T;
+    return struct {
+        /// Does this header actually point at an `rt`-shaped object?
+        fn matches(h: *const RefHeader) bool {
+            if (h.tag != rt.tag) return false;
+            const want = rt.kind orelse return true;
+            const obj: *const Ref = @alignCast(@fieldParentPtr("hdr", h));
+            return obj.kind == want;
+        }
+
+        /// `wasm_X_copy` — another handle to the same object, not a clone. See
+        /// the object-model note: `same(copy(x), x)` has to hold.
+        fn copy(x: ?*const T) callconv(.c) ?*T {
+            const p = x orelse return null;
+            const m: *T = @constCast(p);
+            retain(&m.hdr);
+            return m;
+        }
+
+        fn same(a: ?*const T, b: ?*const T) callconv(.c) bool {
+            const x = a orelse return b == null;
+            const y = b orelse return false;
+            if (x == y) return true;
+            // Two handles onto the same instance export are the same object,
+            // even though they are distinct allocations.
+            if (rt.tag == .extern_obj) {
+                const rx: *const Ref = @ptrCast(x);
+                const ry: *const Ref = @ptrCast(y);
+                if (rx.instance != null and rx.instance == ry.instance)
+                    return rx.kind == ry.kind and rx.index == ry.index;
+            }
+            return false;
+        }
+
+        fn getHostInfo(x: ?*const T) callconv(.c) ?*anyopaque {
+            const p = x orelse return null;
+            return p.hdr.host_info;
+        }
+
+        fn setHostInfo(x: ?*T, info: ?*anyopaque) callconv(.c) void {
+            const p = x orelse return;
+            p.hdr.host_info = info;
+            p.hdr.host_info_finalizer = null;
+        }
+
+        fn setHostInfoWithFinalizer(x: ?*T, info: ?*anyopaque, fin: ?Finalizer) callconv(.c) void {
+            const p = x orelse return;
+            p.hdr.host_info = info;
+            p.hdr.host_info_finalizer = fin;
+        }
+
+        /// Borrowed upcast — must not allocate, so hand out the embedded header.
+        fn asRef(x: ?*T) callconv(.c) ?*RefHeader {
+            const p = x orelse return null;
+            return &p.hdr;
+        }
+
+        fn asRefConst(x: ?*const T) callconv(.c) ?*const RefHeader {
+            const p = x orelse return null;
+            return &p.hdr;
+        }
+
+        /// Downcast, checked: a `wasm_ref_t` that isn't this type yields null
+        /// rather than a bogus pointer.
+        fn refAs(r: ?*RefHeader) callconv(.c) ?*T {
+            const h = r orelse return null;
+            if (!matches(h)) return null;
+            return @alignCast(@fieldParentPtr("hdr", h));
+        }
+
+        fn refAsConst(r: ?*const RefHeader) callconv(.c) ?*const T {
+            const h = r orelse return null;
+            if (!matches(h)) return null;
+            return @alignCast(@fieldParentPtr("hdr", h));
+        }
+    };
+}
+
+comptime {
+    for (ref_types) |rt| {
+        const api = RefApi(rt);
+        const n = "wasm_" ++ rt.name;
+        @export(&api.copy, .{ .name = n ++ "_copy" });
+        @export(&api.same, .{ .name = n ++ "_same" });
+        @export(&api.getHostInfo, .{ .name = n ++ "_get_host_info" });
+        @export(&api.setHostInfo, .{ .name = n ++ "_set_host_info" });
+        @export(&api.setHostInfoWithFinalizer, .{ .name = n ++ "_set_host_info_with_finalizer" });
+        @export(&api.asRef, .{ .name = n ++ "_as_ref" });
+        @export(&api.asRefConst, .{ .name = n ++ "_as_ref_const" });
+        @export(&api.refAs, .{ .name = "wasm_ref_as_" ++ rt.name });
+        @export(&api.refAsConst, .{ .name = "wasm_ref_as_" ++ rt.name ++ "_const" });
+    }
+}
+
+// `wasm_ref_t` itself gets the base API (no casts — it is the base).
+
+export fn wasm_ref_delete(r: ?*RefHeader) void {
+    const h = r orelse return;
+    // Dispatch to the concrete deleter so the object's own teardown runs.
+    switch (h.tag) {
+        .extern_obj => wasm_extern_delete(@alignCast(@fieldParentPtr("hdr", h))),
+        .foreign => wasm_foreign_delete(@alignCast(@fieldParentPtr("hdr", h))),
+        .instance => wasm_instance_delete(@alignCast(@fieldParentPtr("hdr", h))),
+        .module => wasm_module_delete(@alignCast(@fieldParentPtr("hdr", h))),
+        .trap => wasm_trap_delete(@alignCast(@fieldParentPtr("hdr", h))),
+    }
+}
+
+export fn wasm_ref_copy(r: ?*const RefHeader) ?*RefHeader {
+    const h = r orelse return null;
+    const m: *RefHeader = @constCast(h);
+    retain(m);
+    return m;
+}
+
+export fn wasm_ref_same(a: ?*const RefHeader, b: ?*const RefHeader) bool {
+    const x = a orelse return b == null;
+    const y = b orelse return false;
+    if (x == y) return true;
+    if (x.tag != y.tag) return false;
+    if (x.tag == .extern_obj) {
+        const rx: *const Ref = @alignCast(@fieldParentPtr("hdr", x));
+        const ry: *const Ref = @alignCast(@fieldParentPtr("hdr", y));
+        if (rx.instance != null and rx.instance == ry.instance)
+            return rx.kind == ry.kind and rx.index == ry.index;
+    }
+    return false;
+}
+
+export fn wasm_ref_get_host_info(r: ?*const RefHeader) ?*anyopaque {
+    return (r orelse return null).host_info;
+}
+
+export fn wasm_ref_set_host_info(r: ?*RefHeader, info: ?*anyopaque) void {
+    const h = r orelse return;
+    h.host_info = info;
+    h.host_info_finalizer = null;
+}
+
+export fn wasm_ref_set_host_info_with_finalizer(r: ?*RefHeader, info: ?*anyopaque, fin: ?Finalizer) void {
+    const h = r orelse return;
+    h.host_info = info;
+    h.host_info_finalizer = fin;
+}
+
+// ---- wasm_foreign_t -------------------------------------------------------
+
+export fn wasm_foreign_new(store: ?*Store) ?*Foreign {
+    _ = store;
+    const f = alloc.create(Foreign) catch return null;
+    f.* = .{};
+    return f;
+}
+
+export fn wasm_foreign_delete(foreign: ?*Foreign) void {
+    const f = foreign orelse return;
+    if (!release(&f.hdr)) return;
+    alloc.destroy(f);
+}
+
+// ---- wasm_extern_t (delete; the rest is generated above) ------------------
+
+export fn wasm_extern_delete(e: ?*Ref) void {
+    refDelete(e);
+}
+
+/// Free a `Ref` if this was its last handle.
+///
+/// An **export handle** (`instance` set) is storage owned by the
+/// `wasm_extern_vec_t` it came out of, so dropping a handle to it never frees
+/// it here — `wasm_extern_vec_delete` does. Only standalone objects from
+/// `wasm_*_new` own themselves.
+fn refDelete(maybe: ?*Ref) void {
+    const r = maybe orelse return;
+    if (!release(&r.hdr)) return; // other handles remain
+    if (r.vec_owned) return; // storage belongs to the extern vec
+    // Whatever this Ref happens to own — a Ref is one struct covering all five
+    // extern kinds, so each field is independent.
+    if (r.host) |hc| if (hc.finalizer) |fin| fin(hc.env);
+    if (r.functype) |ft| freeExternType(@ptrCast(ft));
+    if (r.host_global) |hg| alloc.destroy(hg);
+    if (r.host_memory) |mem| {
+        alloc.free(mem.bytes);
+        alloc.destroy(mem);
+    }
+    if (r.host_table) |tbl| {
+        alloc.free(tbl.entries);
+        alloc.destroy(tbl);
+    }
+    alloc.destroy(r);
 }
 
 // ---- wasm_frame_t + the trap backtrace ------------------------------------

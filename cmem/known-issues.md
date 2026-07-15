@@ -11,12 +11,57 @@ This file tracks only what's left.
 
 Line numbers are hints (they drift) — the function/construct name is the durable anchor.
 
-## #20 — We ship a `wasm.h` that declares **167 functions we don't define** — OPEN (2026-07-15)
+## #20 — `wasm.h` declared 180 functions we didn't define — **DONE 2026-07-15**
 
-**What:** `third_party/wasm-c-api/include/wasm.h` is the standard header, installed verbatim next to
-our library. An embedder that calls a declared-but-undefined symbol gets an **undefined-symbol link
-error** (static lib) or a failed `dlsym`/`Deno.dlopen` (the DLL path — i.e. our actual integration
-story, `vision.md`). This is not "a missing feature": we are advertising an API we don't have.
+**Was:** `third_party/wasm-c-api/include/wasm.h` is the standard header, installed verbatim next to our
+library, and **180 of the functions it declares had no definition**. An embedder calling one got an
+undefined-symbol link error (static lib) or a failed `dlsym`/`Deno.dlopen` (the DLL path — our actual
+integration story, `vision.md`). Not "a missing feature": we advertised an API we didn't have.
+
+**Now: 0 undefined — every function `wasm.h` declares is defined**, and
+**`tests/c_abi_symbols.c` keeps it that way**. It takes the address of all 319 declared functions and
+links into `zig build c-smoke`, so dropping one fails *our* build. Verified the gate actually fails by
+un-exporting `wasm_table_grow` and watching c-smoke die on `undefined symbol: wasm_table_grow` — a gate
+that can't fail is decoration. **Regenerate it after vendoring a new `wasm.h`** (command below); the
+list must come from the *preprocessed* header, since `WASM_DECLARE_OWN/_VEC/_TYPE` generate most of the
+API and a source grep misses them — which is exactly how this hid for months.
+
+**What landed, and the one decision worth knowing:**
+- **The ref object model.** `RefHeader` (tag + refcount + host_info) embeds in the 9 ref-able types;
+  upcasts hand out `&obj.hdr`, downcasts recover it with `@fieldParentPtr` — no layout assumption,
+  no allocation (the upcast is borrowed, so it *cannot* allocate). **`wasm_X_copy` refcounts rather
+  than clones**, because `wasm_X_same(copy(x), x)` must be true: these are references. That also makes
+  copy meaningful for an `Instance`/`Module`, which can't be deep-copied sensibly.
+- **Type objects are the opposite** — values, so their `copy` really clones, and a vec copy must clone
+  each element or two vecs free the same pointers.
+- **`wasm_table_get`/`set`/`grow`** — deferred for months on "needs `wasm_ref_t`"; that blocker is gone,
+  so they're implemented.
+- **`wasm_module_serialize`** returns the original binary and `deserialize` re-decodes it. wazmrt
+  interprets a decoded IR — there is no AOT artifact to emit, and a round-trip through the original
+  bytes is honest and correct. **Cost: `wasm_module_new` now keeps a copy of the binary** (the decoder
+  otherwise lets the input go). Paid only on the C ABI path, not the CLI.
+- **`wasm_tagtype_t`** exists as a type object though EH is deferred: the header declares it and it's
+  pure data. No module can produce one.
+- ~86 ref functions and ~40 vec functions are **comptime-generated** from a table. That's the point:
+  in that much near-identical bulk, a copy-paste slip (a `global` body under a `memory` name) compiles
+  fine and stays invisible until an embedder hits it.
+
+**Regenerate the gate after vendoring a new `wasm.h`:**
+```sh
+zig build                                   # produces zig-out/{lib,include}
+printf '#include "wasm.h"\n' > pp.c
+zig cc -target x86_64-windows-gnu -E pp.c -I zig-out/include -o pp.i   # expand the macros
+grep -oE "\bwasm_[a-z0-9_]+[ ]*\(" pp.i | tr -d ' (' | sort -u > declared.txt
+# then rebuild tests/c_abi_symbols.c from declared.txt (see its header comment)
+```
+
+**Left deliberately:** nothing in the header. `wasm_table_get` returns funcrefs only (an externref
+table slot has no `wasm_ref_t` to hand back yet — it would need boxing at the host boundary); it
+reports null rather than inventing a handle. Semantics, not a link break.
+
+---
+
+### Original report (kept for the "surfaces when" reasoning)
 
 **Found how (reproducible — re-run this after any C ABI change):**
 ```sh
@@ -48,18 +93,17 @@ what we implement, so nothing ever asked for the rest.
 
 **Surfaces when:** any embedder written against the standard header rather than against our subset —
 `universalWasmLoader-*`, wasmtk-via-FFI, or anyone porting wasmtime/wasmer code (`vision.md` makes all
-three explicit goals). **Decide before that milestone**, since the options differ a lot in cost:
-1. implement the mechanical families (bulk, low risk, big surface);
-2. `wasm_ref_t` first (unblocks the casts *and* table get/set/grow together);
-3. ship a trimmed header declaring only what we define — honest, but forfeits drop-in compatibility,
-   which is the whole point of vendoring the standard header;
-4. leave it and document the supported subset loudly in `README.md`.
+three explicit goals). Four options were on the table: implement the mechanical families; `wasm_ref_t`
+first; trim the header; or document the subset. **Resolution (owner's call, 2026-07-15): implement all
+of it** — "a big hole we don't need to fall into" — done above, ahead of 4.2.
 
-**The durable fix for the *class*:** make the audit above a build step so a declared-but-undefined
-symbol fails CI instead of an embedder's link. That's the real lesson here — the gap existed since the
-C ABI landed and no test could see it, because every test only called what we'd implemented.
+**The durable fix for the *class*:** make the audit a build step so a declared-but-undefined symbol
+fails CI instead of an embedder's link. **Done** — `tests/c_abi_symbols.c`. That was the real lesson:
+the gap existed since the C ABI landed and no test could see it, because every test only called what
+we'd implemented.
 
-**Anchor:** `src/wasm_c_api.zig` (all `export fn`s); `third_party/wasm-c-api/include/wasm.h`.
+**Anchor:** `src/wasm_c_api.zig` (all `export fn`s); `third_party/wasm-c-api/include/wasm.h`;
+`tests/c_abi_symbols.c` (the gate).
 
 ## #19 — Traps carry no location: `trap: Unreachable` and nothing else — **DONE 2026-07-15 (Phase 4.1)**
 
