@@ -197,9 +197,20 @@ resolution the `Io` API doesn't expose.
 `fd_filestat_set_times`/`path_filestat_set_times`, `fd_allocate`, `fd_advise` (returns success —
 advisory), and real fd-readiness in `poll_oneoff`. All still resolve to the `NOTSUP` stub.
 
-**Phase 4 — ergonomics + conformance. ORDERED BY THE OWNER 2026-07-15 — do 4.1 → 4.2 → 4.3 → 4.4 in
-this order.** None of 4.1–4.3 *block* 4.4; the owner scheduled them ahead of it deliberately, so treat
-this sequence as binding rather than re-deriving it.
+**Phase 4 — ergonomics + conformance. ORDERED BY THE OWNER — treat the sequence as binding rather than
+re-deriving it.** The order was set 2026-07-15 and then twice amended by the owner as the day's work
+surfaced things worth doing first (#20, then #22). None of the inserted items *block* the conformance
+work at the end; they were scheduled ahead of it deliberately.
+
+> ### ⇢ START HERE (2026-07-16): **4.0 — `known-issues.md` #22, the C ABI lifecycle fuzz.**
+> Owner's call at the end of 2026-07-15: *"Lets make that the first item on the list of to dos for
+> tomorrow."* A randomized driver over object-lifecycle sequences (new/copy/same/as_ref/ref_as/
+> host_info/delete + the vec ops), run under `std.testing.allocator` so any double-free / leak / UAF
+> fails the run. **Why first:** #21 made C ABI memory safety testable, but every test there is a
+> sequence *a human chose* — each encodes a bug that already shipped. The surface just grew from ~140
+> to 319 functions in one day (#20), so the gap between "tested orderings" and "reachable orderings"
+> widened sharply and has not been probed. See #22 for the shape, the oracle, and the one trap (don't
+> fuzz borrowed handles as if they were `own`).
 
 **4.1 — `known-issues.md` #19: trap diagnostics. DONE 2026-07-15.** Traps now report a named
 backtrace, innermost frame first — on the exact binary from the Phase 3 hunt:
@@ -228,6 +239,18 @@ regressed **14%** from an *error-path* change, because `Frame.run`'s `errdefer` 
 in a ~200-arm switch and inlining `recordTrap` there evicted the loop from i-cache. `noinline` fixed it
 and beat the old baseline — 4.1 had been inlining it too. Both facts are now invariants in
 `design-decisions.md`; the bisect method is in `testing.md`.
+
+**4.1½ — `known-issues.md` #20 + #21: the C ABI. DONE 2026-07-15, inserted by the owner** ahead of
+#17 ("Definitely #20 first. It seems like a big hole at the moment, that we don't need to fall into").
+4.1 exposed that `wasm.h` declared **180 functions we never defined** — a link error for any embedder
+following the header. All 319 are now defined and gated at link time (`tests/c_abi_symbols.c`). The
+owner then flagged memory safety as a project goal, and the audit that followed found **four real
+bugs** — a double free, a use-after-free needing no misuse, an uninitialized refcount, and a leak —
+three of them shipped hours earlier. Fixed, with the deeper problem fixed too: the C ABI was
+**unreachable from `zig build test`** and `c_smoke.c` runs on an allocator where a double free prints
+`OK`. See #20/#21, and the memory-safety invariants in `design-decisions.md`. +7 C-ABI lifecycle tests
+(**118 distinct**; `zig build test` prints 229 — see `testing.md` on reading the count).
+**#22 (fuzz the lifecycle) is the follow-up, and the owner made it the first item for 2026-07-16.**
 
 **4.2 — `known-issues.md` #17: close the symlink hole (make the sandbox real, not lexical).**
 *Budget for this: it is the biggest item in Phase 4, not a cleanup.* `resolve()` stops a guest *naming*

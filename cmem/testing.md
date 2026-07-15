@@ -453,6 +453,13 @@ V8. **Decision:** build the shipped `.lib`/`.dll` (and the freestanding wasm —
 `design-decisions.md`. (Caveat: single machine; sizes + steady-state are solid, the µs/ms cold numbers
 are ±10% noisy.)
 
+## Reading the test count (2026-07-15)
+
+`zig build test` prints **229**, but there are **118 distinct tests**: 111 in the core module + 7 C-ABI
+lifecycle tests. The `cabi_tests` target's root is `wasm_c_api.zig`, which imports `root.zig`, so it
+compiles and re-runs the core module's tests as well (111 + 118). Harmless — a couple hundred ms — but
+**don't quote 229 as a test count**; quote 118, or the per-target numbers from `--summary all`.
+
 ## The C ABI: memory-safety tests (2026-07-15) — read this before touching `wasm_c_api.zig`
 
 **`zig build test` could not reach the C ABI for its entire life.** `root.zig` doesn't import

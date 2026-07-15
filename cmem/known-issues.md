@@ -11,6 +11,40 @@ This file tracks only what's left.
 
 Line numbers are hints (they drift) — the function/construct name is the durable anchor.
 
+## #22 — C ABI lifecycle tests only cover orderings we thought of — OPEN (2026-07-15)
+
+**SCHEDULED: Phase 4 step 4.1 — the FIRST thing tomorrow** (owner, 2026-07-15, ahead of #17 and
+everything else; see `roadmap.md`).
+
+**What:** #21 made C ABI memory safety *testable* — `wasm_c_api.zig`'s tests run the C entry points
+under `std.testing.allocator`, which fails on double-free and leaks. But every one of those tests is a
+sequence **a human chose**. Each encodes a bug that already shipped. Nothing explores the orderings
+nobody imagined, which is precisely where the next double-free lives: the four #21 bugs were all
+"obvious" *after* a test happened to hit them, and three of them shipped anyway.
+
+**Why it's the priority:** the guard is only as good as its coverage, and the C ABI is the one place a
+mistake is a *heap-corruption primitive* rather than a wrong answer (`design-decisions.md`). Hand-written
+lifecycle tests are a floor, not a ceiling. This is cheap insurance on the surface that just grew from
+~140 to 319 functions in one day (#20) — i.e. the coverage gap widened sharply and hasn't been probed.
+
+**Shape:** a randomized/fuzz driver over object-lifecycle operation sequences —
+`new` / `copy` / `same` / `as_ref` / `ref_as_*` / `set_host_info` / `delete` / vec `new`/`copy`/`delete`
+across module, instance, func, global, memory, table, trap, foreign — run under `std.testing.allocator`
+so any double-free, leak, or use-after-free fails the run. Prefer a **deterministic seeded PRNG** with
+the seed printed, so a failure is reproducible from the log; consider `std.testing.fuzz` for
+coverage-guided input. The oracle is the allocator, not an expected value — no need to model correct
+results, only correct *lifetimes*. Worth asserting refcount invariants directly too (`rc == 1` after
+`copy`+`delete`; `same(copy(x), x)`; a downcast of the wrong type is null).
+
+**Watch for:** operations that are legitimately *not* safe to fuzz blindly — deleting a borrowed
+`wasm_extern_as_func` handle is a contract violation, not a bug, so the generator must respect
+`own`/borrowed. Encode that distinction rather than papering over the crashes it produces.
+
+**Surfaces when:** it already has — we just can't see it. Absence of a failing test here is currently
+absence of evidence.
+
+**Anchor:** the test block at the bottom of `src/wasm_c_api.zig`; `cabi_tests` in `build.zig`.
+
 ## #21 — C ABI memory safety: 4 exploitable bugs, found and fixed — **DONE 2026-07-15**
 
 Raised by the owner immediately after #20 landed: *"We do not want to create memory unsafe issues…
