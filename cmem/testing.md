@@ -453,6 +453,45 @@ V8. **Decision:** build the shipped `.lib`/`.dll` (and the freestanding wasm —
 `design-decisions.md`. (Caveat: single machine; sizes + steady-state are solid, the µs/ms cold numbers
 are ±10% noisy.)
 
+## WASI Phase 3 — the sandboxed filesystem (2026-07-15)
+
+- **+3 unit tests (106 total).** The load-bearing one is **`resolve` contains guest paths inside the
+  preopen**: a table of accepted+normalized paths (`./a`, `d/./e//f`, `d/../e`, `d\e`, `.`) and a table
+  of rejected escapes (`..`, `../etc/passwd`, `a/../../b`, `/etc/passwd`, `\Windows\x`, `C:\x`, `C:x`,
+  `\\?\C:\x`, embedded NUL, empty). Also: `path_open` rejects an escaping path with **ENOTCAPABLE**
+  *with `io` set to `undefined`* — so if the rejection were ever not purely lexical, the test would
+  crash rather than pass; and `fd_prestat_get`/`fd_prestat_dir_name` enumerate preopens and EBADF at
+  the first non-preopen (which is how wasi-libc knows to stop).
+- **Compiled-program gate** (`examples/wasi_files.zig`, `-target wasm32-wasi`):
+  `wazmrt files.wasm --dir <tmp>:/data` → **16/16 `ok`**, covering prestat, `path_open` O_CREAT,
+  `fd_write`/`fd_read` round-trip, `fd_seek`, `path_filestat_get` (type+size), `path_create_directory`,
+  `fd_readdir`, four refused escapes, an allowed interior `..`, and cleanup (`path_remove_directory`,
+  `path_unlink_file`, unlinked-file-is-gone). The guest cleans up after itself, so the preopen dir is
+  empty afterward — check that, since leftovers mean a delete silently failed.
+
+### The `bitcast_invalid` trap (cost hours; recognize it instantly next time)
+
+**Symptom:** a compiled guest traps `Unreachable` with no output and no failing WASI call.
+**Cause:** the guest declared `extern "wasi_snapshot_preview1" fn fd_write(...) i32` while `std.os.wasi`
+declares the same import returning `errno_t` (`enum(u16)`). One import, two signatures — wasm-ld can't
+reconcile them, so it points the call at a generated stub named
+`.Lfd_write|wasi_snapshot_preview1_bitcast_invalid` whose entire body is `unreachable`. **No warning at
+compile time.** It only fires if that code path runs, which is why trivial guests seemed fine and
+`--dir` (which makes std's `Preopens.init` run) appeared to "break" things.
+**Tell:** the trap is at `pc=0` of a **2-instruction body** (`unreachable; end`) — dump the wasm name
+section at that function index and the name says it outright.
+**Rule: examples must call WASI through `std.os.wasi`, never hand-rolled `extern`s.**
+
+### The `openFile(.follow_symlinks = false)` host crash (a real Zig 0.16 std bug)
+
+`Io.Dir.openFile` on Windows opens the handle **ASYNCHRONOUS** when `follow_symlinks = false` but still
+returns `.flags = .{ .nonblocking = false }` (`Threaded.zig:5033`). The first `readPositional` then
+takes the synchronous path and hits `.PENDING => unreachable` **inside std — crashing the host, not the
+guest**. `createFile` is unconditionally `SYNCHRONOUS_NONALERT`, which is why only the open-existing
+path crashed and `path_open` with `O_CREAT` looked fine. **Workaround in `wPathOpen`:** implement
+O_NOFOLLOW ourselves (`statFile(.follow_symlinks=false)`, return `ELOOP` on a symlink) and then always
+open with follow — same semantics, no async handle. Recheck when upgrading Zig.
+
 ## WASI Phase 2 — clocks, poll_oneoff (sleep), stdin (2026-07-14)
 
 - **+2 unit tests (103 total)**: `fd_read` scatters stdin across two iovecs (4+3 of "abcdefg"), reports
@@ -478,10 +517,10 @@ are ±10% noisy.)
   `Hello from a compiled WASI program!` / `bulk-memory memcpy works` / `saturating truncation works` —
   real compiled code whose `@memcpy` lowers to `memory.copy` and whose float→int lowers to
   `i32.trunc_sat_f64_s`, calling wazmrt's WASI `fd_write`.
-- **Guest-side finding:** Zig 0.16's new `Io`-model file writer never issues `fd_write(1)` for stdout
-  (traced by instrumenting the WASI dispatch: the *only* call was `fd_fdstat_get(2)`), so it fails
-  before syscalling — a **guest toolchain gap, not a runtime bug**. stderr and a direct `fd_write`
-  import both work, so the example imports `fd_write` directly.
+- ~~**Guest-side finding:** Zig 0.16's `Io`-model file writer never issues `fd_write(1)` for stdout —
+  a guest toolchain gap.~~ **RETRACTED 2026-07-15 — this finding was wrong.** See "The
+  `bitcast_invalid` trap" below; the example's own `extern` declaration was the cause. Pure `std.Io`
+  stdout works under wazmrt.
 - All surfaces green (`test`/`build`/`wasm`/`c-smoke`).
 
 ## WASI preview 1 — first slice (2026-07-14)

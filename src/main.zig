@@ -56,13 +56,15 @@ pub fn main(init: std.process.Init) !void {
     defer module.deinit();
 
     // Run mode: `wazmrt <module.wasm> <export> [args...]` — invoke and print.
-    if (args.len >= 3) {
+    // A trailing arg only selects an export if it actually names one; otherwise
+    // it belongs to the WASI command below (`--dir …`, guest argv, …).
+    if (args.len >= 3 and findExport(&module, args[2]) != null) {
         try runFunction(arena, out, &module, args[2], args[3..]);
         return;
     }
 
-    // WASI command: `wazmrt <module.wasm> [wasi-args...]` runs `_start` with the
-    // core `wasi_snapshot_preview1` host imports wired up.
+    // WASI command: `wazmrt <module.wasm> [--dir <host>[:<guest>]]... [args...]`
+    // runs `_start` with the `wasi_snapshot_preview1` host imports wired up.
     if (findExport(&module, "_start")) |start_index| {
         const code = runWasi(arena, io, out, &module, path, start_index, args[2..]) catch |e| {
             try out.print("trap: {s}\n", .{@errorName(e)});
@@ -142,13 +144,34 @@ fn runWasi(
     var stdin_file_reader: Io.File.Reader = .init(.stdin(), io, &stdin_buffer);
 
     const seed: u64 = @intCast(@max(Io.Timestamp.now(io, .awake).nanoseconds, 0));
-    var wasi = wazmrt.wasi.Wasi.init(io, out, err_w, seed);
+    var wasi = wazmrt.wasi.Wasi.init(arena, io, out, err_w, seed);
+    defer wasi.deinit();
     wasi.stdin = &stdin_file_reader.interface;
 
-    // argv: the module path, then any trailing CLI args.
-    const argv = try arena.alloc([]const u8, 1 + wasi_args.len);
+    // `--dir <host>[:<guest>]` preopens: the guest can reach these and nothing
+    // else. Everything after them is argv for the guest.
+    var rest = wasi_args;
+    while (rest.len >= 2 and std.mem.eql(u8, rest[0], "--dir")) {
+        const spec = rest[1];
+        // Split on the LAST ':' so a Windows host path (`C:\tmp`) still parses.
+        const host, const guest = if (std.mem.lastIndexOfScalar(u8, spec, ':')) |i|
+            if (i > 1) .{ spec[0..i], spec[i + 1 ..] } else .{ spec, spec }
+        else
+            .{ spec, spec };
+        _ = wasi.addPreopen(host, guest) catch |e| {
+            try out.print("error: --dir '{s}': {s}\n", .{ host, @errorName(e) });
+            return 1;
+        };
+        rest = rest[2..];
+    }
+    // An explicit `--` ends our flags; everything after it is the guest's.
+    if (rest.len >= 1 and std.mem.eql(u8, rest[0], "--")) rest = rest[1..];
+
+    // argv: the module path, then the guest's own args (the preopen flags are
+    // ours, not the guest's).
+    const argv = try arena.alloc([]const u8, 1 + rest.len);
     argv[0] = path;
-    for (wasi_args, argv[1..]) |src, *dst| dst.* = src;
+    for (rest, argv[1..]) |src, *dst| dst.* = src;
     wasi.args = argv;
 
     // Back every imported function: `wasi_snapshot_preview1.*` from WASI, any

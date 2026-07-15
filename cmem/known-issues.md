@@ -11,6 +11,31 @@ This file tracks only what's left.
 
 Line numbers are hints (they drift) — the function/construct name is the durable anchor.
 
+## #17 — WASI sandbox containment is **lexical**: a symlink out of a preopen is still followed — OPEN (2026-07-15)
+
+**What:** `wasi.resolve()` rejects absolute paths, escaping `..`, NT/device prefixes, and NUL, so a
+guest cannot *name* a path outside its preopen. It does **not** stop a **symlink stored inside the
+preopen whose target is outside it** (e.g. a host process drops `link -> C:\Users`, the guest opens
+`link/secrets.txt` with `SYMLINK_FOLLOW`). We hand `Io.Dir` a contained relative path; the kernel then
+follows the link out.
+
+**Why not fixed:** correct containment needs per-component resolution — `openat2(RESOLVE_BENEATH)` on
+Linux or an O_PATH component walk — and Zig 0.16's `Io` exposes neither. Its `resolve_beneath` option is
+a **silent no-op** on Linux and Windows (it only maps to a FreeBSD `O.RESOLVE_BENEATH`;
+`Threaded.zig:4239,4819`), so it cannot be leaned on. Doing it by hand means re-walking each component
+with `statFile(.follow_symlinks=false)` and re-validating the target — TOCTOU-prone and slow.
+
+**Severity:** matters only when **untrusted guest + a preopen that can contain attacker-influenced
+symlinks**. For the current use (running your own compiled programs against your own directories) the
+exposure is low. It is *not* a defense against a hostile guest.
+
+**Surfaces when:** wazmrt runs untrusted modules, or a preopen is shared with another writer — i.e. the
+moment it becomes a multi-tenant/plugin host. **Fix before that milestone**, and say so plainly in the
+README rather than implying the sandbox is airtight.
+
+**Anchor:** `resolve()` + the module doc in `src/wasi.zig`; `wPathOpen` already does its own O_NOFOLLOW
+(pre-`statFile`, `ELOOP` on a symlink) to dodge a std bug — that hook is the natural place to extend.
+
 ## RESOLVED 2026-07-09 (second pass — commit `645874c`)
 
 Adding `assert_invalid`/`assert_malformed`/`assert_exhaustion` to the WAST runner made the

@@ -138,10 +138,17 @@ start dropped per §4.5.4). Assembler + validator + 3 unit tests (101 total).
 **`examples/hello_compiled.zig` → `zig build-exe -target wasm32-wasi` → `wazmrt hello.wasm` prints:**
 `Hello from a compiled WASI program!` / `bulk-memory memcpy works` / `saturating truncation works` —
 i.e. real compiled code exercising `memory.copy` (`@memcpy`) and `trunc_sat` drives wazmrt's WASI
-`fd_write`. **Guest-side gotcha found:** Zig 0.16's new `Io`-model file writer doesn't drive WASI
-`fd_write` for stdout (it fails *before* issuing the syscall — no `fd_write(1)` is ever made; traced by
-instrumenting the WASI dispatch). That's a **guest toolchain gap, not a runtime one** — stderr and a
-direct `fd_write` import both work, so the example calls `fd_write` directly.
+`fd_write`.
+
+> **RETRACTED 2026-07-15 (during Phase 3).** Phase 1 recorded a "guest-side gotcha": that Zig 0.16's
+> `Io`-model file writer never issues `fd_write(1)` for stdout, called a *guest toolchain gap*. **That
+> was wrong, and the diagnosis was mine, not the toolchain's.** The real cause: the example declared
+> its own `extern "wasi_snapshot_preview1" fn fd_write(...) i32` while std declares the same import
+> returning `errno_t` (`enum(u16)`). wasm-ld cannot reconcile two signatures for one import, so it
+> silently redirects the call to a `.Lfd_write|wasi_snapshot_preview1_bitcast_invalid` stub whose whole
+> body is `unreachable` — the guest traps with no diagnostic. Pure `std.Io` stdout works fine under
+> wazmrt (`examples/hello_compiled.zig` now proves it). See `cmem/testing.md` for the trap signature
+> and how to recognize it.
 
 **Phase 2 — WASI core for stdout/args/env/compute programs. DONE 2026-07-14.** `clock_res_get` (via
 `Io.Clock.resolution`); **`poll_oneoff`** — clock subscriptions sleep until the earliest deadline (this
@@ -154,14 +161,30 @@ Verified end-to-end by a compiled program (`examples/wasi_clock_stdin.zig`): `cl
 EOF path. +2 unit tests (103 total). **wazmrt now runs the whole compute + stdout + args + clock + stdin
 class — wasmtk's compiler-test-output regime (`vision.md`).**
 
-**Phase 3 — WASI filesystem (the big one; for programs that touch files; independent of 1/2).** A
-`--dir <host>[:<guest>]` CLI flag preopens a host dir as fd 3+ (`fd_prestat_get`/`_dir_name` enumerate).
-A **host-fd table** in the `Wasi` context (guest fd → host handle + rights + offset), path resolution
-**sandboxed to a preopen** (reject `..` escapes). `path_open` honoring oflags/rights, then real
-`fd_read`/`write`/`seek`/`tell`/`close`/`sync`/`pread`/`pwrite`; metadata + dir ops (`fd_fdstat_get`
-real, `path_filestat_get`/`fd_filestat_get`, `fd_readdir`, `path_create_directory`/`unlink_file`/
-`remove_directory`/`rename`, remaining `path_*`). Host side rides the libc-free Zig-0.16 `Io.Dir`/
-`Io.File` API. Main risk surface.
+**Phase 3 — WASI filesystem. DONE 2026-07-15.** `--dir <host>[:<guest>]` preopens a host dir as fd 3+
+(`fd_prestat_get`/`_dir_name` enumerate; the CLI splits on the *last* `:` so `C:\tmp:/data` parses). A
+**host-fd table** (`FdEntry` = stdio | dir | file, with rights + its own offset; lowest-free-fd reuse
+on close). `path_open` honoring oflags/rights/fdflags, with the new fd's rights **intersected with the
+dir fd's inheriting rights** — a guest can never widen its capability by reopening. Real
+`fd_read`/`write`/`seek`/`tell`/`close`/`sync`/`datasync`/`pread`/`pwrite` (WASI fds carry their own
+offset and we use the **positional** calls, so we never depend on the host handle's position);
+`fd_fdstat_get`/`set_flags`, `fd_filestat_get`/`set_size`, `fd_readdir`, `fd_renumber`,
+`path_filestat_get`, `path_create_directory`/`unlink_file`/`remove_directory`/`rename`. Rides the
+libc-free Zig-0.16 `Io.Dir`/`Io.File` API. Verified by a compiled guest (`examples/wasi_files.zig`,
+16/16 checks) + 3 unit tests (**106**).
+
+**The sandbox is ours to enforce, and that is the headline.** `Io.Dir`'s `resolve_beneath` is a silent
+no-op on Windows and Linux (it only maps to a FreeBSD `O.RESOLVE_BENEATH`), so an `*at`-style dir
+handle is **not** a security boundary: an absolute path bypasses the handle entirely, and Windows
+resolves `..` *lexically against the process cwd* before the syscall sees it. `wasi.resolve()` therefore
+rejects absolute paths, escaping `..`, NT/device prefixes, and embedded NUL up front and hands `Io.Dir`
+only a normalized `..`-free relative path. **Known gap (see `known-issues.md`):** a symlink *inside* a
+preopen pointing outside it is still followed — containment is lexical; closing it needs per-component
+resolution the `Io` API doesn't expose.
+
+**Phase 3 leftovers** (deliberate, low demand): `path_symlink`/`path_readlink`/`path_link`,
+`fd_filestat_set_times`/`path_filestat_set_times`, `fd_allocate`, `fd_advise` (returns success —
+advisory), and real fd-readiness in `poll_oneoff`. All still resolve to the `NOTSUP` stub.
 
 **Phase 4 — ergonomics + conformance.** CLI `--dir` / `--env KEY=VAL` / `-- <guest args>`. A reproducible
 `zig build`-driven gate that compiles a real Zig `wasm32-wasi` program and runs it in wazmrt (Zig is the

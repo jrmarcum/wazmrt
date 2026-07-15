@@ -1,13 +1,32 @@
-//! WASI preview 1 (`wasi_snapshot_preview1`) — the core host imports that let a
-//! command module do I/O: stdout/stderr, args, environ, clocks, randomness, and
-//! `proc_exit`. Each function is a native host import bound through the
-//! interpreter's `HostFunc.native_env` (a context + a call fn), so WASI needs no
-//! special interpreter support — it's just a set of imports.
+//! WASI preview 1 (`wasi_snapshot_preview1`) — the host imports that let a
+//! command module do I/O: stdout/stderr/stdin, args, environ, clocks,
+//! randomness, `proc_exit`, and a **sandboxed filesystem** rooted at the
+//! directories the embedder preopens. Each function is a native host import
+//! bound through the interpreter's `HostFunc.native_env` (a context + a call
+//! fn), so WASI needs no special interpreter support — it's just a set of
+//! imports.
 //!
-//! Scope (first slice): enough for a wasi-libc command program to initialize
-//! and print. Unimplemented preview-1 functions resolve to a `NOTSUP` stub, so a
-//! module instantiates and a call fails gracefully rather than trapping. File
-//! system (`path_open`, preopens), sockets, and polling are deferred.
+//! Unimplemented preview-1 functions resolve to a `NOTSUP` stub, so a module
+//! instantiates and a call fails gracefully rather than trapping. Sockets are
+//! not implemented.
+//!
+//! ## The sandbox
+//!
+//! A guest may only name paths under a directory the embedder preopened
+//! (`--dir` on the CLI). **We resolve and contain guest paths ourselves** —
+//! `Io.Dir`'s `resolve_beneath` is a silent no-op on Windows and Linux (it only
+//! maps to a FreeBSD `O.RESOLVE_BENEATH`), so the `*at`-style dir handle alone
+//! is NOT a security boundary: an absolute path bypasses the handle entirely,
+//! and Windows resolves `..` lexically against the *process* cwd before the
+//! syscall ever sees it. `resolve()` therefore rejects absolute paths, escaping
+//! `..`, NT/device prefixes, and embedded NUL up front, and only ever hands
+//! `Io.Dir` an already-normalized relative path with no `..` left in it.
+//!
+//! Known gap: a **symlink inside a preopen that points outside it** is still
+//! followed when the guest passes `SYMLINK_FOLLOW`. Containment here is lexical;
+//! closing that hole needs per-component resolution (`openat2(RESOLVE_BENEATH)`
+//! or an O_PATH walk), which the Zig 0.16 `Io` API does not expose. Tracked in
+//! `cmem/known-issues.md`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -20,18 +39,233 @@ const Memory = interp.Instance.Memory;
 /// WASI `errno` values (§ preview-1 `errno` enum).
 const errno = struct {
     const success: u32 = 0;
+    const acces: u32 = 2;
+    const again: u32 = 6;
     const badf: u32 = 8;
+    const busy: u32 = 10;
+    const canceled: u32 = 11;
+    const dquot: u32 = 19;
+    const exist: u32 = 20;
     const fault: u32 = 21;
+    const fbig: u32 = 22;
+    const ilseq: u32 = 25;
     const inval: u32 = 28;
     const io: u32 = 29;
+    const isdir: u32 = 31;
+    const loop: u32 = 32;
+    const mfile: u32 = 33;
+    const mlink: u32 = 34;
+    const nametoolong: u32 = 37;
+    const nfile: u32 = 41;
+    const noent: u32 = 44;
+    const nomem: u32 = 48;
+    const nospc: u32 = 51;
     const nosys: u32 = 52;
+    const notdir: u32 = 54;
+    const notempty: u32 = 55;
     const notsup: u32 = 58;
+    const nxio: u32 = 60;
+    const perm: u32 = 63;
+    const pipe: u32 = 64;
+    const rofs: u32 = 69;
     const spipe: u32 = 70;
+    const xdev: u32 = 75;
+    /// The path escaped the sandbox, or the fd lacks the right.
+    const notcapable: u32 = 76;
+};
+
+/// Map a Zig `Io` error to the closest WASI errno. Taken across the union of the
+/// `Io.Dir`/`Io.File` error sets; anything unrecognized degrades to EIO rather
+/// than being reported as success.
+fn errnoFor(e: anyerror) u32 {
+    return switch (e) {
+        error.FileNotFound => errno.noent,
+        error.PathAlreadyExists => errno.exist,
+        error.AccessDenied, error.PermissionDenied => errno.acces,
+        error.NotDir => errno.notdir,
+        error.IsDir => errno.isdir,
+        error.DirNotEmpty => errno.notempty,
+        error.SymLinkLoop => errno.loop,
+        error.ProcessFdQuotaExceeded => errno.mfile,
+        error.SystemFdQuotaExceeded => errno.nfile,
+        error.SystemResources, error.OutOfMemory => errno.nomem,
+        error.NoSpaceLeft => errno.nospc,
+        error.DiskQuota => errno.dquot,
+        error.FileTooBig => errno.fbig,
+        error.ReadOnlyFileSystem => errno.rofs,
+        error.DeviceBusy, error.FileBusy, error.PipeBusy => errno.busy,
+        error.WouldBlock => errno.again,
+        error.NoDevice => errno.nxio,
+        error.LinkQuotaExceeded => errno.mlink,
+        error.CrossDevice => errno.xdev,
+        error.NameTooLong => errno.nametoolong,
+        error.BadPathName => errno.ilseq,
+        error.Unseekable, error.Streaming => errno.spipe,
+        error.NotOpenForReading, error.NotOpenForWriting => errno.notcapable,
+        error.BrokenPipe => errno.pipe,
+        error.Canceled => errno.canceled,
+        error.LockViolation => errno.busy,
+        error.FileLocksUnsupported, error.OperationUnsupported => errno.notsup,
+        error.FileSystem, error.InputOutput, error.HardwareFailure => errno.io,
+        else => errno.io,
+    };
+}
+
+// --- WASI constants (§ preview-1) ------------------------------------------
+
+/// `rights` flags.
+const rights = struct {
+    const fd_datasync: u64 = 1 << 0;
+    const fd_read: u64 = 1 << 1;
+    const fd_seek: u64 = 1 << 2;
+    const fd_fdstat_set_flags: u64 = 1 << 3;
+    const fd_sync: u64 = 1 << 4;
+    const fd_tell: u64 = 1 << 5;
+    const fd_write: u64 = 1 << 6;
+    const fd_allocate: u64 = 1 << 8;
+    const path_create_directory: u64 = 1 << 9;
+    const path_create_file: u64 = 1 << 10;
+    const path_open: u64 = 1 << 13;
+    const fd_readdir: u64 = 1 << 14;
+    const path_rename_source: u64 = 1 << 16;
+    const path_rename_target: u64 = 1 << 17;
+    const path_filestat_get: u64 = 1 << 18;
+    const fd_filestat_get: u64 = 1 << 21;
+    const fd_filestat_set_size: u64 = 1 << 22;
+    const path_remove_directory: u64 = 1 << 25;
+    const path_unlink_file: u64 = 1 << 26;
+    const poll_fd_readwrite: u64 = 1 << 27;
+
+    /// Everything a preopened directory hands out (dir rights + what files
+    /// opened under it may inherit).
+    const all: u64 = (1 << 29) - 1;
+};
+
+/// `oflags` for `path_open`.
+const oflags = struct {
+    const creat: u16 = 1 << 0;
+    const directory: u16 = 1 << 1;
+    const excl: u16 = 1 << 2;
+    const trunc: u16 = 1 << 3;
+};
+
+/// `fdflags`.
+const fdflags = struct {
+    const append: u16 = 1 << 0;
+    const dsync: u16 = 1 << 1;
+    const nonblock: u16 = 1 << 2;
+    const rsync: u16 = 1 << 3;
+    const sync: u16 = 1 << 4;
+};
+
+/// `lookupflags`.
+const lookup_symlink_follow: u32 = 1 << 0;
+
+/// `filetype` enum values.
+const filetype = struct {
+    const unknown: u8 = 0;
+    const block_device: u8 = 1;
+    const character_device: u8 = 2;
+    const directory: u8 = 3;
+    const regular_file: u8 = 4;
+    const socket_stream: u8 = 6;
+    const symbolic_link: u8 = 7;
+};
+
+fn filetypeOf(k: Io.File.Kind) u8 {
+    return switch (k) {
+        .block_device => filetype.block_device,
+        .character_device => filetype.character_device,
+        .directory => filetype.directory,
+        .sym_link => filetype.symbolic_link,
+        .file => filetype.regular_file,
+        .unix_domain_socket => filetype.socket_stream,
+        else => filetype.unknown,
+    };
+}
+
+/// WASI `timestamp_t` is `u64` ns since the Unix epoch; `Io.Timestamp` is a
+/// *signed* `i96`. Clamp rather than wrap: a pre-1970 mtime is negative and a
+/// post-2554 one overflows.
+fn timestampOf(t: Io.Timestamp) u64 {
+    return @intCast(std.math.clamp(t.nanoseconds, 0, std.math.maxInt(u64)));
+}
+
+/// Resolve a guest path to a sandbox-safe path relative to its preopen dir.
+///
+/// This is the sandbox (see the module doc for why `Io.Dir` can't be trusted to
+/// enforce it). Returns null — the caller reports `ENOTCAPABLE` — for anything
+/// that could name a file outside the preopen:
+///   - an absolute path (`/etc/passwd`, `\x`, `C:\x`) — bypasses the dir handle
+///   - a `..` that pops above the root, at any point in the walk
+///   - a UNC / NT / device prefix (`\\?\`, `\??\`, `//server/share`)
+///   - an embedded NUL (would truncate the path at the syscall boundary)
+/// `.` components are dropped and separators collapsed, so the result is
+/// normalized with no `..` remaining — safe to hand to `Io.Dir`, whose lexical
+/// Windows normalization is then a no-op. An empty result means "the dir
+/// itself" and is returned as ".".
+fn resolve(gpa: std.mem.Allocator, path: []const u8) ?[]const u8 {
+    if (path.len == 0) return null;
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return null;
+    // Absolute: POSIX root, a Windows separator, or a drive letter.
+    if (path[0] == '/' or path[0] == '\\') return null;
+    if (path.len >= 2 and path[1] == ':') return null;
+
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(gpa);
+
+    var it = std.mem.splitAny(u8, path, "/\\");
+    while (it.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".")) continue;
+        if (std.mem.eql(u8, part, "..")) {
+            // Popping past the root escapes the sandbox.
+            if (parts.items.len == 0) return null;
+            _ = parts.pop();
+            continue;
+        }
+        // A device name or NT-namespace component never belongs in a guest path.
+        if (std.mem.indexOfScalar(u8, part, ':') != null) return null;
+        if (std.mem.eql(u8, part, "?") or std.mem.eql(u8, part, "??")) return null;
+        parts.append(gpa, part) catch return null;
+    }
+    if (parts.items.len == 0) return gpa.dupe(u8, ".") catch null;
+    return std.mem.join(gpa, "/", parts.items) catch null;
+}
+
+/// One guest file descriptor: stdio, a preopened/opened directory, or a file.
+pub const FdEntry = union(enum) {
+    stdin,
+    stdout,
+    stderr,
+    dir: Dir,
+    file: File,
+
+    pub const Dir = struct {
+        handle: Io.Dir,
+        /// The guest-visible path (`fd_prestat_dir_name`), set only on preopens.
+        preopen_name: ?[]const u8 = null,
+        rights_base: u64 = rights.all,
+        rights_inheriting: u64 = rights.all,
+        /// Close the handle on `fd_close`. Preopens opened by the embedder are
+        /// owned by us; `Io.Dir.cwd()` would not be.
+        owned: bool = true,
+    };
+
+    pub const File = struct {
+        handle: Io.File,
+        /// The seek position. WASI fds carry their own offset and we use the
+        /// positional read/write calls, so this stays independent of the host
+        /// handle's position (and is threadsafe).
+        offset: u64 = 0,
+        rights_base: u64 = rights.all,
+        rights_inheriting: u64 = rights.all,
+        flags: u16 = 0,
+    };
 };
 
 /// Per-instance WASI state. `memory` is filled in after instantiation (the
-/// module's memory doesn't exist until then); the writers, args, and environ
-/// are supplied by the embedder (the CLI).
+/// module's memory doesn't exist until then); the writers, args, environ, and
+/// preopens are supplied by the embedder (the CLI).
 pub const Wasi = struct {
     memory: ?*Memory = null,
     stdout: *Io.Writer,
@@ -39,13 +273,77 @@ pub const Wasi = struct {
     /// Process stdin for `fd_read` on fd 0; null reports EOF.
     stdin: ?*Io.Reader = null,
     io: Io,
+    gpa: std.mem.Allocator,
     args: []const []const u8 = &.{},
     environ: []const []const u8 = &.{},
     exit_code: ?u32 = null,
     rng: std.Random.DefaultPrng,
+    /// Guest fd -> host resource, indexed by fd. 0/1/2 are stdio; preopens land
+    /// at 3+ (the convention every wasi-libc expects). A hole is a closed fd.
+    fds: std.ArrayList(?FdEntry) = .empty,
 
-    pub fn init(io: Io, stdout: *Io.Writer, stderr: *Io.Writer, seed: u64) Wasi {
-        return .{ .io = io, .stdout = stdout, .stderr = stderr, .rng = std.Random.DefaultPrng.init(seed) };
+    pub fn init(gpa: std.mem.Allocator, io: Io, stdout: *Io.Writer, stderr: *Io.Writer, seed: u64) Wasi {
+        var w: Wasi = .{
+            .io = io,
+            .gpa = gpa,
+            .stdout = stdout,
+            .stderr = stderr,
+            .rng = std.Random.DefaultPrng.init(seed),
+        };
+        // fds 0-2 are always the standard streams.
+        w.fds.appendSlice(gpa, &.{ .stdin, .stdout, .stderr }) catch {};
+        return w;
+    }
+
+    pub fn deinit(self: *Wasi) void {
+        for (self.fds.items) |maybe| {
+            const e = maybe orelse continue;
+            switch (e) {
+                .dir => |d| {
+                    if (d.owned) d.handle.close(self.io);
+                    if (d.preopen_name) |n| self.gpa.free(n);
+                },
+                .file => |f| f.handle.close(self.io),
+                else => {},
+            }
+        }
+        self.fds.deinit(self.gpa);
+        self.* = undefined;
+    }
+
+    /// Preopen `host_path` as the guest-visible directory `guest_name`, so the
+    /// guest may reach it (and only it) via `path_open`. Returns the guest fd.
+    pub fn addPreopen(self: *Wasi, host_path: []const u8, guest_name: []const u8) !u32 {
+        const cwd = Io.Dir.cwd();
+        const handle = if (std.fs.path.isAbsolute(host_path))
+            try Io.Dir.openDirAbsolute(self.io, host_path, .{ .iterate = true })
+        else
+            try cwd.openDir(self.io, host_path, .{ .iterate = true });
+        errdefer handle.close(self.io);
+
+        const name = try self.gpa.dupe(u8, guest_name);
+        errdefer self.gpa.free(name);
+        try self.fds.append(self.gpa, .{ .dir = .{ .handle = handle, .preopen_name = name } });
+        return @intCast(self.fds.items.len - 1);
+    }
+
+    /// The entry for guest `fd`, or null if it is closed / out of range.
+    fn get(self: *Wasi, fd: u32) ?*FdEntry {
+        if (fd >= self.fds.items.len) return null;
+        if (self.fds.items[fd] == null) return null;
+        return &self.fds.items[fd].?;
+    }
+
+    /// Install `e` at the lowest free guest fd.
+    fn put(self: *Wasi, e: FdEntry) !u32 {
+        for (self.fds.items, 0..) |slot, i| {
+            if (slot == null) {
+                self.fds.items[i] = e;
+                return @intCast(i);
+            }
+        }
+        try self.fds.append(self.gpa, e);
+        return @intCast(self.fds.items.len - 1);
     }
 
     /// The `HostFunc` backing `wasi_snapshot_preview1.<name>`. Known functions get
@@ -94,6 +392,50 @@ pub const Wasi = struct {
     }
 };
 
+/// A `(dirfd, path, path_len)` argument trio resolved against the sandbox.
+/// Caller must `free()` — the resolved path is heap-allocated.
+const ResolvedPath = struct {
+    dir: Io.Dir,
+    /// Normalized, `..`-free, relative to `dir`.
+    path: []const u8,
+    /// The dir fd's inheriting rights, which cap what an opened fd may hold.
+    inheriting: u64,
+
+    fn free(self: ResolvedPath, gpa: std.mem.Allocator) void {
+        gpa.free(self.path);
+    }
+};
+
+/// Resolve `(fd, ptr, len)` from a `path_*` call: the fd must be an open
+/// directory holding `need` rights, and the path must stay inside it.
+/// On failure writes the errno into `results` and returns null.
+fn resolveArg(w: *Wasi, fd: u32, ptr: u32, len: u32, need: u64, results: []Value) ?ResolvedPath {
+    const e = w.get(fd) orelse {
+        _ = ret(results, errno.badf);
+        return null;
+    };
+    const d = switch (e.*) {
+        .dir => |d| d,
+        else => {
+            _ = ret(results, errno.notdir);
+            return null;
+        },
+    };
+    if (need != 0 and d.rights_base & need != need) {
+        _ = ret(results, errno.notcapable);
+        return null;
+    }
+    const raw = w.slice(ptr, len) orelse {
+        _ = ret(results, errno.fault);
+        return null;
+    };
+    const path = resolve(w.gpa, raw) orelse {
+        _ = ret(results, errno.notcapable); // escaped the sandbox
+        return null;
+    };
+    return .{ .dir = d.handle, .path = path, .inheriting = d.rights_inheriting };
+}
+
 const CallFn = *const fn (ctx: *anyopaque, args: []const Value, results: []Value) bool;
 
 fn argU32(args: []const Value, i: usize) u32 {
@@ -113,9 +455,26 @@ fn callFor(name: []const u8) CallFn {
         .{ "fd_read", wFdRead },
         .{ "fd_close", wFdClose },
         .{ "fd_seek", wFdSeek },
+        .{ "fd_tell", wFdTell },
+        .{ "fd_pread", wFdPread },
+        .{ "fd_pwrite", wFdPwrite },
+        .{ "fd_sync", wFdSync },
+        .{ "fd_datasync", wFdSync }, // Io.File.sync flushes contents + metadata
         .{ "fd_fdstat_get", wFdFdstatGet },
+        .{ "fd_fdstat_set_flags", wFdFdstatSetFlags },
+        .{ "fd_filestat_get", wFdFilestatGet },
+        .{ "fd_filestat_set_size", wFdFilestatSetSize },
+        .{ "fd_readdir", wFdReaddir },
+        .{ "fd_renumber", wFdRenumber },
+        .{ "fd_advise", wSchedYield }, // advisory only — success is honest
         .{ "fd_prestat_get", wFdPrestatGet },
-        .{ "fd_prestat_dir_name", wStubBadf },
+        .{ "fd_prestat_dir_name", wFdPrestatDirName },
+        .{ "path_open", wPathOpen },
+        .{ "path_filestat_get", wPathFilestatGet },
+        .{ "path_create_directory", wPathCreateDirectory },
+        .{ "path_remove_directory", wPathRemoveDirectory },
+        .{ "path_unlink_file", wPathUnlinkFile },
+        .{ "path_rename", wPathRename },
         .{ "args_sizes_get", wArgsSizesGet },
         .{ "args_get", wArgsGet },
         .{ "environ_sizes_get", wEnvironSizesGet },
@@ -143,8 +502,39 @@ fn wProcExit(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     return false; // -> error.HostTrap; the host reads exit_code
 }
 
-/// `fd_write(fd, iovs, iovs_len, nwritten)` — gather the iovecs from memory and
-/// write them to fd 1 (stdout) / 2 (stderr).
+/// Gather the guest's `iovec`/`ciovec` array into host slices pointing straight
+/// into linear memory — the shape `Io.File.read/writePositional` want. Caller
+/// frees. Returns null after writing the errno into `results`.
+fn gatherIovecs(w: *Wasi, iovs: u32, iovs_len: u32, results: []Value) ?[][]u8 {
+    const vecs = w.gpa.alloc([]u8, iovs_len) catch {
+        _ = ret(results, errno.nomem);
+        return null;
+    };
+    var i: u32 = 0;
+    while (i < iovs_len) : (i += 1) {
+        const iov = iovs + i * 8; // { buf: u32, buf_len: u32 }
+        const buf = w.readU32(iov) orelse {
+            w.gpa.free(vecs);
+            _ = ret(results, errno.fault);
+            return null;
+        };
+        const len = w.readU32(iov + 4) orelse {
+            w.gpa.free(vecs);
+            _ = ret(results, errno.fault);
+            return null;
+        };
+        vecs[i] = w.slice(buf, len) orelse {
+            w.gpa.free(vecs);
+            _ = ret(results, errno.fault);
+            return null;
+        };
+    }
+    return vecs;
+}
+
+/// `fd_write(fd, iovs, iovs_len, nwritten)` — gather the iovecs and write them
+/// to stdout/stderr or to a file fd at its current offset (or, with the APPEND
+/// flag, at the end — `Io` has no O_APPEND, so we place the write ourselves).
 fn wFdWrite(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const w: *Wasi = @ptrCast(@alignCast(ctx));
     const fd = argU32(args, 0);
@@ -152,88 +542,541 @@ fn wFdWrite(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const iovs_len = argU32(args, 2);
     const nwritten_ptr = argU32(args, 3);
 
-    const sink: *Io.Writer = switch (fd) {
-        1 => w.stdout,
-        2 => w.stderr,
-        else => return ret(results, errno.badf),
-    };
-    var total: u32 = 0;
-    var i: u32 = 0;
-    while (i < iovs_len) : (i += 1) {
-        const iov = iovs + i * 8; // ciovec = { buf: u32, buf_len: u32 }
-        const buf = w.readU32(iov) orelse return ret(results, errno.fault);
-        const len = w.readU32(iov + 4) orelse return ret(results, errno.fault);
-        const data = w.slice(buf, len) orelse return ret(results, errno.fault);
-        sink.writeAll(data) catch return ret(results, errno.badf);
-        total +%= len;
+    const e = w.get(fd) orelse return ret(results, errno.badf);
+    const vecs = gatherIovecs(w, iovs, iovs_len, results) orelse return true;
+    defer w.gpa.free(vecs);
+
+    var total: u64 = 0;
+    switch (e.*) {
+        .stdout, .stderr => {
+            const sink: *Io.Writer = if (e.* == .stdout) w.stdout else w.stderr;
+            for (vecs) |v| {
+                sink.writeAll(v) catch return ret(results, errno.io);
+                total += v.len;
+            }
+        },
+        .file => |*f| {
+            if (f.rights_base & rights.fd_write == 0) return ret(results, errno.notcapable);
+            var at = f.offset;
+            if (f.flags & fdflags.append != 0)
+                at = f.handle.length(w.io) catch |err| return ret(results, errnoFor(err));
+            total = f.handle.writePositional(w.io, vecs, at) catch |err|
+                return ret(results, errnoFor(err));
+            f.offset = at + total;
+        },
+        .stdin => return ret(results, errno.notcapable),
+        .dir => return ret(results, errno.isdir),
     }
-    if (!w.writeU32(nwritten_ptr, total)) return ret(results, errno.fault);
+    if (!w.writeU32(nwritten_ptr, @intCast(total))) return ret(results, errno.fault);
     return ret(results, errno.success);
 }
 
-/// `fd_read(fd, iovs, iovs_len, nread)` — scatter-read stdin (fd 0) into the
-/// iovecs. A short read (or no stdin wired) reports EOF as 0 bytes.
+/// `fd_read(fd, iovs, iovs_len, nread)` — scatter-read stdin or a file fd into
+/// the iovecs. EOF reports 0 bytes with SUCCESS.
 fn wFdRead(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const w: *Wasi = @ptrCast(@alignCast(ctx));
     const fd = argU32(args, 0);
     const iovs = argU32(args, 1);
     const iovs_len = argU32(args, 2);
     const nread_ptr = argU32(args, 3);
-    if (fd != 0) return ret(results, errno.badf); // only stdin is readable today
 
-    var total: u32 = 0;
-    if (w.stdin) |src| {
-        var i: u32 = 0;
-        while (i < iovs_len) : (i += 1) {
-            const iov = iovs + i * 8; // iovec = { buf: u32, buf_len: u32 }
-            const buf = w.readU32(iov) orelse return ret(results, errno.fault);
-            const len = w.readU32(iov + 4) orelse return ret(results, errno.fault);
-            if (len == 0) continue;
-            const dst = w.slice(buf, len) orelse return ret(results, errno.fault);
-            const n = src.readSliceShort(dst) catch return ret(results, errno.io);
-            total += @intCast(n);
-            if (n < len) break; // short read / EOF — don't block for more
-        }
+    const e = w.get(fd) orelse return ret(results, errno.badf);
+    var total: u64 = 0;
+    switch (e.*) {
+        .stdin => {
+            if (w.stdin) |src| {
+                var i: u32 = 0;
+                while (i < iovs_len) : (i += 1) {
+                    const iov = iovs + i * 8;
+                    const buf = w.readU32(iov) orelse return ret(results, errno.fault);
+                    const len = w.readU32(iov + 4) orelse return ret(results, errno.fault);
+                    if (len == 0) continue;
+                    const dst = w.slice(buf, len) orelse return ret(results, errno.fault);
+                    const n = src.readSliceShort(dst) catch return ret(results, errno.io);
+                    total += n;
+                    if (n < len) break; // short read / EOF — don't block for more
+                }
+            }
+        },
+        .file => |*f| {
+            if (f.rights_base & rights.fd_read == 0) return ret(results, errno.notcapable);
+            const vecs = gatherIovecs(w, iovs, iovs_len, results) orelse return true;
+            defer w.gpa.free(vecs);
+            // readPositional returns 0 at end-of-file rather than erroring.
+            total = f.handle.readPositional(w.io, vecs, f.offset) catch |err|
+                return ret(results, errnoFor(err));
+            f.offset += total;
+        },
+        .stdout, .stderr => return ret(results, errno.notcapable),
+        .dir => return ret(results, errno.isdir),
     }
-    if (!w.writeU32(nread_ptr, total)) return ret(results, errno.fault);
+    if (!w.writeU32(nread_ptr, @intCast(total))) return ret(results, errno.fault);
     return ret(results, errno.success);
 }
 
+/// `fd_pread(fd, iovs, iovs_len, offset, nread)` — read at `offset` without
+/// disturbing the fd's position.
+fn wFdPread(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+    return preadWrite(ctx, args, results, .read);
+}
+
+/// `fd_pwrite(fd, iovs, iovs_len, offset, nwritten)`.
+fn wFdPwrite(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+    return preadWrite(ctx, args, results, .write);
+}
+
+fn preadWrite(ctx: *anyopaque, args: []const Value, results: []Value, comptime dir: enum { read, write }) bool {
+    const w: *Wasi = @ptrCast(@alignCast(ctx));
+    const e = w.get(argU32(args, 0)) orelse return ret(results, errno.badf);
+    const f = switch (e.*) {
+        .file => |*f| f,
+        .dir => return ret(results, errno.isdir),
+        else => return ret(results, errno.spipe), // stdio is not seekable
+    };
+    const need = if (dir == .read) rights.fd_read else rights.fd_write;
+    if (f.rights_base & (need | rights.fd_seek) != (need | rights.fd_seek))
+        return ret(results, errno.notcapable);
+
+    const offset: u64 = @bitCast(interp.asI64(args[3]));
+    const vecs = gatherIovecs(w, argU32(args, 1), argU32(args, 2), results) orelse return true;
+    defer w.gpa.free(vecs);
+
+    const n = switch (dir) {
+        .read => f.handle.readPositional(w.io, vecs, offset),
+        .write => f.handle.writePositional(w.io, vecs, offset),
+    } catch |err| return ret(results, errnoFor(err));
+
+    if (!w.writeU32(argU32(args, 4), @intCast(n))) return ret(results, errno.fault);
+    return ret(results, errno.success);
+}
+
+/// `fd_close(fd)` — release the host handle and free the guest fd for reuse.
 fn wFdClose(ctx: *anyopaque, args: []const Value, results: []Value) bool {
-    _ = ctx;
-    _ = args;
-    return ret(results, errno.success);
-}
-
-/// `fd_seek(...)` — stdio streams are not seekable.
-fn wFdSeek(ctx: *anyopaque, args: []const Value, results: []Value) bool {
-    _ = ctx;
-    _ = args;
-    return ret(results, errno.spipe);
-}
-
-/// `fd_fdstat_get(fd, stat)` — report stdio as a character device with all
-/// rights, so wasi-libc treats it as a tty.
-fn wFdFdstatGet(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const w: *Wasi = @ptrCast(@alignCast(ctx));
     const fd = argU32(args, 0);
-    if (fd > 2) return ret(results, errno.badf);
-    const stat = argU32(args, 1);
-    // fdstat: { fs_filetype: u8, pad, fs_flags: u16, pad, rights_base: u64, rights_inheriting: u64 } (24 bytes)
-    const b = w.slice(stat, 24) orelse return ret(results, errno.fault);
-    @memset(b, 0);
-    b[0] = 2; // filetype = character_device
-    std.mem.writeInt(u64, b[8..][0..8], std.math.maxInt(u64), .little); // rights_base
-    std.mem.writeInt(u64, b[16..][0..8], std.math.maxInt(u64), .little); // rights_inheriting
+    const e = w.get(fd) orelse return ret(results, errno.badf);
+    switch (e.*) {
+        .file => |f| f.handle.close(w.io),
+        .dir => |d| {
+            if (d.owned) d.handle.close(w.io);
+            if (d.preopen_name) |n| w.gpa.free(n);
+        },
+        else => return ret(results, errno.success), // closing stdio is a no-op
+    }
+    w.fds.items[fd] = null;
     return ret(results, errno.success);
 }
 
-/// `fd_prestat_get(fd, ...)` — no preopened directories, so every fd is BADF;
-/// wasi-libc uses this to stop enumerating preopens.
+/// `fd_renumber(from, to)` — move `from` onto `to`, closing whatever `to` was.
+fn wFdRenumber(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+    const w: *Wasi = @ptrCast(@alignCast(ctx));
+    const from = argU32(args, 0);
+    const to = argU32(args, 1);
+    if (w.get(from) == null or w.get(to) == null) return ret(results, errno.badf);
+    if (from == to) return ret(results, errno.success);
+    const closing = [_]Value{interp.i32Value(@bitCast(to))};
+    var ignored = [_]Value{interp.i32Value(0)};
+    _ = wFdClose(ctx, &closing, &ignored);
+    w.fds.items[to] = w.fds.items[from];
+    w.fds.items[from] = null;
+    return ret(results, errno.success);
+}
+
+/// `fd_seek(fd, offset, whence, newoffset)` — reposition a file fd.
+fn wFdSeek(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+    const w: *Wasi = @ptrCast(@alignCast(ctx));
+    const e = w.get(argU32(args, 0)) orelse return ret(results, errno.badf);
+    const f = switch (e.*) {
+        .file => |*f| f,
+        else => return ret(results, errno.spipe), // stdio/dirs are not seekable
+    };
+    if (f.rights_base & rights.fd_seek == 0) return ret(results, errno.notcapable);
+
+    const delta = interp.asI64(args[1]);
+    const whence = argU32(args, 2);
+    const base: i128 = switch (whence) {
+        0 => 0, // SET
+        1 => @intCast(f.offset), // CUR
+        2 => @intCast(f.handle.length(w.io) catch |err| return ret(results, errnoFor(err))), // END
+        else => return ret(results, errno.inval),
+    };
+    const target = base + delta;
+    if (target < 0) return ret(results, errno.inval); // seeking before byte 0
+    f.offset = @intCast(target);
+    if (!w.writeU64(argU32(args, 3), f.offset)) return ret(results, errno.fault);
+    return ret(results, errno.success);
+}
+
+/// `fd_tell(fd, offset)`.
+fn wFdTell(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+    const w: *Wasi = @ptrCast(@alignCast(ctx));
+    const e = w.get(argU32(args, 0)) orelse return ret(results, errno.badf);
+    const f = switch (e.*) {
+        .file => |*f| f,
+        else => return ret(results, errno.spipe),
+    };
+    if (f.rights_base & rights.fd_tell == 0) return ret(results, errno.notcapable);
+    if (!w.writeU64(argU32(args, 1), f.offset)) return ret(results, errno.fault);
+    return ret(results, errno.success);
+}
+
+/// `fd_sync(fd)` / `fd_datasync(fd)` — `Io.File.sync` covers both (it flushes
+/// contents *and* metadata; there is no data-only split).
+fn wFdSync(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+    const w: *Wasi = @ptrCast(@alignCast(ctx));
+    const e = w.get(argU32(args, 0)) orelse return ret(results, errno.badf);
+    switch (e.*) {
+        .file => |f| f.handle.sync(w.io) catch |err| return ret(results, errnoFor(err)),
+        .stdout => w.stdout.flush() catch return ret(results, errno.io),
+        .stderr => w.stderr.flush() catch return ret(results, errno.io),
+        else => {},
+    }
+    return ret(results, errno.success);
+}
+
+/// `fd_fdstat_get(fd, stat)` — the fd's type, flags, and rights.
+fn wFdFdstatGet(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+    const w: *Wasi = @ptrCast(@alignCast(ctx));
+    const e = w.get(argU32(args, 0)) orelse return ret(results, errno.badf);
+    // fdstat: { fs_filetype: u8, pad, fs_flags: u16, pad, rights_base: u64, rights_inheriting: u64 }
+    const b = w.slice(argU32(args, 1), 24) orelse return ret(results, errno.fault);
+    @memset(b, 0);
+    switch (e.*) {
+        // stdio reports as a character device with all rights, so wasi-libc
+        // treats it as a tty.
+        .stdin, .stdout, .stderr => {
+            b[0] = filetype.character_device;
+            std.mem.writeInt(u64, b[8..][0..8], std.math.maxInt(u64), .little);
+            std.mem.writeInt(u64, b[16..][0..8], std.math.maxInt(u64), .little);
+        },
+        .dir => |d| {
+            b[0] = filetype.directory;
+            std.mem.writeInt(u64, b[8..][0..8], d.rights_base, .little);
+            std.mem.writeInt(u64, b[16..][0..8], d.rights_inheriting, .little);
+        },
+        .file => |f| {
+            const st = f.handle.stat(w.io) catch |err| return ret(results, errnoFor(err));
+            b[0] = filetypeOf(st.kind);
+            std.mem.writeInt(u16, b[2..][0..2], f.flags, .little);
+            std.mem.writeInt(u64, b[8..][0..8], f.rights_base, .little);
+            std.mem.writeInt(u64, b[16..][0..8], f.rights_inheriting, .little);
+        },
+    }
+    return ret(results, errno.success);
+}
+
+/// `fd_fdstat_set_flags(fd, flags)` — only APPEND is meaningful here, and we
+/// honor it in `fd_write` rather than at the host handle.
+fn wFdFdstatSetFlags(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+    const w: *Wasi = @ptrCast(@alignCast(ctx));
+    const e = w.get(argU32(args, 0)) orelse return ret(results, errno.badf);
+    switch (e.*) {
+        .file => |*f| {
+            if (f.rights_base & rights.fd_fdstat_set_flags == 0) return ret(results, errno.notcapable);
+            f.flags = @truncate(argU32(args, 1));
+        },
+        else => {},
+    }
+    return ret(results, errno.success);
+}
+
+/// Write a 64-byte `filestat` at `at`.
+fn writeFilestat(w: *Wasi, at: u32, st: Io.File.Stat) bool {
+    const b = w.slice(at, 64) orelse return false;
+    @memset(b, 0);
+    // dev@0 has no source in Io.File.Stat — 0. ino@8, filetype@16, nlink@24,
+    // size@32, atim@40, mtim@48, ctim@56.
+    std.mem.writeInt(u64, b[8..][0..8], @intCast(st.inode), .little);
+    b[16] = filetypeOf(st.kind);
+    std.mem.writeInt(u64, b[24..][0..8], @intCast(st.nlink), .little);
+    std.mem.writeInt(u64, b[32..][0..8], st.size, .little);
+    // atime is optional (some systems refuse to report it) — fall back to mtime.
+    std.mem.writeInt(u64, b[40..][0..8], timestampOf(st.atime orelse st.mtime), .little);
+    std.mem.writeInt(u64, b[48..][0..8], timestampOf(st.mtime), .little);
+    std.mem.writeInt(u64, b[56..][0..8], timestampOf(st.ctime), .little);
+    return true;
+}
+
+/// `fd_filestat_get(fd, buf)`.
+fn wFdFilestatGet(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+    const w: *Wasi = @ptrCast(@alignCast(ctx));
+    const e = w.get(argU32(args, 0)) orelse return ret(results, errno.badf);
+    const st: Io.File.Stat = switch (e.*) {
+        .file => |f| blk: {
+            if (f.rights_base & rights.fd_filestat_get == 0) return ret(results, errno.notcapable);
+            break :blk f.handle.stat(w.io) catch |err| return ret(results, errnoFor(err));
+        },
+        .dir => |d| d.handle.stat(w.io) catch |err| return ret(results, errnoFor(err)),
+        // stdio has no stat; report a character device.
+        else => {
+            const b = w.slice(argU32(args, 1), 64) orelse return ret(results, errno.fault);
+            @memset(b, 0);
+            b[16] = filetype.character_device;
+            return ret(results, errno.success);
+        },
+    };
+    if (!writeFilestat(w, argU32(args, 1), st)) return ret(results, errno.fault);
+    return ret(results, errno.success);
+}
+
+/// `fd_filestat_set_size(fd, size)` — truncate/extend.
+fn wFdFilestatSetSize(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+    const w: *Wasi = @ptrCast(@alignCast(ctx));
+    const e = w.get(argU32(args, 0)) orelse return ret(results, errno.badf);
+    const f = switch (e.*) {
+        .file => |f| f,
+        else => return ret(results, errno.inval),
+    };
+    if (f.rights_base & rights.fd_filestat_set_size == 0) return ret(results, errno.notcapable);
+    const size: u64 = @bitCast(interp.asI64(args[1]));
+    f.handle.setLength(w.io, size) catch |err| return ret(results, errnoFor(err));
+    return ret(results, errno.success);
+}
+
+/// `fd_prestat_get(fd, buf)` — describe a preopen. wasi-libc walks fds upward
+/// from 3 and stops at the first EBADF, so non-preopens must report EBADF.
 fn wFdPrestatGet(ctx: *anyopaque, args: []const Value, results: []Value) bool {
-    _ = ctx;
-    _ = args;
-    return ret(results, errno.badf);
+    const w: *Wasi = @ptrCast(@alignCast(ctx));
+    const e = w.get(argU32(args, 0)) orelse return ret(results, errno.badf);
+    const d = switch (e.*) {
+        .dir => |d| d,
+        else => return ret(results, errno.badf),
+    };
+    const name = d.preopen_name orelse return ret(results, errno.badf);
+    // prestat: { tag: u8, pad, u: { dir: { pr_name_len: u32 } } } — len at +4.
+    const b = w.slice(argU32(args, 1), 8) orelse return ret(results, errno.fault);
+    @memset(b, 0);
+    b[0] = 0; // preopentype = dir
+    std.mem.writeInt(u32, b[4..][0..4], @intCast(name.len), .little);
+    return ret(results, errno.success);
+}
+
+/// `fd_prestat_dir_name(fd, path, path_len)` — the guest-visible name.
+fn wFdPrestatDirName(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+    const w: *Wasi = @ptrCast(@alignCast(ctx));
+    const e = w.get(argU32(args, 0)) orelse return ret(results, errno.badf);
+    const d = switch (e.*) {
+        .dir => |d| d,
+        else => return ret(results, errno.badf),
+    };
+    const name = d.preopen_name orelse return ret(results, errno.badf);
+    const len = argU32(args, 2);
+    if (len < name.len) return ret(results, errno.nametoolong);
+    const b = w.slice(argU32(args, 1), len) orelse return ret(results, errno.fault);
+    @memcpy(b[0..name.len], name);
+    return ret(results, errno.success);
+}
+
+/// `path_open(dirfd, lookupflags, path, path_len, oflags, rights_base,
+///            rights_inheriting, fdflags, opened_fd)` — the gateway into the
+/// sandbox. The new fd's rights are capped by the dir fd's inheriting rights,
+/// so a guest can never widen its own capability by reopening.
+fn wPathOpen(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+    const w: *Wasi = @ptrCast(@alignCast(ctx));
+    const lookup = argU32(args, 1);
+    const rp = resolveArg(w, argU32(args, 0), argU32(args, 2), argU32(args, 3), rights.path_open, results) orelse
+        return true;
+    defer rp.free(w.gpa);
+
+    const of: u16 = @truncate(argU32(args, 4));
+    const want_base: u64 = @bitCast(interp.asI64(args[5]));
+    const want_inheriting: u64 = @bitCast(interp.asI64(args[6]));
+    const ff: u16 = @truncate(argU32(args, 7));
+    const opened_fd_ptr = argU32(args, 8);
+
+    const follow = lookup & lookup_symlink_follow != 0;
+    // A guest may only ever narrow: intersect with what the dir fd may pass on.
+    const new_base = want_base & rp.inheriting;
+    const new_inheriting = want_inheriting & rp.inheriting;
+
+    if (of & oflags.directory != 0) {
+        const dir = rp.dir.openDir(w.io, rp.path, .{ .iterate = true, .follow_symlinks = follow }) catch |err|
+            return ret(results, errnoFor(err));
+        const fd = w.put(.{ .dir = .{
+            .handle = dir,
+            .rights_base = new_base,
+            .rights_inheriting = new_inheriting,
+        } }) catch {
+            dir.close(w.io);
+            return ret(results, errno.nomem);
+        };
+        if (!w.writeU32(opened_fd_ptr, fd)) return ret(results, errno.fault);
+        return ret(results, errno.success);
+    }
+
+    const wants_read = new_base & rights.fd_read != 0;
+    const wants_write = new_base & (rights.fd_write | rights.fd_filestat_set_size) != 0;
+
+    const file: Io.File = if (of & oflags.creat != 0) blk: {
+        if (rp.inheriting & rights.path_create_file == 0) return ret(results, errno.notcapable);
+        // createFile is always write-capable; `read` widens it to read_write.
+        break :blk rp.dir.createFile(w.io, rp.path, .{
+            .read = wants_read,
+            .truncate = of & oflags.trunc != 0,
+            .exclusive = of & oflags.excl != 0,
+        }) catch |err| return ret(results, errnoFor(err));
+    } else blk: {
+        // O_NOFOLLOW, without asking Io for it. `openFile(.follow_symlinks =
+        // false)` on Windows opens an ASYNCHRONOUS handle but still reports
+        // `.nonblocking = false`, so the first read takes the synchronous path
+        // and hits `.PENDING => unreachable` inside std — it crashes the host.
+        // (Zig 0.16 Threaded.zig:5033; `createFile` is unconditionally
+        // SYNCHRONOUS_NONALERT, which is why only the open path is affected.)
+        // Fail on a symlink ourselves — which is what O_NOFOLLOW means — and
+        // then open normally, since there is no link left to follow.
+        if (!follow) {
+            const lst = rp.dir.statFile(w.io, rp.path, .{ .follow_symlinks = false }) catch null;
+            if (lst) |s| if (s.kind == .sym_link) return ret(results, errno.loop);
+        }
+        const f = rp.dir.openFile(w.io, rp.path, .{
+            .mode = if (wants_write and wants_read) .read_write else if (wants_write) .write_only else .read_only,
+        }) catch |err| return ret(results, errnoFor(err));
+        // O_TRUNC without O_CREAT: truncate after opening.
+        if (of & oflags.trunc != 0) f.setLength(w.io, 0) catch |err| {
+            f.close(w.io);
+            return ret(results, errnoFor(err));
+        };
+        break :blk f;
+    };
+
+    const fd = w.put(.{ .file = .{
+        .handle = file,
+        .rights_base = new_base,
+        .rights_inheriting = new_inheriting,
+        .flags = ff,
+    } }) catch {
+        file.close(w.io);
+        return ret(results, errno.nomem);
+    };
+    if (!w.writeU32(opened_fd_ptr, fd)) return ret(results, errno.fault);
+    return ret(results, errno.success);
+}
+
+/// `path_filestat_get(dirfd, lookupflags, path, path_len, buf)`.
+fn wPathFilestatGet(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+    const w: *Wasi = @ptrCast(@alignCast(ctx));
+    const follow = argU32(args, 1) & lookup_symlink_follow != 0;
+    const rp = resolveArg(w, argU32(args, 0), argU32(args, 2), argU32(args, 3), rights.path_filestat_get, results) orelse
+        return true;
+    defer rp.free(w.gpa);
+    const st = rp.dir.statFile(w.io, rp.path, .{ .follow_symlinks = follow }) catch |err|
+        return ret(results, errnoFor(err));
+    if (!writeFilestat(w, argU32(args, 4), st)) return ret(results, errno.fault);
+    return ret(results, errno.success);
+}
+
+/// `path_create_directory(dirfd, path, path_len)`.
+fn wPathCreateDirectory(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+    const w: *Wasi = @ptrCast(@alignCast(ctx));
+    const rp = resolveArg(w, argU32(args, 0), argU32(args, 1), argU32(args, 2), rights.path_create_directory, results) orelse
+        return true;
+    defer rp.free(w.gpa);
+    rp.dir.createDir(w.io, rp.path, .default_dir) catch |err| return ret(results, errnoFor(err));
+    return ret(results, errno.success);
+}
+
+/// `path_remove_directory(dirfd, path, path_len)`.
+fn wPathRemoveDirectory(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+    const w: *Wasi = @ptrCast(@alignCast(ctx));
+    const rp = resolveArg(w, argU32(args, 0), argU32(args, 1), argU32(args, 2), rights.path_remove_directory, results) orelse
+        return true;
+    defer rp.free(w.gpa);
+    rp.dir.deleteDir(w.io, rp.path) catch |err| return ret(results, errnoFor(err));
+    return ret(results, errno.success);
+}
+
+/// `path_unlink_file(dirfd, path, path_len)`.
+fn wPathUnlinkFile(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+    const w: *Wasi = @ptrCast(@alignCast(ctx));
+    const rp = resolveArg(w, argU32(args, 0), argU32(args, 1), argU32(args, 2), rights.path_unlink_file, results) orelse
+        return true;
+    defer rp.free(w.gpa);
+    rp.dir.deleteFile(w.io, rp.path) catch |err| return ret(results, errnoFor(err));
+    return ret(results, errno.success);
+}
+
+/// `path_rename(old_dirfd, old_path, old_len, new_dirfd, new_path, new_len)` —
+/// both ends are resolved independently, so neither may escape its own preopen.
+fn wPathRename(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+    const w: *Wasi = @ptrCast(@alignCast(ctx));
+    const old = resolveArg(w, argU32(args, 0), argU32(args, 1), argU32(args, 2), rights.path_rename_source, results) orelse
+        return true;
+    defer old.free(w.gpa);
+    const new = resolveArg(w, argU32(args, 3), argU32(args, 4), argU32(args, 5), rights.path_rename_target, results) orelse
+        return true;
+    defer new.free(w.gpa);
+    // `io` is the LAST parameter on the two-dir operations.
+    Io.Dir.rename(old.dir, old.path, new.dir, new.path, w.io) catch |err|
+        return ret(results, errnoFor(err));
+    return ret(results, errno.success);
+}
+
+/// `fd_readdir(fd, buf, buf_len, cookie, bufused)` — serialize dirents into the
+/// guest buffer, resuming at `cookie`.
+///
+/// `Io.Dir.Reader` has no arbitrary-cookie seek (only reset + skip forward), so
+/// we restart the walk each call and skip `cookie` entries. That is O(n²) across
+/// a full enumeration of a large directory, but it is correct and keeps no
+/// per-fd iterator state alive between calls. Cookies 0 and 1 are the synthetic
+/// `.` and `..` that std filters out but readdir consumers expect.
+fn wFdReaddir(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+    const w: *Wasi = @ptrCast(@alignCast(ctx));
+    const e = w.get(argU32(args, 0)) orelse return ret(results, errno.badf);
+    const d = switch (e.*) {
+        .dir => |d| d,
+        else => return ret(results, errno.notdir),
+    };
+    if (d.rights_base & rights.fd_readdir == 0) return ret(results, errno.notcapable);
+
+    const buf_ptr = argU32(args, 1);
+    const buf_len = argU32(args, 2);
+    const cookie: u64 = @bitCast(interp.asI64(args[3]));
+    const out = w.slice(buf_ptr, buf_len) orelse return ret(results, errno.fault);
+
+    var used: u32 = 0;
+    var index: u64 = 0;
+
+    // dirent: { d_next: u64, d_ino: u64, d_namlen: u32, d_type: u8 } = 24 bytes,
+    // followed by the name. A truncated final entry is how a guest learns its
+    // buffer was too small, so a partial copy is correct — not an error.
+    const emit = struct {
+        fn f(dst: []u8, u: *u32, name: []const u8, ino: u64, kind: u8, next: u64) bool {
+            var hdr: [24]u8 = @splat(0);
+            std.mem.writeInt(u64, hdr[0..8], next, .little);
+            std.mem.writeInt(u64, hdr[8..16], ino, .little);
+            std.mem.writeInt(u32, hdr[16..20], @intCast(name.len), .little);
+            hdr[20] = kind;
+            for ([2][]const u8{ &hdr, name }) |src| {
+                const room = dst.len - u.*;
+                const n = @min(room, src.len);
+                @memcpy(dst[u.*..][0..n], src[0..n]);
+                u.* += @intCast(n);
+                if (n < src.len) return false; // buffer full
+            }
+            return true;
+        }
+    }.f;
+
+    const self_ino: u64 = if (d.handle.stat(w.io)) |st| @intCast(st.inode) else |_| 0;
+    for ([2][]const u8{ ".", ".." }) |dot| {
+        defer index += 1;
+        if (index < cookie) continue;
+        if (!emit(out, &used, dot, if (index == 0) self_ino else 0, filetype.directory, index + 1)) break;
+    }
+
+    if (used < buf_len) {
+        var rbuf: [Io.Dir.Reader.min_buffer_len * 2]u8 align(@alignOf(usize)) = undefined;
+        var r = Io.Dir.Reader.init(d.handle, &rbuf);
+        // `Entry.name` is invalidated by the next `next()`, so copy it out now.
+        while (r.next(w.io) catch |err| return ret(results, errnoFor(err))) |entry| {
+            defer index += 1;
+            if (index < cookie) continue;
+            if (!emit(out, &used, entry.name, @intCast(entry.inode), filetypeOf(entry.kind), index + 1)) break;
+        }
+    }
+
+    if (!w.writeU32(argU32(args, 4), used)) return ret(results, errno.fault);
+    return ret(results, errno.success);
 }
 
 fn wArgsSizesGet(ctx: *anyopaque, args: []const Value, results: []Value) bool {
@@ -416,7 +1259,16 @@ fn wStubNotsup(ctx: *anyopaque, args: []const Value, results: []Value) bool {
 // --- Tests -----------------------------------------------------------------
 
 fn testWasi(mem: *Memory, stdout: *Io.Writer) Wasi {
-    return .{ .memory = mem, .stdout = stdout, .stderr = stdout, .io = undefined, .rng = std.Random.DefaultPrng.init(0) };
+    var w: Wasi = .{
+        .memory = mem,
+        .stdout = stdout,
+        .stderr = stdout,
+        .io = undefined,
+        .gpa = std.testing.allocator,
+        .rng = std.Random.DefaultPrng.init(0),
+    };
+    w.fds.appendSlice(std.testing.allocator, &.{ .stdin, .stdout, .stderr }) catch unreachable;
+    return w;
 }
 
 test "fd_write gathers iovecs to the target stream" {
@@ -430,6 +1282,7 @@ test "fd_write gathers iovecs to the target stream" {
     var obuf: [64]u8 = undefined;
     var ow = Io.Writer.fixed(&obuf);
     var w = testWasi(&mem, &ow);
+    defer w.fds.deinit(std.testing.allocator);
 
     const args = [_]Value{ interp.i32Value(1), interp.i32Value(0), interp.i32Value(1), interp.i32Value(40) };
     var results = [_]Value{interp.i32Value(-1)};
@@ -450,6 +1303,7 @@ test "proc_exit records the code and traps" {
     var obuf: [8]u8 = undefined;
     var ow = Io.Writer.fixed(&obuf);
     var w = testWasi(&mem, &ow);
+    defer w.fds.deinit(std.testing.allocator);
 
     const args = [_]Value{interp.i32Value(7)};
     try std.testing.expect(!wProcExit(&w, &args, &.{})); // false -> HostTrap
@@ -468,6 +1322,7 @@ test "fd_read scatters stdin into the iovecs (and reports EOF)" {
     var obuf: [8]u8 = undefined;
     var ow = Io.Writer.fixed(&obuf);
     var w = testWasi(&mem, &ow);
+    defer w.fds.deinit(std.testing.allocator);
     var in = Io.Reader.fixed("abcdefg"); // 7 bytes -> fills 4, then a short 3
     w.stdin = &in;
 
@@ -495,6 +1350,7 @@ test "poll_oneoff reports an fd subscription ready immediately" {
     var obuf: [8]u8 = undefined;
     var ow = Io.Writer.fixed(&obuf);
     var w = testWasi(&mem, &ow);
+    defer w.fds.deinit(std.testing.allocator);
 
     // one subscription at 0: userdata=42, tag=2 (fd_write)
     std.mem.writeInt(u64, mem_bytes[0..8], 42, .little);
@@ -516,12 +1372,126 @@ test "poll_oneoff reports an fd subscription ready immediately" {
     try std.testing.expectEqual(@as(i32, @bitCast(errno.inval)), interp.asI32(results[0]));
 }
 
+test "resolve contains guest paths inside the preopen" {
+    const gpa = std.testing.allocator;
+
+    // Accepted, and normalized: `.` dropped, separators collapsed, an interior
+    // `..` folded away — the result never reaches Io.Dir with a `..` left.
+    const ok = [_]struct { in: []const u8, want: []const u8 }{
+        .{ .in = "a.txt", .want = "a.txt" },
+        .{ .in = "./a.txt", .want = "a.txt" },
+        .{ .in = "d/./e//f.txt", .want = "d/e/f.txt" },
+        .{ .in = "d/../e.txt", .want = "e.txt" },
+        .{ .in = "d/e/../../f.txt", .want = "f.txt" },
+        .{ .in = "d\\e.txt", .want = "d/e.txt" }, // guests may use either separator
+        .{ .in = ".", .want = "." },
+    };
+    for (ok) |c| {
+        const got = resolve(gpa, c.in) orelse return error.UnexpectedlyRejected;
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings(c.want, got);
+    }
+
+    // Rejected — each of these would name a file outside the preopen.
+    const escapes = [_][]const u8{
+        "..", // pop above the root
+        "../etc/passwd",
+        "a/../../b", // net escape, even though it dips inside first
+        "/etc/passwd", // absolute POSIX
+        "\\Windows\\x", // absolute Windows
+        "C:\\Windows\\x", // drive-qualified
+        "C:x", // drive-relative
+        "\\\\?\\C:\\x", // NT/UNC prefix
+        "a\x00b", // embedded NUL would truncate at the syscall
+        "", // empty
+    };
+    for (escapes) |p| {
+        if (resolve(gpa, p)) |got| {
+            defer gpa.free(got);
+            std.debug.print("escape not rejected: '{s}' -> '{s}'\n", .{ p, got });
+            return error.SandboxEscaped;
+        }
+    }
+}
+
+test "path_open rejects an escaping path with ENOTCAPABLE before touching the host" {
+    var mem_bytes = [_]u8{0} ** 128;
+    var mem = Memory{ .bytes = &mem_bytes, .max = null };
+    var obuf: [8]u8 = undefined;
+    var ow = Io.Writer.fixed(&obuf);
+    var w = testWasi(&mem, &ow);
+    defer w.fds.deinit(std.testing.allocator);
+
+    // fd 3: a preopen dir. `io` is undefined in this test, so a call that
+    // reached the host would crash — proving the rejection is purely lexical.
+    try w.fds.append(std.testing.allocator, .{ .dir = .{
+        .handle = .{ .handle = undefined },
+        .preopen_name = null,
+        .owned = false,
+    } });
+
+    const path = "../../etc/passwd";
+    @memcpy(mem_bytes[0..path.len], path);
+    var results = [_]Value{interp.i32Value(-1)};
+    const args = [_]Value{
+        interp.i32Value(3), // dirfd
+        interp.i32Value(1), // lookupflags = SYMLINK_FOLLOW
+        interp.i32Value(0), // path ptr
+        interp.i32Value(path.len),
+        interp.i32Value(0), // oflags
+        interp.i64Value(@bitCast(rights.all)), // rights_base
+        interp.i64Value(@bitCast(rights.all)), // rights_inheriting
+        interp.i32Value(0), // fdflags
+        interp.i32Value(64), // opened_fd out
+    };
+    try std.testing.expect(wPathOpen(&w, &args, &results));
+    try std.testing.expectEqual(@as(i32, @bitCast(errno.notcapable)), interp.asI32(results[0]));
+}
+
+test "fd_prestat_get/dir_name enumerate preopens and stop at the first non-preopen" {
+    var mem_bytes = [_]u8{0} ** 128;
+    var mem = Memory{ .bytes = &mem_bytes, .max = null };
+    var obuf: [8]u8 = undefined;
+    var ow = Io.Writer.fixed(&obuf);
+    var w = testWasi(&mem, &ow);
+    defer w.fds.deinit(std.testing.allocator);
+
+    try w.fds.append(std.testing.allocator, .{ .dir = .{
+        .handle = .{ .handle = undefined },
+        .preopen_name = "/sandbox",
+        .owned = false,
+    } });
+
+    var results = [_]Value{interp.i32Value(-1)};
+    const pre = [_]Value{ interp.i32Value(3), interp.i32Value(0) };
+    try std.testing.expect(wFdPrestatGet(&w, &pre, &results));
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(results[0]));
+    try std.testing.expectEqual(@as(u8, 0), mem_bytes[0]); // preopentype = dir
+    try std.testing.expectEqual(@as(u32, 8), w.readU32(4).?); // len("/sandbox")
+
+    const name = [_]Value{ interp.i32Value(3), interp.i32Value(16), interp.i32Value(8) };
+    try std.testing.expect(wFdPrestatDirName(&w, &name, &results));
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(results[0]));
+    try std.testing.expectEqualStrings("/sandbox", mem_bytes[16..24]);
+
+    // fd 4 doesn't exist -> EBADF, which is how wasi-libc stops enumerating.
+    const done = [_]Value{ interp.i32Value(4), interp.i32Value(0) };
+    try std.testing.expect(wFdPrestatGet(&w, &done, &results));
+    try std.testing.expectEqual(@as(i32, @bitCast(errno.badf)), interp.asI32(results[0]));
+
+    // So is stdout: it's an fd, but not a preopen.
+    const nope = [_]Value{ interp.i32Value(1), interp.i32Value(0) };
+    try std.testing.expect(wFdPrestatGet(&w, &nope, &results));
+    try std.testing.expectEqual(@as(i32, @bitCast(errno.badf)), interp.asI32(results[0]));
+}
+
 test "args_sizes_get + args_get round-trip argv into memory" {
     var mem_bytes = [_]u8{0} ** 128;
     var mem = Memory{ .bytes = &mem_bytes, .max = null };
     var obuf: [8]u8 = undefined;
     var ow = Io.Writer.fixed(&obuf);
     var w = testWasi(&mem, &ow);
+    defer w.fds.deinit(std.testing.allocator);
     w.args = &.{ "prog", "hi" };
 
     var results = [_]Value{interp.i32Value(-1)};

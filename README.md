@@ -36,8 +36,9 @@ compliance process, and for the ledger of any reused code.
 > global/memory/table objects — loadable over FFI, see below), and runs **WASI
 > preview 1** command modules — including real LLVM-compiled `wasm32-wasi`
 > programs: stdout/stderr, args/environ, clocks, `poll_oneoff` (sleep), stdin,
-> random, `proc_exit` (filesystem/sockets deferred). Coming next: the WASI
-> filesystem (`--dir` preopens, `path_open`), plus multi-memory and
+> random, `proc_exit`, and a **sandboxed filesystem** rooted at the directories
+> you preopen with `--dir` (sockets deferred). Coming next: CLI ergonomics
+> (`--env`), broader compiled-program conformance, plus multi-memory and
 > exception-handling tags as needed. Requires Zig 0.16.
 
 ## Build
@@ -59,6 +60,48 @@ The runtime loads over FFI from any host language: `zig build dll` produces a
 libc-free `wazmrt.dll`, and [`examples/deno_ffi.mjs`](examples/deno_ffi.mjs)
 `Deno.dlopen`s it and drives the standard wasm-c-api to instantiate and call a
 module — no wasmtime, no JS engine in the path.
+
+## Running WASI programs
+
+Compile a program to `wasm32-wasi` with any toolchain and run it:
+
+```
+zig build-exe examples/hello_compiled.zig -target wasm32-wasi -O ReleaseSmall -femit-bin=hello.wasm
+wazmrt hello.wasm                       # prints via ordinary std stdout
+```
+
+A module exporting `_start` runs as a WASI command. Anything after the module
+path is passed through as the guest's `argv`, except the preopen flags:
+
+```
+wazmrt files.wasm --dir ./data:/data -- app args…
+```
+
+`--dir <host>[:<guest>]` **preopens** a host directory and is the guest's *only*
+route to the filesystem: with no `--dir`, a guest has no reachable files at all,
+and with one it can reach that directory and nothing above it. The guest sees it
+under `<guest>` (defaulting to the host path). wazmrt resolves guest paths itself
+and refuses absolute paths, `..` escapes, and NT/device prefixes — an interior
+`..` that stays inside is fine. See [`examples/wasi_files.zig`](examples/wasi_files.zig).
+
+> **Scope of the sandbox.** Containment is *lexical*: a guest cannot name a path
+> outside its preopens. A **symlink inside a preopen that points outside it is
+> still followed**, so do not treat this as a boundary against a hostile module —
+> it is meant for running your own programs against your own directories. Details
+> and the fix path: `cmem/known-issues.md` (#17).
+
+Implemented: stdout/stderr/stdin, args/environ, clocks, `poll_oneoff` (clock
+sleep), `random_get`, `proc_exit`, and the filesystem (`path_open`, `fd_read`/
+`fd_write`/`fd_seek`/`fd_tell`/`fd_pread`/`fd_pwrite`/`fd_sync`, `fd_readdir`,
+`*_filestat_get`, create/unlink/rename). Not implemented: sockets, symlink ops,
+and `*_filestat_set_times` — these return `ENOTSUP` rather than trapping, so a
+module still instantiates and fails gracefully.
+
+> **Writing a WASI guest in Zig:** call the imports via `std.os.wasi`, not your
+> own `extern "wasi_snapshot_preview1"` declarations. If your signature differs
+> from std's, wasm-ld silently redirects the call to a trapping stub and the
+> program dies with no diagnostic — see the note in
+> [`examples/wasi_files.zig`](examples/wasi_files.zig).
 
 ## Embedding (C ABI)
 
