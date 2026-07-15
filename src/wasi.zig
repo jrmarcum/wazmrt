@@ -23,6 +23,7 @@ const errno = struct {
     const badf: u32 = 8;
     const fault: u32 = 21;
     const inval: u32 = 28;
+    const io: u32 = 29;
     const nosys: u32 = 52;
     const notsup: u32 = 58;
     const spipe: u32 = 70;
@@ -35,6 +36,8 @@ pub const Wasi = struct {
     memory: ?*Memory = null,
     stdout: *Io.Writer,
     stderr: *Io.Writer,
+    /// Process stdin for `fd_read` on fd 0; null reports EOF.
+    stdin: ?*Io.Reader = null,
     io: Io,
     args: []const []const u8 = &.{},
     environ: []const []const u8 = &.{},
@@ -60,6 +63,16 @@ pub const Wasi = struct {
         const b = self.bytes() orelse return null;
         if (@as(u64, off) + 4 > b.len) return null;
         return std.mem.readInt(u32, b[off..][0..4], .little);
+    }
+    fn readU16(self: *Wasi, off: u32) ?u16 {
+        const b = self.bytes() orelse return null;
+        if (@as(u64, off) + 2 > b.len) return null;
+        return std.mem.readInt(u16, b[off..][0..2], .little);
+    }
+    fn readU64(self: *Wasi, off: u32) ?u64 {
+        const b = self.bytes() orelse return null;
+        if (@as(u64, off) + 8 > b.len) return null;
+        return std.mem.readInt(u64, b[off..][0..8], .little);
     }
     fn writeU32(self: *Wasi, off: u32, v: u32) bool {
         const b = self.bytes() orelse return false;
@@ -108,8 +121,11 @@ fn callFor(name: []const u8) CallFn {
         .{ "environ_sizes_get", wEnvironSizesGet },
         .{ "environ_get", wEnvironGet },
         .{ "clock_time_get", wClockTimeGet },
+        .{ "clock_res_get", wClockResGet },
+        .{ "poll_oneoff", wPollOneoff },
         .{ "random_get", wRandomGet },
         .{ "sched_yield", wSchedYield },
+        .{ "proc_raise", wProcRaise },
     };
     inline for (map) |m| {
         if (std.mem.eql(u8, name, m[0])) return m[1];
@@ -155,11 +171,31 @@ fn wFdWrite(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     return ret(results, errno.success);
 }
 
-/// `fd_read(...)` — no stdin wired yet: report 0 bytes read (EOF).
+/// `fd_read(fd, iovs, iovs_len, nread)` — scatter-read stdin (fd 0) into the
+/// iovecs. A short read (or no stdin wired) reports EOF as 0 bytes.
 fn wFdRead(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const w: *Wasi = @ptrCast(@alignCast(ctx));
+    const fd = argU32(args, 0);
+    const iovs = argU32(args, 1);
+    const iovs_len = argU32(args, 2);
     const nread_ptr = argU32(args, 3);
-    if (!w.writeU32(nread_ptr, 0)) return ret(results, errno.fault);
+    if (fd != 0) return ret(results, errno.badf); // only stdin is readable today
+
+    var total: u32 = 0;
+    if (w.stdin) |src| {
+        var i: u32 = 0;
+        while (i < iovs_len) : (i += 1) {
+            const iov = iovs + i * 8; // iovec = { buf: u32, buf_len: u32 }
+            const buf = w.readU32(iov) orelse return ret(results, errno.fault);
+            const len = w.readU32(iov + 4) orelse return ret(results, errno.fault);
+            if (len == 0) continue;
+            const dst = w.slice(buf, len) orelse return ret(results, errno.fault);
+            const n = src.readSliceShort(dst) catch return ret(results, errno.io);
+            total += @intCast(n);
+            if (n < len) break; // short read / EOF — don't block for more
+        }
+    }
+    if (!w.writeU32(nread_ptr, total)) return ret(results, errno.fault);
     return ret(results, errno.success);
 }
 
@@ -251,6 +287,106 @@ fn wClockTimeGet(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     return ret(results, errno.success);
 }
 
+/// The WASI clock id 0 is realtime; everything else maps to the monotonic clock.
+fn clockOf(id: u32) Io.Clock {
+    return if (id == 0) .real else .awake;
+}
+
+/// `clock_res_get(id, resolution)` — the clock's tick resolution, in ns.
+fn wClockResGet(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+    const w: *Wasi = @ptrCast(@alignCast(ctx));
+    const d = clockOf(argU32(args, 0)).resolution(w.io) catch return ret(results, errno.inval);
+    // A zero resolution would be nonsense to a guest; report at least 1 ns.
+    if (!w.writeU64(argU32(args, 1), @intCast(@max(d.nanoseconds, 1)))) return ret(results, errno.fault);
+    return ret(results, errno.success);
+}
+
+// `poll_oneoff` record layout (§ preview-1): a 48-byte subscription and a
+// 32-byte event.
+const sub_size: u32 = 48;
+const event_size: u32 = 32;
+const subclock_abstime: u16 = 1;
+
+/// Write one `event { userdata, error, type, fd_readwrite{nbytes, flags} }`.
+fn writeEvent(w: *Wasi, at: u32, userdata: u64, err: u16, kind: u8) bool {
+    const b = w.slice(at, event_size) orelse return false;
+    @memset(b, 0);
+    std.mem.writeInt(u64, b[0..8], userdata, .little);
+    std.mem.writeInt(u16, b[8..10], err, .little);
+    b[10] = kind;
+    return true;
+}
+
+/// `poll_oneoff(in, out, nsubscriptions, nevents)` — block until a subscription
+/// is ready, then report the ready events.
+///
+/// Scope: **clock** subscriptions sleep until the earliest deadline (this is what
+/// `sleep()` compiles to), and **fd_read/fd_write** subscriptions on stdio report
+/// ready immediately (stdio never blocks here). Real fd readiness polling is
+/// deferred with the rest of the filesystem work.
+fn wPollOneoff(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+    const w: *Wasi = @ptrCast(@alignCast(ctx));
+    const in = argU32(args, 0);
+    const out = argU32(args, 1);
+    const nsubs = argU32(args, 2);
+    const nevents_ptr = argU32(args, 3);
+    if (nsubs == 0) return ret(results, errno.inval);
+
+    var emitted: u32 = 0;
+
+    // An fd subscription is ready now, so it wins over any timeout.
+    var i: u32 = 0;
+    while (i < nsubs) : (i += 1) {
+        const s = in + i * sub_size;
+        const userdata = w.readU64(s) orelse return ret(results, errno.fault);
+        const tag = (w.slice(s + 8, 1) orelse return ret(results, errno.fault))[0];
+        if (tag == 1 or tag == 2) { // fd_read / fd_write
+            if (!writeEvent(w, out + emitted * event_size, userdata, errno.success, tag)) return ret(results, errno.fault);
+            emitted += 1;
+        }
+    }
+
+    // Otherwise sleep until the earliest clock deadline, then report those.
+    if (emitted == 0) {
+        var min_ns: ?i96 = null;
+        i = 0;
+        while (i < nsubs) : (i += 1) {
+            const s = in + i * sub_size;
+            const tag = (w.slice(s + 8, 1) orelse return ret(results, errno.fault))[0];
+            if (tag != 0) continue; // clock
+            const id = w.readU32(s + 16) orelse return ret(results, errno.fault);
+            const timeout = w.readU64(s + 24) orelse return ret(results, errno.fault);
+            const flags = w.readU16(s + 40) orelse return ret(results, errno.fault);
+            var ns: i96 = @intCast(timeout);
+            if (flags & subclock_abstime != 0) ns -= Io.Timestamp.now(w.io, clockOf(id)).nanoseconds;
+            if (ns < 0) ns = 0;
+            if (min_ns == null or ns < min_ns.?) min_ns = ns;
+        }
+        const ns = min_ns orelse return ret(results, errno.inval); // no clock subs either
+        w.io.sleep(.fromNanoseconds(ns), .awake) catch {};
+        i = 0;
+        while (i < nsubs) : (i += 1) {
+            const s = in + i * sub_size;
+            const tag = (w.slice(s + 8, 1) orelse return ret(results, errno.fault))[0];
+            if (tag != 0) continue;
+            const userdata = w.readU64(s) orelse return ret(results, errno.fault);
+            if (!writeEvent(w, out + emitted * event_size, userdata, errno.success, 0)) return ret(results, errno.fault);
+            emitted += 1;
+        }
+    }
+
+    if (!w.writeU32(nevents_ptr, emitted)) return ret(results, errno.fault);
+    return ret(results, errno.success);
+}
+
+/// `proc_raise(sig)` — a raised signal terminates the guest; unwind as a trap.
+fn wProcRaise(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+    _ = ctx;
+    _ = args;
+    _ = results;
+    return false; // -> error.HostTrap
+}
+
 /// `random_get(buf, len)` — fill `buf` with pseudo-random bytes.
 fn wRandomGet(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const w: *Wasi = @ptrCast(@alignCast(ctx));
@@ -318,6 +454,66 @@ test "proc_exit records the code and traps" {
     const args = [_]Value{interp.i32Value(7)};
     try std.testing.expect(!wProcExit(&w, &args, &.{})); // false -> HostTrap
     try std.testing.expectEqual(@as(u32, 7), w.exit_code.?);
+}
+
+test "fd_read scatters stdin into the iovecs (and reports EOF)" {
+    var mem_bytes = [_]u8{0} ** 128;
+    var mem = Memory{ .bytes = &mem_bytes, .max = null };
+    // two iovecs: {base=64,len=4} and {base=80,len=4}
+    std.mem.writeInt(u32, mem_bytes[0..4], 64, .little);
+    std.mem.writeInt(u32, mem_bytes[4..8], 4, .little);
+    std.mem.writeInt(u32, mem_bytes[8..12], 80, .little);
+    std.mem.writeInt(u32, mem_bytes[12..16], 4, .little);
+
+    var obuf: [8]u8 = undefined;
+    var ow = Io.Writer.fixed(&obuf);
+    var w = testWasi(&mem, &ow);
+    var in = Io.Reader.fixed("abcdefg"); // 7 bytes -> fills 4, then a short 3
+    w.stdin = &in;
+
+    const args = [_]Value{ interp.i32Value(0), interp.i32Value(0), interp.i32Value(2), interp.i32Value(120) };
+    var results = [_]Value{interp.i32Value(-1)};
+    try std.testing.expect(wFdRead(&w, &args, &results));
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(results[0])); // SUCCESS
+    try std.testing.expectEqual(@as(u32, 7), w.readU32(120).?); // nread
+    try std.testing.expectEqualStrings("abcd", mem_bytes[64..68]);
+    try std.testing.expectEqualStrings("efg", mem_bytes[80..83]);
+
+    // Exhausted -> EOF reports 0 bytes, still SUCCESS.
+    try std.testing.expect(wFdRead(&w, &args, &results));
+    try std.testing.expectEqual(@as(u32, 0), w.readU32(120).?);
+
+    // A non-stdin fd is EBADF.
+    const bad = [_]Value{ interp.i32Value(5), interp.i32Value(0), interp.i32Value(2), interp.i32Value(120) };
+    try std.testing.expect(wFdRead(&w, &bad, &results));
+    try std.testing.expectEqual(@as(i32, @bitCast(errno.badf)), interp.asI32(results[0]));
+}
+
+test "poll_oneoff reports an fd subscription ready immediately" {
+    var mem_bytes = [_]u8{0} ** 256;
+    var mem = Memory{ .bytes = &mem_bytes, .max = null };
+    var obuf: [8]u8 = undefined;
+    var ow = Io.Writer.fixed(&obuf);
+    var w = testWasi(&mem, &ow);
+
+    // one subscription at 0: userdata=42, tag=2 (fd_write)
+    std.mem.writeInt(u64, mem_bytes[0..8], 42, .little);
+    mem_bytes[8] = 2;
+
+    const args = [_]Value{ interp.i32Value(0), interp.i32Value(128), interp.i32Value(1), interp.i32Value(200) };
+    var results = [_]Value{interp.i32Value(-1)};
+    try std.testing.expect(wPollOneoff(&w, &args, &results));
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(results[0]));
+    try std.testing.expectEqual(@as(u32, 1), w.readU32(200).?); // nevents
+    // the event carries the userdata back, with no error and type=fd_write
+    try std.testing.expectEqual(@as(u64, 42), w.readU64(128).?);
+    try std.testing.expectEqual(@as(u16, 0), w.readU16(136).?); // error
+    try std.testing.expectEqual(@as(u8, 2), mem_bytes[138]); // type
+
+    // Zero subscriptions is invalid.
+    const none = [_]Value{ interp.i32Value(0), interp.i32Value(128), interp.i32Value(0), interp.i32Value(200) };
+    try std.testing.expect(wPollOneoff(&w, &none, &results));
+    try std.testing.expectEqual(@as(i32, @bitCast(errno.inval)), interp.asI32(results[0]));
 }
 
 test "args_sizes_get + args_get round-trip argv into memory" {

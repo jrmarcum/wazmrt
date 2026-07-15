@@ -138,8 +138,12 @@ fn runWasi(
     const err_w = &stderr_file_writer.interface;
     defer err_w.flush() catch {};
 
+    var stdin_buffer: [4096]u8 = undefined;
+    var stdin_file_reader: Io.File.Reader = .init(.stdin(), io, &stdin_buffer);
+
     const seed: u64 = @intCast(@max(Io.Timestamp.now(io, .awake).nanoseconds, 0));
     var wasi = wazmrt.wasi.Wasi.init(io, out, err_w, seed);
+    wasi.stdin = &stdin_file_reader.interface;
 
     // argv: the module path, then any trailing CLI args.
     const argv = try arena.alloc([]const u8, 1 + wasi_args.len);

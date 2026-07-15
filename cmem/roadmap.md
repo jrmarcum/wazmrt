@@ -143,10 +143,16 @@ i.e. real compiled code exercising `memory.copy` (`@memcpy`) and `trunc_sat` dri
 instrumenting the WASI dispatch). That's a **guest toolchain gap, not a runtime one** — stderr and a
 direct `fd_write` import both work, so the example calls `fd_write` directly.
 
-**Phase 2 — WASI core for stdout/args/env/compute programs.** `clock_res_get`; `poll_oneoff` (support
-clock-subscription sleep; real event polling stubbed); real **stdin** `fd_read` (fd 0 ← process stdin);
-`proc_raise`→trap. After this wazmrt runs the whole **compute + stdout + args** class — exactly wasmtk's
-compiler-test-output regime (`vision.md`).
+**Phase 2 — WASI core for stdout/args/env/compute programs. DONE 2026-07-14.** `clock_res_get` (via
+`Io.Clock.resolution`); **`poll_oneoff`** — clock subscriptions sleep until the earliest deadline (this
+is what a guest `sleep()` compiles to; relative + `ABSTIME` flag both handled via `Io.sleep`), and
+fd_read/fd_write subscriptions on stdio report ready immediately (real fd-readiness polling defers with
+the filesystem work); real **stdin** `fd_read` (fd 0 ← process stdin, scatter into iovecs, short
+read/EOF → 0; other fds EBADF) wired from the CLI via an `Io.File.Reader`; `proc_raise` → trap.
+Verified end-to-end by a compiled program (`examples/wasi_clock_stdin.zig`): `clock_res_get works` /
+`poll_oneoff clock sleep works` (asserts ≥15 ms actually elapsed) / `stdin echo: hello stdin!`, plus the
+EOF path. +2 unit tests (103 total). **wazmrt now runs the whole compute + stdout + args + clock + stdin
+class — wasmtk's compiler-test-output regime (`vision.md`).**
 
 **Phase 3 — WASI filesystem (the big one; for programs that touch files; independent of 1/2).** A
 `--dir <host>[:<guest>]` CLI flag preopens a host dir as fd 3+ (`fd_prestat_get`/`_dir_name` enumerate).

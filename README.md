@@ -34,10 +34,11 @@ compliance process, and for the ledger of any reused code.
 > 11/0. It runs a module's **start function** at instantiation, embeds through
 > the **standard wasm-c-api** (instantiate/call, host-function imports,
 > global/memory/table objects — loadable over FFI, see below), and runs **WASI
-> preview 1** command modules (`fd_write`, args/environ, clocks, random,
-> `proc_exit`; filesystem/sockets deferred). Coming next: the rest of WASI (a
-> filesystem), plus multi-memory and exception-handling tags as needed. Requires
-> Zig 0.16.
+> preview 1** command modules — including real LLVM-compiled `wasm32-wasi`
+> programs: stdout/stderr, args/environ, clocks, `poll_oneoff` (sleep), stdin,
+> random, `proc_exit` (filesystem/sockets deferred). Coming next: the WASI
+> filesystem (`--dir` preopens, `path_open`), plus multi-memory and
+> exception-handling tags as needed. Requires Zig 0.16.
 
 ## Build
 

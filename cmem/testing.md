@@ -453,6 +453,18 @@ V8. **Decision:** build the shipped `.lib`/`.dll` (and the freestanding wasm —
 `design-decisions.md`. (Caveat: single machine; sizes + steady-state are solid, the µs/ms cold numbers
 are ±10% noisy.)
 
+## WASI Phase 2 — clocks, poll_oneoff (sleep), stdin (2026-07-14)
+
+- **+2 unit tests (103 total)**: `fd_read` scatters stdin across two iovecs (4+3 of "abcdefg"), reports
+  the exhausted reader as EOF (0 bytes, still SUCCESS), and EBADFs a non-stdin fd; `poll_oneoff` reports
+  an fd subscription ready immediately (echoing userdata, error=0, type) and rejects 0 subscriptions.
+- **Compiled-program gate** (`examples/wasi_clock_stdin.zig`, `-target wasm32-wasi`):
+  `echo "hello stdin!" | wazmrt p2.wasm` → `clock_res_get works` / `poll_oneoff clock sleep works`
+  (the guest asserts ≥15 ms actually elapsed around a 20 ms clock subscription) / `stdin echo: hello
+  stdin!`. With `< /dev/null` it prints `stdin: EOF`.
+- All surfaces green (`test`/`build`/`wasm`/`c-smoke`); the Phase 1 and hand-written WASI examples
+  still pass.
+
 ## Bulk memory + saturating truncation — the `0xFC` completion (Phase 1, 2026-07-14)
 
 **Milestone: a real LLVM-compiled `wasm32-wasi` program runs and prints in wazmrt.**
