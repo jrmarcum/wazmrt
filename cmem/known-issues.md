@@ -26,8 +26,11 @@ report `fn[i] (+pc)` on any trap; decode the `name` custom section when present 
 Optionally keep the frame chain for a backtrace. None of it is on a hot path — it is error-path only.
 
 **Surfaces when:** running unfamiliar compiled guests — i.e. **Phase 4 by definition** (C/wasi-sdk,
-Rust, Zig conformance). Every one of those that traps costs the same hours again. **Not a blocker for
-Phase 4, but it is the highest-leverage thing to do first in it.**
+Rust, Zig conformance). Every one of those that traps costs the same hours again.
+
+**SCHEDULED: Phase 4 step 4.1 — do this FIRST** (owner's order, 2026-07-15: #19 → #17 → Phase 3
+leftovers → the Phase 4 items proper; see `roadmap.md`). Not a blocker; sequenced deliberately because
+everything after it gets cheaper to debug once traps name a function.
 
 **Anchor:** `Frame.run`'s `.@"unreachable"` arm + `Instance.callFunction` in `src/interp.zig`;
 `runWasi`'s `trap: {s}` print in `src/main.zig`.
@@ -75,8 +78,17 @@ symlinks**. For the current use (running your own compiled programs against your
 exposure is low. It is *not* a defense against a hostile guest.
 
 **Surfaces when:** wazmrt runs untrusted modules, or a preopen is shared with another writer — i.e. the
-moment it becomes a multi-tenant/plugin host. **Fix before that milestone**, and say so plainly in the
-README rather than implying the sandbox is airtight.
+moment it becomes a multi-tenant/plugin host. Until fixed, say so plainly in the README rather than
+implying the sandbox is airtight.
+
+**SCHEDULED: Phase 4 step 4.2 — do this SECOND**, right after #19 (owner's order, 2026-07-15; see
+`roadmap.md` for the full sequence and the approach). Note this is *earlier* than the "surfaces when"
+above strictly requires — it is scheduled ahead of the conformance work by decision, not necessity.
+**Budget for it: it is the biggest item in Phase 4**, because the fix needs per-component resolution
+that Zig 0.16's `Io` does not expose (no `openat2(RESOLVE_BENEATH)`, no O_PATH walk, `resolve_beneath`
+a no-op off FreeBSD) — expect raw platform syscalls below `Io`, plus TOCTOU care. It also **changes
+what #17-adjacent leftovers (`path_symlink`/`path_readlink`) must do**, which is why those sit at 4.3
+behind it.
 
 **Anchor:** `resolve()` + the module doc in `src/wasi.zig`; `wPathOpen` already does its own O_NOFOLLOW
 (pre-`statFile`, `ELOOP` on a symlink) to dodge a std bug — that hook is the natural place to extend.

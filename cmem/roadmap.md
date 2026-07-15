@@ -186,19 +186,47 @@ resolution the `Io` API doesn't expose.
 `fd_filestat_set_times`/`path_filestat_set_times`, `fd_allocate`, `fd_advise` (returns success —
 advisory), and real fd-readiness in `poll_oneoff`. All still resolve to the `NOTSUP` stub.
 
-**Phase 4 — ergonomics + conformance.** ~~CLI `--dir`~~ (done in Phase 3) / `--env KEY=VAL` /
+**Phase 4 — ergonomics + conformance. ORDERED BY THE OWNER 2026-07-15 — do 4.1 → 4.2 → 4.3 → 4.4 in
+this order.** None of 4.1–4.3 *block* 4.4; the owner scheduled them ahead of it deliberately, so treat
+this sequence as binding rather than re-deriving it.
+
+**4.1 — `known-issues.md` #19: trap diagnostics. FIRST.** Today a trap says `trap: Unreachable` and
+nothing more — no function, no pc, no name. That is precisely what made the Phase 3 `bitcast_invalid`
+hunt cost hours, and everything after this step multiplies the number of guests that can trap in
+unfamiliar ways. Carry `func_index` onto `Frame` (already available at the `callFunction` call site),
+report `fn[i] (+pc)` on any trap, and decode the `name` custom section to print the symbol. Error-path
+only, nothing hot. It pays for itself on the first failure in 4.3/4.4 — and 4.2 will lean on it too.
+
+**4.2 — `known-issues.md` #17: close the symlink hole (make the sandbox real, not lexical).**
+*Budget for this: it is the biggest item in Phase 4, not a cleanup.* `resolve()` stops a guest *naming*
+a path outside a preopen, but a symlink stored *inside* one still gets followed out. Correct
+containment needs **per-component** resolution, and **Zig 0.16's `Io` exposes no way to do it**:
+`resolve_beneath` is a silent no-op off FreeBSD, and there is no `openat2(RESOLVE_BENEATH)` and no
+O_PATH walk. So expect to go **below `Io` to raw platform syscalls** (Linux `openat2` with
+`RESOLVE_BENEATH`/`RESOLVE_NO_SYMLINKS`; Windows: walk components with
+`statFile(.follow_symlinks=false)` and re-validate each target, or open with `OPEN_REPARSE_POINT` per
+component) — with a portable fallback. Watch TOCTOU: validate-then-open on a live filesystem races, so
+prefer resolving *through held handles* rather than re-walking by path. The existing `if (!follow)`
+pre-stat in `wPathOpen` is the natural hook. **Done means:** a test where a symlink inside the preopen
+targets outside it is refused with `ENOTCAPABLE`/`ELOOP` — add it to `examples/wasi_files.zig`
+alongside the four existing refused escapes. Only after this may the README stop hedging the sandbox.
+
+**4.3 — the Phase 3 leftovers** (listed above): `path_symlink`/`path_readlink`/`path_link`,
+`fd_filestat_set_times`/`path_filestat_set_times`, `fd_allocate`, real fd-readiness in `poll_oneoff`.
+These are the likeliest things 4.4 trips over, since wasi-libc and Rust's std touch more API surface
+than our Zig guests do. Note **4.2 changes what `path_symlink`/`path_readlink` must do** — implementing
+them before the sandbox is real would mean writing them twice, which is part of why they sit after it.
+
+**4.4 — the Phase 4 items proper.** ~~CLI `--dir`~~ (done in Phase 3) / `--env KEY=VAL` /
 ~~`-- <guest args>`~~ (done). A reproducible `zig build`-driven gate that compiles a real Zig
 `wasm32-wasi` program and runs it in wazmrt (Zig is the toolchain we already have). Broaden to compiled
 **C (wasi-sdk), Rust (wasm32-wasi), Zig** programs covering stdout/args/env/files/clocks; fill the long
-tail of actually-called functions (the Phase 3 leftovers above are the likely first hits).
+tail of actually-called functions.
 
-> **Do `known-issues.md` #19 (trap diagnostics) FIRST.** Phase 4 *is* "run many unfamiliar compiled
-> guests," and today a trap says `trap: Unreachable` and nothing more — no function, no pc, no name.
-> That is precisely what made the Phase 3 `bitcast_invalid` hunt cost hours, and Phase 4 multiplies the
-> number of guests that can trap in unfamiliar ways. Carrying `func_index` into the trap and decoding
-> the `name` section is a small, error-path-only change that pays for itself on the first failure.
-> **Nothing else in #17/#18/#19 blocks Phase 4** — #17 gates the *untrusted-module* milestone (not
-> conformance runs of your own programs), and #18 is worked around and contained.
+**Not scheduled: `known-issues.md` #18** (the Zig std `openFile(.follow_symlinks=false)` host crash).
+It is worked around and contained — it is **trigger-based, not ordered**: recheck it on **every Zig
+upgrade**, whenever that happens. 4.2 will touch the same `wPathOpen` hook, so re-read #18 before
+changing that code.
 
 ## Next increments (rough order)
 
