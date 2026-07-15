@@ -4,6 +4,28 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
 
 ## Invariants
 
+- **MEMORY SAFETY IS A PROJECT GOAL, AND `wasm_c_api.zig` IS WHERE IT IS AT RISK (owner, 2026-07-15:
+  "we do not ever want to introduce exploitable holes").** It is the only file that hands raw ownership
+  across a C boundary, so a mistake there is a *heap-corruption primitive*, not a wrong answer. Four
+  rules, each of which has already been violated once and cost a real bug:
+  1. **Every `Ref` free goes through `refDelete`/`destroyRef`.** Never `alloc.destroy` a `Ref` directly:
+     it skips the refcount (→ double free) and the object's own cleanup (→ leaked functype/host_global,
+     unrun finalizer). `wasm_extern_vec_delete` did exactly this.
+  2. **Nothing aliases a `Ref` without taking a handle.** A copy retains, or duplicates an export
+     handle; it never just repeats the pointer. `wasm_extern_vec_copy` did, making
+     `copy; delete; delete` — which the header invites — a double free.
+  3. **A `Ref` that names an `Instance` owns a handle on it** (`refRetainInstance`). It dereferences it
+     on every call, so without this, `exports(); instance_delete(); func_call()` — an *ordinary* embedder
+     sequence, no misuse — read freed memory.
+  4. **Construct ref-able objects with a whole-struct literal.** `alloc.create` returns uninitialized
+     memory, and field-by-field assignment leaves `hdr` — hence `rc` — garbage, i.e. freeable at any
+     moment. `wasm_instance_new` and `wasm_trap_new` both did this.
+  **These are enforced by tests, not vigilance:** the C ABI's tests run the C entry points under
+  `std.testing.allocator`, which fails on double-free and leaks. `zig build test` reaches them via a
+  dedicated `cabi_tests` target — `root.zig` does not import `wasm_c_api.zig` (the dependency runs the
+  other way), so for the C ABI's whole life its tests were *unreachable* and it had none.
+  **`tests/c_smoke.c` cannot substitute:** on the real allocator a double free silently corrupts the
+  freelist and the test still prints `OK`. It did. "It didn't crash" is not evidence of safety.
 - **`Instance.recordTrap` must stay `noinline` (2026-07-15).** `Frame.run`'s `errdefer` expands at
   *every* `try` in a ~200-arm dispatch switch, so whatever it calls is duplicated across hundreds of
   landing pads. Letting `recordTrap` inline bloats `Frame.run` and evicts the interpreter loop from

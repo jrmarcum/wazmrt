@@ -11,6 +11,46 @@ This file tracks only what's left.
 
 Line numbers are hints (they drift) — the function/construct name is the durable anchor.
 
+## #21 — C ABI memory safety: 4 exploitable bugs, found and fixed — **DONE 2026-07-15**
+
+Raised by the owner immediately after #20 landed: *"We do not want to create memory unsafe issues…
+memory safety is a massive project goal"* / *"We do not ever want to introduce exploitable holes."*
+The audit that followed found **four real bugs**, three of them shipped in #20 hours earlier. All are
+fixed, and — more importantly — the reason none were caught is fixed.
+
+**The bugs** (all in `src/wasm_c_api.zig`):
+1. **Double free.** `wasm_extern_vec_copy` aliased element pointers while `wasm_extern_vec_delete`
+   destroyed them outright, so `copy(&b,&a); delete(&a); delete(&b);` — a sequence the header invites —
+   freed each `Ref` twice. Heap-corruption primitive. Fixed: copies take a real handle (retain, or
+   duplicate for export handles, which are cheap views); vec_delete routes through `refDelete`.
+2. **Use-after-free, no misuse required.** A `Ref` stores `*Instance` and dereferences it on every call,
+   but never owned it: `exports(); instance_delete(); func_call();` read freed memory. Fixed: a `Ref`
+   that names an instance retains it (`refRetainInstance`), released in `destroyRef`.
+3. **Uninitialized refcount.** `wasm_instance_new` / `wasm_trap_new` assigned fields one at a time onto
+   `alloc.create` memory, so `hdr.rc` was garbage — freeable at any moment, or never. Only a
+   whole-struct literal picks up defaults. Fixed, plus a test asserting `rc == 1` for every ref-able
+   constructor, which catches the whole class.
+4. **Leak + unrun finalizer.** `wasm_extern_vec_delete` destroyed standalone `Ref`s directly, skipping
+   their functype/host_global/finalizer. Fixed by the same routing as (1).
+Also hardened `release` to drive `rc` to 0 rather than leave it at 1, so a double delete can't run a
+host-info finalizer twice.
+
+**Why nothing caught them — the actual finding.** `root.zig` doesn't import `wasm_c_api.zig` (the
+dependency runs the other way), so **`zig build test` could not reach the C ABI at all**: it had zero
+Zig tests and no way to have any. And `tests/c_smoke.c` runs on the real allocator, where a double free
+silently corrupts the freelist and the test **still prints OK** — it did exactly that when run against
+the bug. A C repro of the double free printed `deleted b -- no crash?` and exited 0.
+
+**The fix for the class:** `alloc` in `wasm_c_api.zig` is now
+`if (builtin.is_test) std.testing.allocator else std.heap.smp_allocator` (comptime — release builds
+unaffected), and `build.zig` has a `cabi_tests` target on the `test` step. The C entry points now run
+under an allocator that **fails the build** on double-free or leak. That is what turned all four bugs
+from invisible into a red test in one run. **Anything that hands ownership across the boundary needs a
+test there** — see the invariants in `design-decisions.md`.
+
+**Surfaces when:** never again, ideally — but the guard is only as good as its coverage. New C ABI
+surface without a lifecycle test in `wasm_c_api.zig` is unguarded.
+
 ## #20 — `wasm.h` declared 180 functions we didn't define — **DONE 2026-07-15**
 
 **Was:** `third_party/wasm-c-api/include/wasm.h` is the standard header, installed verbatim next to our

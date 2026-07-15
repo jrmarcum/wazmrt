@@ -453,6 +453,33 @@ V8. **Decision:** build the shipped `.lib`/`.dll` (and the freestanding wasm —
 `design-decisions.md`. (Caveat: single machine; sizes + steady-state are solid, the µs/ms cold numbers
 are ±10% noisy.)
 
+## The C ABI: memory-safety tests (2026-07-15) — read this before touching `wasm_c_api.zig`
+
+**`zig build test` could not reach the C ABI for its entire life.** `root.zig` doesn't import
+`wasm_c_api.zig` (the dependency runs the other way), so tests in it were unreachable from `mod_tests`
+— the file had none and couldn't have. `build.zig` now has a **`cabi_tests`** target on the `test` step.
+
+**`alloc` in `wasm_c_api.zig` is `std.testing.allocator` under test** (comptime-selected; release is
+unaffected). That is the whole point: it **fails the build on double-free and leaks**.
+
+**Why `tests/c_smoke.c` cannot substitute.** It runs on the real allocator, where a double free silently
+corrupts the freelist and the test **still prints OK** — it did, against a live double free. A standalone
+C repro printed `deleted b -- no crash?` and exited 0. **"It didn't crash" is not evidence of safety**;
+on a C boundary it is barely evidence of anything. Use the C test for *behavior*, the Zig tests for
+*lifetime*.
+
+The lifecycle tests each encode one bug that actually shipped (see `known-issues.md` #21):
+- copy an extern vec, delete both → each `Ref` freed exactly once (was a double free)
+- a standalone host func in a vec → freed once *with its functype* (was a leak + unrun finalizer)
+- an export handle keeps its instance alive → `exports(); instance_delete(); call()` (was a UAF, and
+  needs no misuse)
+- refcounted copy outlives the first handle; host-info finalizer runs exactly once, on the last handle
+- **every ref-able object starts with `rc == 1`** — guards the class where `alloc.create` +
+  field-by-field assignment leaves `hdr` garbage. **Any new ref-able constructor must be added there.**
+
+One of these tests caught a use-after-free *in the test itself* (a name outliving the vec that owned
+it), which is a fair advertisement for the allocator.
+
 ## The C ABI: the link-time completeness gate (2026-07-15)
 
 `wasm.h` declared **180 functions we never defined** — a link error for any embedder following the

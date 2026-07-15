@@ -148,4 +148,20 @@ pub fn build(b: *std.Build) void {
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
+
+    // The C ABI needs its own test target: `root.zig` doesn't import
+    // `wasm_c_api.zig` (the dependency runs the other way), so tests in it were
+    // unreachable from `mod_tests` — the file had none, and couldn't have had
+    // any. Its tests drive the C entry points under `std.testing.allocator`,
+    // which catches the double-frees and leaks that the C smoke test cannot see
+    // (on the real allocator a double free corrupts the freelist silently and
+    // the test still prints OK).
+    const cabi_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wasm_c_api.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(cabi_tests).step);
 }

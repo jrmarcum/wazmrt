@@ -6,20 +6,44 @@
 //! including the `universalWasmLoader-*` loaders, wasmtime, and wasmer clients —
 //! binds to wazmrt identically.
 //!
-//! **Minimal-now, expand-later (within the standard).** This file backs only
-//! what the runtime can do today: `config`/`engine`/`store` lifecycle, byte
-//! vectors, and module `new`/`validate`/`delete`. Instances, functions, traps,
-//! globals, tables, memories, and calls are declared in the standard header but
-//! intentionally left unimplemented until instantiation/execution exist — an
-//! undefined symbol in a static library only errors if a consumer references it.
+//! **Complete against the header.** Every function `wasm.h` declares is defined
+//! here, and `tests/c_abi_symbols.c` enforces that at link time
+//! (`cmem/known-issues.md` #20). It did not used to be: this file once reasoned
+//! that "an undefined symbol in a static library only errors if a consumer
+//! references it" and left 180 declared functions undefined. That is exactly
+//! backwards — a consumer referencing them is the *entire point of the header*,
+//! and they got a link error. Do not reintroduce that trade.
+//!
+//! ## Memory safety
+//!
+//! This file hands raw ownership across a C boundary, so it is the one place in
+//! wazmrt where a mistake is a **heap-corruption primitive**, not a wrong
+//! answer. Two rules, both learned from real bugs (see the `Ref` and vec
+//! sections):
+//!
+//! 1. **Every free of a `Ref` goes through `refDelete`.** Never `alloc.destroy`
+//!    a `Ref` directly — that skips the refcount (→ double free) and the
+//!    object's own cleanup (→ leaked functype/host_global, unrun finalizer).
+//! 2. **Nothing aliases a `Ref` without owning a handle to it.** A copy either
+//!    retains or duplicates; it never just repeats the pointer.
+//!
+//! Both are covered by the tests at the bottom, which run the C entry points
+//! under `std.testing.allocator` — it detects double-free and leaks, which the
+//! C smoke test cannot (it runs on the real allocator, where a double free
+//! silently corrupts the freelist and *appears to pass*).
 //!
 //! Libc-free: uses `std.heap.smp_allocator` (see `cmem/design-decisions.md`).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const root = @import("root.zig");
 const types = @import("types.zig");
 
-const alloc = std.heap.smp_allocator;
+/// The C ABI's allocator. Under `zig build test` this is the testing allocator,
+/// so the lifecycle tests at the bottom of this file catch double-frees and
+/// leaks in the ownership rules above; everywhere else it is the libc-free
+/// `smp_allocator`. Comptime, so release builds are unaffected.
+const alloc: std.mem.Allocator = if (builtin.is_test) std.testing.allocator else std.heap.smp_allocator;
 
 // ---- Opaque objects -------------------------------------------------------
 // C sees only `struct wasm_*_t*`; layout is private. The padding byte gives
@@ -62,11 +86,13 @@ const RefHeader = struct {
 
 /// Drop one handle. Returns true when the last one went away and the caller
 /// should tear the object down.
+///
+/// `rc` is driven to 0 rather than left at 1, so a second delete of the same
+/// object is a no-op here instead of running the host-info finalizer twice.
 fn release(hdr: *RefHeader) bool {
-    if (hdr.rc > 1) {
-        hdr.rc -= 1;
-        return false;
-    }
+    if (hdr.rc == 0) return false; // already released — don't finalize twice
+    hdr.rc -= 1;
+    if (hdr.rc != 0) return false;
     if (hdr.host_info_finalizer) |f| f(hdr.host_info);
     return true;
 }
@@ -935,7 +961,21 @@ export fn wasm_extern_vec_new(out: *ExternVec, size: usize, data: [*c]const ?*Re
 export fn wasm_extern_vec_delete(vec: *ExternVec) void {
     if (vec.data != null and vec.size != 0) {
         for (vec.data[0..vec.size]) |slot| {
-            if (slot) |r| alloc.destroy(r);
+            const r = slot orelse continue;
+            if (r.vec_owned) {
+                // This vec is the sole owner: `copy` duplicates export handles
+                // rather than aliasing them, so nothing else can hold this
+                // pointer. Free it outright — via destroyRef, so its handle on
+                // the instance is dropped too.
+                destroyRef(r);
+            } else {
+                // A standalone object the vec took ownership of (e.g. a host
+                // func from `wasm_extern_vec_new`). It is refcounted and owns
+                // host resources — its functype, finalizer, backing memory —
+                // so it must go through `refDelete`. Destroying it directly
+                // leaked all of that and skipped the finalizer.
+                refDelete(r);
+            }
         }
         alloc.free(vec.data[0..vec.size]);
     }
@@ -1045,23 +1085,30 @@ export fn wasm_instance_new(store: ?*Store, module: ?*const Module, imports: ?*c
         alloc.destroy(wi);
         return null;
     };
-    wi.host_funcs = funcs;
-    wi.inst = root.Instance.initWithImports(alloc, &m.inner, .{
-        .funcs = funcs,
-        .globals = gvals.items,
-        .memories = mems.items,
-        .tables = tbls.items,
-    }) catch |e| {
-        alloc.free(funcs);
-        alloc.destroy(wi);
-        if (trap_out) |t| t.* = makeTrap(@errorName(e));
-        return null;
+    // Whole-struct literal, so `hdr` gets its default (rc = 1). Assigning
+    // `wi.host_funcs`/`wi.inst` field-by-field onto `alloc.create` memory left
+    // `hdr` uninitialized — a garbage refcount, which meant the instance could
+    // be freed while export handles still pointed at it.
+    wi.* = .{
+        .inst = root.Instance.initWithImports(alloc, &m.inner, .{
+            .funcs = funcs,
+            .globals = gvals.items,
+            .memories = mems.items,
+            .tables = tbls.items,
+        }) catch |e| {
+            alloc.free(funcs);
+            alloc.destroy(wi);
+            if (trap_out) |t| t.* = makeTrap(@errorName(e));
+            return null;
+        },
+        .host_funcs = funcs,
     };
     return wi;
 }
 
 export fn wasm_instance_delete(instance: ?*Instance) void {
     const wi = instance orelse return;
+    if (!release(&wi.hdr)) return; // export handles / copies still hold it
     wi.inst.deinit();
     if (wi.host_funcs.len != 0) alloc.free(wi.host_funcs);
     alloc.destroy(wi);
@@ -1080,7 +1127,12 @@ export fn wasm_instance_exports(instance: ?*const Instance, out: *ExternVec) voi
         };
         // Calls mutate instance state (memory/heap growth), so the handle keeps a
         // mutable pointer despite the `const` export view.
-        r.* = .{ .kind = externKindToC(e.type.kind()), .vec_owned = true, .instance = @constCast(wi), .index = e.index };
+        r.* = .{
+            .kind = externKindToC(e.type.kind()),
+            .vec_owned = true,
+            .instance = refRetainInstance(@constCast(wi)),
+            .index = e.index,
+        };
         slot.* = r;
     }
     out.* = .{ .size = exps.len, .data = arr.ptr };
@@ -1431,7 +1483,7 @@ export fn wasm_table_delete(t: ?*Ref) void {
 fn refFromTableValue(owner: *const Ref, v: interp.Value) ?*RefHeader {
     if (v == interp.null_ref) return null;
     const r = alloc.create(Ref) catch return null;
-    r.* = .{ .kind = EXTERN_FUNC, .instance = owner.instance, .index = @intCast(v) };
+    r.* = .{ .kind = EXTERN_FUNC, .instance = refRetainInstance(owner.instance), .index = @intCast(v) };
     return &r.hdr;
 }
 
@@ -1479,7 +1531,10 @@ export fn wasm_table_grow(t: ?*Ref, delta: u32, init: ?*RefHeader) bool {
 export fn wasm_trap_new(store: ?*Store, message: ?*const ByteVec) ?*Trap {
     _ = store;
     const t = alloc.create(Trap) catch return null;
-    t.message = undefined;
+    // Whole-struct literal, so `hdr` gets its default (rc = 1). Assigning fields
+    // one at a time onto `alloc.create` memory leaves `hdr` uninitialized — a
+    // garbage refcount, i.e. free-at-any-time.
+    t.* = .{ .message = undefined };
     if (message) |m| wasm_byte_vec_copy(&t.message, m) else t.message.empty();
     return t;
 }
@@ -1787,13 +1842,16 @@ comptime {
 }
 
 /// `wasm_extern_vec_copy` — externs are *references*, so unlike the type vecs
-/// above this bumps refcounts rather than cloning objects.
+/// above this does not clone objects. It must still leave the two vecs with
+/// independent ownership: aliasing the element pointers made
+/// `copy(&b,&a); delete(&a); delete(&b);` — which the header invites — a double
+/// free. It did not crash; it corrupted the freelist. Each element therefore
+/// takes a real handle, via exactly the rule `wasm_X_copy` uses.
 export fn wasm_extern_vec_copy(out: *ExternVec, src: *const ExternVec) void {
     if (src.size == 0 or src.data == null) return wasm_extern_vec_new_empty(out);
     const buf = alloc.alloc(?*Ref, src.size) catch return wasm_extern_vec_new_empty(out);
     for (src.data[0..src.size], buf) |s, *dst| {
-        dst.* = s;
-        if (s) |r| retain(&r.hdr);
+        dst.* = if (s) |r| refApiFor("extern").copy(r) else null;
     }
     out.* = .{ .size = src.size, .data = buf.ptr };
 }
@@ -1845,6 +1903,14 @@ fn RefApi(comptime rt: RefType) type {
         fn copy(x: ?*const T) callconv(.c) ?*T {
             const p = x orelse return null;
             const m: *T = @constCast(p);
+            // An export handle's storage belongs to the extern vec that made it,
+            // and that vec frees it on its own schedule. Retaining would hand
+            // the caller a pointer the vec later frees regardless — a
+            // use-after-free. Duplicate instead: it is a cheap view (kind +
+            // instance + index), `same` compares those structurally, so the
+            // duplicate is still "the same object" while owning itself.
+            if (rt.tag == .extern_obj and @as(*const Ref, @ptrCast(p)).vec_owned)
+                return @ptrCast(dupExportHandle(@ptrCast(p)) orelse return null);
             retain(&m.hdr);
             return m;
         }
@@ -1906,6 +1972,16 @@ fn RefApi(comptime rt: RefType) type {
             return @alignCast(@fieldParentPtr("hdr", h));
         }
     };
+}
+
+/// The generated API for one ref type, by its `wasm.h` name. The generated
+/// functions are exported symbols, not Zig identifiers, so this is how Zig code
+/// (the tests below) reaches them.
+fn refApiFor(comptime name: []const u8) type {
+    for (ref_types) |rt| {
+        if (std.mem.eql(u8, rt.name, name)) return RefApi(rt);
+    }
+    @compileError("no ref type named " ++ name);
 }
 
 comptime {
@@ -1996,16 +2072,35 @@ export fn wasm_extern_delete(e: ?*Ref) void {
     refDelete(e);
 }
 
-/// Free a `Ref` if this was its last handle.
+/// A standalone copy of an instance-export handle: same object (`same` compares
+/// kind+instance+index), but owning its own allocation so the caller can delete
+/// it independently of the `wasm_extern_vec_t` the original came from.
 ///
-/// An **export handle** (`instance` set) is storage owned by the
-/// `wasm_extern_vec_t` it came out of, so dropping a handle to it never frees
-/// it here — `wasm_extern_vec_delete` does. Only standalone objects from
-/// `wasm_*_new` own themselves.
-fn refDelete(maybe: ?*Ref) void {
-    const r = maybe orelse return;
-    if (!release(&r.hdr)) return; // other handles remain
-    if (r.vec_owned) return; // storage belongs to the extern vec
+/// Export handles are views — kind, instance, index — with no host resources to
+/// clone, which is what makes duplicating them correct rather than a deep-copy
+/// problem.
+fn dupExportHandle(src: *const Ref) ?*Ref {
+    const r = alloc.create(Ref) catch return null;
+    r.* = .{ .kind = src.kind, .instance = refRetainInstance(src.instance), .index = src.index };
+    return r;
+}
+
+/// Take a handle on the instance a `Ref` names, if any.
+///
+/// A `Ref` that names an instance dereferences it on **every call** — so it has
+/// to own it. Without this, `exports(); instance_delete(); func_call()` — an
+/// ordinary embedder sequence, no misuse — read freed memory. Balanced by
+/// `destroyRef`.
+fn refRetainInstance(wi: ?*Instance) ?*Instance {
+    if (wi) |p| retain(&p.hdr);
+    return wi;
+}
+
+/// Tear a `Ref` down: drop its handle on its instance, run its host cleanup,
+/// free its storage. **The only place a `Ref`'s storage is released** — so the
+/// instance handle can't be dropped twice or forgotten.
+fn destroyRef(r: *Ref) void {
+    if (r.instance) |wi| wasm_instance_delete(wi); // our handle, not the caller's
     // Whatever this Ref happens to own — a Ref is one struct covering all five
     // extern kinds, so each field is independent.
     if (r.host) |hc| if (hc.finalizer) |fin| fin(hc.env);
@@ -2020,6 +2115,18 @@ fn refDelete(maybe: ?*Ref) void {
         alloc.destroy(tbl);
     }
     alloc.destroy(r);
+}
+
+/// Free a `Ref` if this was its last handle.
+///
+/// An **export handle** is storage owned by the `wasm_extern_vec_t` it came out
+/// of, so dropping a handle never frees it here — `wasm_extern_vec_delete`
+/// does. Only standalone objects from `wasm_*_new` own themselves.
+fn refDelete(maybe: ?*Ref) void {
+    const r = maybe orelse return;
+    if (!release(&r.hdr)) return; // other handles remain
+    if (r.vec_owned) return; // storage belongs to the extern vec
+    destroyRef(r);
 }
 
 // ---- wasm_frame_t + the trap backtrace ------------------------------------
@@ -2136,3 +2243,258 @@ export fn wazmrt_abi_version() u32 {
 export fn wazmrt_version_string() [*:0]const u8 {
     return root.version.ptr;
 }
+
+// --- Tests -----------------------------------------------------------------
+//
+// These run the **C entry points** under `std.testing.allocator`, which fails a
+// test on a leak or a double free. That detection is the point: `c_smoke.c`
+// exercises the same paths on the real allocator, where a double free quietly
+// corrupts the freelist and the test still prints OK — i.e. the C test cannot
+// tell "correct" from "exploitable". Anything that hands ownership across the
+// boundary belongs here too.
+
+/// (func (export "add") (param i32 i32) (result i32) local.get 0 local.get 1 i32.add)
+const test_add_module = [_]u8{
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f,
+    0x03, 0x02, 0x01, 0x00,
+    0x07, 0x07, 0x01, 0x03, 'a', 'd', 'd', 0x00, 0x00,
+    0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b,
+};
+
+fn testInstance() struct { engine: *Engine, store: *Store, module: *Module, inst: *Instance } {
+    const e = wasm_engine_new().?;
+    const s = wasm_store_new(e).?;
+    var bin: ByteVec = undefined;
+    wasm_byte_vec_new(&bin, test_add_module.len, &test_add_module);
+    defer wasm_byte_vec_delete(&bin);
+    const m = wasm_module_new(s, &bin).?;
+    var trap: ?*Trap = null;
+    var none: ExternVec = undefined;
+    wasm_extern_vec_new_empty(&none);
+    const i = wasm_instance_new(s, m, &none, &trap).?;
+    return .{ .engine = e, .store = s, .module = m, .inst = i };
+}
+
+fn testTeardown(h: anytype) void {
+    wasm_instance_delete(h.inst);
+    wasm_module_delete(h.module);
+    wasm_store_delete(h.store);
+    wasm_engine_delete(h.engine);
+}
+
+test "copying an extern vec and deleting both frees each Ref exactly once" {
+    // The bug this exists for: `wasm_extern_vec_copy` aliased the element
+    // pointers while `wasm_extern_vec_delete` destroyed them outright, so this
+    // sequence — which the header invites — was a double free. It did not
+    // crash; it corrupted the freelist. The testing allocator sees it.
+    const h = testInstance();
+    defer testTeardown(h);
+
+    var a: ExternVec = undefined;
+    wasm_instance_exports(h.inst, &a);
+    try std.testing.expectEqual(@as(usize, 1), a.size);
+
+    var b: ExternVec = undefined;
+    wasm_extern_vec_copy(&b, &a);
+    try std.testing.expectEqual(@as(usize, 1), b.size);
+
+    wasm_extern_vec_delete(&a);
+    wasm_extern_vec_delete(&b); // must not double-free the shared elements
+}
+
+test "a standalone host func in an extern vec is freed once, with its type" {
+    // A vec the embedder built themselves owns real host objects: deleting it
+    // must run the object's own cleanup (its functype), not just free the Ref.
+    const e = wasm_engine_new().?;
+    defer wasm_engine_delete(e);
+    const s = wasm_store_new(e).?;
+    defer wasm_store_delete(s);
+
+    var params: ValTypeVec = undefined;
+    var results: ValTypeVec = undefined;
+    wasm_valtype_vec_new_empty(&params);
+    wasm_valtype_vec_new_empty(&results);
+    const ft = wasm_functype_new(&params, &results).?;
+    const f = wasm_func_new(s, ft, testHostNoop).?;
+    wasm_functype_delete(ft);
+
+    var vec: ExternVec = undefined;
+    const items = [_]?*Ref{wasm_func_as_extern(f)};
+    wasm_extern_vec_new(&vec, 1, &items);
+    wasm_extern_vec_delete(&vec); // owns the func now — frees it and its type
+}
+
+fn testHostNoop(args: ?*const ValVec, results: ?*ValVec) callconv(.c) ?*Trap {
+    _ = args;
+    _ = results;
+    return null;
+}
+
+test "refcounted copy: the object outlives the first handle, and is freed once" {
+    const e = wasm_engine_new().?;
+    defer wasm_engine_delete(e);
+    const s = wasm_store_new(e).?;
+    defer wasm_store_delete(s);
+    var bin: ByteVec = undefined;
+    wasm_byte_vec_new(&bin, test_add_module.len, &test_add_module);
+    defer wasm_byte_vec_delete(&bin);
+
+    const mod_api = refApiFor("module"); // the generated fns are symbols, not idents
+    const m = wasm_module_new(s, &bin).?;
+    const m2 = mod_api.copy(m).?;
+    try std.testing.expect(mod_api.same(m, m2)); // a copy IS the same object
+
+    wasm_module_delete(m); // first handle goes; the object must survive
+    {
+        // Read through the surviving handle. The name is owned by `ex`, so it
+        // must be compared before `ex` is deleted — not returned out of the
+        // block (the testing allocator caught that as a use-after-free).
+        var ex: ExportTypeVec = undefined;
+        wasm_module_exports(m2, &ex);
+        defer wasm_exporttype_vec_delete(&ex);
+        try std.testing.expectEqual(@as(usize, 1), ex.size);
+        const n = wasm_exporttype_name(ex.data[0]).?;
+        try std.testing.expectEqualStrings("add", n.data[0..n.size]);
+    }
+    wasm_module_delete(m2); // last handle: freed exactly once
+}
+
+test "host_info finalizer runs exactly once, on the last handle" {
+    const S = struct {
+        var calls: usize = 0;
+        fn fin(p: ?*anyopaque) callconv(.c) void {
+            _ = p;
+            calls += 1;
+        }
+    };
+    S.calls = 0;
+
+    const e = wasm_engine_new().?;
+    defer wasm_engine_delete(e);
+    const fgn = refApiFor("foreign");
+    const f = wasm_foreign_new(null).?;
+    var marker: u32 = 7;
+    fgn.setHostInfoWithFinalizer(f, &marker, S.fin);
+
+    const f2 = fgn.copy(f).?;
+    wasm_foreign_delete(f); // not the last handle: finalizer must NOT run
+    try std.testing.expectEqual(@as(usize, 0), S.calls);
+    wasm_foreign_delete(f2); // last handle
+    try std.testing.expectEqual(@as(usize, 1), S.calls);
+}
+
+test "a trap's frames stay valid after the call, and free once" {
+    const h = testInstance();
+    defer testTeardown(h);
+    // Build a trap the way a failed call does, then read it back.
+    const t = makeTrap("boom").?;
+    var msg: ByteVec = undefined;
+    wasm_trap_message(t, &msg);
+    try std.testing.expectEqualStrings("boom", msg.data[0..4]);
+    wasm_byte_vec_delete(&msg);
+
+    var frames: FrameVec = undefined;
+    wasm_trap_trace(t, &frames);
+    wasm_frame_vec_delete(&frames);
+    wasm_trap_delete(t);
+}
+
+test "an export handle keeps its instance alive" {
+    // A Ref stores `*Instance` and dereferences it on every call. If deleting
+    // the instance freed it while an export handle still pointed at it, the
+    // next call would be a use-after-free -- reachable from a plain embedder
+    // sequence (take exports, delete the instance, call). Handles own their
+    // instance, so this must stay valid.
+    const e = wasm_engine_new().?;
+    defer wasm_engine_delete(e);
+    const s = wasm_store_new(e).?;
+    defer wasm_store_delete(s);
+    var bin: ByteVec = undefined;
+    wasm_byte_vec_new(&bin, test_add_module.len, &test_add_module);
+    defer wasm_byte_vec_delete(&bin);
+    const m = wasm_module_new(s, &bin).?;
+    defer wasm_module_delete(m);
+
+    var trap: ?*Trap = null;
+    var none: ExternVec = undefined;
+    wasm_extern_vec_new_empty(&none);
+    const inst = wasm_instance_new(s, m, &none, &trap).?;
+
+    var exps: ExternVec = undefined;
+    wasm_instance_exports(inst, &exps);
+    defer wasm_extern_vec_delete(&exps);
+
+    wasm_instance_delete(inst); // the embedder is done with their handle
+
+    // The export handle must still work.
+    const f = wasm_extern_as_func(exps.data[0]).?;
+    var args_buf = [_]Val{ valI32(40), valI32(2) };
+    var args: ValVec = .{ .size = 2, .data = &args_buf };
+    var res_buf = [_]Val{undefined};
+    var res: ValVec = .{ .size = 1, .data = &res_buf };
+    const t = wasm_func_call(f, &args, &res);
+    try std.testing.expect(t == null);
+    try std.testing.expectEqual(@as(i32, 42), res_buf[0].of.i32);
+}
+
+fn valI32(v: i32) Val {
+    return .{ .kind = 0, .of = .{ .i32 = v } };
+}
+
+test "every ref-able object starts with exactly one handle" {
+    // Guards a whole bug class. `alloc.create` returns uninitialized memory, so
+    // a constructor that assigns fields one at a time leaves `hdr` — and thus
+    // `rc` — garbage: the object is then freeable at any moment, or never.
+    // `wasm_instance_new` and `wasm_trap_new` both did exactly that. Only a
+    // whole-struct literal picks up the field defaults. Any new constructor for
+    // a ref-able type must appear here.
+    const e = wasm_engine_new().?;
+    defer wasm_engine_delete(e);
+    const s = wasm_store_new(e).?;
+    defer wasm_store_delete(s);
+    var bin: ByteVec = undefined;
+    wasm_byte_vec_new(&bin, test_add_module.len, &test_add_module);
+    defer wasm_byte_vec_delete(&bin);
+
+    const m = wasm_module_new(s, &bin).?;
+    try std.testing.expectEqual(@as(u32, 1), m.hdr.rc);
+    try std.testing.expectEqual(RefTag.module, m.hdr.tag);
+
+    var trap: ?*Trap = null;
+    var none: ExternVec = undefined;
+    wasm_extern_vec_new_empty(&none);
+    const inst = wasm_instance_new(s, m, &none, &trap).?;
+    try std.testing.expectEqual(@as(u32, 1), inst.hdr.rc);
+    try std.testing.expectEqual(RefTag.instance, inst.hdr.tag);
+
+    const t = wasm_trap_new(s, null).?;
+    try std.testing.expectEqual(@as(u32, 1), t.hdr.rc);
+    try std.testing.expectEqual(RefTag.trap, t.hdr.tag);
+    wasm_trap_delete(t);
+
+    const fgn = wasm_foreign_new(s).?;
+    try std.testing.expectEqual(@as(u32, 1), fgn.hdr.rc);
+    wasm_foreign_delete(fgn);
+
+    // Standalone extern objects (each `wasm_*_new` builds a Ref).
+    const gt = wasm_globaltype_new(wasm_valtype_new(WASM_I32_KIND), 1).?;
+    var gv: Val = .{ .kind = 0, .of = .{ .i32 = 1 } };
+    const g = wasm_global_new(s, gt, &gv).?;
+    try std.testing.expectEqual(@as(u32, 1), g.hdr.rc);
+    try std.testing.expectEqual(RefTag.extern_obj, g.hdr.tag);
+    wasm_global_delete(g);
+    wasm_globaltype_delete(gt);
+
+    // An export handle, which the vec owns.
+    var exps: ExternVec = undefined;
+    wasm_instance_exports(inst, &exps);
+    try std.testing.expectEqual(@as(u32, 1), exps.data[0].?.hdr.rc);
+    try std.testing.expect(exps.data[0].?.vec_owned);
+    wasm_extern_vec_delete(&exps);
+
+    wasm_instance_delete(inst);
+    wasm_module_delete(m);
+}
+
+const WASM_I32_KIND: Valkind = 0;
