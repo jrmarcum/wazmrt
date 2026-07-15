@@ -11,6 +11,51 @@ This file tracks only what's left.
 
 Line numbers are hints (they drift) — the function/construct name is the durable anchor.
 
+## #19 — Traps carry no location: `trap: Unreachable` and nothing else — OPEN (2026-07-15)
+
+**What:** every trap surfaces as a bare `trap: <ErrorName>`. No function index, no name, no pc. When a
+compiled guest traps, there is nothing to go on.
+
+**Cost paid:** this is what turned the Phase 3 `bitcast_invalid` diagnosis (#18) into hours. The fix
+took ~10 lines of throwaway instrumentation: print `func_index` + `pc` + `ir.len` at the `unreachable`
+arm, which immediately said "pc=0 of a 2-instruction body" — i.e. a trap stub — and a ~50-line name
+section parser then named it. **All of that got thrown away.** Make it permanent instead.
+
+**Shape of the fix:** carry `func_index` on `Frame` (it's already at the `callFunction` call site);
+report `fn[i] (+pc)` on any trap; decode the `name` custom section when present and print the symbol.
+Optionally keep the frame chain for a backtrace. None of it is on a hot path — it is error-path only.
+
+**Surfaces when:** running unfamiliar compiled guests — i.e. **Phase 4 by definition** (C/wasi-sdk,
+Rust, Zig conformance). Every one of those that traps costs the same hours again. **Not a blocker for
+Phase 4, but it is the highest-leverage thing to do first in it.**
+
+**Anchor:** `Frame.run`'s `.@"unreachable"` arm + `Instance.callFunction` in `src/interp.zig`;
+`runWasi`'s `trap: {s}` print in `src/main.zig`.
+
+## #18 — Zig 0.16 std bug: `openFile(.follow_symlinks=false)` on Windows crashes the host — WORKED AROUND (2026-07-15)
+
+**What (std's bug, not ours):** `Io.Dir.openFile` opens the handle **ASYNCHRONOUS** when
+`follow_symlinks = false` but still returns `.flags = .{ .nonblocking = false }`
+(`Threaded.zig:5033` — the only conditional `.IO =` in the file). The first `readPositional` then takes
+the synchronous branch and hits `.PENDING => unreachable` **inside std**, killing the *host* process,
+not the guest. `createFile` is unconditionally `SYNCHRONOUS_NONALERT`, which is why only the
+open-an-existing-file path crashed and `path_open` with `O_CREAT` looked healthy.
+
+**Our workaround:** `wPathOpen` implements O_NOFOLLOW itself — `statFile(.follow_symlinks=false)`, return
+`ELOOP` if the final component is a symlink — then always opens *with* follow, since no link remains to
+follow. Same observable semantics, no async handle. Minor TOCTOU between the stat and the open;
+acceptable versus crashing.
+
+**Contained:** the other two `.IO = .ASYNCHRONOUS` sites are `dirReadLinkWindows` (an internal
+reparse-point handle we never read from; `path_readlink` is `NOTSUP` here) and `openSocketAfd` (sockets,
+which correctly set `nonblocking = true`). No other file path can reach the mismatch.
+
+**Surfaces when:** **upgrading Zig.** If std fixes it, drop the pre-stat and pass `.follow_symlinks`
+straight through; if std changes shape around it, recheck before assuming the workaround still holds.
+Re-run `examples/wasi_files.zig` — "fd_read round-trips the contents" is the check that fails.
+
+**Anchor:** the `if (!follow)` pre-stat in `wPathOpen`, `src/wasi.zig`.
+
 ## #17 — WASI sandbox containment is **lexical**: a symlink out of a preopen is still followed — OPEN (2026-07-15)
 
 **What:** `wasi.resolve()` rejects absolute paths, escaping `..`, NT/device prefixes, and NUL, so a

@@ -186,10 +186,19 @@ resolution the `Io` API doesn't expose.
 `fd_filestat_set_times`/`path_filestat_set_times`, `fd_allocate`, `fd_advise` (returns success —
 advisory), and real fd-readiness in `poll_oneoff`. All still resolve to the `NOTSUP` stub.
 
-**Phase 4 — ergonomics + conformance.** CLI `--dir` / `--env KEY=VAL` / `-- <guest args>`. A reproducible
-`zig build`-driven gate that compiles a real Zig `wasm32-wasi` program and runs it in wazmrt (Zig is the
-toolchain we already have). Broaden to compiled **C (wasi-sdk), Rust (wasm32-wasi), Zig** programs
-covering stdout/args/env/files/clocks; fill the long tail of actually-called functions.
+**Phase 4 — ergonomics + conformance.** ~~CLI `--dir`~~ (done in Phase 3) / `--env KEY=VAL` /
+~~`-- <guest args>`~~ (done). A reproducible `zig build`-driven gate that compiles a real Zig
+`wasm32-wasi` program and runs it in wazmrt (Zig is the toolchain we already have). Broaden to compiled
+**C (wasi-sdk), Rust (wasm32-wasi), Zig** programs covering stdout/args/env/files/clocks; fill the long
+tail of actually-called functions (the Phase 3 leftovers above are the likely first hits).
+
+> **Do `known-issues.md` #19 (trap diagnostics) FIRST.** Phase 4 *is* "run many unfamiliar compiled
+> guests," and today a trap says `trap: Unreachable` and nothing more — no function, no pc, no name.
+> That is precisely what made the Phase 3 `bitcast_invalid` hunt cost hours, and Phase 4 multiplies the
+> number of guests that can trap in unfamiliar ways. Carrying `func_index` into the trap and decoding
+> the `name` section is a small, error-path-only change that pays for itself on the first failure.
+> **Nothing else in #17/#18/#19 blocks Phase 4** — #17 gates the *untrusted-module* milestone (not
+> conformance runs of your own programs), and #18 is worked around and contained.
 
 ## Next increments (rough order)
 
