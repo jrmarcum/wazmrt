@@ -262,7 +262,7 @@ error path.** Bisect against a same-session baseline; do not trust a recorded nu
 `opcode.decodeBodyTracked`; `printTrap` (`src/main.zig`); `makeTrapFrom` + the `wasm_frame_*` exports
 (`src/wasm_c_api.zig`).
 
-## #18 — Zig 0.16 std bug: `openFile(.follow_symlinks=false)` on Windows crashes the host — WORKED AROUND (2026-07-15)
+## #18 — Zig 0.16 std bug: `openFile(.follow_symlinks=false)` on Windows crashes the host — WORKED AROUND, but now **security-relevant** (2026-07-15, updated 2026-07-16)
 
 **What (std's bug, not ours):** `Io.Dir.openFile` opens the handle **ASYNCHRONOUS** when
 `follow_symlinks = false` but still returns `.flags = .{ .nonblocking = false }`
@@ -271,20 +271,31 @@ the synchronous branch and hits `.PENDING => unreachable` **inside std**, killin
 not the guest. `createFile` is unconditionally `SYNCHRONOUS_NONALERT`, which is why only the
 open-an-existing-file path crashed and `path_open` with `O_CREAT` looked healthy.
 
-**Our workaround:** `wPathOpen` implements O_NOFOLLOW itself — `statFile(.follow_symlinks=false)`, return
-`ELOOP` if the final component is a symlink — then always opens *with* follow, since no link remains to
-follow. Same observable semantics, no async handle. Minor TOCTOU between the stat and the open;
-acceptable versus crashing.
+**Our workaround:** `wPathOpen` never calls `openFile(.follow_symlinks=false)`. Instead it stats the
+final component no-follow (`finalIsSymlink`), refuses a symlink outright, then opens *with* follow —
+safe, because a non-symlink can't be followed anywhere. Same observable semantics, no async handle.
 
-**Contained:** the other two `.IO = .ASYNCHRONOUS` sites are `dirReadLinkWindows` (an internal
-reparse-point handle we never read from; `path_readlink` is `NOTSUP` here) and `openSocketAfd` (sockets,
-which correctly set `nonblocking = true`). No other file path can reach the mismatch.
+**⚠️ This is why #17 has a residual, so #18 must be fixed to fully close #17.** Because we can't open
+no-follow, there is a **stat-then-open TOCTOU window on `path_open`'s final component**: an attacker
+with write access *inside* the preopen could swap the just-stat'd name for a symlink before the follow
+open, and we'd follow it out. Narrow (needs in-sandbox write + a race) and it does **not** affect the
+intermediate walk (the actual reported #17 hole, which opens each component no-follow with no such
+window) — but it is the one path where a real `openFile(.follow_symlinks=false)` would let us open
+no-follow atomically and eliminate the window. **The correct close is upstream: fix this std bug (or a
+real `openat2(RESOLVE_BENEATH)` in `Io`), then `wPathOpen` opens no-follow directly and drops the
+pre-stat.** Until then the residual stands, documented in the `src/wasi.zig` module doc and #17.
 
-**Surfaces when:** **upgrading Zig.** If std fixes it, drop the pre-stat and pass `.follow_symlinks`
-straight through; if std changes shape around it, recheck before assuming the workaround still holds.
-Re-run `examples/wasi_files.zig` — "fd_read round-trips the contents" is the check that fails.
+**Contained (crash-wise):** the other two `.IO = .ASYNCHRONOUS` sites are `dirReadLinkWindows` (an
+internal reparse-point handle we never read from; `path_readlink` is `NOTSUP` here) and `openSocketAfd`
+(sockets, which correctly set `nonblocking = true`). No other file path can reach the mismatch.
 
-**Anchor:** the `if (!follow)` pre-stat in `wPathOpen`, `src/wasi.zig`.
+**Surfaces when:** **upgrading Zig** (recheck: does the workaround still hold?) *and* whenever the #17
+final-component TOCTOU matters (untrusted guest with in-sandbox write). If std fixes it: in `wPathOpen`,
+replace the `finalIsSymlink` pre-stat + follow-open with a direct `openFile(.follow_symlinks=false)`,
+which closes #17's residual for free. Re-run `examples/wasi_files.zig` ("fd_read round-trips the
+contents" is the crash check) and `examples/wasi_symlink_escape.zig` (the containment check).
+
+**Anchor:** `finalIsSymlink` + the `openFile` call in `wPathOpen`, `src/wasi.zig`.
 
 ## #17 — WASI sandbox: a symlink out of a preopen was followed — **DONE 2026-07-16**
 
