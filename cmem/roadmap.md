@@ -212,13 +212,26 @@ module) and a `wasm_trap_delete` double-free (it froze unconditionally, ignoring
 `wasm_trap_copy` bumps — the fuzz caught it on seed 1, fixed with `release`). Verified the fuzz fails on
 each reintroduced bug. +3 C-ABI tests (121 distinct). Invariants 5–6 in `design-decisions.md`.
 
-> ### ⇢ START HERE (next session): **4.2 — `known-issues.md` #17, make the WASI sandbox real.**
-> The standing order after #22 is #17 → Phase-3 leftovers → the Phase 4 items proper. #17 is the
-> biggest item in Phase 4: containment today is *lexical* (a symlink inside a preopen pointing outside
-> it is still followed), and a real fix needs per-component resolution that Zig 0.16's `Io` doesn't
-> expose — expect raw `openat2(RESOLVE_BENEATH)` / platform syscalls below `Io`, plus TOCTOU care. Its
-> done-condition is concrete: a symlink-out-of-preopen refused, tested in `examples/wasi_files.zig`
-> beside the four escapes that already pass.
+**4.2 — `known-issues.md` #17, make the WASI sandbox real. DONE 2026-07-16.** Containment was *lexical*:
+a symlink stored inside a preopen pointing outside it was followed straight out (`follow_symlinks=false`
+only guards the final `openat` component). Fixed with a **handle-based component walk** (`walkTo` +
+`finalIsSymlink`): descend one component at a time, opening each relative to the previous *handle*
+(TOCTOU-safe) with no-follow, reject anything that isn't a real directory; refuse a final symlink in any
+op that would follow it. **Policy: no symlink is ever traversed** (a guest can't create one, so every
+symlink is host-placed — the attack). No `openat2(RESOLVE_BENEATH)` needed after all — the walk gets
+there portably. **Verified before/after with a real NTFS symlink** (`examples/wasi_symlink_escape.zig`:
+pre-fix `ESCAPED`, post-fix refused) + a unit test (POSIX CI; skips on unprivileged Windows since Zig
+std can't make a symlink there) + Phase 3 gate still 16/16. One documented residual: a narrow
+final-component `path_open` TOCTOU tied to std bug #18. See #17.
+
+> ### ⇢ START HERE (next session): **4.3 — the Phase 3 leftovers.**
+> `path_symlink` / `path_readlink` / `path_link`, `fd_filestat_set_times` / `path_filestat_set_times`,
+> `fd_allocate`, and real fd-readiness in `poll_oneoff` — all currently the `NOTSUP` stub (see the
+> "Phase 3 leftovers" note above). These are the likeliest things a compiled C/Rust guest trips over.
+> **Note the #17 interaction:** `path_symlink`/`path_readlink` would let a guest *create* symlinks,
+> which changes #17's "no symlink is host-placed" assumption — decide the traversal policy (keep
+> no-follow, or move to target-revalidation) before implementing them. Then **4.4** — the Phase 4 items
+> proper (`--env`, the `zig build`-driven compiled gate, C/Rust/Zig conformance).
 
 **4.1 — `known-issues.md` #19: trap diagnostics. DONE 2026-07-15.** Traps now report a named
 backtrace, innermost frame first — on the exact binary from the Phase 3 hunt:

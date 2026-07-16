@@ -84,11 +84,14 @@ under `<guest>` (defaulting to the host path). wazmrt resolves guest paths itsel
 and refuses absolute paths, `..` escapes, and NT/device prefixes — an interior
 `..` that stays inside is fine. See [`examples/wasi_files.zig`](examples/wasi_files.zig).
 
-> **Scope of the sandbox.** Containment is *lexical*: a guest cannot name a path
-> outside its preopens. A **symlink inside a preopen that points outside it is
-> still followed**, so do not treat this as a boundary against a hostile module —
-> it is meant for running your own programs against your own directories. Details
-> and the fix path: `cmem/known-issues.md` (#17).
+> **Scope of the sandbox.** Containment is enforced two ways: **lexically** (a
+> guest cannot name a path outside its preopens) and **through the filesystem**
+> — path resolution descends one component at a time through directory handles
+> and **refuses to traverse any symlink**, so a symlink planted inside a preopen
+> cannot redirect a guest outside it. One documented residual remains: a narrow
+> TOCTOU race on the final component of `path_open`, tied to a Zig std bug on
+> Windows (`cmem/known-issues.md` #17/#18). In-sandbox symlink *traversal* is
+> intentionally unsupported.
 
 Implemented: stdout/stderr/stdin, args/environ, clocks, `poll_oneoff` (clock
 sleep), `random_get`, `proc_exit`, and the filesystem (`path_open`, `fd_read`/

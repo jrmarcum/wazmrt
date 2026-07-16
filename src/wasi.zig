@@ -13,20 +13,33 @@
 //! ## The sandbox
 //!
 //! A guest may only name paths under a directory the embedder preopened
-//! (`--dir` on the CLI). **We resolve and contain guest paths ourselves** —
-//! `Io.Dir`'s `resolve_beneath` is a silent no-op on Windows and Linux (it only
-//! maps to a FreeBSD `O.RESOLVE_BENEATH`), so the `*at`-style dir handle alone
-//! is NOT a security boundary: an absolute path bypasses the handle entirely,
-//! and Windows resolves `..` lexically against the *process* cwd before the
-//! syscall ever sees it. `resolve()` therefore rejects absolute paths, escaping
-//! `..`, NT/device prefixes, and embedded NUL up front, and only ever hands
-//! `Io.Dir` an already-normalized relative path with no `..` left in it.
+//! (`--dir` on the CLI). **We resolve and contain guest paths ourselves**, in
+//! two layers — `Io.Dir`'s `resolve_beneath` is a silent no-op on Windows and
+//! Linux (it only maps to a FreeBSD `O.RESOLVE_BENEATH`), so the `*at`-style dir
+//! handle alone is NOT a security boundary.
 //!
-//! Known gap: a **symlink inside a preopen that points outside it** is still
-//! followed when the guest passes `SYMLINK_FOLLOW`. Containment here is lexical;
-//! closing that hole needs per-component resolution (`openat2(RESOLVE_BENEATH)`
-//! or an O_PATH walk), which the Zig 0.16 `Io` API does not expose. Tracked in
-//! `cmem/known-issues.md`.
+//! 1. **Lexical** (`resolve`): reject absolute paths, escaping `..`, NT/device
+//!    prefixes, and embedded NUL; normalize to a `..`-free relative path.
+//! 2. **Filesystem** (`walkTo` + `finalIsSymlink`): a guest could still escape
+//!    through a *symlink stored inside the preopen* whose target is outside it,
+//!    because `follow_symlinks = false` only guards the final `openat` component
+//!    — intermediate symlinks are followed. So we descend one component at a
+//!    time, opening each relative to the previous *handle* (TOCTOU-safe: the
+//!    handle pins the inode) with no-follow, and reject anything that isn't a
+//!    real directory. A final-component symlink is refused by any op that would
+//!    follow it (`path_open`, `path_filestat_get` with `SYMLINK_FOLLOW`).
+//!
+//! **Policy: no symlink is ever traversed.** A guest can't create one anyway
+//! (`path_symlink` is unimplemented), so every symlink in a preopen is
+//! host-placed — i.e. the attack — and refusing to follow it is the safe
+//! default. In-sandbox symlink traversal is therefore unsupported; relax to
+//! target-revalidation if a real guest needs it (see `known-issues.md` #17).
+//!
+//! Residual: a narrow TOCTOU on the *final* component of `path_open` — we stat
+//! it no-follow (reject symlink) then open with follow, because
+//! `openFile(.follow_symlinks = false)` crashes the host on Windows (std bug
+//! #18). A swap in that window needs write access *inside* the sandbox and a
+//! race; the intermediate walk (the actual reported hole) has no such window.
 
 const std = @import("std");
 const Io = std.Io;
@@ -392,23 +405,99 @@ pub const Wasi = struct {
     }
 };
 
-/// A `(dirfd, path, path_len)` argument trio resolved against the sandbox.
-/// Caller must `free()` — the resolved path is heap-allocated.
+/// A `(dirfd, path, path_len)` argument trio resolved against the sandbox: the
+/// final component (`name`) and the directory handle it lives in (`dir`), with
+/// every intermediate component walked and verified to be a real directory (not
+/// a symlink). Caller must `close()`.
+///
+/// `dir` is the directory *containing* the final component — for `a/b/c.txt`,
+/// the handle for `a/b` — reached by descending one component at a time so no
+/// intermediate symlink can redirect the walk outside the preopen (see the
+/// module doc). It is either the preopen handle (single-component path) or the
+/// last of the handles in `opened`, which `close()` releases.
 const ResolvedPath = struct {
     dir: Io.Dir,
-    /// Normalized, `..`-free, relative to `dir`.
+    /// The final path component, borrowed from `path`.
+    name: []const u8,
+    /// The full normalized path, owned (freed by `close`); `name` slices it.
     path: []const u8,
+    /// Intermediate directory handles the walk opened, to close afterward.
+    opened: std.ArrayList(Io.Dir),
     /// The dir fd's inheriting rights, which cap what an opened fd may hold.
     inheriting: u64,
 
-    fn free(self: ResolvedPath, gpa: std.mem.Allocator) void {
-        gpa.free(self.path);
+    fn close(self: *ResolvedPath, w: *Wasi) void {
+        for (self.opened.items) |d| d.close(w.io);
+        self.opened.deinit(w.gpa);
+        w.gpa.free(self.path);
+    }
+
+    /// True if the final component is itself a symlink. A following operation
+    /// (`path_open`, `path_filestat_get` with `SYMLINK_FOLLOW`) must refuse it:
+    /// with the intermediate walk already containing the directory portion, a
+    /// final symlink is the last way to escape, so we never follow one.
+    fn finalIsSymlink(self: *const ResolvedPath, w: *Wasi) bool {
+        const st = self.dir.statFile(w.io, self.name, .{ .follow_symlinks = false }) catch return false;
+        return st.kind == .sym_link;
     }
 };
 
+/// Descend `path`'s directory components from `start`, one at a time, so an
+/// intermediate symlink can't redirect the walk out of the preopen. Returns the
+/// handle for the directory holding the final component. Opened handles are
+/// pushed to `opened` for the caller to close; on failure this closes them and
+/// writes the errno.
+///
+/// **TOCTOU-safe by construction:** each component is opened *relative to the
+/// previous handle* (which pins its inode), never by re-walking a path string,
+/// and `follow_symlinks = false` plus a post-open `stat` reject anything that is
+/// not a real directory — including a symlink Windows might open as a reparse
+/// point rather than fail on.
+fn walkTo(w: *Wasi, start: Io.Dir, path: []const u8, opened: *std.ArrayList(Io.Dir), results: []Value) ?Io.Dir {
+    const last_sep = std.mem.lastIndexOfScalar(u8, path, '/') orelse return start; // single component
+    var current = start;
+    var it = std.mem.splitScalar(u8, path[0..last_sep], '/');
+    while (it.next()) |comp| {
+        // `resolve` already stripped '.'/'..' and empty components, so `comp` is
+        // a single real name. Open it no-follow, relative to the current handle.
+        const next = current.openDir(w.io, comp, .{ .iterate = true, .follow_symlinks = false }) catch |err| {
+            closeWalk(w, opened);
+            _ = ret(results, errnoFor(err)); // a symlink here → ELOOP on POSIX
+            return null;
+        };
+        // Confirm the handle is a directory, not a symlink that slipped through.
+        const st = next.stat(w.io) catch {
+            next.close(w.io);
+            closeWalk(w, opened);
+            _ = ret(results, errno.io);
+            return null;
+        };
+        if (st.kind != .directory) {
+            next.close(w.io);
+            closeWalk(w, opened);
+            _ = ret(results, errno.notcapable); // a reparse point / symlink dir
+            return null;
+        }
+        opened.append(w.gpa, next) catch {
+            next.close(w.io);
+            closeWalk(w, opened);
+            _ = ret(results, errno.nomem);
+            return null;
+        };
+        current = next;
+    }
+    return current;
+}
+
+fn closeWalk(w: *Wasi, opened: *std.ArrayList(Io.Dir)) void {
+    for (opened.items) |d| d.close(w.io);
+    opened.deinit(w.gpa);
+}
+
 /// Resolve `(fd, ptr, len)` from a `path_*` call: the fd must be an open
-/// directory holding `need` rights, and the path must stay inside it.
-/// On failure writes the errno into `results` and returns null.
+/// directory holding `need` rights, and the path must stay inside it — both
+/// lexically (`resolve`) and through the filesystem (`walkTo`, no symlink
+/// traversal). On failure writes the errno into `results` and returns null.
 fn resolveArg(w: *Wasi, fd: u32, ptr: u32, len: u32, need: u64, results: []Value) ?ResolvedPath {
     const e = w.get(fd) orelse {
         _ = ret(results, errno.badf);
@@ -430,10 +519,24 @@ fn resolveArg(w: *Wasi, fd: u32, ptr: u32, len: u32, need: u64, results: []Value
         return null;
     };
     const path = resolve(w.gpa, raw) orelse {
-        _ = ret(results, errno.notcapable); // escaped the sandbox
+        _ = ret(results, errno.notcapable); // escaped the sandbox lexically
         return null;
     };
-    return .{ .dir = d.handle, .path = path, .inheriting = d.rights_inheriting };
+
+    var opened: std.ArrayList(Io.Dir) = .empty;
+    const final_dir = walkTo(w, d.handle, path, &opened, results) orelse {
+        w.gpa.free(path); // walkTo already closed `opened` and set the errno
+        return null;
+    };
+    const last_sep = std.mem.lastIndexOfScalar(u8, path, '/');
+    const name = if (last_sep) |i| path[i + 1 ..] else path;
+    return .{
+        .dir = final_dir,
+        .name = name,
+        .path = path,
+        .opened = opened,
+        .inheriting = d.rights_inheriting,
+    };
 }
 
 const CallFn = *const fn (ctx: *anyopaque, args: []const Value, results: []Value) bool;
@@ -873,10 +976,10 @@ fn wFdPrestatDirName(ctx: *anyopaque, args: []const Value, results: []Value) boo
 /// so a guest can never widen its own capability by reopening.
 fn wPathOpen(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const w: *Wasi = @ptrCast(@alignCast(ctx));
-    const lookup = argU32(args, 1);
-    const rp = resolveArg(w, argU32(args, 0), argU32(args, 2), argU32(args, 3), rights.path_open, results) orelse
+    var rp = resolveArg(w, argU32(args, 0), argU32(args, 2), argU32(args, 3), rights.path_open, results) orelse
         return true;
-    defer rp.free(w.gpa);
+    defer rp.close(w);
+    _ = argU32(args, 1); // lookupflags: we never follow a symlink (see below)
 
     const of: u16 = @truncate(argU32(args, 4));
     const want_base: u64 = @bitCast(interp.asI64(args[5]));
@@ -884,13 +987,18 @@ fn wPathOpen(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const ff: u16 = @truncate(argU32(args, 7));
     const opened_fd_ptr = argU32(args, 8);
 
-    const follow = lookup & lookup_symlink_follow != 0;
+    // Never follow the final component if it's a symlink — that's the last way
+    // to escape now that the walk contains the directory portion. We refuse
+    // rather than resolve-and-recheck: a guest can't create symlinks through
+    // wazmrt (no `path_symlink`), so any link is host-placed, i.e. the attack.
+    if (rp.finalIsSymlink(w)) return ret(results, errno.notcapable);
+
     // A guest may only ever narrow: intersect with what the dir fd may pass on.
     const new_base = want_base & rp.inheriting;
     const new_inheriting = want_inheriting & rp.inheriting;
 
     if (of & oflags.directory != 0) {
-        const dir = rp.dir.openDir(w.io, rp.path, .{ .iterate = true, .follow_symlinks = follow }) catch |err|
+        const dir = rp.dir.openDir(w.io, rp.name, .{ .iterate = true, .follow_symlinks = false }) catch |err|
             return ret(results, errnoFor(err));
         const fd = w.put(.{ .dir = .{
             .handle = dir,
@@ -910,25 +1018,18 @@ fn wPathOpen(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const file: Io.File = if (of & oflags.creat != 0) blk: {
         if (rp.inheriting & rights.path_create_file == 0) return ret(results, errno.notcapable);
         // createFile is always write-capable; `read` widens it to read_write.
-        break :blk rp.dir.createFile(w.io, rp.path, .{
+        break :blk rp.dir.createFile(w.io, rp.name, .{
             .read = wants_read,
             .truncate = of & oflags.trunc != 0,
             .exclusive = of & oflags.excl != 0,
         }) catch |err| return ret(results, errnoFor(err));
     } else blk: {
-        // O_NOFOLLOW, without asking Io for it. `openFile(.follow_symlinks =
-        // false)` on Windows opens an ASYNCHRONOUS handle but still reports
-        // `.nonblocking = false`, so the first read takes the synchronous path
-        // and hits `.PENDING => unreachable` inside std — it crashes the host.
-        // (Zig 0.16 Threaded.zig:5033; `createFile` is unconditionally
-        // SYNCHRONOUS_NONALERT, which is why only the open path is affected.)
-        // Fail on a symlink ourselves — which is what O_NOFOLLOW means — and
-        // then open normally, since there is no link left to follow.
-        if (!follow) {
-            const lst = rp.dir.statFile(w.io, rp.path, .{ .follow_symlinks = false }) catch null;
-            if (lst) |s| if (s.kind == .sym_link) return ret(results, errno.loop);
-        }
-        const f = rp.dir.openFile(w.io, rp.path, .{
+        // `finalIsSymlink` above already refused a symlink, so opening with
+        // follow is a no-op on the final component — and it avoids the Windows
+        // std bug where `openFile(.follow_symlinks = false)` returns an async
+        // handle that crashes the first read (Threaded.zig:5033, known-issues
+        // #18).
+        const f = rp.dir.openFile(w.io, rp.name, .{
             .mode = if (wants_write and wants_read) .read_write else if (wants_write) .write_only else .read_only,
         }) catch |err| return ret(results, errnoFor(err));
         // O_TRUNC without O_CREAT: truncate after opening.
@@ -956,10 +1057,14 @@ fn wPathOpen(ctx: *anyopaque, args: []const Value, results: []Value) bool {
 fn wPathFilestatGet(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const w: *Wasi = @ptrCast(@alignCast(ctx));
     const follow = argU32(args, 1) & lookup_symlink_follow != 0;
-    const rp = resolveArg(w, argU32(args, 0), argU32(args, 2), argU32(args, 3), rights.path_filestat_get, results) orelse
+    var rp = resolveArg(w, argU32(args, 0), argU32(args, 2), argU32(args, 3), rights.path_filestat_get, results) orelse
         return true;
-    defer rp.free(w.gpa);
-    const st = rp.dir.statFile(w.io, rp.path, .{ .follow_symlinks = follow }) catch |err|
+    defer rp.close(w);
+    // Following a symlink out of the preopen is the one remaining escape; refuse
+    // rather than follow. Without `SYMLINK_FOLLOW` we stat the link itself,
+    // which is safe.
+    if (follow and rp.finalIsSymlink(w)) return ret(results, errno.notcapable);
+    const st = rp.dir.statFile(w.io, rp.name, .{ .follow_symlinks = follow }) catch |err|
         return ret(results, errnoFor(err));
     if (!writeFilestat(w, argU32(args, 4), st)) return ret(results, errno.fault);
     return ret(results, errno.success);
@@ -968,45 +1073,47 @@ fn wPathFilestatGet(ctx: *anyopaque, args: []const Value, results: []Value) bool
 /// `path_create_directory(dirfd, path, path_len)`.
 fn wPathCreateDirectory(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const w: *Wasi = @ptrCast(@alignCast(ctx));
-    const rp = resolveArg(w, argU32(args, 0), argU32(args, 1), argU32(args, 2), rights.path_create_directory, results) orelse
+    var rp = resolveArg(w, argU32(args, 0), argU32(args, 1), argU32(args, 2), rights.path_create_directory, results) orelse
         return true;
-    defer rp.free(w.gpa);
-    rp.dir.createDir(w.io, rp.path, .default_dir) catch |err| return ret(results, errnoFor(err));
+    defer rp.close(w);
+    rp.dir.createDir(w.io, rp.name, .default_dir) catch |err| return ret(results, errnoFor(err));
     return ret(results, errno.success);
 }
 
 /// `path_remove_directory(dirfd, path, path_len)`.
 fn wPathRemoveDirectory(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const w: *Wasi = @ptrCast(@alignCast(ctx));
-    const rp = resolveArg(w, argU32(args, 0), argU32(args, 1), argU32(args, 2), rights.path_remove_directory, results) orelse
+    var rp = resolveArg(w, argU32(args, 0), argU32(args, 1), argU32(args, 2), rights.path_remove_directory, results) orelse
         return true;
-    defer rp.free(w.gpa);
-    rp.dir.deleteDir(w.io, rp.path) catch |err| return ret(results, errnoFor(err));
+    defer rp.close(w);
+    rp.dir.deleteDir(w.io, rp.name) catch |err| return ret(results, errnoFor(err));
     return ret(results, errno.success);
 }
 
-/// `path_unlink_file(dirfd, path, path_len)`.
+/// `path_unlink_file(dirfd, path, path_len)` — removes the final component
+/// itself (never follows it), so a symlink is unlinked, not its target. Safe.
 fn wPathUnlinkFile(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const w: *Wasi = @ptrCast(@alignCast(ctx));
-    const rp = resolveArg(w, argU32(args, 0), argU32(args, 1), argU32(args, 2), rights.path_unlink_file, results) orelse
+    var rp = resolveArg(w, argU32(args, 0), argU32(args, 1), argU32(args, 2), rights.path_unlink_file, results) orelse
         return true;
-    defer rp.free(w.gpa);
-    rp.dir.deleteFile(w.io, rp.path) catch |err| return ret(results, errnoFor(err));
+    defer rp.close(w);
+    rp.dir.deleteFile(w.io, rp.name) catch |err| return ret(results, errnoFor(err));
     return ret(results, errno.success);
 }
 
 /// `path_rename(old_dirfd, old_path, old_len, new_dirfd, new_path, new_len)` —
-/// both ends are resolved independently, so neither may escape its own preopen.
+/// both ends are resolved independently (walk included), so neither may escape
+/// its own preopen; rename acts on the final names without following them.
 fn wPathRename(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const w: *Wasi = @ptrCast(@alignCast(ctx));
-    const old = resolveArg(w, argU32(args, 0), argU32(args, 1), argU32(args, 2), rights.path_rename_source, results) orelse
+    var old = resolveArg(w, argU32(args, 0), argU32(args, 1), argU32(args, 2), rights.path_rename_source, results) orelse
         return true;
-    defer old.free(w.gpa);
-    const new = resolveArg(w, argU32(args, 3), argU32(args, 4), argU32(args, 5), rights.path_rename_target, results) orelse
+    defer old.close(w);
+    var new = resolveArg(w, argU32(args, 3), argU32(args, 4), argU32(args, 5), rights.path_rename_target, results) orelse
         return true;
-    defer new.free(w.gpa);
+    defer new.close(w);
     // `io` is the LAST parameter on the two-dir operations.
-    Io.Dir.rename(old.dir, old.path, new.dir, new.path, w.io) catch |err|
+    Io.Dir.rename(old.dir, old.name, new.dir, new.name, w.io) catch |err|
         return ret(results, errnoFor(err));
     return ret(results, errno.success);
 }
@@ -1412,6 +1519,93 @@ test "resolve contains guest paths inside the preopen" {
             return error.SandboxEscaped;
         }
     }
+}
+
+test "a symlink pointing out of a preopen is refused, intermediate and final (#17)" {
+    // The real-filesystem containment test: `resolve` is lexical, so this is the
+    // part that catches a symlink *stored inside* the preopen whose target is
+    // outside it — the hole #17 closed. Creating a symlink needs privilege
+    // (admin, or Developer Mode + the CreateSymbolicLinkW unprivileged flag);
+    // Zig std's Windows path uses raw FSCTL_SET_REPARSE_POINT, which needs
+    // SeCreateSymbolicLinkPrivilege, so this SKIPS on an unprivileged Windows
+    // box (it runs on POSIX CI, where symlinks are unprivileged). The Windows
+    // path is covered manually by `examples/wasi_symlink_escape.zig` — see
+    // `cmem/testing.md`.
+    const gpa = std.testing.allocator;
+    const tio = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // tmp/outside/secret.txt is OUTSIDE the preopen; tmp/pre is the preopen.
+    try tmp.dir.createDir(tio, "outside", .default_dir);
+    try tmp.dir.createDir(tio, "pre", .default_dir);
+    {
+        const f = try tmp.dir.createFile(tio, "outside/secret.txt", .{});
+        defer f.close(tio);
+        try f.writeStreamingAll(tio, "SECRET");
+    }
+    {
+        const f = try tmp.dir.createFile(tio, "pre/real.txt", .{});
+        defer f.close(tio);
+        try f.writeStreamingAll(tio, "ok");
+    }
+    var pre = try tmp.dir.openDir(tio, "pre", .{ .iterate = true });
+    // Escaping links, planted inside the preopen. If we can't make one, there's
+    // nothing to test — skip rather than pass vacuously.
+    pre.symLink(tio, "../outside", "dlink", .{ .is_directory = true }) catch {
+        pre.close(tio);
+        return error.SkipZigTest;
+    };
+    pre.symLink(tio, "../outside/secret.txt", "flink", .{}) catch {
+        pre.close(tio);
+        return error.SkipZigTest;
+    };
+
+    var mem_bytes = [_]u8{0} ** 128;
+    var mem = Memory{ .bytes = &mem_bytes, .max = null };
+    var obuf: [8]u8 = undefined;
+    var ow = Io.Writer.fixed(&obuf);
+    var w = Wasi.init(gpa, tio, &ow, &ow, 0);
+    defer w.deinit(); // closes the preopen (owned) + any fd path_open opened
+    w.memory = &mem;
+    try w.fds.append(gpa, .{ .dir = .{ .handle = pre, .preopen_name = null, .owned = true } });
+
+    const openErrno = struct {
+        fn f(wasi: *Wasi, buf: []u8, path: []const u8) u32 {
+            @memcpy(buf[0..path.len], path);
+            var results = [_]Value{interp.i32Value(-1)};
+            const args = [_]Value{
+                interp.i32Value(3), // dirfd = the preopen
+                interp.i32Value(1), // lookupflags = SYMLINK_FOLLOW
+                interp.i32Value(0), // path ptr
+                interp.i32Value(@intCast(path.len)),
+                interp.i32Value(0), // oflags
+                interp.i64Value(@bitCast(rights.all)),
+                interp.i64Value(@bitCast(rights.all)),
+                interp.i32Value(0), // fdflags
+                interp.i32Value(120), // opened-fd out
+            };
+            _ = wPathOpen(wasi, &args, &results);
+            return @bitCast(interp.asI32(results[0]));
+        }
+    }.f;
+
+    // A refusal is any error that isn't "opened it": ENOTCAPABLE (our explicit
+    // reject) or ELOOP (POSIX openat O_NOFOLLOW on a symlink) — never SUCCESS,
+    // which would mean we followed the link out.
+    const refused = struct {
+        fn ok(e: u32) bool {
+            return e == errno.notcapable or e == errno.loop;
+        }
+    }.ok;
+
+    try std.testing.expect(refused(openErrno(&w, &mem_bytes, "dlink/secret.txt"))); // intermediate
+    try std.testing.expect(refused(openErrno(&w, &mem_bytes, "flink"))); // final
+
+    // The control: a genuine in-sandbox file still opens, so we didn't just
+    // break all path resolution.
+    try std.testing.expectEqual(errno.success, openErrno(&w, &mem_bytes, "real.txt"));
 }
 
 test "path_open rejects an escaping path with ENOTCAPABLE before touching the host" {

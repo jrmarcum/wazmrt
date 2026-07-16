@@ -286,39 +286,43 @@ Re-run `examples/wasi_files.zig` — "fd_read round-trips the contents" is the c
 
 **Anchor:** the `if (!follow)` pre-stat in `wPathOpen`, `src/wasi.zig`.
 
-## #17 — WASI sandbox containment is **lexical**: a symlink out of a preopen is still followed — OPEN (2026-07-15)
+## #17 — WASI sandbox: a symlink out of a preopen was followed — **DONE 2026-07-16**
 
-**What:** `wasi.resolve()` rejects absolute paths, escaping `..`, NT/device prefixes, and NUL, so a
-guest cannot *name* a path outside its preopen. It does **not** stop a **symlink stored inside the
-preopen whose target is outside it** (e.g. a host process drops `link -> C:\Users`, the guest opens
-`link/secrets.txt` with `SYMLINK_FOLLOW`). We hand `Io.Dir` a contained relative path; the kernel then
-follows the link out.
+**Was:** `wasi.resolve()` is lexical — it stops a guest *naming* a path outside its preopen, but not a
+**symlink stored inside the preopen whose target is outside it**. `follow_symlinks = false` only guards
+the final `openat` component, so an intermediate symlink (`dirlink/secret.txt` where `dirlink ->` an
+outside dir) was followed straight out. **Proven** with a real NTFS symlink: the pre-fix build printed
+`ESCAPED via intermediate dir symlink`, reading a file outside the preopen.
 
-**Why not fixed:** correct containment needs per-component resolution — `openat2(RESOLVE_BENEATH)` on
-Linux or an O_PATH component walk — and Zig 0.16's `Io` exposes neither. Its `resolve_beneath` option is
-a **silent no-op** on Linux and Windows (it only maps to a FreeBSD `O.RESOLVE_BENEATH`;
-`Threaded.zig:4239,4819`), so it cannot be leaned on. Doing it by hand means re-walking each component
-with `statFile(.follow_symlinks=false)` and re-validating the target — TOCTOU-prone and slow.
+**Now: filesystem-level containment via a handle-based component walk** (`walkTo` + `finalIsSymlink` in
+`src/wasi.zig`). Two layers:
+1. lexical `resolve` (unchanged) — absolute / escaping-`..` / NT-device / NUL rejected up front;
+2. **descend one component at a time**, opening each relative to the previous *handle* (TOCTOU-safe —
+   the handle pins the inode; we never re-walk a path string) with `follow_symlinks = false`, and a
+   post-open `stat` rejects anything that isn't a real directory. On POSIX, `openat(O_NOFOLLOW)` on a
+   symlink fails outright (ELOOP); on Windows it can open the reparse point, which the post-open stat
+   then catches (`kind == .sym_link`). A **final-component** symlink is refused by any op that would
+   follow it (`path_open`, `path_filestat_get` with `SYMLINK_FOLLOW`).
 
-**Severity:** matters only when **untrusted guest + a preopen that can contain attacker-influenced
-symlinks**. For the current use (running your own compiled programs against your own directories) the
-exposure is low. It is *not* a defense against a hostile guest.
+**Policy: no symlink is ever traversed.** A guest can't create one (`path_symlink` unimplemented), so
+every symlink in a preopen is host-placed — the attack — and refusing it is the safe default.
+In-sandbox symlink traversal is unsupported; relax to target-revalidation only if a real guest needs it
+(that's why `path_symlink`/`path_readlink` sit behind this at 4.3 — they'd change this policy).
 
-**Surfaces when:** wazmrt runs untrusted modules, or a preopen is shared with another writer — i.e. the
-moment it becomes a multi-tenant/plugin host. Until fixed, say so plainly in the README rather than
-implying the sandbox is airtight.
+**Residual (documented, narrow):** a TOCTOU window on the *final* component of `path_open` only — we
+stat it no-follow then open with follow, because `openFile(.follow_symlinks = false)` crashes the host
+on Windows (std bug #18). A swap in that window needs write access *inside* the sandbox and a race; the
+intermediate walk (the actual reported hole) has no such window. Closing it fully needs #18 fixed
+upstream, or a real `openat2(RESOLVE_BENEATH)` in `Io`.
 
-**SCHEDULED: Phase 4 step 4.2 — do this SECOND**, right after #19 (owner's order, 2026-07-15; see
-`roadmap.md` for the full sequence and the approach). Note this is *earlier* than the "surfaces when"
-above strictly requires — it is scheduled ahead of the conformance work by decision, not necessity.
-**Budget for it: it is the biggest item in Phase 4**, because the fix needs per-component resolution
-that Zig 0.16's `Io` does not expose (no `openat2(RESOLVE_BENEATH)`, no O_PATH walk, `resolve_beneath`
-a no-op off FreeBSD) — expect raw platform syscalls below `Io`, plus TOCTOU care. It also **changes
-what #17-adjacent leftovers (`path_symlink`/`path_readlink`) must do**, which is why those sit at 4.3
-behind it.
+**Verified:** before/after with a real symlink via `examples/wasi_symlink_escape.zig` (pre-fix ESCAPED,
+post-fix all-refused, in-sandbox file still readable); a unit test in `src/wasi.zig` that plants a real
+symlink and drives the path ops (runs on POSIX CI, **skips on unprivileged Windows** — Zig std's Windows
+symlink uses raw `FSCTL_SET_REPARSE_POINT`, which needs `SeCreateSymbolicLinkPrivilege`); Phase 3 file
+gate still 16/16 (no over-restriction).
 
-**Anchor:** `resolve()` + the module doc in `src/wasi.zig`; `wPathOpen` already does its own O_NOFOLLOW
-(pre-`statFile`, `ELOOP` on a symlink) to dodge a std bug — that hook is the natural place to extend.
+**Anchor:** `walkTo`/`finalIsSymlink`/`resolveArg` + the module doc in `src/wasi.zig`;
+`examples/wasi_symlink_escape.zig`.
 
 ## RESOLVED 2026-07-09 (second pass — commit `645874c`)
 

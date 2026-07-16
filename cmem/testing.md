@@ -455,10 +455,32 @@ are ±10% noisy.)
 
 ## Reading the test count (2026-07-16)
 
-`zig build test` prints **232**, but there are **121 distinct tests**: 111 in the core module + 10 C-ABI
+`zig build test` prints **234**, but there are **122 distinct tests**: 112 in the core module + 10 C-ABI
 tests. The `cabi_tests` target's root is `wasm_c_api.zig`, which imports `root.zig`, so it compiles and
-re-runs the core module's tests as well (111 + 121). Harmless — under a second — but **don't quote 232
-as a test count**; quote 121, or the per-target numbers from `--summary all`.
+re-runs the core module's tests as well (112 + 122). Harmless — under a second — but **don't quote 234
+as a test count**; quote 122, or the per-target numbers from `--summary all`. One core test skips on an
+unprivileged Windows box (the #17 real-symlink test — see below), so you'll usually see `1 skip`.
+
+## WASI sandbox: real-symlink containment (#17, 2026-07-16)
+
+The escape #17 closed (a symlink inside a preopen pointing outside it) needs a **real symlink** to test,
+which is where it gets platform-specific:
+
+- **Unit test** (`src/wasi.zig`, "a symlink pointing out of a preopen is refused"): creates the symlink
+  via `Io.Dir.symLink` at runtime, plants it in a `tmpDir`, and drives `wPathOpen`. Runs on POSIX CI
+  (unprivileged symlinks). **Skips on unprivileged Windows** — Zig std's Windows symlink uses raw
+  `FSCTL_SET_REPARSE_POINT`, which needs `SeCreateSymbolicLinkPrivilege` (admin), *not* the
+  `CreateSymbolicLinkW` unprivileged-with-Developer-Mode path. So the test can't create its own symlink
+  there and returns `error.SkipZigTest` rather than pass vacuously.
+- **Windows manual check** (`examples/wasi_symlink_escape.zig`): git-bash *can* make unprivileged native
+  symlinks with `MSYS=winsymlinks:nativestrict` (+ Developer Mode). Plant `dirlink`/`filelink` in a
+  preopen pointing outside it, run the guest. **Verified before/after**: the pre-#17 build printed
+  `ESCAPED via intermediate dir symlink` (it read a file outside the preopen); the fixed build refuses
+  both vectors and still reads a genuine in-sandbox file. The example's doc comment has the exact setup.
+- **Gotcha that cost time:** plain `ln -s` in git-bash makes a **copy**, not a symlink, so an "escape"
+  through it is really reading an in-sandbox copy — a false alarm. Confirm a link is real by changing
+  the outside target and checking the inside reflects it. `Io.Dir.statFile(.follow_symlinks=false).kind`
+  reports `sym_link` only for real reparse points.
 
 ## The C ABI lifecycle fuzz (#22, 2026-07-16)
 
