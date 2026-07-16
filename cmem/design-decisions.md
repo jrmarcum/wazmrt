@@ -6,7 +6,7 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
 
 - **MEMORY SAFETY IS A PROJECT GOAL, AND `wasm_c_api.zig` IS WHERE IT IS AT RISK (owner, 2026-07-15:
   "we do not ever want to introduce exploitable holes").** It is the only file that hands raw ownership
-  across a C boundary, so a mistake there is a *heap-corruption primitive*, not a wrong answer. Four
+  across a C boundary, so a mistake there is a *heap-corruption primitive*, not a wrong answer. Six
   rules, each of which has already been violated once and cost a real bug:
   1. **Every `Ref` free goes through `refDelete`/`destroyRef`.** Never `alloc.destroy` a `Ref` directly:
      it skips the refcount (→ double free) and the object's own cleanup (→ leaked functype/host_global,
@@ -20,12 +20,26 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   4. **Construct ref-able objects with a whole-struct literal.** `alloc.create` returns uninitialized
      memory, and field-by-field assignment leaves `hdr` — hence `rc` — garbage, i.e. freeable at any
      moment. `wasm_instance_new` and `wasm_trap_new` both did this.
+  5. **An `Instance` owns a handle on its `Module`.** `interp.Instance` stores `&m.inner` and
+     dereferences it on every call, but the wasm-c-api contract lets the embedder delete the module
+     right after `wasm_instance_new`. So the instance retains the module and releases it on delete;
+     without it, delete-module-then-call was a segfault (found 2026-07-16 while building the #22 fuzz).
+  6. **Every `wasm_X_delete` for a refcounted type calls `release` first** — do not free unconditionally.
+     `wasm_X_copy` bumps the count, so an unconditional free double-frees the moment an object is copied.
+     `wasm_trap_delete` shipped in #20 without this (it predated refcounting and was never updated); the
+     #22 fuzzer found it on seed 1. Audit all eight (`module`/`instance`/`trap`/`foreign` + the four
+     extern kinds via `refDelete`) whenever a new ref-able type is added.
   **These are enforced by tests, not vigilance:** the C ABI's tests run the C entry points under
   `std.testing.allocator`, which fails on double-free and leaks. `zig build test` reaches them via a
   dedicated `cabi_tests` target — `root.zig` does not import `wasm_c_api.zig` (the dependency runs the
   other way), so for the C ABI's whole life its tests were *unreachable* and it had none.
   **`tests/c_smoke.c` cannot substitute:** on the real allocator a double free silently corrupts the
   freelist and the test still prints `OK`. It did. "It didn't crash" is not evidence of safety.
+  **Beyond the hand-written lifecycle tests, a randomized fuzz (`fuzzStep` + the two `lifecycle fuzz`
+  tests, #22) drives arbitrary new/copy/delete/cast/vec orderings under the same allocator** — 400
+  seeds in `zig build test`, coverage-guided under `zig build test --fuzz`. It found rule 6 on its
+  first seed. When adding a ref-able type or op, extend the fuzz's `FuzzKind`/`fuzzBuild`, not just the
+  example-based tests — the fuzz is the part that finds the ordering nobody thought of.
 - **`Instance.recordTrap` must stay `noinline` (2026-07-15).** `Frame.run`'s `errdefer` expands at
   *every* `try` in a ~200-arm dispatch switch, so whatever it calls is duplicated across hundreds of
   landing pads. Letting `recordTrap` inline bloats `Frame.run` and evicts the interpreter loop from

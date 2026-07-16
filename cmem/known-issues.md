@@ -11,10 +11,40 @@ This file tracks only what's left.
 
 Line numbers are hints (they drift) — the function/construct name is the durable anchor.
 
-## #22 — C ABI lifecycle tests only cover orderings we thought of — OPEN (2026-07-15)
+## #22 — C ABI lifecycle fuzz — **DONE 2026-07-16.** Found 2 more real bugs.
 
-**SCHEDULED: Phase 4 step 4.1 — the FIRST thing tomorrow** (owner, 2026-07-15, ahead of #17 and
-everything else; see `roadmap.md`).
+Built the randomized lifecycle fuzz the owner scheduled as the first item for 2026-07-16. The process —
+studying the object model to build a faithful generator, then running it — turned up **two more real
+memory-safety bugs**, both now fixed:
+
+- **Module use-after-free (found by studying the model, before a line of fuzzer ran).**
+  `interp.Instance` stores `&m.inner` and dereferences it on every call, but the wasm-c-api contract
+  lets the embedder delete the module right after `wasm_instance_new`. So delete-module-then-call was a
+  **segfault**. Fix: the C-ABI `Instance` now holds a handle on its `Module` (`retain` on new, release
+  on delete) — invariant 5 in `design-decisions.md`. This is the #21-bug-2 pattern (a stored pointer
+  with no owned handle) for a second object; worth remembering the *class*, not just the instance.
+- **`wasm_trap_delete` ignored the refcount (found by the fuzzer, on seed 1).** #20 added
+  `wasm_trap_copy` (which `retain`s) but the pre-existing `wasm_trap_delete` freed unconditionally, so
+  `trap_copy` then `delete` was a **double free**. The seeded sweep caught it immediately: a trap gets
+  copied (rc=2), one delete frees it while a handle remains, and a later `new` reuses the address. Fix:
+  `wasm_trap_delete` calls `release` first — invariant 6, and all eight deleters were audited.
+
+**The fuzz itself** (`fuzzStep` + `runFuzzSequence` + two tests in `src/wasm_c_api.zig`):
+- A live-handle **pool** of *owned* handles only; a weighted op generator does
+  new/copy/delete/host_info/cast/table-get/vec-transfer. **Ownership is respected, not papered over:**
+  borrowed views (`as_ref`, `X_as_extern`) are used transiently and never deleted (deleting one is a
+  contract violation, not a bug to report); handing objects to an extern vec removes them from the pool
+  because the vec now owns them.
+- **One driver, two decision sources** via a tiny `decider` interface: `RandDecider` (a seeded
+  `std.Random`) runs **400 seeds × 250 ops in `zig build test`** — deterministic, a failure prints its
+  seed; `SmithDecider` (`std.testing.Smith`) runs the *same* ops **coverage-guided under
+  `zig build test --fuzz`**. Single-sourced so the fuzzer and the CI sweep can never diverge.
+- **The allocator is the oracle** (the comptime `alloc` is `std.testing.allocator` under test): it
+  asserts almost no expected values, only correct *lifetimes* — any leak / double-free / UAF fails.
+- **Verified it actually fails** (a gate nobody has seen fail is decoration): reintroducing the trap
+  bug, the module UAF, and #21-bug-4 each made the fuzz go red.
+
+**Original problem statement, kept for the reasoning:**
 
 **What:** #21 made C ABI memory safety *testable* — `wasm_c_api.zig`'s tests run the C entry points
 under `std.testing.allocator`, which fails on double-free and leaks. But every one of those tests is a

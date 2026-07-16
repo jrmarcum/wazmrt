@@ -453,12 +453,29 @@ V8. **Decision:** build the shipped `.lib`/`.dll` (and the freestanding wasm —
 `design-decisions.md`. (Caveat: single machine; sizes + steady-state are solid, the µs/ms cold numbers
 are ±10% noisy.)
 
-## Reading the test count (2026-07-15)
+## Reading the test count (2026-07-16)
 
-`zig build test` prints **229**, but there are **118 distinct tests**: 111 in the core module + 7 C-ABI
-lifecycle tests. The `cabi_tests` target's root is `wasm_c_api.zig`, which imports `root.zig`, so it
-compiles and re-runs the core module's tests as well (111 + 118). Harmless — a couple hundred ms — but
-**don't quote 229 as a test count**; quote 118, or the per-target numbers from `--summary all`.
+`zig build test` prints **232**, but there are **121 distinct tests**: 111 in the core module + 10 C-ABI
+tests. The `cabi_tests` target's root is `wasm_c_api.zig`, which imports `root.zig`, so it compiles and
+re-runs the core module's tests as well (111 + 121). Harmless — under a second — but **don't quote 232
+as a test count**; quote 121, or the per-target numbers from `--summary all`.
+
+## The C ABI lifecycle fuzz (#22, 2026-07-16)
+
+A randomized driver over object-lifecycle sequences — the follow-up to #21's example-based tests, which
+each only cover an ordering a human chose. Building it found **two more real bugs** (a module UAF and a
+`wasm_trap_delete` double-free; see `known-issues.md` #22).
+
+- **`fuzzStep`** does new/copy/delete/host_info/cast/table-get/vec-transfer against a pool of *owned*
+  handles. Borrowed views are exercised transiently, never deleted; vec transfer removes handles from
+  the pool. **The allocator is the oracle** — it checks lifetimes, not values.
+- **Two entry points, one driver** (a `decider` interface): the deterministic sweep runs **400 seeds ×
+  250 ops in `zig build test`** (a failure prints its seed to reproduce); the coverage-guided one runs
+  the same ops under **`zig build test --fuzz`** via `std.testing.Smith`. Extend `FuzzKind`/`fuzzBuild`
+  when adding a ref-able type — that is the part that finds unimagined orderings.
+- **Proven to fail on real bugs**: reintroducing the trap-delete bug, the module UAF, and #21-bug-4
+  each turned the fuzz red (segfault / leak under the testing allocator). A gate that has only ever
+  passed is decoration — this one has been watched to fail.
 
 ## The C ABI: memory-safety tests (2026-07-15) — read this before touching `wasm_c_api.zig`
 

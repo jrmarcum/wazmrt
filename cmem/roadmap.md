@@ -202,15 +202,23 @@ re-deriving it.** The order was set 2026-07-15 and then twice amended by the own
 surfaced things worth doing first (#20, then #22). None of the inserted items *block* the conformance
 work at the end; they were scheduled ahead of it deliberately.
 
-> ### ⇢ START HERE (2026-07-16): **4.0 — `known-issues.md` #22, the C ABI lifecycle fuzz.**
-> Owner's call at the end of 2026-07-15: *"Lets make that the first item on the list of to dos for
-> tomorrow."* A randomized driver over object-lifecycle sequences (new/copy/same/as_ref/ref_as/
-> host_info/delete + the vec ops), run under `std.testing.allocator` so any double-free / leak / UAF
-> fails the run. **Why first:** #21 made C ABI memory safety testable, but every test there is a
-> sequence *a human chose* — each encodes a bug that already shipped. The surface just grew from ~140
-> to 319 functions in one day (#20), so the gap between "tested orderings" and "reachable orderings"
-> widened sharply and has not been probed. See #22 for the shape, the oracle, and the one trap (don't
-> fuzz borrowed handles as if they were `own`).
+**4.0 — `known-issues.md` #22, the C ABI lifecycle fuzz. DONE 2026-07-16.** A randomized driver over
+object-lifecycle sequences (new/copy/delete/host_info/cast/table-get/vec-transfer) under
+`std.testing.allocator` so any double-free / leak / UAF fails the run — 400 seeds in `zig build test`,
+coverage-guided under `zig build test --fuzz`, one driver behind both. **Building it found two more
+real bugs**: a module use-after-free (`interp.Instance` stored `&m.inner` with no owned handle; the
+embedder deleting the module then calling was a segfault — fixed by having the instance retain the
+module) and a `wasm_trap_delete` double-free (it froze unconditionally, ignoring the refcount
+`wasm_trap_copy` bumps — the fuzz caught it on seed 1, fixed with `release`). Verified the fuzz fails on
+each reintroduced bug. +3 C-ABI tests (121 distinct). Invariants 5–6 in `design-decisions.md`.
+
+> ### ⇢ START HERE (next session): **4.2 — `known-issues.md` #17, make the WASI sandbox real.**
+> The standing order after #22 is #17 → Phase-3 leftovers → the Phase 4 items proper. #17 is the
+> biggest item in Phase 4: containment today is *lexical* (a symlink inside a preopen pointing outside
+> it is still followed), and a real fix needs per-component resolution that Zig 0.16's `Io` doesn't
+> expose — expect raw `openat2(RESOLVE_BENEATH)` / platform syscalls below `Io`, plus TOCTOU care. Its
+> done-condition is concrete: a symlink-out-of-preopen refused, tested in `examples/wasi_files.zig`
+> beside the four escapes that already pass.
 
 **4.1 — `known-issues.md` #19: trap diagnostics. DONE 2026-07-15.** Traps now report a named
 backtrace, innermost frame first — on the exact binary from the Phase 3 hunt:

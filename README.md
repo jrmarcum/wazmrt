@@ -119,10 +119,12 @@ ports bind to the same ABI. `zig build` installs both `wasm.h` and the small
 > `wasm_frame_*`), `wasm_foreign_t`, and module serialize/deserialize/share.
 >
 > **Object lifetimes are refcounted**, so the usual C-API footguns are not
-> footguns here: an export handle keeps its instance alive, a copy keeps the
-> object alive until the last handle goes, and deleting a vector frees each
-> element exactly once. The C entry points are tested under an allocator that
-> fails on double-free or leak.
+> footguns here: an instance keeps its module alive, an export handle keeps its
+> instance alive, a copy keeps the object alive until the last handle goes, and
+> deleting a vector frees each element exactly once — so you can delete a module
+> right after `wasm_instance_new`, per the standard. The C entry points are
+> tested under an allocator that fails on double-free or leak, including a
+> randomized lifecycle fuzz.
 >
 > Two semantics worth knowing: `wasm_*_copy` on a *reference* (module, instance,
 > func, trap, …) returns another handle to the same object — `wasm_*_same` on it

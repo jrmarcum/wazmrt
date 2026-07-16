@@ -703,6 +703,13 @@ const Instance = struct {
     hdr: RefHeader = .{ .tag = .instance },
     inst: root.Instance,
     host_funcs: []interp.Instance.HostFunc = &.{},
+    /// The module this was instantiated from, with a handle held. `inst.module`
+    /// points into `module.inner` and is dereferenced on every call, so the
+    /// module must outlive the instance — but the wasm-c-api contract lets the
+    /// embedder delete it right after `wasm_instance_new`. We retain it here and
+    /// release it when the instance is freed. Without this, delete-module-then-
+    /// call is a use-after-free.
+    module: *Module,
 };
 
 const FuncCallback = *const fn (args: ?*const ValVec, results: ?*ValVec) callconv(.c) ?*Trap;
@@ -1102,7 +1109,11 @@ export fn wasm_instance_new(store: ?*Store, module: ?*const Module, imports: ?*c
             return null;
         },
         .host_funcs = funcs,
+        .module = @constCast(m),
     };
+    // The instance now points into `m.inner` for its whole life; hold a handle
+    // so the embedder deleting the module doesn't free it out from under us.
+    retain(&wi.module.hdr);
     return wi;
 }
 
@@ -1111,6 +1122,7 @@ export fn wasm_instance_delete(instance: ?*Instance) void {
     if (!release(&wi.hdr)) return; // export handles / copies still hold it
     wi.inst.deinit();
     if (wi.host_funcs.len != 0) alloc.free(wi.host_funcs);
+    wasm_module_delete(wi.module); // drop our handle on the module
     alloc.destroy(wi);
 }
 
@@ -1546,6 +1558,7 @@ export fn wasm_trap_message(trap: ?*const Trap, out: *ByteVec) void {
 
 export fn wasm_trap_delete(trap: ?*Trap) void {
     const t = trap orelse return;
+    if (!release(&t.hdr)) return; // a `wasm_trap_copy` handle still holds it
     wasm_byte_vec_delete(&t.message);
     if (t.frames.len != 0) alloc.free(t.frames);
     alloc.destroy(t);
@@ -2498,3 +2511,362 @@ test "every ref-able object starts with exactly one handle" {
 }
 
 const WASM_I32_KIND: Valkind = 0;
+
+test "an instance keeps its module alive after the embedder deletes it" {
+    // Standard wasm-c-api: after wasm_instance_new, the module may be deleted;
+    // the instance is self-contained. But interp.Instance stores `&m.inner` and
+    // dereferences it on every call, so the instance must hold a handle on the
+    // module. Found by studying the model for the #22 fuzz; was a segfault.
+    const e = wasm_engine_new().?;
+    defer wasm_engine_delete(e);
+    const s = wasm_store_new(e).?;
+    defer wasm_store_delete(s);
+    var bin: ByteVec = undefined;
+    wasm_byte_vec_new(&bin, test_add_module.len, &test_add_module);
+    defer wasm_byte_vec_delete(&bin);
+
+    const m = wasm_module_new(s, &bin).?;
+    var trap: ?*Trap = null;
+    var none: ExternVec = undefined;
+    wasm_extern_vec_new_empty(&none);
+    const inst = wasm_instance_new(s, m, &none, &trap).?;
+
+    wasm_module_delete(m); // the embedder is done with the module
+
+    // Now use the instance — must still work.
+    var exps: ExternVec = undefined;
+    wasm_instance_exports(inst, &exps);
+    defer wasm_extern_vec_delete(&exps);
+    const f = wasm_extern_as_func(exps.data[0]).?;
+    var args_buf = [_]Val{ valI32(40), valI32(2) };
+    var args: ValVec = .{ .size = 2, .data = &args_buf };
+    var res_buf = [_]Val{undefined};
+    var res: ValVec = .{ .size = 1, .data = &res_buf };
+    const t = wasm_func_call(f, &args, &res);
+    try std.testing.expect(t == null);
+    try std.testing.expectEqual(@as(i32, 42), res_buf[0].of.i32);
+
+    wasm_instance_delete(inst);
+}
+
+// --- Lifecycle fuzz (known-issues #22) -------------------------------------
+//
+// The hand-written tests above each cover an ordering a human chose — and each
+// encodes a bug that already shipped. This drives *random* lifecycle sequences
+// so it explores orderings nobody imagined, which is where the next double-free
+// hides. It runs under `std.testing.allocator` (see the comptime `alloc`), so
+// the allocator is the oracle: any double-free, leak, or use-after-free fails
+// the run. No expected values — only correct *lifetimes* are checked.
+//
+// Ownership is respected, not papered over: only OWNED handles enter the pool
+// (`new`, `copy`, `table_get`). Borrowed views — `as_ref`, `X_as_extern` — are
+// exercised transiently and never deleted; deleting one would be a contract
+// violation, not a bug the fuzzer should report. Handing objects to an extern
+// vec transfers ownership, so those handles leave the pool.
+
+const FuzzKind = enum { module, instance, func, global, memory, table, trap, foreign, ref };
+
+const FuzzHandle = struct { kind: FuzzKind, ptr: *anyopaque };
+
+const FuzzWorld = struct {
+    engine: *Engine,
+    store: *Store,
+    pool: [64]FuzzHandle = undefined,
+    len: usize = 0,
+
+    fn init() FuzzWorld {
+        const e = wasm_engine_new().?;
+        return .{ .engine = e, .store = wasm_store_new(e).? };
+    }
+
+    fn deinit(w: *FuzzWorld) void {
+        // Drain every owned handle. Refcounting makes the order safe — which is
+        // itself part of what this checks — so just delete in reverse order.
+        while (w.len > 0) {
+            w.len -= 1;
+            fuzzDelete(w.pool[w.len]);
+        }
+        wasm_store_delete(w.store);
+        wasm_engine_delete(w.engine);
+    }
+
+    fn push(w: *FuzzWorld, h: FuzzHandle) void {
+        if (w.len == w.pool.len) {
+            fuzzDelete(h); // pool full: free rather than lose track
+            return;
+        }
+        w.pool[w.len] = h;
+        w.len += 1;
+    }
+
+    fn removeAt(w: *FuzzWorld, i: usize) FuzzHandle {
+        const h = w.pool[i];
+        w.pool[i] = w.pool[w.len - 1];
+        w.len -= 1;
+        return h;
+    }
+};
+
+fn fuzzDelete(h: FuzzHandle) void {
+    switch (h.kind) {
+        .module => wasm_module_delete(@ptrCast(@alignCast(h.ptr))),
+        .instance => wasm_instance_delete(@ptrCast(@alignCast(h.ptr))),
+        .func => wasm_func_delete(@ptrCast(@alignCast(h.ptr))),
+        .global => wasm_global_delete(@ptrCast(@alignCast(h.ptr))),
+        .memory => wasm_memory_delete(@ptrCast(@alignCast(h.ptr))),
+        .table => wasm_table_delete(@ptrCast(@alignCast(h.ptr))),
+        .trap => wasm_trap_delete(@ptrCast(@alignCast(h.ptr))),
+        .foreign => wasm_foreign_delete(@ptrCast(@alignCast(h.ptr))),
+        .ref => wasm_ref_delete(@ptrCast(@alignCast(h.ptr))),
+    }
+}
+
+/// `wasm_X_copy` for a live handle, as a new owned handle of the same kind.
+fn fuzzCopy(h: FuzzHandle) ?FuzzHandle {
+    const p: ?*anyopaque = switch (h.kind) {
+        .module => refApiFor("module").copy(@ptrCast(@alignCast(h.ptr))),
+        .instance => refApiFor("instance").copy(@ptrCast(@alignCast(h.ptr))),
+        .func => refApiFor("func").copy(@ptrCast(@alignCast(h.ptr))),
+        .global => refApiFor("global").copy(@ptrCast(@alignCast(h.ptr))),
+        .memory => refApiFor("memory").copy(@ptrCast(@alignCast(h.ptr))),
+        .table => refApiFor("table").copy(@ptrCast(@alignCast(h.ptr))),
+        .trap => refApiFor("trap").copy(@ptrCast(@alignCast(h.ptr))),
+        .foreign => refApiFor("foreign").copy(@ptrCast(@alignCast(h.ptr))),
+        .ref => wasm_ref_copy(@ptrCast(@alignCast(h.ptr))),
+    };
+    return .{ .kind = h.kind, .ptr = p orelse return null };
+}
+
+/// The `RefHeader` of any ref-able handle — for `set_host_info` / `as_ref`.
+fn fuzzHeader(h: FuzzHandle) *RefHeader {
+    return switch (h.kind) {
+        .ref => @ptrCast(@alignCast(h.ptr)),
+        .module => &@as(*Module, @ptrCast(@alignCast(h.ptr))).hdr,
+        .instance => &@as(*Instance, @ptrCast(@alignCast(h.ptr))).hdr,
+        .trap => &@as(*Trap, @ptrCast(@alignCast(h.ptr))).hdr,
+        .foreign => &@as(*Foreign, @ptrCast(@alignCast(h.ptr))).hdr,
+        .func, .global, .memory, .table => &@as(*Ref, @ptrCast(@alignCast(h.ptr))).hdr,
+    };
+}
+
+fn fuzzBuild(w: *FuzzWorld, kind: FuzzKind) ?FuzzHandle {
+    const s = w.store;
+    const ptr: ?*anyopaque = switch (kind) {
+        .module => fuzzModule(s),
+        .instance => blk: {
+            const m = fuzzModule(s) orelse break :blk null;
+            defer wasm_module_delete(m); // the instance retains it
+            break :blk fuzzInstance(s, m);
+        },
+        .func => fuzzFunc(s),
+        .global => blk: {
+            const gt = wasm_globaltype_new(wasm_valtype_new(WASM_I32_KIND), 0) orelse break :blk null;
+            defer wasm_globaltype_delete(gt);
+            var v: Val = valI32(7);
+            break :blk wasm_global_new(s, gt, &v);
+        },
+        .memory => blk: {
+            var lim: Limits = .{ .min = 1, .max = 2 };
+            const mt = wasm_memorytype_new(&lim) orelse break :blk null;
+            defer wasm_memorytype_delete(mt);
+            break :blk wasm_memory_new(s, mt);
+        },
+        .table => blk: {
+            var lim: Limits = .{ .min = 2, .max = 8 };
+            const tt = wasm_tabletype_new(wasm_valtype_new(129), &lim) orelse break :blk null; // 129 = funcref
+            defer wasm_tabletype_delete(tt);
+            break :blk wasm_table_new(s, tt, null);
+        },
+        .trap => wasm_trap_new(s, null),
+        .foreign => wasm_foreign_new(s),
+        .ref => null, // only produced by table_get
+    };
+    return .{ .kind = kind, .ptr = ptr orelse return null };
+}
+
+fn fuzzModule(s: *Store) ?*Module {
+    var bin: ByteVec = undefined;
+    wasm_byte_vec_new(&bin, test_add_module.len, &test_add_module);
+    defer wasm_byte_vec_delete(&bin);
+    return wasm_module_new(s, &bin);
+}
+
+fn fuzzInstance(s: *Store, m: *Module) ?*Instance {
+    var trap: ?*Trap = null;
+    var none: ExternVec = undefined;
+    wasm_extern_vec_new_empty(&none);
+    return wasm_instance_new(s, m, &none, &trap); // add module has no imports
+}
+
+fn fuzzFunc(s: *Store) ?*Ref {
+    var p: ValTypeVec = undefined;
+    var r: ValTypeVec = undefined;
+    wasm_valtype_vec_new_empty(&p);
+    wasm_valtype_vec_new_empty(&r);
+    const ft = wasm_functype_new(&p, &r) orelse return null;
+    defer wasm_functype_delete(ft);
+    return wasm_func_new(s, ft, testHostNoop);
+}
+
+// The driver takes decisions from a `decider` — anything with `lessThan(n)` and
+// `boolean()` — so one code path serves both the deterministic seeded sweep
+// (`RandDecider`, runs in `zig build test`) and the coverage-guided fuzzer
+// (`SmithDecider`, runs under `zig build test --fuzz`). Single-sourcing the
+// driver is the point: a bug the sweep can't reach, the fuzzer still can, and
+// both exercise identical lifecycle logic.
+const RandDecider = struct {
+    rng: std.Random,
+    fn lessThan(d: RandDecider, n: usize) usize {
+        return d.rng.uintLessThan(usize, n);
+    }
+    fn boolean(d: RandDecider) bool {
+        return d.rng.boolean();
+    }
+};
+const SmithDecider = struct {
+    smith: *std.testing.Smith,
+    fn lessThan(d: SmithDecider, n: usize) usize {
+        // Smith needs a fixed-bitsize type; u32 covers any pool/op count here.
+        return d.smith.valueRangeLessThan(u32, 0, @intCast(n));
+    }
+    fn boolean(d: SmithDecider) bool {
+        return d.smith.value(bool);
+    }
+};
+
+/// One random lifecycle step. Returns nothing meaningful — the allocator judges.
+fn fuzzStep(w: *FuzzWorld, d: anytype) !void {
+    const kinds = [_]FuzzKind{ .module, .instance, .func, .global, .memory, .table, .trap, .foreign };
+    switch (d.lessThan(11)) {
+        // Weighted toward new/copy/delete; the churn is where ordering bugs live.
+        0, 1, 2 => { // new
+            const k = kinds[d.lessThan(kinds.len)];
+            if (fuzzBuild(w, k)) |h| w.push(h);
+        },
+        3, 4 => { // copy a random live handle
+            if (w.len == 0) return;
+            const src = w.pool[d.lessThan(w.len)];
+            if (fuzzCopy(src)) |h| w.push(h);
+        },
+        5, 6 => { // delete a random live handle
+            if (w.len == 0) return;
+            fuzzDelete(w.removeAt(d.lessThan(w.len)));
+        },
+        7 => { // host_info round-trips
+            if (w.len == 0) return;
+            const hdr = fuzzHeader(w.pool[d.lessThan(w.len)]);
+            var marker: u8 = 0;
+            wasm_ref_set_host_info(hdr, &marker);
+            try std.testing.expectEqual(@as(?*anyopaque, &marker), wasm_ref_get_host_info(hdr));
+        },
+        8 => { // cast round-trip: X -> as_ref -> ref_as_X == X; a wrong cast is null
+            if (w.len == 0) return;
+            const h = w.pool[d.lessThan(w.len)];
+            const hdr = fuzzHeader(h);
+            // `ref_as_module` etc. are generated @exports, reached via refApiFor.
+            switch (h.kind) {
+                .module => {
+                    try std.testing.expectEqual(@as(?*Module, @ptrCast(@alignCast(h.ptr))), refApiFor("module").refAs(hdr));
+                    try std.testing.expect(refApiFor("trap").refAs(hdr) == null); // wrong type
+                },
+                .foreign => try std.testing.expect(refApiFor("foreign").refAs(hdr) != null),
+                .trap => try std.testing.expect(refApiFor("trap").refAs(hdr) != null),
+                else => {},
+            }
+        },
+        9 => { // table set (borrows a func) then get (owns) -> push the funcref
+            const ti = pickKind(w, d, .table) orelse return;
+            const fi = pickKind(w, d, .func) orelse return;
+            const tbl: *Ref = @ptrCast(@alignCast(w.pool[ti].ptr));
+            const fun: *Ref = @ptrCast(@alignCast(w.pool[fi].ptr));
+            _ = wasm_table_set(tbl, 0, refApiFor("func").asRef(fun)); // generated @export
+
+            if (wasm_table_get(tbl, 0)) |rh| w.push(.{ .kind = .ref, .ptr = rh });
+        },
+        10 => { // transfer standalone externs into a vec, then delete the vec
+            try fuzzVecMove(w, d);
+        },
+        else => unreachable,
+    }
+}
+
+/// Index of a random live handle of `kind`, or null if none.
+fn pickKind(w: *FuzzWorld, d: anytype, kind: FuzzKind) ?usize {
+    var count: usize = 0;
+    for (w.pool[0..w.len]) |h| {
+        if (h.kind == kind) count += 1;
+    }
+    if (count == 0) return null;
+    var nth = d.lessThan(count);
+    for (w.pool[0..w.len], 0..) |h, i| {
+        if (h.kind == kind) {
+            if (nth == 0) return i;
+            nth -= 1;
+        }
+    }
+    unreachable;
+}
+
+/// Gather up to a few standalone extern handles, hand them to an extern vec
+/// (which takes ownership), and delete the vec — exercising ownership transfer
+/// and the "freed once, with its resources" path (#21 bug 4).
+fn fuzzVecMove(w: *FuzzWorld, d: anytype) !void {
+    var picked: [8]?*Ref = undefined;
+    var n: usize = 0;
+    var i: usize = w.len;
+    while (i > 0 and n < picked.len) { // backwards, so removeAt's swap is safe
+        i -= 1;
+        switch (w.pool[i].kind) {
+            .func, .global, .memory, .table => {
+                picked[n] = @ptrCast(@alignCast(w.removeAt(i).ptr));
+                n += 1;
+            },
+            else => {},
+        }
+        if (d.boolean() and n > 0) break; // sometimes stop early
+    }
+    if (n == 0) return;
+    var vec: ExternVec = undefined;
+    wasm_extern_vec_new(&vec, n, &picked[0]); // takes ownership of the n handles
+    wasm_extern_vec_delete(&vec); // frees each exactly once
+}
+
+fn runFuzzSequence(seed: u64, steps: usize) !void {
+    var prng = std.Random.DefaultPrng.init(seed);
+    var w = FuzzWorld.init();
+    defer w.deinit(); // drains the pool; testing.allocator then checks for leaks
+    const d = RandDecider{ .rng = prng.random() };
+    var n: usize = 0;
+    while (n < steps) : (n += 1) try fuzzStep(&w, d);
+}
+
+test "lifecycle fuzz: random object sequences never leak or double-free" {
+    // Deterministic: a fixed span of seeds, each a fresh world drained at the
+    // end. A failure prints its seed so it reproduces from the log. The testing
+    // allocator is the oracle — this asserts almost nothing itself.
+    var seed: u64 = 1;
+    while (seed <= 400) : (seed += 1) {
+        runFuzzSequence(seed, 250) catch |err| {
+            std.debug.print("lifecycle fuzz failed at seed {d}: {t}\n", .{ seed, err });
+            return err;
+        };
+    }
+}
+
+test "lifecycle fuzz (coverage-guided under `zig build test --fuzz`)" {
+    // Same driver, decisions drawn from the coverage-guided fuzzer instead of a
+    // fixed seed. Outside `--fuzz` this runs one short input and returns, so it
+    // costs the normal test run almost nothing; under `--fuzz` it explores
+    // orderings the seed sweep never reaches. The testing allocator is still the
+    // oracle.
+    try std.testing.fuzz({}, fuzzOneInput, .{});
+}
+
+fn fuzzOneInput(_: void, smith: *std.testing.Smith) !void {
+    var w = FuzzWorld.init();
+    defer w.deinit();
+    const d = SmithDecider{ .smith = smith };
+    // ~5% stop chance per step: sequences long enough to build interesting
+    // ownership graphs, bounded so a single input still terminates.
+    while (!smith.eosWeightedSimple(20, 1)) try fuzzStep(&w, d);
+}
