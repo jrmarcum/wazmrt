@@ -56,6 +56,17 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   have bitten. Full argument + spec in `cmem/security-model.md`; the resolver is `walkFull` in
   `src/wasi.zig`. **Mandatory when touching it: re-run the adversarial fuzz** (`src/wasi.zig`,
   "symlink resolver fuzz" — canary-outside oracle).
+- **Pin verification hashes the bytes it runs, and the gate has no path to re-open (2026-07-17,
+  Phase 5).** `verifyGate` (in `main.zig`) receives the **in-memory module buffer** and hashes *that*;
+  it is handed the path only for messages and never re-reads the file. So the verified bytes provably
+  *are* the executed bytes — the check→use swap window (TOCTOU) is closed by construction, not by
+  discipline a refactor could lose. **Rule: never add a second read of the module by path near the
+  verify/run seam** — if you need the bytes, thread the existing buffer through. The enforcement
+  *policy* lives in the **root-owned** pin DB (`# mode:` directive), so authority comes from the file's
+  ownership; a user's `--no-verify`/`--verify` can only *raise* strictness (`pin.stricter`) and is
+  refused under `enforce` (`pin.decide` returns `.deny` before consulting the opt-out). The whole
+  matrix is the pure `pin.decide(policy, pinned, opt_out, tty)` — unit-tested; keep the CLI a thin shell
+  over it. Signature path (embedded key) is still design-only — see `security-model.md`.
 - **Read-only preopens ride the rights model, not a write-path check (2026-07-17, `--ro-dir`).** A
   `--ro-dir` preopen is just a dir fd whose rights omit `rights.write_mask` (write/create/delete/
   rename/link/truncate/set-times/allocate). It stays enforced for the *whole subtree* because

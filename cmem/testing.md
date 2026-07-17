@@ -481,15 +481,29 @@ V8. **Decision:** build the shipped `.lib`/`.dll` (and the freestanding wasm —
 `design-decisions.md`. (Caveat: single machine; sizes + steady-state are solid, the µs/ms cold numbers
 are ±10% noisy.)
 
-## Reading the test count (updated 2026-07-17)
+## Reading the test count (updated 2026-07-17, Phase 5)
 
-`zig build test --summary all` prints **240** (236 pass, 4 skip), but there are **125 distinct tests**:
-115 in the core module (113 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
+`zig build test --summary all` prints **254** (250 pass, 4 skip), but there are **132 distinct tests**:
+122 in the core module (120 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
 `wasm_c_api.zig`, which imports `root.zig`, so it compiles and **re-runs the core module's tests too**
-(115 core + 10 C-ABI = 125), on top of the standalone `mod_tests` run (115) → 240 printed. Harmless —
-under a second — but **don't quote 240 as a test count**; quote **125**, or the per-target numbers from
+(122 core + 10 C-ABI = 132), on top of the standalone `mod_tests` run (122) → 254 printed. Harmless —
+under a second — but **don't quote 254 as a test count**; quote **132**, or the per-target numbers from
 `--summary all`. Two core tests skip on an unprivileged Windows box (the #17 real-symlink test and the
 traversal example gate — see below), so you'll usually see `2 skip` per run (`4` total).
+
+## Pin verification tests — `src/pin.zig` (2026-07-17, Phase 5)
+
+7 unit tests over the **pure** pin logic (no I/O), so the security matrix is deterministic in CI:
+known SHA-256 vectors (empty/"abc"); `parseHex` round-trip + case-insensitivity + reject; `Db.parse`
+(comments/labels/blanks, `contains`, and **loud-on-corruption** — a mangled content line is
+`error.InvalidPinLine`, so a truncated DB fails closed, not silently short); `modeFromStr`; `stricter`
+(never lowers); `modeFromDb` (`# mode:` directive); and **`decide` — the full enforcement/precedence
+matrix** (off/pinned → run; enforce+unpinned → deny regardless of opt-out/TTY; warn+unpinned →
+opt-out runs, else TTY prompts / non-TTY denies). The CLI (`main.zig` `verifyGate`) is a thin shell
+over `decide`. **End-to-end verified manually** (not yet a build-graph gate): off runs; enforce+pin
+runs; enforce+wrong/absent refuses; warn+no-tty refuses; warn+`--no-verify` runs; **enforce+`--no-verify`
+STILL refuses** (precedence); corrupt DB fails closed; `wazmrt pin --db` appends and the module then
+runs under `enforce`.
 
 ## Compiled-program conformance gate — `zig build wasi-gate` (2026-07-17, Phase 4.4)
 

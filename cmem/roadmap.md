@@ -223,9 +223,20 @@ opens; `symlink_max`→ELOOP). No `openat2(RESOLVE_BENEATH)` needed — the walk
 incl. an adversarial fuzz + Phase 3 gate still 16/16. One documented residual: a narrow
 final-component `path_open` TOCTOU tied to std bug #18. See #17.
 
-> ### ✅ 4.3 COMPLETE (2026-07-16). ✅ 4.4 COMPLETE (2026-07-17). ⇢ START HERE next: **Phase 5 —
-> Secure base: pin verification** (owner chose it 2026-07-17 as the next build; plan in §5 below).
-> **Exception handling** (former "5.1") moves to **Phase 6** — plan retained below, unchanged.
+> ### ✅ 4.3 (2026-07-16). ✅ 4.4 (2026-07-17). ✅ Phase 5 — pin verification COMPLETE (2026-07-17).
+> ⇢ START HERE next: **Phase 6 — Exception handling** (exnref; plan in §6 below).
+>
+> **Phase 5 delivered (DONE 2026-07-17):** `src/pin.zig` (pure logic — SHA-256, content-addressed
+> plaintext pin-DB parse, `# mode:` policy directive, `stricter`, and the pure `decide()` matrix) +
+> the CLI in `main.zig`: `wazmrt pin <file> [--db <path>]`, and `verifyGate` gating execution — it
+> hashes the **in-memory bytes it is about to run** (TOCTOU-safe: `verifyGate` receives the buffer, has
+> no path to re-open), checks the root-owned DB, and applies the policy. Flags: `--pins <path>`,
+> `--verify <mode>` (raise-only), `--no-verify`/`--yes` (**refused under `enforce`** — the precedence
+> rule). Default `off`. 7 new unit tests incl. the full enforcement/precedence matrix; verified
+> end-to-end (off runs; enforce+pin runs; enforce+wrong/absent refuses; warn+no-tty refuses;
+> warn+`--no-verify` runs; enforce+`--no-verify` STILL refuses; corrupt DB fails closed). **Still
+> DESIGN-ONLY: the signature path** (embedded key, Ed25519, `try`-less) — needs the open owner decisions
+> (trust anchor, signature format, revocation) in `security-model.md`.
 >
 > **The C ABI is NOT remaining work** — #20 (all 319 `wasm.h` fns) / #21 (mem-safety) / #22 (fuzz) are
 > DONE and 4.4 added a C conformance guest. Only two narrow, demand-driven residuals stay deferred:
@@ -245,7 +256,7 @@ final-component `path_open` TOCTOU tied to std bug #18. See #17.
 >   all three compilers' output byte-for-byte. The gate *can fail* (wrong output → exit 1, confirmed).
 >
 
-## Phase 5 — Secure base: pin verification (PLANNED, owner-chosen 2026-07-17 — the NEXT build)
+## Phase 5 — Secure base: pin verification (✅ COMPLETE 2026-07-17 — all 6 increments below built)
 
 The **buildable slice of the authenticity design** (`security-model.md`), chosen next because its
 mechanism is fully **DECIDED** and it needs **none** of the still-open *signature* decisions (trust

@@ -39,8 +39,9 @@ compliance process, and for the ledger of any reused code.
 > random, `proc_exit`, and a **sandboxed filesystem** rooted at the directories
 > you preopen with `--dir`/`--ro-dir`, environment passed with `--env`
 > (sockets deferred). It runs stock Zig-, C-, and Rust-compiled `wasm32-wasi`
-> binaries, checked by a build-graph conformance gate (`zig build wasi-gate`).
-> Coming next: multi-memory and exception-handling tags as needed. Requires
+> binaries, checked by a build-graph conformance gate (`zig build wasi-gate`),
+> and can gate execution on a root-owned **pin database** of approved SHA-256
+> hashes (see *Verifying modules* below). Coming next: exception handling. Requires
 > Zig 0.16.
 
 ## Build
@@ -109,6 +110,34 @@ empty. All preopen/`--env` flags are consumed by wazmrt; everything after `--`
 > tied to a Zig std bug on Windows (`cmem/known-issues.md` #17/#18). Creating a
 > symlink (`path_symlink`) needs OS privilege on Windows, so it is POSIX-only on
 > the write side; *following* host-placed symlinks works everywhere.
+
+### Verifying modules (pin database)
+
+wazmrt can gate execution on a **pin database** — a plaintext, content-addressed
+list of approved SHA-256 hashes. Register a module's hash:
+
+```
+wazmrt pin app.wasm                     # prints:  <sha256>  app.wasm
+wazmrt pin app.wasm --db /etc/wazmrt/pins   # …and appends it to the DB
+```
+
+The database is meant to be **root-owned and read-only to the user** (created at
+install time, with privilege); wazmrt only ever reads it. Its first line may set
+the enforcement policy — `# mode: off | warn | enforce`:
+
+- **`off`** (default when there is no DB) — run everything, no check.
+- **`warn`** — an unpinned module prompts `proceed? [y/N]` on an interactive
+  terminal (default No); with no terminal it is refused unless `--no-verify` is
+  passed.
+- **`enforce`** — an unpinned module is **refused**, full stop.
+
+Before running, wazmrt hashes the exact in-memory bytes it is about to execute
+(so the verified bytes *are* the executed bytes — no swap-after-check race) and
+looks them up. `--pins <path>` overrides the DB location; `--verify <mode>` can
+only *raise* strictness; `--no-verify` skips the check **but is refused under an
+`enforce` policy** — a user argument can never weaken a root-owned policy. The
+default is `off`, so verification is opt-in until a DB with a stricter `# mode:`
+is installed. Design + rationale: [`cmem/security-model.md`](cmem/security-model.md).
 
 Implemented: stdout/stderr/stdin, args/environ, clocks, `poll_oneoff` (clock
 sleep), `random_get`, `proc_exit`, and the filesystem (`path_open`, `fd_read`/
