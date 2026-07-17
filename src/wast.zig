@@ -134,6 +134,9 @@ const Runner = struct {
             .global => |want| try gs.append(self.a, try self.resolveGlobalImport(imp.module, imp.name, want)),
             .memory => |want| try ms.append(self.a, try self.resolveMemoryImport(imp.module, imp.name, want)),
             .table => |want| try ts.append(self.a, try self.resolveTableImport(imp.module, imp.name, want)),
+            // An imported tag needs no host backing — it is just a local tag
+            // identity in this module's tag index space (EH proposal).
+            .tag => {},
         };
         return .{ .funcs = fs.items, .globals = gs.items, .memories = ms.items, .tables = ts.items };
     }

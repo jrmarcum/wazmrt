@@ -223,11 +223,20 @@ opens; `symlink_max`→ELOOP). No `openat2(RESOLVE_BENEATH)` needed — the walk
 incl. an adversarial fuzz + Phase 3 gate still 16/16. One documented residual: a narrow
 final-component `path_open` TOCTOU tied to std bug #18. See #17.
 
-> ### ✅ 4.3 (2026-07-16). ✅ 4.4 + Phase 5 (2026-07-17). ✅ Phase 6 exception handling — CORE +
-> **6.1 (WAT assembler + `.wast`) COMPLETE (2026-07-17)**. The exnref proposal now works from text:
-> `(tag …)` / `throw` / `throw_ref` / `try_table` + catch clauses assemble → decode → validate → run,
-> and the `.wast` runner accepts `assert_trap` on an uncaught exception. ⇢ START HERE next: the next
-> frontier (SIMD / multi-memory / the signature path in `security-model.md`).
+> ### ✅ 4.3 (2026-07-16). ✅ 4.4 + Phase 5 (2026-07-17). ✅ Phase 6 exception handling — core +
+> **6.1 (WAT/`.wast`) + 6.2 (tag imports) COMPLETE (2026-07-17)**. The exnref proposal works from text
+> and imported tags decode. ⇢ START HERE next: the next frontier (SIMD / multi-memory / the signature
+> path in `security-model.md`), **or legacy EH** (see the wasmtk result below).
+>
+> **6.2 — tag imports (2026-07-17):** ran the **wasmtk WASI corpus** (`../wasmtk/tests/wasi/wasm_wasi`,
+> 336 files) as a real-world conformance check. 21 failed to decode with `UnknownExternKind` — they
+> import an exception tag (`(import "env" "__exn_tag" (tag …))`, extern kind `0x04`), which Phase 6 had
+> deferred. Fixed: `ExternKind.tag`, tag imports/exports decode into a `tag_space`, imported tags lead
+> the tag index space (`tagType`). **Result: 336 → 321 run fully, 2 library modules (no `_start`), 3
+> correctly trap** (`15_panic`/`15_Trap-On-Error`/`13_Secure…` — they `throw` with no handler, an
+> uncaught exception, which correctly traps with a backtrace), **and 10 use the LEGACY EH encoding**
+> (`try`/`catch`/`rethrow` — 0x06/0x07/0x09), which we scoped out. Supporting legacy EH is the only way
+> to run those 10; it's a real chunk — **owner decision** whether it's worth it.
 >
 > **Phase 6 delivered (DONE 2026-07-17):** the standardized **exnref** proposal end to end —
 > `exnref` value type + `exn` heap type (`types.zig`/`opcode.zig`), the **tag section** (id 13,

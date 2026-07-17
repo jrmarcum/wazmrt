@@ -91,6 +91,9 @@ pub const Extern = union(enum) {
     table: TableType,
     memory: MemoryType,
     global: GlobalType,
+    /// An imported exception tag (EH proposal): its type is a function type
+    /// whose params are the exception's value types.
+    tag: FuncType,
 
     pub fn kind(self: Extern) types.ExternKind {
         return switch (self) {
@@ -98,6 +101,7 @@ pub const Extern = union(enum) {
             .table => .table,
             .memory => .memory,
             .global => .global,
+            .tag => .tag,
         };
     }
 };
@@ -230,6 +234,9 @@ const Decoder = struct {
     table_space: std.ArrayList(TableType) = .empty,
     mem_space: std.ArrayList(MemoryType) = .empty,
     global_space: std.ArrayList(GlobalType) = .empty,
+    /// Exception-tag index space (imported tags first, then defined), each as its
+    /// signature — so an exported tag resolves its type (EH proposal).
+    tag_space: std.ArrayList(FuncType) = .empty,
     global_init_space: std.ArrayList([]const u8) = .empty,
 };
 
@@ -436,10 +443,19 @@ pub fn funcSig(self: *const Module, ti: u32) ?FuncType {
 }
 
 /// The function type an exception `tag` names (its params are the exception's
-/// value types). Null if the tag index or its type index is out of range.
+/// value types). Imported tags lead the tag index space (like imported funcs),
+/// then defined tags. Null if the index or its type index is out of range.
 pub fn tagType(self: *const Module, tag_index: u32) ?FuncType {
-    if (tag_index >= self.tags.len) return null;
-    return self.funcSig(self.tags[tag_index]);
+    var i: u32 = 0;
+    for (self.imports) |imp| {
+        if (imp.type == .tag) {
+            if (i == tag_index) return imp.type.tag;
+            i += 1;
+        }
+    }
+    const defined = tag_index - i;
+    if (defined >= self.tags.len) return null;
+    return self.funcSig(self.tags[defined]);
 }
 
 /// The struct field vector at type index `ti`, or null if `ti` is not a struct.
@@ -808,6 +824,13 @@ fn decodeImportSection(d: *Decoder, r: *Reader) Error![]const Import {
                 try d.global_space.append(d.a, gt);
                 break :blk .{ .global = gt };
             },
+            .tag => blk: {
+                // Tag import: an attribute byte (0 = exception) + a type index.
+                if ((try r.readByte()) != 0x00) return error.MalformedFlag;
+                const ft = try funcTypeAt(d, try r.readVarU32());
+                try d.tag_space.append(d.a, ft);
+                break :blk .{ .tag = ft };
+            },
             else => return error.UnknownExternKind,
         };
     }
@@ -833,6 +856,7 @@ fn decodeTagSection(d: *Decoder, r: *Reader) Error![]const u32 {
         const attr = try r.readByte();
         if (attr != 0x00) return error.MalformedFlag; // only the exception attribute (0) exists
         i.* = try r.readVarU32();
+        try d.tag_space.append(d.a, try funcTypeAt(d, i.*)); // defined tags follow imported ones
     }
     return list;
 }
@@ -867,6 +891,7 @@ fn decodeExportSection(d: *Decoder, r: *Reader) Error![]const Export {
             .table => .{ .table = try spaceAt(TableType, d.table_space, e.index) },
             .memory => .{ .memory = try spaceAt(MemoryType, d.mem_space, e.index) },
             .global => .{ .global = try spaceAt(GlobalType, d.global_space, e.index) },
+            .tag => .{ .tag = try spaceAt(FuncType, d.tag_space, e.index) },
             else => return error.UnknownExternKind,
         };
     }

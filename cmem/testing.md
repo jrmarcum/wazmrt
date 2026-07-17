@@ -483,11 +483,11 @@ are ±10% noisy.)
 
 ## Reading the test count (updated 2026-07-17, Phase 6)
 
-`zig build test --summary all` prints **278** (274 pass, 4 skip), but there are **144 distinct tests**:
-134 in the core module (132 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
+`zig build test --summary all` prints **280** (276 pass, 4 skip), but there are **145 distinct tests**:
+135 in the core module (133 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
 `wasm_c_api.zig`, which imports `root.zig`, so it compiles and **re-runs the core module's tests too**
-(134 core + 10 C-ABI = 144), on top of the standalone `mod_tests` run (134) → 278 printed. Harmless —
-under a second — but **don't quote 278 as a test count**; quote **144**, or the per-target numbers from
+(135 core + 10 C-ABI = 145), on top of the standalone `mod_tests` run (135) → 280 printed. Harmless —
+under a second — but **don't quote 280 as a test count**; quote **145**, or the per-target numbers from
 `--summary all`. Two core tests skip on an unprivileged Windows box (the #17 real-symlink test and the
 traversal example gate — see below), so you'll usually see `2 skip` per run (`4` total).
 
@@ -508,6 +508,20 @@ hand-encoded constants < 64 or emit a proper multi-byte SLEB.
 resolving by name to an enclosing block); 1 test in `wast.zig` runs a `.wast` script asserting a caught
 exception returns a value **and** `assert_trap` fires on an uncaught one. Also CLI-verified
 (`wazmrt eh.wat run`, `wazmrt eh.wast`).
+
+**Phase 6.2 (tag imports):** 1 test in `interp.zig` imports a tag from `env`, throws + catches it by
+index 0, proving imported tags lead the tag index space.
+
+## wasmtk WASI corpus — real-world conformance snapshot (2026-07-17)
+
+Not in the repo (sibling `../wasmtk/tests/wasi/wasm_wasi`, 336 compiled `wasm32-wasi` programs from a
+mix of source languages), so it's a *manual* check, not a CI gate. Ran each through the release CLI
+(stdin=/dev/null, 15 s timeout). **Result: 321 run fully, 2 are `_start`-less library modules, 3
+correctly trap** (they `throw` with no handler — an uncaught exception, which traps with a backtrace),
+**10 use the legacy EH encoding** (`try`/`catch`/`rethrow`) which is out of scope. **Zero runtime
+crashes; zero traps outside the 3 deliberate uncaught-throws.** The 21 that first failed with
+`UnknownExternKind` (tag imports) were fixed in Phase 6.2. Reproduce with a shell loop over the corpus;
+`error:`/`trap:` are printed but the CLI still exits 0, so classify on *output text*, not exit code.
 
 ## Pin verification tests — `src/pin.zig` (2026-07-17, Phase 5)
 

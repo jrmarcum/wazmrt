@@ -2326,3 +2326,27 @@ test "EH: throw_ref rethrows a caught exnref to an outer catch_all" {
     defer std.testing.allocator.free(r);
     try std.testing.expectEqual(@as(i32, 5), asI32(r[0]));
 }
+
+test "EH: an imported tag leads the tag index space and can be thrown + caught" {
+    // Import a tag from env, then throw/catch it by index 0 (the imported tag),
+    // proving imported tags decode and lead the tag index space (Phase 6.2).
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x02, 0x60, 0x01, 0x7f, 0x00, 0x60, 0x00, 0x01, 0x7f } }, // (func(param i32)), (func()->i32)
+        // import "env"."e" (tag (type 0)) — kind 0x04, attr 0x00, typeidx 0.
+        .{ .id = 2, .body = &.{ 0x01, 0x03, 'e', 'n', 'v', 0x01, 'e', 0x04, 0x00, 0x00 } },
+        .{ .id = 3, .body = &.{ 0x01, 0x01 } }, // func 0 : type 1
+        .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{
+            // try_table (result i32) (catch 0 0) ; i32.const 42 ; throw 0 ; end
+            &.{ 0x00, 0x1f, 0x7f, 0x01, 0x00, 0x00, 0x00, 0x41, 0x2a, 0x08, 0x00, 0x0b, 0x0b },
+        }) },
+    });
+    var inst = try instantiateValidated(bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("f", &.{});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(i32, 42), asI32(r[0]));
+}

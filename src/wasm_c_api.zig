@@ -382,6 +382,9 @@ fn makeValTypeVec(out: *ValTypeVec, src: []const types.ValType) void {
 
 fn makeExternType(ext: root.Module.Extern) ?*anyopaque {
     switch (ext) {
+        // The classic wasm-c-api has no tag externtype (a wasmtime extension);
+        // an imported/exported tag is not representable here.
+        .tag => return null,
         .func => |ft| {
             const obj = alloc.create(FuncType) catch return null;
             obj.ekind = EXTERN_FUNC;
@@ -1080,6 +1083,9 @@ export fn wasm_instance_new(store: ?*Store, module: ?*const Module, imports: ?*c
             .table => if (ext) |e| {
                 if (e.host_table) |tbl| tbls.append(alloc, tbl) catch return null;
             },
+            // An imported tag needs no host backing (EH proposal) — it is a local
+            // tag identity in the module's tag index space.
+            .tag => {},
         }
     }
 

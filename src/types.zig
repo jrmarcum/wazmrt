@@ -239,6 +239,7 @@ pub const ExternKind = enum(u8) {
     table = 0x01,
     memory = 0x02,
     global = 0x03,
+    tag = 0x04, // exception tag (EH proposal)
     _,
 };
 
