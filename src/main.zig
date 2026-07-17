@@ -192,24 +192,42 @@ fn runWasi(
     defer wasi.deinit();
     wasi.stdin = &stdin_file_reader.interface;
 
-    // `--dir <host>[:<guest>]` preopens: the guest can reach these and nothing
-    // else. Everything after them is argv for the guest.
+    // wazmrt flags precede the guest's own argv. Each takes a value:
+    //   --dir <host>[:<guest>]      read-write preopen (the guest's only files)
+    //   --ro-dir <host>[:<guest>]   read-only preopen (no write/create/delete)
+    //   --env KEY=VAL               one environment variable for the guest
+    //   --                          end of wazmrt flags; the rest is guest argv
+    var environ: std.ArrayList([]const u8) = .empty;
     var rest = wasi_args;
-    while (rest.len >= 2 and std.mem.eql(u8, rest[0], "--dir")) {
-        const spec = rest[1];
-        // Split on the LAST ':' so a Windows host path (`C:\tmp`) still parses.
-        const host, const guest = if (std.mem.lastIndexOfScalar(u8, spec, ':')) |i|
-            if (i > 1) .{ spec[0..i], spec[i + 1 ..] } else .{ spec, spec }
-        else
-            .{ spec, spec };
-        _ = wasi.addPreopen(host, guest) catch |e| {
-            try out.print("error: --dir '{s}': {s}\n", .{ host, @errorName(e) });
-            return 1;
-        };
-        rest = rest[2..];
+    flags: while (rest.len >= 1) {
+        const flag = rest[0];
+        const ro = std.mem.eql(u8, flag, "--ro-dir");
+        if ((std.mem.eql(u8, flag, "--dir") or ro) and rest.len >= 2) {
+            const spec = rest[1];
+            // Split on the LAST ':' so a Windows host path (`C:\tmp`) still parses.
+            const host, const guest = if (std.mem.lastIndexOfScalar(u8, spec, ':')) |i|
+                if (i > 1) .{ spec[0..i], spec[i + 1 ..] } else .{ spec, spec }
+            else
+                .{ spec, spec };
+            const rmask = if (ro) wazmrt.wasi.readOnlyRights else wazmrt.wasi.allRights;
+            _ = wasi.addPreopen(host, guest, rmask) catch |e| {
+                try out.print("error: {s} '{s}': {s}\n", .{ flag, host, @errorName(e) });
+                return 1;
+            };
+            rest = rest[2..];
+            continue :flags;
+        }
+        if (std.mem.eql(u8, flag, "--env") and rest.len >= 2) {
+            // WASI environ entries are `KEY=VALUE`; pass through verbatim.
+            try environ.append(arena, try arena.dupe(u8, rest[1]));
+            rest = rest[2..];
+            continue :flags;
+        }
+        // An explicit `--` ends our flags; everything after it is the guest's.
+        if (std.mem.eql(u8, flag, "--")) rest = rest[1..];
+        break :flags;
     }
-    // An explicit `--` ends our flags; everything after it is the guest's.
-    if (rest.len >= 1 and std.mem.eql(u8, rest[0], "--")) rest = rest[1..];
+    wasi.environ = environ.items;
 
     // argv: the module path, then the guest's own args (the preopen flags are
     // ours, not the guest's).

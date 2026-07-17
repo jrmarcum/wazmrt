@@ -37,9 +37,11 @@ compliance process, and for the ledger of any reused code.
 > preview 1** command modules — including real LLVM-compiled `wasm32-wasi`
 > programs: stdout/stderr, args/environ, clocks, `poll_oneoff` (sleep), stdin,
 > random, `proc_exit`, and a **sandboxed filesystem** rooted at the directories
-> you preopen with `--dir` (sockets deferred). Coming next: CLI ergonomics
-> (`--env`), broader compiled-program conformance, plus multi-memory and
-> exception-handling tags as needed. Requires Zig 0.16.
+> you preopen with `--dir`/`--ro-dir`, environment passed with `--env`
+> (sockets deferred). It runs stock Zig-, C-, and Rust-compiled `wasm32-wasi`
+> binaries, checked by a build-graph conformance gate (`zig build wasi-gate`).
+> Coming next: multi-memory and exception-handling tags as needed. Requires
+> Zig 0.16.
 
 ## Build
 
@@ -49,6 +51,8 @@ zig build run -- <file.wasm>       # summarize, or run _start (WASI command)
 zig build run -- <file.wat>        # assemble .wat, then the same
 zig build run -- <file.wasm> <export> [args…]   # run an exported function
 zig build test                     # unit tests
+zig build wasi-gate                # compile Zig+C wasm32-wasi programs, run them, assert output
+                                   #   add -Drust-gate=true to also cross-check a rustc build
 zig build wasm                     # build the runtime itself as a wasm module
 zig build dll                      # C-ABI shared library (for FFI: Deno, ctypes, …)
 zig build c-smoke                  # build + run the C example (needs no external deps)
@@ -74,7 +78,7 @@ A module exporting `_start` runs as a WASI command. Anything after the module
 path is passed through as the guest's `argv`, except the preopen flags:
 
 ```
-wazmrt files.wasm --dir ./data:/data -- app args…
+wazmrt files.wasm --dir ./data:/data --ro-dir ./assets:/assets --env LANG=C -- app args…
 ```
 
 `--dir <host>[:<guest>]` **preopens** a host directory and is the guest's *only*
@@ -83,6 +87,15 @@ and with one it can reach that directory and nothing above it. The guest sees it
 under `<guest>` (defaulting to the host path). wazmrt resolves guest paths itself
 and refuses absolute paths, `..` escapes, and NT/device prefixes — an interior
 `..` that stays inside is fine. See [`examples/wasi_files.zig`](examples/wasi_files.zig).
+
+`--ro-dir` preopens a directory **read-only**: it hands out every read right but
+no mutating one (write, create, delete, rename, link, truncate, set-times). Because
+`path_open` can only ever *narrow* an fd's rights against the directory it came
+from, the read-only-ness propagates to the whole subtree — nothing opened under a
+`--ro-dir` preopen can write either. `--env KEY=VAL` (repeatable) sets one
+environment variable visible to the guest; the guest's environment is otherwise
+empty. All preopen/`--env` flags are consumed by wazmrt; everything after `--`
+(or the first non-flag) is the guest's `argv`.
 
 > **Scope of the sandbox.** Containment is enforced two ways: **lexically** (a
 > guest cannot name a path outside its preopens) and **through the filesystem**

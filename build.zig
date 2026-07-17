@@ -143,6 +143,56 @@ pub fn build(b: *std.Build) void {
         bench_step.dependOn(&run_bench.step);
     }
 
+    // ---- Compiled-program conformance gate (`zig build wasi-gate`) ---------
+    // Compiles REAL `wasm32-wasi` programs with independent toolchains, runs
+    // each through the wazmrt CLI, and asserts exact stdout. This turns the
+    // hand-run WASI examples into a CI gate: a regression in decode /
+    // instantiate / the WASI host surface fails the build, not a manual check.
+    //
+    //   Zig  — always available (this toolchain), compiled to wasm32-wasi.
+    //   C    — always available (`zig cc` ships clang + wasi-libc).
+    //   Rust — opt-in `-Drust-gate=true` (needs rustc w/ wasm32-wasip1); a
+    //          genuinely different compiler is the strongest conformance signal.
+    {
+        const wasi_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi });
+        const gate_step = b.step("wasi-gate", "Compile wasm32-wasi programs (Zig/C[/Rust]) and run them through wazmrt");
+
+        // Assert `wazmrt <wasm>` prints exactly `out`.
+        const assertOut = struct {
+            fn run(bld: *std.Build, cli: *std.Build.Step.Compile, step: *std.Build.Step, wasm: std.Build.LazyPath, out: []const u8) void {
+                const r = bld.addRunArtifact(cli);
+                r.addFileArg(wasm);
+                r.expectStdOutEqual(out);
+                step.dependOn(&r.step);
+            }
+        }.run;
+
+        // Zig guest — compiled by the Zig build graph itself.
+        const zig_guest = b.addExecutable(.{
+            .name = "wasi_gate_zig",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("examples/hello_compiled.zig"),
+                .target = wasi_target,
+                .optimize = .ReleaseSmall,
+            }),
+        });
+        assertOut(b, exe, gate_step, zig_guest.getEmittedBin(), "Hello from a compiled WASI program!\nbulk-memory memcpy works\nsaturating truncation works\n");
+
+        // C guest — `zig cc -target wasm32-wasi` (LLVM + bundled wasi-libc).
+        const cc = b.addSystemCommand(&.{ b.graph.zig_exe, "cc", "-target", "wasm32-wasi", "-Oz", "-o" });
+        const c_wasm = cc.addOutputFileArg("c_hello.wasm");
+        cc.addFileArg(b.path("examples/c_hello.c"));
+        assertOut(b, exe, gate_step, c_wasm, "Hello from C on wazmrt!\nsum 1..100 = 5050\n");
+
+        // Rust guest — opt-in; a third, independent compiler.
+        if (b.option(bool, "rust-gate", "Also build examples/rust_hello.rs via rustc (needs wasm32-wasip1)") orelse false) {
+            const rc = b.addSystemCommand(&.{ "rustc", "--target", "wasm32-wasip1", "-O", "-o" });
+            const rust_wasm = rc.addOutputFileArg("rust_hello.wasm");
+            rc.addFileArg(b.path("examples/rust_hello.rs"));
+            assertOut(b, exe, gate_step, rust_wasm, "Hello from Rust on wazmrt!\nsum of squares 1..5 = 55\n");
+        }
+    }
+
     // ---- Tests -------------------------------------------------------------
     const mod_tests = b.addTest(.{ .root_module = mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);

@@ -53,14 +53,15 @@ The pipeline, in order: **decode → validate → execute**, with a text front-e
 | `src/validate.zig` | Spec type-checking validator over the IR (value + control-frame stacks) + module-level checks: global-init/element const-exprs, `select`/`if`/`call_indirect`/alignment/memory-presence. |
 | `src/interp.zig` | `Instance` + the switch interpreter (untyped `u64` slots, label stack). Runs int/float/memory, `call_indirect` over multiple tables, reference types + table ops, element segments, **imported functions** (`HostFunc`), **full WasmGC** (i31/struct/array heap, casts, subtyping), and bulk memory/table ops; carries the **trap backtrace** (`errdefer`-recorded frames). |
 | `src/sexpr.zig` / `src/wat.zig` / `src/wast.zig` | Text toolchain: S-expression parser → WAT→wasm-binary assembler (`wat.zig` maps names→`Op` via `stringToEnum`) → WAST script runner (`wast.zig`, drives an `Instance`, compares — **runs the official spec testsuite**). |
-| `src/wasi.zig` | **WASI preview 1** as native host imports: stdio/args/environ/clocks/`poll_oneoff`/random/`proc_exit` + the **sandboxed filesystem** (`--dir` preopens, host-fd table, and the security-critical handle-stack path resolver `walkFull` — follows symlinks, escape impossible by construction; see `security-model.md`). |
+| `src/wasi.zig` | **WASI preview 1** as native host imports: stdio/args/environ/clocks/`poll_oneoff`/random/`proc_exit` + the **sandboxed filesystem** (`--dir`/read-only `--ro-dir` preopens, host-fd table, and the security-critical handle-stack path resolver `walkFull` — follows symlinks, escape impossible by construction; see `security-model.md`). Read-only-ness rides the rights model: `path_open` only narrows an fd's rights against its parent, so a `--ro-dir`'s no-write mask propagates to the whole subtree. |
 | `src/wasm_c_api.zig` | The **standard wasm-c-api** — every one of the 319 functions `wasm.h` declares is defined (link-gated by `tests/c_abi_symbols.c`), with a refcounted `wasm_ref_t` object model. The ABI every `universalWasmLoader-*` port binds to (+ the `wazmrt_*` extension handshake). **The one file that hands raw ownership across a C boundary — memory-safety-critical (`design-decisions.md`), lifecycle-fuzzed.** |
 | `src/root.zig` | Library surface (`@import("wazmrt")`). Re-exports `types`/`Reader`/`Module`/`opcode`/`validate`/`interp`/`Instance`/`sexpr`/`wat`/`wast`/`wasi`/`decode`/`version`/`abi_version`. |
 
 ## Build targets (see architecture.md)
 
 - `zig build`      → native CLI `wazmrt` + C-ABI static lib `wazmrt` + installs `wasm.h` + `wazmrt.h`
-- `zig build test` → runs the unit tests (**65 passing** as of 2026-07-09)
+- `zig build test` → runs the unit tests (**125 distinct**, 240 printed as of 2026-07-17; see `testing.md`)
+- `zig build wasi-gate` → compiles real `wasm32-wasi` guests (Zig + C via `zig cc`; Rust with `-Drust-gate=true`) and runs them through wazmrt asserting stdout
 - `zig build wasm` → builds the runtime itself as a freestanding `wasm32` module
 - `zig build run -- <file.wasm> [export args…]` → summarize a module, or invoke an export and print results
 

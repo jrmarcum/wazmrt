@@ -160,7 +160,26 @@ const rights = struct {
     /// Everything a preopened directory hands out (dir rights + what files
     /// opened under it may inherit).
     const all: u64 = (1 << 29) - 1;
+
+    /// The rights that let a guest *mutate* the filesystem — write, create,
+    /// delete, rename, link, truncate, set-times, preallocate.
+    const write_mask: u64 = fd_write | fd_allocate |
+        path_create_directory | path_create_file |
+        path_link_source | path_link_target |
+        path_rename_source | path_rename_target |
+        path_filestat_set_times | fd_filestat_set_size | fd_filestat_set_times |
+        path_remove_directory | path_unlink_file;
+
+    /// A read-only preopen (`--ro-dir`): everything except the mutating rights.
+    /// Since `path_open` intersects a new fd's rights with the dir fd's
+    /// inheriting rights, nothing opened under a read-only preopen can write
+    /// either — the restriction propagates.
+    const read_only: u64 = all & ~write_mask;
 };
+
+/// Preopen rights masks for the embedder (the CLI's `--dir` / `--ro-dir`).
+pub const allRights: u64 = rights.all;
+pub const readOnlyRights: u64 = rights.read_only;
 
 /// `oflags` for `path_open`.
 const oflags = struct {
@@ -343,7 +362,11 @@ pub const Wasi = struct {
 
     /// Preopen `host_path` as the guest-visible directory `guest_name`, so the
     /// guest may reach it (and only it) via `path_open`. Returns the guest fd.
-    pub fn addPreopen(self: *Wasi, host_path: []const u8, guest_name: []const u8) !u32 {
+    /// Preopen `host_path` as guest dir `guest_name` with the given `dir_rights`
+    /// (`rights.all` for read-write, `rights.read_only` for `--ro-dir`). The
+    /// rights also cap what fds opened under it may hold (inheriting), so a
+    /// read-only preopen makes the whole subtree read-only.
+    pub fn addPreopen(self: *Wasi, host_path: []const u8, guest_name: []const u8, dir_rights: u64) !u32 {
         const cwd = Io.Dir.cwd();
         const handle = if (std.fs.path.isAbsolute(host_path))
             try Io.Dir.openDirAbsolute(self.io, host_path, .{ .iterate = true })
@@ -353,7 +376,12 @@ pub const Wasi = struct {
 
         const name = try self.gpa.dupe(u8, guest_name);
         errdefer self.gpa.free(name);
-        try self.fds.append(self.gpa, .{ .dir = .{ .handle = handle, .preopen_name = name } });
+        try self.fds.append(self.gpa, .{ .dir = .{
+            .handle = handle,
+            .preopen_name = name,
+            .rights_base = dir_rights,
+            .rights_inheriting = dir_rights,
+        } });
         return @intCast(self.fds.items.len - 1);
     }
 
@@ -2023,6 +2051,35 @@ test "path_open rejects an escaping path with ENOTCAPABLE before touching the ho
     };
     try std.testing.expect(wPathOpen(&w, &args, &results));
     try std.testing.expectEqual(@as(i32, @bitCast(errno.notcapable)), interp.asI32(results[0]));
+}
+
+test "read-only preopen rights can never yield a writable child fd (--ro-dir)" {
+    // The security contract behind `--ro-dir`: a read-only preopen omits every
+    // mutating right, and `path_open` only ever *narrows* (new_inheriting =
+    // want_inheriting & dir.inheriting). So no matter what a guest asks for,
+    // nothing opened under a read-only preopen can gain a write right.
+    const ro = readOnlyRights;
+
+    // The mask itself carries no mutating right...
+    try std.testing.expectEqual(@as(u64, 0), ro & rights.write_mask);
+    inline for (.{
+        rights.fd_write,          rights.path_create_file, rights.path_create_directory,
+        rights.path_unlink_file,  rights.path_remove_directory, rights.path_link_source,
+        rights.path_rename_source, rights.fd_filestat_set_size, rights.fd_allocate,
+    }) |bit| {
+        try std.testing.expectEqual(@as(u64, 0), ro & bit);
+    }
+    // ...yet keeps the read rights that make it useful.
+    try std.testing.expect(ro & rights.fd_read != 0);
+    try std.testing.expect(ro & rights.path_open != 0);
+    try std.testing.expect(ro & rights.fd_readdir != 0);
+
+    // The intersection path_open performs: even a guest that requests *all*
+    // rights (rights.all) under a read-only dir fd is narrowed to no writes.
+    const child_inheriting = rights.all & ro;
+    try std.testing.expectEqual(@as(u64, 0), child_inheriting & rights.write_mask);
+    // A read-write preopen, by contrast, does pass write rights through.
+    try std.testing.expect((rights.all & allRights) & rights.fd_write != 0);
 }
 
 test "fd_prestat_get/dir_name enumerate preopens and stop at the first non-preopen" {

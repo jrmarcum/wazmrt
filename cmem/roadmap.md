@@ -223,12 +223,23 @@ opens; `symlink_max`→ELOOP). No `openat2(RESOLVE_BENEATH)` needed — the walk
 incl. an adversarial fuzz + Phase 3 gate still 16/16. One documented residual: a narrow
 final-component `path_open` TOCTOU tied to std bug #18. See #17.
 
-> ### ✅ 4.3 COMPLETE (2026-07-16). ⇢ START HERE next: **4.4 — the Phase 4 items proper** (below):
-> `--env KEY=VAL`, a `zig build`-driven compiled-program gate, and broadened C/Rust/Zig conformance.
-> **Also unscheduled but high-value from the security conversation: `--ro-dir` (read-only preopens)** —
-> the rights machinery exists; it makes least-authority pipelines expressible and is cheap. Consider it
-> for 4.4 or ahead of it.
+> ### ✅ 4.3 COMPLETE (2026-07-16). ✅ 4.4 COMPLETE (2026-07-17). ⇢ START HERE next: pick the next
+> Phase 4/5 frontier (multi-memory, exception-handling tags, or the deferred authenticity design in
+> `security-model.md` awaiting owner decisions).
 >
+> **4.4 delivered (all DONE 2026-07-17):**
+> - **`--env KEY=VAL`** (repeatable) — sets one guest env var; guest environ otherwise empty. `main.zig`.
+> - **`--ro-dir <host>[:<guest>]`** — read-only preopen. `wasi.zig` gained `rights.write_mask` /
+>   `rights.read_only` and public `allRights`/`readOnlyRights`; `addPreopen` takes `dir_rights: u64`.
+>   Because `path_open` only ever *narrows* an fd's rights against its parent dir fd, read-only-ness
+>   propagates to the whole subtree. Unit-tested (rights-mask + narrowing invariant, POSIX-CI).
+> - **`zig build wasi-gate`** — compiles REAL `wasm32-wasi` guests and runs them through the wazmrt CLI,
+>   asserting exact stdout. **Zig + C (`zig cc`) always-on** (both ship with the Zig toolchain);
+>   **Rust opt-in via `-Drust-gate=true`** (needs rustc w/ wasm32-wasip1). Guests:
+>   `examples/hello_compiled.zig`, `examples/c_hello.c`, `examples/rust_hello.rs`. Verified wazmrt runs
+>   all three compilers' output byte-for-byte. The gate *can fail* (wrong output → exit 1, confirmed).
+>
+
 > 4.3 delivered (all DONE 2026-07-16): the safe leftovers (`fd`/`path_filestat_set_times`, `fd_allocate`,
 > `path_link`, `poll_oneoff` EBADF fix) **and** — owner chose full traversal — `path_symlink`/
 > `path_readlink` with the secure **handle-stack resolver** (`walkFull`): in-sandbox symlinks followed,
@@ -320,11 +331,12 @@ These are the likeliest things 4.4 trips over, since wasi-libc and Rust's std to
 than our Zig guests do. Note **4.2 changes what `path_symlink`/`path_readlink` must do** — implementing
 them before the sandbox is real would mean writing them twice, which is part of why they sit after it.
 
-**4.4 — the Phase 4 items proper.** ~~CLI `--dir`~~ (done in Phase 3) / `--env KEY=VAL` /
-~~`-- <guest args>`~~ (done). A reproducible `zig build`-driven gate that compiles a real Zig
-`wasm32-wasi` program and runs it in wazmrt (Zig is the toolchain we already have). Broaden to compiled
-**C (wasi-sdk), Rust (wasm32-wasi), Zig** programs covering stdout/args/env/files/clocks; fill the long
-tail of actually-called functions.
+**4.4 — the Phase 4 items proper. ✅ COMPLETE 2026-07-17.** ~~CLI `--dir`~~ (Phase 3) /
+~~`--env KEY=VAL`~~ / ~~`--ro-dir`~~ / ~~`-- <guest args>`~~ all done. The reproducible
+`zig build wasi-gate` gate compiles real `wasm32-wasi` programs and runs them in wazmrt asserting exact
+stdout — **Zig + C via `zig cc` always-on** (both ship with Zig), **Rust opt-in `-Drust-gate=true`**.
+Verified wazmrt runs all three compilers' output. The remaining long tail (fill in more
+actually-called functions as specific guests demand them) is demand-driven, not a blocker.
 
 **Not scheduled: `known-issues.md` #18** (the Zig std `openFile(.follow_symlinks=false)` host crash).
 It is worked around and contained — it is **trigger-based, not ordered**: recheck it on **every Zig

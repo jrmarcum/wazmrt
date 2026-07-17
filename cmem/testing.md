@@ -481,13 +481,29 @@ V8. **Decision:** build the shipped `.lib`/`.dll` (and the freestanding wasm —
 `design-decisions.md`. (Caveat: single machine; sizes + steady-state are solid, the µs/ms cold numbers
 are ±10% noisy.)
 
-## Reading the test count (2026-07-16)
+## Reading the test count (updated 2026-07-17)
 
-`zig build test` prints **238**, but there are **124 distinct tests**: 112 in the core module + 10 C-ABI
-tests. The `cabi_tests` target's root is `wasm_c_api.zig`, which imports `root.zig`, so it compiles and
-re-runs the core module's tests as well (112 + 122). Harmless — under a second — but **don't quote 234
-as a test count**; quote 124, or the per-target numbers from `--summary all`. One core test skips on an
-unprivileged Windows box (the #17 real-symlink test — see below), so you'll usually see `1 skip`.
+`zig build test --summary all` prints **240** (236 pass, 4 skip), but there are **125 distinct tests**:
+115 in the core module (113 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
+`wasm_c_api.zig`, which imports `root.zig`, so it compiles and **re-runs the core module's tests too**
+(115 core + 10 C-ABI = 125), on top of the standalone `mod_tests` run (115) → 240 printed. Harmless —
+under a second — but **don't quote 240 as a test count**; quote **125**, or the per-target numbers from
+`--summary all`. Two core tests skip on an unprivileged Windows box (the #17 real-symlink test and the
+traversal example gate — see below), so you'll usually see `2 skip` per run (`4` total).
+
+## Compiled-program conformance gate — `zig build wasi-gate` (2026-07-17, Phase 4.4)
+
+Separate from `zig build test`. Compiles REAL `wasm32-wasi` programs with independent toolchains and
+runs each through the wazmrt CLI, asserting exact stdout — a regression in decode/instantiate/the WASI
+host surface fails the build, not a manual check. **Zig (`examples/hello_compiled.zig`) + C via `zig cc`
+(`examples/c_hello.c`) run always** (both ship with the Zig toolchain, so the gate is hermetic by
+default). **Rust (`examples/rust_hello.rs`) is opt-in via `-Drust-gate=true`** (needs a rustc with the
+`wasm32-wasip1` target) — a genuinely different compiler, the strongest cross-toolchain signal. All
+three verified running byte-for-byte on wazmrt. The gate is wired in `build.zig` via `expectStdOutEqual`
+and **can fail** — confirmed by feeding it a wrong expected string (→ exit 1). Note: on Windows,
+`.zig-cache` intermittently corrupts (`error: Unexpected`) when several `zig build` runs fire
+back-to-back or when build output is piped to `head`/`grep` (SIGPIPE); `rm -rf .zig-cache` and run gates
+one at a time from a clean cache to get a clean signal.
 
 ## WASI 4.3 leftovers — timestamps, allocate, hard link (2026-07-16)
 
