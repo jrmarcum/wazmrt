@@ -237,9 +237,8 @@ final-component `path_open` TOCTOU tied to std bug #18. See #17.
 > `error.UncaughtException` with each `call` site catching in its own try_tables (`Frame.onCallError` →
 > `throwException` searches the label stack innermost-out); `exnref` values box into `Instance.exn_store`.
 > 6 hand-built binary tests cover catch / catch_all / catch_ref / throw_ref / cross-frame catch / uncaught
-> (→ trap). **Deferred to 6.1:** the WAT assembler + spec `.wast` conformance (the assembler needs
-> `(tag …)` + try_table/catch label-name resolution — a separate chunk). Legacy `try`/`catch`/`delegate`
-> stays out of scope.
+> (→ trap). **6.1 (also DONE 2026-07-17):** the WAT assembler + `.wast` runner — see the §6 detail
+> below. Legacy `try`/`catch`/`delegate` stays out of scope.
 >
 > **Phase 5 delivered (DONE 2026-07-17):** `src/pin.zig` (pure logic — SHA-256, content-addressed
 > plaintext pin-DB parse, `# mode:` policy directive, `stricter`, and the pure `decide()` matrix) +

@@ -52,7 +52,7 @@ The pipeline, in order: **decode → validate → execute**, with a text front-e
 | `src/Module.zig` | The decoded module + `decode()`: header, all core sections, resolved import/export extern types, function bodies, globals/memories/data. Validates custom-section names + data-count consistency; rejects reserved flag/valtype bytes. Arena-owned. |
 | `src/opcode.zig` | The **shared instruction authority** — `Op` table, `Imm`/`Instr` IR, `decodeBody`. Used by validate, the interpreter, *and* the assembler (in reverse). |
 | `src/validate.zig` | Spec type-checking validator over the IR (value + control-frame stacks) + module-level checks: global-init/element const-exprs, `select`/`if`/`call_indirect`/alignment/memory-presence. |
-| `src/interp.zig` | `Instance` + the switch interpreter (untyped `u64` slots, label stack). Runs int/float/memory, `call_indirect` over multiple tables, reference types + table ops, element segments, **imported functions** (`HostFunc`), **full WasmGC** (i31/struct/array heap, casts, subtyping), and bulk memory/table ops; carries the **trap backtrace** (`errdefer`-recorded frames). |
+| `src/interp.zig` | `Instance` + the switch interpreter (untyped `u64` slots, label stack). Runs int/float/memory, `call_indirect` over multiple tables, reference types + table ops, element segments, **imported functions** (`HostFunc`), **full WasmGC** (i31/struct/array heap, casts, subtyping), bulk memory/table ops, and **exception handling** (exnref: `throw`/`throw_ref`/`try_table`, unwinding via `error.UncaughtException` + call-site catch); carries the **trap backtrace** (`errdefer`-recorded frames). |
 | `src/sexpr.zig` / `src/wat.zig` / `src/wast.zig` | Text toolchain: S-expression parser → WAT→wasm-binary assembler (`wat.zig` maps names→`Op` via `stringToEnum`) → WAST script runner (`wast.zig`, drives an `Instance`, compares — **runs the official spec testsuite**). |
 | `src/wasi.zig` | **WASI preview 1** as native host imports: stdio/args/environ/clocks/`poll_oneoff`/random/`proc_exit` + the **sandboxed filesystem** (`--dir`/read-only `--ro-dir` preopens, host-fd table, and the security-critical handle-stack path resolver `walkFull` — follows symlinks, escape impossible by construction; see `security-model.md`). Read-only-ness rides the rights model: `path_open` only narrows an fd's rights against its parent, so a `--ro-dir`'s no-write mask propagates to the whole subtree. |
 | `src/wasm_c_api.zig` | The **standard wasm-c-api** — every one of the 319 functions `wasm.h` declares is defined (link-gated by `tests/c_abi_symbols.c`), with a refcounted `wasm_ref_t` object model. The ABI every `universalWasmLoader-*` port binds to (+ the `wazmrt_*` extension handshake). **The one file that hands raw ownership across a C boundary — memory-safety-critical (`design-decisions.md`), lifecycle-fuzzed.** |
@@ -83,8 +83,10 @@ The pipeline, in order: **decode → validate → execute**, with a text front-e
   typed/untyped `select`, `if`-without-`else`, alignment ≤ natural, memory presence) and the **decoder
   rejects malformed binaries** (spec-correct LEB128 bounds, custom-section names, data-count
   consistency, reserved flag/valtype bytes). Imported tables/memories, bulk table/memory ops, the
-  **function-references** proposal, and **full WasmGC** (i31/struct/array, casts, subtyping, concrete
-  refs) are all done. **Current frontier is Phase 4 (WASI + ergonomics/conformance)** — see `roadmap.md`.
+  **function-references** proposal, **full WasmGC** (i31/struct/array, casts, subtyping, concrete
+  refs), and **exception handling** (exnref: `throw`/`throw_ref`/`try_table`, Phase 6) are all done.
+  **Phases 1–6 complete (WASI, CLI ergonomics + conformance, pin verification, exception handling);
+  next frontier is SIMD / multi-memory / the signature-verification path** — see `roadmap.md`.
 - **Text toolchain (working).** `sexpr.zig` + `wat.zig` (WAT→wasm binary) + `wast.zig` (WAST script
   runner) — `wazmrt <file.wast>` **runs the official spec testsuite** (thousands of assertions pass; see
   `testing.md`). The runner executes `assert_return`/`assert_trap`/`assert_exhaustion` *and*
@@ -92,4 +94,5 @@ The pipeline, in order: **decode → validate → execute**, with a text front-e
   runtime trap, and handles `(register "name")` for cross-module imports. The assembler covers control
   flow + multi-value/type-index block types, `call_indirect` + multi-table, element segments (func-index
   + const-expr forms, all 8 flag variants, const-expr offsets), globals (imported + extended-const),
-  **imported functions**, reference types + reference-type table ops, GC composite types, and bulk ops.
+  **imported functions**, reference types + reference-type table ops, GC composite types, bulk ops, and
+  **exception handling** (tag section + `throw`/`throw_ref`/`try_table`+catch, Phase 6.1).
