@@ -224,13 +224,27 @@ pre-fix `ESCAPED`, post-fix refused) + a unit test (POSIX CI; skips on unprivile
 std can't make a symlink there) + Phase 3 gate still 16/16. One documented residual: a narrow
 final-component `path_open` TOCTOU tied to std bug #18. See #17.
 
-> ### ⇢ START HERE (next session): **4.3 — the Phase 3 leftovers.**
-> `path_symlink` / `path_readlink` / `path_link`, `fd_filestat_set_times` / `path_filestat_set_times`,
-> `fd_allocate`, and real fd-readiness in `poll_oneoff` — all currently the `NOTSUP` stub (see the
-> "Phase 3 leftovers" note above). These are the likeliest things a compiled C/Rust guest trips over.
-> **Note the #17 interaction:** `path_symlink`/`path_readlink` would let a guest *create* symlinks,
-> which changes #17's "no symlink is host-placed" assumption — decide the traversal policy (keep
-> no-follow, or move to target-revalidation) before implementing them. Then **4.4** — the Phase 4 items
+> ### ⛔ 4.3 IS PAUSED (owner, 2026-07-16) — **read `cmem/security-model.md` before resuming.**
+> Starting 4.3 surfaced the symlink-policy decision, which opened into a design conversation about the
+> **actual product vision** (wasm-as-scripts, wazmrt as a signed base runtime) and a **secure-by-default
+> base**. The owner is deciding: *"I need to think about this before proceeding further. This is a base
+> that I think we need to get right and create a secure by default base."* **Do not resume 4.3 without
+> checking back** — the outcome may reorder or reshape it.
+>
+> Three findings from that conversation that change 4.3's shape:
+> 1. **The vision's symlink is host-side dispatch** (`argv[0]`/`binfmt_misc`), **not** the guest-visible
+>    symlink of #17 — **the vision does not need `path_symlink`.** The two were being conflated.
+> 2. **If `path_symlink` is ever built, targets must be validated at *creation*** (refuse escaping
+>    targets) — a persisted link is a landmine for whoever follows it next with more authority. This is
+>    *different from and stronger than* the traversal policy, and holds even if no-follow is kept.
+> 3. **`--ro-dir` (read-only preopens)** looks like the highest security-value-per-effort item available
+>    and is on no list. It may deserve to jump the queue.
+>
+> **4.3 as scoped** (unchanged, for reference): `path_symlink` / `path_readlink` / `path_link`,
+> `fd_filestat_set_times` / `path_filestat_set_times`, `fd_allocate`, real fd-readiness in `poll_oneoff`
+> — all currently the `NOTSUP` stub. The non-symlink items carry no policy question and are safe to do
+> whenever. `path_link` (hardlink) is also safe now — both ends go through the resolver at creation, so
+> neither can name outside, and there is no traversal hazard afterward. Then **4.4** — the Phase 4 items
 > proper (`--env`, the `zig build`-driven compiled gate, C/Rust/Zig conformance).
 
 **4.1 — `known-issues.md` #19: trap diagnostics. DONE 2026-07-15.** Traps now report a named
