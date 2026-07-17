@@ -318,11 +318,31 @@ internal reparse-point handle we never read from; `path_readlink` is `NOTSUP` he
 final-component TOCTOU matters (untrusted guest with in-sandbox write). If std fixes it: in `wPathOpen`,
 replace the `finalIsSymlink` pre-stat + follow-open with a direct `openFile(.follow_symlinks=false)`,
 which closes #17's residual for free. Re-run `examples/wasi_files.zig` ("fd_read round-trips the
-contents" is the crash check) and `examples/wasi_symlink_escape.zig` (the containment check).
+contents" is the crash check) and `examples/wasi_symlink_traversal.zig` (the containment check).
 
 **Anchor:** `finalIsSymlink` + the `openFile` call in `wPathOpen`, `src/wasi.zig`.
 
-## #17 — WASI sandbox: a symlink out of a preopen was followed — **DONE 2026-07-16**
+## #17 — WASI sandbox symlink containment — **DONE 2026-07-16, then UPGRADED to full traversal same day**
+
+**UPDATE 2026-07-16 (4.3, owner chose full traversal):** the no-traversal fix below was replaced by
+**secure full symlink traversal** — the handle-stack resolver `walkFull` (RESOLVE_BENEATH in userspace).
+In-sandbox symlinks are now **followed** (wasmtime parity, for compiled C/Rust guests) while escapes are
+still impossible — **secure by construction, not by refusing to follow**:
+- a stack of open dir handles, bottom = preopen; `..` pops but never below it (no handle above the
+  preopen exists → up-escape impossible);
+- a symlink's target is expanded through the same loop; an **absolute** target resets to the preopen
+  root (not host root);
+- every open is one component, no-follow, through a held handle (TOCTOU-safe); `symlink_max` → `ELOOP`.
+
+`path_symlink`/`path_readlink` implemented (create validates: absolute targets refused at creation as
+defence-in-depth). **Verified**: `examples/wasi_symlink_traversal.zig` (5/5 on Windows with real
+symlinks — in-sandbox followed, escape refused, absolute-can't-reach-host, cycle→ELOOP, readlink) + two
+POSIX-CI unit tests incl. an **adversarial fuzz** (random symlink topologies, canary-outside oracle,
+2000 iters — assert the canary is never read). Design + full argument in `cmem/security-model.md`.
+`path_symlink` is POSIX-only on the creation side (Windows needs privilege, #17/#23); *following*
+host-placed symlinks works on Windows. The residual below (final-component TOCTOU, #18) is unchanged.
+
+**Original no-traversal fix (2026-07-16, superseded above):**
 
 **Was:** `wasi.resolve()` is lexical — it stops a guest *naming* a path outside its preopen, but not a
 **symlink stored inside the preopen whose target is outside it**. `follow_symlinks = false` only guards
@@ -351,14 +371,14 @@ on Windows (std bug #18). A swap in that window needs write access *inside* the 
 intermediate walk (the actual reported hole) has no such window. Closing it fully needs #18 fixed
 upstream, or a real `openat2(RESOLVE_BENEATH)` in `Io`.
 
-**Verified:** before/after with a real symlink via `examples/wasi_symlink_escape.zig` (pre-fix ESCAPED,
+**Verified:** before/after with a real symlink via `examples/wasi_symlink_traversal.zig` (pre-fix ESCAPED,
 post-fix all-refused, in-sandbox file still readable); a unit test in `src/wasi.zig` that plants a real
 symlink and drives the path ops (runs on POSIX CI, **skips on unprivileged Windows** — Zig std's Windows
 symlink uses raw `FSCTL_SET_REPARSE_POINT`, which needs `SeCreateSymbolicLinkPrivilege`); Phase 3 file
 gate still 16/16 (no over-restriction).
 
 **Anchor:** `walkTo`/`finalIsSymlink`/`resolveArg` + the module doc in `src/wasi.zig`;
-`examples/wasi_symlink_escape.zig`.
+`examples/wasi_symlink_traversal.zig`.
 
 ## RESOLVED 2026-07-09 (second pass — commit `645874c`)
 

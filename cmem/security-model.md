@@ -283,6 +283,59 @@ to PCRs** → defeats the **offline** attacker (stolen disk) and detects boot-ch
 Boot** → anchors the chain in firmware. Bolt-ons for when offline/persistence enters the threat model —
 not foundations.
 
+## DONE 2026-07-16 — WASI symlink traversal: FULL support, secure-by-construction
+
+**IMPLEMENTED** as designed below — `walkFull` in `src/wasi.zig`, `path_symlink`/`path_readlink`, +
+adversarial fuzz. Verified 5/5 on Windows with real symlinks (`examples/wasi_symlink_traversal.zig`) and
+by POSIX-CI unit tests. The spec below *is* what was built.
+
+**Owner chose full traversal (wasmtime/cap-std parity)** for `path_symlink`/`path_readlink` + in-sandbox
+symlink following, over the cheaper no-traversal option. This is **conformance-only** — the product
+vision uses host-side dispatch, not guest symlinks (see "The vision") — but full fidelity was chosen so
+compiled C/Rust guests behave normally.
+
+**This reopens the exact escape surface #17 closed, with an adversarial twist: the guest can now
+*author* the symlinks.** So the resolver must be secure against attacker-chosen link topologies, not
+just host-placed ones. **The mandated design is a handle-stack walk (RESOLVE_BENEATH in userspace) —
+secure *by construction*, not by lexical re-validation**, because lexical `..` math becomes unsound once
+targets can inject `..` and absolute paths:
+
+> ### The handle-stack resolver (implementation spec)
+> State: a stack of **open directory handles**, `dirs[0]` = the preopen (borrowed, **never popped or
+> closed**). A work queue of path components. A **symlink budget** (→ `ELOOP` at 0).
+> Per component `c` relative to `dirs.last()`:
+> - `.` / empty → skip. `..` → **pop the stack, but never below `dirs[0]`** (at root, `..` stays root).
+>   *This is why up-escape is impossible: there is no handle above the preopen to reach.*
+> - lstat `c` no-follow. If it's a **symlink** and we should follow it here (not a no-follow final):
+>   readlink it, spend one budget, and **push the target's components onto the FRONT of the queue**. If
+>   the target is **absolute, reset the stack to `[preopen]`** and strip the prefix — *an absolute target
+>   means the preopen root, never the host root.* Relative targets resolve from the current top.
+> - Real directory (intermediate) → `openDir` no-follow, **push** the handle.
+> - Final real component → return `(dirs.last(), name)`. `FileNotFound` on the final is OK for create ops.
+> **Every open is a single component, no-follow, relative to a held handle** → TOCTOU-safe; the handle
+> pins the inode, and a swapped-in symlink is caught by the next lstat. **Targets go through the same
+> machinery** — no bypass channel.
+>
+> Ops pass **`follow_final`**: `path_open`/`*_filestat_get` with `SYMLINK_FOLLOW` = true; `path_unlink`,
+> `path_readlink`, and the no-`SYMLINK_FOLLOW` stats = false (operate on the link itself).
+>
+> **Creation (`path_symlink`) also validates:** the *link's location* is contained by the walk like any
+> path; the *target string* is stored as the guest gives it (a relative target is resolved only when
+> later followed, through this same secure resolver, so a "malicious" target simply fails to escape at
+> follow time). **Still refuse an obviously-escaping absolute/`..` target at creation too** — defence in
+> depth, and it stops planting a landmine for a *less careful* future reader (the orchestrator-invariant
+> concern).
+>
+> **Security properties, by construction:** (1) `..` can't rise above the preopen — no handle exists
+> there; (2) absolute targets reset to the preopen, not host root; (3) all opens no-follow single-component
+> through handles — TOCTOU-safe, no intermediate-symlink surprise; (4) budget → ELOOP; (5) one code path,
+> no bypass. **Mandatory: adversarial fuzz** (the #22 pattern) where the *guest authors* symlink
+> topologies and tries to escape — assert it never reads outside the preopen.
+
+**Windows caveat:** creating a symlink needs privilege there (Zig std uses raw `FSCTL_SET_REPARSE_POINT`,
+#17/#23), so `path_symlink` is effectively POSIX-only; *following* host-placed symlinks still works on
+Windows. Tests run on POSIX CI, skip on unprivileged Windows.
+
 ## Threat model — state the boundary honestly
 
 | Attacker | What stops them |

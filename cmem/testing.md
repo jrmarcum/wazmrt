@@ -483,10 +483,10 @@ are ±10% noisy.)
 
 ## Reading the test count (2026-07-16)
 
-`zig build test` prints **236**, but there are **123 distinct tests**: 112 in the core module + 10 C-ABI
+`zig build test` prints **238**, but there are **124 distinct tests**: 112 in the core module + 10 C-ABI
 tests. The `cabi_tests` target's root is `wasm_c_api.zig`, which imports `root.zig`, so it compiles and
 re-runs the core module's tests as well (112 + 122). Harmless — under a second — but **don't quote 234
-as a test count**; quote 123, or the per-target numbers from `--summary all`. One core test skips on an
+as a test count**; quote 124, or the per-target numbers from `--summary all`. One core test skips on an
 unprivileged Windows box (the #17 real-symlink test — see below), so you'll usually see `1 skip`.
 
 ## WASI 4.3 leftovers — timestamps, allocate, hard link (2026-07-16)
@@ -508,26 +508,30 @@ through the new name.
   correct answer, not a placeholder. Real readiness polling would only matter for pipes/sockets, which
   wazmrt doesn't have.
 
-## WASI sandbox: real-symlink containment (#17, 2026-07-16)
+## WASI symlink traversal — secure full traversal (#17/4.3, 2026-07-16)
 
-The escape #17 closed (a symlink inside a preopen pointing outside it) needs a **real symlink** to test,
-which is where it gets platform-specific:
+The resolver (`walkFull`) **follows** symlinks (wasmtime parity) while keeping escape impossible by
+construction. Testing needs **real symlinks**, which is platform-specific:
 
-- **Unit test** (`src/wasi.zig`, "a symlink pointing out of a preopen is refused"): creates the symlink
-  via `Io.Dir.symLink` at runtime, plants it in a `tmpDir`, and drives `wPathOpen`. Runs on POSIX CI
-  (unprivileged symlinks). **Skips on unprivileged Windows** — Zig std's Windows symlink uses raw
-  `FSCTL_SET_REPARSE_POINT`, which needs `SeCreateSymbolicLinkPrivilege` (admin), *not* the
-  `CreateSymbolicLinkW` unprivileged-with-Developer-Mode path. So the test can't create its own symlink
-  there and returns `error.SkipZigTest` rather than pass vacuously.
-- **Windows manual check** (`examples/wasi_symlink_escape.zig`): git-bash *can* make unprivileged native
-  symlinks with `MSYS=winsymlinks:nativestrict` (+ Developer Mode). Plant `dirlink`/`filelink` in a
-  preopen pointing outside it, run the guest. **Verified before/after**: the pre-#17 build printed
-  `ESCAPED via intermediate dir symlink` (it read a file outside the preopen); the fixed build refuses
-  both vectors and still reads a genuine in-sandbox file. The example's doc comment has the exact setup.
-- **Gotcha that cost time:** plain `ln -s` in git-bash makes a **copy**, not a symlink, so an "escape"
-  through it is really reading an in-sandbox copy — a false alarm. Confirm a link is real by changing
-  the outside target and checking the inside reflects it. `Io.Dir.statFile(.follow_symlinks=false).kind`
-  reports `sym_link` only for real reparse points.
+- **Two POSIX-CI unit tests** (`src/wasi.zig`), both create symlinks via `Io.Dir.symLink` at runtime and
+  **skip on unprivileged Windows** (Zig std's Windows symlink uses raw `FSCTL_SET_REPARSE_POINT`, needs
+  `SeCreateSymbolicLinkPrivilege`, *not* the unprivileged `CreateSymbolicLinkW` path — so `symLink`
+  fails there → `error.SkipZigTest`, never a vacuous pass):
+  - *"symlink traversal: in-sandbox links follow, escaping links refused"* — an in-sandbox link is
+    followed (opens); `../outside` links are refused.
+  - *"symlink resolver fuzz"* — **the mandated adversarial test.** Plants a random symlink graph
+    (in-sandbox, `..`-escapes, absolute-to-root, chains, cycles), hammers 2000 random guest paths, and
+    asserts a **canary file outside the preopen is never read** (the oracle is the canary, not a value).
+    A broken `..`-pop or absolute-rebase would read the canary → `error.SandboxEscaped`.
+- **Windows manual check** (`examples/wasi_symlink_traversal.zig`, 5/5): git-bash makes unprivileged
+  native symlinks with `MSYS=winsymlinks:nativestrict` (+ Developer Mode). Verifies in-sandbox followed,
+  escape refused, absolute-target-can't-reach-host-file, cycle→ELOOP, and `path_readlink`.
+- **Gotcha that cost time:** plain `ln -s` in git-bash makes a **copy**, not a symlink (so an "escape"
+  through it is a false alarm — reading an in-sandbox copy). Force native links with
+  `MSYS=winsymlinks:nativestrict`; confirm real by changing the outside target and seeing the inside
+  reflect it. `Io.Dir.statFile(.follow_symlinks=false).kind` reports `sym_link` only for real reparse
+  points, and on Windows a symlink to `/x` is rebased by git-bash to its *install root* — a test artifact,
+  not a resolver behavior.
 
 ## The C ABI lifecycle fuzz (#22, 2026-07-16)
 

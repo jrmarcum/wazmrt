@@ -19,27 +19,30 @@
 //! handle alone is NOT a security boundary.
 //!
 //! 1. **Lexical** (`resolve`): reject absolute paths, escaping `..`, NT/device
-//!    prefixes, and embedded NUL; normalize to a `..`-free relative path.
-//! 2. **Filesystem** (`walkTo` + `finalIsSymlink`): a guest could still escape
-//!    through a *symlink stored inside the preopen* whose target is outside it,
-//!    because `follow_symlinks = false` only guards the final `openat` component
-//!    — intermediate symlinks are followed. So we descend one component at a
-//!    time, opening each relative to the previous *handle* (TOCTOU-safe: the
-//!    handle pins the inode) with no-follow, and reject anything that isn't a
-//!    real directory. A final-component symlink is refused by any op that would
-//!    follow it (`path_open`, `path_filestat_get` with `SYMLINK_FOLLOW`).
+//!    prefixes, and embedded NUL in the *guest* path; normalize.
+//! 2. **Filesystem** (`walkFull`, the handle-stack resolver): symlinks are
+//!    **followed**, but securely — RESOLVE_BENEATH in userspace (4.3). A stack of
+//!    open directory handles is kept, bottom = the preopen. `..` pops it but
+//!    **never below the bottom** (no handle exists above the preopen, so
+//!    up-escape is impossible, not merely rejected); a symlink's target is
+//!    expanded through the *same* loop; an **absolute** target resets the stack
+//!    to the preopen root (absolute means the sandbox root, never the host
+//!    root); every open is one component, no-follow, relative to a held handle
+//!    (TOCTOU-safe — the handle pins the inode); a `symlink_max` budget bounds
+//!    cycles. See `cmem/security-model.md` for the full argument, and
+//!    `walkFull`'s doc for the spec.
 //!
-//! **Policy: no symlink is ever traversed.** A guest can't create one anyway
-//! (`path_symlink` is unimplemented), so every symlink in a preopen is
-//! host-placed — i.e. the attack — and refusing to follow it is the safe
-//! default. In-sandbox symlink traversal is therefore unsupported; relax to
-//! target-revalidation if a real guest needs it (see `known-issues.md` #17).
+//! So an **in-sandbox** symlink works like a real filesystem, while a symlink
+//! whose target leaves the preopen simply fails to resolve — security is a
+//! property of the construction, not of lexical target-checking. Ops pass
+//! `follow_final`: stat/open with `SYMLINK_FOLLOW` follow the final component;
+//! `unlink`/`readlink`/no-follow stats operate on the link itself.
 //!
-//! Residual: a narrow TOCTOU on the *final* component of `path_open` — we stat
-//! it no-follow (reject symlink) then open with follow, because
-//! `openFile(.follow_symlinks = false)` crashes the host on Windows (std bug
-//! #18). A swap in that window needs write access *inside* the sandbox and a
-//! race; the intermediate walk (the actual reported hole) has no such window.
+//! Residual: a narrow TOCTOU on the *final* component of `path_open` — the walk
+//! resolves the final to a non-symlink, then opens with follow (a no-op),
+//! because `openFile(.follow_symlinks = false)` crashes the host on Windows (std
+//! bug #18). A swap in that window needs write access *inside* the sandbox and a
+//! race; the walk's per-component opens have no such window.
 
 const std = @import("std");
 const Io = std.Io;
@@ -142,6 +145,7 @@ const rights = struct {
     const path_link_target: u64 = 1 << 12;
     const path_open: u64 = 1 << 13;
     const fd_readdir: u64 = 1 << 14;
+    const path_readlink: u64 = 1 << 15;
     const path_rename_source: u64 = 1 << 16;
     const path_rename_target: u64 = 1 << 17;
     const path_filestat_get: u64 = 1 << 18;
@@ -418,23 +422,25 @@ pub const Wasi = struct {
     }
 };
 
-/// A `(dirfd, path, path_len)` argument trio resolved against the sandbox: the
-/// final component (`name`) and the directory handle it lives in (`dir`), with
-/// every intermediate component walked and verified to be a real directory (not
-/// a symlink). Caller must `close()`.
-///
-/// `dir` is the directory *containing* the final component — for `a/b/c.txt`,
-/// the handle for `a/b` — reached by descending one component at a time so no
-/// intermediate symlink can redirect the walk outside the preopen (see the
-/// module doc). It is either the preopen handle (single-component path) or the
-/// last of the handles in `opened`, which `close()` releases.
+/// Cap on symlink expansions during one resolution (→ `ELOOP`). Bounds cycles
+/// (`a→b→a`) and length amplification.
+const symlink_max: u32 = 32;
+
+/// A `(dirfd, path, path_len)` argument resolved against the sandbox: the final
+/// component (`name`) and the directory handle it lives in (`dir`), reached by a
+/// handle-stack walk that **follows symlinks securely** (see the module doc and
+/// `cmem/security-model.md`). Caller must `close()`.
 const ResolvedPath = struct {
     dir: Io.Dir,
-    /// The final path component, borrowed from `path`.
-    name: []const u8,
-    /// The full normalized path, owned (freed by `close`); `name` slices it.
-    path: []const u8,
-    /// Intermediate directory handles the walk opened, to close afterward.
+    /// The final component, owned (freed by `close`). After a followed symlink
+    /// this is the resolved real name; with `follow_final = false` it may be a
+    /// symlink the op operates on directly.
+    name: []u8,
+    /// True if `name` is itself a symlink (only possible when the op asked not
+    /// to follow the final). `path_open` uses this to `ELOOP` on a bare symlink.
+    final_is_symlink: bool,
+    /// Directory handles the walk opened, to close afterward. `dir` is the last
+    /// of these, or the preopen handle if the walk opened none.
     opened: std.ArrayList(Io.Dir),
     /// The dir fd's inheriting rights, which cap what an opened fd may hold.
     inheriting: u64,
@@ -442,76 +448,154 @@ const ResolvedPath = struct {
     fn close(self: *ResolvedPath, w: *Wasi) void {
         for (self.opened.items) |d| d.close(w.io);
         self.opened.deinit(w.gpa);
-        w.gpa.free(self.path);
-    }
-
-    /// True if the final component is itself a symlink. A following operation
-    /// (`path_open`, `path_filestat_get` with `SYMLINK_FOLLOW`) must refuse it:
-    /// with the intermediate walk already containing the directory portion, a
-    /// final symlink is the last way to escape, so we never follow one.
-    fn finalIsSymlink(self: *const ResolvedPath, w: *Wasi) bool {
-        const st = self.dir.statFile(w.io, self.name, .{ .follow_symlinks = false }) catch return false;
-        return st.kind == .sym_link;
+        w.gpa.free(self.name);
     }
 };
 
-/// Descend `path`'s directory components from `start`, one at a time, so an
-/// intermediate symlink can't redirect the walk out of the preopen. Returns the
-/// handle for the directory holding the final component. Opened handles are
-/// pushed to `opened` for the caller to close; on failure this closes them and
-/// writes the errno.
+const WalkOut = struct { dir: Io.Dir, name: []u8, final_is_symlink: bool };
+
+fn isAbsoluteTarget(t: []const u8) bool {
+    if (t.len == 0) return false;
+    if (t[0] == '/' or t[0] == '\\') return true;
+    return t.len >= 2 and t[1] == ':'; // drive-qualified
+}
+
+/// Resolve `guest_path` from `start` to `(dir, name)`, **following symlinks
+/// through a handle stack** — the RESOLVE_BENEATH model in userspace, secure by
+/// construction (see `cmem/security-model.md` for the full argument):
 ///
-/// **TOCTOU-safe by construction:** each component is opened *relative to the
-/// previous handle* (which pins its inode), never by re-walking a path string,
-/// and `follow_symlinks = false` plus a post-open `stat` reject anything that is
-/// not a real directory — including a symlink Windows might open as a reparse
-/// point rather than fail on.
-fn walkTo(w: *Wasi, start: Io.Dir, path: []const u8, opened: *std.ArrayList(Io.Dir), results: []Value) ?Io.Dir {
-    const last_sep = std.mem.lastIndexOfScalar(u8, path, '/') orelse return start; // single component
-    var current = start;
-    var it = std.mem.splitScalar(u8, path[0..last_sep], '/');
-    while (it.next()) |comp| {
-        // `resolve` already stripped '.'/'..' and empty components, so `comp` is
-        // a single real name. Open it no-follow, relative to the current handle.
-        const next = current.openDir(w.io, comp, .{ .iterate = true, .follow_symlinks = false }) catch |err| {
-            closeWalk(w, opened);
-            _ = ret(results, errnoFor(err)); // a symlink here → ELOOP on POSIX
+///   - the stack bottom is `start` (the preopen); `..` pops it but **never below
+///     the bottom** — there is no handle above the preopen to reach, so up-escape
+///     is impossible, not merely rejected;
+///   - a **symlink**'s target is expanded through the *same* loop; an **absolute**
+///     target resets the stack to `[start]` — absolute means the preopen root,
+///     never the host root;
+///   - every open is a single component, no-follow, relative to a held handle —
+///     TOCTOU-safe (the handle pins the inode) and immune to intermediate-symlink
+///     redirection;
+///   - `symlink_max` bounds cycles/amplification.
+///
+/// `follow_final = false` leaves a final-component symlink unfollowed (for
+/// `unlink`/`readlink`/no-`SYMLINK_FOLLOW` stats). Opened handles go to `opened`;
+/// on failure this closes them and writes the errno. `name` is `gpa`-owned.
+fn walkFull(w: *Wasi, start: Io.Dir, guest_path: []const u8, follow_final: bool, opened: *std.ArrayList(Io.Dir), results: []Value) ?WalkOut {
+    var arena = std.heap.ArenaAllocator.init(w.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const fail = struct {
+        fn f(ww: *Wasi, op: *std.ArrayList(Io.Dir), res: []Value, e: u32) ?WalkOut {
+            for (op.items) |d| d.close(ww.io);
+            op.deinit(ww.gpa);
+            op.* = .empty;
+            _ = ret(res, e);
             return null;
+        }
+    }.f;
+
+    // The current directory is `start` when `opened` is empty, else the last
+    // handle we pushed. `..` pops (and closes) the last pushed handle; it can
+    // never reach `start`, which we never push.
+    const topDir = struct {
+        fn f(s: Io.Dir, op: *std.ArrayList(Io.Dir)) Io.Dir {
+            return if (op.items.len == 0) s else op.items[op.items.len - 1];
+        }
+    }.f;
+
+    // Pending components as a LIFO stack: push a path's components in reverse so
+    // popping yields them left-to-right. Following a symlink pushes its target's
+    // components (reversed) on top, so they resolve before the remainder.
+    var pending: std.ArrayList([]const u8) = .empty;
+    pushReversed(a, &pending, guest_path) catch return fail(w, opened, results, errno.nomem);
+
+    var budget: u32 = symlink_max;
+
+    while (pending.pop()) |c| {
+        if (c.len == 0 or std.mem.eql(u8, c, ".")) continue;
+        if (std.mem.eql(u8, c, "..")) {
+            if (opened.items.len == 0) return fail(w, opened, results, errno.notcapable); // would escape above root
+            (opened.pop().?).close(w.io);
+            continue;
+        }
+        const is_final = pending.items.len == 0;
+        const top = topDir(start, opened);
+
+        const st = top.statFile(w.io, c, .{ .follow_symlinks = false }) catch |err| {
+            // A missing FINAL component is fine for create ops; the caller sees
+            // it via a later openFile/createFile. Anything else is a real error.
+            if (is_final and err == error.FileNotFound)
+                return .{ .dir = top, .name = w.gpa.dupe(u8, c) catch return fail(w, opened, results, errno.nomem), .final_is_symlink = false };
+            return fail(w, opened, results, errnoFor(err));
         };
-        // Confirm the handle is a directory, not a symlink that slipped through.
-        const st = next.stat(w.io) catch {
+
+        if (st.kind == .sym_link and !(is_final and !follow_final)) {
+            // Follow it: read the target and splice its components onto `pending`.
+            if (budget == 0) return fail(w, opened, results, errno.loop);
+            budget -= 1;
+            var buf: [4096]u8 = undefined;
+            const n = top.readLink(w.io, c, &buf) catch |err| return fail(w, opened, results, errnoFor(err));
+            var target = a.dupe(u8, buf[0..n]) catch return fail(w, opened, results, errno.nomem);
+            if (isAbsoluteTarget(target)) {
+                // Absolute → the preopen root, not the host root: reset the stack
+                // and re-base. Strip the whole absolute prefix — a drive
+                // (`C:`), then any leading separators — so what remains is
+                // relative to the root. (`readLink` on Windows can return a
+                // drive-qualified target even for a link made with `/foo`.)
+                while (opened.pop()) |d| d.close(w.io);
+                if (target.len >= 2 and target[1] == ':') target = target[2..];
+                while (target.len > 0 and (target[0] == '/' or target[0] == '\\')) target = target[1..];
+            }
+            pushReversed(a, &pending, target) catch return fail(w, opened, results, errno.nomem);
+            continue;
+        }
+
+        if (is_final)
+            return .{ .dir = top, .name = w.gpa.dupe(u8, c) catch return fail(w, opened, results, errno.nomem), .final_is_symlink = st.kind == .sym_link };
+
+        // Intermediate real component: must be a directory; descend into it.
+        if (st.kind != .directory) return fail(w, opened, results, errno.notdir);
+        const next = top.openDir(w.io, c, .{ .iterate = true, .follow_symlinks = false }) catch |err|
+            return fail(w, opened, results, errnoFor(err));
+        // Post-open guard: on Windows a reparse point can be opened rather than
+        // fail; the fstat catches a symlink that slipped through no-follow.
+        const nst = next.stat(w.io) catch {
             next.close(w.io);
-            closeWalk(w, opened);
-            _ = ret(results, errno.io);
-            return null;
+            return fail(w, opened, results, errno.io);
         };
-        if (st.kind != .directory) {
+        if (nst.kind != .directory) {
             next.close(w.io);
-            closeWalk(w, opened);
-            _ = ret(results, errno.notcapable); // a reparse point / symlink dir
-            return null;
+            return fail(w, opened, results, errno.notcapable);
         }
         opened.append(w.gpa, next) catch {
             next.close(w.io);
-            closeWalk(w, opened);
-            _ = ret(results, errno.nomem);
-            return null;
+            return fail(w, opened, results, errno.nomem);
         };
-        current = next;
     }
-    return current;
+
+    // The path resolved to a directory itself (all `.`/`..`, or empty): name ".".
+    return .{ .dir = topDir(start, opened), .name = w.gpa.dupe(u8, ".") catch return fail(w, opened, results, errno.nomem), .final_is_symlink = false };
 }
 
-fn closeWalk(w: *Wasi, opened: *std.ArrayList(Io.Dir)) void {
-    for (opened.items) |d| d.close(w.io);
-    opened.deinit(w.gpa);
+/// Split `path` on `/` and `\` and push the components onto `pending` in reverse
+/// (so a LIFO pop yields them left-to-right). A leading absolute prefix is
+/// dropped — the caller has already reset to the root for absolute targets.
+fn pushReversed(a: std.mem.Allocator, pending: *std.ArrayList([]const u8), path: []const u8) !void {
+    var it = std.mem.splitAny(u8, path, "/\\");
+    var comps: std.ArrayList([]const u8) = .empty;
+    defer comps.deinit(a);
+    while (it.next()) |c| try comps.append(a, c);
+    var i: usize = comps.items.len;
+    while (i > 0) {
+        i -= 1;
+        try pending.append(a, comps.items[i]);
+    }
 }
 
 /// Resolve `(fd, ptr, len)` from a `path_*` call: the fd must be an open
-/// directory holding `need` rights, and the path must stay inside it — both
-/// lexically (`resolve`) and through the filesystem (`walkTo`, no symlink
-/// traversal). On failure writes the errno into `results` and returns null.
-fn resolveArg(w: *Wasi, fd: u32, ptr: u32, len: u32, need: u64, results: []Value) ?ResolvedPath {
+/// directory holding `need` rights, and the path is walked into the sandbox
+/// following symlinks securely (`walkFull`). `follow_final` = whether a final
+/// symlink is followed. On failure writes the errno and returns null.
+fn resolveArg(w: *Wasi, fd: u32, ptr: u32, len: u32, need: u64, follow_final: bool, results: []Value) ?ResolvedPath {
     const e = w.get(fd) orelse {
         _ = ret(results, errno.badf);
         return null;
@@ -531,22 +615,21 @@ fn resolveArg(w: *Wasi, fd: u32, ptr: u32, len: u32, need: u64, results: []Value
         _ = ret(results, errno.fault);
         return null;
     };
-    const path = resolve(w.gpa, raw) orelse {
-        _ = ret(results, errno.notcapable); // escaped the sandbox lexically
+    // Cheap lexical gate on the *guest* path: reject absolute / escaping-`..` /
+    // NT-device / NUL up front. (Symlink *targets* are handled by walkFull's
+    // stack, where absolute means the preopen root — a different rule.)
+    const norm = resolve(w.gpa, raw) orelse {
+        _ = ret(results, errno.notcapable);
         return null;
     };
+    defer w.gpa.free(norm);
 
     var opened: std.ArrayList(Io.Dir) = .empty;
-    const final_dir = walkTo(w, d.handle, path, &opened, results) orelse {
-        w.gpa.free(path); // walkTo already closed `opened` and set the errno
-        return null;
-    };
-    const last_sep = std.mem.lastIndexOfScalar(u8, path, '/');
-    const name = if (last_sep) |i| path[i + 1 ..] else path;
+    const out = walkFull(w, d.handle, norm, follow_final, &opened, results) orelse return null;
     return .{
-        .dir = final_dir,
-        .name = name,
-        .path = path,
+        .dir = out.dir,
+        .name = out.name,
+        .final_is_symlink = out.final_is_symlink,
         .opened = opened,
         .inheriting = d.rights_inheriting,
     };
@@ -595,6 +678,8 @@ fn callFor(name: []const u8) CallFn {
         .{ "path_unlink_file", wPathUnlinkFile },
         .{ "path_rename", wPathRename },
         .{ "path_link", wPathLink },
+        .{ "path_symlink", wPathSymlink },
+        .{ "path_readlink", wPathReadlink },
         .{ "args_sizes_get", wArgsSizesGet },
         .{ "args_get", wArgsGet },
         .{ "environ_sizes_get", wEnvironSizesGet },
@@ -1041,10 +1126,10 @@ fn wFdPrestatDirName(ctx: *anyopaque, args: []const Value, results: []Value) boo
 /// so a guest can never widen its own capability by reopening.
 fn wPathOpen(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const w: *Wasi = @ptrCast(@alignCast(ctx));
-    var rp = resolveArg(w, argU32(args, 0), argU32(args, 2), argU32(args, 3), rights.path_open, results) orelse
+    const follow = argU32(args, 1) & lookup_symlink_follow != 0;
+    var rp = resolveArg(w, argU32(args, 0), argU32(args, 2), argU32(args, 3), rights.path_open, follow, results) orelse
         return true;
     defer rp.close(w);
-    _ = argU32(args, 1); // lookupflags: we never follow a symlink (see below)
 
     const of: u16 = @truncate(argU32(args, 4));
     const want_base: u64 = @bitCast(interp.asI64(args[5]));
@@ -1052,11 +1137,10 @@ fn wPathOpen(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const ff: u16 = @truncate(argU32(args, 7));
     const opened_fd_ptr = argU32(args, 8);
 
-    // Never follow the final component if it's a symlink — that's the last way
-    // to escape now that the walk contains the directory portion. We refuse
-    // rather than resolve-and-recheck: a guest can't create symlinks through
-    // wazmrt (no `path_symlink`), so any link is host-placed, i.e. the attack.
-    if (rp.finalIsSymlink(w)) return ret(results, errno.notcapable);
+    // The walk already followed symlinks securely to a real final component. If
+    // it stopped at a symlink, the guest asked NOT to follow (no SYMLINK_FOLLOW)
+    // — you can't `open` a bare symlink as a file, so ELOOP (POSIX O_NOFOLLOW).
+    if (rp.final_is_symlink) return ret(results, errno.loop);
 
     // A guest may only ever narrow: intersect with what the dir fd may pass on.
     const new_base = want_base & rp.inheriting;
@@ -1089,11 +1173,11 @@ fn wPathOpen(ctx: *anyopaque, args: []const Value, results: []Value) bool {
             .exclusive = of & oflags.excl != 0,
         }) catch |err| return ret(results, errnoFor(err));
     } else blk: {
-        // `finalIsSymlink` above already refused a symlink, so opening with
-        // follow is a no-op on the final component — and it avoids the Windows
-        // std bug where `openFile(.follow_symlinks = false)` returns an async
-        // handle that crashes the first read (Threaded.zig:5033, known-issues
-        // #18).
+        // The walk resolved away any symlink (`final_is_symlink` was refused
+        // above), so `rp.name` is a real file — opening with follow is a no-op
+        // and avoids the Windows std bug where `openFile(.follow_symlinks =
+        // false)` returns an async handle that crashes the first read
+        // (Threaded.zig:5033, known-issues #18).
         const f = rp.dir.openFile(w.io, rp.name, .{
             .mode = if (wants_write and wants_read) .read_write else if (wants_write) .write_only else .read_only,
         }) catch |err| return ret(results, errnoFor(err));
@@ -1122,14 +1206,13 @@ fn wPathOpen(ctx: *anyopaque, args: []const Value, results: []Value) bool {
 fn wPathFilestatGet(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const w: *Wasi = @ptrCast(@alignCast(ctx));
     const follow = argU32(args, 1) & lookup_symlink_follow != 0;
-    var rp = resolveArg(w, argU32(args, 0), argU32(args, 2), argU32(args, 3), rights.path_filestat_get, results) orelse
+    var rp = resolveArg(w, argU32(args, 0), argU32(args, 2), argU32(args, 3), rights.path_filestat_get, follow, results) orelse
         return true;
     defer rp.close(w);
-    // Following a symlink out of the preopen is the one remaining escape; refuse
-    // rather than follow. Without `SYMLINK_FOLLOW` we stat the link itself,
-    // which is safe.
-    if (follow and rp.finalIsSymlink(w)) return ret(results, errno.notcapable);
-    const st = rp.dir.statFile(w.io, rp.name, .{ .follow_symlinks = follow }) catch |err|
+    // The walk already followed per `follow`. With no-follow, `rp.name` may be a
+    // symlink — stat it no-follow to describe the link itself (safe on Windows,
+    // unlike openFile-nofollow).
+    const st = rp.dir.statFile(w.io, rp.name, .{ .follow_symlinks = false }) catch |err|
         return ret(results, errnoFor(err));
     if (!writeFilestat(w, argU32(args, 4), st)) return ret(results, errno.fault);
     return ret(results, errno.success);
@@ -1139,13 +1222,13 @@ fn wPathFilestatGet(ctx: *anyopaque, args: []const Value, results: []Value) bool
 fn wPathFilestatSetTimes(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const w: *Wasi = @ptrCast(@alignCast(ctx));
     const follow = argU32(args, 1) & lookup_symlink_follow != 0;
-    var rp = resolveArg(w, argU32(args, 0), argU32(args, 2), argU32(args, 3), rights.path_filestat_set_times, results) orelse
+    var rp = resolveArg(w, argU32(args, 0), argU32(args, 2), argU32(args, 3), rights.path_filestat_set_times, follow, results) orelse
         return true;
     defer rp.close(w);
-    // Never follow a symlink out (our no-traversal policy); also lets us open
-    // the final component directly below without a link in the way.
-    if (rp.finalIsSymlink(w)) return ret(results, errno.notcapable);
-    _ = follow;
+    // The walk followed per `follow`; a leftover symlink final (no-follow) can't
+    // be opened read_write below, so refuse it — set-times on a link itself is
+    // uncommon and not supported here.
+    if (rp.final_is_symlink) return ret(results, errno.loop);
     const atim: u64 = @bitCast(interp.asI64(args[4]));
     const mtim: u64 = @bitCast(interp.asI64(args[5]));
     const t = timeSet(atim, mtim, @truncate(argU32(args, 6))) orelse return ret(results, errno.inval);
@@ -1163,29 +1246,69 @@ fn wPathFilestatSetTimes(ctx: *anyopaque, args: []const Value, results: []Value)
 
 /// `path_link(old_dirfd, old_flags, old_path, old_len, new_dirfd, new_path, new_len)`
 /// — a hard link. Both ends are resolved through the sandbox walk, so neither
-/// may escape its preopen; the link is created on the final names without
-/// following them (a hardlink references an inode, and a hardlink-to-symlink
-/// would be a way to smuggle one in — we refuse a symlink source).
+/// may escape its preopen. The source follows a symlink only if `old_flags` asks
+/// (`SYMLINK_FOLLOW`); the new name is created without following.
 fn wPathLink(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const w: *Wasi = @ptrCast(@alignCast(ctx));
-    var old = resolveArg(w, argU32(args, 0), argU32(args, 2), argU32(args, 3), rights.path_link_source, results) orelse
+    const src_follow = argU32(args, 1) & lookup_symlink_follow != 0;
+    var old = resolveArg(w, argU32(args, 0), argU32(args, 2), argU32(args, 3), rights.path_link_source, src_follow, results) orelse
         return true;
     defer old.close(w);
-    var new = resolveArg(w, argU32(args, 4), argU32(args, 5), argU32(args, 6), rights.path_link_target, results) orelse
+    var new = resolveArg(w, argU32(args, 4), argU32(args, 5), argU32(args, 6), rights.path_link_target, false, results) orelse
         return true;
     defer new.close(w);
-    // No symlink smuggling: refuse to hardlink a symlink source (our no-traversal
-    // policy — see the module doc / #17).
-    if (old.finalIsSymlink(w)) return ret(results, errno.notcapable);
     Io.Dir.hardLink(old.dir, old.name, new.dir, new.name, w.io, .{ .follow_symlinks = false }) catch |err|
         return ret(results, errnoFor(err));
+    return ret(results, errno.success);
+}
+
+/// `path_symlink(old_path, old_len, dirfd, new_path, new_len)` — create a
+/// symlink at `new_path` (inside the sandbox) whose target is `old_path`.
+///
+/// The *link's location* is contained by the walk (no-follow: we create the link
+/// itself, not through one). The *target* is stored as given — it is only ever
+/// resolved later through the same secure `walkFull`, where an escaping target
+/// simply fails to escape at follow time. We still refuse an obviously-escaping
+/// **absolute** target at creation (defence in depth: don't plant a landmine a
+/// less careful reader might follow — the orchestrator-invariant concern in
+/// `cmem/security-model.md`).
+fn wPathSymlink(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+    const w: *Wasi = @ptrCast(@alignCast(ctx));
+    const target = w.slice(argU32(args, 0), argU32(args, 1)) orelse return ret(results, errno.fault);
+    if (isAbsoluteTarget(target)) return ret(results, errno.notcapable); // don't plant an escape
+    if (std.mem.indexOfScalar(u8, target, 0) != null) return ret(results, errno.inval);
+    var rp = resolveArg(w, argU32(args, 2), argU32(args, 3), argU32(args, 4), rights.path_open, false, results) orelse
+        return true;
+    defer rp.close(w);
+    // Copy the target — `slice` borrows linear memory that `symLink` may outlive.
+    const tgt = w.gpa.dupe(u8, target) catch return ret(results, errno.nomem);
+    defer w.gpa.free(tgt);
+    rp.dir.symLink(w.io, tgt, rp.name, .{}) catch |err| return ret(results, errnoFor(err));
+    return ret(results, errno.success);
+}
+
+/// `path_readlink(dirfd, path, path_len, buf, buf_len, bufused)` — read a
+/// symlink's target into the guest buffer (the link itself, never followed).
+fn wPathReadlink(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+    const w: *Wasi = @ptrCast(@alignCast(ctx));
+    var rp = resolveArg(w, argU32(args, 0), argU32(args, 1), argU32(args, 2), rights.path_readlink, false, results) orelse
+        return true;
+    defer rp.close(w);
+    const out = w.slice(argU32(args, 3), argU32(args, 4)) orelse return ret(results, errno.fault);
+    // readLink truncates to the buffer; WASI reports the written length. Read
+    // into a scratch buffer first so we control truncation semantics.
+    var scratch: [4096]u8 = undefined;
+    const cap = @min(out.len, scratch.len);
+    const n = rp.dir.readLink(w.io, rp.name, scratch[0..cap]) catch |err| return ret(results, errnoFor(err));
+    @memcpy(out[0..n], scratch[0..n]);
+    if (!w.writeU32(argU32(args, 5), @intCast(n))) return ret(results, errno.fault);
     return ret(results, errno.success);
 }
 
 /// `path_create_directory(dirfd, path, path_len)`.
 fn wPathCreateDirectory(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const w: *Wasi = @ptrCast(@alignCast(ctx));
-    var rp = resolveArg(w, argU32(args, 0), argU32(args, 1), argU32(args, 2), rights.path_create_directory, results) orelse
+    var rp = resolveArg(w, argU32(args, 0), argU32(args, 1), argU32(args, 2), rights.path_create_directory, false, results) orelse
         return true;
     defer rp.close(w);
     rp.dir.createDir(w.io, rp.name, .default_dir) catch |err| return ret(results, errnoFor(err));
@@ -1195,7 +1318,7 @@ fn wPathCreateDirectory(ctx: *anyopaque, args: []const Value, results: []Value) 
 /// `path_remove_directory(dirfd, path, path_len)`.
 fn wPathRemoveDirectory(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const w: *Wasi = @ptrCast(@alignCast(ctx));
-    var rp = resolveArg(w, argU32(args, 0), argU32(args, 1), argU32(args, 2), rights.path_remove_directory, results) orelse
+    var rp = resolveArg(w, argU32(args, 0), argU32(args, 1), argU32(args, 2), rights.path_remove_directory, false, results) orelse
         return true;
     defer rp.close(w);
     rp.dir.deleteDir(w.io, rp.name) catch |err| return ret(results, errnoFor(err));
@@ -1203,10 +1326,10 @@ fn wPathRemoveDirectory(ctx: *anyopaque, args: []const Value, results: []Value) 
 }
 
 /// `path_unlink_file(dirfd, path, path_len)` — removes the final component
-/// itself (never follows it), so a symlink is unlinked, not its target. Safe.
+/// itself (never follows it), so a symlink is unlinked, not its target.
 fn wPathUnlinkFile(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const w: *Wasi = @ptrCast(@alignCast(ctx));
-    var rp = resolveArg(w, argU32(args, 0), argU32(args, 1), argU32(args, 2), rights.path_unlink_file, results) orelse
+    var rp = resolveArg(w, argU32(args, 0), argU32(args, 1), argU32(args, 2), rights.path_unlink_file, false, results) orelse
         return true;
     defer rp.close(w);
     rp.dir.deleteFile(w.io, rp.name) catch |err| return ret(results, errnoFor(err));
@@ -1214,14 +1337,14 @@ fn wPathUnlinkFile(ctx: *anyopaque, args: []const Value, results: []Value) bool 
 }
 
 /// `path_rename(old_dirfd, old_path, old_len, new_dirfd, new_path, new_len)` —
-/// both ends are resolved independently (walk included), so neither may escape
-/// its own preopen; rename acts on the final names without following them.
+/// both ends resolved independently (walk included), neither may escape; rename
+/// acts on the final names without following them.
 fn wPathRename(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const w: *Wasi = @ptrCast(@alignCast(ctx));
-    var old = resolveArg(w, argU32(args, 0), argU32(args, 1), argU32(args, 2), rights.path_rename_source, results) orelse
+    var old = resolveArg(w, argU32(args, 0), argU32(args, 1), argU32(args, 2), rights.path_rename_source, false, results) orelse
         return true;
     defer old.close(w);
-    var new = resolveArg(w, argU32(args, 3), argU32(args, 4), argU32(args, 5), rights.path_rename_target, results) orelse
+    var new = resolveArg(w, argU32(args, 3), argU32(args, 4), argU32(args, 5), rights.path_rename_target, false, results) orelse
         return true;
     defer new.close(w);
     // `io` is the LAST parameter on the two-dir operations.
@@ -1662,16 +1785,13 @@ test "resolve contains guest paths inside the preopen" {
     }
 }
 
-test "a symlink pointing out of a preopen is refused, intermediate and final (#17)" {
-    // The real-filesystem containment test: `resolve` is lexical, so this is the
-    // part that catches a symlink *stored inside* the preopen whose target is
-    // outside it — the hole #17 closed. Creating a symlink needs privilege
-    // (admin, or Developer Mode + the CreateSymbolicLinkW unprivileged flag);
-    // Zig std's Windows path uses raw FSCTL_SET_REPARSE_POINT, which needs
-    // SeCreateSymbolicLinkPrivilege, so this SKIPS on an unprivileged Windows
-    // box (it runs on POSIX CI, where symlinks are unprivileged). The Windows
-    // path is covered manually by `examples/wasi_symlink_escape.zig` — see
-    // `cmem/testing.md`.
+test "symlink traversal: in-sandbox links follow, escaping links refused (#17/4.3)" {
+    // The real-filesystem resolver test. Full traversal (4.3): an in-sandbox
+    // symlink is FOLLOWED; a symlink whose target leaves the preopen is REFUSED
+    // by the handle-stack (`..` can't rise above the root). Creating a symlink
+    // needs privilege on Windows (Zig std uses raw FSCTL_SET_REPARSE_POINT), so
+    // this SKIPS on an unprivileged Windows box; it runs on POSIX CI. The
+    // Windows path is covered manually by `examples/wasi_symlink_traversal.zig`.
     const gpa = std.testing.allocator;
     const tio = std.testing.io;
 
@@ -1681,24 +1801,28 @@ test "a symlink pointing out of a preopen is refused, intermediate and final (#1
     // tmp/outside/secret.txt is OUTSIDE the preopen; tmp/pre is the preopen.
     try tmp.dir.createDir(tio, "outside", .default_dir);
     try tmp.dir.createDir(tio, "pre", .default_dir);
+    try tmp.dir.createDir(tio, "pre/sub", .default_dir);
     {
         const f = try tmp.dir.createFile(tio, "outside/secret.txt", .{});
         defer f.close(tio);
         try f.writeStreamingAll(tio, "SECRET");
     }
     {
-        const f = try tmp.dir.createFile(tio, "pre/real.txt", .{});
+        const f = try tmp.dir.createFile(tio, "pre/sub/inside.txt", .{});
         defer f.close(tio);
         try f.writeStreamingAll(tio, "ok");
     }
     var pre = try tmp.dir.openDir(tio, "pre", .{ .iterate = true });
-    // Escaping links, planted inside the preopen. If we can't make one, there's
-    // nothing to test — skip rather than pass vacuously.
-    pre.symLink(tio, "../outside", "dlink", .{ .is_directory = true }) catch {
+    // Plant the links. If we can't make one, there's nothing to test — skip.
+    pre.symLink(tio, "sub", "inlink", .{ .is_directory = true }) catch { // in-sandbox
         pre.close(tio);
         return error.SkipZigTest;
     };
-    pre.symLink(tio, "../outside/secret.txt", "flink", .{}) catch {
+    pre.symLink(tio, "../outside", "dlink", .{ .is_directory = true }) catch { // escapes
+        pre.close(tio);
+        return error.SkipZigTest;
+    };
+    pre.symLink(tio, "../outside/secret.txt", "flink", .{}) catch { // escapes
         pre.close(tio);
         return error.SkipZigTest;
     };
@@ -1732,21 +1856,139 @@ test "a symlink pointing out of a preopen is refused, intermediate and final (#1
         }
     }.f;
 
-    // A refusal is any error that isn't "opened it": ENOTCAPABLE (our explicit
-    // reject) or ELOOP (POSIX openat O_NOFOLLOW on a symlink) — never SUCCESS,
-    // which would mean we followed the link out.
+    // Refusal = any error that isn't SUCCESS (ENOTCAPABLE / ELOOP), which would
+    // mean we followed the link out.
     const refused = struct {
         fn ok(e: u32) bool {
-            return e == errno.notcapable or e == errno.loop;
+            return e != errno.success;
         }
     }.ok;
 
-    try std.testing.expect(refused(openErrno(&w, &mem_bytes, "dlink/secret.txt"))); // intermediate
-    try std.testing.expect(refused(openErrno(&w, &mem_bytes, "flink"))); // final
+    // In-sandbox symlink IS followed now.
+    try std.testing.expectEqual(errno.success, openErrno(&w, &mem_bytes, "inlink/inside.txt"));
+    // Escaping symlinks refused, intermediate and final.
+    try std.testing.expect(refused(openErrno(&w, &mem_bytes, "dlink/secret.txt")));
+    try std.testing.expect(refused(openErrno(&w, &mem_bytes, "flink")));
+}
 
-    // The control: a genuine in-sandbox file still opens, so we didn't just
-    // break all path resolution.
-    try std.testing.expectEqual(errno.success, openErrno(&w, &mem_bytes, "real.txt"));
+test "symlink resolver fuzz: no adversarial topology reaches outside the preopen" {
+    // The mandated adversarial test for the security-critical resolver
+    // (`cmem/security-model.md`): plant random symlink graphs — in-sandbox,
+    // escaping via `..`, absolute to a canary, chains, cycles — then hammer
+    // random guest paths and assert the CANARY content (a file outside the
+    // preopen) is NEVER read, and nothing hangs. POSIX CI; skips on unprivileged
+    // Windows (can't create symlinks). The oracle is the canary, not a value.
+    const gpa = std.testing.allocator;
+    const tio = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDir(tio, "outside", .default_dir);
+    try tmp.dir.createDir(tio, "pre", .default_dir);
+    {
+        const f = try tmp.dir.createFile(tio, "outside/canary.txt", .{});
+        defer f.close(tio);
+        try f.writeStreamingAll(tio, "CANARY-LEAKED");
+    }
+    var pre = try tmp.dir.openDir(tio, "pre", .{ .iterate = true });
+    // A real in-sandbox file, so some paths legitimately resolve.
+    {
+        const f = pre.createFile(tio, "real.txt", .{}) catch {
+            pre.close(tio);
+            return error.SkipZigTest;
+        };
+        f.close(tio);
+    }
+
+    // Plant a set of links with adversarial targets. `l0..l7`.
+    const targets = [_][]const u8{
+        "real.txt", // in-sandbox
+        "..", // escape attempt (parent)
+        "../outside", // escape to the canary dir
+        "../outside/canary.txt", // direct escape to canary
+        "l4", // chain -> l4
+        "l3", // l4 -> l3 (so l5->l4->l3->canary): a chain to the escape
+        "l6", // cycle: l6 -> l7
+        "l6", // l7 -> l6 (cycle)
+    };
+    for (targets, 0..) |t, i| {
+        var name: [4]u8 = undefined;
+        const nm = std.fmt.bufPrint(&name, "l{d}", .{i}) catch unreachable;
+        pre.symLink(tio, t, nm, .{}) catch {
+            pre.close(tio);
+            return error.SkipZigTest; // no symlink support here
+        };
+    }
+    // An absolute-target link to the host root — must re-base to the preopen,
+    // never reach the host `/etc/passwd` etc. (absolute-to-canary is covered by
+    // examples/wasi_symlink_traversal.zig on Windows).
+    pre.symLink(tio, "/outside/canary.txt", "labs", .{}) catch {
+        pre.close(tio);
+        return error.SkipZigTest;
+    };
+
+    var mem_bytes = [_]u8{0} ** 256;
+    var mem = Memory{ .bytes = &mem_bytes, .max = null };
+    var obuf: [8]u8 = undefined;
+    var ow = Io.Writer.fixed(&obuf);
+    var w = Wasi.init(gpa, tio, &ow, &ow, 0);
+    defer w.deinit();
+    w.memory = &mem;
+    try w.fds.append(gpa, .{ .dir = .{ .handle = pre, .preopen_name = null, .owned = true } });
+
+    const names = [_][]const u8{ "l0", "l1", "l2", "l3", "l4", "l5", "l6", "l7", "labs", "real.txt", "..", "sub" };
+
+    var prng = std.Random.DefaultPrng.init(0x5217);
+    const rng = prng.random();
+    var iter: usize = 0;
+    while (iter < 2000) : (iter += 1) {
+        // Build a random path of 1–4 components from the link/name set.
+        var path_buf: [128]u8 = undefined;
+        var len: usize = 0;
+        const parts = rng.intRangeAtMost(usize, 1, 4);
+        var p: usize = 0;
+        while (p < parts) : (p += 1) {
+            if (p != 0) {
+                path_buf[len] = '/';
+                len += 1;
+            }
+            const seg = names[rng.uintLessThan(usize, names.len)];
+            @memcpy(path_buf[len..][0..seg.len], seg);
+            len += seg.len;
+        }
+        const path = path_buf[0..len];
+
+        // Resolve + open + read; assert we never read the canary.
+        @memset(mem_bytes[0..200], 0);
+        @memcpy(mem_bytes[0..path.len], path);
+        var results = [_]Value{interp.i32Value(-1)};
+        const args = [_]Value{
+            interp.i32Value(3),                      interp.i32Value(1), // dirfd, SYMLINK_FOLLOW
+            interp.i32Value(0),                      interp.i32Value(@intCast(path.len)),
+            interp.i32Value(0),                      interp.i64Value(@bitCast(rights.all)),
+            interp.i64Value(@bitCast(rights.all)),   interp.i32Value(0),
+            interp.i32Value(200), // opened-fd out
+        };
+        _ = wPathOpen(&w, &args, &results);
+        if (interp.asI32(results[0]) != 0) continue; // refused — good
+        const fd = w.readU32(200).?;
+        // Read it (into guest memory at 220, len 32) and check for the canary.
+        std.mem.writeInt(u32, mem_bytes[208..212], 220, .little); // iovec.base
+        std.mem.writeInt(u32, mem_bytes[212..216], 32, .little); // iovec.len
+        var rres = [_]Value{interp.i32Value(-1)};
+        const rargs = [_]Value{ interp.i32Value(@bitCast(fd)), interp.i32Value(208), interp.i32Value(1), interp.i32Value(240) };
+        _ = wFdRead(&w, &rargs, &rres);
+        const nread = w.readU32(240) orelse 0;
+        const content = mem_bytes[220..][0..@min(nread, 32)];
+        if (std.mem.indexOf(u8, content, "CANARY") != null) {
+            std.debug.print("LEAK via path '{s}'\n", .{path});
+            return error.SandboxEscaped;
+        }
+        // close the fd
+        var cres = [_]Value{interp.i32Value(-1)};
+        const cargs = [_]Value{interp.i32Value(@bitCast(fd))};
+        _ = wFdClose(&w, &cargs, &cres);
+    }
 }
 
 test "path_open rejects an escaping path with ENOTCAPABLE before touching the host" {

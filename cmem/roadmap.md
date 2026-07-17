@@ -219,23 +219,23 @@ only guards the final `openat` component). Fixed with a **handle-based component
 (TOCTOU-safe) with no-follow, reject anything that isn't a real directory; refuse a final symlink in any
 op that would follow it. **Policy: no symlink is ever traversed** (a guest can't create one, so every
 symlink is host-placed — the attack). No `openat2(RESOLVE_BENEATH)` needed after all — the walk gets
-there portably. **Verified before/after with a real NTFS symlink** (`examples/wasi_symlink_escape.zig`:
+there portably. **Verified before/after with a real NTFS symlink** (`examples/wasi_symlink_traversal.zig`:
 pre-fix `ESCAPED`, post-fix refused) + a unit test (POSIX CI; skips on unprivileged Windows since Zig
 std can't make a symlink there) + Phase 3 gate still 16/16. One documented residual: a narrow
 final-component `path_open` TOCTOU tied to std bug #18. See #17.
 
-> ### ▶ 4.3 RESUMED (owner, 2026-07-16, after the security design conversation + cold-start measurement).
-> The pause (below) produced `cmem/security-model.md` and the decision that **the vision does not need
-> `path_symlink`** (its symlink is host-side dispatch, not the guest-visible op). Cold-start cost of
-> hashing was measured and is **negligible**, unblocking the signature/pin direction. **Sequencing for
-> 4.3:** do the **safe, no-policy items first** — `fd_filestat_set_times`, `path_filestat_set_times`,
-> `fd_allocate`, `path_link` (hardlink — both ends resolved at creation, no traversal hazard), and real
-> `poll_oneoff` fd-readiness. **`path_symlink`/`path_readlink` still carry the one live decision**
-> (create-time policy: no-traversal + validate-target-at-creation per `security-model.md`, vs full
-> target-revalidation traversal for wasmtime-parity conformance) — surface it when reached, don't decide
-> it unilaterally.
+> ### ✅ 4.3 COMPLETE (2026-07-16). ⇢ START HERE next: **4.4 — the Phase 4 items proper** (below):
+> `--env KEY=VAL`, a `zig build`-driven compiled-program gate, and broadened C/Rust/Zig conformance.
+> **Also unscheduled but high-value from the security conversation: `--ro-dir` (read-only preopens)** —
+> the rights machinery exists; it makes least-authority pipelines expressible and is cheap. Consider it
+> for 4.4 or ahead of it.
 >
-> Three findings from the pause conversation that shaped this (retained):
+> 4.3 delivered (all DONE 2026-07-16): the safe leftovers (`fd`/`path_filestat_set_times`, `fd_allocate`,
+> `path_link`, `poll_oneoff` EBADF fix) **and** — owner chose full traversal — `path_symlink`/
+> `path_readlink` with the secure **handle-stack resolver** (`walkFull`): in-sandbox symlinks followed,
+> escapes impossible by construction, adversarial-fuzzed. See `security-model.md` (DONE) and #17.
+>
+> Three findings from the pause conversation, retained for the record:
 > 1. **The vision's symlink is host-side dispatch** (`argv[0]`/`binfmt_misc`), **not** the guest-visible
 >    symlink of #17 — **the vision does not need `path_symlink`.** The two were being conflated.
 > 2. **If `path_symlink` is ever built, targets must be validated at *creation*** (refuse escaping
@@ -250,9 +250,16 @@ final-component `path_open` TOCTOU tied to std bug #18. See #17.
 > links — #23), and a `poll_oneoff` correctness fix (a subscription on a closed fd reports EBADF, not a
 > false "ready"; note **files/stdio being always-ready is *correct* per POSIX, not a stub** — only
 > pipes/sockets, which we don't have, would need real polling). +3 unit tests, `examples/wasi_leftovers.zig`
-> gate. **STILL OPEN: `path_symlink` / `path_readlink`** — the one live create-time policy decision
-> (see the "▶ 4.3 RESUMED" banner). Then **4.4** — the Phase 4 items proper (`--env`, the `zig build`-driven
-> compiled gate, C/Rust/Zig conformance).
+> gate. **`path_symlink` / `path_readlink` DONE 2026-07-16 — owner chose FULL traversal (wasmtime
+> parity).** The lexical/no-follow walk was replaced by the secure handle-stack resolver `walkFull`
+> (RESOLVE_BENEATH in userspace): in-sandbox symlinks are **followed**, escapes are impossible **by
+> construction** (`..` can't rise above the preopen; absolute targets re-base to the preopen root;
+> per-component no-follow opens through held handles; `symlink_max`→ELOOP). `path_symlink` validates
+> targets at creation (absolute refused). Verified 5/5 on Windows with real symlinks
+> (`examples/wasi_symlink_traversal.zig`) + POSIX-CI unit tests incl. an **adversarial fuzz**
+> (random topologies, canary oracle). Design in `cmem/security-model.md` (marked DONE). Creation is
+> POSIX-only (Windows privilege, #17/#23); following works everywhere. **4.3 COMPLETE.** Then **4.4** —
+> the Phase 4 items proper (`--env`, the `zig build`-driven compiled gate, C/Rust/Zig conformance).
 
 **4.1 — `known-issues.md` #19: trap diagnostics. DONE 2026-07-15.** Traps now report a named
 backtrace, innermost frame first — on the exact binary from the Phase 3 hunt:

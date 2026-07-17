@@ -86,19 +86,25 @@ and refuses absolute paths, `..` escapes, and NT/device prefixes — an interior
 
 > **Scope of the sandbox.** Containment is enforced two ways: **lexically** (a
 > guest cannot name a path outside its preopens) and **through the filesystem**
-> — path resolution descends one component at a time through directory handles
-> and **refuses to traverse any symlink**, so a symlink planted inside a preopen
-> cannot redirect a guest outside it. One documented residual remains: a narrow
-> TOCTOU race on the final component of `path_open`, tied to a Zig std bug on
-> Windows (`cmem/known-issues.md` #17/#18). In-sandbox symlink *traversal* is
-> intentionally unsupported.
+> — path resolution walks one component at a time through directory handles
+> (RESOLVE_BENEATH in userspace). **Symlinks are followed** like a real
+> filesystem, but a symlink whose target leaves the preopen cannot escape: `..`
+> can never rise above the preopen (there is no handle there), absolute targets
+> re-base to the preopen root, and a symlink-expansion budget bounds cycles.
+> Security is a property of the construction, not of checking target strings.
+> One documented residual: a narrow TOCTOU on the final component of `path_open`,
+> tied to a Zig std bug on Windows (`cmem/known-issues.md` #17/#18). Creating a
+> symlink (`path_symlink`) needs OS privilege on Windows, so it is POSIX-only on
+> the write side; *following* host-placed symlinks works everywhere.
 
 Implemented: stdout/stderr/stdin, args/environ, clocks, `poll_oneoff` (clock
 sleep), `random_get`, `proc_exit`, and the filesystem (`path_open`, `fd_read`/
 `fd_write`/`fd_seek`/`fd_tell`/`fd_pread`/`fd_pwrite`/`fd_sync`, `fd_readdir`,
-`*_filestat_get`, create/unlink/rename). Not implemented: sockets, symlink ops,
-and `*_filestat_set_times` — these return `ENOTSUP` rather than trapping, so a
-module still instantiates and fails gracefully.
+`*_filestat_get`/`*_filestat_set_times`, `fd_allocate`, create/unlink/rename,
+`path_symlink`/`path_readlink`, `path_link`). Not implemented: sockets — those
+return `ENOTSUP` rather than trapping, so a module still instantiates and fails
+gracefully. Note `path_link`/`path_symlink` need OS support/privilege that is
+absent on unprivileged Windows (they return `ENOTSUP` there; both work on POSIX).
 
 > **Writing a WASI guest in Zig:** call the imports via `std.os.wasi`, not your
 > own `extern "wasi_snapshot_preview1"` declarations. If your signature differs
