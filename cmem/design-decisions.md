@@ -248,11 +248,12 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   - **Deferred (until browser-standard):** **WASI preview 2/3** (component-model based), **multi-memory**,
     **SIMD** — pulled in as the real corpus (`wasm_wasi`) demands. Typed/GC reference *value types* are
     already *accepted* (P1) so such modules build.
-  - **Exception handling — moved IN SCOPE 2026-07-17** (owner chose it as the Phase 5.1 frontier). The
-    standardized **exnref** proposal (`try_table`/`throw`/`throw_ref` + `tag` section, `exnref` heap
-    type) shipped cross-browser (Chrome/Firefox 2024), so it clears the browser-standard bar. Plan in
-    `roadmap.md` §5.1. Note the encoding split: the **legacy** `try`/`catch`/`catch_all`/`delegate`/
-    `rethrow` form (older LLVM) is distinct from the standard exnref form — plan targets exnref first.
+  - **Exception handling — moved IN SCOPE 2026-07-17** (owner chose it as a frontier; sequenced as
+    **Phase 6**, after the Phase 5 secure-base pin verification). The standardized **exnref** proposal
+    (`try_table`/`throw`/`throw_ref` + `tag` section, `exnref` heap type) shipped cross-browser
+    (Chrome/Firefox 2024), so it clears the browser-standard bar. Plan in `roadmap.md` §6. Note the
+    encoding split: the **legacy** `try`/`catch`/`catch_all`/`delegate`/`rethrow` form (older LLVM) is
+    distinct from the standard exnref form — plan targets exnref first.
 
 ## Zig 0.16 API notes (this project targets 0.16.0)
 

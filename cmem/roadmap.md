@@ -223,8 +223,9 @@ opens; `symlink_max`→ELOOP). No `openat2(RESOLVE_BENEATH)` needed — the walk
 incl. an adversarial fuzz + Phase 3 gate still 16/16. One documented residual: a narrow
 final-component `path_open` TOCTOU tied to std bug #18. See #17.
 
-> ### ✅ 4.3 COMPLETE (2026-07-16). ✅ 4.4 COMPLETE (2026-07-17). ⇢ START HERE next: **Phase 5.1 —
-> Exception handling** (owner chose it 2026-07-17 as the next frontier; plan in §5.1 below).
+> ### ✅ 4.3 COMPLETE (2026-07-16). ✅ 4.4 COMPLETE (2026-07-17). ⇢ START HERE next: **Phase 5 —
+> Secure base: pin verification** (owner chose it 2026-07-17 as the next build; plan in §5 below).
+> **Exception handling** (former "5.1") moves to **Phase 6** — plan retained below, unchanged.
 >
 > **The C ABI is NOT remaining work** — #20 (all 319 `wasm.h` fns) / #21 (mem-safety) / #22 (fuzz) are
 > DONE and 4.4 added a C conformance guest. Only two narrow, demand-driven residuals stay deferred:
@@ -244,13 +245,52 @@ final-component `path_open` TOCTOU tied to std bug #18. See #17.
 >   all three compilers' output byte-for-byte. The gate *can fail* (wrong output → exit 1, confirmed).
 >
 
-## Phase 5.1 — Exception handling (PLANNED, owner-chosen 2026-07-17)
+## Phase 5 — Secure base: pin verification (PLANNED, owner-chosen 2026-07-17 — the NEXT build)
+
+The **buildable slice of the authenticity design** (`security-model.md`), chosen next because its
+mechanism is fully **DECIDED** and it needs **none** of the still-open *signature* decisions (trust
+anchor, signature format, revocation). It delivers the unsigned-module path end to end: an install-time
+root-owned pin + a pre-run SHA-256 check.
+
+**Decided mechanism — do NOT re-derive (security-model.md §1):**
+- Pin DB is **root-owned, read-only to the user, plaintext**. Integrity from *ownership*, not secrecy.
+- Pinning is done **at install time, with privilege** — verified install, **NOT TOFU**. wazmrt (as the
+  user) only ever *reads* the DB; user-level malware can't rewrite it.
+- **Signed → verify signature; unsigned → check the pin.** This phase builds the **pin** half only.
+- **TOCTOU discipline (aligned with owner 2026-07-17):** read the file **once** into memory, hash *those*
+  bytes, execute *those* bytes — never hash-by-path then re-open. It is not caching/perf: the buffer is
+  freed at exit like any decode buffer; it exists so the verified bytes provably *are* the run bytes,
+  closing the check→use swap window. It falls out of how the runtime already loads a module (zero/negative
+  cost). In the root-owned-script deployment ownership already shuts the window; the single-read keeps the
+  guarantee sound even when a user runs `wazmrt ./downloaded.wasm` from a writable dir.
+- Cold-start cost **measured negligible** — SHA-256 ~21 µs (~0.5% of instantiate).
+
+**Increments (each with tests):**
+1. **Pin DB format** — minimal plaintext, auditable (`cat`/diff-able). Micro-decision: **content-addressed**
+   (just the set of approved SHA-256s — path-independent, simplest) vs `sha256␠identifier` lines. Lean
+   content-addressed.
+2. **`wazmrt pin <file>`** subcommand — hashes the module and writes/appends the DB; meant to be run with
+   privilege by an installer. Document the root-owned DB location per-OS.
+3. **Runtime verify** — before instantiating a `_start` command module, SHA-256 the **in-memory** bytes,
+   look them up in the pin DB, gate execution. **Reuse the single buffer the loader already reads**
+   (TOCTOU-safe by construction).
+4. **Enforcement policy = a knob, default OFF for now** — `default-deny-unsigned` is still an *open* owner
+   decision, so ship the check behind an explicit mode (e.g. `--verify`, or "DB present ⇒ enforce"),
+   erroring clearly on mismatch / absent pin. **Do NOT make deny-the-default until the owner settles it.**
+5. **`bytes-hashed == bytes-run` test** — assert the verified buffer is the executed buffer, so a future
+   refactor can't silently reintroduce a hash-by-path TOCTOU.
+
+**Open, and NOT blocking this slice** (they belong to the *signature* path): trust anchor, signature
+format, revocation. **Touches this slice:** default policy (deferred to the knob above), DB
+location/ownership convention per-OS. All tracked in `security-model.md` "Open decisions".
+
+## Phase 6 — Exception handling (PLANNED, owner-chosen 2026-07-17; was "Phase 5.1")
 
 **Scope decision first:** target the **standardized exnref proposal** (`try_table` + `throw`/`throw_ref`,
 `tag` section id 13, `exnref` heap type) — it shipped cross-browser (Chrome/Firefox 2024) so it clears
 the project's browser-standard bar (`design-decisions.md` proposal-scope). The **legacy** form
 (`try`/`catch`/`catch_all`/`delegate`/`rethrow`, older LLVM/Emscripten) is a *distinct* encoding; treat
-it as a later compat add-on only if a real corpus module needs it, not part of 5.1.
+it as a later compat add-on only if a real corpus module needs it, not part of this phase.
 
 **Why it fits cleanly:** EH extends seams that already exist — a new section (like tags are just typed
 function-signatures), new opcodes in the `opcode.zig` IR, new control-frame kinds in `validate.zig`, and

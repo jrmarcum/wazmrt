@@ -416,7 +416,13 @@ the deliverable that prevents that.
 **Settled, do not re-litigate** (reasoning in "DECIDED" above): pin mechanism (verified-install,
 root-owned) · no encryption · no machine-binding.
 
-**Genuinely open:**
+**SCHEDULED TO BUILD NEXT (owner, 2026-07-17): the pin path.** The pin half of the design — install-time
+root-owned plaintext pin DB + pre-run SHA-256 check, read-once so the verified bytes *are* the run bytes
+(TOCTOU-safe) — is fully decided and needs none of the open signature decisions below. It is **Phase 5**
+in `roadmap.md` (plan there). Enforcement ships behind an explicit knob, default OFF, until "default
+policy" below is settled.
+
+**Genuinely open** (all belong to the *signature* path — they do NOT block the Phase 5 pin build):
 
 - Trust anchor: embedded-in-binary (recommended) vs OS keystore vs signed keyring file vs a hybrid.
 - Signature format: adopt existing prior art (→ Adoption Checklist) vs roll our own.
