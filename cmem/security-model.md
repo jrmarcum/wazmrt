@@ -402,7 +402,14 @@ the deliverable that prevents that.
 5. OS enforces wazmrt's integrity (Authenticode+WDAC / IMA+Secure Boot).
 6. Optional signed keyring file, anchored to the embedded root, for rotation/revocation.
 7. **Default-deny unsigned `.wasm`**, explicit `--unsigned`/dev-mode opt-out. *If unsigned is the default,
-   nobody signs.*
+   nobody signs.* **Owner requirement 2026-07-17 — the opt-out is a real CLI flag** (`--no-verify` /
+   `--unsigned`) so a developer can run their own unpinned modules. **Precedence rule (load-bearing):**
+   the skip flag is **subordinate to the root-owned enforcement policy** — honored when policy is
+   `off`/`warn`, **refused when policy is `enforce`**. Otherwise user-level malware would just pass
+   `--no-verify evil.wasm` and the pin system would protect nothing. Same invariant as everything else
+   here: *authority comes from ownership, not from a runtime argument.* A user flag cannot override a
+   policy owned by root. (While the default enforcement mode is OFF, the flag is pure dev convenience;
+   the precedence only bites once an `enforce` mode exists.) Built in Phase 5 — see `roadmap.md` §5.
 8. **`--ro-dir` (read-only preopens)** — surfaced three times in the design conversation as the highest
    security-value-per-effort item on the table. **BUILT in Phase 4.4 (2026-07-17).** It exposes the
    existing rights machinery at the CLI: a `--ro-dir` preopen omits `rights.write_mask`, and because

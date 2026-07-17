@@ -277,7 +277,17 @@ root-owned pin + a pre-run SHA-256 check.
 4. **Enforcement policy = a knob, default OFF for now** — `default-deny-unsigned` is still an *open* owner
    decision, so ship the check behind an explicit mode (e.g. `--verify`, or "DB present ⇒ enforce"),
    erroring clearly on mismatch / absent pin. **Do NOT make deny-the-default until the owner settles it.**
-5. **`bytes-hashed == bytes-run` test** — assert the verified buffer is the executed buffer, so a future
+5. **Skip flag for user-run files (owner requirement, 2026-07-17)** — a `--no-verify` (a.k.a.
+   `--unsigned`/dev-mode) CLI flag that bypasses the pin check for that one invocation. This is posture
+   item 7's dev escape hatch; while the default is OFF it is pure convenience. **The subtlety — get it
+   right now:** a plain user-space skip flag that *always* works would let user-level malware simply pass
+   `--no-verify evil.wasm` and the pin system protects nothing. So the flag must be **subordinate to a
+   root-owned enforce policy**: when policy is `off`/`warn` (dev/permissive) `--no-verify` is honored;
+   when policy is `enforce` the flag is **refused** — the root-owned policy outranks a user flag, exactly
+   like the pin DB itself (authority from ownership, not from a runtime argument). Net: developers skip
+   freely on their own machines; a hardened deployment can't be bypassed by an argument. Record the flag
+   name + this precedence rule in `main.zig` help and `security-model.md`.
+6. **`bytes-hashed == bytes-run` test** — assert the verified buffer is the executed buffer, so a future
    refactor can't silently reintroduce a hash-by-path TOCTOU.
 
 **Open, and NOT blocking this slice** (they belong to the *signature* path): trust anchor, signature
