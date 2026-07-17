@@ -483,11 +483,11 @@ are ±10% noisy.)
 
 ## Reading the test count (updated 2026-07-17, Phase 6)
 
-`zig build test --summary all` prints **266** (262 pass, 4 skip), but there are **138 distinct tests**:
-128 in the core module (126 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
+`zig build test --summary all` prints **278** (274 pass, 4 skip), but there are **144 distinct tests**:
+134 in the core module (132 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
 `wasm_c_api.zig`, which imports `root.zig`, so it compiles and **re-runs the core module's tests too**
-(128 core + 10 C-ABI = 138), on top of the standalone `mod_tests` run (128) → 266 printed. Harmless —
-under a second — but **don't quote 266 as a test count**; quote **138**, or the per-target numbers from
+(134 core + 10 C-ABI = 144), on top of the standalone `mod_tests` run (134) → 278 printed. Harmless —
+under a second — but **don't quote 278 as a test count**; quote **144**, or the per-target numbers from
 `--summary all`. Two core tests skip on an unprivileged Windows box (the #17 real-symlink test and the
 traversal example gate — see below), so you'll usually see `2 skip` per run (`4` total).
 
@@ -502,6 +502,12 @@ the opcodes are hand-written. Coverage: `catch` carrying a payload, `catch_all`,
 `throw_ref` rethrowing a caught `exnref` to an outer `catch_all`. **Gotcha for future hand-built tests:**
 `i32.const` is *signed* LEB128 — a single byte ≥ 0x40 decodes negative (`0x63` → −29, not 99), so keep
 hand-encoded constants < 64 or emit a proper multi-byte SLEB.
+
+**Phase 6.1 (WAT/​`.wast` round-trips):** 5 tests in `wat.zig` assemble EH *text* → binary → run
+(folded + flat `try_table`, `throw`/`throw_ref`, `catch`/`catch_all`/`catch_ref`, and a `(catch $e $out)`
+resolving by name to an enclosing block); 1 test in `wast.zig` runs a `.wast` script asserting a caught
+exception returns a value **and** `assert_trap` fires on an uncaught one. Also CLI-verified
+(`wazmrt eh.wat run`, `wazmrt eh.wast`).
 
 ## Pin verification tests — `src/pin.zig` (2026-07-17, Phase 5)
 

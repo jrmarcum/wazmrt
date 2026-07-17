@@ -223,10 +223,11 @@ opens; `symlink_max`→ELOOP). No `openat2(RESOLVE_BENEATH)` needed — the walk
 incl. an adversarial fuzz + Phase 3 gate still 16/16. One documented residual: a narrow
 final-component `path_open` TOCTOU tied to std bug #18. See #17.
 
-> ### ✅ 4.3 (2026-07-16). ✅ 4.4 + Phase 5 (2026-07-17). ✅ Phase 6 — exception handling CORE
-> COMPLETE (2026-07-17: decode + validate + execute for the exnref proposal). ⇢ START HERE next:
-> **Phase 6.1 — WAT assembler + `.wast` conformance for EH** (the one deferred piece; §6 below), then
-> the next frontier (SIMD / multi-memory / the signature path).
+> ### ✅ 4.3 (2026-07-16). ✅ 4.4 + Phase 5 (2026-07-17). ✅ Phase 6 exception handling — CORE +
+> **6.1 (WAT assembler + `.wast`) COMPLETE (2026-07-17)**. The exnref proposal now works from text:
+> `(tag …)` / `throw` / `throw_ref` / `try_table` + catch clauses assemble → decode → validate → run,
+> and the `.wast` runner accepts `assert_trap` on an uncaught exception. ⇢ START HERE next: the next
+> frontier (SIMD / multi-memory / the signature path in `security-model.md`).
 >
 > **Phase 6 delivered (DONE 2026-07-17):** the standardized **exnref** proposal end to end —
 > `exnref` value type + `exn` heap type (`types.zig`/`opcode.zig`), the **tag section** (id 13,
@@ -326,7 +327,17 @@ root-owned pin + a pre-run SHA-256 check.
 format, revocation. **Touches this slice:** default policy (deferred to the knob above), DB
 location/ownership convention per-OS. All tracked in `security-model.md` "Open decisions".
 
-## Phase 6 — Exception handling (CORE ✅ COMPLETE 2026-07-17; §6.1 WAT/​.wast conformance deferred)
+## Phase 6 — Exception handling (✅ COMPLETE 2026-07-17 — core + 6.1 WAT assembler + `.wast`)
+
+**6.1 delivered (2026-07-17):** the WAT assembler now emits the tag section and assembles
+`throw $e` / `throw_ref` / `try_table` with catch clauses (`catch`/`catch_ref`/`catch_all`/
+`catch_all_ref`), folded *and* flat forms, with `$tag`/`$label` name resolution (the try_table's own
+label is pushed before its catches resolve, so `(catch $e 0)` targets the try_table). `exnref`/`(ref
+exn)` parse as value types (fixed a latent bug: the valtype table had mapped `exnref` → `externref`).
+The `.wast` runner counts an uncaught exception as a trap (`isRuntimeTrap` += `UncaughtException`). 6
+round-trip tests (5 in `wat.zig`, 1 `.wast` in `wast.zig`) + CLI-verified end to end. Running the
+*official* `exception-handling` `.wast` corpus is gated only on that corpus being present in-tree (it
+isn't — the spec corpora live on removable media, like the others).
 
 **Scope decision first:** target the **standardized exnref proposal** (`try_table` + `throw`/`throw_ref`,
 `tag` section id 13, `exnref` heap type) — it shipped cross-browser (Chrome/Firefox 2024) so it clears

@@ -473,6 +473,7 @@ fn isRuntimeTrap(e: anyerror) bool {
         error.CastFailure,
         error.HostTrap,
         error.CallStackExhausted,
+        error.UncaughtException, // an uncaught exception traps (EH proposal)
         => true,
         else => false,
     };
@@ -794,5 +795,24 @@ test "runs a (module binary …) command" {
     ;
     const s = try runScript(std.testing.allocator, src);
     try std.testing.expectEqual(@as(usize, 1), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "exception handling: assert_return on a caught exn, assert_trap on an uncaught one" {
+    const src =
+        \\(module
+        \\  (tag $e (param i32))
+        \\  (func (export "caught") (result i32)
+        \\    (try_table (result i32) (catch $e 0)
+        \\      i32.const 88
+        \\      throw $e))
+        \\  (func (export "uncaught")
+        \\    i32.const 1
+        \\    throw $e))
+        \\(assert_return (invoke "caught") (i32.const 88))
+        \\(assert_trap (invoke "uncaught") "uncaught exception")
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 2), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }

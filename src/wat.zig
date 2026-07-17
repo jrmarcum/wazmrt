@@ -122,6 +122,10 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     var elem_names: List(?[]const u8) = .empty;
     var sigs: List(Sig) = .empty;
     var type_names: List(?[]const u8) = .empty;
+    // Exception tags (EH proposal): each names a type index (its params are the
+    // exception's value types); `tag_names` is index-aligned for `$e` resolution.
+    var tag_types: List(u32) = .empty;
+    var tag_names: List(?[]const u8) = .empty;
     // GC composite kinds, index-aligned with the leading named `(type …)` defs
     // in `sigs`; struct/array carry their fields (func types use `sigs`).
     var gc_types: List(GcTypeDef) = .empty;
@@ -200,6 +204,29 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             try exports.append(a, .{ .name = name, .kind = kind, .index = idx });
         } else if (std.mem.eql(u8, kw, "global")) {
             try parseGlobal(a, items, &globals, &global_imports, &global_names, &exports, type_names.items);
+        } else if (std.mem.eql(u8, kw, "tag")) {
+            // (tag $name? (type $t) | (param …)*) — an exception tag names a type
+            // index (params = the exception's value types; no results).
+            var j: usize = 1;
+            const nm = if (isId(items[j])) blk: {
+                defer j += 1;
+                break :blk items[j].asAtom();
+            } else null;
+            var type_ref: ?u32 = null;
+            var params: List(V) = .empty;
+            var results: List(V) = .empty;
+            while (j < items.len) : (j += 1) {
+                const tkw = items[j].keyword() orelse break;
+                if (std.mem.eql(u8, tkw, "type")) {
+                    type_ref = try resolveType(type_names.items, items[j].asList().?[1]);
+                } else if (std.mem.eql(u8, tkw, "param")) {
+                    try parseDecls(a, items[j].asList().?, &params, null, type_names.items);
+                } else if (std.mem.eql(u8, tkw, "result")) {
+                    try parseDecls(a, items[j].asList().?, &results, null, type_names.items);
+                } else break;
+            }
+            try tag_types.append(a, type_ref orelse try internSig(a, &sigs, params.items, results.items));
+            try tag_names.append(a, nm);
         } else if (std.mem.eql(u8, kw, "memory")) {
             var mi: usize = 1;
             if (mi < items.len and isId(items[mi])) mi += 1; // optional $name
@@ -361,7 +388,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     }
 
     var bodies: List([]const u8) = .empty;
-    for (funcs.items) |f| try bodies.append(a, try encodeBody(a, f, func_names.items, &sigs, type_names.items, global_names.items, table_names.items, elem_names.items));
+    for (funcs.items) |f| try bodies.append(a, try encodeBody(a, f, func_names.items, &sigs, type_names.items, global_names.items, table_names.items, elem_names.items, tag_names.items));
 
     // Pre-encode every const-expr-bearing section (global inits, element and data
     // exprs/offsets) BEFORE the type section, mirroring the function-body path, so
@@ -466,6 +493,17 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         try uleb(a, &s, 1);
         try emitLimits(a, &s, mn, mem_max);
         try emitSection(a, &out, 5, s.items);
+    }
+    // Tag section (13) — exception tags. Ordered after memory (5) and before
+    // global (6), per the EH proposal's section order.
+    if (tag_types.items.len != 0) {
+        var s: List(u8) = .empty;
+        try uleb(a, &s, tag_types.items.len);
+        for (tag_types.items) |ti| {
+            try s.append(a, 0x00); // attribute: exception
+            try uleb(a, &s, ti);
+        }
+        try emitSection(a, &out, 13, s.items);
     }
     // Global section (6) — pre-encoded above (before the type section).
     if (globals.items.len != 0) try emitSection(a, &out, 6, global_pay);
@@ -1007,8 +1045,10 @@ fn heapTypeToValType(s: Sexpr, nullable: bool, type_names: []const ?[]const u8) 
         return V.concreteRef(nullable, .@"struct", try resolveType(type_names, s));
     const pair: ?[2]V = if (std.mem.eql(u8, atom, "func") or std.mem.eql(u8, atom, "funcref") or std.mem.eql(u8, atom, "nofunc"))
         .{ .funcref, .funcref_nn }
-    else if (std.mem.eql(u8, atom, "extern") or std.mem.eql(u8, atom, "externref") or std.mem.eql(u8, atom, "noextern") or std.mem.eql(u8, atom, "exn") or std.mem.eql(u8, atom, "noexn"))
+    else if (std.mem.eql(u8, atom, "extern") or std.mem.eql(u8, atom, "externref") or std.mem.eql(u8, atom, "noextern"))
         .{ .externref, .externref_nn }
+    else if (std.mem.eql(u8, atom, "exn") or std.mem.eql(u8, atom, "exnref") or std.mem.eql(u8, atom, "noexn"))
+        .{ .exnref, .exnref_nn }
     else if (std.mem.eql(u8, atom, "any") or std.mem.eql(u8, atom, "anyref"))
         .{ .anyref, .anyref_nn }
     else if (std.mem.eql(u8, atom, "eq") or std.mem.eql(u8, atom, "eqref"))
@@ -1037,7 +1077,7 @@ fn stringToValType(atom: []const u8) ?V {
         .{ "anyref", V.anyref },       .{ "eqref", V.eqref },
         .{ "i31ref", V.i31ref },       .{ "structref", V.structref },
         .{ "arrayref", V.arrayref },   .{ "nullref", V.nullref },
-        .{ "exnref", V.externref },    .{ "nullexnref", V.externref },
+        .{ "exnref", V.exnref },       .{ "nullexnref", V.exnref },
     };
     inline for (map) |m| {
         if (std.mem.eql(u8, atom, m[0])) return m[1];
@@ -1066,12 +1106,15 @@ const Ctx = struct {
     /// Element-segment names (index-aligned with the element index space), for
     /// resolving `$e` in `table.init` / `elem.drop`.
     elem_names: []const ?[]const u8 = &.{},
+    /// Exception-tag names (index-aligned with the tag index space), for
+    /// resolving `$e` in `throw $e` and `(catch $e …)` (EH proposal, Phase 6).
+    tag_names: []const ?[]const u8 = &.{},
     /// Control-flow label stack (innermost last), for resolving `br $name` to a
     /// relative depth.
     labels: List(?[]const u8) = .empty,
 };
 
-fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, table_names: []const ?[]const u8, elem_names: []const ?[]const u8) Error![]const u8 {
+fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, table_names: []const ?[]const u8, elem_names: []const ?[]const u8, tag_names: []const ?[]const u8) Error![]const u8 {
     var body: List(u8) = .empty;
     // Locals vector: one (count=1, type) group per declared local.
     try uleb(a, &body, f.locals.items.len);
@@ -1079,7 +1122,7 @@ fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, si
         try uleb(a, &body, 1);
         try emitValType(a, &body, t);
     }
-    var ctx: Ctx = .{ .a = a, .out = &body, .local_names = f.local_names.items, .func_names = func_names, .sigs = sigs, .type_names = type_names, .global_names = global_names, .table_names = table_names, .elem_names = elem_names };
+    var ctx: Ctx = .{ .a = a, .out = &body, .local_names = f.local_names.items, .func_names = func_names, .sigs = sigs, .type_names = type_names, .global_names = global_names, .table_names = table_names, .elem_names = elem_names, .tag_names = tag_names };
     try emitSeq(&ctx, f.body);
     try body.append(a, @intFromEnum(Op.end)); // implicit function end
     return body.items;
@@ -1111,6 +1154,7 @@ fn emitFoldedOne(ctx: *Ctx, l: []const Sexpr, i: usize) Error!usize {
     const op = lookupOp(kw) orelse return error.UnknownInstr;
     switch (op) {
         .block, .loop => try emitFoldedBlock(ctx, op, l),
+        .try_table => try emitTryTable(ctx, l),
         .@"if" => try emitFoldedIf(ctx, l),
         .select => try emitFoldedSelect(ctx, l),
         .call_indirect => {
@@ -1221,6 +1265,60 @@ fn emitFoldedBlock(ctx: *Ctx, op: Op, l: []const Sexpr) Error!void {
     _ = ctx.labels.pop();
 }
 
+/// `(try_table $label? blocktype? (catch|catch_ref $tag $l)* (catch_all|catch_all_ref $l)* instr*)`
+fn emitTryTable(ctx: *Ctx, l: []const Sexpr) Error!void {
+    try ctx.out.append(ctx.a, @intFromEnum(Op.try_table));
+    var j: usize = 1;
+    const label = parseOptLabel(l, &j);
+    const bt = try parseBlockTypeSig(ctx, l, &j);
+    // Push the try_table's own label first so a `(catch … $l)` targeting it
+    // resolves to 0 (label 0 = the try_table block); outer labels are > 0.
+    try ctx.labels.append(ctx.a, label);
+    try emitBlockTypeSig(ctx, bt);
+    try emitCatchClauses(ctx, l, &j);
+    try emitSeq(ctx, l[j..]);
+    try ctx.out.append(ctx.a, @intFromEnum(Op.end));
+    _ = ctx.labels.pop();
+}
+
+/// Emit a `try_table`'s catch vector: consume leading `(catch …)` / `(catch_ref …)`
+/// / `(catch_all …)` / `(catch_all_ref …)` clauses from `items[j..]`, then emit
+/// `count` followed by each clause (kind byte, tag index for the non-`all` kinds,
+/// label index). `j` is advanced past the clauses.
+fn emitCatchClauses(ctx: *Ctx, items: []const Sexpr, j: *usize) Error!void {
+    const Clause = struct { kind: u8, tag: ?u32, label: u32 };
+    var clauses: List(Clause) = .empty;
+    while (j.* < items.len) {
+        const cl = items[j.*].asList() orelse break;
+        if (cl.len == 0) break;
+        const kw = cl[0].asAtom() orelse break;
+        const kind: u8 = if (std.mem.eql(u8, kw, "catch"))
+            0
+        else if (std.mem.eql(u8, kw, "catch_ref"))
+            1
+        else if (std.mem.eql(u8, kw, "catch_all"))
+            2
+        else if (std.mem.eql(u8, kw, "catch_all_ref"))
+            3
+        else
+            break;
+        if (kind < 2) {
+            if (cl.len < 3) return error.BadImmediate;
+            try clauses.append(ctx.a, .{ .kind = kind, .tag = try resolveByName(ctx.tag_names, cl[1]), .label = try resolveLabel(ctx, cl[2]) });
+        } else {
+            if (cl.len < 2) return error.BadImmediate;
+            try clauses.append(ctx.a, .{ .kind = kind, .tag = null, .label = try resolveLabel(ctx, cl[1]) });
+        }
+        j.* += 1;
+    }
+    try uleb(ctx.a, ctx.out, clauses.items.len);
+    for (clauses.items) |c| {
+        try ctx.out.append(ctx.a, c.kind);
+        if (c.tag) |t| try uleb(ctx.a, ctx.out, t);
+        try uleb(ctx.a, ctx.out, c.label);
+    }
+}
+
 /// `(if $label? blocktype? cond? (then instr*) (else instr*)?)`
 fn emitFoldedIf(ctx: *Ctx, l: []const Sexpr) Error!void {
     var j: usize = 1;
@@ -1263,6 +1361,19 @@ fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Erro
             const label = parseOptLabel(items, &j);
             try emitBlockTypeSig(ctx, try parseBlockTypeSig(ctx, items, &j));
             try ctx.labels.append(ctx.a, label);
+            return j;
+        },
+        .try_table => {
+            // Flat: `try_table $l? blocktype? catch* … end`. Push the label before
+            // resolving the catch labels (label 0 = the try_table itself); the
+            // body instructions follow and the eventual `end` pops the label.
+            try ctx.out.append(ctx.a, @intFromEnum(op));
+            var j = i + 1;
+            const label = parseOptLabel(items, &j);
+            const bt = try parseBlockTypeSig(ctx, items, &j);
+            try ctx.labels.append(ctx.a, label);
+            try emitBlockTypeSig(ctx, bt);
+            try emitCatchClauses(ctx, items, &j);
             return j;
         },
         .@"else" => {
@@ -1558,6 +1669,8 @@ fn emitInstr(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
         .table => try uleb(ctx.a, ctx.out, if (immediates.len == 0) 0 else try resolveByName(ctx.table_names, immediates[0])),
         .func => try uleb(ctx.a, ctx.out, try resolveFunc(ctx, try imm0(immediates))),
         .label => try uleb(ctx.a, ctx.out, try resolveLabel(ctx, try imm0(immediates))),
+        .tag => try uleb(ctx.a, ctx.out, try resolveByName(ctx.tag_names, try imm0(immediates))), // throw <tag>
+
         .i32c => try sleb(ctx.a, ctx.out, try parseWatI32(try imm0(immediates))),
         .i64c => try sleb(ctx.a, ctx.out, try parseWatI64(try imm0(immediates))),
         .f32c => try floatBits(ctx, u32, try imm0(immediates)),
@@ -1655,6 +1768,7 @@ fn flatImmCount(op: Op) usize {
     return switch (opcode.immediateKind(op)) {
         .local, .global, .func, .label, .i32c, .i64c, .f32c, .f64c, .ref_type, .gc_type => 1,
         .data, .data_init => 1, // memory.init / data.drop: a data index
+        .tag => 1, // throw <tagidx>
         .gc_field, .gc_type_n => 2,
         else => 0,
     };
@@ -2722,4 +2836,76 @@ test "GC concrete value types: a self-referential linked list traverses a (ref n
     // The `next` field is the concrete `(ref null $node)`, so struct.get returns a
     // node ref you can struct.get again: 10 + 20 = 30.
     try std.testing.expectEqual(@as(i32, 30), interp.asI32(try assembleAndRun(src, "sum2", &.{})));
+}
+
+// --- Exception handling: WAT assembler round-trips (Phase 6.1) --------------
+// Assemble EH text -> binary -> decode -> run, proving the assembler emits the
+// tag section + throw/throw_ref/try_table/catch that the interpreter accepts.
+
+test "EH wat: throw caught by a matching catch carries the payload" {
+    const src =
+        \\(module
+        \\  (tag $e (param i32))
+        \\  (func (export "f") (result i32)
+        \\    (try_table (result i32) (catch $e 0)
+        \\      i32.const 42
+        \\      throw $e)))
+    ;
+    try std.testing.expectEqual(@as(i32, 42), interp.asI32(try assembleAndRun(src, "f", &.{})));
+}
+
+test "EH wat: catch_all catches and control resumes after the try_table" {
+    const src =
+        \\(module
+        \\  (tag $e)
+        \\  (func (export "f") (result i32)
+        \\    (try_table (catch_all 0)
+        \\      throw $e)
+        \\    i32.const 55))
+    ;
+    try std.testing.expectEqual(@as(i32, 55), interp.asI32(try assembleAndRun(src, "f", &.{})));
+}
+
+test "EH wat: an exception thrown in a callee is caught in the caller" {
+    const src =
+        \\(module
+        \\  (tag $e)
+        \\  (func $callee throw $e)
+        \\  (func (export "f") (result i32)
+        \\    (try_table (catch_all 0)
+        \\      call $callee)
+        \\    i32.const 7))
+    ;
+    try std.testing.expectEqual(@as(i32, 7), interp.asI32(try assembleAndRun(src, "f", &.{})));
+}
+
+test "EH wat: flat try_table with catch_ref + throw_ref reaches an outer catch_all" {
+    const src =
+        \\(module
+        \\  (tag $e)
+        \\  (func (export "f") (result i32)
+        \\    try_table (catch_all 0)
+        \\      try_table (result exnref) (catch_ref $e 0)
+        \\        throw $e
+        \\      end
+        \\      throw_ref
+        \\    end
+        \\    i32.const 5))
+    ;
+    try std.testing.expectEqual(@as(i32, 5), interp.asI32(try assembleAndRun(src, "f", &.{})));
+}
+
+test "EH wat: catch labels resolve by name to an enclosing block" {
+    const src =
+        \\(module
+        \\  (tag $e (param i32))
+        \\  (func (export "f") (result i32)
+        \\    (block $out (result i32)
+        \\      (try_table (catch $e $out)
+        \\        i32.const 9
+        \\        throw $e)
+        \\      i32.const 0)))
+    ;
+    // The throw carries i32 9 to $out; the trailing i32.const 0 is skipped.
+    try std.testing.expectEqual(@as(i32, 9), interp.asI32(try assembleAndRun(src, "f", &.{})));
 }
