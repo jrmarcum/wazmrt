@@ -194,9 +194,23 @@ vision's shape (system-wide wazmrt + scripts in a root-owned directory).
 ⇒ **Signed module → verify signature. Unsigned module → check the root-owned pin.** Authenticity where
 available, continuity where not, and local dev modules still work.
 
-**Open caveat:** hashing a large `.wasm` on **every run costs cold-start** — the metric the vision
-competes on (`vision.md`). **Measure before committing.** May argue for pinning only the system script
-directory.
+**Cold-start cost — MEASURED 2026-07-16, and it is a non-issue** (`zig build bench -- hash <file>`).
+Verification is negligible against what wazmrt already does at cold start. On a real 46 KB compiled
+guest (`hc2.wasm`):
+
+| step | time | note |
+| --- | --- | --- |
+| **SHA-256** (pin check) | **21 µs** | 0.5% of instantiate; ~2.2 GB/s, SHA-NI hardware-accelerated |
+| **Ed25519 verify** (signature check) | **105 µs** | 2.4% of instantiate; hash included |
+| decode + **instantiate** | **~4.4 ms** | the real cold-start path — dwarfs both |
+
+And instantiate itself sits under a **~72 ms process-startup floor** (measured end-to-end), so a pin
+check is **<0.03%** of a real `wazmrt file.wasm` invocation, a signature check <0.15%. Even a 1.1 MB
+module hashes in 0.5 ms. **No extra I/O either** — the file is read to decode it regardless; hashing is a
+CPU pass over bytes already in memory. The only case where hashing looks large by *percentage* is a
+70-byte toy (7–10% of a 0.8 µs instantiate) — 70 **nanoseconds** absolute, i.e. noise.
+**Conclusion: verify-on-every-run does not threaten the cold-start metric. Pin the whole thing; no need
+to restrict to the system script dir for perf reasons.** Full numbers in `cmem/testing.md`.
 
 ### 2. **No encryption of the pin DB**
 
@@ -348,8 +362,10 @@ root-owned) · no encryption · no machine-binding.
 
 - Trust anchor: embedded-in-binary (recommended) vs OS keystore vs signed keyring file vs a hybrid.
 - Signature format: adopt existing prior art (→ Adoption Checklist) vs roll our own.
-- **Cold-start cost of hashing on every run** — must be measured against `vision.md`'s headline metric
-  before the pin design is committed. May argue for pinning only the system script directory.
+
+**Resolved with data 2026-07-16:** ~~cold-start cost of hashing on every run~~ — **measured, negligible**
+(SHA-256 0.5% of instantiate, Ed25519 2.4%, both <0.15% of the process-startup floor). See the pin
+section above and `testing.md`.
 - Default policy: deny-unsigned out of the box, or opt-in?
 - Scope: is the keyring genuinely a separate project (owner's lean), and where is the boundary?
 - Does `--ro-dir` jump the queue ahead of the rest of 4.3?

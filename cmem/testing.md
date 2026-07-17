@@ -409,6 +409,31 @@ the standard wasm-c-api by symbol (engine/store → `wasm_byte_vec_new` → `was
 `wasm_val_vec`/`wasm_extern_vec` struct plumbing with `DataView` + `Deno.UnsafePointer`, so it exercises
 the real ABI layout, not a convenience shim. Requires `deno` on PATH (2.x; FFI is stable).
 
+## Cold-start reality check + verification cost (2026-07-16, `zig build bench -- hash <file>`)
+
+Measured for the `security-model.md` "does hashing every module hurt cold start?" question — and it
+surfaced a framing correction worth keeping.
+
+**Verification is negligible.** On a real 46 KB compiled guest (`hc2.wasm`):
+
+| | time | vs instantiate | vs ~72 ms process floor |
+| --- | --- | --- | --- |
+| SHA-256 (pin) | 21 µs | 0.5% | 0.03% |
+| Ed25519 verify (signature) | 105 µs | 2.4% | 0.15% |
+| decode + instantiate | ~4.4 ms | — | 6% |
+
+SHA-256 runs ~2.2 GB/s (SHA-NI). No extra I/O — the file is read to decode it anyway. A 1.1 MB module
+still hashes in 0.5 ms. **⇒ verify-on-every-run is not a cold-start concern; pin the whole file.**
+
+**The framing correction:** the "**~0.8–0.9 µs cold start**" we've quoted since 2026-07-14 is the
+**70-byte toy compute module** — a pipeline-overhead microbenchmark, not a script. A **real** compiled
+guest's decode+instantiate is **~4.4 ms** — roughly **5000× higher** — and it is nearly flat from 46 KB
+to 1.1 MB (4.4 → 4.8 ms), so instantiate cost tracks **function count / instruction count**, not file
+size. Still ~25× faster than Deno's ~110 ms, so the vision thesis holds — but **quote ~4.4 ms as a real
+script's cold start, not 0.8 µs.** (Separate observation, not chased here: instantiate eagerly
+`decodeBody`s *every* function even ones never called — a candidate lazy-decode optimization, out of
+scope for the security question.)
+
 ## Performance gate — native wazmrt vs Deno/V8 (2026-07-14, first measurement)
 
 The vision's central question (`vision.md`): does native wazmrt beat Deno/V8 on **cold-start wall-clock**
