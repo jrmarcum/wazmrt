@@ -223,9 +223,13 @@ opens; `symlink_max`→ELOOP). No `openat2(RESOLVE_BENEATH)` needed — the walk
 incl. an adversarial fuzz + Phase 3 gate still 16/16. One documented residual: a narrow
 final-component `path_open` TOCTOU tied to std bug #18. See #17.
 
-> ### ✅ 4.3 COMPLETE (2026-07-16). ✅ 4.4 COMPLETE (2026-07-17). ⇢ START HERE next: pick the next
-> Phase 4/5 frontier (multi-memory, exception-handling tags, or the deferred authenticity design in
-> `security-model.md` awaiting owner decisions).
+> ### ✅ 4.3 COMPLETE (2026-07-16). ✅ 4.4 COMPLETE (2026-07-17). ⇢ START HERE next: **Phase 5.1 —
+> Exception handling** (owner chose it 2026-07-17 as the next frontier; plan in §5.1 below).
+>
+> **The C ABI is NOT remaining work** — #20 (all 319 `wasm.h` fns) / #21 (mem-safety) / #22 (fuzz) are
+> DONE and 4.4 added a C conformance guest. Only two narrow, demand-driven residuals stay deferred:
+> shared-mutable imported globals, and externref table slots via `wasm_table_get`. Don't treat C as a
+> phase.
 >
 > **4.4 delivered (all DONE 2026-07-17):**
 > - **`--env KEY=VAL`** (repeatable) — sets one guest env var; guest environ otherwise empty. `main.zig`.
@@ -239,6 +243,40 @@ final-component `path_open` TOCTOU tied to std bug #18. See #17.
 >   `examples/hello_compiled.zig`, `examples/c_hello.c`, `examples/rust_hello.rs`. Verified wazmrt runs
 >   all three compilers' output byte-for-byte. The gate *can fail* (wrong output → exit 1, confirmed).
 >
+
+## Phase 5.1 — Exception handling (PLANNED, owner-chosen 2026-07-17)
+
+**Scope decision first:** target the **standardized exnref proposal** (`try_table` + `throw`/`throw_ref`,
+`tag` section id 13, `exnref` heap type) — it shipped cross-browser (Chrome/Firefox 2024) so it clears
+the project's browser-standard bar (`design-decisions.md` proposal-scope). The **legacy** form
+(`try`/`catch`/`catch_all`/`delegate`/`rethrow`, older LLVM/Emscripten) is a *distinct* encoding; treat
+it as a later compat add-on only if a real corpus module needs it, not part of 5.1.
+
+**Why it fits cleanly:** EH extends seams that already exist — a new section (like tags are just typed
+function-signatures), new opcodes in the `opcode.zig` IR, new control-frame kinds in `validate.zig`, and
+a new unwind path in `interp.zig` that can reuse the label/frame stack the trap backtrace (#19) already
+walks.
+
+**Increments (each with unit tests + a `.wast` slice; keep the IR seam clean):**
+1. **Decode** — tag section (id 13): each tag = an attribute byte + a type index (the exception
+   signature). Store on `Module` alongside functions. Add `exnref` to the heap-type/valtype decoders.
+2. **IR** — add `throw {tag}`, `throw_ref`, and `try_table {blocktype, catch[]}` to `opcode.zig`
+   (`Op`/`Imm`/`decodeBody`), where each catch clause is `{kind: catch|catch_ref|catch_all|catch_all_ref,
+   tag?, label}`. Mirror in the assembler (`wat.zig`) for `.wast` coverage.
+3. **Validate** — `try_table` pushes a control frame carrying its catch table; `throw` checks operands
+   against the tag's params; `throw_ref` consumes an `exnref`; catch-clause target labels must accept
+   the tag's params (+ `exnref` for the `_ref` variants). `exnref` typing + null rules.
+4. **Execute** — represent a thrown exception as `{tag, values}`; `throw` unwinds the frame/label stack
+   to the nearest enclosing `try_table` whose catch matches (by tag, or `catch_all`), pushing the values
+   (and an `exnref` for `_ref`); `throw_ref` re-throws a caught `exnref`; unmatched at the top frame →
+   the existing trap path. Reuse the `errdefer`/frame machinery from #19 where it fits (mind the
+   `noinline recordTrap` invariant — the unwind is an error-ish path off the hot switch).
+5. **Conformance** — run the spec `exception-handling` `.wast` files through `wast.zig`; add a compiled
+   guest to `wasi-gate` only if a stock toolchain emits exnref by default (C++ `-fwasm-exceptions` via
+   wasi-sdk does; Zig/Rust panics are traps, so probably a `.wat`/`.wast`-only gate).
+
+**Open sub-question for the owner (surface before coding step 4):** do we want the legacy try/catch
+encoding at all, or exnref-only for now? Plan assumes exnref-only.
 
 > 4.3 delivered (all DONE 2026-07-16): the safe leftovers (`fd`/`path_filestat_set_times`, `fd_allocate`,
 > `path_link`, `poll_oneoff` EBADF fix) **and** — owner chose full traversal — `path_symlink`/
