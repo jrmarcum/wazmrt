@@ -138,13 +138,17 @@ const rights = struct {
     const fd_allocate: u64 = 1 << 8;
     const path_create_directory: u64 = 1 << 9;
     const path_create_file: u64 = 1 << 10;
+    const path_link_source: u64 = 1 << 11;
+    const path_link_target: u64 = 1 << 12;
     const path_open: u64 = 1 << 13;
     const fd_readdir: u64 = 1 << 14;
     const path_rename_source: u64 = 1 << 16;
     const path_rename_target: u64 = 1 << 17;
     const path_filestat_get: u64 = 1 << 18;
+    const path_filestat_set_times: u64 = 1 << 20;
     const fd_filestat_get: u64 = 1 << 21;
     const fd_filestat_set_size: u64 = 1 << 22;
+    const fd_filestat_set_times: u64 = 1 << 23;
     const path_remove_directory: u64 = 1 << 25;
     const path_unlink_file: u64 = 1 << 26;
     const poll_fd_readwrite: u64 = 1 << 27;
@@ -173,6 +177,15 @@ const fdflags = struct {
 
 /// `lookupflags`.
 const lookup_symlink_follow: u32 = 1 << 0;
+
+/// `fstflags` for `*_filestat_set_times` (§ preview-1). Setting both the value
+/// and the _NOW bit for one timestamp is invalid.
+const fstflags = struct {
+    const atim: u16 = 1 << 0;
+    const atim_now: u16 = 1 << 1;
+    const mtim: u16 = 1 << 2;
+    const mtim_now: u16 = 1 << 3;
+};
 
 /// `filetype` enum values.
 const filetype = struct {
@@ -567,6 +580,8 @@ fn callFor(name: []const u8) CallFn {
         .{ "fd_fdstat_set_flags", wFdFdstatSetFlags },
         .{ "fd_filestat_get", wFdFilestatGet },
         .{ "fd_filestat_set_size", wFdFilestatSetSize },
+        .{ "fd_filestat_set_times", wFdFilestatSetTimes },
+        .{ "fd_allocate", wFdAllocate },
         .{ "fd_readdir", wFdReaddir },
         .{ "fd_renumber", wFdRenumber },
         .{ "fd_advise", wSchedYield }, // advisory only — success is honest
@@ -574,10 +589,12 @@ fn callFor(name: []const u8) CallFn {
         .{ "fd_prestat_dir_name", wFdPrestatDirName },
         .{ "path_open", wPathOpen },
         .{ "path_filestat_get", wPathFilestatGet },
+        .{ "path_filestat_set_times", wPathFilestatSetTimes },
         .{ "path_create_directory", wPathCreateDirectory },
         .{ "path_remove_directory", wPathRemoveDirectory },
         .{ "path_unlink_file", wPathUnlinkFile },
         .{ "path_rename", wPathRename },
+        .{ "path_link", wPathLink },
         .{ "args_sizes_get", wArgsSizesGet },
         .{ "args_get", wArgsGet },
         .{ "environ_sizes_get", wEnvironSizesGet },
@@ -936,6 +953,54 @@ fn wFdFilestatSetSize(ctx: *anyopaque, args: []const Value, results: []Value) bo
     return ret(results, errno.success);
 }
 
+/// Translate a WASI `(atim, mtim, fstflags)` trio to `Io`'s timestamp options,
+/// or null if the flags are invalid (both a value bit and its _NOW bit set for
+/// the same timestamp — the guest asked for two different things at once).
+fn timeSet(atim: u64, mtim: u64, flags: u16) ?struct { a: Io.File.SetTimestamp, m: Io.File.SetTimestamp } {
+    if (flags & fstflags.atim != 0 and flags & fstflags.atim_now != 0) return null;
+    if (flags & fstflags.mtim != 0 and flags & fstflags.mtim_now != 0) return null;
+    return .{
+        .a = if (flags & fstflags.atim_now != 0) .now else if (flags & fstflags.atim != 0) .{ .new = .{ .nanoseconds = @intCast(atim) } } else .unchanged,
+        .m = if (flags & fstflags.mtim_now != 0) .now else if (flags & fstflags.mtim != 0) .{ .new = .{ .nanoseconds = @intCast(mtim) } } else .unchanged,
+    };
+}
+
+/// `fd_filestat_set_times(fd, atim, mtim, fstflags)` — set access/modify times.
+fn wFdFilestatSetTimes(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+    const w: *Wasi = @ptrCast(@alignCast(ctx));
+    const e = w.get(argU32(args, 0)) orelse return ret(results, errno.badf);
+    const f = switch (e.*) {
+        .file => |f| f,
+        else => return ret(results, errno.inval),
+    };
+    if (f.rights_base & rights.fd_filestat_set_times == 0) return ret(results, errno.notcapable);
+    const atim: u64 = @bitCast(interp.asI64(args[1]));
+    const mtim: u64 = @bitCast(interp.asI64(args[2]));
+    const t = timeSet(atim, mtim, @truncate(argU32(args, 3))) orelse return ret(results, errno.inval);
+    f.handle.setTimestamps(w.io, .{ .access_timestamp = t.a, .modify_timestamp = t.m }) catch |err|
+        return ret(results, errnoFor(err));
+    return ret(results, errno.success);
+}
+
+/// `fd_allocate(fd, offset, len)` — ensure the file is at least `offset+len`
+/// bytes, extending (never shrinking) it. `Io` has no posix_fallocate, so we
+/// extend via `setLength` when short; a file already large enough is untouched.
+fn wFdAllocate(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+    const w: *Wasi = @ptrCast(@alignCast(ctx));
+    const e = w.get(argU32(args, 0)) orelse return ret(results, errno.badf);
+    const f = switch (e.*) {
+        .file => |f| f,
+        else => return ret(results, errno.badf),
+    };
+    if (f.rights_base & rights.fd_allocate == 0) return ret(results, errno.notcapable);
+    const offset: u64 = @bitCast(interp.asI64(args[1]));
+    const len: u64 = @bitCast(interp.asI64(args[2]));
+    const need = std.math.add(u64, offset, len) catch return ret(results, errno.inval);
+    const cur = f.handle.length(w.io) catch |err| return ret(results, errnoFor(err));
+    if (need > cur) f.handle.setLength(w.io, need) catch |err| return ret(results, errnoFor(err));
+    return ret(results, errno.success);
+}
+
 /// `fd_prestat_get(fd, buf)` — describe a preopen. wasi-libc walks fds upward
 /// from 3 and stops at the first EBADF, so non-preopens must report EBADF.
 fn wFdPrestatGet(ctx: *anyopaque, args: []const Value, results: []Value) bool {
@@ -1067,6 +1132,53 @@ fn wPathFilestatGet(ctx: *anyopaque, args: []const Value, results: []Value) bool
     const st = rp.dir.statFile(w.io, rp.name, .{ .follow_symlinks = follow }) catch |err|
         return ret(results, errnoFor(err));
     if (!writeFilestat(w, argU32(args, 4), st)) return ret(results, errno.fault);
+    return ret(results, errno.success);
+}
+
+/// `path_filestat_set_times(dirfd, lookupflags, path, path_len, atim, mtim, fstflags)`.
+fn wPathFilestatSetTimes(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+    const w: *Wasi = @ptrCast(@alignCast(ctx));
+    const follow = argU32(args, 1) & lookup_symlink_follow != 0;
+    var rp = resolveArg(w, argU32(args, 0), argU32(args, 2), argU32(args, 3), rights.path_filestat_set_times, results) orelse
+        return true;
+    defer rp.close(w);
+    // Never follow a symlink out (our no-traversal policy); also lets us open
+    // the final component directly below without a link in the way.
+    if (rp.finalIsSymlink(w)) return ret(results, errno.notcapable);
+    _ = follow;
+    const atim: u64 = @bitCast(interp.asI64(args[4]));
+    const mtim: u64 = @bitCast(interp.asI64(args[5]));
+    const t = timeSet(atim, mtim, @truncate(argU32(args, 6))) orelse return ret(results, errno.inval);
+    // Open the file and use the fd-based `setTimestamps`: `Io.Dir.setTimestamps`
+    // (the path form) is an unimplemented `@panic("TODO")` on Windows (std;
+    // sibling of #18). Opening with follow is safe — we already refused a
+    // symlink — and dodges the #18 openFile-nofollow crash.
+    const f = rp.dir.openFile(w.io, rp.name, .{ .mode = .read_write }) catch |err|
+        return ret(results, errnoFor(err));
+    defer f.close(w.io);
+    f.setTimestamps(w.io, .{ .access_timestamp = t.a, .modify_timestamp = t.m }) catch |err|
+        return ret(results, errnoFor(err));
+    return ret(results, errno.success);
+}
+
+/// `path_link(old_dirfd, old_flags, old_path, old_len, new_dirfd, new_path, new_len)`
+/// — a hard link. Both ends are resolved through the sandbox walk, so neither
+/// may escape its preopen; the link is created on the final names without
+/// following them (a hardlink references an inode, and a hardlink-to-symlink
+/// would be a way to smuggle one in — we refuse a symlink source).
+fn wPathLink(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+    const w: *Wasi = @ptrCast(@alignCast(ctx));
+    var old = resolveArg(w, argU32(args, 0), argU32(args, 2), argU32(args, 3), rights.path_link_source, results) orelse
+        return true;
+    defer old.close(w);
+    var new = resolveArg(w, argU32(args, 4), argU32(args, 5), argU32(args, 6), rights.path_link_target, results) orelse
+        return true;
+    defer new.close(w);
+    // No symlink smuggling: refuse to hardlink a symlink source (our no-traversal
+    // policy — see the module doc / #17).
+    if (old.finalIsSymlink(w)) return ret(results, errno.notcapable);
+    Io.Dir.hardLink(old.dir, old.name, new.dir, new.name, w.io, .{ .follow_symlinks = false }) catch |err|
+        return ret(results, errnoFor(err));
     return ret(results, errno.success);
 }
 
@@ -1284,14 +1396,20 @@ fn wPollOneoff(ctx: *anyopaque, args: []const Value, results: []Value) bool {
 
     var emitted: u32 = 0;
 
-    // An fd subscription is ready now, so it wins over any timeout.
+    // fd subscriptions resolve now (they win over any timeout). A regular file
+    // and stdio never block, so "ready" is the *correct* answer for them, not a
+    // stub — the only fds where readiness is non-trivial are pipes/sockets,
+    // which wazmrt doesn't have. A closed/invalid fd is reported EBADF rather
+    // than a false "ready".
     var i: u32 = 0;
     while (i < nsubs) : (i += 1) {
         const s = in + i * sub_size;
         const userdata = w.readU64(s) orelse return ret(results, errno.fault);
         const tag = (w.slice(s + 8, 1) orelse return ret(results, errno.fault))[0];
         if (tag == 1 or tag == 2) { // fd_read / fd_write
-            if (!writeEvent(w, out + emitted * event_size, userdata, errno.success, tag)) return ret(results, errno.fault);
+            const fd = w.readU32(s + 16) orelse return ret(results, errno.fault);
+            const err: u16 = if (w.get(fd) != null) errno.success else errno.badf;
+            if (!writeEvent(w, out + emitted * event_size, userdata, @intCast(err), tag)) return ret(results, errno.fault);
             emitted += 1;
         }
     }
@@ -1477,6 +1595,29 @@ test "poll_oneoff reports an fd subscription ready immediately" {
     const none = [_]Value{ interp.i32Value(0), interp.i32Value(128), interp.i32Value(0), interp.i32Value(200) };
     try std.testing.expect(wPollOneoff(&w, &none, &results));
     try std.testing.expectEqual(@as(i32, @bitCast(errno.inval)), interp.asI32(results[0]));
+
+    // A subscription on a closed/invalid fd reports EBADF, not a false "ready".
+    @memset(mem_bytes[0..16], 0);
+    std.mem.writeInt(u64, mem_bytes[0..8], 7, .little); // userdata
+    mem_bytes[8] = 1; // tag = fd_read
+    std.mem.writeInt(u32, mem_bytes[16..20], 99, .little); // fd 99 — not open
+    try std.testing.expect(wPollOneoff(&w, &args, &results));
+    try std.testing.expectEqual(@as(u16, @intCast(errno.badf)), w.readU16(136).?);
+}
+
+test "fstflags translate to Io timestamp options (and reject value+NOW together)" {
+    // NOW bits win; value bits carry the timestamp; unset = unchanged.
+    const t = timeSet(111, 222, fstflags.atim_now | fstflags.mtim).?;
+    try std.testing.expectEqual(Io.File.SetTimestamp.now, t.a);
+    try std.testing.expectEqual(@as(i96, 222), t.m.new.nanoseconds);
+
+    const none = timeSet(0, 0, 0).?;
+    try std.testing.expectEqual(Io.File.SetTimestamp.unchanged, none.a);
+    try std.testing.expectEqual(Io.File.SetTimestamp.unchanged, none.m);
+
+    // Asking for both a value and NOW on the same timestamp is invalid.
+    try std.testing.expectEqual(@as(?@TypeOf(none), null), timeSet(1, 2, fstflags.atim | fstflags.atim_now));
+    try std.testing.expectEqual(@as(?@TypeOf(none), null), timeSet(1, 2, fstflags.mtim | fstflags.mtim_now));
 }
 
 test "resolve contains guest paths inside the preopen" {

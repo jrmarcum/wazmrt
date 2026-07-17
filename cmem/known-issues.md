@@ -11,6 +11,31 @@ This file tracks only what's left.
 
 Line numbers are hints (they drift) — the function/construct name is the durable anchor.
 
+## #23 — Zig 0.16 Windows `Io` filesystem gaps found in WASI 4.3 (2026-07-16)
+
+Two more std holes on Windows, same family as #18 (which is the first). Both hit during 4.3; recheck all
+three on every Zig upgrade.
+
+**(a) `Io.Dir.setTimestamps` is `@panic("TODO implement dirSetTimestamps windows")`** (`Threaded.zig:8989`)
+— the path form. A `path_filestat_set_times` call would **crash the host**. **WORKED AROUND:**
+`wPathFilestatSetTimes` opens the file and uses the **fd-based** `File.setTimestamps`, which *is*
+implemented on Windows (`NtSetInformationFile(FileBasicInformation)`). Opening with follow is safe — we
+refuse a symlink final first — and dodges #18's openFile-nofollow crash too. When std implements the
+path form, this can go back to a direct `Dir.setTimestamps`. Verified working via
+`examples/wasi_leftovers.zig`.
+
+**(b) `Io.Dir.hardLink` is `return error.OperationUnsupported`** on Windows (`Threaded.zig:9509`) — std
+simply doesn't do hard links there. So **`path_link` returns ENOTSUP on Windows**; it works on POSIX
+(std implements it). **DEFERRED, not worked around:** unlike (a) there is *no* existing `Io` function
+that creates a hard link on Windows, so the fix is raw `NtSetInformationFile(FileLinkInformationEx)` with
+WTF-16 + NT-path handling — a bigger, error-prone Windows-specific lift, out of proportion to path_link's
+demand right now. The wazmrt logic (resolve both ends through the walk, refuse a symlink source) *is*
+exercised — it reaches `hardLink` and returns its errno — so only the std backend is missing.
+`examples/wasi_leftovers.zig` treats ENOTSUP as a skip. **If a real guest needs Windows hard links,**
+implement the NT call in `wPathLink`.
+
+**Anchor:** `wPathFilestatSetTimes` (workaround) and `wPathLink` (deferred), `src/wasi.zig`.
+
 ## #22 — C ABI lifecycle fuzz — **DONE 2026-07-16.** Found 2 more real bugs.
 
 Built the randomized lifecycle fuzz the owner scheduled as the first item for 2026-07-16. The process —

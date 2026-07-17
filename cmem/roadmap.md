@@ -244,12 +244,15 @@ final-component `path_open` TOCTOU tied to std bug #18. See #17.
 > 3. **`--ro-dir` (read-only preopens)** looks like the highest security-value-per-effort item available
 >    and is on no list. It may deserve to jump the queue.
 >
-> **4.3 as scoped** (unchanged, for reference): `path_symlink` / `path_readlink` / `path_link`,
-> `fd_filestat_set_times` / `path_filestat_set_times`, `fd_allocate`, real fd-readiness in `poll_oneoff`
-> — all currently the `NOTSUP` stub. The non-symlink items carry no policy question and are safe to do
-> whenever. `path_link` (hardlink) is also safe now — both ends go through the resolver at creation, so
-> neither can name outside, and there is no traversal hazard afterward. Then **4.4** — the Phase 4 items
-> proper (`--env`, the `zig build`-driven compiled gate, C/Rust/Zig conformance).
+> **4.3 progress:** the safe, no-policy items are **DONE 2026-07-16** — `fd_filestat_set_times`,
+> `path_filestat_set_times` (via an opened handle, dodging a std `dirSetTimestamps` panic — #23),
+> `fd_allocate` (extend-not-shrink via `setLength`), `path_link` (POSIX-only; Windows std has no hard
+> links — #23), and a `poll_oneoff` correctness fix (a subscription on a closed fd reports EBADF, not a
+> false "ready"; note **files/stdio being always-ready is *correct* per POSIX, not a stub** — only
+> pipes/sockets, which we don't have, would need real polling). +3 unit tests, `examples/wasi_leftovers.zig`
+> gate. **STILL OPEN: `path_symlink` / `path_readlink`** — the one live create-time policy decision
+> (see the "▶ 4.3 RESUMED" banner). Then **4.4** — the Phase 4 items proper (`--env`, the `zig build`-driven
+> compiled gate, C/Rust/Zig conformance).
 
 **4.1 — `known-issues.md` #19: trap diagnostics. DONE 2026-07-15.** Traps now report a named
 backtrace, innermost frame first — on the exact binary from the Phase 3 hunt:

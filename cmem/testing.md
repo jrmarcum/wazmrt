@@ -483,11 +483,30 @@ are ±10% noisy.)
 
 ## Reading the test count (2026-07-16)
 
-`zig build test` prints **234**, but there are **122 distinct tests**: 112 in the core module + 10 C-ABI
+`zig build test` prints **236**, but there are **123 distinct tests**: 112 in the core module + 10 C-ABI
 tests. The `cabi_tests` target's root is `wasm_c_api.zig`, which imports `root.zig`, so it compiles and
 re-runs the core module's tests as well (112 + 122). Harmless — under a second — but **don't quote 234
-as a test count**; quote 122, or the per-target numbers from `--summary all`. One core test skips on an
+as a test count**; quote 123, or the per-target numbers from `--summary all`. One core test skips on an
 unprivileged Windows box (the #17 real-symlink test — see below), so you'll usually see `1 skip`.
+
+## WASI 4.3 leftovers — timestamps, allocate, hard link (2026-07-16)
+
+The `NOTSUP`-stub ops implemented in 4.3's safe batch. Unit tests in `src/wasi.zig` cover the pure
+logic (`timeSet` flag translation incl. the value+NOW-together → EINVAL rejection; `poll_oneoff`
+reporting EBADF for a closed-fd subscription). End-to-end via **`examples/wasi_leftovers.zig`**
+(`wazmrt lo.wasm --dir <writable>:/data`): `fd_filestat_set_times` / `path_filestat_set_times` set mtime
+(read back within 1s granularity), `fd_allocate` extends-never-shrinks, `path_link` round-trips content
+through the new name.
+
+- **`path_link` skips on Windows** (prints `skip path_link (ENOTSUP — Windows std gap)`): Zig std's
+  `dirHardLink` is `error.OperationUnsupported` on Windows (#23). It works on POSIX. The wazmrt logic is
+  still exercised (it reaches `hardLink`).
+- **`path_filestat_set_times` had to route through an opened handle** — the path-form
+  `Io.Dir.setTimestamps` is a `@panic("TODO")` on Windows that would crash the host (#23). Watch for
+  this pattern when adding path-based metadata ops.
+- **`poll_oneoff` is not a stub for files:** a regular file / stdio never blocks, so "ready" is the
+  correct answer, not a placeholder. Real readiness polling would only matter for pipes/sockets, which
+  wazmrt doesn't have.
 
 ## WASI sandbox: real-symlink containment (#17, 2026-07-16)
 
