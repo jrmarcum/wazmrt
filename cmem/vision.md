@@ -50,7 +50,9 @@ wall-clock and steady-state throughput separately** so we know which regime wasm
 **First measurement (2026-07-14) — thesis confirmed.** `zig build bench` + a cross-process run (see
 `testing.md`): native wazmrt beats Deno/V8 on **cold-start wall-clock — 2.4× on a trivial call, 1.5× on
 `sum(1e6)`** (Deno pays ~110 ms of V8 init + wasm JIT-compile + JS marshalling every run; wazmrt's own
-work is sub-µs to tens-of-ms). Steady-state interpreter throughput is ~264 Mops/s — a JIT wins that
+work is sub-µs to tens-of-ms). *(Cold-start number corrected 2026-07-16: a **real ~46 KB guest**
+decode+instantiates in **~4.4 ms**, not the ~0.8 µs the 70-byte toy shows — still ~25× under Deno, so
+the thesis holds; `testing.md`.)* Steady-state interpreter throughput is ~264 Mops/s — a JIT wins that
 regime, so the win is exactly where the vision predicted: **short-lived / native-FFI programs (wasmtk's
 compiler-test outputs), not sustained hot loops.** Option A stays; A→B waits for a real compute-bound
 workload. First datapoint on one dev box, not a tuned benchmark.

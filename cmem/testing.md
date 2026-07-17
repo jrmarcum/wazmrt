@@ -442,7 +442,10 @@ measured.** (Windows dev box; ReleaseFast; PowerShell `Measure-Command`, 40 runs
 floor included, which both pay.)
 
 - **In-process microbench** (`zig build bench`, ReleaseFast):
-  - **cold** decode + instantiate + call: **~0.93 µs/run** — the runtime's own per-run cost is negligible.
+  - **cold** decode + instantiate + call: **~0.93 µs/run** — **⚠️ this is the 70-byte toy module.** A
+    real ~46 KB compiled guest is **~4.4 ms** (see the "Cold-start reality check" section above,
+    2026-07-16). Both still beat Deno's ~110 ms; quote the toy number only as "runtime pipeline
+    overhead," never as a real script's cold start.
   - **steady** `sum(1e6)` hot loop: **~30 ns/loop-iter, ~264 Mops/s** (switch interpreter; a JIT is
     ~10–50× faster here — the Option A→B trigger if a compute-bound workload appears).
 - **Cross-process cold-start** (`wazmrt.exe file.wasm export …` vs `deno run harness.js file.wasm`):

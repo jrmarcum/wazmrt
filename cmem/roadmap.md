@@ -224,14 +224,18 @@ pre-fix `ESCAPED`, post-fix refused) + a unit test (POSIX CI; skips on unprivile
 std can't make a symlink there) + Phase 3 gate still 16/16. One documented residual: a narrow
 final-component `path_open` TOCTOU tied to std bug #18. See #17.
 
-> ### ⛔ 4.3 IS PAUSED (owner, 2026-07-16) — **read `cmem/security-model.md` before resuming.**
-> Starting 4.3 surfaced the symlink-policy decision, which opened into a design conversation about the
-> **actual product vision** (wasm-as-scripts, wazmrt as a signed base runtime) and a **secure-by-default
-> base**. The owner is deciding: *"I need to think about this before proceeding further. This is a base
-> that I think we need to get right and create a secure by default base."* **Do not resume 4.3 without
-> checking back** — the outcome may reorder or reshape it.
+> ### ▶ 4.3 RESUMED (owner, 2026-07-16, after the security design conversation + cold-start measurement).
+> The pause (below) produced `cmem/security-model.md` and the decision that **the vision does not need
+> `path_symlink`** (its symlink is host-side dispatch, not the guest-visible op). Cold-start cost of
+> hashing was measured and is **negligible**, unblocking the signature/pin direction. **Sequencing for
+> 4.3:** do the **safe, no-policy items first** — `fd_filestat_set_times`, `path_filestat_set_times`,
+> `fd_allocate`, `path_link` (hardlink — both ends resolved at creation, no traversal hazard), and real
+> `poll_oneoff` fd-readiness. **`path_symlink`/`path_readlink` still carry the one live decision**
+> (create-time policy: no-traversal + validate-target-at-creation per `security-model.md`, vs full
+> target-revalidation traversal for wasmtime-parity conformance) — surface it when reached, don't decide
+> it unilaterally.
 >
-> Three findings from that conversation that change 4.3's shape:
+> Three findings from the pause conversation that shaped this (retained):
 > 1. **The vision's symlink is host-side dispatch** (`argv[0]`/`binfmt_misc`), **not** the guest-visible
 >    symlink of #17 — **the vision does not need `path_symlink`.** The two were being conflated.
 > 2. **If `path_symlink` is ever built, targets must be validated at *creation*** (refuse escaping
