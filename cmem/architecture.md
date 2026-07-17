@@ -97,7 +97,12 @@ The core (`root.zig`) is compiled into three artifacts by `build.zig`:
 - `cabi` = `addLibrary(.static, wasm_c_api.zig)` + `installHeader(wasm.h)` + `installHeader(wazmrt.h)`;
   installed by default. **Does NOT link libc** (deliberate — see `design-decisions.md`).
 - `wasm_exe` = `addExecutable(wasm_entry.zig)` for `wasm32-freestanding`, under the `wasm` step only.
-- `mod_tests` = `addTest(mod)` under the `test` step.
+- `mod_tests` = `addTest(mod)` under the `test` step; `cabi_tests` = `addTest(wasm_c_api.zig)` (re-runs
+  the core tests + the C-ABI tests under `std.testing.allocator`), also under `test`.
+- `wasi-gate` step = compiles real `wasm32-wasi` guests and runs them through `exe` asserting stdout:
+  a Zig guest (`hello_compiled.zig`, built by the build graph) + a C guest (`c_hello.c` via `zig cc`),
+  both always-on; a Rust guest (`rust_hello.rs` via `rustc`) behind `-Drust-gate=true`. The
+  compiled-program conformance gate — see `testing.md` and the invariant in `design-decisions.md`.
 
 ## C ABI contract — the standard wasm-c-api
 

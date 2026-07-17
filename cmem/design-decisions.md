@@ -56,6 +56,22 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   have bitten. Full argument + spec in `cmem/security-model.md`; the resolver is `walkFull` in
   `src/wasi.zig`. **Mandatory when touching it: re-run the adversarial fuzz** (`src/wasi.zig`,
   "symlink resolver fuzz" — canary-outside oracle).
+- **Read-only preopens ride the rights model, not a write-path check (2026-07-17, `--ro-dir`).** A
+  `--ro-dir` preopen is just a dir fd whose rights omit `rights.write_mask` (write/create/delete/
+  rename/link/truncate/set-times/allocate). It stays enforced for the *whole subtree* because
+  `path_open` **only ever narrows**: `new_inheriting = want_inheriting & dir.inheriting`. A guest can
+  never widen by reopening, so there is no per-syscall "is this dir read-only?" branch to forget —
+  the containment is the intersection arithmetic. **Rule: express new authority restrictions as rights
+  the fd doesn't carry, not as checks at each mutating call.** `rights.read_only`/`allRights` in
+  `src/wasi.zig`; invariant unit-tested ("read-only preopen rights can never yield a writable child fd").
+- **Conformance is gated on real compiled guests, not just hand-written `.wat` (2026-07-17,
+  `zig build wasi-gate`).** The gate compiles actual `wasm32-wasi` programs and runs them through the
+  wazmrt CLI asserting exact stdout, so a decode/instantiate/WASI-surface regression fails the build.
+  **Zig + C (via `zig cc`) run always** — both ship with the Zig toolchain, so the gate stays hermetic;
+  **Rust is opt-in (`-Drust-gate=true`)** because it needs an external rustc, but a third independent
+  compiler is the strongest cross-toolchain signal. **Rule: a conformance gate that can't fail is
+  decoration** — verified by feeding a wrong expected string (→ exit 1). Guests live in `examples/`
+  (`hello_compiled.zig`, `c_hello.c`, `rust_hello.rs`); wiring is `expectStdOutEqual` in `build.zig`.
 - **`Instance.recordTrap` must stay `noinline` (2026-07-15).** `Frame.run`'s `errdefer` expands at
   *every* `try` in a ~200-arm dispatch switch, so whatever it calls is duplicated across hundreds of
   landing pads. Letting `recordTrap` inline bloats `Frame.run` and evicts the interpreter loop from

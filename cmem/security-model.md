@@ -404,10 +404,11 @@ the deliverable that prevents that.
 7. **Default-deny unsigned `.wasm`**, explicit `--unsigned`/dev-mode opt-out. *If unsigned is the default,
    nobody signs.*
 8. **`--ro-dir` (read-only preopens)** — surfaced three times in the design conversation as the highest
-   security-value-per-effort item on the table, and it is **not currently on any roadmap list**. The
-   rights machinery already exists; exposing it at the CLI makes least-authority pipelines expressible
-   and converts most of the orchestrator risks above from "trust the author" to "structurally
-   impossible."
+   security-value-per-effort item on the table. **BUILT in Phase 4.4 (2026-07-17).** It exposes the
+   existing rights machinery at the CLI: a `--ro-dir` preopen omits `rights.write_mask`, and because
+   `path_open` only ever narrows an fd's rights against its parent, read-only-ness propagates to the
+   whole subtree — least-authority pipelines are now expressible, converting most of the orchestrator
+   risks above from "trust the author" to "structurally impossible." See `design-decisions.md`.
 9. TPM sealing only to defeat offline/persistent attackers — bolt-on, not foundational.
 
 ## Open decisions (owner is thinking — 2026-07-16)
@@ -425,5 +426,5 @@ root-owned) · no encryption · no machine-binding.
 section above and `testing.md`.
 - Default policy: deny-unsigned out of the box, or opt-in?
 - Scope: is the keyring genuinely a separate project (owner's lean), and where is the boundary?
-- Does `--ro-dir` jump the queue ahead of the rest of 4.3?
+- ~~Does `--ro-dir` jump the queue ahead of the rest of 4.3?~~ — **resolved: built in 4.4 (2026-07-17).**
 - Revocation/rotation story — the boring part everyone skips.
