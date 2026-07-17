@@ -136,6 +136,139 @@ library + a signed data file, not a daemon.** A verification *service* means waz
 daemon: a new link in the chain, guarding something that had no secrets. Signing *services* make sense
 (isolating a private key); verification services mostly don't.
 
+## DECIDED 2026-07-16 — three rejected mechanisms, and why
+
+> These were proposed, reasoned through, and **rejected with cause** in the owner design conversation.
+> The *why-not* is the valuable part — each looks appealing on first contact, so record the refutation
+> or it gets re-proposed in six months. All three converge on one invariant:
+
+> ### 🔑 **Integrity is anchored by ownership or a signature — never by secrecy.**
+> Arrived at independently from three directions (keystore, encryption, machine-binding). Corollary:
+> **any scheme requiring a secret on the user's machine is broken** — by open source if we publish, by
+> `strings`/debugger/memory-dump if we don't. The signature scheme needs no secret on the user's
+> machine at all, which is exactly why it survives.
+
+### 1. Pin database: **verified-install (root-owned), NOT trust-on-first-use**
+
+**Proposed:** wazmrt SHA-256s a `.wasm` on first run, stores the hash in "a file only accessible by
+wazmrt," and halts + warns if it ever differs. (This is TOFU — the SSH `known_hosts` model. Real
+pattern, and its genuine advantage is **zero infrastructure**: no PKI, no publisher, no key
+distribution, works for self-built modules. Signature schemes often die of key-management friction.)
+
+**Why it fails as stated — `"a file only accessible by wazmrt"` does not exist.** OS access control is
+per-**user**, not per-**program**. wazmrt runs *as the user*; any file it can write, user-level malware
+can write. There is no "this program only" ACL on Windows, Linux, or macOS. So the DB is **exactly as
+tamperable as the `.wasm` it protects** — malware updates `tool.wasm` and `hashes.db` together, two
+lines of extra work. It's *worse* than the keystore case: a TOFU DB **must stay writable** (it records
+new entries), so it can't even be locked down. Getting a genuinely program-private file needs a service
+account, setuid (a vulnerability class of its own), or MAC labelling — all heavier than just signing.
+
+**Other TOFU gaps:**
+- **Continuity ≠ authenticity.** It answers "changed since I first saw it?", never "is this what the
+  publisher intended?" If the file was already malicious at first sight, **TOFU faithfully protects the
+  malware from tampering.** First use is unauthenticated (SSH's known weakness).
+- **Updates are indistinguishable from attacks** → every legitimate update trips the alarm → users learn
+  to click through. That's the `REMOTE HOST IDENTIFICATION HAS CHANGED` → `rm known_hosts` reflex. **A
+  warning users always dismiss is worse than none — it teaches dismissal.**
+- **Doesn't scale to distribution.** 1000 machines = 1000 independent, blind first-uses. A signature
+  verifies on all of them having never seen the file.
+- **TOCTOU** — hash the bytes you *execute*: read once into memory, hash *those bytes*, run *those
+  bytes*. Never hash by path and re-open.
+
+**DECISION — move the pinning to install time and give the DB to root.** The **privileged installer**
+hashes the module and writes the DB ("first use" done once, *with authority*); the DB is **root-owned,
+read-only to the user**; wazmrt (as the user) only ever *reads* it. Now user-level malware cannot rewrite
+the pin. This is **not TOFU — it's verified install**, i.e. exactly the apt/rpm model: verify at install
+with privilege, rely on ownership afterward. It defeats the unprivileged attacker — the realistic
+threat — with nothing but ownership. **The distinction that makes it work is *who* pins and *who* owns
+the DB.** Lazy user-side pinning is weak; privileged install-time pinning is strong. It also fits the
+vision's shape (system-wide wazmrt + scripts in a root-owned directory).
+
+**Layers with signatures — complementary, not competing.** Their weaknesses are each other's strengths:
+
+| | Answers | First sight | Infrastructure |
+| --- | --- | --- | --- |
+| **Signature** | "From someone I trust?" | ✅ works | needs PKI |
+| **Pin** | "Changed since approved?" | ❌ blind | none |
+
+⇒ **Signed module → verify signature. Unsigned module → check the root-owned pin.** Authenticity where
+available, continuity where not, and local dev modules still work.
+
+**Open caveat:** hashing a large `.wasm` on **every run costs cold-start** — the metric the vision
+competes on (`vision.md`). **Measure before committing.** May argue for pinning only the system script
+directory.
+
+### 2. **No encryption of the pin DB**
+
+**Proposed:** encrypt the DB at install so an attacker can't change it; wazmrt holds the key. (Owner then
+spotted the flaw themselves: wazmrt is open source, so the key is discoverable — *"so why encrypt to
+start with?"*)
+
+**Why — category error: encryption gives confidentiality; we need integrity.** It doesn't even achieve
+the stated goal. An attacker who can *write* the DB needs no key:
+- **delete it** → wazmrt re-pins, and the malicious file becomes the trusted baseline;
+- **corrupt it** → DoS or re-pin;
+- **roll it back** — swap in an older encrypted copy. **Encryption offers zero defense against replay**,
+  and they never decrypt a byte;
+- **transplant** an encrypted DB from another machine.
+
+**And nothing is secret anyway** — it's a SHA-256 of a *public* file; the attacker computes it in a
+millisecond from the file they already have. Encrypting a value the attacker can derive, to prevent a
+modification encryption doesn't prevent.
+
+**The open-source objection is right but sharper than framed: closed source wouldn't save it either** —
+`strings`, a debugger, or a memory dump gets the key, because the key must be *in* the binary to be
+used. **Kerckhoffs's principle**: security lives in the key, not the design's obscurity. **A symmetric
+key shipped to the attacker is not a key; it's obfuscation.** Every DRM scheme relearns this.
+
+**⇒ This is the argument FOR the signature path, not against it.** Asymmetric crypto is the only
+construction that survives *the attacker holding your verifier, your source, and your binary* — literally
+what public-key crypto was invented for. The private key never ships; the public key ships to everyone,
+embedded in an open-source binary. **A public key being public is not a weakness; it's the name of the
+thing.** An attacker reading our source learns the verification key and gains nothing.
+
+**DECISION — the pin DB is plaintext.** Auditable (`cat`/diff it, paste it in a bug report), root-owned,
+read-only. **Integrity from ownership; zero crypto beyond the hash itself.** The question was never "how
+do we encrypt this?" but **"who owns this file?"** — which is how `root:root 0755` has protected every
+binary in `/usr/bin` for thirty years.
+
+### 3. **No machine-binding / machine-derived secret**
+
+**Proposed:** mix in information that exists only on the user's machine, that only the user can access,
+to shrink the attack surface further.
+
+**Why — the attacker *is* the user.** The OS security principal is the **account**, not the human.
+"Only the user has access" and "malware running as the user has access" are **the same sentence** to the
+OS. Anything our programs can read, theirs can read.
+
+| Candidate | Why it doesn't help |
+| --- | --- |
+| MachineGuid, `/etc/machine-id`, IOPlatformUUID | Machine-unique but **readable by every process** — an identifier, not a secret. Obscurity. |
+| Disk serial / CPU ID / MAC | Same; often spoofable too. |
+| Windows **DPAPI** | Tied to the *user account* — same-user malware just calls `CryptUnprotectData`. |
+| Linux kernel keyring | Per-user session keyring. Same. |
+| **TPM** | Protects a key from **extraction**, not from **use**. Malware doesn't need the key — it asks the TPM to perform the operation. |
+
+Each defends a *different* attacker (another user, a stolen disk) — **none defends against the one that
+matters here.**
+
+**The one real exception: human physical presence** (YubiKey/FIDO touch, biometric, typed passphrase) —
+genuinely separates *the human* from *code running as the human*. But the UX cost disqualifies it for a
+script runner (nobody taps a token per script run), and at install time **root already provides the
+boundary**, so it'd be redundant. *(Aside: macOS Keychain ACLs can bind an item to a specific code-signed
+app — the only true "program-private" mechanism anywhere. macOS-only, rests on code-signing enforcement,
+doesn't generalize to the Windows/Linux base.)*
+
+**DECISION — no machine-binding. Ownership already solved it.** The DB is root-owned; user-level malware
+already cannot write it. Mixing a machine secret into a file the attacker *cannot modify* defends against
+nothing new. **Defense-in-depth that addresses no threat is negative value** — complexity to maintain,
+new failure modes, and confidence we haven't earned.
+
+**Where hardware genuinely earns its place** (a *different* threat, already in the table below): **TPM-seal
+to PCRs** → defeats the **offline** attacker (stolen disk) and detects boot-chain tampering; **Secure
+Boot** → anchors the chain in firmware. Bolt-ons for when offline/persistence enters the threat model —
+not foundations.
+
 ## Threat model — state the boundary honestly
 
 | Attacker | What stops them |
@@ -181,24 +314,42 @@ the deliverable that prevents that.
   requirement than the traversal policy, and the one that protects the user's machine. This holds **even
   if no-follow traversal is kept.**
 
-## Proposed secure-by-default posture (for the owner's decision)
+## Proposed secure-by-default posture
 
-1. Embed a root public key in wazmrt — **one artifact to protect**.
-2. OS enforces wazmrt's integrity (Authenticode+WDAC / IMA+Secure Boot).
-3. Optional signed keyring file, anchored to the embedded root, for rotation/revocation.
-4. **Default-deny unsigned `.wasm`**, explicit `--unsigned`/dev-mode opt-out. *If unsigned is the default,
+**Settled 2026-07-16** (see "DECIDED" above for the reasoning):
+
+1. **Verified install, not TOFU** — the privileged installer pins; the DB is **root-owned, read-only,
+   plaintext**. Integrity from ownership.
+2. **No encryption, no machine-binding** — both rejected with cause; they solve confidentiality/obscurity,
+   not integrity.
+3. **Signed → verify signature; unsigned → check the pin.** The two layers are complementary.
+
+**Still proposed, pending the owner's decision:**
+
+4. Embed a root **public** key in wazmrt — **one artifact to protect**. (Public keys are meant to be
+   public; open source is a non-issue for this and *fatal* for every alternative.)
+5. OS enforces wazmrt's integrity (Authenticode+WDAC / IMA+Secure Boot).
+6. Optional signed keyring file, anchored to the embedded root, for rotation/revocation.
+7. **Default-deny unsigned `.wasm`**, explicit `--unsigned`/dev-mode opt-out. *If unsigned is the default,
    nobody signs.*
-5. **`--ro-dir` (read-only preopens)** — surfaced three times in the design conversation as the highest
+8. **`--ro-dir` (read-only preopens)** — surfaced three times in the design conversation as the highest
    security-value-per-effort item on the table, and it is **not currently on any roadmap list**. The
    rights machinery already exists; exposing it at the CLI makes least-authority pipelines expressible
    and converts most of the orchestrator risks above from "trust the author" to "structurally
    impossible."
-6. TPM sealing only to defeat offline/persistent attackers — bolt-on, not foundational.
+9. TPM sealing only to defeat offline/persistent attackers — bolt-on, not foundational.
 
 ## Open decisions (owner is thinking — 2026-07-16)
 
+**Settled, do not re-litigate** (reasoning in "DECIDED" above): pin mechanism (verified-install,
+root-owned) · no encryption · no machine-binding.
+
+**Genuinely open:**
+
 - Trust anchor: embedded-in-binary (recommended) vs OS keystore vs signed keyring file vs a hybrid.
 - Signature format: adopt existing prior art (→ Adoption Checklist) vs roll our own.
+- **Cold-start cost of hashing on every run** — must be measured against `vision.md`'s headline metric
+  before the pin design is committed. May argue for pinning only the system script directory.
 - Default policy: deny-unsigned out of the box, or opt-in?
 - Scope: is the keyring genuinely a separate project (owner's lean), and where is the boundary?
 - Does `--ro-dir` jump the queue ahead of the rest of 4.3?
