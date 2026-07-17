@@ -56,6 +56,19 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   have bitten. Full argument + spec in `cmem/security-model.md`; the resolver is `walkFull` in
   `src/wasi.zig`. **Mandatory when touching it: re-run the adversarial fuzz** (`src/wasi.zig`,
   "symlink resolver fuzz" — canary-outside oracle).
+- **Exceptions unwind as a Zig error, caught at each `call` site (2026-07-17, Phase 6).** A `throw`
+  builds an `Exception{tag, values}` and calls `Frame.throwException`, which searches *this* frame's
+  label stack innermost-out for a `try_table` whose catch matches (tag, or `catch_all`); on a match it
+  resets the value stack to the try_table's base, pushes the payload (plus a boxed `exnref` for the
+  `_ref` variants), and `branch`es to the clause's label. If no handler in this frame matches, it stashes
+  the exception on `Instance.pending_exn` and returns **`error.UncaughtException`** — which each `call`
+  arm intercepts via `Frame.onCallError`, re-running the same search in the *caller's* try_tables. This
+  reuses the existing recursive-call + `errdefer` unwinding rather than a separate exception stack. **Two
+  things to preserve:** (1) on a successful call-site catch, reset `trap_len`/`trap_depth` (the unwinding
+  frames recorded a would-be trace that must not leak into a later real trap); (2) `exn_store` and
+  `pending_exn` are cleared per invocation — `exnref` payloads are invocation-arena memory and must never
+  outlive the call. Only the standardized **exnref** encoding is built; legacy `try`/`catch`/`delegate`
+  is out of scope.
 - **Pin verification hashes the bytes it runs, and the gate has no path to re-open (2026-07-17,
   Phase 5).** `verifyGate` (in `main.zig`) receives the **in-memory module buffer** and hashes *that*;
   it is handed the path only for messages and never re-reads the file. So the verified bytes provably
@@ -259,12 +272,11 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   - **Deferred (until browser-standard):** **WASI preview 2/3** (component-model based), **multi-memory**,
     **SIMD** — pulled in as the real corpus (`wasm_wasi`) demands. Typed/GC reference *value types* are
     already *accepted* (P1) so such modules build.
-  - **Exception handling — moved IN SCOPE 2026-07-17** (owner chose it as a frontier; sequenced as
-    **Phase 6**, after the Phase 5 secure-base pin verification). The standardized **exnref** proposal
-    (`try_table`/`throw`/`throw_ref` + `tag` section, `exnref` heap type) shipped cross-browser
-    (Chrome/Firefox 2024), so it clears the browser-standard bar. Plan in `roadmap.md` §6. Note the
-    encoding split: the **legacy** `try`/`catch`/`catch_all`/`delegate`/`rethrow` form (older LLVM) is
-    distinct from the standard exnref form — plan targets exnref first.
+  - **Exception handling — IN SCOPE; CORE BUILT 2026-07-17 (Phase 6).** The standardized **exnref**
+    proposal (`try_table`/`throw`/`throw_ref` + `tag` section, `exnref` heap type) — decode + validate +
+    execute all done (see the EH invariant above and `roadmap.md` §6). Only the WAT assembler + `.wast`
+    conformance remain (deferred §6.1). The **legacy** `try`/`catch`/`catch_all`/`delegate`/`rethrow`
+    form (older LLVM) is a distinct encoding and stays out of scope.
 
 ## Zig 0.16 API notes (this project targets 0.16.0)
 

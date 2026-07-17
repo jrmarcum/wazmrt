@@ -36,6 +36,10 @@ pub const Op = enum(u8) {
     @"return" = 0x0f,
     call = 0x10,
     call_indirect = 0x11,
+    // Exception handling (exnref proposal, Phase 6).
+    throw = 0x08, // immediate: a tag index — package operands into an exception + throw
+    throw_ref = 0x0a, // rethrow the exnref on the stack (null → trap)
+    try_table = 0x1f, // immediate: a block type + a vector of catch clauses
     // Typed function references (function-references proposal).
     call_ref = 0x14, // immediate: a type index (the func ref's signature)
     return_call_ref = 0x15,
@@ -316,6 +320,7 @@ pub const HeapType = union(enum) {
     none,
     nofunc,
     noextern,
+    exn, // exception heap type (EH proposal, Phase 6)
     concrete: u32, // a type index
 };
 
@@ -387,6 +392,13 @@ pub const MemArg = struct { alignment: u32, offset: u32 };
 pub const BrTable = struct { labels: []const u32, default: u32 };
 pub const CallIndirect = struct { type_index: u32, table: u32 };
 
+/// A `try_table` catch clause (EH proposal). On a thrown exception whose tag
+/// matches (or `catch_all`), control branches to `label` with the exception's
+/// values pushed — plus the `exnref` itself for the `_ref` variants.
+pub const CatchKind = enum { catch_, catch_ref, catch_all, catch_all_ref };
+pub const Catch = struct { kind: CatchKind, tag: u32 = 0, label: u32 };
+pub const TryTable = struct { block_type: BlockType, catches: []const Catch };
+
 /// A decoded instruction immediate.
 pub const Imm = union(enum) {
     none,
@@ -430,6 +442,10 @@ pub const Imm = union(enum) {
     /// A GC cast-branch (`br_on_cast` / `br_on_cast_fail`): a label + the source
     /// and destination reference types.
     br_cast: struct { label: u32, src: RefType, dst: RefType },
+    /// `throw` — an exception tag index.
+    tag: u32,
+    /// `try_table` — a block type + its catch clauses.
+    try_table: TryTable,
 };
 
 pub const Instr = struct { op: Op, imm: Imm };
@@ -466,6 +482,8 @@ const ImmKind = enum {
     gc_type_n,
     ref_cast,
     br_cast,
+    tag,
+    try_table,
     unsupported,
 };
 
@@ -474,6 +492,9 @@ const ImmKind = enum {
 pub fn immediateKind(op: Op) ImmKind {
     return switch (@intFromEnum(op)) {
         0x02, 0x03, 0x04 => .block_type,
+        0x08 => .tag, // throw <tagidx>
+        0x0a => .none, // throw_ref
+        0x1f => .try_table, // try_table <blocktype> vec(catch)
         0x0c, 0x0d => .label,
         0x0e => .br_table,
         0x10 => .func,
@@ -537,6 +558,7 @@ fn readBlockType(r: *Reader) DecodeError!BlockType {
         -20 => .{ .value = .i31ref }, // 0x6c
         -21 => .{ .value = .structref }, // 0x6b
         -22 => .{ .value = .arrayref }, // 0x6a
+        -23 => .{ .value = .exnref }, // 0x69 (exception ref)
         -15 => .{ .value = .nullref }, // 0x71 (none)
         -24 => .{ .value = .funcref_nn }, // 0x68 (our synthetic non-null tags)
         -25 => .{ .value = .externref_nn }, // 0x67
@@ -546,6 +568,7 @@ fn readBlockType(r: *Reader) DecodeError!BlockType {
         -31 => .{ .value = .structref_nn }, // 0x61
         -39 => .{ .value = .arrayref_nn }, // 0x59
         -40 => .{ .value = .nullref_nn }, // 0x58
+        -41 => .{ .value = .exnref_nn }, // 0x57 (synthetic non-null exn ref)
         else => error.UnsupportedOpcode,
     };
 }
@@ -571,6 +594,30 @@ fn readBrCast(r: *Reader) DecodeError!Imm {
     } };
 }
 
+/// Read a `try_table` immediate: a block type followed by a vector of catch
+/// clauses. Each clause is a kind byte (0=catch, 1=catch_ref, 2=catch_all,
+/// 3=catch_all_ref), a tag index for the non-`all` kinds, then a label index.
+fn readTryTable(r: *Reader, a: std.mem.Allocator) (DecodeError || std.mem.Allocator.Error)!Imm {
+    const bt = try readBlockType(r);
+    const n = try r.readVarU32();
+    const catches = try a.alloc(Catch, n);
+    for (catches) |*c| {
+        const kind: CatchKind = switch (try r.readByte()) {
+            0x00 => .catch_,
+            0x01 => .catch_ref,
+            0x02 => .catch_all,
+            0x03 => .catch_all_ref,
+            else => return error.UnsupportedOpcode,
+        };
+        const tag: u32 = switch (kind) {
+            .catch_, .catch_ref => try r.readVarU32(),
+            .catch_all, .catch_all_ref => 0,
+        };
+        c.* = .{ .kind = kind, .tag = tag, .label = try r.readVarU32() };
+    }
+    return .{ .try_table = .{ .block_type = bt, .catches = catches } };
+}
+
 /// Read a heap type (§ GC binary format): a non-negative `s33` is a concrete
 /// type index; negative values are the abstract heap-type codes.
 pub fn readHeapType(r: *Reader) DecodeError!HeapType {
@@ -587,6 +634,7 @@ pub fn readHeapType(r: *Reader) DecodeError!HeapType {
         -0x0f => .none,
         -0x0d => .nofunc,
         -0x0e => .noextern,
+        -0x17 => .exn, // 0x69
         else => error.UnsupportedOpcode,
     };
 }
@@ -725,6 +773,8 @@ pub fn decodeBodyTracked(
                 break :blk .{ .select_types = tys };
             },
             .ref_type => .{ .ref_type = try readHeapType(&r) },
+            .tag => .{ .tag = try r.readVarU32() },
+            .try_table => try readTryTable(&r, a),
             // These are `0xFC`-prefixed ops decoded via the interception above;
             // reaching here means a raw synthetic-tag byte, which is malformed.
             // 0xFB/0xFC-prefixed ops are decoded via the prefix interceptions

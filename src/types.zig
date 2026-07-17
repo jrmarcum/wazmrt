@@ -25,10 +25,11 @@ pub const SectionId = enum(u8) {
     code = 10,
     data = 11,
     data_count = 12,
+    tag = 13, // exception tags (EH proposal, Phase 6)
     _,
 
     /// Highest identifier defined by the current spec.
-    pub const max: u8 = 12;
+    pub const max: u8 = 13;
 };
 
 /// WebAssembly value types (§5.3.1). Numeric and abstract-reference types keep
@@ -57,6 +58,7 @@ pub const ValType = enum(u32) {
     i31ref = 0x6c,
     structref = 0x6b,
     arrayref = 0x6a,
+    exnref = 0x69, // (ref null exn) — exception references (EH proposal, Phase 6)
     nullref = 0x71, // (ref null none) — bottom of the `any` hierarchy
     // Non-nullable reference types (`(ref func)`/`(ref i31)`/…, function-references
     // + GC proposals). Synthetic internal tags in an otherwise-unused valtype-byte
@@ -70,6 +72,7 @@ pub const ValType = enum(u32) {
     structref_nn = 0x61,
     arrayref_nn = 0x59,
     nullref_nn = 0x58, // (ref none) — uninhabited but syntactically valid
+    exnref_nn = 0x57, // (ref exn) — non-null exception reference
     _,
 
     // --- Concrete typed-reference encoding (high bits of the u32) -------------
@@ -117,8 +120,8 @@ pub const ValType = enum(u32) {
     pub fn isRef(self: ValType) bool {
         if (self.isConcrete()) return true;
         return switch (self) {
-            .funcref, .externref, .anyref, .eqref, .i31ref, .structref, .arrayref, .nullref => true,
-            .funcref_nn, .externref_nn, .anyref_nn, .eqref_nn, .i31ref_nn, .structref_nn, .arrayref_nn, .nullref_nn => true,
+            .funcref, .externref, .anyref, .eqref, .i31ref, .structref, .arrayref, .exnref, .nullref => true,
+            .funcref_nn, .externref_nn, .anyref_nn, .eqref_nn, .i31ref_nn, .structref_nn, .arrayref_nn, .exnref_nn, .nullref_nn => true,
             else => false,
         };
     }
@@ -127,7 +130,7 @@ pub const ValType = enum(u32) {
     pub fn isNonNullRef(self: ValType) bool {
         if (self.isConcrete()) return @intFromEnum(self) & nullable_bit == 0;
         return switch (self) {
-            .funcref_nn, .externref_nn, .anyref_nn, .eqref_nn, .i31ref_nn, .structref_nn, .arrayref_nn, .nullref_nn => true,
+            .funcref_nn, .externref_nn, .anyref_nn, .eqref_nn, .i31ref_nn, .structref_nn, .arrayref_nn, .exnref_nn, .nullref_nn => true,
             else => false,
         };
     }
@@ -143,6 +146,7 @@ pub const ValType = enum(u32) {
             .i31ref_nn => .i31ref,
             .structref_nn => .structref,
             .arrayref_nn => .arrayref,
+            .exnref_nn => .exnref,
             .nullref_nn => .nullref,
             else => self,
         };
@@ -159,6 +163,7 @@ pub const ValType = enum(u32) {
         @"struct",
         array,
         none,
+        exn, // exception references — its own hierarchy (EH proposal, Phase 6)
 
         /// The value type for this heap head at the given nullability (the
         /// collapsed reference representation — concrete refs share their head).
@@ -172,6 +177,7 @@ pub const ValType = enum(u32) {
                 .@"struct" => if (is_nullable) .structref else .structref_nn,
                 .array => if (is_nullable) .arrayref else .arrayref_nn,
                 .none => if (is_nullable) .nullref else .nullref_nn,
+                .exn => if (is_nullable) .exnref else .exnref_nn,
             };
         }
 
@@ -181,6 +187,7 @@ pub const ValType = enum(u32) {
             return switch (self) {
                 .func => .func,
                 .extern_ => .extern_,
+                .exn => .exn,
                 else => .any,
             };
         }
@@ -216,6 +223,7 @@ pub const ValType = enum(u32) {
             .i31ref, .i31ref_nn => .i31,
             .structref, .structref_nn => .@"struct",
             .arrayref, .arrayref_nn => .array,
+            .exnref, .exnref_nn => .exn,
             .nullref, .nullref_nn => .none,
             else => unreachable,
         };

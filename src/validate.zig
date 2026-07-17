@@ -36,6 +36,10 @@ pub const Error = Module.Error || error{
     ImmutableGlobal,
     UndefinedFunc,
     UndefinedType,
+    /// A `throw`/catch tag index out of range (EH proposal).
+    UndefinedTag,
+    /// A tag whose type produces results (tags must have empty results).
+    InvalidTag,
     UndefinedTable,
     UndefinedElem,
     /// A `memory.init`/`data.drop` data-segment index out of range.
@@ -210,7 +214,7 @@ fn validateFunction(a: std.mem.Allocator, module: *const Module, ft: Module.Func
 
 const StackType = union(enum) { val: V, unknown };
 
-const FrameKind = enum { block, loop, if_, else_ };
+const FrameKind = enum { block, loop, if_, else_, try_table };
 
 const Frame = struct {
     kind: FrameKind,
@@ -344,6 +348,33 @@ const FuncValidator = struct {
         };
     }
 
+    /// Every `want[i]` must be a subtype of `got[i]` (same length). Used to check
+    /// that a catch handler's pushed values fit its target label.
+    fn matchTypes(self: *FuncValidator, want: []const V, got: []const V) Error!void {
+        if (want.len != got.len) return error.TypeMismatch;
+        for (want, got) |w, g| if (!subtypeOf(self.module, w, g)) return error.TypeMismatch;
+    }
+
+    /// A `try_table` catch clause branches to `lt` (its target label's types)
+    /// carrying the tag's params (`catch`/`catch_ref`) — plus an `exnref` for the
+    /// `_ref` variants, and nothing for `catch_all`. Check those match `lt`.
+    fn checkCatch(self: *FuncValidator, c: opcode.Catch, lt: []const V) Error!void {
+        switch (c.kind) {
+            .catch_ => {
+                const ft = self.module.tagType(c.tag) orelse return error.UndefinedTag;
+                try self.matchTypes(ft.params, lt);
+            },
+            .catch_ref => {
+                const ft = self.module.tagType(c.tag) orelse return error.UndefinedTag;
+                if (lt.len != ft.params.len + 1) return error.TypeMismatch;
+                try self.matchTypes(ft.params, lt[0..ft.params.len]);
+                if (!subtypeOf(self.module, .exnref, lt[lt.len - 1])) return error.TypeMismatch;
+            },
+            .catch_all => if (lt.len != 0) return error.TypeMismatch,
+            .catch_all_ref => if (lt.len != 1 or !subtypeOf(self.module, .exnref, lt[0])) return error.TypeMismatch,
+        }
+    }
+
     fn step(self: *FuncValidator, instr: opcode.Instr) Error!void {
         if (self.ctrls.items.len == 0) return error.ControlUnderflow; // code after final `end`
         switch (instr.op) {
@@ -365,6 +396,31 @@ const FuncValidator = struct {
                 const s = try self.blockSig(instr.imm.block_type);
                 try self.popVals(s.pop);
                 try self.pushCtrl(.if_, s.pop, s.push);
+            },
+
+            // Exception handling (exnref proposal, Phase 6).
+            .try_table => {
+                const tt = instr.imm.try_table;
+                const s = try self.blockSig(tt.block_type);
+                try self.popVals(s.pop);
+                try self.pushCtrl(.try_table, s.pop, s.push);
+                // Each catch's target label must accept exactly the values the
+                // handler pushes: the tag's params, plus an `exnref` for `_ref`.
+                // Label indices are resolved with the try_table frame on top.
+                for (tt.catches) |c| {
+                    const lt = try self.labelTypesAt(c.label);
+                    try self.checkCatch(c, lt);
+                }
+            },
+            .throw => {
+                const ft = self.module.tagType(instr.imm.tag) orelse return error.UndefinedTag;
+                if (ft.results.len != 0) return error.InvalidTag; // tags never produce results
+                try self.popVals(ft.params); // consume the exception's operands
+                self.setUnreachable(); // control transfers; the rest is dead
+            },
+            .throw_ref => {
+                _ = try self.popExpect(.exnref);
+                self.setUnreachable();
             },
             .@"else" => {
                 const frame = try self.popCtrl();

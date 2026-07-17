@@ -481,15 +481,27 @@ V8. **Decision:** build the shipped `.lib`/`.dll` (and the freestanding wasm —
 `design-decisions.md`. (Caveat: single machine; sizes + steady-state are solid, the µs/ms cold numbers
 are ±10% noisy.)
 
-## Reading the test count (updated 2026-07-17, Phase 5)
+## Reading the test count (updated 2026-07-17, Phase 6)
 
-`zig build test --summary all` prints **254** (250 pass, 4 skip), but there are **132 distinct tests**:
-122 in the core module (120 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
+`zig build test --summary all` prints **266** (262 pass, 4 skip), but there are **138 distinct tests**:
+128 in the core module (126 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
 `wasm_c_api.zig`, which imports `root.zig`, so it compiles and **re-runs the core module's tests too**
-(122 core + 10 C-ABI = 132), on top of the standalone `mod_tests` run (122) → 254 printed. Harmless —
-under a second — but **don't quote 254 as a test count**; quote **132**, or the per-target numbers from
+(128 core + 10 C-ABI = 138), on top of the standalone `mod_tests` run (128) → 266 printed. Harmless —
+under a second — but **don't quote 266 as a test count**; quote **138**, or the per-target numbers from
 `--summary all`. Two core tests skip on an unprivileged Windows box (the #17 real-symlink test and the
 traversal example gate — see below), so you'll usually see `2 skip` per run (`4` total).
+
+## Exception-handling tests — `src/interp.zig` (2026-07-17, Phase 6)
+
+6 tests that **build module binaries by hand** (no assembler yet — see `roadmap.md` §6.1) so they
+exercise the tag-section decode, the validator's `try_table`/`throw` typing, and the interpreter's
+unwinding directly (decode → validate → invoke). A tiny helper frames the section/body lengths so only
+the opcodes are hand-written. Coverage: `catch` carrying a payload, `catch_all`, an **uncaught** throw
+(→ `error.UncaughtException`), an exception thrown in a **callee** and caught in the caller's `try_table`
+(cross-frame unwind via the `call`-site catch), `catch_ref` materializing a non-null `exnref`, and
+`throw_ref` rethrowing a caught `exnref` to an outer `catch_all`. **Gotcha for future hand-built tests:**
+`i32.const` is *signed* LEB128 — a single byte ≥ 0x40 decodes negative (`0x63` → −29, not 99), so keep
+hand-encoded constants < 64 or emit a proper multi-byte SLEB.
 
 ## Pin verification tests — `src/pin.zig` (2026-07-17, Phase 5)
 

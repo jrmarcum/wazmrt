@@ -125,6 +125,10 @@ pub const Error = Module.Error || error{
     CastFailure,
     /// A host-function import callback signaled a trap (C ABI `wasm_func_new`).
     HostTrap,
+    /// An exception is unwinding and has not (yet) been caught. Used internally
+    /// to propagate a `throw` across frames; if it reaches the top of a call it
+    /// is an uncaught exception, which traps (EH proposal, Phase 6).
+    UncaughtException,
 };
 
 /// Null reference sentinel — on the value stack (`ref.null`) and as an
@@ -156,7 +160,15 @@ const Label = struct {
     target: usize,
     /// Value-stack height below this construct's operands.
     stack_base: usize,
+    /// Non-empty only for a `try_table` label — its catch clauses, consulted
+    /// when an exception unwinds through this frame (EH proposal, Phase 6).
+    catches: []const opcode.Catch = &.{},
 };
+
+/// A thrown exception in flight: the tag it carries and its value payload
+/// (arena-owned by the invocation). Boxed in `Instance.exn_store` when an
+/// `exnref` must be materialized (`catch_ref` / `throw_ref`).
+const Exception = struct { tag: u32, values: []const Value };
 
 /// A defined function prepared for execution.
 const FuncBody = struct {
@@ -229,6 +241,13 @@ pub const Instance = struct {
     /// True call depth at the trap; exceeds `trap_len` when the stack was deeper
     /// than `max_trap_frames`, so a truncated backtrace can say it was truncated.
     trap_depth: usize = 0,
+    /// Exception handling (Phase 6). `pending_exn` carries a thrown exception
+    /// while it unwinds across frames (via `error.UncaughtException`), so a
+    /// caller's `call` site can try to catch it. `exn_store` boxes exceptions
+    /// that become `exnref` values (`catch_ref`/`throw_ref`); indices into it are
+    /// the exnref value. Both are reset per invocation.
+    pending_exn: ?Exception = null,
+    exn_store: std.ArrayList(Exception) = .empty,
     /// GC heap (full GC, P3): one object per allocated struct/array; a GC
     /// reference value is the object's index here (its runtime type — the type
     /// index — rides in the object, so `ref.test`/`ref.cast` can check it).
@@ -443,6 +462,7 @@ pub const Instance = struct {
         for (self.elem_values) |ev| self.gpa.free(ev);
         self.gpa.free(self.elem_values);
         self.gpa.free(self.elem_dropped);
+        self.exn_store.deinit(self.gpa);
         self.gpa.free(self.data_dropped);
         for (self.tables, 0..) |t, k| if (k >= self.imported_tables) {
             self.gpa.free(t.entries);
@@ -479,6 +499,10 @@ pub const Instance = struct {
         // Any trace left over describes an older call, not this one.
         self.trap_len = 0;
         self.trap_depth = 0;
+        // Exceptions never outlive the invocation that raised them (their payload
+        // is invocation-arena memory); start each call with a clean store.
+        self.pending_exn = null;
+        self.exn_store.clearRetainingCapacity();
 
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
@@ -671,7 +695,7 @@ fn precomputeControlFlow(a: std.mem.Allocator, ir: []const opcode.Instr) Error!s
     var stack: std.ArrayList(usize) = .empty;
     for (ir, 0..) |instr, i| {
         switch (instr.op) {
-            .block, .loop, .@"if" => try stack.append(a, i),
+            .block, .loop, .@"if", .try_table => try stack.append(a, i),
             .@"else" => else_of[stack.items[stack.items.len - 1]] = i,
             .end => {
                 if (stack.items.len == 0) continue; // the function's implicit end
@@ -737,6 +761,62 @@ const Frame = struct {
         const keep = if (label.is_loop) self.labels.items.len - n else self.labels.items.len - (n + 1);
         self.labels.shrinkRetainingCapacity(keep);
         return label.target;
+    }
+
+    /// Try to catch `exn` in this frame: search the label stack innermost-out for
+    /// a `try_table` whose catch clauses match this exception's tag (or a
+    /// `catch_all`). On a match, unwind the value stack to that try_table's base,
+    /// push the handler values (the exception payload, plus the `exnref` for a
+    /// `_ref` clause), and branch to the clause's target label — returning the new
+    /// pc. Returns null if no handler in this frame matches (the caller then
+    /// propagates `error.UncaughtException`).
+    fn throwException(self: *Frame, exn: Exception) Error!?usize {
+        var d: usize = 0;
+        while (d < self.labels.items.len) : (d += 1) {
+            const label = self.labels.items[self.labels.items.len - 1 - d];
+            for (label.catches) |c| {
+                const matches = switch (c.kind) {
+                    .catch_, .catch_ref => c.tag == exn.tag,
+                    .catch_all, .catch_all_ref => true,
+                };
+                if (!matches) continue;
+                // Discard everything the try_table body pushed (incl. any call
+                // args in flight), back to its entry height.
+                self.vstack.shrinkRetainingCapacity(label.stack_base);
+                switch (c.kind) {
+                    .catch_, .catch_ref => for (exn.values) |v| try self.pushU64(v),
+                    .catch_all, .catch_all_ref => {},
+                }
+                switch (c.kind) {
+                    .catch_ref, .catch_all_ref => {
+                        const idx = self.inst.exn_store.items.len;
+                        try self.inst.exn_store.append(self.inst.gpa, exn);
+                        try self.pushU64(@intCast(idx));
+                    },
+                    else => {},
+                }
+                // The clause's label index is relative to the try_table (label 0 =
+                // the try_table block); the try_table sits `d` deep, so branch to
+                // `d + c.label`.
+                return self.branch(@intCast(d + c.label));
+            }
+        }
+        return null;
+    }
+
+    /// Handle an error propagating out of a `call`. If it is an unwinding
+    /// exception this frame catches, return the resumption pc; otherwise re-raise
+    /// it (so a real trap, or an exception no handler here matches, keeps
+    /// unwinding). Never returns null — it either yields a pc or re-raises.
+    fn onCallError(self: *Frame, e: Error) Error!usize {
+        if (e != error.UncaughtException) return e;
+        const exn = self.inst.pending_exn.?;
+        const target = (try self.throwException(exn)) orelse return e;
+        // Caught here: drop the in-flight exception and the unwind trace it left.
+        self.inst.pending_exn = null;
+        self.inst.trap_len = 0;
+        self.inst.trap_depth = 0;
+        return target;
     }
 
     fn blockArity(self: *Frame, bt: opcode.BlockType, comptime want_params: bool) u32 {
@@ -957,6 +1037,44 @@ const Frame = struct {
                     _ = self.labels.pop();
                     pc += 1;
                 },
+
+                // --- Exception handling (exnref proposal, Phase 6) ---
+                .try_table => {
+                    const tt = instr.imm.try_table;
+                    const params = self.blockArity(tt.block_type, true);
+                    try self.labels.append(self.a, .{
+                        .is_loop = false,
+                        .arity = self.blockArity(tt.block_type, false),
+                        .target = self.body.end_of[pc] + 1,
+                        .stack_base = self.vstack.items.len - params,
+                        .catches = tt.catches,
+                    });
+                    pc += 1;
+                },
+                .throw => {
+                    const tag = instr.imm.tag;
+                    const ft = self.inst.module.tagType(tag).?; // validated
+                    const base = self.vstack.items.len - ft.params.len;
+                    const exn: Exception = .{ .tag = tag, .values = try self.a.dupe(Value, self.vstack.items[base..]) };
+                    self.vstack.shrinkRetainingCapacity(base);
+                    if (try self.throwException(exn)) |target| {
+                        pc = target;
+                    } else {
+                        self.inst.pending_exn = exn;
+                        return error.UncaughtException;
+                    }
+                },
+                .throw_ref => {
+                    const r = self.pop();
+                    if (r == null_ref) return error.NullReference;
+                    const exn = self.inst.exn_store.items[@intCast(r)];
+                    if (try self.throwException(exn)) |target| {
+                        pc = target;
+                    } else {
+                        self.inst.pending_exn = exn;
+                        return error.UncaughtException;
+                    }
+                },
                 .br => pc = self.branch(instr.imm.label),
                 .br_if => {
                     if (self.popI32() != 0) pc = self.branch(instr.imm.label) else pc += 1;
@@ -974,7 +1092,10 @@ const Frame = struct {
                     const ft = self.inst.module.funcType(f) orelse return error.UndefinedFunc;
                     const np = ft.params.len;
                     const args = self.vstack.items[self.vstack.items.len - np ..];
-                    const results = try self.inst.callFunction(self.a, f, args, self.depth + 1);
+                    const results = self.inst.callFunction(self.a, f, args, self.depth + 1) catch |e| {
+                        pc = try self.onCallError(e); // caught here → resume; else re-raise
+                        continue;
+                    };
                     self.vstack.shrinkRetainingCapacity(self.vstack.items.len - np);
                     for (results) |r| try self.pushU64(r);
                     pc += 1;
@@ -992,7 +1113,10 @@ const Frame = struct {
                     if (!funcTypeEqual(want, ft)) return error.IndirectTypeMismatch;
                     const np = ft.params.len;
                     const args = self.vstack.items[self.vstack.items.len - np ..];
-                    const results = try self.inst.callFunction(self.a, f, args, self.depth + 1);
+                    const results = self.inst.callFunction(self.a, f, args, self.depth + 1) catch |e| {
+                        pc = try self.onCallError(e);
+                        continue;
+                    };
                     self.vstack.shrinkRetainingCapacity(self.vstack.items.len - np);
                     for (results) |r| try self.pushU64(r);
                     pc += 1;
@@ -1006,7 +1130,10 @@ const Frame = struct {
                     const ft = self.inst.module.funcType(f) orelse return error.UndefinedFunc;
                     const np = ft.params.len;
                     const args = self.vstack.items[self.vstack.items.len - np ..];
-                    const results = try self.inst.callFunction(self.a, f, args, self.depth + 1);
+                    const results = self.inst.callFunction(self.a, f, args, self.depth + 1) catch |e| {
+                        pc = try self.onCallError(e);
+                        continue;
+                    };
                     self.vstack.shrinkRetainingCapacity(self.vstack.items.len - np);
                     for (results) |r| try self.pushU64(r);
                     // return_call_ref is a tail call: the callee's results become
@@ -2019,4 +2146,183 @@ test "initializes memory from an active data segment" {
     const r = try inst.invoke("get", &.{});
     defer std.testing.allocator.free(r);
     try std.testing.expectEqual(@as(u32, 0xDEADBEEF), @as(u32, @bitCast(asI32(r[0]))));
+}
+
+// --- Exception handling tests (Phase 6) ------------------------------------
+// These build module binaries by hand (no assembler yet) so they exercise the
+// tag-section decode, the validator's try_table/throw typing, and the
+// interpreter's unwinding directly. Section bodies are raw opcode bytes; the
+// helper frames the section/body lengths so only the opcodes are hand-written.
+
+fn ehUleb(a: std.mem.Allocator, out: *std.ArrayList(u8), v: usize) !void {
+    var x = v;
+    while (true) {
+        var b: u8 = @intCast(x & 0x7f);
+        x >>= 7;
+        if (x != 0) b |= 0x80;
+        try out.append(a, b);
+        if (x == 0) break;
+    }
+}
+
+const EhSection = struct { id: u8, body: []const u8 };
+
+fn ehModule(a: std.mem.Allocator, sections: []const EhSection) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, &.{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 });
+    for (sections) |s| {
+        try out.append(a, s.id);
+        try ehUleb(a, &out, s.body.len);
+        try out.appendSlice(a, s.body);
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// Frame a code section from raw function bodies (count + per-body size).
+fn ehCode(a: std.mem.Allocator, bodies: []const []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try ehUleb(a, &out, bodies.len);
+    for (bodies) |b| {
+        try ehUleb(a, &out, b.len);
+        try out.appendSlice(a, b);
+    }
+    return out.toOwnedSlice(a);
+}
+
+fn instantiateValidated(bytes: []const u8) !Instance {
+    const m = try std.testing.allocator.create(Module);
+    errdefer std.testing.allocator.destroy(m);
+    m.* = try Module_decode(std.testing.allocator, bytes);
+    errdefer m.deinit();
+    try @import("validate.zig").validate(std.testing.allocator, m);
+    return Instance.init(std.testing.allocator, m);
+}
+
+test "EH: throw is caught by a matching catch, carrying the payload" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x02, 0x60, 0x01, 0x7f, 0x00, 0x60, 0x00, 0x01, 0x7f } }, // (func(param i32)), (func()->i32)
+        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } }, // tag 0 : type 0
+        .{ .id = 3, .body = &.{ 0x01, 0x01 } }, // func 0 : type 1
+        .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{
+            // try_table (result i32) (catch 0 0) ; i32.const 42 ; throw 0 ; end
+            &.{ 0x00, 0x1f, 0x7f, 0x01, 0x00, 0x00, 0x00, 0x41, 0x2a, 0x08, 0x00, 0x0b, 0x0b },
+        }) },
+    });
+    var inst = try instantiateValidated(bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("f", &.{});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(i32, 42), asI32(r[0]));
+}
+
+test "EH: catch_all catches any tag and control resumes after the try_table" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x02, 0x60, 0x00, 0x00, 0x60, 0x00, 0x01, 0x7f } }, // (func), (func()->i32)
+        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } },
+        .{ .id = 3, .body = &.{ 0x01, 0x01 } },
+        .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{
+            // try_table (catch_all 0) ; throw 0 ; end ; i32.const 55
+            &.{ 0x00, 0x1f, 0x40, 0x01, 0x02, 0x00, 0x08, 0x00, 0x0b, 0x41, 0x37, 0x0b },
+        }) },
+    });
+    var inst = try instantiateValidated(bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("f", &.{});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(i32, 55), asI32(r[0]));
+}
+
+test "EH: an uncaught throw traps (UncaughtException)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x00 } }, // (func)
+        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } },
+        .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+        .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{&.{ 0x00, 0x08, 0x00, 0x0b }}) }, // throw 0 ; end
+    });
+    var inst = try instantiateValidated(bytes);
+    defer destroy(&inst);
+    try std.testing.expectError(error.UncaughtException, inst.invoke("f", &.{}));
+}
+
+test "EH: an exception thrown in a callee is caught in the caller's try_table" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x02, 0x60, 0x00, 0x00, 0x60, 0x00, 0x01, 0x7f } }, // (func), (func()->i32)
+        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } },
+        .{ .id = 3, .body = &.{ 0x02, 0x00, 0x01 } }, // func0:type0 (callee), func1:type1 (caller)
+        .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x01 } }, // export caller (func 1)
+        .{ .id = 10, .body = try ehCode(a, &.{
+            &.{ 0x00, 0x08, 0x00, 0x0b }, // callee: throw 0 ; end
+            // caller: try_table (catch_all 0) ; call 0 ; end ; i32.const 7
+            &.{ 0x00, 0x1f, 0x40, 0x01, 0x02, 0x00, 0x10, 0x00, 0x0b, 0x41, 0x07, 0x0b },
+        }) },
+    });
+    var inst = try instantiateValidated(bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("f", &.{});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(i32, 7), asI32(r[0]));
+}
+
+test "EH: catch_ref materializes a non-null exnref" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x02, 0x60, 0x00, 0x00, 0x60, 0x00, 0x01, 0x7f } },
+        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } },
+        .{ .id = 3, .body = &.{ 0x01, 0x01 } },
+        .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{
+            // try_table (result exnref) (catch_ref 0 0) ; throw 0 ; end ; ref.is_null
+            &.{ 0x00, 0x1f, 0x69, 0x01, 0x01, 0x00, 0x00, 0x08, 0x00, 0x0b, 0xd1, 0x0b },
+        }) },
+    });
+    var inst = try instantiateValidated(bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("f", &.{});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(i32, 0), asI32(r[0])); // non-null exnref => ref.is_null = 0
+}
+
+test "EH: throw_ref rethrows a caught exnref to an outer catch_all" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x02, 0x60, 0x00, 0x00, 0x60, 0x00, 0x01, 0x7f } },
+        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } },
+        .{ .id = 3, .body = &.{ 0x01, 0x01 } },
+        .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{&.{
+            0x00,
+            0x1f, 0x40, 0x01, 0x02, 0x00, // outer try_table (catch_all 0)
+            0x1f, 0x69, 0x01, 0x01, 0x00, 0x00, // inner try_table (result exnref) (catch_ref 0 0)
+            0x08, 0x00, // throw 0
+            0x0b, // end inner
+            0x0a, // throw_ref
+            0x0b, // end outer
+            0x41, 0x05, // i32.const 5
+            0x0b, // end func
+        }}) },
+    });
+    var inst = try instantiateValidated(bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("f", &.{});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(i32, 5), asI32(r[0]));
 }

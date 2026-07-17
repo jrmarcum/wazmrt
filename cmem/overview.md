@@ -61,7 +61,7 @@ The pipeline, in order: **decode → validate → execute**, with a text front-e
 ## Build targets (see architecture.md)
 
 - `zig build`      → native CLI `wazmrt` + C-ABI static lib `wazmrt` + installs `wasm.h` + `wazmrt.h`
-- `zig build test` → runs the unit tests (**132 distinct**, 254 printed as of 2026-07-17; see `testing.md`)
+- `zig build test` → runs the unit tests (**138 distinct**, 266 printed as of 2026-07-17; see `testing.md`)
 - `zig build wasi-gate` → compiles real `wasm32-wasi` guests (Zig + C via `zig cc`; Rust with `-Drust-gate=true`) and runs them through wazmrt asserting stdout
 - `zig build wasm` → builds the runtime itself as a freestanding `wasm32` module
 - `zig build run -- <file.wasm> [export args…]` → summarize a module, or invoke an export and print results

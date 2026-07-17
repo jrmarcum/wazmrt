@@ -223,8 +223,22 @@ opens; `symlink_max`→ELOOP). No `openat2(RESOLVE_BENEATH)` needed — the walk
 incl. an adversarial fuzz + Phase 3 gate still 16/16. One documented residual: a narrow
 final-component `path_open` TOCTOU tied to std bug #18. See #17.
 
-> ### ✅ 4.3 (2026-07-16). ✅ 4.4 (2026-07-17). ✅ Phase 5 — pin verification COMPLETE (2026-07-17).
-> ⇢ START HERE next: **Phase 6 — Exception handling** (exnref; plan in §6 below).
+> ### ✅ 4.3 (2026-07-16). ✅ 4.4 + Phase 5 (2026-07-17). ✅ Phase 6 — exception handling CORE
+> COMPLETE (2026-07-17: decode + validate + execute for the exnref proposal). ⇢ START HERE next:
+> **Phase 6.1 — WAT assembler + `.wast` conformance for EH** (the one deferred piece; §6 below), then
+> the next frontier (SIMD / multi-memory / the signature path).
+>
+> **Phase 6 delivered (DONE 2026-07-17):** the standardized **exnref** proposal end to end —
+> `exnref` value type + `exn` heap type (`types.zig`/`opcode.zig`), the **tag section** (id 13,
+> `Module.tags` + `tagType`), the IR ops `throw`/`throw_ref`/`try_table` with a `Catch`-clause immediate
+> (`opcode.zig`), validation (try_table control frame + `checkCatch` label typing, `throw`/`throw_ref`,
+> `UndefinedTag`/`InvalidTag`), and execution: an `Exception{tag,values}` unwinds via
+> `error.UncaughtException` with each `call` site catching in its own try_tables (`Frame.onCallError` →
+> `throwException` searches the label stack innermost-out); `exnref` values box into `Instance.exn_store`.
+> 6 hand-built binary tests cover catch / catch_all / catch_ref / throw_ref / cross-frame catch / uncaught
+> (→ trap). **Deferred to 6.1:** the WAT assembler + spec `.wast` conformance (the assembler needs
+> `(tag …)` + try_table/catch label-name resolution — a separate chunk). Legacy `try`/`catch`/`delegate`
+> stays out of scope.
 >
 > **Phase 5 delivered (DONE 2026-07-17):** `src/pin.zig` (pure logic — SHA-256, content-addressed
 > plaintext pin-DB parse, `# mode:` policy directive, `stricter`, and the pure `decide()` matrix) +
@@ -312,7 +326,7 @@ root-owned pin + a pre-run SHA-256 check.
 format, revocation. **Touches this slice:** default policy (deferred to the knob above), DB
 location/ownership convention per-OS. All tracked in `security-model.md` "Open decisions".
 
-## Phase 6 — Exception handling (PLANNED, owner-chosen 2026-07-17; was "Phase 5.1")
+## Phase 6 — Exception handling (CORE ✅ COMPLETE 2026-07-17; §6.1 WAT/​.wast conformance deferred)
 
 **Scope decision first:** target the **standardized exnref proposal** (`try_table` + `throw`/`throw_ref`,
 `tag` section id 13, `exnref` heap type) — it shipped cross-browser (Chrome/Firefox 2024) so it clears

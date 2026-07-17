@@ -181,6 +181,10 @@ comp_types: []const CompType,
 supertypes: []const ?u32,
 /// Type index of each *defined* function (function section), in order.
 functions: []const u32,
+/// Type index of each exception tag (tag section §5.5.14, EH proposal). Each
+/// names a function type whose params are the exception's value types (results
+/// must be empty). Imported tags are not yet in this space (defined tags only).
+tags: []const u32,
 imports: []const Import,
 exports: []const Export,
 /// Body of each defined function (code section), positionally matching
@@ -244,6 +248,7 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
     var d: Decoder = .{ .a = a };
     var sections: std.ArrayList(Section) = .empty;
     var functions: []const u32 = &.{};
+    var tags: []const u32 = &.{};
     var imports: []const Import = &.{};
     var exports: []const Export = &.{};
     var code: []const Code = &.{};
@@ -279,6 +284,7 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
             .type => try decodeTypeSection(&d, &sub),
             .import => imports = try decodeImportSection(&d, &sub),
             .function => functions = try decodeFunctionSection(&d, &sub),
+            .tag => tags = try decodeTagSection(&d, &sub),
             .table => try decodeTableSection(&d, &sub),
             .memory => try decodeMemorySection(&d, &sub),
             .global => try decodeGlobalSection(&d, &sub),
@@ -302,6 +308,7 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
         .comp_types = d.comp_types,
         .supertypes = d.supertypes,
         .functions = functions,
+        .tags = tags,
         .imports = imports,
         .exports = exports,
         .code = code,
@@ -428,6 +435,13 @@ pub fn funcSig(self: *const Module, ti: u32) ?FuncType {
     };
 }
 
+/// The function type an exception `tag` names (its params are the exception's
+/// value types). Null if the tag index or its type index is out of range.
+pub fn tagType(self: *const Module, tag_index: u32) ?FuncType {
+    if (tag_index >= self.tags.len) return null;
+    return self.funcSig(self.tags[tag_index]);
+}
+
 /// The struct field vector at type index `ti`, or null if `ti` is not a struct.
 pub fn structFields(self: *const Module, ti: u32) ?[]const FieldType {
     if (ti >= self.comp_types.len) return null;
@@ -459,6 +473,7 @@ pub fn refHead(self: *const Module, ht: opcode.HeapType) Error!types.ValType.Ref
         .@"struct" => .@"struct",
         .array => .array,
         .none => .none,
+        .exn => .exn,
         .concrete => |ti| blk: {
             if (ti >= self.comp_types.len) return error.IndexOutOfRange;
             break :blk switch (self.comp_types[ti].kind()) {
@@ -805,6 +820,19 @@ fn decodeFunctionSection(d: *Decoder, r: *Reader) Error![]const u32 {
     for (list) |*i| {
         i.* = try r.readVarU32();
         try d.func_space.append(d.a, try funcTypeAt(d, i.*));
+    }
+    return list;
+}
+
+/// Tag section (§5.5.14, EH proposal): a vector of tags, each an attribute byte
+/// (0x00 = exception) followed by a type index. Returns the type indices.
+fn decodeTagSection(d: *Decoder, r: *Reader) Error![]const u32 {
+    const count = try r.readVarU32();
+    const list = try d.a.alloc(u32, count);
+    for (list) |*i| {
+        const attr = try r.readByte();
+        if (attr != 0x00) return error.MalformedFlag; // only the exception attribute (0) exists
+        i.* = try r.readVarU32();
     }
     return list;
 }
