@@ -73,7 +73,7 @@ the whole pipeline and **runs the official spec testsuite** (`wazmrt <file.wast>
 | `validate.zig` | `validate(gpa, module)`: spec Appendix type-check over the IR (value + control-frame stacks) + module-level const-expr / element / select / alignment / memory-presence checks. |
 | `interp.zig` | `Instance` (init/deinit/invoke), the switch interpreter (`Frame`, `execNumeric`/`execFloat`/`execMemory`), `Value` (u64) helpers. |
 | `sexpr.zig` / `wat.zig` / `wast.zig` | Text toolchain: S-expression parser / WAT-text assembler / WAST script runner (runs the spec testsuite). |
-| `wasi.zig` | WASI preview 1 (`wasi_snapshot_preview1`) — the core host imports (`fd_write`, args/environ, clocks, random, `proc_exit`, …) as native `HostFunc`s over the interpreter's memory; the CLI wires them for `_start` command modules. No interpreter changes. |
+| `wasi.zig` | WASI preview 1 (`wasi_snapshot_preview1`) as native `HostFunc`s over the interpreter's memory (no interp changes): stdio, args/environ, clocks, `poll_oneoff`, random, `proc_exit`, and the **sandboxed filesystem** — `--dir` preopens, a host-fd table, and the security-critical **handle-stack path resolver** `walkFull` that follows symlinks while keeping escape impossible by construction (see `cmem/security-model.md`). The CLI wires it for `_start` command modules. |
 | `root.zig` | Public surface; re-exports the pipeline modules + `decode`/`validate`/`interp`/`Instance`/`sexpr`/`wat`/`wast`/`wasi`/`version`/`abi_version`. libc-free. |
 
 ## Three consumption surfaces (one core)

@@ -296,19 +296,20 @@ the synchronous branch and hits `.PENDING => unreachable` **inside std**, killin
 not the guest. `createFile` is unconditionally `SYNCHRONOUS_NONALERT`, which is why only the
 open-an-existing-file path crashed and `path_open` with `O_CREAT` looked healthy.
 
-**Our workaround:** `wPathOpen` never calls `openFile(.follow_symlinks=false)`. Instead it stats the
-final component no-follow (`finalIsSymlink`), refuses a symlink outright, then opens *with* follow —
-safe, because a non-symlink can't be followed anywhere. Same observable semantics, no async handle.
+**Our workaround:** `wPathOpen` never calls `openFile(.follow_symlinks=false)`. The resolver `walkFull`
+resolves the final component to a real (non-symlink) name — an unfollowed symlink final yields
+`final_is_symlink`, which `wPathOpen` turns into ELOOP — and then it opens *with* follow, safe because
+a non-symlink can't be followed anywhere. Same observable semantics, no async handle.
 
 **⚠️ This is why #17 has a residual, so #18 must be fixed to fully close #17.** Because we can't open
-no-follow, there is a **stat-then-open TOCTOU window on `path_open`'s final component**: an attacker
-with write access *inside* the preopen could swap the just-stat'd name for a symlink before the follow
+no-follow, there is a **resolve-then-open TOCTOU window on `path_open`'s final component**: an attacker
+with write access *inside* the preopen could swap the just-resolved name for a symlink before the follow
 open, and we'd follow it out. Narrow (needs in-sandbox write + a race) and it does **not** affect the
-intermediate walk (the actual reported #17 hole, which opens each component no-follow with no such
-window) — but it is the one path where a real `openFile(.follow_symlinks=false)` would let us open
-no-follow atomically and eliminate the window. **The correct close is upstream: fix this std bug (or a
-real `openat2(RESOLVE_BENEATH)` in `Io`), then `wPathOpen` opens no-follow directly and drops the
-pre-stat.** Until then the residual stands, documented in the `src/wasi.zig` module doc and #17.
+per-component walk (which opens each component no-follow through a held handle — no such window) — but
+it is the one path where a real `openFile(.follow_symlinks=false)` would let us open no-follow
+atomically. **The correct close is upstream: fix this std bug (or a real `openat2(RESOLVE_BENEATH)` in
+`Io`), then `wPathOpen` opens no-follow directly.** Until then the residual stands, documented in the
+`src/wasi.zig` module doc and #17.
 
 **Contained (crash-wise):** the other two `.IO = .ASYNCHRONOUS` sites are `dirReadLinkWindows` (an
 internal reparse-point handle we never read from; `path_readlink` is `NOTSUP` here) and `openSocketAfd`
@@ -316,11 +317,11 @@ internal reparse-point handle we never read from; `path_readlink` is `NOTSUP` he
 
 **Surfaces when:** **upgrading Zig** (recheck: does the workaround still hold?) *and* whenever the #17
 final-component TOCTOU matters (untrusted guest with in-sandbox write). If std fixes it: in `wPathOpen`,
-replace the `finalIsSymlink` pre-stat + follow-open with a direct `openFile(.follow_symlinks=false)`,
-which closes #17's residual for free. Re-run `examples/wasi_files.zig` ("fd_read round-trips the
-contents" is the crash check) and `examples/wasi_symlink_traversal.zig` (the containment check).
+open the resolved final with a direct `openFile(.follow_symlinks=false)` instead of follow, which closes
+#17's residual for free. Re-run `examples/wasi_files.zig` ("fd_read round-trips the contents" is the
+crash check) and `examples/wasi_symlink_traversal.zig` (the containment check).
 
-**Anchor:** `finalIsSymlink` + the `openFile` call in `wPathOpen`, `src/wasi.zig`.
+**Anchor:** the `openFile` call in `wPathOpen` (the `else`/non-create branch), `src/wasi.zig`.
 
 ## #17 — WASI sandbox symlink containment — **DONE 2026-07-16, then UPGRADED to full traversal same day**
 
@@ -342,7 +343,8 @@ POSIX-CI unit tests incl. an **adversarial fuzz** (random symlink topologies, ca
 `path_symlink` is POSIX-only on the creation side (Windows needs privilege, #17/#23); *following*
 host-placed symlinks works on Windows. The residual below (final-component TOCTOU, #18) is unchanged.
 
-**Original no-traversal fix (2026-07-16, superseded above):**
+**Original no-traversal fix (2026-07-16 morning, SUPERSEDED the same afternoon by full traversal above —
+kept only as the record of the first design; `walkTo`/`finalIsSymlink` no longer exist):**
 
 **Was:** `wasi.resolve()` is lexical — it stops a guest *naming* a path outside its preopen, but not a
 **symlink stored inside the preopen whose target is outside it**. `follow_symlinks = false` only guards
@@ -377,7 +379,7 @@ symlink and drives the path ops (runs on POSIX CI, **skips on unprivileged Windo
 symlink uses raw `FSCTL_SET_REPARSE_POINT`, which needs `SeCreateSymbolicLinkPrivilege`); Phase 3 file
 gate still 16/16 (no over-restriction).
 
-**Anchor:** `walkTo`/`finalIsSymlink`/`resolveArg` + the module doc in `src/wasi.zig`;
+**Anchor:** `walkFull`/`resolveArg` + the module doc in `src/wasi.zig`;
 `examples/wasi_symlink_traversal.zig`.
 
 ## RESOLVED 2026-07-09 (second pass — commit `645874c`)

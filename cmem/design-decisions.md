@@ -41,16 +41,21 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   first seed. When adding a ref-able type or op, extend the fuzz's `FuzzKind`/`fuzzBuild`, not just the
   example-based tests — the fuzz is the part that finds the ordering nobody thought of.
 - **The WASI sandbox is a security boundary, and `Io.Dir` does not enforce it (2026-07-16).** Two
-  independent things escape a preopen, and both are on us: (1) *naming* — an absolute path or escaping
-  `..` bypasses the `*at` dir handle (`resolve_beneath` is a silent no-op off FreeBSD), handled
-  lexically by `resolve`; (2) *symlinks* — `follow_symlinks = false` only guards the final `openat`
-  component, so an intermediate symlink is followed out. **Rule: never resolve a guest path as one
-  string handed to `Io.Dir`.** Descend component by component through handles (`walkTo`), each opened
-  no-follow and verified a real directory, and refuse to traverse any symlink (`finalIsSymlink` for the
-  last one). **Policy: no symlink is ever traversed** — a guest can't create one (`path_symlink`
-  unimplemented), so every symlink in a preopen is host-placed. If `path_symlink` is ever added (4.3),
-  this assumption changes — revisit the policy then. A path op that resolves the full path in one
-  `Io.Dir` call is the bug; it was, and it read a file outside the preopen.
+  independent things escape a preopen, both on us: (1) *naming* — an absolute path or escaping `..`
+  bypasses the `*at` dir handle (`resolve_beneath` is a silent no-op off FreeBSD), handled lexically by
+  `resolve`; (2) *symlinks* — `follow_symlinks = false` only guards the final `openat` component, so an
+  intermediate symlink is followed out. **Rule: never resolve a guest path as one string handed to
+  `Io.Dir`.** The resolver `walkFull` (4.3, "secure full traversal") is RESOLVE_BENEATH in userspace: a
+  **stack of open dir handles**, bottom = preopen, walked one component at a time — each opened
+  no-follow through the held handle (TOCTOU-safe), symlinks **followed** but expanded through the same
+  loop, `..` popping the stack **but never below the preopen** (no handle above it exists → up-escape
+  impossible), absolute targets **re-based to the preopen root**, a `symlink_max` budget → ELOOP.
+  **Security is a property of the construction, not of checking target strings** — which is essential
+  now that `path_symlink` lets the *guest author* the links. A path op that resolves the full path in
+  one `Io.Dir` call, or that trusts a lexical `..` check once symlinks are in play, is the bug; both
+  have bitten. Full argument + spec in `cmem/security-model.md`; the resolver is `walkFull` in
+  `src/wasi.zig`. **Mandatory when touching it: re-run the adversarial fuzz** (`src/wasi.zig`,
+  "symlink resolver fuzz" — canary-outside oracle).
 - **`Instance.recordTrap` must stay `noinline` (2026-07-15).** `Frame.run`'s `errdefer` expands at
   *every* `try` in a ~200-arm dispatch switch, so whatever it calls is duplicated across hundreds of
   landing pads. Letting `recordTrap` inline bloats `Frame.run` and evicts the interpreter loop from

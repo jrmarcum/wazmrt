@@ -1,15 +1,19 @@
 # Security Model — threat model, trust chain, and the secure-by-default base
 
-> ## ⚠️ STATUS: DESIGN ONLY — NONE OF THE AUTHENTICITY WORK EXISTS (2026-07-16)
+> ## ⚠️ STATUS: the AUTHENTICITY design is DESIGN-ONLY; the SANDBOX is BUILT (2026-07-16)
 >
-> **wazmrt does not verify signatures today.** It will run any `.wasm` you hand it. Everything in the
-> "Authenticity" and "Keystore" sections below is a *design under consideration*, recorded from the
-> 2026-07-16 owner design conversation so it survives the session — **not a description of the
-> runtime.** Only the "What holds today" section describes shipped behavior.
+> **Authenticity (signatures / pin DB / keystore) does NOT exist** — wazmrt verifies nothing today and
+> will run any `.wasm`. The "Authenticity" and "Keystore" sections and the "DECIDED — rejected
+> mechanisms" block are a *design under consideration*, recorded from the 2026-07-16 owner conversation
+> so it survives the session — **not a description of the runtime.**
 >
-> **Phase 4.3 is paused pending the owner's decision here** (owner, 2026-07-16: *"I need to think about
-> this before proceeding further. This is a base that I think we need to get right and create a secure
-> by default base."*). Do not resume 4.3 without checking back.
+> **What IS built and shipped:** everything in "What holds today" (the authority/sandbox side — no exec,
+> preopens, rights) **and the "DONE — WASI symlink traversal" section** (the handle-stack resolver
+> `walkFull`, `path_symlink`/`path_readlink`, adversarial-fuzzed). Authority is real; authenticity is
+> not yet. **The orchestrator-invariant section is advice, enforceable only by the embedder.**
+>
+> 4.3 is COMPLETE (the pause this file records was resolved). The open **authenticity** decisions — trust
+> anchor, signature format, default policy — are still the owner's to make; see the bottom of the file.
 
 ## The vision this serves
 

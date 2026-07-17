@@ -212,16 +212,15 @@ module) and a `wasm_trap_delete` double-free (it froze unconditionally, ignoring
 `wasm_trap_copy` bumps — the fuzz caught it on seed 1, fixed with `release`). Verified the fuzz fails on
 each reintroduced bug. +3 C-ABI tests (121 distinct). Invariants 5–6 in `design-decisions.md`.
 
-**4.2 — `known-issues.md` #17, make the WASI sandbox real. DONE 2026-07-16.** Containment was *lexical*:
-a symlink stored inside a preopen pointing outside it was followed straight out (`follow_symlinks=false`
-only guards the final `openat` component). Fixed with a **handle-based component walk** (`walkTo` +
-`finalIsSymlink`): descend one component at a time, opening each relative to the previous *handle*
-(TOCTOU-safe) with no-follow, reject anything that isn't a real directory; refuse a final symlink in any
-op that would follow it. **Policy: no symlink is ever traversed** (a guest can't create one, so every
-symlink is host-placed — the attack). No `openat2(RESOLVE_BENEATH)` needed after all — the walk gets
-there portably. **Verified before/after with a real NTFS symlink** (`examples/wasi_symlink_traversal.zig`:
-pre-fix `ESCAPED`, post-fix refused) + a unit test (POSIX CI; skips on unprivileged Windows since Zig
-std can't make a symlink there) + Phase 3 gate still 16/16. One documented residual: a narrow
+**4.2 — `known-issues.md` #17, make the WASI sandbox real. DONE 2026-07-16 (then upgraded to full
+traversal in 4.3, below).** Containment was *lexical*: a symlink inside a preopen pointing outside it was
+followed straight out (`follow_symlinks=false` only guards the final `openat` component). First fixed
+with a handle-based no-traversal walk; **then 4.3 replaced it with the secure handle-stack resolver
+`walkFull`** that *follows* in-sandbox symlinks while keeping escape impossible by construction (`..`
+can't rise above the preopen; absolute targets re-base to the preopen root; per-component no-follow
+opens; `symlink_max`→ELOOP). No `openat2(RESOLVE_BENEATH)` needed — the walk gets there portably.
+**Verified with real NTFS symlinks** (`examples/wasi_symlink_traversal.zig`, 5/5) + POSIX-CI unit tests
+incl. an adversarial fuzz + Phase 3 gate still 16/16. One documented residual: a narrow
 final-component `path_open` TOCTOU tied to std bug #18. See #17.
 
 > ### ✅ 4.3 COMPLETE (2026-07-16). ⇢ START HERE next: **4.4 — the Phase 4 items proper** (below):

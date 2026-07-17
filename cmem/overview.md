@@ -51,10 +51,11 @@ The pipeline, in order: **decode → validate → execute**, with a text front-e
 | `src/Module.zig` | The decoded module + `decode()`: header, all core sections, resolved import/export extern types, function bodies, globals/memories/data. Validates custom-section names + data-count consistency; rejects reserved flag/valtype bytes. Arena-owned. |
 | `src/opcode.zig` | The **shared instruction authority** — `Op` table, `Imm`/`Instr` IR, `decodeBody`. Used by validate, the interpreter, *and* the assembler (in reverse). |
 | `src/validate.zig` | Spec type-checking validator over the IR (value + control-frame stacks) + module-level checks: global-init/element const-exprs, `select`/`if`/`call_indirect`/alignment/memory-presence. |
-| `src/interp.zig` | `Instance` + the switch interpreter (untyped `u64` slots, label stack). Runs int/float/memory, `call_indirect` over multiple tables, reference types, the reference-type table ops, element segments (func-index + const-expr forms), and **imported functions** (`HostFunc`: cross-module `wasm` calls or `native` host fns); globals get their init const-exprs evaluated (imported + extended-const). |
+| `src/interp.zig` | `Instance` + the switch interpreter (untyped `u64` slots, label stack). Runs int/float/memory, `call_indirect` over multiple tables, reference types + table ops, element segments, **imported functions** (`HostFunc`), **full WasmGC** (i31/struct/array heap, casts, subtyping), and bulk memory/table ops; carries the **trap backtrace** (`errdefer`-recorded frames). |
 | `src/sexpr.zig` / `src/wat.zig` / `src/wast.zig` | Text toolchain: S-expression parser → WAT→wasm-binary assembler (`wat.zig` maps names→`Op` via `stringToEnum`) → WAST script runner (`wast.zig`, drives an `Instance`, compares — **runs the official spec testsuite**). |
-| `src/wasm_c_api.zig` | The **standard wasm-c-api** integration ABI every `universalWasmLoader-*` port binds to (+ the `wazmrt_*` extension handshake). |
-| `src/root.zig` | Library surface (`@import("wazmrt")`). Re-exports `types`/`Reader`/`Module`/`opcode`/`validate`/`interp`/`Instance`/`sexpr`/`wat`/`wast`/`decode`/`version`/`abi_version`. |
+| `src/wasi.zig` | **WASI preview 1** as native host imports: stdio/args/environ/clocks/`poll_oneoff`/random/`proc_exit` + the **sandboxed filesystem** (`--dir` preopens, host-fd table, and the security-critical handle-stack path resolver `walkFull` — follows symlinks, escape impossible by construction; see `security-model.md`). |
+| `src/wasm_c_api.zig` | The **standard wasm-c-api** — every one of the 319 functions `wasm.h` declares is defined (link-gated by `tests/c_abi_symbols.c`), with a refcounted `wasm_ref_t` object model. The ABI every `universalWasmLoader-*` port binds to (+ the `wazmrt_*` extension handshake). **The one file that hands raw ownership across a C boundary — memory-safety-critical (`design-decisions.md`), lifecycle-fuzzed.** |
+| `src/root.zig` | Library surface (`@import("wazmrt")`). Re-exports `types`/`Reader`/`Module`/`opcode`/`validate`/`interp`/`Instance`/`sexpr`/`wat`/`wast`/`wasi`/`decode`/`version`/`abi_version`. |
 
 ## Build targets (see architecture.md)
 
@@ -79,8 +80,9 @@ The pipeline, in order: **decode → validate → execute**, with a text front-e
   The **validator rejects invalid modules properly** (global init const-exprs, element segments,
   typed/untyped `select`, `if`-without-`else`, alignment ≤ natural, memory presence) and the **decoder
   rejects malformed binaries** (spec-correct LEB128 bounds, custom-section names, data-count
-  consistency, reserved flag/valtype bytes). **Imported tables/memories + bulk table ops**
-  (`table.copy`/`.init`) are the main remaining execution slices (→ WASI).
+  consistency, reserved flag/valtype bytes). Imported tables/memories, bulk table/memory ops, the
+  **function-references** proposal, and **full WasmGC** (i31/struct/array, casts, subtyping, concrete
+  refs) are all done. **Current frontier is Phase 4 (WASI + ergonomics/conformance)** — see `roadmap.md`.
 - **Text toolchain (working).** `sexpr.zig` + `wat.zig` (WAT→wasm binary) + `wast.zig` (WAST script
   runner) — `wazmrt <file.wast>` **runs the official spec testsuite** (thousands of assertions pass; see
   `testing.md`). The runner executes `assert_return`/`assert_trap`/`assert_exhaustion` *and*
@@ -88,5 +90,4 @@ The pipeline, in order: **decode → validate → execute**, with a text front-e
   runtime trap, and handles `(register "name")` for cross-module imports. The assembler covers control
   flow + multi-value/type-index block types, `call_indirect` + multi-table, element segments (func-index
   + const-expr forms, all 8 flag variants, const-expr offsets), globals (imported + extended-const),
-  **imported functions**, and reference types + reference-type table ops. Next: imported tables/memories,
-  bulk table ops (`table.init`/`.copy`), passive element segments.
+  **imported functions**, reference types + reference-type table ops, GC composite types, and bulk ops.
