@@ -401,15 +401,18 @@ the deliverable that prevents that.
    public; open source is a non-issue for this and *fatal* for every alternative.)
 5. OS enforces wazmrt's integrity (Authenticode+WDAC / IMA+Secure Boot).
 6. Optional signed keyring file, anchored to the embedded root, for rotation/revocation.
-7. **Default-deny unsigned `.wasm`**, explicit `--unsigned`/dev-mode opt-out. *If unsigned is the default,
-   nobody signs.* **Owner requirement 2026-07-17 — the opt-out is a real CLI flag** (`--no-verify` /
-   `--unsigned`) so a developer can run their own unpinned modules. **Precedence rule (load-bearing):**
-   the skip flag is **subordinate to the root-owned enforcement policy** — honored when policy is
-   `off`/`warn`, **refused when policy is `enforce`**. Otherwise user-level malware would just pass
-   `--no-verify evil.wasm` and the pin system would protect nothing. Same invariant as everything else
-   here: *authority comes from ownership, not from a runtime argument.* A user flag cannot override a
-   policy owned by root. (While the default enforcement mode is OFF, the flag is pure dev convenience;
-   the precedence only bites once an `enforce` mode exists.) Built in Phase 5 — see `roadmap.md` §5.
+7. **Default-deny unsigned `.wasm`**, explicit dev-mode opt-out. *If unsigned is the default, nobody
+   signs.* **Owner refinement 2026-07-17 — prefer interactive consent over a bare skip flag.** When a
+   module is unverified, the root-owned policy decides: **`off`** runs (one-line notice, no prompt —
+   prompting every run trains the dismissal reflex, see §1 TOFU); **`warn`** on an interactive TTY
+   **prompts** "unverified — proceed? [y/N]" (default No, and No on EOF/non-tty); **`enforce`** hard-denies
+   with no prompt. **Two honest limits, both recorded:** (a) the prompt is **UX consent, not a security
+   boundary** — `yes | wazmrt evil.wasm` answers it, so it only helps an honest human; the boundary stays
+   the root-owned policy. (b) unattended deployments (`binfmt`/`argv[0]`, cron, CI) have **no TTY**, so a
+   **non-interactive opt-out** (`--yes`/`--no-verify` / `WAZMRT_ASSUME_YES`) is still needed for scripts —
+   **subordinate to the policy** (honored under `off`/`warn`, **refused under `enforce`**). Same invariant
+   as everything else: *authority comes from ownership, not from a runtime argument.* Built in Phase 5 —
+   see `roadmap.md` §5 increment 5.
 8. **`--ro-dir` (read-only preopens)** — surfaced three times in the design conversation as the highest
    security-value-per-effort item on the table. **BUILT in Phase 4.4 (2026-07-17).** It exposes the
    existing rights machinery at the CLI: a `--ro-dir` preopen omits `rights.write_mask`, and because

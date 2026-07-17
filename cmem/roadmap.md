@@ -277,16 +277,23 @@ root-owned pin + a pre-run SHA-256 check.
 4. **Enforcement policy = a knob, default OFF for now** — `default-deny-unsigned` is still an *open* owner
    decision, so ship the check behind an explicit mode (e.g. `--verify`, or "DB present ⇒ enforce"),
    erroring clearly on mismatch / absent pin. **Do NOT make deny-the-default until the owner settles it.**
-5. **Skip flag for user-run files (owner requirement, 2026-07-17)** — a `--no-verify` (a.k.a.
-   `--unsigned`/dev-mode) CLI flag that bypasses the pin check for that one invocation. This is posture
-   item 7's dev escape hatch; while the default is OFF it is pure convenience. **The subtlety — get it
-   right now:** a plain user-space skip flag that *always* works would let user-level malware simply pass
-   `--no-verify evil.wasm` and the pin system protects nothing. So the flag must be **subordinate to a
-   root-owned enforce policy**: when policy is `off`/`warn` (dev/permissive) `--no-verify` is honored;
-   when policy is `enforce` the flag is **refused** — the root-owned policy outranks a user flag, exactly
-   like the pin DB itself (authority from ownership, not from a runtime argument). Net: developers skip
-   freely on their own machines; a hardened deployment can't be bypassed by an argument. Record the flag
-   name + this precedence rule in `main.zig` help and `security-model.md`.
+5. **Unverified-module handling — interactive consent, not a bare skip flag (owner refinement,
+   2026-07-17).** When a module isn't in the pin DB, behaviour is governed by the root-owned policy:
+   - **`off`** (dev default) → run, optional one-line "unverified" notice. **No prompt** — prompting on
+     every run trains dismissal (the "warning users always dismiss" anti-pattern, `security-model.md`).
+   - **`warn`** → **interactive TTY: prompt** "module X is unverified (not pinned) — proceed? [y/N]",
+     **default No** on EOF / non-interactive. **No TTY** (script, pipe, cron, `binfmt`/`argv[0]` dispatch
+     — the vision's own deployment) → **deny**, unless an explicit non-interactive opt-out is present.
+   - **`enforce`** (hardened) → **hard deny, no prompt** — a locked-down system doesn't negotiate and has
+     no TTY to negotiate with.
+
+   **Two things this must NOT pretend to be:** (a) the prompt is **UX consent, not a security boundary** —
+   `echo y | wazmrt evil.wasm` / `yes |` answers it for an attacker, so it only helps an honest human; the
+   real boundary stays the root-owned policy. (b) it can't be the *only* mechanism — the unattended
+   deployments have no keyboard, so keep a **non-interactive opt-out** (`--yes` / `--no-verify` or
+   `WAZMRT_ASSUME_YES`) for scripts, itself **subordinate to the policy** (honored under `off`/`warn`,
+   **refused under `enforce`** — authority from ownership, not from a runtime argument). Record the prompt
+   text, the TTY/EOF→No rule, and the opt-out precedence in `main.zig` help and `security-model.md`.
 6. **`bytes-hashed == bytes-run` test** — assert the verified buffer is the executed buffer, so a future
    refactor can't silently reintroduce a hash-by-path TOCTOU.
 
