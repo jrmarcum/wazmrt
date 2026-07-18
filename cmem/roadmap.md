@@ -326,9 +326,15 @@ final-component `path_open` TOCTOU tied to std bug #18. See #17.
 > **streaming Ed25519** (Zig stdlib, no third-party crypto, no alloc); the CLI gate runs the signature
 > check before the pin fallback (authenticated ⇒ no pin needed; tampered-by-our-key ⇒ refused always).
 > **Inert until a build embeds a key** (default `null` ⇒ byte-identical to pin-only), same default-OFF
-> discipline as Phase 5. 7 unit tests + manual real-binary e2e. ⇢ REMAINING (publisher/rotation side):
-> signing+keygen CLI & private-key custody, keyring file + rotation (PK→KEK→db), release-time key
-> injection (`-Droot-key`?), and the deny-unsigned-by-default policy call. See `security-model.md`.
+> discipline as Phase 5. 7 unit tests + manual real-binary e2e.
+>
+> ✅ **Signing CLI BUILT (2026-07-18).** `wazmrt keygen [--out <name>]` (Ed25519 keypair, entropy from the
+> `Io`; private seed → `<name>.key`, public key printed to embed) and `wazmrt sign <in> <out> --key
+> <keyfile>` (assembles `.wat`, appends the `"signature"` section). Thin CLI over the tested `signModule`
+> + `pin.toHex`/`parseHex`; whole loop keygen→sign→embed→verify proven through the real binary. ⇢
+> REMAINING: private-key custody for a real publisher (HSM/YubiKey/KMS), keyring file + rotation
+> (PK→KEK→db), release-time key injection (`-Droot-key` build option — threads through ~8 targets), and
+> the deny-unsigned-by-default policy call. See `security-model.md`.
 >
 > **The C ABI is NOT remaining work** — #20 (all 319 `wasm.h` fns) / #21 (mem-safety) / #22 (fuzz) are
 > DONE and 4.4 added a C conformance guest. Only two narrow, demand-driven residuals stay deferred:

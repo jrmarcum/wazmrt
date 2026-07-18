@@ -88,10 +88,11 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   ownership; a user's `--no-verify`/`--verify` can only *raise* strictness (`pin.stricter`) and is
   refused under `enforce` (`pin.decide` returns `.deny` before consulting the opt-out). The whole
   matrix is the pure `pin.decide(policy, pinned, opt_out, tty)` — unit-tested; keep the CLI a thin shell
-  over it. **Signature verify (embedded key) is now BUILT** (`src/sign.zig`, 2026-07-18): the CLI
+  over it. **Signatures are now BUILT** (`src/sign.zig` + `wazmrt keygen`/`sign`, 2026-07-18): the CLI
   `verifyGate` runs the Ed25519 signature check *before* the pin fallback (authenticated ⇒ no pin
-  needed; tampered-by-our-key ⇒ refused always), inert until a build sets `embedded_root_key`. The
-  publisher/rotation side stays design-only — see `security-model.md`.
+  needed; tampered-by-our-key ⇒ refused always), inert until a build sets `embedded_root_key`; the
+  publisher tools generate a keypair and sign modules. Only private-key custody (HSM), keyring/rotation,
+  and release-time key injection stay design-only — see `security-model.md`.
 - **Read-only preopens ride the rights model, not a write-path check (2026-07-17, `--ro-dir`).** A
   `--ro-dir` preopen is just a dir fd whose rights omit `rights.write_mask` (write/create/delete/
   rename/link/truncate/set-times/allocate). It stays enforced for the *whole subtree* because

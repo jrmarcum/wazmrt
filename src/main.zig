@@ -27,6 +27,12 @@ pub fn main(init: std.process.Init) !void {
     // `wazmrt pin <file> [--db <path>]` — hash a module for the pin DB (Phase 5).
     if (std.mem.eql(u8, args[1], "pin")) return pinSubcommand(arena, io, out, args[2..]);
 
+    // Publisher-side signing tools (authenticity):
+    //   wazmrt keygen [--out <name>]                    — new Ed25519 keypair
+    //   wazmrt sign <in> <out> --key <keyfile>          — sign a module
+    if (std.mem.eql(u8, args[1], "keygen")) return keygenSubcommand(arena, io, out, args[2..]);
+    if (std.mem.eql(u8, args[1], "sign")) return signSubcommand(arena, io, out, args[2..]);
+
     const path = args[1];
     var bytes: []const u8 = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 << 20)) catch |e| {
         try out.print("error: cannot read '{s}': {s}\n", .{ path, @errorName(e) });
@@ -177,6 +183,87 @@ fn appendPinLine(arena: std.mem.Allocator, io: Io, path: []const u8, hex: []cons
     try buf.appendSlice(arena, label);
     try buf.append(arena, '\n');
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = buf.items });
+}
+
+// ===== Authenticity — publisher-side signing (see cmem/security-model.md) =====
+
+/// `wazmrt keygen [--out <name>]` — generate an Ed25519 signing keypair. Writes
+/// the **private** seed (hex) to `<name>.key` and prints the **public** key hex
+/// to embed as the verifier's trust anchor. The private key file must be kept
+/// secret (a production signer would hold it in an HSM/YubiKey/KMS instead).
+fn keygenSubcommand(arena: std.mem.Allocator, io: Io, out: *Io.Writer, rest: []const []const u8) !void {
+    const name = flagValue(rest, "--out") orelse "wazmrt_root";
+    const kp = wazmrt.sign.Ed25519.KeyPair.generate(io); // entropy from the Io
+    const seed_hex = wazmrt.pin.toHex(kp.secret_key.seed());
+    const pub_hex = wazmrt.pin.toHex(kp.public_key.bytes);
+    const key_path = try std.fmt.allocPrint(arena, "{s}.key", .{name});
+    const key_text = try std.fmt.allocPrint(arena, "{s}\n", .{&seed_hex});
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = key_path, .data = key_text }) catch |e| {
+        try out.print("error: cannot write '{s}': {s}\n", .{ key_path, @errorName(e) });
+        return;
+    };
+    try out.print("wrote private key: {s}  (KEEP SECRET)\n", .{key_path});
+    try out.print("public key (embed as sign.embedded_root_key):\n  {s}\n", .{&pub_hex});
+}
+
+/// `wazmrt sign <in.wasm|.wat> <out.wasm> --key <keyfile>` — sign a module with
+/// the private key and write the signed module (original bytes + a `"signature"`
+/// custom section). The signed module still runs in any runtime; wazmrt (with a
+/// matching embedded root key) authenticates it before executing.
+fn signSubcommand(arena: std.mem.Allocator, io: Io, out: *Io.Writer, rest: []const []const u8) !void {
+    const keyfile = flagValue(rest, "--key");
+    var pos: [2][]const u8 = undefined;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        if (std.mem.eql(u8, rest[i], "--key")) {
+            i += 1; // skip its value
+            continue;
+        }
+        if (std.mem.startsWith(u8, rest[i], "--")) continue;
+        if (n < 2) {
+            pos[n] = rest[i];
+            n += 1;
+        }
+    }
+    if (n < 2 or keyfile == null) {
+        try out.print("usage: wazmrt sign <in.wasm|.wat> <out.wasm> --key <keyfile>\n", .{});
+        return;
+    }
+    const in_path = pos[0];
+    const out_path = pos[1];
+
+    var bytes: []const u8 = Io.Dir.cwd().readFileAlloc(io, in_path, arena, .limited(64 << 20)) catch |e| {
+        try out.print("error: cannot read '{s}': {s}\n", .{ in_path, @errorName(e) });
+        return;
+    };
+    if (std.mem.endsWith(u8, in_path, ".wat")) bytes = wazmrt.wat.assemble(arena, bytes) catch |e| {
+        try out.print("error: cannot assemble '{s}': {s}\n", .{ in_path, @errorName(e) });
+        return;
+    };
+
+    const key_text = Io.Dir.cwd().readFileAlloc(io, keyfile.?, arena, .limited(1 << 16)) catch |e| {
+        try out.print("error: cannot read key '{s}': {s}\n", .{ keyfile.?, @errorName(e) });
+        return;
+    };
+    const seed = wazmrt.pin.parseHex(std.mem.trim(u8, key_text, " \t\r\n")) orelse {
+        try out.print("error: '{s}' is not a 64-hex-char Ed25519 seed\n", .{keyfile.?});
+        return;
+    };
+    const kp = wazmrt.sign.Ed25519.KeyPair.generateDeterministic(seed) catch {
+        try out.print("error: invalid signing key\n", .{});
+        return;
+    };
+    const signed = wazmrt.sign.signModule(arena, bytes, kp) catch |e| {
+        try out.print("error: cannot sign: {s}\n", .{@errorName(e)});
+        return;
+    };
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = signed }) catch |e| {
+        try out.print("error: cannot write '{s}': {s}\n", .{ out_path, @errorName(e) });
+        return;
+    };
+    const pub_hex = wazmrt.pin.toHex(kp.public_key.bytes);
+    try out.print("signed {s} -> {s}\n  public key: {s}\n", .{ in_path, out_path, &pub_hex });
 }
 
 fn defaultPinsPath() []const u8 {

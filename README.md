@@ -146,9 +146,20 @@ is installed.
 key**; wazmrt then authenticates a module carrying a `"signature"` custom section
 (the signature covers every other byte) before running it — a module signed by
 the trusted key needs no pin, and one signed by that key whose bytes don't match
-is refused outright. This is **inert in the default build** (no key embedded), so
-it changes nothing until a release embeds a key; the publisher-side signing tools
-are still in progress. Design + rationale: [`cmem/security-model.md`](cmem/security-model.md).
+is refused outright. Generate a key and sign modules with:
+
+```
+wazmrt keygen --out mykey          # writes mykey.key (private, KEEP SECRET);
+                                   #   prints the public key to embed
+wazmrt sign app.wasm app.signed.wasm --key mykey.key   # appends the signature
+```
+
+`sign` accepts `.wat` too (it assembles first), and the signed module still runs
+in any other runtime (they ignore the custom section). Verification is **inert in
+the default build** — no root key is embedded, so nothing changes until a release
+build sets one (a local `.key` file is fine for testing; a real publisher keeps
+the private key in an HSM/YubiKey/KMS). Design + rationale:
+[`cmem/security-model.md`](cmem/security-model.md).
 
 Implemented: stdout/stderr/stdin, args/environ, clocks, `poll_oneoff` (clock
 sleep), `random_get`, `proc_exit`, and the filesystem (`path_open`, `fd_read`/

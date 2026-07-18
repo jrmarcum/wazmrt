@@ -454,12 +454,24 @@ root is authenticated and needs no pin; a module signed *by our key* whose bytes
 a root key** (`embedded_root_key == null` by default → byte-identical to the pin-only path), matching the
 Phase 5 "ship behind a default-OFF knob" precedent.
 
-**Still open** (the publisher/rotation side — do NOT block the verify mechanism):
+**Publisher signing CLI — BUILT 2026-07-18 (`src/main.zig`):**
 
-- Signing/keygen CLI + where the **private** key lives (HSM/YubiKey/KMS on the publisher side).
+- `wazmrt keygen [--out <name>]` — generate an Ed25519 keypair (entropy from the `Io`); writes the
+  private **seed** as hex to `<name>.key` (KEEP SECRET) and prints the public key hex to embed.
+- `wazmrt sign <in.wasm|.wat> <out.wasm> --key <keyfile>` — sign a module (assembles `.wat` first);
+  writes the original bytes + a `"signature"` custom section. Reuses `pin.toHex`/`parseHex` for the
+  32-byte hex; the key seed round-trips via `Ed25519.KeyPair.generateDeterministic`.
+- **Verified through the real binary:** keygen → sign → embed the printed key → an authenticated run
+  (42) and a refused tampered run. Same "thin CLI over a tested library function" shape as `wazmrt pin`.
+
+**Still open** (do NOT block the above):
+
+- Where the **private** key lives for a real publisher (HSM/YubiKey/KMS — the local `.key` file is the
+  MVP; the design never wanted a private key on a *user's* machine, only the publisher's).
 - Keyring file + rotation (embedded root signs a keyring; PK→KEK→db).
-- How the embedded key is injected at release build (a `-Droot-key=<hex>` build option vs a committed
-  constant), and the default policy (deny-unsigned out of the box vs opt-in).
+- How the embedded key is injected at release build — a `-Droot-key=<hex>` build option (recommended, but
+  it must thread through every module that compiles `root.zig` — ~8 targets) vs the committed constant
+  today. And the default policy (deny-unsigned out of the box vs opt-in).
 
 **Resolved with data 2026-07-16:** ~~cold-start cost of hashing on every run~~ — **measured, negligible**
 (SHA-256 0.5% of instantiate, Ed25519 2.4%, both <0.15% of the process-startup floor). See the pin
