@@ -225,8 +225,27 @@ final-component `path_open` TOCTOU tied to std bug #18. See #17.
 
 > ### ✅ 4.3 (2026-07-16). ✅ 4.4 + Phase 5 (2026-07-17). ✅ Phase 6 exception handling — core +
 > **6.1 (WAT/`.wast`) + 6.2 (tag imports) + 6.3 (legacy EH) COMPLETE (2026-07-17)**. Both EH encodings
-> run. ✅ **Phase 7 — multi-memory COMPLETE (2026-07-17)**. ⇢ START HERE next: **SIMD** (the last big
-> proposal on the list) or the **signature path** in `security-model.md`.
+> run. ✅ **Phase 7 — multi-memory COMPLETE (2026-07-17)**. 🚧 **Phase 8 — SIMD FOUNDATION laid
+> (2026-07-17)**: the hard part (the two-slot v128 value model) is done + proven; ~16 of ~236 ops run.
+> ⇢ START HERE next: **fill in more SIMD ops** (mechanical), fix the **drop/select-v128 width gap**
+> (needs a type pass), or the **signature path** in `security-model.md`.
+>
+> **Phase 8 — SIMD, foundational slice (2026-07-17).** Owner chose the **two-u64-slots** representation
+> for the 128-bit `v128` (no memory penalty for non-SIMD; correct; more work than widening). The
+> **foundation is the value**: `slotWidth()` (v128=2, else 1); `FuncBody.local_map`/`local_w` +
+> `num_local_slots` (a v128 local is 2 slots); `blockArity`/branch, call arg/result counts, and the
+> `invoke` arg check all in **slots**; `local.get/set/tee` copy the right slot count. **Non-SIMD is
+> byte-identical** (all widths 1) — full suite + wasi-gate green. Ops: all 236 `0xFD` sub-opcodes
+> **decode** (one `Op.simd` tag + `imm.simd.sub`; `decodeSimd` covers every immediate shape); a subset
+> **executes** — `v128.const`, `v128.load`/`store`, `i32x4`/`i8x16`/`f32x4` splat, `i32x4`/`f32x4`
+> extract/replace_lane, `i8x16`/`i32x4` add/sub/mul, `f32x4` add/mul (via Zig `@Vector`); the rest trap
+> `UnsupportedInstruction`. 4 tests incl. a v128 held in a local. **KNOWN GAPS (document, don't hide):**
+> (1) `drop`/untyped `select` of a v128 are **not width-aware** — they'd mis-count slots and corrupt the
+> stack; the interp can't tell a v128 from an i32 there without type info (fix: a validator/decode type
+> pass annotating widths). (2) v128 **globals**/GC-fields unsupported (loud `UnsupportedInstruction` for
+> globals). (3) no **validator** SIMD sigs and no **WAT assembler** for v128 (`.wat` can't author SIMD;
+> binaries run). The corpus has no SIMD today so the gaps aren't live, but they must be closed before
+> claiming full SIMD.
 >
 > **Phase 7 — multi-memory (2026-07-17):** a module may have >1 linear memory; every load/store/
 > `memory.*` selects one by index. `Instance.memory: ?*Memory` → `memories: []*Memory` +

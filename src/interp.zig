@@ -146,6 +146,19 @@ pub const null_ref: Value = std.math.maxInt(u64);
 /// is checked before this bit, so the two never confuse.
 const i31_tag: Value = @as(Value, 1) << 63;
 
+/// Stack slots a value type occupies: a `v128` is **two** `u64` slots (SIMD),
+/// every other type is one. Only v128 differs, so a module with no v128 keeps
+/// the "one value = one slot" model unchanged.
+fn slotWidth(vt: types.ValType) u32 {
+    return if (vt == .v128) 2 else 1;
+}
+/// Total stack slots a list of value types occupies.
+fn typeSlots(ts: []const types.ValType) u32 {
+    var n: u32 = 0;
+    for (ts) |t| n += slotWidth(t);
+    return n;
+}
+
 fn funcTypeEqual(x: Module.FuncType, y: Module.FuncType) bool {
     return std.mem.eql(V, x.params, y.params) and std.mem.eql(V, y.results, x.results);
 }
@@ -186,11 +199,17 @@ const LegacyTry = struct { handlers: []const LegacyCatch = &.{}, delegate: ?u32 
 /// A defined function prepared for execution.
 const FuncBody = struct {
     type: Module.FuncType,
-    num_locals: usize, // params + declared locals
-    /// Default value of every local slot at function entry: `null_ref` for a
+    /// Total stack slots for params + declared locals (a v128 local is 2 slots).
+    num_local_slots: usize,
+    /// Starting slot of each local (params first, then declared), and its slot
+    /// width (1, or 2 for v128) — so `local.get $i` copies the right slots.
+    local_map: []const u32,
+    local_w: []const u8,
+    /// Default value of every local *slot* at function entry: `null_ref` for a
     /// reference-typed local (a nullable ref defaults to null; a non-null ref is
     /// non-defaultable, so validation forbids reading it before a set — the value
-    /// is immaterial), `0` for a numeric local. Params are overwritten by args.
+    /// is immaterial), `0` for a numeric or v128 local. Params are overwritten
+    /// by args.
     local_defaults: []const Value,
     ir: []const opcode.Instr,
     /// For each `block`/`loop`/`if`/`else` index: the matching `end` index.
@@ -329,25 +348,54 @@ pub const Instance = struct {
         const bodies = try a.alloc(FuncBody, module.functions.len);
         for (module.functions, module.code, bodies) |type_index, code, *body| {
             const ft = module.funcSig(type_index) orelse return error.UndefinedType;
-            var num_locals: usize = ft.params.len;
-            for (code.locals) |l| num_locals += l.count;
+            var local_count: usize = ft.params.len;
+            for (code.locals) |l| local_count += l.count;
 
             const ir = try opcode.decodeBody(a, code.body);
             const cf = try precomputeControlFlow(a, ir);
 
-            // Per-slot entry defaults: a reference local starts null, numeric 0.
-            const defaults = try a.alloc(Value, num_locals);
-            for (ft.params, 0..) |p, i| defaults[i] = if (p.isRef()) null_ref else 0;
-            var slot: usize = ft.params.len;
+            // Build the local slot map: params first, then declared locals, each
+            // starting at a running slot offset (v128 = 2 slots). Slot-sized
+            // defaults: a reference local starts null, numeric/v128 zero.
+            const local_map = try a.alloc(u32, local_count);
+            const local_w = try a.alloc(u8, local_count);
+            var num_slots: u32 = 0;
+            var li: usize = 0;
+            for (ft.params) |p| {
+                local_map[li] = num_slots;
+                local_w[li] = @intCast(slotWidth(p));
+                num_slots += local_w[li];
+                li += 1;
+            }
             for (code.locals) |l| {
-                const d: Value = if (l.type.isRef()) null_ref else 0;
-                @memset(defaults[slot..][0..l.count], d);
-                slot += l.count;
+                var c: u32 = 0;
+                while (c < l.count) : (c += 1) {
+                    local_map[li] = num_slots;
+                    local_w[li] = @intCast(slotWidth(l.type));
+                    num_slots += local_w[li];
+                    li += 1;
+                }
+            }
+            const defaults = try a.alloc(Value, num_slots);
+            @memset(defaults, 0);
+            li = 0;
+            for (ft.params) |p| {
+                if (p.isRef()) defaults[local_map[li]] = null_ref;
+                li += 1;
+            }
+            for (code.locals) |l| {
+                var c: u32 = 0;
+                while (c < l.count) : (c += 1) {
+                    if (l.type.isRef()) defaults[local_map[li]] = null_ref;
+                    li += 1;
+                }
             }
 
             body.* = .{
                 .type = ft,
-                .num_locals = num_locals,
+                .num_local_slots = num_slots,
+                .local_map = local_map,
+                .local_w = local_w,
                 .local_defaults = defaults,
                 .ir = ir,
                 .end_of = cf.end_of,
@@ -524,7 +572,7 @@ pub const Instance = struct {
     /// caller has already resolved the export (avoids re-resolving by name).
     pub fn invokeIndex(self: *Instance, func_index: u32, args: []const Value) Error![]Value {
         const ft = self.module.funcType(func_index) orelse return error.UndefinedFunc;
-        if (args.len != ft.params.len) return error.BadArgCount;
+        if (args.len != typeSlots(ft.params)) return error.BadArgCount;
 
         // Any trace left over describes an older call, not this one.
         self.trap_len = 0;
@@ -680,13 +728,13 @@ pub const Instance = struct {
                 .wasm => |w| return w.instance.callFunction(a, w.func_index, args, depth + 1),
                 .native => |f| {
                     const ft = self.module.funcType(func_index) orelse return error.UndefinedFunc;
-                    const results = try a.alloc(Value, ft.results.len);
+                    const results = try a.alloc(Value, typeSlots(ft.results));
                     f(args, results);
                     return results;
                 },
                 .native_env => |ne| {
                     const ft = self.module.funcType(func_index) orelse return error.UndefinedFunc;
-                    const results = try a.alloc(Value, ft.results.len);
+                    const results = try a.alloc(Value, typeSlots(ft.results));
                     if (!ne.call(ne.ctx, args, results)) return error.HostTrap;
                     return results;
                 },
@@ -696,20 +744,20 @@ pub const Instance = struct {
         if (defined >= self.func_bodies.len) return error.UndefinedFunc;
         const body = &self.func_bodies[defined];
 
-        const locals = try a.alloc(Value, body.num_locals);
-        @memcpy(locals, body.local_defaults); // ref locals → null, numeric → 0
-        @memcpy(locals[0..args.len], args);
+        const locals = try a.alloc(Value, body.num_local_slots);
+        @memcpy(locals, body.local_defaults); // ref locals → null, numeric/v128 → 0
+        @memcpy(locals[0..args.len], args); // args are param slots (v128 = 2 each)
 
         var frame: Frame = .{ .inst = self, .a = a, .body = body, .locals = locals, .depth = depth, .func_index = func_index };
         try frame.labels.append(a, .{
             .is_loop = false,
-            .arity = @intCast(body.type.results.len),
+            .arity = typeSlots(body.type.results),
             .target = body.ir.len,
             .stack_base = 0,
         });
         try frame.run();
 
-        const n = body.type.results.len;
+        const n = typeSlots(body.type.results);
         const res = try a.alloc(Value, n);
         @memcpy(res, frame.vstack.items[frame.vstack.items.len - n ..]);
         return res;
@@ -903,14 +951,16 @@ const Frame = struct {
         return target;
     }
 
+    /// Branch/label arity in **slots** (a v128 result is 2 slots), so `branch`
+    /// copies the right number of `u64`s.
     fn blockArity(self: *Frame, bt: opcode.BlockType, comptime want_params: bool) u32 {
         return switch (bt) {
             .empty => 0,
-            .value => if (want_params) 0 else 1,
+            .value => |t| if (want_params) 0 else slotWidth(t),
             // Validated code guarantees a func type at this index.
             .type_index => |i| blk: {
                 const ft = self.inst.module.funcSig(i).?;
-                break :blk @intCast(if (want_params) ft.params.len else ft.results.len);
+                break :blk typeSlots(if (want_params) ft.params else ft.results);
             },
         };
     }
@@ -1210,7 +1260,7 @@ const Frame = struct {
                 .call => {
                     const f = instr.imm.func;
                     const ft = self.inst.module.funcType(f) orelse return error.UndefinedFunc;
-                    const np = ft.params.len;
+                    const np = typeSlots(ft.params); // param slots (v128 = 2)
                     const args = self.vstack.items[self.vstack.items.len - np ..];
                     const results = self.inst.callFunction(self.a, f, args, self.depth + 1) catch |e| {
                         pc = try self.onCallError(e); // caught here → resume; else re-raise
@@ -1231,7 +1281,7 @@ const Frame = struct {
                     const want = self.inst.module.funcSig(ci.type_index) orelse return error.UndefinedType;
                     const ft = self.inst.module.funcType(f) orelse return error.UndefinedFunc;
                     if (!funcTypeEqual(want, ft)) return error.IndirectTypeMismatch;
-                    const np = ft.params.len;
+                    const np = typeSlots(ft.params); // param slots (v128 = 2)
                     const args = self.vstack.items[self.vstack.items.len - np ..];
                     const results = self.inst.callFunction(self.a, f, args, self.depth + 1) catch |e| {
                         pc = try self.onCallError(e);
@@ -1248,7 +1298,7 @@ const Frame = struct {
                     if (f_ref == null_ref) return error.NullReference;
                     const f: u32 = @intCast(f_ref);
                     const ft = self.inst.module.funcType(f) orelse return error.UndefinedFunc;
-                    const np = ft.params.len;
+                    const np = typeSlots(ft.params); // param slots (v128 = 2)
                     const args = self.vstack.items[self.vstack.items.len - np ..];
                     const results = self.inst.callFunction(self.a, f, args, self.depth + 1) catch |e| {
                         pc = try self.onCallError(e);
@@ -1410,22 +1460,34 @@ const Frame = struct {
 
                 // --- Variables ---
                 .local_get => {
-                    try self.pushU64(self.locals[instr.imm.local]);
+                    const off = self.body.local_map[instr.imm.local];
+                    var k: u32 = 0;
+                    while (k < self.body.local_w[instr.imm.local]) : (k += 1) try self.pushU64(self.locals[off + k]);
                     pc += 1;
                 },
                 .local_set => {
-                    self.locals[instr.imm.local] = self.pop();
+                    const off = self.body.local_map[instr.imm.local];
+                    var k = self.body.local_w[instr.imm.local];
+                    while (k > 0) { // top of stack is the value's high slot
+                        k -= 1;
+                        self.locals[off + k] = self.pop();
+                    }
                     pc += 1;
                 },
                 .local_tee => {
-                    self.locals[instr.imm.local] = self.vstack.items[self.vstack.items.len - 1];
+                    const off = self.body.local_map[instr.imm.local];
+                    const w = self.body.local_w[instr.imm.local];
+                    for (0..w) |k| self.locals[off + k] = self.vstack.items[self.vstack.items.len - w + k];
                     pc += 1;
                 },
                 .global_get => {
+                    // v128 globals (2 slots) are not represented yet — fail loud.
+                    if (self.inst.module.globals[instr.imm.global].content == .v128) return error.UnsupportedInstruction;
                     try self.pushU64(self.inst.globals[instr.imm.global]);
                     pc += 1;
                 },
                 .global_set => {
+                    if (self.inst.module.globals[instr.imm.global].content == .v128) return error.UnsupportedInstruction;
                     self.inst.globals[instr.imm.global] = self.pop();
                     pc += 1;
                 },
@@ -1450,6 +1512,10 @@ const Frame = struct {
 
                 .i32_load, .i64_load, .f32_load, .f64_load, .i32_load8_s, .i32_load8_u, .i32_load16_s, .i32_load16_u, .i64_load8_s, .i64_load8_u, .i64_load16_s, .i64_load16_u, .i64_load32_s, .i64_load32_u, .i32_store, .i64_store, .f32_store, .f64_store, .i32_store8, .i32_store16, .i64_store8, .i64_store16, .i64_store32, .memory_size, .memory_grow => {
                     try self.execMemory(instr);
+                    pc += 1;
+                },
+                .simd => {
+                    try self.execSimd(instr.imm.simd);
                     pc += 1;
                 },
 
@@ -1791,6 +1857,93 @@ const Frame = struct {
             .i64_store32 => try self.store(u32, ma, @truncate(@as(u64, @bitCast(self.popI64())))),
 
             else => unreachable,
+        }
+    }
+
+    // --- SIMD (v128): a value is two u64 stack slots, low then high --------
+    fn pushV128(self: *Frame, v: u128) Error!void {
+        try self.pushU64(@truncate(v));
+        try self.pushU64(@truncate(v >> 64));
+    }
+    fn popV128(self: *Frame) u128 {
+        const hi = self.pop();
+        const lo = self.pop();
+        return (@as(u128, hi) << 64) | lo;
+    }
+
+    /// A lane-wise binary op on integer lanes of width `Lane` (wrapping arithmetic).
+    fn simdIntBin(self: *Frame, comptime Lane: type, comptime op: enum { add, sub, mul }) Error!void {
+        const Vec = @Vector(16 / @sizeOf(Lane), Lane);
+        const b: Vec = @bitCast(self.popV128());
+        const a: Vec = @bitCast(self.popV128());
+        const r: Vec = switch (op) {
+            .add => a +% b,
+            .sub => a -% b,
+            .mul => a *% b,
+        };
+        try self.pushV128(@bitCast(r));
+    }
+    /// A lane-wise binary op on float lanes of width `Lane`.
+    fn simdFloatBin(self: *Frame, comptime Lane: type, comptime op: enum { add, sub, mul, div }) Error!void {
+        const Vec = @Vector(16 / @sizeOf(Lane), Lane);
+        const b: Vec = @bitCast(self.popV128());
+        const a: Vec = @bitCast(self.popV128());
+        const r: Vec = switch (op) {
+            .add => a + b,
+            .sub => a - b,
+            .mul => a * b,
+            .div => a / b,
+        };
+        try self.pushV128(@bitCast(r));
+    }
+
+    /// Execute a `0xFD` SIMD op. Supports a foundational subset — v128.const,
+    /// v128.load/store, splat, i32x4 lane get/set, and i8x16/i32x4/f32x4
+    /// arithmetic — enough to prove the two-slot v128 model. The rest of the
+    /// ~236-op family is mechanical fill-in following the same shape and traps
+    /// as `UnsupportedInstruction` for now.
+    fn execSimd(self: *Frame, s: opcode.Simd) Error!void {
+        switch (s.sub) {
+            0x0c => try self.pushV128(s.bytes), // v128.const
+            0x00 => { // v128.load
+                const base: u32 = @bitCast(self.popI32());
+                const mem = try self.memBytes(s.mem.memory);
+                const ea = @as(u64, base) + s.mem.offset;
+                if (ea + 16 > mem.len) return error.MemoryOutOfBounds;
+                try self.pushV128(std.mem.readInt(u128, mem[@intCast(ea)..][0..16], .little));
+            },
+            0x0b => { // v128.store
+                const v = self.popV128();
+                const base: u32 = @bitCast(self.popI32());
+                const mem = try self.memBytes(s.mem.memory);
+                const ea = @as(u64, base) + s.mem.offset;
+                if (ea + 16 > mem.len) return error.MemoryOutOfBounds;
+                std.mem.writeInt(u128, mem[@intCast(ea)..][0..16], v, .little);
+            },
+            0x0f => try self.pushV128(@bitCast(@as(@Vector(16, u8), @splat(@truncate(@as(u32, @bitCast(self.popI32()))))))), // i8x16.splat
+            0x11 => try self.pushV128(@bitCast(@as(@Vector(4, u32), @splat(@bitCast(self.popI32()))))), // i32x4.splat
+            0x13 => try self.pushV128(@bitCast(@as(@Vector(4, u32), @splat(@truncate(self.pop()))))), // f32x4.splat (bit pattern)
+            0x1b => { // i32x4.extract_lane (arrays are runtime-indexable, vectors aren't)
+                const arr: [4]u32 = @bitCast(self.popV128());
+                try self.pushI32(@bitCast(arr[s.lane]));
+            },
+            0x1c => { // i32x4.replace_lane
+                const x: u32 = @bitCast(self.popI32());
+                var arr: [4]u32 = @bitCast(self.popV128());
+                arr[s.lane] = x;
+                try self.pushV128(@bitCast(arr));
+            },
+            0x1f => { // f32x4.extract_lane (push the 32-bit pattern as an f32 value)
+                const arr: [4]u32 = @bitCast(self.popV128());
+                try self.pushU64(arr[s.lane]);
+            },
+            0x6e => try self.simdIntBin(u8, .add), // i8x16.add
+            0xae => try self.simdIntBin(u32, .add), // i32x4.add
+            0xb1 => try self.simdIntBin(u32, .sub), // i32x4.sub
+            0xb5 => try self.simdIntBin(u32, .mul), // i32x4.mul
+            0xe4 => try self.simdFloatBin(f32, .add), // f32x4.add
+            0xe6 => try self.simdFloatBin(f32, .mul), // f32x4.mul
+            else => return error.UnsupportedInstruction,
         }
     }
 };
@@ -2653,4 +2806,94 @@ test "multi-memory: memory.size / memory.grow select by index" {
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
     try std.testing.expectEqual(@as(i32, 3), asI32(r[0])); // mem1 has 3 pages, not mem0's 1
+}
+
+// --- SIMD (v128) tests (Phase 8) -------------------------------------------
+// A v128 is two u64 stack slots. These hand-built binaries prove the two-slot
+// model end to end: v128 held in a LOCAL (2 slots), lane arithmetic, extract,
+// and load/store to linear memory.
+
+test "SIMD: v128 in a local, i32x4.add, extract_lane" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x01, 0x7f } }, // (func()->i32)
+        .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+        .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{&.{
+            0x01, 0x01, 0x7b, // 1 local: v128  (occupies 2 slots)
+            0xfd, 0x0c, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, // v128.const i32x4(1,2,3,4)
+            0x21, 0x00, // local.set 0   (pops 2 slots)
+            0x20, 0x00, // local.get 0   (pushes 2 slots)
+            0xfd, 0x0c, 10, 0, 0, 0, 20, 0, 0, 0, 30, 0, 0, 0, 40, 0, 0, 0, // v128.const i32x4(10,20,30,40)
+            0xfd, 0xae, 0x01, // i32x4.add  (sub-opcode 0xae = LEB 0xae 0x01) -> (11,22,33,44)
+            0xfd, 0x1b, 0x02, // i32x4.extract_lane 2  -> 33
+            0x0b,
+        }}) },
+    });
+    var inst = try instantiate(bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("f", &.{});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(i32, 33), asI32(r[0]));
+}
+
+test "SIMD: i32x4.splat -> v128.store -> v128.load -> extract_lane" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x01, 0x7f } },
+        .{ .id = 5, .body = &.{ 0x01, 0x00, 0x01 } }, // 1 memory, min 1
+        .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+        .{ .id = 7, .body = &.{ 0x01, 0x01, 'g', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{&.{
+            0x00, // no locals
+            0x41, 0x00, // i32.const 0 (store addr)
+            0x41, 0x07, // i32.const 7
+            0xfd, 0x11, // i32x4.splat -> (7,7,7,7)
+            0xfd, 0x0b, 0x00, 0x00, // v128.store (align 0, offset 0)
+            0x41, 0x00, // i32.const 0 (load addr)
+            0xfd, 0x00, 0x00, 0x00, // v128.load (align 0, offset 0)
+            0xfd, 0x1b, 0x00, // i32x4.extract_lane 0 -> 7
+            0x0b,
+        }}) },
+    });
+    var inst = try instantiate(bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("g", &.{});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(i32, 7), asI32(r[0]));
+}
+
+test "SIMD: f32x4.mul lane-wise" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (2.0,2.0,2.0,2.0) * (3.0,1.5,4.0,0.5) -> lane 1 = 3.0
+    const two = @as(u32, @bitCast(@as(f32, 2.0)));
+    const b0 = @as(u32, @bitCast(@as(f32, 3.0)));
+    const b1 = @as(u32, @bitCast(@as(f32, 1.5)));
+    const b2 = @as(u32, @bitCast(@as(f32, 4.0)));
+    const b3 = @as(u32, @bitCast(@as(f32, 0.5)));
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x01, 0x7d } }, // (func()->f32)
+        .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+        .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{
+            &([_]u8{ 0x00, 0xfd, 0x0c } ++ le32(two) ++ le32(two) ++ le32(two) ++ le32(two) ++
+                [_]u8{ 0xfd, 0x0c } ++ le32(b0) ++ le32(b1) ++ le32(b2) ++ le32(b3) ++
+                [_]u8{ 0xfd, 0xe6, 0x01, 0xfd, 0x1f, 0x01, 0x0b }), // f32x4.mul ; f32x4.extract_lane 1 ; end
+        }) },
+    });
+    var inst = try instantiate(bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("f", &.{});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(f32, 3.0), asF32(r[0]));
+}
+
+fn le32(x: u32) [4]u8 {
+    return .{ @truncate(x), @truncate(x >> 8), @truncate(x >> 16), @truncate(x >> 24) };
 }

@@ -483,10 +483,10 @@ are ±10% noisy.)
 
 ## Reading the test count (updated 2026-07-17, Phase 6)
 
-`zig build test --summary all` prints **294** (290 pass, 4 skip), but there are **152 distinct tests**:
-142 in the core module (140 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
+`zig build test --summary all` prints **302** (298 pass, 4 skip), but there are **156 distinct tests**:
+146 in the core module (144 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
 `wasm_c_api.zig`, which imports `root.zig`, so it compiles and **re-runs the core module's tests too**
-(142 core + 10 C-ABI = 152), on top of the standalone `mod_tests` run (142) → 294 printed. Harmless —
+(146 core + 10 C-ABI = 156), on top of the standalone `mod_tests` run (146) → 302 printed. Harmless —
 under a second — but **don't quote 294 as a test count**; quote **152**, or the per-target numbers from
 `--summary all`. Two core tests skip on an unprivileged Windows box (the #17 real-symlink test and the
 traversal example gate — see below), so you'll usually see `2 skip` per run (`4` total).
@@ -519,6 +519,12 @@ outer one. They use the non-validating `instantiate` helper (the validator does 
 **Phase 7 (multi-memory):** 3 hand-built binary tests in `interp.zig` — a store to memory 1 leaving
 memory 0 untouched (index routing via the memarg bit-6 flag), `memory.copy` between two memories, and
 `memory.size` selecting by index. Non-validating `instantiate`; the WAT assembler is single-memory-only.
+
+**Phase 8 (SIMD, foundational):** 3 exec tests in `interp.zig` — a v128 held in a **local** (2 slots)
+through `i32x4.add` + `extract_lane`; `i32x4.splat` → `v128.store` → `v128.load` → `extract_lane`; and
+`f32x4.mul` + `f32x4.extract_lane` — plus a decode test (`v128.const`) in `opcode.zig`. These prove the
+two-slot v128 model. **Not yet covered (known gaps):** `drop`/untyped-`select` of a v128 (width not
+tracked), v128 globals/GC-fields, and any `.wat`/validator SIMD path.
 
 ## wasmtk WASI corpus — real-world conformance snapshot (2026-07-17)
 

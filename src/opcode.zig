@@ -266,6 +266,10 @@ pub const Op = enum(u8) {
 
     // Bulk memory (`0xFC` prefix). LLVM/Zig emit `memory.copy`/`memory.fill` for
     // memcpy/memset by default (`+bulk-memory`).
+    /// All `0xFD`-prefixed fixed-width SIMD (v128) ops share this tag; the
+    /// specific operation is `imm.simd.sub` (the 0xFD sub-opcode). Using one tag
+    /// keeps the ~236-op family out of the u8 `Op` space.
+    simd = 0xdb,
     memory_init = 0xd7, // 0xFC 0x08: [dst src n] -> [] (from a data segment)
     data_drop = 0xd8, // 0xFC 0x09: mark a data segment consumed
     memory_copy = 0xd9, // 0xFC 0x0a: [dst src n] -> []
@@ -462,6 +466,18 @@ pub const Imm = union(enum) {
     tag: u32,
     /// `try_table` — a block type + its catch clauses.
     try_table: TryTable,
+    /// A `0xFD` SIMD op: the sub-opcode plus whatever immediate it carries.
+    simd: Simd,
+};
+
+/// A decoded `0xFD` (v128 SIMD) instruction. `sub` is the 0xFD sub-opcode;
+/// `mem` is set for loads/stores, `lane` for lane ops, `bytes` for `v128.const`
+/// (and the 16 lane indices of `i8x16.shuffle`).
+pub const Simd = struct {
+    sub: u32,
+    mem: MemArg = .{ .alignment = 0, .offset = 0 },
+    lane: u8 = 0,
+    bytes: u128 = 0,
 };
 
 pub const Instr = struct { op: Op, imm: Imm };
@@ -613,6 +629,44 @@ fn readBrCast(r: *Reader) DecodeError!Imm {
     } };
 }
 
+/// Read a load/store memarg. Multi-memory: bit 6 of the alignment flags an
+/// explicit memory index that follows (before the offset); else memory 0.
+fn readMemArg(r: *Reader) DecodeError!MemArg {
+    var al = try r.readVarU32();
+    var mem_i: u32 = 0;
+    if (al & 0x40 != 0) {
+        al &= ~@as(u32, 0x40);
+        mem_i = try r.readVarU32();
+    }
+    const of = try r.readVarU32();
+    return .{ .alignment = al, .offset = of, .memory = mem_i };
+}
+
+/// Decode a `0xFD` SIMD op given its sub-opcode. Every op is `Op.simd`; the
+/// sub-opcode picks the operation and its immediate shape (memarg for loads/
+/// stores, +lane for load/store-lane, 16 bytes for `v128.const`/`shuffle`, a
+/// lane byte for extract/replace_lane, nothing otherwise). Decoding is complete
+/// for the whole family; execution supports a subset (`interp.execSimd`).
+fn decodeSimd(r: *Reader, sub: u32) DecodeError!Instr {
+    var s: Simd = .{ .sub = sub };
+    switch (sub) {
+        0x00...0x0b, 0x5c, 0x5d => s.mem = try readMemArg(r), // v128.load* / store / load{32,64}_zero
+        0x54...0x5b => { // v128.load/store lane: memarg + a lane index
+            s.mem = try readMemArg(r);
+            s.lane = try r.readByte();
+        },
+        0x0c, 0x0d => { // v128.const / i8x16.shuffle: 16 immediate bytes (LE)
+            var v: u128 = 0;
+            var i: u5 = 0;
+            while (i < 16) : (i += 1) v |= @as(u128, try r.readByte()) << (@as(u7, i) * 8);
+            s.bytes = v;
+        },
+        0x15...0x22 => s.lane = try r.readByte(), // extract_lane / replace_lane
+        else => {}, // all other SIMD ops take no immediate
+    }
+    return .{ .op = .simd, .imm = .{ .simd = s } };
+}
+
 /// Read a `try_table` immediate: a block type followed by a vector of catch
 /// clauses. Each clause is a kind byte (0=catch, 1=catch_ref, 2=catch_all,
 /// 3=catch_all_ref), a tag index for the non-`all` kinds, then a label index.
@@ -755,6 +809,11 @@ pub fn decodeBodyTracked(
             try list.append(a, imm);
             continue;
         }
+        if (b0 == 0xfd) {
+            // 0xFD-prefixed fixed-width SIMD (v128): a LEB sub-opcode + immediate.
+            try list.append(a, try decodeSimd(&r, try r.readVarU32()));
+            continue;
+        }
         const op: Op = @enumFromInt(b0);
         const imm: Imm = switch (immediateKind(op)) {
             .none => .none,
@@ -775,18 +834,7 @@ pub fn decodeBodyTracked(
             .local => .{ .local = try r.readVarU32() },
             .global => .{ .global = try r.readVarU32() },
             .table => .{ .table = try r.readVarU32() },
-            .mem => blk: {
-                // Multi-memory: bit 6 of the alignment flags an explicit memory
-                // index that follows (before the offset); else memory 0.
-                var al = try r.readVarU32();
-                var mem_i: u32 = 0;
-                if (al & 0x40 != 0) {
-                    al &= ~@as(u32, 0x40);
-                    mem_i = try r.readVarU32();
-                }
-                const of = try r.readVarU32();
-                break :blk .{ .mem = .{ .alignment = al, .offset = of, .memory = mem_i } };
-            },
+            .mem => .{ .mem = try readMemArg(&r) },
             .mem_reserved => .{ .mem_reserved = try r.readByte() },
             .mem_index => .{ .mem_index = try r.readVarU32() }, // memory.size / memory.grow
             .i32c => .{ .i32 = try r.readVarI32() },
@@ -857,7 +905,18 @@ test "decodes a br_table" {
     try std.testing.expectEqual(@as(u32, 2), instrs[0].imm.br_table.default);
 }
 
-test "rejects an unsupported opcode (SIMD prefix)" {
-    const body = [_]u8{0xfd};
+test "decodes a SIMD (0xFD) op: v128.const" {
+    // 0xfd 0x0c <16 bytes> — v128.const with a 1,2,3,4 (i32x4) little-endian payload.
+    const body = [_]u8{ 0xfd, 0x0c, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0 };
+    const instrs = try decodeBody(std.testing.allocator, &body);
+    defer std.testing.allocator.free(instrs);
+    try std.testing.expectEqual(Op.simd, instrs[0].op);
+    try std.testing.expectEqual(@as(u32, 0x0c), instrs[0].imm.simd.sub);
+    // lanes 1,2,3,4 packed little-endian into the u128.
+    try std.testing.expectEqual(@as(u128, 1 | (2 << 32) | (3 << 64) | (4 << 96)), instrs[0].imm.simd.bytes);
+}
+
+test "rejects a genuinely unknown opcode" {
+    const body = [_]u8{0xff}; // 0xff is not a defined opcode or prefix
     try std.testing.expectError(error.UnsupportedOpcode, decodeBody(std.testing.allocator, &body));
 }

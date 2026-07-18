@@ -281,6 +281,18 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   - **Deferred (until browser-standard):** **WASI preview 2/3** (component-model based), **SIMD** —
     pulled in as the real corpus (`wasm_wasi`) demands. Typed/GC reference *value types* are already
     *accepted* (P1) so such modules build.
+  - **SIMD (v128) — IN SCOPE; FOUNDATION BUILT 2026-07-17 (Phase 8).** Owner chose **two u64 slots per
+    v128** (not widening `Value` to u128 — that would 2x memory for every value in every program, against
+    the small/fast vision; not boxing — that grows unbounded in SIMD loops). So a v128 occupies 2 stack
+    slots. `slotWidth(vt)` (v128=2, else 1) threads through **locals** (`FuncBody.local_map`/`local_w`,
+    `num_local_slots`), **block/branch arity**, **call arg/result counts**, and the `invoke` arg check —
+    all now in *slots*. A module with no v128 keeps all widths at 1, so the non-SIMD path is byte-for-byte
+    unchanged (verified: full suite green). The `0xFD` family is one `Op.simd` tag carrying `imm.simd.sub`
+    (a u8 `Op` can't hold 236 ops); `execSimd` runs a subset via Zig `@Vector`. **THE LIMITATION TO CLOSE:
+    `drop` and untyped `select` of a v128 are not width-aware** — with no per-slot type info the interp
+    mis-counts and corrupts the stack; fixing it needs a type-annotation pass (the validator has the
+    types). v128 globals/GC-fields and the WAT assembler are also unbuilt. Full scope + op list in
+    `roadmap.md` Phase 8.
   - **Multi-memory — IN SCOPE; BUILT 2026-07-17 (Phase 7).** A module may have >1 linear memory;
     load/store/`memory.*` select by index. The runtime holds `Instance.memories: []*Memory` (imported
     lead, then defined); a load/store memarg's **alignment bit 6** flags an explicit memory index that
