@@ -396,7 +396,9 @@ pub const BlockType = union(enum) {
     type_index: u32,
 };
 
-pub const MemArg = struct { alignment: u32, offset: u32 };
+/// A load/store memory-immediate. `memory` is the target memory index
+/// (multi-memory): the alignment's bit 6 flags an explicit index that follows.
+pub const MemArg = struct { alignment: u32, offset: u32, memory: u32 = 0 };
 pub const BrTable = struct { labels: []const u32, default: u32 };
 pub const CallIndirect = struct { type_index: u32, table: u32 };
 
@@ -429,6 +431,12 @@ pub const Imm = union(enum) {
     mem: MemArg,
     /// Reserved byte of `memory.size` / `memory.grow` (the memory index, 0).
     mem_reserved: u8,
+    /// Memory index of `memory.size` / `memory.grow` / `memory.fill` (multi-memory).
+    mem_index: u32,
+    /// `memory.copy` — destination + source memory indices (multi-memory).
+    mem_copy: struct { dst: u32, src: u32 },
+    /// `memory.init` — a data-segment index + the target memory index.
+    mem_init: struct { data: u32, mem: u32 },
     i32: i32,
     i64: i64,
     /// Raw little-endian bit pattern (`f32.const` / `f64.const`).
@@ -479,6 +487,8 @@ const ImmKind = enum {
     table_copy,
     mem,
     mem_reserved,
+    /// `memory.size` / `memory.grow` — a single memory index (multi-memory).
+    mem_index,
     i32c,
     i64c,
     f32c,
@@ -521,7 +531,7 @@ pub fn immediateKind(op: Op) ImmKind {
         0xd9 => .mem_copy, // memory.copy: two reserved mem bytes
         0xda => .mem_reserved, // memory.fill: one reserved mem byte
         0x28...0x3e => .mem,
-        0x3f, 0x40 => .mem_reserved,
+        0x3f, 0x40 => .mem_index, // memory.size / memory.grow — a memory index
         0x41 => .i32c,
         0x42 => .i64c,
         0x43 => .f32c,
@@ -720,20 +730,20 @@ pub fn decodeBodyTracked(
                 0x05 => .{ .op = .i64_trunc_sat_f32_u, .imm = .none },
                 0x06 => .{ .op = .i64_trunc_sat_f64_s, .imm = .none },
                 0x07 => .{ .op = .i64_trunc_sat_f64_u, .imm = .none },
-                // Bulk memory. The trailing memory indices are reserved (always 0
-                // until multi-memory); read and discard them.
+                // Bulk memory (multi-memory: each carries a memory index — a
+                // varu32 that reads 0 for the single-memory case).
                 0x08 => blk: {
                     const d = try r.readVarU32();
-                    _ = try r.readByte(); // reserved memory index
-                    break :blk .{ .op = .memory_init, .imm = .{ .data = d } };
+                    const m = try r.readVarU32(); // target memory index
+                    break :blk .{ .op = .memory_init, .imm = .{ .mem_init = .{ .data = d, .mem = m } } };
                 },
                 0x09 => .{ .op = .data_drop, .imm = .{ .data = try r.readVarU32() } },
                 0x0a => blk: {
-                    _ = try r.readByte(); // reserved dst memory index
-                    _ = try r.readByte(); // reserved src memory index
-                    break :blk .{ .op = .memory_copy, .imm = .none };
+                    const dst = try r.readVarU32(); // dst memory index
+                    const src = try r.readVarU32(); // src memory index
+                    break :blk .{ .op = .memory_copy, .imm = .{ .mem_copy = .{ .dst = dst, .src = src } } };
                 },
-                0x0b => .{ .op = .memory_fill, .imm = .{ .mem_reserved = try r.readByte() } },
+                0x0b => .{ .op = .memory_fill, .imm = .{ .mem_index = try r.readVarU32() } },
                 0x0c => .{ .op = .table_init, .imm = .{ .table_init = .{ .elem = try r.readVarU32(), .table = try r.readVarU32() } } },
                 0x0d => .{ .op = .elem_drop, .imm = .{ .elem = try r.readVarU32() } },
                 0x0e => .{ .op = .table_copy, .imm = .{ .table_copy = .{ .dst = try r.readVarU32(), .src = try r.readVarU32() } } },
@@ -766,11 +776,19 @@ pub fn decodeBodyTracked(
             .global => .{ .global = try r.readVarU32() },
             .table => .{ .table = try r.readVarU32() },
             .mem => blk: {
-                const al = try r.readVarU32();
+                // Multi-memory: bit 6 of the alignment flags an explicit memory
+                // index that follows (before the offset); else memory 0.
+                var al = try r.readVarU32();
+                var mem_i: u32 = 0;
+                if (al & 0x40 != 0) {
+                    al &= ~@as(u32, 0x40);
+                    mem_i = try r.readVarU32();
+                }
                 const of = try r.readVarU32();
-                break :blk .{ .mem = .{ .alignment = al, .offset = of } };
+                break :blk .{ .mem = .{ .alignment = al, .offset = of, .memory = mem_i } };
             },
             .mem_reserved => .{ .mem_reserved = try r.readByte() },
+            .mem_index => .{ .mem_index = try r.readVarU32() }, // memory.size / memory.grow
             .i32c => .{ .i32 = try r.readVarI32() },
             .i64c => .{ .i64 = try r.readVarI64() },
             .f32c => .{ .f32 = try r.readF32Bits() },

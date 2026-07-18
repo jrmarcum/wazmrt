@@ -429,7 +429,7 @@ fn runWasi(
 
     var inst = try interp.Instance.initWithImports(arena, module, .{ .funcs = funcs.items });
     defer inst.deinit();
-    wasi.memory = inst.memory; // module memory now exists
+    wasi.memory = inst.memory0(); // module memory now exists
 
     _ = inst.invokeIndex(start_index, &.{}) catch |e| {
         // `proc_exit` unwinds via HostTrap with the code recorded — a clean exit.

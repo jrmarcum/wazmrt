@@ -278,9 +278,15 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
       `dst <: src` and that the label's last type accepts the carried ref. Also completed the
       block-type decoder for the non-null synthetic tags (`readBlockType` gained anyref_nn…nullref_nn),
       needed for `(block (result (ref i31)) …)` around a cast-branch.
-  - **Deferred (until browser-standard):** **WASI preview 2/3** (component-model based), **multi-memory**,
-    **SIMD** — pulled in as the real corpus (`wasm_wasi`) demands. Typed/GC reference *value types* are
-    already *accepted* (P1) so such modules build.
+  - **Deferred (until browser-standard):** **WASI preview 2/3** (component-model based), **SIMD** —
+    pulled in as the real corpus (`wasm_wasi`) demands. Typed/GC reference *value types* are already
+    *accepted* (P1) so such modules build.
+  - **Multi-memory — IN SCOPE; BUILT 2026-07-17 (Phase 7).** A module may have >1 linear memory;
+    load/store/`memory.*` select by index. The runtime holds `Instance.memories: []*Memory` (imported
+    lead, then defined); a load/store memarg's **alignment bit 6** flags an explicit memory index that
+    follows. `memory0()` keeps single-memory consumers (WASI host, C ABI) working. Decode + execute done
+    (validator stays permissive — memidx bounds are a runtime check; the CLI run path doesn't validate).
+    The WAT assembler is single-memory-only (deferred) — see `roadmap.md` Phase 7.
   - **Exception handling — IN SCOPE; CORE BUILT 2026-07-17 (Phase 6).** The standardized **exnref**
     proposal (`try_table`/`throw`/`throw_ref` + `tag` section, `exnref` heap type) — decode + validate +
     execute all done (see the EH invariant above and `roadmap.md` §6). Only the WAT assembler + `.wast`

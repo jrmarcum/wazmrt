@@ -1374,7 +1374,7 @@ export fn wasm_global_delete(g: ?*Ref) void {
 // ---- Memories -------------------------------------------------------------
 
 fn memObj(r: *const Ref) ?*interp.Instance.Memory {
-    if (r.instance) |wi| return wi.inst.memory; // MVP: single memory (index 0)
+    if (r.instance) |wi| return wi.inst.memory0(); // MVP: single memory (index 0)
     return r.host_memory;
 }
 

@@ -228,11 +228,13 @@ pub const Instance = struct {
     /// Backing callables for imported functions (index-aligned with the first
     /// `imported_funcs` entries of the function index space).
     import_funcs: []const HostFunc,
-    /// Linear memory (shared object so an imported memory reflects the exporter's
-    /// growth), or null if the module has neither a defined nor imported memory.
-    memory: ?*Memory,
-    /// True if `memory` is borrowed from an import (owned/freed by the exporter).
-    imported_memory: bool,
+    /// The linear-memory index space (multi-memory): imported memories first
+    /// (borrowed shared objects, so growth reflects the exporter), then defined
+    /// memories (owned). Empty if the module has no memory. A load/store/`memory.*`
+    /// selects one by its instruction's memory index.
+    memories: []*Memory,
+    /// How many leading entries of `memories` are imported (borrowed, not freed).
+    imported_memories: usize,
     /// Reference tables, one shared `*Table` per module table (imports first, so
     /// an imported table reflects the exporter's growth). The outer slice is
     /// `gpa`-owned; `tables[0..imported_tables]` are borrowed objects.
@@ -280,6 +282,12 @@ pub const Instance = struct {
     /// instance and every importer, so `memory.grow` (which updates `bytes`) is
     /// visible across the module boundary.
     pub const Memory = struct { bytes: []u8, max: ?u32 };
+
+    /// Memory index 0, or null if the module has no memory. The WASI host and the
+    /// C ABI speak the conventional single memory through this.
+    pub fn memory0(self: *const Instance) ?*Memory {
+        return if (self.memories.len > 0) self.memories[0] else null;
+    }
 
     /// Shared reference table (funcref/externref `Value` slots; `null_ref` =
     /// uninitialized). Referenced by the definer and importers; `table.grow`
@@ -360,37 +368,41 @@ pub const Instance = struct {
         for (module.global_inits, 0..) |init_expr, gi|
             globals[defined_start + gi] = try evalConstExpr(globals[0 .. defined_start + gi], init_expr);
 
-        // Linear memory: an imported memory (index 0 when present) borrows the
-        // host-supplied shared object; a defined memory allocates its own. Active
-        // data segments then initialize whichever memory backs index 0.
-        const imported_memory = module.importedMemoryCount() > 0;
-        var memory: ?*Memory = null;
-        if (module.memories.len > 0) {
-            if (imported_memory) {
-                if (imports.memories.len == 0) return error.MissingImport;
-                memory = imports.memories[0];
-            } else {
-                const mt = module.memories[0];
-                const buf = try gpa.alloc(u8, @as(usize, mt.limits.min) * page_size);
-                errdefer gpa.free(buf);
-                @memset(buf, 0);
-                const mem_obj = try gpa.create(Memory);
-                mem_obj.* = .{ .bytes = buf, .max = mt.limits.max };
-                memory = mem_obj;
-            }
-            const bytes = memory.?.bytes;
-            for (module.data) |seg| {
-                if (!seg.active) continue;
-                const offset = try evalConstOffset(module, globals, seg.offset_expr);
-                if (@as(u64, offset) + seg.bytes.len > bytes.len) return error.MemoryOutOfBounds;
-                @memcpy(bytes[offset..][0..seg.bytes.len], seg.bytes);
-            }
-        }
-        // Cover errors after the memory block; a *defined* memory object is owned.
-        errdefer if (!imported_memory) if (memory) |m| {
+        // Linear memories (multi-memory): imported memories (the low indices)
+        // borrow host-supplied shared objects; defined memories allocate their
+        // own. Active data segments then initialize their target memory.
+        const imported_memories = module.importedMemoryCount();
+        const memories = try gpa.alloc(*Memory, module.memories.len);
+        errdefer gpa.free(memories);
+        var built: usize = 0;
+        errdefer for (memories[imported_memories..built]) |m| { // free only owned ones built so far
             gpa.free(m.bytes);
             gpa.destroy(m);
         };
+        for (module.memories, 0..) |mt, i| {
+            if (i < imported_memories) {
+                if (i >= imports.memories.len) return error.MissingImport;
+                memories[i] = imports.memories[i];
+            } else {
+                const buf = try gpa.alloc(u8, @as(usize, mt.limits.min) * page_size);
+                @memset(buf, 0);
+                const mem_obj = gpa.create(Memory) catch |e| {
+                    gpa.free(buf);
+                    return e;
+                };
+                mem_obj.* = .{ .bytes = buf, .max = mt.limits.max };
+                memories[i] = mem_obj;
+                built = i + 1;
+            }
+        }
+        for (module.data) |seg| {
+            if (!seg.active) continue;
+            if (seg.mem_index >= memories.len) return error.NoMemory;
+            const bytes = memories[seg.mem_index].bytes;
+            const offset = try evalConstOffset(module, globals, seg.offset_expr);
+            if (@as(u64, offset) + seg.bytes.len > bytes.len) return error.MemoryOutOfBounds;
+            @memcpy(bytes[offset..][0..seg.bytes.len], seg.bytes);
+        }
 
         // Tables: imported tables (the low indices) borrow host-supplied shared
         // objects; defined tables allocate their own. Entries are `Value` slots
@@ -459,8 +471,8 @@ pub const Instance = struct {
             .globals = globals,
             .imported_funcs = module.importedFuncCount(),
             .import_funcs = imports.funcs,
-            .memory = memory,
-            .imported_memory = imported_memory,
+            .memories = memories,
+            .imported_memories = imported_memories,
             .tables = tables,
             .imported_tables = n_imported_tables,
             .elem_values = elem_values,
@@ -470,12 +482,13 @@ pub const Instance = struct {
     }
 
     pub fn deinit(self: *Instance) void {
-        // Free only owned (defined) memory/tables; imported ones belong to the
+        // Free only owned (defined) memories/tables; imported ones belong to the
         // exporting instance.
-        if (!self.imported_memory) if (self.memory) |m| {
+        for (self.memories[self.imported_memories..]) |m| {
             self.gpa.free(m.bytes);
             self.gpa.destroy(m);
-        };
+        }
+        self.gpa.free(self.memories);
         for (self.elem_values) |ev| self.gpa.free(ev);
         self.gpa.free(self.elem_values);
         self.gpa.free(self.elem_dropped);
@@ -1322,23 +1335,25 @@ const Frame = struct {
                     @memset(t[dst..][0..n], val);
                     pc += 1;
                 },
-                // --- Bulk memory ---
+                // --- Bulk memory (multi-memory: each carries its memory index) ---
                 .memory_copy => {
-                    const mem = (self.inst.memory orelse return error.NoMemory).bytes;
+                    const dmem = try self.memBytes(instr.imm.mem_copy.dst);
+                    const smem = try self.memBytes(instr.imm.mem_copy.src);
                     const n = @as(u32, @bitCast(self.popI32()));
                     const src = @as(u32, @bitCast(self.popI32()));
                     const dst = @as(u32, @bitCast(self.popI32()));
-                    if (@as(u64, src) + n > mem.len or @as(u64, dst) + n > mem.len) return error.MemoryOutOfBounds;
-                    // Ranges may overlap — copy in the safe direction.
-                    if (dst <= src) {
-                        std.mem.copyForwards(u8, mem[dst..][0..n], mem[src..][0..n]);
+                    if (@as(u64, src) + n > smem.len or @as(u64, dst) + n > dmem.len) return error.MemoryOutOfBounds;
+                    if (instr.imm.mem_copy.dst != instr.imm.mem_copy.src) {
+                        @memcpy(dmem[dst..][0..n], smem[src..][0..n]); // distinct buffers: no overlap
+                    } else if (dst <= src) {
+                        std.mem.copyForwards(u8, dmem[dst..][0..n], smem[src..][0..n]);
                     } else {
-                        std.mem.copyBackwards(u8, mem[dst..][0..n], mem[src..][0..n]);
+                        std.mem.copyBackwards(u8, dmem[dst..][0..n], smem[src..][0..n]);
                     }
                     pc += 1;
                 },
                 .memory_fill => {
-                    const mem = (self.inst.memory orelse return error.NoMemory).bytes;
+                    const mem = try self.memBytes(instr.imm.mem_index);
                     const n = @as(u32, @bitCast(self.popI32()));
                     const byte: u8 = @truncate(@as(u32, @bitCast(self.popI32())));
                     const dst = @as(u32, @bitCast(self.popI32()));
@@ -1347,8 +1362,8 @@ const Frame = struct {
                     pc += 1;
                 },
                 .memory_init => {
-                    const mem = (self.inst.memory orelse return error.NoMemory).bytes;
-                    const di = instr.imm.data;
+                    const mem = try self.memBytes(instr.imm.mem_init.mem);
+                    const di = instr.imm.mem_init.data;
                     // A dropped (or active, already-applied) segment reads as empty.
                     const seg: []const u8 = if (self.inst.data_dropped[di]) &.{} else self.inst.module.data[di].bytes;
                     const n = @as(u32, @bitCast(self.popI32()));
@@ -1695,31 +1710,38 @@ const Frame = struct {
         try self.pushI64(try applyInt(i64, u64, o, a, b));
     }
 
-    /// Load `T` from linear memory at (popped address + memarg offset), little-
-    /// endian. Signed `T` sign-extends, unsigned zero-extends when pushed.
+    /// The bytes of memory `idx` (multi-memory); `NoMemory` if out of range.
+    fn memBytes(self: *Frame, idx: u32) Error![]u8 {
+        if (idx >= self.inst.memories.len) return error.NoMemory;
+        return self.inst.memories[idx].bytes;
+    }
+
+    /// Load `T` from linear memory `ma.memory` at (popped address + memarg
+    /// offset), little-endian. Signed `T` sign-extends, unsigned zero-extends.
     fn load(self: *Frame, comptime T: type, ma: opcode.MemArg) Error!T {
         const n = @sizeOf(T);
         const base: u32 = @bitCast(self.popI32());
-        const mem = (self.inst.memory orelse return error.NoMemory).bytes;
+        const mem = try self.memBytes(ma.memory);
         const ea = @as(u64, base) + ma.offset;
         if (ea + n > mem.len) return error.MemoryOutOfBounds;
         return std.mem.readInt(T, mem[@intCast(ea)..][0..n], .little);
     }
 
-    /// Store `value: T` to linear memory at (popped address + memarg offset).
-    /// The caller has already popped the value; this pops the address.
+    /// Store `value: T` to linear memory `ma.memory` at (popped address + memarg
+    /// offset). The caller has already popped the value; this pops the address.
     fn store(self: *Frame, comptime T: type, ma: opcode.MemArg, value: T) Error!void {
         const n = @sizeOf(T);
         const base: u32 = @bitCast(self.popI32());
-        const mem = (self.inst.memory orelse return error.NoMemory).bytes;
+        const mem = try self.memBytes(ma.memory);
         const ea = @as(u64, base) + ma.offset;
         if (ea + n > mem.len) return error.MemoryOutOfBounds;
         std.mem.writeInt(T, mem[@intCast(ea)..][0..n], value, .little);
     }
 
-    fn memoryGrow(self: *Frame) Error!void {
+    fn memoryGrow(self: *Frame, mem_idx: u32) Error!void {
         const delta: u64 = @as(u32, @bitCast(self.popI32()));
-        const m = self.inst.memory orelse return error.NoMemory;
+        if (mem_idx >= self.inst.memories.len) return error.NoMemory;
+        const m = self.inst.memories[mem_idx];
         const old = m.bytes;
         const old_pages: u64 = old.len / page_size;
         const limit: u64 = m.max orelse 65536; // wasm32 hard cap
@@ -1732,13 +1754,13 @@ const Frame = struct {
     }
 
     fn execMemory(self: *Frame, instr: opcode.Instr) Error!void {
-        // memory.size / memory.grow carry a reserved-byte immediate, not a memarg.
+        // memory.size / memory.grow carry a memory index, not a memarg.
         switch (instr.op) {
             .memory_size => {
-                const mem = (self.inst.memory orelse return error.NoMemory).bytes;
+                const mem = try self.memBytes(instr.imm.mem_index);
                 return self.pushI32(@intCast(mem.len / page_size));
             },
-            .memory_grow => return self.memoryGrow(),
+            .memory_grow => return self.memoryGrow(instr.imm.mem_index),
             else => {},
         }
         const ma = instr.imm.mem;
@@ -2555,4 +2577,80 @@ test "legacy EH: rethrow from an inner catch propagates to an outer catch" {
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
     try std.testing.expectEqual(@as(i32, 9), asI32(r[0]));
+}
+
+// --- Multi-memory tests (Phase 7) ------------------------------------------
+// Two defined memories; loads/stores/bulk ops select one by index (the memarg's
+// bit-6 flag carries an explicit index). Hand-built binaries exercise decode +
+// execute directly (the CLI run path doesn't validate).
+
+test "multi-memory: a store to memory 1 does not touch memory 0 (index routing)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x01, 0x7f } }, // (func()->i32)
+        .{ .id = 5, .body = &.{ 0x02, 0x00, 0x01, 0x00, 0x01 } }, // 2 memories, each min 1
+        .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+        .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{&.{
+            0x00,
+            0x41, 0x00, 0x41, 0x07, 0x36, 0x02, 0x00, // i32.store mem0[0] = 7  (align 2, offset 0)
+            0x41, 0x00, 0x41, 0x09, 0x36, 0x42, 0x01, 0x00, // i32.store (memory 1) [0] = 9  (align|0x40, memidx 1)
+            0x41, 0x00, 0x28, 0x02, 0x00, // i32.load mem0[0]  -> 7 (not clobbered by the mem1 store)
+            0x0b,
+        }}) },
+    });
+    var inst = try instantiate(bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("f", &.{});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(i32, 7), asI32(r[0]));
+}
+
+test "multi-memory: memory.copy moves bytes between two memories" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x01, 0x7f } },
+        .{ .id = 5, .body = &.{ 0x02, 0x00, 0x01, 0x00, 0x01 } },
+        .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+        .{ .id = 7, .body = &.{ 0x01, 0x01, 'g', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{&.{
+            0x00,
+            0x41, 0x00, 0x41, 0x37, 0x36, 0x42, 0x01, 0x00, // i32.store (memory 1) [0] = 55
+            0x41, 0x00, 0x41, 0x00, 0x41, 0x01, 0xfc, 0x0a, 0x00, 0x01, // memory.copy dst=mem0 src=mem1 (dst0,src0,n1)
+            0x41, 0x00, 0x28, 0x02, 0x00, // i32.load mem0[0] -> 55 (copied from mem1)
+            0x0b,
+        }}) },
+    });
+    var inst = try instantiate(bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("g", &.{});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(i32, 55), asI32(r[0]));
+}
+
+test "multi-memory: memory.size / memory.grow select by index" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x01, 0x7f } },
+        // mem0 min 1, mem1 min 3
+        .{ .id = 5, .body = &.{ 0x02, 0x00, 0x01, 0x00, 0x03 } },
+        .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+        .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{&.{
+            0x00,
+            0x3f, 0x01, // memory.size (memory 1) -> 3
+            0x0b,
+        }}) },
+    });
+    var inst = try instantiate(bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("f", &.{});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(i32, 3), asI32(r[0])); // mem1 has 3 pages, not mem0's 1
 }

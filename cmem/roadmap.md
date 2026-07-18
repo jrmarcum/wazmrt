@@ -225,8 +225,19 @@ final-component `path_open` TOCTOU tied to std bug #18. See #17.
 
 > ### ✅ 4.3 (2026-07-16). ✅ 4.4 + Phase 5 (2026-07-17). ✅ Phase 6 exception handling — core +
 > **6.1 (WAT/`.wast`) + 6.2 (tag imports) + 6.3 (legacy EH) COMPLETE (2026-07-17)**. Both EH encodings
-> run. ⇢ START HERE next: the next frontier — **SIMD / multi-memory / the signature path** in
-> `security-model.md`.
+> run. ✅ **Phase 7 — multi-memory COMPLETE (2026-07-17)**. ⇢ START HERE next: **SIMD** (the last big
+> proposal on the list) or the **signature path** in `security-model.md`.
+>
+> **Phase 7 — multi-memory (2026-07-17):** a module may have >1 linear memory; every load/store/
+> `memory.*` selects one by index. `Instance.memory: ?*Memory` → `memories: []*Memory` +
+> `imported_memories` (borrowed lead the space; `memory0()` accessor keeps WASI/C-ABI single-memory
+> consumers working). Decode: the memarg alignment's **bit 6** flags an explicit memidx that follows
+> (`MemArg.memory`); `memory.size`/`grow`/`fill`/`copy`/`init` carry memidx(s) (`mem_index`/`mem_copy`/
+> `mem_init` immediates); active data segments already had a memidx (flag 2). Cross-memory `memory.copy`
+> handles distinct buffers (no overlap) vs same-index (directional). 3 hand-built binary tests (index
+> routing, cross-mem copy, `memory.size` by index); single-memory path unaffected (spec testsuite + all
+> tests green). **Deferred (low-value): the WAT assembler for multi-memory** — it assumes a single
+> memory throughout (spec-testsuite-critical), so text authoring of >1 memory is out; binaries run.
 >
 > **6.3 — legacy EH (2026-07-17):** the older `try`/`catch`/`catch_all`/`rethrow`/`delegate` encoding
 > (0x06/0x07/0x19/0x09/0x18) that older LLVM emits — decode + execute (no assembler, no validator; the

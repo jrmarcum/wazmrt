@@ -185,7 +185,7 @@ const Runner = struct {
             for (inst.module.exports) |e| {
                 if (e.type == .memory and std.mem.eql(u8, e.name, name)) {
                     if (!limitsFit(e.type.memory.limits, want.limits)) return error.IncompatibleImportType;
-                    return inst.memory orelse error.UnresolvedImport;
+                    return inst.memory0() orelse error.UnresolvedImport;
                 }
             }
         }

@@ -483,11 +483,11 @@ are ±10% noisy.)
 
 ## Reading the test count (updated 2026-07-17, Phase 6)
 
-`zig build test --summary all` prints **288** (284 pass, 4 skip), but there are **149 distinct tests**:
-139 in the core module (137 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
+`zig build test --summary all` prints **294** (290 pass, 4 skip), but there are **152 distinct tests**:
+142 in the core module (140 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
 `wasm_c_api.zig`, which imports `root.zig`, so it compiles and **re-runs the core module's tests too**
-(139 core + 10 C-ABI = 149), on top of the standalone `mod_tests` run (139) → 288 printed. Harmless —
-under a second — but **don't quote 288 as a test count**; quote **149**, or the per-target numbers from
+(142 core + 10 C-ABI = 152), on top of the standalone `mod_tests` run (142) → 294 printed. Harmless —
+under a second — but **don't quote 294 as a test count**; quote **152**, or the per-target numbers from
 `--summary all`. Two core tests skip on an unprivileged Windows box (the #17 real-symlink test and the
 traversal example gate — see below), so you'll usually see `2 skip` per run (`4` total).
 
@@ -515,6 +515,10 @@ index 0, proving imported tags lead the tag index space.
 **Phase 6.3 (legacy EH):** 4 hand-built binary tests in `interp.zig` — `try`/`catch` binding a payload,
 a non-throwing try skipping its handler, `catch_all`, and `rethrow` from an inner catch reaching an
 outer one. They use the non-validating `instantiate` helper (the validator does not model legacy try).
+
+**Phase 7 (multi-memory):** 3 hand-built binary tests in `interp.zig` — a store to memory 1 leaving
+memory 0 untouched (index routing via the memarg bit-6 flag), `memory.copy` between two memories, and
+`memory.size` selecting by index. Non-validating `instantiate`; the WAT assembler is single-memory-only.
 
 ## wasmtk WASI corpus — real-world conformance snapshot (2026-07-17)
 
