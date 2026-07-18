@@ -1884,7 +1884,7 @@ const Frame = struct {
         try self.pushV128(@bitCast(r));
     }
     /// A lane-wise binary op on float lanes of width `Lane`.
-    fn simdFloatBin(self: *Frame, comptime Lane: type, comptime op: enum { add, sub, mul, div }) Error!void {
+    fn simdFloatBin(self: *Frame, comptime Lane: type, comptime op: enum { add, sub, mul, div, min, max, pmin, pmax }) Error!void {
         const Vec = @Vector(16 / @sizeOf(Lane), Lane);
         const b: Vec = @bitCast(self.popV128());
         const a: Vec = @bitCast(self.popV128());
@@ -1893,15 +1893,104 @@ const Frame = struct {
             .sub => a - b,
             .mul => a * b,
             .div => a / b,
+            .min => @min(a, b),
+            .max => @max(a, b),
+            .pmin => @select(Lane, b < a, b, a), // pseudo-min: b if b<a else a
+            .pmax => @select(Lane, a < b, b, a),
         };
         try self.pushV128(@bitCast(r));
     }
+    /// A lane-wise unary op on float lanes. (ceil/floor/trunc/nearest — which
+    /// need round-to-even — are not wired yet; see the SIMD gap notes.)
+    fn simdFloatUn(self: *Frame, comptime Lane: type, comptime op: enum { abs, neg, sqrt, ceil, floor, trunc }) Error!void {
+        const Vec = @Vector(16 / @sizeOf(Lane), Lane);
+        const a: Vec = @bitCast(self.popV128());
+        const r: Vec = switch (op) {
+            .abs => @abs(a),
+            .neg => -a,
+            .sqrt => @sqrt(a),
+            .ceil => @ceil(a),
+            .floor => @floor(a),
+            .trunc => @trunc(a),
+        };
+        try self.pushV128(@bitCast(r));
+    }
+    /// Integer min/max (signed lanes if `Signed`), lane-wise.
+    fn simdIntMinMax(self: *Frame, comptime Lane: type, comptime want_max: bool) Error!void {
+        const Vec = @Vector(16 / @sizeOf(Lane), Lane);
+        const b: Vec = @bitCast(self.popV128());
+        const a: Vec = @bitCast(self.popV128());
+        const r: Vec = if (want_max) @max(a, b) else @min(a, b);
+        try self.pushV128(@bitCast(r));
+    }
+    /// Integer unary abs/neg, lane-wise (signed).
+    fn simdIntUn(self: *Frame, comptime Lane: type, comptime op: enum { abs, neg }) Error!void {
+        const Vec = @Vector(16 / @sizeOf(Lane), Lane);
+        const a: Vec = @bitCast(self.popV128());
+        const r: Vec = switch (op) {
+            .abs => @bitCast(@abs(a)), // @abs of a signed vector is unsigned; bitcast back (wraps INT_MIN correctly)
+            .neg => -%a,
+        };
+        try self.pushV128(@bitCast(r));
+    }
+    /// Lane-wise comparison → all-ones / all-zeros mask per lane (`Lane` is the
+    /// lane type; unsigned lanes give an unsigned compare).
+    fn simdCmp(self: *Frame, comptime Lane: type, comptime op: enum { eq, ne, lt, gt, le, ge }) Error!void {
+        const N = 16 / @sizeOf(Lane);
+        const Vec = @Vector(N, Lane);
+        const U = @Vector(N, std.meta.Int(.unsigned, @bitSizeOf(Lane)));
+        const b: Vec = @bitCast(self.popV128());
+        const a: Vec = @bitCast(self.popV128());
+        const m: @Vector(N, bool) = switch (op) {
+            .eq => a == b,
+            .ne => a != b,
+            .lt => a < b,
+            .gt => a > b,
+            .le => a <= b,
+            .ge => a >= b,
+        };
+        const ones: U = @splat(std.math.maxInt(std.meta.Int(.unsigned, @bitSizeOf(Lane))));
+        const zeros: U = @splat(0);
+        try self.pushV128(@bitCast(@select(std.meta.Int(.unsigned, @bitSizeOf(Lane)), m, ones, zeros)));
+    }
+    /// A vector shift (shl / shr) by a scalar amount (mod lane bits).
+    fn simdShift(self: *Frame, comptime Lane: type, comptime op: enum { shl, shr }) Error!void {
+        const N = 16 / @sizeOf(Lane);
+        const Vec = @Vector(N, Lane);
+        const ShiftLane = std.math.Log2Int(Lane);
+        const amt: ShiftLane = @intCast(@as(u32, @bitCast(self.popI32())) % @bitSizeOf(Lane));
+        const a: Vec = @bitCast(self.popV128());
+        const sh: @Vector(N, ShiftLane) = @splat(amt);
+        const r: Vec = switch (op) {
+            .shl => a << sh,
+            .shr => a >> sh, // arithmetic if Lane is signed, logical if unsigned
+        };
+        try self.pushV128(@bitCast(r));
+    }
+    fn simdAllTrue(self: *Frame, comptime Lane: type) Error!void {
+        const arr: [16 / @sizeOf(Lane)]Lane = @bitCast(self.popV128());
+        var all: bool = true;
+        for (arr) |x| if (x == 0) {
+            all = false;
+        };
+        try self.pushI32(if (all) 1 else 0);
+    }
+    fn simdBitmask(self: *Frame, comptime Lane: type) Error!void {
+        // The high bit of each lane, packed into the low bits of an i32.
+        const arr: [16 / @sizeOf(Lane)]Lane = @bitCast(self.popV128());
+        var m: u32 = 0;
+        for (arr, 0..) |x, i| {
+            if (@as(std.meta.Int(.unsigned, @bitSizeOf(Lane)), @bitCast(x)) >> (@bitSizeOf(Lane) - 1) != 0) m |= (@as(u32, 1) << @intCast(i));
+        }
+        try self.pushI32(@bitCast(m));
+    }
 
-    /// Execute a `0xFD` SIMD op. Supports a foundational subset — v128.const,
-    /// v128.load/store, splat, i32x4 lane get/set, and i8x16/i32x4/f32x4
-    /// arithmetic — enough to prove the two-slot v128 model. The rest of the
-    /// ~236-op family is mechanical fill-in following the same shape and traps
-    /// as `UnsupportedInstruction` for now.
+    /// Execute a `0xFD` SIMD op. Covers the common surface — const, load/store,
+    /// splat, lane get/set, shuffle/swizzle, bitwise, comparisons, integer &
+    /// float arithmetic (add/sub/mul/neg/abs/min/max/div/sqrt/shifts),
+    /// any_true/all_true/bitmask — via Zig `@Vector`. The remaining exotic ops
+    /// (saturating add/sub, narrow/extend/widen, dot, q15, extended-multiply,
+    /// pairwise, conversions, lane load/store, relaxed) trap `UnsupportedInstruction`.
     fn execSimd(self: *Frame, s: opcode.Simd) Error!void {
         switch (s.sub) {
             0x0c => try self.pushV128(s.bytes), // v128.const
@@ -1920,31 +2009,237 @@ const Frame = struct {
                 if (ea + 16 > mem.len) return error.MemoryOutOfBounds;
                 std.mem.writeInt(u128, mem[@intCast(ea)..][0..16], v, .little);
             },
-            0x0f => try self.pushV128(@bitCast(@as(@Vector(16, u8), @splat(@truncate(@as(u32, @bitCast(self.popI32()))))))), // i8x16.splat
-            0x11 => try self.pushV128(@bitCast(@as(@Vector(4, u32), @splat(@bitCast(self.popI32()))))), // i32x4.splat
-            0x13 => try self.pushV128(@bitCast(@as(@Vector(4, u32), @splat(@truncate(self.pop()))))), // f32x4.splat (bit pattern)
-            0x1b => { // i32x4.extract_lane (arrays are runtime-indexable, vectors aren't)
+            0x0d => { // i8x16.shuffle — 16 immediate byte indices into a++b (32 bytes)
+                const b: [16]u8 = @bitCast(self.popV128());
+                const a: [16]u8 = @bitCast(self.popV128());
+                const idx: [16]u8 = @bitCast(s.bytes);
+                var r: [16]u8 = undefined;
+                for (0..16) |i| r[i] = if (idx[i] < 16) a[idx[i]] else if (idx[i] < 32) b[idx[i] - 16] else 0;
+                try self.pushV128(@bitCast(r));
+            },
+            0x0e => { // i8x16.swizzle — runtime byte indices
+                const idx: [16]u8 = @bitCast(self.popV128());
+                const a: [16]u8 = @bitCast(self.popV128());
+                var r: [16]u8 = undefined;
+                for (0..16) |i| r[i] = if (idx[i] < 16) a[idx[i]] else 0;
+                try self.pushV128(@bitCast(r));
+            },
+            // splat
+            0x0f => try self.pushV128(@bitCast(@as(@Vector(16, u8), @splat(@truncate(@as(u32, @bitCast(self.popI32()))))))),
+            0x10 => try self.pushV128(@bitCast(@as(@Vector(8, u16), @splat(@truncate(@as(u32, @bitCast(self.popI32()))))))),
+            0x11 => try self.pushV128(@bitCast(@as(@Vector(4, u32), @splat(@bitCast(self.popI32()))))),
+            0x12 => try self.pushV128(@bitCast(@as(@Vector(2, u64), @splat(@bitCast(self.popI64()))))),
+            0x13 => try self.pushV128(@bitCast(@as(@Vector(4, u32), @splat(@truncate(self.pop()))))),
+            0x14 => try self.pushV128(@bitCast(@as(@Vector(2, u64), @splat(self.pop())))),
+            // extract_lane
+            0x15 => try self.extractLaneInt(i8, s.lane), // i8x16.extract_lane_s
+            0x16 => try self.extractLaneInt(u8, s.lane),
+            0x18 => try self.extractLaneInt(i16, s.lane),
+            0x19 => try self.extractLaneInt(u16, s.lane),
+            0x1b => { // i32x4.extract_lane
                 const arr: [4]u32 = @bitCast(self.popV128());
                 try self.pushI32(@bitCast(arr[s.lane]));
             },
-            0x1c => { // i32x4.replace_lane
-                const x: u32 = @bitCast(self.popI32());
+            0x1d => { // i64x2.extract_lane
+                const arr: [2]u64 = @bitCast(self.popV128());
+                try self.pushU64(arr[s.lane]);
+            },
+            0x1f => { // f32x4.extract_lane
+                const arr: [4]u32 = @bitCast(self.popV128());
+                try self.pushU64(arr[s.lane]);
+            },
+            0x21 => { // f64x2.extract_lane
+                const arr: [2]u64 = @bitCast(self.popV128());
+                try self.pushU64(arr[s.lane]);
+            },
+            // replace_lane
+            0x17 => try self.replaceLaneInt(u8, s.lane),
+            0x1a => try self.replaceLaneInt(u16, s.lane),
+            0x1c => try self.replaceLaneInt(u32, s.lane),
+            0x1e => { // i64x2.replace_lane
+                const x: u64 = @bitCast(self.popI64());
+                var arr: [2]u64 = @bitCast(self.popV128());
+                arr[s.lane] = x;
+                try self.pushV128(@bitCast(arr));
+            },
+            0x20 => { // f32x4.replace_lane
+                const x: u32 = @truncate(self.pop());
                 var arr: [4]u32 = @bitCast(self.popV128());
                 arr[s.lane] = x;
                 try self.pushV128(@bitCast(arr));
             },
-            0x1f => { // f32x4.extract_lane (push the 32-bit pattern as an f32 value)
-                const arr: [4]u32 = @bitCast(self.popV128());
-                try self.pushU64(arr[s.lane]);
+            0x22 => { // f64x2.replace_lane
+                const x: u64 = self.pop();
+                var arr: [2]u64 = @bitCast(self.popV128());
+                arr[s.lane] = x;
+                try self.pushV128(@bitCast(arr));
             },
-            0x6e => try self.simdIntBin(u8, .add), // i8x16.add
-            0xae => try self.simdIntBin(u32, .add), // i32x4.add
-            0xb1 => try self.simdIntBin(u32, .sub), // i32x4.sub
-            0xb5 => try self.simdIntBin(u32, .mul), // i32x4.mul
-            0xe4 => try self.simdFloatBin(f32, .add), // f32x4.add
-            0xe6 => try self.simdFloatBin(f32, .mul), // f32x4.mul
+            // comparisons — i8x16 / i16x8 / i32x4 (s/u), f32x4 / f64x2
+            0x23 => try self.simdCmp(u8, .eq),
+            0x24 => try self.simdCmp(u8, .ne),
+            0x25 => try self.simdCmp(i8, .lt),
+            0x26 => try self.simdCmp(u8, .lt),
+            0x27 => try self.simdCmp(i8, .gt),
+            0x28 => try self.simdCmp(u8, .gt),
+            0x29 => try self.simdCmp(i8, .le),
+            0x2a => try self.simdCmp(u8, .le),
+            0x2b => try self.simdCmp(i8, .ge),
+            0x2c => try self.simdCmp(u8, .ge),
+            0x2d => try self.simdCmp(u16, .eq),
+            0x2e => try self.simdCmp(u16, .ne),
+            0x2f => try self.simdCmp(i16, .lt),
+            0x30 => try self.simdCmp(u16, .lt),
+            0x31 => try self.simdCmp(i16, .gt),
+            0x32 => try self.simdCmp(u16, .gt),
+            0x33 => try self.simdCmp(i16, .le),
+            0x34 => try self.simdCmp(u16, .le),
+            0x35 => try self.simdCmp(i16, .ge),
+            0x36 => try self.simdCmp(u16, .ge),
+            0x37 => try self.simdCmp(u32, .eq),
+            0x38 => try self.simdCmp(u32, .ne),
+            0x39 => try self.simdCmp(i32, .lt),
+            0x3a => try self.simdCmp(u32, .lt),
+            0x3b => try self.simdCmp(i32, .gt),
+            0x3c => try self.simdCmp(u32, .gt),
+            0x3d => try self.simdCmp(i32, .le),
+            0x3e => try self.simdCmp(u32, .le),
+            0x3f => try self.simdCmp(i32, .ge),
+            0x40 => try self.simdCmp(u32, .ge),
+            0x41 => try self.simdCmp(f32, .eq),
+            0x42 => try self.simdCmp(f32, .ne),
+            0x43 => try self.simdCmp(f32, .lt),
+            0x44 => try self.simdCmp(f32, .gt),
+            0x45 => try self.simdCmp(f32, .le),
+            0x46 => try self.simdCmp(f32, .ge),
+            0x47 => try self.simdCmp(f64, .eq),
+            0x48 => try self.simdCmp(f64, .ne),
+            0x49 => try self.simdCmp(f64, .lt),
+            0x4a => try self.simdCmp(f64, .gt),
+            0x4b => try self.simdCmp(f64, .le),
+            0x4c => try self.simdCmp(f64, .ge),
+            // bitwise (whole v128)
+            0x4d => try self.pushV128(~self.popV128()), // v128.not
+            0x4e => { // v128.and
+                const b = self.popV128();
+                try self.pushV128(self.popV128() & b);
+            },
+            0x4f => { // v128.andnot
+                const b = self.popV128();
+                try self.pushV128(self.popV128() & ~b);
+            },
+            0x50 => { // v128.or
+                const b = self.popV128();
+                try self.pushV128(self.popV128() | b);
+            },
+            0x51 => { // v128.xor
+                const b = self.popV128();
+                try self.pushV128(self.popV128() ^ b);
+            },
+            0x52 => { // v128.bitselect: (a & c) | (b & ~c)
+                const c = self.popV128();
+                const b = self.popV128();
+                const a = self.popV128();
+                try self.pushV128((a & c) | (b & ~c));
+            },
+            0x53 => try self.pushI32(if (self.popV128() != 0) 1 else 0), // v128.any_true
+            // i8x16
+            0x60 => try self.simdIntUn(i8, .abs),
+            0x61 => try self.simdIntUn(i8, .neg),
+            0x63 => try self.simdAllTrue(u8),
+            0x64 => try self.simdBitmask(u8),
+            0x6b => try self.simdShift(u8, .shl),
+            0x6c => try self.simdShift(i8, .shr),
+            0x6d => try self.simdShift(u8, .shr),
+            0x6e => try self.simdIntBin(u8, .add),
+            0x71 => try self.simdIntBin(u8, .sub),
+            0x76 => try self.simdIntMinMax(i8, false),
+            0x77 => try self.simdIntMinMax(u8, false),
+            0x78 => try self.simdIntMinMax(i8, true),
+            0x79 => try self.simdIntMinMax(u8, true),
+            // i16x8
+            0x80 => try self.simdIntUn(i16, .abs),
+            0x81 => try self.simdIntUn(i16, .neg),
+            0x83 => try self.simdAllTrue(u16),
+            0x84 => try self.simdBitmask(u16),
+            0x8b => try self.simdShift(u16, .shl),
+            0x8c => try self.simdShift(i16, .shr),
+            0x8d => try self.simdShift(u16, .shr),
+            0x8e => try self.simdIntBin(u16, .add),
+            0x91 => try self.simdIntBin(u16, .sub),
+            0x95 => try self.simdIntBin(u16, .mul),
+            0x96 => try self.simdIntMinMax(i16, false),
+            0x97 => try self.simdIntMinMax(u16, false),
+            0x98 => try self.simdIntMinMax(i16, true),
+            0x99 => try self.simdIntMinMax(u16, true),
+            // i32x4
+            0xa0 => try self.simdIntUn(i32, .abs),
+            0xa1 => try self.simdIntUn(i32, .neg),
+            0xa3 => try self.simdAllTrue(u32),
+            0xa4 => try self.simdBitmask(u32),
+            0xab => try self.simdShift(u32, .shl),
+            0xac => try self.simdShift(i32, .shr),
+            0xad => try self.simdShift(u32, .shr),
+            0xae => try self.simdIntBin(u32, .add),
+            0xb1 => try self.simdIntBin(u32, .sub),
+            0xb5 => try self.simdIntBin(u32, .mul),
+            0xb6 => try self.simdIntMinMax(i32, false),
+            0xb7 => try self.simdIntMinMax(u32, false),
+            0xb8 => try self.simdIntMinMax(i32, true),
+            0xb9 => try self.simdIntMinMax(u32, true),
+            // i64x2
+            0xc1 => try self.simdIntUn(i64, .neg),
+            0xcb => try self.simdShift(u64, .shl),
+            0xcc => try self.simdShift(i64, .shr),
+            0xcd => try self.simdShift(u64, .shr),
+            0xce => try self.simdIntBin(u64, .add),
+            0xd1 => try self.simdIntBin(u64, .sub),
+            0xd5 => try self.simdIntBin(u64, .mul),
+            // f32x4
+            0xe0 => try self.simdFloatUn(f32, .abs),
+            0xe1 => try self.simdFloatUn(f32, .neg),
+            0xe3 => try self.simdFloatUn(f32, .sqrt),
+            0x67 => try self.simdFloatUn(f32, .ceil),
+            0x68 => try self.simdFloatUn(f32, .floor),
+            0x69 => try self.simdFloatUn(f32, .trunc),
+            0xe4 => try self.simdFloatBin(f32, .add),
+            0xe5 => try self.simdFloatBin(f32, .sub),
+            0xe6 => try self.simdFloatBin(f32, .mul),
+            0xe7 => try self.simdFloatBin(f32, .div),
+            0xe8 => try self.simdFloatBin(f32, .min),
+            0xe9 => try self.simdFloatBin(f32, .max),
+            0xea => try self.simdFloatBin(f32, .pmin),
+            0xeb => try self.simdFloatBin(f32, .pmax),
+            // f64x2
+            0xec => try self.simdFloatUn(f64, .abs),
+            0xed => try self.simdFloatUn(f64, .neg),
+            0xef => try self.simdFloatUn(f64, .sqrt),
+            0x74 => try self.simdFloatUn(f64, .ceil),
+            0x75 => try self.simdFloatUn(f64, .floor),
+            0x7a => try self.simdFloatUn(f64, .trunc),
+            0xf0 => try self.simdFloatBin(f64, .add),
+            0xf1 => try self.simdFloatBin(f64, .sub),
+            0xf2 => try self.simdFloatBin(f64, .mul),
+            0xf3 => try self.simdFloatBin(f64, .div),
+            0xf4 => try self.simdFloatBin(f64, .min),
+            0xf5 => try self.simdFloatBin(f64, .max),
+            0xf6 => try self.simdFloatBin(f64, .pmin),
+            0xf7 => try self.simdFloatBin(f64, .pmax),
             else => return error.UnsupportedInstruction,
         }
+    }
+
+    /// `iNxM.extract_lane_s/u`: read lane `lane` of type `Lane`, sign- or zero-
+    /// extend (per `Lane`'s signedness) to i32.
+    fn extractLaneInt(self: *Frame, comptime Lane: type, lane: u8) Error!void {
+        const arr: [16 / @sizeOf(Lane)]Lane = @bitCast(self.popV128());
+        try self.pushI32(@intCast(arr[lane]));
+    }
+    /// `iNxM.replace_lane`: set lane `lane` from a truncated i32.
+    fn replaceLaneInt(self: *Frame, comptime Lane: type, lane: u8) Error!void {
+        const x: Lane = @truncate(@as(u32, @bitCast(self.popI32())));
+        var arr: [16 / @sizeOf(Lane)]Lane = @bitCast(self.popV128());
+        arr[lane] = x;
+        try self.pushV128(@bitCast(arr));
     }
 };
 
@@ -2896,4 +3191,44 @@ test "SIMD: f32x4.mul lane-wise" {
 
 fn le32(x: u32) [4]u8 {
     return .{ @truncate(x), @truncate(x >> 8), @truncate(x >> 16), @truncate(x >> 24) };
+}
+
+test "SIMD: i32x4.eq produces an all-ones lane mask" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = [_]u8{ 0x00, 0xfd, 0x0c } ++ le32(1) ++ le32(2) ++ le32(3) ++ le32(4) ++
+        [_]u8{ 0xfd, 0x0c } ++ le32(1) ++ le32(9) ++ le32(3) ++ le32(9) ++
+        [_]u8{ 0xfd, 0x37, 0xfd, 0x1b, 0x00, 0x0b }; // i32x4.eq ; extract_lane 0 -> -1
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x01, 0x7f } },
+        .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+        .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{&body}) },
+    });
+    var inst = try instantiate(bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("f", &.{});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(i32, -1), asI32(r[0]));
+}
+
+test "SIMD: i32x4.max_s picks the signed max per lane" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = [_]u8{ 0x00, 0xfd, 0x0c } ++ le32(5) ++ le32(2) ++ le32(8) ++ le32(1) ++
+        [_]u8{ 0xfd, 0x0c } ++ le32(3) ++ le32(7) ++ le32(8) ++ le32(0) ++
+        [_]u8{ 0xfd, 0xb8, 0x01, 0xfd, 0x1b, 0x01, 0x0b }; // i32x4.max_s ; extract_lane 1 -> 7
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x01, 0x7f } },
+        .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+        .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{&body}) },
+    });
+    var inst = try instantiate(bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("f", &.{});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(i32, 7), asI32(r[0]));
 }

@@ -225,10 +225,13 @@ final-component `path_open` TOCTOU tied to std bug #18. See #17.
 
 > ### ✅ 4.3 (2026-07-16). ✅ 4.4 + Phase 5 (2026-07-17). ✅ Phase 6 exception handling — core +
 > **6.1 (WAT/`.wast`) + 6.2 (tag imports) + 6.3 (legacy EH) COMPLETE (2026-07-17)**. Both EH encodings
-> run. ✅ **Phase 7 — multi-memory COMPLETE (2026-07-17)**. 🚧 **Phase 8 — SIMD FOUNDATION laid
-> (2026-07-17)**: the hard part (the two-slot v128 value model) is done + proven; ~16 of ~236 ops run.
-> ⇢ START HERE next: **fill in more SIMD ops** (mechanical), fix the **drop/select-v128 width gap**
-> (needs a type pass), or the **signature path** in `security-model.md`.
+> run. ✅ **Phase 7 — multi-memory COMPLETE (2026-07-17)**. 🚧 **Phase 8 — SIMD: foundation + common
+> op set (2026-07-17)**: the two-slot v128 model + **~100 ops** run (all splat/lane/shuffle/swizzle,
+> comparisons, bitwise, int+float add/sub/mul/neg/abs/min/max, div/sqrt, shifts, any/all_true, bitmask).
+> ⇢ REMAINING TO FINISH SIMD: (1) **drop/select-v128 width** (silent-corruption gap — needs a type
+> pass); (2) **exotic ops** (saturating add/sub, narrow/extend/widen, dot, conversions, lane load/store,
+> pairwise, q15, relaxed) — these fail *loud* today; (3) **v128 globals**; (4) **validator** SIMD sigs +
+> **WAT assembler** for v128. Or pivot to the **signature path** in `security-model.md`.
 >
 > **Phase 8 — SIMD, foundational slice (2026-07-17).** Owner chose the **two-u64-slots** representation
 > for the 128-bit `v128` (no memory penalty for non-SIMD; correct; more work than widening). The
