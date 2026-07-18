@@ -219,6 +219,10 @@ const FuncBody = struct {
     /// For each legacy `try` index: its catch handlers + optional delegate; null
     /// elsewhere (Phase 6.3). Empty slice when there are no legacy trys.
     try_info: []const ?LegacyTry,
+    /// Operand slot width of each `drop`/`select` (2 for a v128, else 1), so the
+    /// interpreter pops the right number of `u64` slots (SIMD). Empty for a
+    /// function with no v128 — then every drop/select is width 1.
+    drop_select_w: []const u8,
 };
 
 /// One frame of a trap's call stack: where execution was when it trapped.
@@ -354,6 +358,26 @@ pub const Instance = struct {
             const ir = try opcode.decodeBody(a, code.body);
             const cf = try precomputeControlFlow(a, ir);
 
+            // v128 `drop`/`select` pop two slots, not one. A function can only
+            // hold a v128 if it has a SIMD op or a v128 param/local, so only then
+            // do we run the (validator-backed) width annotation — the common path
+            // pays nothing and every drop/select is width 1.
+            var has_v128 = false;
+            for (ft.params) |p| if (p == .v128) {
+                has_v128 = true;
+            };
+            for (code.locals) |l| if (l.type == .v128) {
+                has_v128 = true;
+            };
+            if (!has_v128) for (ir) |instr| if (instr.op == .simd) {
+                has_v128 = true;
+                break;
+            };
+            const drop_select_w: []const u8 = if (has_v128)
+                try @import("validate.zig").dropSelectWidths(a, module, ft, code)
+            else
+                &.{};
+
             // Build the local slot map: params first, then declared locals, each
             // starting at a running slot offset (v128 = 2 slots). Slot-sized
             // defaults: a reference local starts null, numeric/v128 zero.
@@ -401,6 +425,7 @@ pub const Instance = struct {
                 .end_of = cf.end_of,
                 .else_of = cf.else_of,
                 .try_info = cf.try_info,
+                .drop_select_w = drop_select_w,
             };
         }
 
@@ -979,14 +1004,22 @@ const Frame = struct {
                 .nop => pc += 1,
                 .@"unreachable" => return error.Unreachable,
                 .drop => {
-                    _ = self.pop();
+                    // A v128 is two slots; `dropWidth` is 2 there (SIMD), else 1.
+                    var k = self.dropSelectWidth(pc);
+                    while (k > 0) : (k -= 1) _ = self.pop();
                     pc += 1;
                 },
                 .select, .select_t => {
+                    const w = self.dropSelectWidth(pc);
                     const c = self.popI32();
-                    const b = self.pop();
-                    const av = self.pop();
-                    try self.pushU64(if (c != 0) av else b);
+                    var b: [2]Value = undefined;
+                    var av: [2]Value = undefined;
+                    var k: u8 = w;
+                    while (k > 0) : (k -= 1) b[k - 1] = self.pop(); // b (high slot first)
+                    k = w;
+                    while (k > 0) : (k -= 1) av[k - 1] = self.pop();
+                    const chosen = if (c != 0) av else b;
+                    for (0..w) |i| try self.pushU64(chosen[i]);
                     pc += 1;
                 },
 
@@ -1858,6 +1891,12 @@ const Frame = struct {
 
             else => unreachable,
         }
+    }
+
+    /// Slot width of the `drop`/`select` at `pc` (2 for a v128, else 1). Empty
+    /// annotation (a function with no v128) means every drop/select is width 1.
+    fn dropSelectWidth(self: *Frame, pc: usize) u8 {
+        return if (pc < self.body.drop_select_w.len) self.body.drop_select_w[pc] else 1;
     }
 
     // --- SIMD (v128): a value is two u64 stack slots, low then high --------
@@ -3231,4 +3270,65 @@ test "SIMD: i32x4.max_s picks the signed max per lane" {
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
     try std.testing.expectEqual(@as(i32, 7), asI32(r[0]));
+}
+
+test "SIMD: drop of a v128 pops both slots (width-aware)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // i32.const 42 ; v128.const(..) ; drop ; end  -> 42 (drop must remove BOTH v128 slots)
+    const body = [_]u8{ 0x00, 0x41, 0x2a, 0xfd, 0x0c } ++ le32(1) ++ le32(2) ++ le32(3) ++ le32(4) ++ [_]u8{ 0x1a, 0x0b };
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x01, 0x7f } },
+        .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+        .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{&body}) },
+    });
+    var inst = try instantiate(bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("f", &.{});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(i32, 42), asI32(r[0]));
+}
+
+test "SIMD: select of two v128s picks the whole vector (width-aware)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // v128.const A ; v128.const B ; i32.const 1 ; select ; i32x4.extract_lane 0 -> A[0] = 10
+    const body = [_]u8{ 0x00, 0xfd, 0x0c } ++ le32(10) ++ le32(20) ++ le32(30) ++ le32(40) ++
+        [_]u8{ 0xfd, 0x0c } ++ le32(50) ++ le32(60) ++ le32(70) ++ le32(80) ++
+        [_]u8{ 0x41, 0x01, 0x1b, 0xfd, 0x1b, 0x00, 0x0b };
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x01, 0x7f } },
+        .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+        .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{&body}) },
+    });
+    var inst = try instantiate(bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("f", &.{});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(i32, 10), asI32(r[0]));
+}
+
+test "SIMD: typed select (select_t v128) is width-aware" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // ... i32.const 0 ; select_t v128 ; extract_lane 0 -> B[0] = 50 (cond 0 picks second)
+    const body = [_]u8{ 0x00, 0xfd, 0x0c } ++ le32(10) ++ le32(20) ++ le32(30) ++ le32(40) ++
+        [_]u8{ 0xfd, 0x0c } ++ le32(50) ++ le32(60) ++ le32(70) ++ le32(80) ++
+        [_]u8{ 0x41, 0x00, 0x1c, 0x01, 0x7b, 0xfd, 0x1b, 0x00, 0x0b }; // select_t (1 type: v128)
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x01, 0x7f } },
+        .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+        .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{&body}) },
+    });
+    var inst = try instantiate(bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("f", &.{});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(i32, 50), asI32(r[0]));
 }

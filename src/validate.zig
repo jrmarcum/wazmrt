@@ -111,7 +111,7 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
 
     for (module.functions, module.code) |type_index, code| {
         const ft = module.funcSig(type_index) orelse return error.UndefinedType;
-        try validateFunction(arena.allocator(), module, ft, code);
+        try validateFunction(arena.allocator(), module, ft, code, null);
         _ = arena.reset(.retain_capacity);
     }
 }
@@ -184,7 +184,7 @@ fn validateConstExpr(module: *const Module, expr: []const u8, expected: V, self_
     if (sp != 1 or !subtypeOf(module, stack[0], expected)) return error.TypeMismatch;
 }
 
-fn validateFunction(a: std.mem.Allocator, module: *const Module, ft: Module.FuncType, code: Module.Code) Error!void {
+fn validateFunction(a: std.mem.Allocator, module: *const Module, ft: Module.FuncType, code: Module.Code, widths: ?[]u8) Error!void {
     // locals = parameters ++ declared locals (expanded from run-length form).
     var locals: std.ArrayList(V) = .empty;
     try locals.appendSlice(a, ft.params);
@@ -202,12 +202,38 @@ fn validateFunction(a: std.mem.Allocator, module: *const Module, ft: Module.Func
     const local_init = try a.alloc(bool, locals.items.len);
     for (local_init, locals.items, 0..) |*init, t, i| init.* = i < n_params or !t.isNonNullRef();
 
-    var v: FuncValidator = .{ .a = a, .module = module, .locals = locals.items, .results = ft.results, .local_init = local_init };
+    var v: FuncValidator = .{ .a = a, .module = module, .locals = locals.items, .results = ft.results, .local_init = local_init, .widths = widths };
     // The whole body is an implicit block of type [] -> results; its trailing
     // `end` closes this frame.
     try v.pushCtrl(.block, empty, ft.results);
-    for (instrs) |instr| try v.step(instr);
+    for (instrs, 0..) |instr, i| {
+        v.pc = i;
+        try v.step(instr);
+    }
     if (v.ctrls.items.len != 0) return error.ControlUnderflow; // missing `end`
+}
+
+/// Type-check one function *for the purpose of* annotating each `drop`/`select`
+/// with its operand slot width (2 for a v128, else 1) — the interpreter needs
+/// this to pop the right number of `u64` slots (a v128 is two). Returns an
+/// array indexed by instruction position (1 everywhere except v128 drop/select).
+///
+/// Only called for functions that actually use v128 (see `interp`), so the
+/// common non-SIMD path never pays for it. Tolerant: on a validation error it
+/// returns the widths captured **before** the error — an error can only be at or
+/// after an unsupported/invalid instruction, which the interpreter traps on
+/// before reaching any later drop/select, so those later widths are never used.
+pub fn dropSelectWidths(a: std.mem.Allocator, module: *const Module, ft: Module.FuncType, code: Module.Code) std.mem.Allocator.Error![]const u8 {
+    // The caller (interp) already decoded this body successfully, so re-decoding
+    // here fails only on OOM; a (hypothetical) decode error → empty = all width 1.
+    const instrs = opcode.decodeBody(a, code.body) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return &.{},
+    };
+    const widths = try a.alloc(u8, instrs.len);
+    @memset(widths, 1);
+    validateFunction(a, module, ft, code, widths) catch {};
+    return widths;
 }
 
 // --- The validation algorithm ---------------------------------------------
@@ -237,6 +263,21 @@ const FuncValidator = struct {
     local_init: []bool,
     vals: std.ArrayList(StackType) = .empty,
     ctrls: std.ArrayList(Frame) = .empty,
+    /// Optional: per-instruction operand *slot width* (2 for a v128 `drop`/
+    /// `select`, else 1), written as those ops are checked. Used by the interp to
+    /// pop the right slot count (SIMD). Null when validating for correctness only.
+    widths: ?[]u8 = null,
+    /// Index of the instruction currently being checked (for `widths`).
+    pc: usize = 0,
+
+    /// Record the slot width of a `drop`/`select` operand at the current pc
+    /// (2 for v128, else 1) when width-capture is on.
+    fn recordWidth(self: *FuncValidator, st: StackType) void {
+        if (self.widths) |w| w[self.pc] = switch (st) {
+            .val => |t| if (t == .v128) 2 else 1,
+            .unknown => 1, // polymorphic (unreachable code) — never executed
+        };
+    }
 
     fn pushValT(self: *FuncValidator, t: V) Error!void {
         try self.vals.append(self.a, .{ .val = t });
@@ -483,7 +524,10 @@ const FuncValidator = struct {
                 try self.pushVals(ft.results);
             },
 
-            .drop => _ = try self.popVal(),
+            .drop => {
+                const t = try self.popVal();
+                self.recordWidth(t);
+            },
             .select => {
                 // Untyped select: operands must be equal and a *numeric/vector*
                 // type — reference-typed operands require the typed form.
@@ -498,6 +542,7 @@ const FuncValidator = struct {
                         .val => |b| if (a == b) t1 else return error.TypeMismatch,
                     },
                 };
+                self.recordWidth(rt);
                 try self.pushVal(rt);
             },
             .select_t => {
@@ -508,7 +553,13 @@ const FuncValidator = struct {
                 _ = try self.popExpect(.i32);
                 _ = try self.popExpect(tys[0]);
                 _ = try self.popExpect(tys[0]);
+                if (self.widths) |w| w[self.pc] = if (tys[0] == .v128) 2 else 1;
                 try self.pushValT(tys[0]);
+            },
+            .simd => {
+                const s = simdSig(instr.imm.simd.sub);
+                try self.popVals(s.pop);
+                try self.pushVals(s.push);
             },
 
             .table_get => {
@@ -876,9 +927,51 @@ const f64_2: []const V = &.{ .f64, .f64 };
 const store_i64: []const V = &.{ .i32, .i64 }; // addr, value
 const store_f32: []const V = &.{ .i32, .f32 };
 const store_f64: []const V = &.{ .i32, .f64 };
+const v128_1: []const V = &.{.v128};
+const v128_2: []const V = &.{ .v128, .v128 };
+const v128_3: []const V = &.{ .v128, .v128, .v128 };
+const v128_shift: []const V = &.{ .v128, .i32 }; // vector, shift amount
+const addr_v128: []const V = &.{ .i32, .v128 }; // store / lane load-store: addr, vector
 
 fn sig(pop: []const V, push: []const V) FuncValidator.Sig {
     return .{ .pop = pop, .push = push };
+}
+
+/// Value-type signature of a `0xFD` SIMD op (by sub-opcode). Total — an
+/// unclassified op defaults to the common binary shape `v128,v128 -> v128`;
+/// that only affects functions using unimplemented ops, which trap at execution
+/// before the annotation is used (see `interp` drop/select width handling).
+fn simdSig(sub: u32) FuncValidator.Sig {
+    return switch (sub) {
+        0x00...0x0a, 0x5c, 0x5d => sig(i32_1, v128_1), // loads: addr -> v128
+        0x0b => sig(addr_v128, empty), // v128.store
+        0x54...0x57 => sig(addr_v128, v128_1), // load lane
+        0x58...0x5b => sig(addr_v128, empty), // store lane
+        0x0c => sig(empty, v128_1), // v128.const
+        0x0d, 0x0e => sig(v128_2, v128_1), // shuffle / swizzle
+        0x0f, 0x10, 0x11 => sig(i32_1, v128_1), // i8/i16/i32 splat
+        0x12 => sig(i64_1, v128_1), // i64x2.splat
+        0x13 => sig(f32_1, v128_1), // f32x4.splat
+        0x14 => sig(f64_1, v128_1), // f64x2.splat
+        0x15, 0x16, 0x18, 0x19, 0x1b => sig(v128_1, i32_1), // extract_lane -> i32
+        0x1d => sig(v128_1, i64_1),
+        0x1f => sig(v128_1, f32_1),
+        0x21 => sig(v128_1, f64_1),
+        0x17, 0x1a, 0x1c => sig(&.{ .v128, .i32 }, v128_1), // replace_lane
+        0x1e => sig(&.{ .v128, .i64 }, v128_1),
+        0x20 => sig(&.{ .v128, .f32 }, v128_1),
+        0x22 => sig(&.{ .v128, .f64 }, v128_1),
+        0x23...0x4c => sig(v128_2, v128_1), // comparisons
+        0x4d => sig(v128_1, v128_1), // v128.not
+        0x4e...0x51 => sig(v128_2, v128_1), // and/andnot/or/xor
+        0x52 => sig(v128_3, v128_1), // bitselect
+        0x53, 0x63, 0x83, 0xa3, 0xc3 => sig(v128_1, i32_1), // any_true / all_true
+        0x64, 0x84, 0xa4, 0xc4 => sig(v128_1, i32_1), // bitmask
+        0x6b...0x6d, 0x8b...0x8d, 0xab...0xad, 0xcb...0xcd => sig(v128_shift, v128_1), // shifts
+        // unary v128 -> v128: abs/neg/popcnt, sqrt, ceil/floor/trunc/nearest.
+        0x60, 0x61, 0x62, 0x80, 0x81, 0xa0, 0xa1, 0xc0, 0xc1, 0xe0, 0xe1, 0xe3, 0xec, 0xed, 0xef, 0x67, 0x68, 0x69, 0x6a, 0x74, 0x75, 0x7a, 0x94 => sig(v128_1, v128_1),
+        else => sig(v128_2, v128_1), // default: binary lane arithmetic
+    };
 }
 
 /// Fixed value-type signature for the numeric / comparison / conversion /

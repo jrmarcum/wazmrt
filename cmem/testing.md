@@ -483,10 +483,10 @@ are ±10% noisy.)
 
 ## Reading the test count (updated 2026-07-17, Phase 6)
 
-`zig build test --summary all` prints **306** (302 pass, 4 skip), but there are **158 distinct tests**:
-148 in the core module (146 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
+`zig build test --summary all` prints **312** (308 pass, 4 skip), but there are **161 distinct tests**:
+151 in the core module (149 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
 `wasm_c_api.zig`, which imports `root.zig`, so it compiles and **re-runs the core module's tests too**
-(148 core + 10 C-ABI = 158), on top of the standalone `mod_tests` run (148) → 306 printed. Harmless —
+(151 core + 10 C-ABI = 161), on top of the standalone `mod_tests` run (151) → 312 printed. Harmless —
 under a second — but **don't quote 294 as a test count**; quote **152**, or the per-target numbers from
 `--summary all`. Two core tests skip on an unprivileged Windows box (the #17 real-symlink test and the
 traversal example gate — see below), so you'll usually see `2 skip` per run (`4` total).
@@ -524,9 +524,10 @@ memory 0 untouched (index routing via the memarg bit-6 flag), `memory.copy` betw
 `i32x4.add` + `extract_lane`; splat→store→load→extract; `f32x4.mul`; `i32x4.eq` (all-ones mask); and
 `i32x4.max_s` — plus a `v128.const` decode test in `opcode.zig`. ~100 ops implemented (splat/lane/
 shuffle/swizzle, comparisons, bitwise, int+float arith, shifts, min/max, any/all_true, bitmask).
-**Known gaps (fail *loud* except the first):** `drop`/untyped-`select` of a v128 (width not tracked — the
-one silent-corruption path); exotic ops (saturating/narrow/extend/dot/conversions/lane-load-store);
-v128 globals/GC-fields; no `.wat`/validator SIMD path.
+The **drop/select-v128 width fix** adds 3 tests (drop a v128 and still read the value below it; `select`
+and `select_t` of two v128s pick the whole vector) — each would return the wrong scalar if drop/select
+popped one slot. **Remaining gaps (all fail *loud*):** exotic ops (saturating/narrow/extend/dot/
+conversions/lane-load-store); v128 globals/GC-fields; no WAT assembler for v128.
 
 ## wasmtk WASI corpus — real-world conformance snapshot (2026-07-17)
 

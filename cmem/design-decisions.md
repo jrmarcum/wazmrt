@@ -288,11 +288,17 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
     `num_local_slots`), **block/branch arity**, **call arg/result counts**, and the `invoke` arg check —
     all now in *slots*. A module with no v128 keeps all widths at 1, so the non-SIMD path is byte-for-byte
     unchanged (verified: full suite green). The `0xFD` family is one `Op.simd` tag carrying `imm.simd.sub`
-    (a u8 `Op` can't hold 236 ops); `execSimd` runs a subset via Zig `@Vector`. **THE LIMITATION TO CLOSE:
-    `drop` and untyped `select` of a v128 are not width-aware** — with no per-slot type info the interp
-    mis-counts and corrupts the stack; fixing it needs a type-annotation pass (the validator has the
-    types). v128 globals/GC-fields and the WAT assembler are also unbuilt. Full scope + op list in
-    `roadmap.md` Phase 8.
+    (a u8 `Op` can't hold 236 ops); `execSimd` runs ~100 ops via Zig `@Vector`. **The drop/select-v128
+    width gap is CLOSED via the validator (2026-07-17):** `drop`/untyped-`select` carry no operand type,
+    so the interp couldn't tell a 2-slot v128 from a 1-slot scalar. Rather than duplicate type inference,
+    the **validator** (which already tracks the full type stack, control flow, and unreachable) now
+    type-checks SIMD (`simdSig`, total) and records each `drop`/`select` operand's slot width;
+    `validate.dropSelectWidths` returns it. The interp runs this **only for v128 functions** (a SIMD op
+    or v128 param/local — the common path pays nothing) and pops the right slots. **Tolerant:** on a
+    validation error it keeps the widths captured before it — an error can only be at/after an
+    unsupported op, which the interp traps on before any later drop/select runs, so those widths are
+    never used. Bonus: v128 modules now get real SIMD validation. Still unbuilt: exotic ops (fail loud),
+    v128 globals/GC-fields, WAT assembler for v128. Full list in `roadmap.md` Phase 8.
   - **Multi-memory — IN SCOPE; BUILT 2026-07-17 (Phase 7).** A module may have >1 linear memory;
     load/store/`memory.*` select by index. The runtime holds `Instance.memories: []*Memory` (imported
     lead, then defined); a load/store memarg's **alignment bit 6** flags an explicit memory index that
