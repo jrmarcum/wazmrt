@@ -226,14 +226,15 @@ final-component `path_open` TOCTOU tied to std bug #18. See #17.
 > ### ✅ 4.3 (2026-07-16). ✅ 4.4 + Phase 5 (2026-07-17). ✅ Phase 6 exception handling — core +
 > **6.1 (WAT/`.wast`) + 6.2 (tag imports) + 6.3 (legacy EH) COMPLETE (2026-07-17)**. Both EH encodings
 > run. ✅ **Phase 7 — multi-memory COMPLETE (2026-07-17)**. 🚧 **Phase 8 — SIMD: foundation + common
-> op set + drop/select fix (2026-07-17)**: the two-slot v128 model + **~100 ops** (splat/lane/shuffle/
-> swizzle, comparisons, bitwise, int+float arith, shifts, any/all_true, bitmask), and the
+> op set + drop/select fix (2026-07-17)**: the two-slot v128 model + **~140 ops** (splat/lane/shuffle/
+> swizzle, comparisons, bitwise, int+float arith, shifts, any/all_true, bitmask, saturating add/sub,
 > **drop/select-v128 silent-corruption gap is CLOSED** — the validator now type-checks SIMD (`simdSig`)
 > and annotates each `drop`/`select` operand slot width; the interp runs it per-v128-function
-> (`dropSelectWidths`, tolerant) and pops the right slots. ⇢ REMAINING TO FINISH SIMD: (1) **exotic ops**
-> (saturating add/sub, narrow/extend/widen, dot, conversions, lane load/store, pairwise, q15, relaxed) —
-> these fail *loud* today; (2) **v128 globals**; (3) **WAT assembler** for v128 (`.wat` authoring).
-> Or pivot to the **signature path** in `security-model.md`.
+> (`dropSelectWidths`, tolerant) and pops the right slots. avgr, popcnt, extend/narrow, int<->float
+> convert + trunc_sat, promote/demote are in too. ⇢ REMAINING: (1) a few rare ops (extmul, dot,
+> extadd_pairwise, q15mulr, lane load/store, relaxed) — fail *loud*; (2) **v128 globals** (rare, fails
+> loud — needs slot-indexed global storage + v128.const const-exprs); (3) the **WAT assembler** for v128
+> (`.wat` authoring; binaries run). Or pivot to the **signature path**.
 >
 > **Phase 8 — SIMD, foundational slice (2026-07-17).** Owner chose the **two-u64-slots** representation
 > for the 128-bit `v128` (no memory penalty for non-SIMD; correct; more work than widening). The

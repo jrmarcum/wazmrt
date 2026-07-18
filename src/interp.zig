@@ -1910,7 +1910,7 @@ const Frame = struct {
         return (@as(u128, hi) << 64) | lo;
     }
 
-    /// A lane-wise binary op on integer lanes of width `Lane` (wrapping arithmetic).
+    /// A lane-wise wrapping binary op on integer lanes of width `Lane`.
     fn simdIntBin(self: *Frame, comptime Lane: type, comptime op: enum { add, sub, mul }) Error!void {
         const Vec = @Vector(16 / @sizeOf(Lane), Lane);
         const b: Vec = @bitCast(self.popV128());
@@ -1921,6 +1921,77 @@ const Frame = struct {
             .mul => a *% b,
         };
         try self.pushV128(@bitCast(r));
+    }
+    /// Saturating add/sub on integer lanes: widen a lane, compute, clamp back to
+    /// `Lane`'s range (signedness of `Lane` decides signed vs unsigned saturation).
+    fn simdSatAddSub(self: *Frame, comptime Lane: type, comptime is_add: bool) Error!void {
+        const N = 16 / @sizeOf(Lane);
+        const Wide = std.meta.Int(@typeInfo(Lane).int.signedness, @bitSizeOf(Lane) + 1);
+        const b: [N]Lane = @bitCast(self.popV128());
+        const a: [N]Lane = @bitCast(self.popV128());
+        var r: [N]Lane = undefined;
+        for (0..N) |i| {
+            const s: Wide = if (is_add) @as(Wide, a[i]) + b[i] else @as(Wide, a[i]) - b[i];
+            r[i] = satTo(Lane, s);
+        }
+        try self.pushV128(@bitCast(r));
+    }
+    /// Unsigned rounding average: (a + b + 1) >> 1, computed a lane wider so it
+    /// can't overflow.
+    fn simdAvgrU(self: *Frame, comptime Lane: type) Error!void {
+        const N = 16 / @sizeOf(Lane);
+        const W = std.meta.Int(.unsigned, @bitSizeOf(Lane) + 1);
+        const b: [N]Lane = @bitCast(self.popV128());
+        const a: [N]Lane = @bitCast(self.popV128());
+        var r: [N]Lane = undefined;
+        for (0..N) |i| r[i] = @intCast((@as(W, a[i]) + @as(W, b[i]) + 1) >> 1);
+        try self.pushV128(@bitCast(r));
+    }
+    /// popcount per lane.
+    fn simdPopcnt(self: *Frame, comptime Lane: type) Error!void {
+        const Vec = @Vector(16 / @sizeOf(Lane), Lane);
+        const a: Vec = @bitCast(self.popV128());
+        const r: Vec = @intCast(@popCount(a)); // @popCount lanes are narrower; widen back
+        try self.pushV128(@bitCast(r));
+    }
+    /// Widen the low or high half of the operand: each `Src` lane → a `Dst` lane
+    /// (sign- or zero-extend per `Src`'s signedness).
+    fn simdExtend(self: *Frame, comptime Src: type, comptime Dst: type, comptime high: bool) Error!void {
+        const src: [16 / @sizeOf(Src)]Src = @bitCast(self.popV128());
+        var dst: [16 / @sizeOf(Dst)]Dst = undefined;
+        const base: usize = if (high) dst.len else 0;
+        for (0..dst.len) |i| dst[i] = src[base + i];
+        try self.pushV128(@bitCast(dst));
+    }
+    /// Narrow two `Src` vectors into one `Dst` vector with saturation.
+    fn simdNarrow(self: *Frame, comptime Src: type, comptime Dst: type) Error!void {
+        const b: [16 / @sizeOf(Src)]Src = @bitCast(self.popV128());
+        const a: [16 / @sizeOf(Src)]Src = @bitCast(self.popV128());
+        var r: [16 / @sizeOf(Dst)]Dst = undefined;
+        const half = a.len;
+        for (0..half) |i| r[i] = satTo(Dst, a[i]);
+        for (0..half) |i| r[half + i] = satTo(Dst, b[i]);
+        try self.pushV128(@bitCast(r));
+    }
+    /// Convert integer lanes to float lanes (widening a low half for f64x2).
+    fn simdConvert(self: *Frame, comptime Src: type, comptime Dst: type, comptime low_only: bool) Error!void {
+        const N = 16 / @sizeOf(Dst);
+        const src: [16 / @sizeOf(Src)]Src = @bitCast(self.popV128());
+        var dst: [N]Dst = undefined;
+        for (0..N) |i| dst[i] = if (low_only or i < src.len) @floatFromInt(src[i]) else 0;
+        try self.pushV128(@bitCast(dst));
+    }
+    /// Truncate float lanes to saturated integer lanes (NaN→0). `low_only` zeroes
+    /// the high half (the `_zero` forms narrowing f64x2 → i32x4).
+    fn simdTruncSat(self: *Frame, comptime Src: type, comptime Dst: type, comptime low_only: bool) Error!void {
+        const N = 16 / @sizeOf(Dst);
+        const src: [16 / @sizeOf(Src)]Src = @bitCast(self.popV128());
+        var dst: [N]Dst = undefined;
+        for (0..N) |i| dst[i] = if (i < src.len) satTruncLane(Dst, src[i]) else 0;
+        if (low_only) for (src.len..N) |i| {
+            dst[i] = 0;
+        };
+        try self.pushV128(@bitCast(dst));
     }
     /// A lane-wise binary op on float lanes of width `Lane`.
     fn simdFloatBin(self: *Frame, comptime Lane: type, comptime op: enum { add, sub, mul, div, min, max, pmin, pmax }) Error!void {
@@ -2263,6 +2334,56 @@ const Frame = struct {
             0xf5 => try self.simdFloatBin(f64, .max),
             0xf6 => try self.simdFloatBin(f64, .pmin),
             0xf7 => try self.simdFloatBin(f64, .pmax),
+            // saturating add/sub, avgr, popcnt, i64 abs
+            0x6f => try self.simdSatAddSub(i8, true),
+            0x70 => try self.simdSatAddSub(u8, true),
+            0x72 => try self.simdSatAddSub(i8, false),
+            0x73 => try self.simdSatAddSub(u8, false),
+            0x8f => try self.simdSatAddSub(i16, true),
+            0x90 => try self.simdSatAddSub(u16, true),
+            0x92 => try self.simdSatAddSub(i16, false),
+            0x93 => try self.simdSatAddSub(u16, false),
+            0x7b => try self.simdAvgrU(u8),
+            0x9b => try self.simdAvgrU(u16),
+            0x62 => try self.simdPopcnt(u8),
+            0xc0 => try self.simdIntUn(i64, .abs),
+            // extend (widen) low/high halves
+            0x87 => try self.simdExtend(i8, i16, false),
+            0x88 => try self.simdExtend(i8, i16, true),
+            0x89 => try self.simdExtend(u8, u16, false),
+            0x8a => try self.simdExtend(u8, u16, true),
+            0xa7 => try self.simdExtend(i16, i32, false),
+            0xa8 => try self.simdExtend(i16, i32, true),
+            0xa9 => try self.simdExtend(u16, u32, false),
+            0xaa => try self.simdExtend(u16, u32, true),
+            0xc7 => try self.simdExtend(i32, i64, false),
+            0xc8 => try self.simdExtend(i32, i64, true),
+            0xc9 => try self.simdExtend(u32, u64, false),
+            0xca => try self.simdExtend(u32, u64, true),
+            // narrow (saturating)
+            0x65 => try self.simdNarrow(i16, i8),
+            0x66 => try self.simdNarrow(i16, u8),
+            0x85 => try self.simdNarrow(i32, i16),
+            0x86 => try self.simdNarrow(i32, u16),
+            // int<->float conversions
+            0xfa => try self.simdConvert(i32, f32, false), // f32x4.convert_i32x4_s
+            0xfb => try self.simdConvert(u32, f32, false),
+            0xfe => try self.simdConvert(i32, f64, true), // f64x2.convert_low_i32x4_s
+            0xff => try self.simdConvert(u32, f64, true),
+            0xf8 => try self.simdTruncSat(f32, i32, false), // i32x4.trunc_sat_f32x4_s
+            0xf9 => try self.simdTruncSat(f32, u32, false),
+            0xfc => try self.simdTruncSat(f64, i32, true), // ..._f64x2_s_zero
+            0xfd => try self.simdTruncSat(f64, u32, true),
+            0x5e => { // f64x2.promote_low_f32x4
+                const src: [4]f32 = @bitCast(self.popV128());
+                const dst = [2]f64{ src[0], src[1] };
+                try self.pushV128(@bitCast(dst));
+            },
+            0x5f => { // f32x4.demote_f64x2_zero
+                const src: [2]f64 = @bitCast(self.popV128());
+                const dst = [4]f32{ @floatCast(src[0]), @floatCast(src[1]), 0, 0 };
+                try self.pushV128(@bitCast(dst));
+            },
             else => return error.UnsupportedInstruction,
         }
     }
@@ -2281,6 +2402,25 @@ const Frame = struct {
         try self.pushV128(@bitCast(arr));
     }
 };
+
+/// Clamp an integer `x` into `Dst`'s range (saturating narrow).
+fn satTo(comptime Dst: type, x: anytype) Dst {
+    const lo = std.math.minInt(Dst);
+    const hi = std.math.maxInt(Dst);
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return @intCast(x);
+}
+
+/// Truncate a float toward zero into `Int`'s range, saturating; NaN → 0. The
+/// bounds are compared in f64 (which represents i32/u32 bounds exactly, unlike f32).
+fn satTruncLane(comptime Int: type, x: anytype) Int {
+    if (std.math.isNan(x)) return 0;
+    const tf: f64 = @trunc(x);
+    if (tf <= @as(f64, std.math.minInt(Int))) return std.math.minInt(Int);
+    if (tf >= @as(f64, std.math.maxInt(Int))) return std.math.maxInt(Int);
+    return @intFromFloat(tf);
+}
 
 /// Evaluate a constant offset expression (data / element segment offset) to an
 /// i32 address.
@@ -3331,4 +3471,43 @@ test "SIMD: typed select (select_t v128) is width-aware" {
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
     try std.testing.expectEqual(@as(i32, 50), asI32(r[0]));
+}
+
+test "SIMD: i8x16.add_sat_s saturates instead of wrapping" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // splat(100) + splat(100) with signed saturation -> 127 (not -56 wrap).
+    // 100 is encoded as multi-byte SLEB (0xe4 0x00) — a single 0x64 byte is -28.
+    const body = [_]u8{ 0x00, 0x41, 0xe4, 0x00, 0xfd, 0x0f, 0x41, 0xe4, 0x00, 0xfd, 0x0f, 0xfd, 0x6f, 0xfd, 0x15, 0x00, 0x0b };
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x01, 0x7f } },
+        .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+        .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{&body}) },
+    });
+    var inst = try instantiate(bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("f", &.{});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(i32, 127), asI32(r[0]));
+}
+
+test "SIMD: i16x8.extend_low_i8x16_s sign-extends" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // splat(-1) as i8x16 ; extend_low_s -> i16 ; extract_lane_s 0 -> -1 (not 255)
+    const body = [_]u8{ 0x00, 0x41, 0x7f, 0xfd, 0x0f, 0xfd, 0x87, 0x01, 0xfd, 0x18, 0x00, 0x0b };
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x01, 0x7f } },
+        .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+        .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{&body}) },
+    });
+    var inst = try instantiate(bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("f", &.{});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(i32, -1), asI32(r[0]));
 }
