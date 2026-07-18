@@ -481,13 +481,13 @@ V8. **Decision:** build the shipped `.lib`/`.dll` (and the freestanding wasm —
 `design-decisions.md`. (Caveat: single machine; sizes + steady-state are solid, the µs/ms cold numbers
 are ±10% noisy.)
 
-## Reading the test count (updated 2026-07-18, Phase 8 WAT-SIMD)
+## Reading the test count (updated 2026-07-18, Phase 8 rare-SIMD)
 
-`zig build test --summary all` prints **336** (332 pass, 4 skip), but there are **168 distinct tests**:
-158 in the core module (156 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
+`zig build test --summary all` prints **330** (326 pass, 4 skip), but there are **170 distinct tests**:
+160 in the core module (158 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
 `wasm_c_api.zig`, which imports `root.zig`, so it compiles and **re-runs the core module's tests too**
-(158 core + 10 C-ABI = 168), on top of the standalone `mod_tests` run (158) → 336 printed. Harmless —
-under a second — but **don't quote the printed number as a test count**; quote **156**, or the per-target
+(160 core + 10 C-ABI = 170), on top of the standalone `mod_tests` run (160) → 330 printed. Harmless —
+under a second — but **don't quote the printed number as a test count**; quote **158**, or the per-target
 numbers from `--summary all`. Two core tests skip on an unprivileged Windows box (the #17 real-symlink test and the
 traversal example gate — see below), so you'll usually see `2 skip` per run (`4` total).
 
@@ -533,8 +533,17 @@ run: folded `i32x4.splat`+`add`+`extract_lane`; `v128.const i32x4`; flat-form `f
 test covering `v128.store`/`v128.load` with `offset=`/`align=` memargs, `i8x16.shuffle` (16-byte immediate),
 and a signed `i8x16.const` lane (`-1` → `extract_lane_u` = 255). The assembler adds a ~130-entry
 name→sub-opcode table (`lookupSimd`) intercepted in both `emitFoldedOne`/`emitFlatOne`, immediate parsing
-for `v128.const` (all 6 shapes), lane index, shuffle bytes, and memarg. **Remaining gaps (all fail
-*loud*):** exotic ops (dot/extmul/extadd_pairwise/q15mulr/relaxed/lane-load-store); v128 GC-fields.
+for `v128.const` (all 6 shapes), lane index, shuffle bytes, and memarg.
+
+**Rare-SIMD completion (2026-07-18):** 2 more round-trip tests in `wat.zig` cover the last common-SIMD
+gaps: `extmul` (low/high, i16x8/i32x4/i64x2), `i32x4.dot_i16x8_s`, `extadd_pairwise`, `i16x8.q15mulr_sat_s`,
+`i64x2` comparisons (eq/ne/lt_s/gt_s/le_s/ge_s), and the memory family — `load8x8`/`load16x4`/`load32x2`
+widening loads, `loadN_splat`, `load32/64_zero`, and `loadN_lane`/`storeN_lane` (memarg **plus** a lane
+immediate — a new `.mem_lane` assembler shape; per-op **natural-alignment defaults** via `simdNaturalAlign`,
+or an omitted-`align=` `load8_splat` would be rejected as over-aligned). Also fixed a **latent validator
+bug**: the unary ops `extend`/`convert`/`trunc_sat`/`promote`/`demote`/`extadd_pairwise` were hitting the
+binary `else` default in `simdSig`, which would mis-count v128 operands for `drop`/`select` width tracking.
+**Remaining gaps (fail *loud*):** relaxed-SIMD ops; v128 GC-fields.
 
 ## wasmtk WASI corpus — real-world conformance snapshot (2026-07-17)
 

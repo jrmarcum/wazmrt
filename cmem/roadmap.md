@@ -234,10 +234,14 @@ final-component `path_open` TOCTOU tied to std bug #18. See #17.
 > convert + trunc_sat, promote/demote are in too. ✅ **WAT assembler for v128 DONE (2026-07-18)** — a
 > ~130-entry `lookupSimd` name→sub-opcode table intercepted in `emitFoldedOne`/`emitFlatOne`, plus
 > immediate parsing for `v128.const` (all 6 shapes), lane index, `i8x16.shuffle` bytes, and load/store
-> memargs; 4 round-trip tests. `.wat`/`.wast` can now author SIMD. ⇢ REMAINING: (1) a few rare ops
-> (extmul, dot, extadd_pairwise, q15mulr, lane load/store, relaxed) — fail *loud*; (2) v128 GC-fields
-> (v128 globals DONE via parallel high-64 array, fails loud only for the rare
-> imported-v128-global-in-const-expr case). Or pivot to the **signature path**.
+> memargs; 4 round-trip tests. `.wat`/`.wast` can now author SIMD. ✅ **Rare-SIMD ops DONE (2026-07-18)**
+> — extmul (all 3 widths, low/high), `i32x4.dot_i16x8_s`, extadd_pairwise, `i16x8.q15mulr_sat_s`, i64x2
+> comparisons, and the whole memory family (widening loadMxN, loadN_splat, load32/64_zero, loadN_lane/
+> storeN_lane with a new `.mem_lane` assembler shape + per-op natural-align defaults). Also fixed a latent
+> `simdSig` bug (unary extend/convert/trunc_sat/promote/demote were typed binary → drop/select mis-count).
+> ⇢ REMAINING (fail *loud*): (1) relaxed-SIMD ops; (2) v128 GC-fields (v128 globals DONE via parallel
+> high-64 array, fails loud only for the rare imported-v128-global-in-const-expr case). Or pivot to the
+> **signature path**.
 >
 > **Phase 8 — SIMD, foundational slice (2026-07-17).** Owner chose the **two-u64-slots** representation
 > for the 128-bit `v128` (no memory penalty for non-SIMD; correct; more work than widening). The

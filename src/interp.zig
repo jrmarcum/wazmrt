@@ -2114,12 +2114,102 @@ const Frame = struct {
         try self.pushI32(@bitCast(m));
     }
 
-    /// Execute a `0xFD` SIMD op. Covers the common surface — const, load/store,
-    /// splat, lane get/set, shuffle/swizzle, bitwise, comparisons, integer &
-    /// float arithmetic (add/sub/mul/neg/abs/min/max/div/sqrt/shifts),
-    /// any_true/all_true/bitmask — via Zig `@Vector`. The remaining exotic ops
-    /// (saturating add/sub, narrow/extend/widen, dot, q15, extended-multiply,
-    /// pairwise, conversions, lane load/store, relaxed) trap `UnsupportedInstruction`.
+    /// Pop an address and compute the effective address for a SIMD memory op,
+    /// bounds-checking `n` bytes. `offset` is a `u32` and the base a `u32`, so
+    /// `base + offset + n` cannot overflow `u64` — the check is exact.
+    fn simdMemEA(self: *Frame, ma: opcode.MemArg, n: u64) Error!struct { mem: []u8, ea: usize } {
+        const base: u32 = @bitCast(self.popI32());
+        const mem = try self.memBytes(ma.memory);
+        const ea = @as(u64, base) + ma.offset;
+        if (ea + n > mem.len) return error.MemoryOutOfBounds;
+        return .{ .mem = mem, .ea = @intCast(ea) };
+    }
+    /// `v128.loadMxN_s/u`: load 8 bytes as `Src` lanes, widen each to `Dst`.
+    fn simdLoadExtend(self: *Frame, comptime Src: type, comptime Dst: type, ma: opcode.MemArg) Error!void {
+        const N = 8 / @sizeOf(Src); // 8 source bytes → N lanes; N*sizeof(Dst)==16
+        const r = try self.simdMemEA(ma, 8);
+        const src: [N]Src = @bitCast(r.mem[r.ea..][0..8].*);
+        var dst: [N]Dst = undefined;
+        for (0..N) |i| dst[i] = src[i]; // widen (sign/zero per Src's signedness)
+        try self.pushV128(@bitCast(dst));
+    }
+    /// `v128.loadN_splat`: load one `Lane` and broadcast it across all lanes.
+    fn simdLoadSplat(self: *Frame, comptime Lane: type, ma: opcode.MemArg) Error!void {
+        const sz = @sizeOf(Lane);
+        const r = try self.simdMemEA(ma, sz);
+        const v = std.mem.readInt(Lane, r.mem[r.ea..][0..sz], .little);
+        const vec: @Vector(16 / sz, Lane) = @splat(v);
+        try self.pushV128(@bitCast(vec));
+    }
+    /// `v128.loadN_zero`: load `sz` bytes into the low lane, zeroing the rest.
+    fn simdLoadZero(self: *Frame, comptime sz: usize, ma: opcode.MemArg) Error!void {
+        const r = try self.simdMemEA(ma, sz);
+        var bytes: [16]u8 = @splat(0);
+        @memcpy(bytes[0..sz], r.mem[r.ea..][0..sz]);
+        try self.pushV128(@bitCast(bytes));
+    }
+    /// `v128.loadN_lane`: replace lane `lane` of the operand v128 with `Lane`
+    /// bytes from memory. The v128 is on top of the stack (popped first), the
+    /// address below it.
+    fn simdLoadLane(self: *Frame, comptime Lane: type, ma: opcode.MemArg, lane: u8) Error!void {
+        const sz = @sizeOf(Lane);
+        var arr: [16 / sz]Lane = @bitCast(self.popV128());
+        const r = try self.simdMemEA(ma, sz);
+        arr[lane] = std.mem.readInt(Lane, r.mem[r.ea..][0..sz], .little);
+        try self.pushV128(@bitCast(arr));
+    }
+    /// `v128.storeN_lane`: store lane `lane` of the operand v128 to memory.
+    fn simdStoreLane(self: *Frame, comptime Lane: type, ma: opcode.MemArg, lane: u8) Error!void {
+        const sz = @sizeOf(Lane);
+        const arr: [16 / sz]Lane = @bitCast(self.popV128());
+        const r = try self.simdMemEA(ma, sz);
+        std.mem.writeInt(Lane, r.mem[r.ea..][0..sz], arr[lane], .little);
+    }
+    /// Extended multiply: widen the low (or high) half of two `Src` vectors to
+    /// `Dst` and multiply lane-wise. `Dst` is twice `Src`'s width, so the product
+    /// never overflows.
+    fn simdExtmul(self: *Frame, comptime Src: type, comptime Dst: type, comptime high: bool) Error!void {
+        const b: [16 / @sizeOf(Src)]Src = @bitCast(self.popV128());
+        const a: [16 / @sizeOf(Src)]Src = @bitCast(self.popV128());
+        const N = 16 / @sizeOf(Dst); // result lanes
+        const base: usize = if (high) N else 0;
+        var r: [N]Dst = undefined;
+        for (0..N) |i| r[i] = @as(Dst, a[base + i]) * @as(Dst, b[base + i]);
+        try self.pushV128(@bitCast(r));
+    }
+    /// Extended pairwise add: sum adjacent `Src` lane pairs, each sum widened to
+    /// `Dst` (which is twice `Src`'s width, so the sum never overflows).
+    fn simdExtaddPairwise(self: *Frame, comptime Src: type, comptime Dst: type) Error!void {
+        const src: [16 / @sizeOf(Src)]Src = @bitCast(self.popV128());
+        const N = 16 / @sizeOf(Dst);
+        var r: [N]Dst = undefined;
+        for (0..N) |i| r[i] = @as(Dst, src[2 * i]) + @as(Dst, src[2 * i + 1]);
+        try self.pushV128(@bitCast(r));
+    }
+    /// `i16x8.q15mulr_sat_s`: fixed-point Q15 rounding multiply, saturating.
+    fn simdQ15mulrSat(self: *Frame) Error!void {
+        const b: [8]i16 = @bitCast(self.popV128());
+        const a: [8]i16 = @bitCast(self.popV128());
+        var r: [8]i16 = undefined;
+        for (0..8) |i| r[i] = satTo(i16, (@as(i32, a[i]) * @as(i32, b[i]) + 0x4000) >> 15);
+        try self.pushV128(@bitCast(r));
+    }
+    /// `i32x4.dot_i16x8_s`: multiply i16 lanes pairwise (exact i32 products) and
+    /// add adjacent products with wrapping (the spec's modular `iadd`).
+    fn simdDot(self: *Frame) Error!void {
+        const b: [8]i16 = @bitCast(self.popV128());
+        const a: [8]i16 = @bitCast(self.popV128());
+        var r: [4]i32 = undefined;
+        for (0..4) |i| r[i] = @as(i32, a[2 * i]) * @as(i32, b[2 * i]) +% @as(i32, a[2 * i + 1]) * @as(i32, b[2 * i + 1]);
+        try self.pushV128(@bitCast(r));
+    }
+
+    /// Execute a `0xFD` SIMD op. Covers const, load/store (incl. splat/extend/
+    /// zero and lane load/store), splat, lane get/set, shuffle/swizzle, bitwise,
+    /// comparisons, integer & float arithmetic, saturating add/sub, narrow/
+    /// extend/extmul, dot, q15, extadd_pairwise, conversions, any/all_true and
+    /// bitmask — via Zig `@Vector`. Only the relaxed-SIMD ops and v128 GC-fields
+    /// remain unimplemented (they trap `UnsupportedInstruction`).
     fn execSimd(self: *Frame, s: opcode.Simd) Error!void {
         switch (s.sub) {
             0x0c => try self.pushV128(s.bytes), // v128.const
@@ -2403,6 +2493,57 @@ const Frame = struct {
                 const dst = [4]f32{ @floatCast(src[0]), @floatCast(src[1]), 0, 0 };
                 try self.pushV128(@bitCast(dst));
             },
+            // widening loads: load8x8 / load16x4 / load32x2 (s/u)
+            0x01 => try self.simdLoadExtend(i8, i16, s.mem),
+            0x02 => try self.simdLoadExtend(u8, u16, s.mem),
+            0x03 => try self.simdLoadExtend(i16, i32, s.mem),
+            0x04 => try self.simdLoadExtend(u16, u32, s.mem),
+            0x05 => try self.simdLoadExtend(i32, i64, s.mem),
+            0x06 => try self.simdLoadExtend(u32, u64, s.mem),
+            // load-splat / load-zero
+            0x07 => try self.simdLoadSplat(u8, s.mem),
+            0x08 => try self.simdLoadSplat(u16, s.mem),
+            0x09 => try self.simdLoadSplat(u32, s.mem),
+            0x0a => try self.simdLoadSplat(u64, s.mem),
+            0x5c => try self.simdLoadZero(4, s.mem),
+            0x5d => try self.simdLoadZero(8, s.mem),
+            // load-lane / store-lane
+            0x54 => try self.simdLoadLane(u8, s.mem, s.lane),
+            0x55 => try self.simdLoadLane(u16, s.mem, s.lane),
+            0x56 => try self.simdLoadLane(u32, s.mem, s.lane),
+            0x57 => try self.simdLoadLane(u64, s.mem, s.lane),
+            0x58 => try self.simdStoreLane(u8, s.mem, s.lane),
+            0x59 => try self.simdStoreLane(u16, s.mem, s.lane),
+            0x5a => try self.simdStoreLane(u32, s.mem, s.lane),
+            0x5b => try self.simdStoreLane(u64, s.mem, s.lane),
+            // extadd_pairwise
+            0x7c => try self.simdExtaddPairwise(i8, i16),
+            0x7d => try self.simdExtaddPairwise(u8, u16),
+            0x7e => try self.simdExtaddPairwise(i16, i32),
+            0x7f => try self.simdExtaddPairwise(u16, u32),
+            // q15mulr / dot
+            0x82 => try self.simdQ15mulrSat(),
+            0xba => try self.simdDot(),
+            // extmul low/high — i16x8 / i32x4 / i64x2
+            0x9c => try self.simdExtmul(i8, i16, false),
+            0x9d => try self.simdExtmul(i8, i16, true),
+            0x9e => try self.simdExtmul(u8, u16, false),
+            0x9f => try self.simdExtmul(u8, u16, true),
+            0xbc => try self.simdExtmul(i16, i32, false),
+            0xbd => try self.simdExtmul(i16, i32, true),
+            0xbe => try self.simdExtmul(u16, u32, false),
+            0xbf => try self.simdExtmul(u16, u32, true),
+            0xdc => try self.simdExtmul(i32, i64, false),
+            0xdd => try self.simdExtmul(i32, i64, true),
+            0xde => try self.simdExtmul(u32, u64, false),
+            0xdf => try self.simdExtmul(u32, u64, true),
+            // i64x2 comparisons (signed lt/gt/le/ge; eq/ne signedness-agnostic)
+            0xd6 => try self.simdCmp(u64, .eq),
+            0xd7 => try self.simdCmp(u64, .ne),
+            0xd8 => try self.simdCmp(i64, .lt),
+            0xd9 => try self.simdCmp(i64, .gt),
+            0xda => try self.simdCmp(i64, .le),
+            0xdb => try self.simdCmp(i64, .ge),
             else => return error.UnsupportedInstruction,
         }
     }
