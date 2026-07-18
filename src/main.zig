@@ -227,6 +227,20 @@ fn verifyGate(
     path: []const u8,
     rest: []const []const u8,
 ) !bool {
+    // Authenticity gate (signature) runs before the pin fallback: a module
+    // signed by the trusted root key is authenticated and needs no pin. Inert
+    // unless this build embedded a root key (`sign.embedded_root_key != null`),
+    // so a default build behaves exactly as the pin-only path did. The bytes
+    // checked are the in-memory buffer we are about to run (TOCTOU-safe).
+    if (wazmrt.sign.embedded_root_key) |root| switch (wazmrt.sign.verify(bytes, root)) {
+        .authenticated => return true, // signed by the trusted root; skip the pin check
+        .tampered => {
+            try out.print("refusing to run {s}: signed by the trusted key but the bytes do not match (tampered or corrupt)\n", .{path});
+            return false;
+        },
+        .foreign, .unsigned => {}, // no trusted signature → fall through to the pin check
+    };
+
     const db_path = flagValue(rest, "--pins") orelse defaultPinsPath();
     const db_text: ?[]const u8 = Io.Dir.cwd().readFileAlloc(io, db_path, arena, .limited(1 << 20)) catch |e| switch (e) {
         error.FileNotFound => null, // no DB ⇒ no policy ⇒ dev default (off)

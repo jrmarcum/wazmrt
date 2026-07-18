@@ -317,9 +317,18 @@ final-component `path_open` TOCTOU tied to std bug #18. See #17.
 > `--verify <mode>` (raise-only), `--no-verify`/`--yes` (**refused under `enforce`** — the precedence
 > rule). Default `off`. 7 new unit tests incl. the full enforcement/precedence matrix; verified
 > end-to-end (off runs; enforce+pin runs; enforce+wrong/absent refuses; warn+no-tty refuses;
-> warn+`--no-verify` runs; enforce+`--no-verify` STILL refuses; corrupt DB fails closed). **Still
-> DESIGN-ONLY: the signature path** (embedded key, Ed25519, `try`-less) — needs the open owner decisions
-> (trust anchor, signature format, revocation) in `security-model.md`.
+> warn+`--no-verify` runs; enforce+`--no-verify` STILL refuses; corrupt DB fails closed).
+>
+> ✅ **Signature VERIFY mechanism BUILT (2026-07-18, `src/sign.zig`).** Owner decisions locked: trust
+> anchor = **embedded root key** (`sign.embedded_root_key`), format = **roll-our-own minimal** Ed25519
+> over a `"signature"` custom section (governance-checked: wasmsign2 is an individual PoC / WASM-CG
+> tool-convention, not Bytecode Alliance). `verify()` returns unsigned/authenticated/foreign/tampered via
+> **streaming Ed25519** (Zig stdlib, no third-party crypto, no alloc); the CLI gate runs the signature
+> check before the pin fallback (authenticated ⇒ no pin needed; tampered-by-our-key ⇒ refused always).
+> **Inert until a build embeds a key** (default `null` ⇒ byte-identical to pin-only), same default-OFF
+> discipline as Phase 5. 7 unit tests + manual real-binary e2e. ⇢ REMAINING (publisher/rotation side):
+> signing+keygen CLI & private-key custody, keyring file + rotation (PK→KEK→db), release-time key
+> injection (`-Droot-key`?), and the deny-unsigned-by-default policy call. See `security-model.md`.
 >
 > **The C ABI is NOT remaining work** — #20 (all 319 `wasm.h` fns) / #21 (mem-safety) / #22 (fuzz) are
 > DONE and 4.4 added a C conformance guest. Only two narrow, demand-driven residuals stay deferred:

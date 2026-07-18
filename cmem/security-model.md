@@ -432,10 +432,31 @@ root-owned plaintext pin DB + pre-run SHA-256 check, read-once so the verified b
 in `roadmap.md` (plan there). Enforcement ships behind an explicit knob, default OFF, until "default
 policy" below is settled.
 
-**Genuinely open** (all belong to the *signature* path — they do NOT block the Phase 5 pin build):
+**RESOLVED 2026-07-18 (owner) — and the verify mechanism is BUILT (`src/sign.zig`):**
 
-- Trust anchor: embedded-in-binary (recommended) vs OS keystore vs signed keyring file vs a hybrid.
-- Signature format: adopt existing prior art (→ Adoption Checklist) vs roll our own.
+- Trust anchor: **embedded-in-binary root key** (`sign.embedded_root_key: ?[32]u8`). Rotation/keyring is
+  a clean later layer (embedded root signs a keyring file — Secure Boot's PK→KEK→db), deferred.
+- Signature format: **roll our own minimal** — an Ed25519 signature over the canonical bytes, in a
+  `"signature"` custom section (`magic ++ algo ++ pubkey ++ sig`). Chosen after confirming the prior-art
+  `wasmsign2` format is **not** a Bytecode Alliance item: it's an individual's PoC under the independent
+  `wasm-signatures` org, and its spec lives in the W3C WASM-CG `tool-conventions` repo (`Signatures.md`) —
+  neutral, but PoC-grade and heavier than we need. Our format is shaped so a tool-conventions-compatible
+  layer can be added later if interop is ever wanted (no Adoption Checklist incurred).
+
+**What's built:** `verify(bytes, root_key) → {unsigned, authenticated, foreign, tampered}` (streaming
+Ed25519 over every byte except the signature section, no alloc); `signModule` (library signing helper);
+the CLI `verifyGate` runs the signature check **before** the pin fallback — a module signed by the trusted
+root is authenticated and needs no pin; a module signed *by our key* whose bytes don't match is refused
+**always** (even default-off); unsigned/foreign fall through to the pin path. **Inert until a build embeds
+a root key** (`embedded_root_key == null` by default → byte-identical to the pin-only path), matching the
+Phase 5 "ship behind a default-OFF knob" precedent.
+
+**Still open** (the publisher/rotation side — do NOT block the verify mechanism):
+
+- Signing/keygen CLI + where the **private** key lives (HSM/YubiKey/KMS on the publisher side).
+- Keyring file + rotation (embedded root signs a keyring; PK→KEK→db).
+- How the embedded key is injected at release build (a `-Droot-key=<hex>` build option vs a committed
+  constant), and the default policy (deny-unsigned out of the box vs opt-in).
 
 **Resolved with data 2026-07-16:** ~~cold-start cost of hashing on every run~~ — **measured, negligible**
 (SHA-256 0.5% of instantiate, Ed25519 2.4%, both <0.15% of the process-startup floor). See the pin

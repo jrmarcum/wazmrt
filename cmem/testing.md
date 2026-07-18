@@ -481,14 +481,28 @@ V8. **Decision:** build the shipped `.lib`/`.dll` (and the freestanding wasm —
 `design-decisions.md`. (Caveat: single machine; sizes + steady-state are solid, the µs/ms cold numbers
 are ±10% noisy.)
 
-## Reading the test count (updated 2026-07-18, Phase 8 SIMD fully complete)
+## Reading the test count (updated 2026-07-18, signature-verify increment)
 
-`zig build test --summary all` prints **336** (332 pass, 4 skip), but there are **173 distinct tests**:
-163 in the core module (161 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
+`zig build test --summary all` prints **350** (346 pass, 4 skip), but there are **180 distinct tests**:
+170 in the core module (168 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
 `wasm_c_api.zig`, which imports `root.zig`, so it compiles and **re-runs the core module's tests too**
-(163 core + 10 C-ABI = 173), on top of the standalone `mod_tests` run (163) → 336 printed. Harmless —
-under a second — but **don't quote the printed number as a test count**; quote **161**, or the per-target
+(170 core + 10 C-ABI = 180), on top of the standalone `mod_tests` run (170) → 350 printed. Harmless —
+under a second — but **don't quote the printed number as a test count**; quote **168**, or the per-target
 numbers from `--summary all`.
+
+## Authenticity — Ed25519 signature verification (`src/sign.zig`, 2026-07-18)
+
+7 tests. `signModule` (a library helper — the publisher-side signing CLI is a later increment) signs a
+module and appends a `"signature"` custom section; `verify(bytes, root_key)` returns one of four verdicts.
+Coverage: sign→verify **authenticated**; a body byte flipped after signing → **tampered** (both an
+empty header-only module and a real wat-assembled one); signed by a different key than the root →
+**foreign**; no section → **unsigned**; our magic but wrong length → **tampered** (malformed); a
+foreign-named custom section is ignored → **unsigned**. The CLI gate (`main.zig verifyGate`) is **inert by
+default** (`sign.embedded_root_key == null`), so these are the only place the crypto runs in the suite.
+**Manually e2e-verified through the real binary** (temporary embedded key, since reverted): an
+authenticated module runs, a tampered-but-still-decodable one is refused, an unsigned one falls through to
+the pin check. Tamper tests must corrupt a **body** byte (before the appended section, `< bin.len`) — a
+byte inside the section instead breaks section-recognition and reads as `.unsigned`, not `.tampered`.
 
 **Flaky-build gotcha:** `zig build`/`zig build test`/`wasi-gate` intermittently abort with a bare
 `error: Unexpected end` (no file/line). It's a **stale `.zig-cache`** artifact of this Zig fork, *not* a
