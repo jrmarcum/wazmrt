@@ -1834,6 +1834,19 @@ fn lookupSimd(name: []const u8) ?SimdOp {
         .{ .n = "f32x4.ceil", .s = 0x67, .i = .none }, .{ .n = "f32x4.floor", .s = 0x68, .i = .none }, .{ .n = "f32x4.trunc", .s = 0x69, .i = .none }, .{ .n = "f32x4.abs", .s = 0xe0, .i = .none }, .{ .n = "f32x4.neg", .s = 0xe1, .i = .none }, .{ .n = "f32x4.sqrt", .s = 0xe3, .i = .none }, .{ .n = "f32x4.add", .s = 0xe4, .i = .none }, .{ .n = "f32x4.sub", .s = 0xe5, .i = .none }, .{ .n = "f32x4.mul", .s = 0xe6, .i = .none }, .{ .n = "f32x4.div", .s = 0xe7, .i = .none }, .{ .n = "f32x4.min", .s = 0xe8, .i = .none }, .{ .n = "f32x4.max", .s = 0xe9, .i = .none }, .{ .n = "f32x4.pmin", .s = 0xea, .i = .none }, .{ .n = "f32x4.pmax", .s = 0xeb, .i = .none }, .{ .n = "f32x4.convert_i32x4_s", .s = 0xfa, .i = .none }, .{ .n = "f32x4.convert_i32x4_u", .s = 0xfb, .i = .none }, .{ .n = "f32x4.demote_f64x2_zero", .s = 0x5f, .i = .none },
         .{ .n = "f64x2.ceil", .s = 0x74, .i = .none }, .{ .n = "f64x2.floor", .s = 0x75, .i = .none }, .{ .n = "f64x2.trunc", .s = 0x7a, .i = .none }, .{ .n = "f64x2.abs", .s = 0xec, .i = .none }, .{ .n = "f64x2.neg", .s = 0xed, .i = .none }, .{ .n = "f64x2.sqrt", .s = 0xef, .i = .none }, .{ .n = "f64x2.add", .s = 0xf0, .i = .none }, .{ .n = "f64x2.sub", .s = 0xf1, .i = .none }, .{ .n = "f64x2.mul", .s = 0xf2, .i = .none }, .{ .n = "f64x2.div", .s = 0xf3, .i = .none }, .{ .n = "f64x2.min", .s = 0xf4, .i = .none }, .{ .n = "f64x2.max", .s = 0xf5, .i = .none }, .{ .n = "f64x2.pmin", .s = 0xf6, .i = .none }, .{ .n = "f64x2.pmax", .s = 0xf7, .i = .none }, .{ .n = "f64x2.promote_low_f32x4", .s = 0x5e, .i = .none }, .{ .n = "f64x2.convert_low_i32x4_s", .s = 0xfe, .i = .none }, .{ .n = "f64x2.convert_low_i32x4_u", .s = 0xff, .i = .none },
         .{ .n = "i32x4.trunc_sat_f32x4_s", .s = 0xf8, .i = .none }, .{ .n = "i32x4.trunc_sat_f32x4_u", .s = 0xf9, .i = .none }, .{ .n = "i32x4.trunc_sat_f64x2_s_zero", .s = 0xfc, .i = .none }, .{ .n = "i32x4.trunc_sat_f64x2_u_zero", .s = 0xfd, .i = .none },
+        // relaxed SIMD (sub-opcodes >= 0x100)
+        .{ .n = "i8x16.relaxed_swizzle", .s = 0x100, .i = .none },
+        .{ .n = "i32x4.relaxed_trunc_f32x4_s", .s = 0x101, .i = .none }, .{ .n = "i32x4.relaxed_trunc_f32x4_u", .s = 0x102, .i = .none },
+        .{ .n = "i32x4.relaxed_trunc_f64x2_s_zero", .s = 0x103, .i = .none }, .{ .n = "i32x4.relaxed_trunc_f64x2_u_zero", .s = 0x104, .i = .none },
+        .{ .n = "f32x4.relaxed_madd", .s = 0x105, .i = .none }, .{ .n = "f32x4.relaxed_nmadd", .s = 0x106, .i = .none },
+        .{ .n = "f64x2.relaxed_madd", .s = 0x107, .i = .none }, .{ .n = "f64x2.relaxed_nmadd", .s = 0x108, .i = .none },
+        .{ .n = "i8x16.relaxed_laneselect", .s = 0x109, .i = .none }, .{ .n = "i16x8.relaxed_laneselect", .s = 0x10a, .i = .none },
+        .{ .n = "i32x4.relaxed_laneselect", .s = 0x10b, .i = .none }, .{ .n = "i64x2.relaxed_laneselect", .s = 0x10c, .i = .none },
+        .{ .n = "f32x4.relaxed_min", .s = 0x10d, .i = .none }, .{ .n = "f32x4.relaxed_max", .s = 0x10e, .i = .none },
+        .{ .n = "f64x2.relaxed_min", .s = 0x10f, .i = .none }, .{ .n = "f64x2.relaxed_max", .s = 0x110, .i = .none },
+        .{ .n = "i16x8.relaxed_q15mulr_s", .s = 0x111, .i = .none },
+        .{ .n = "i16x8.relaxed_dot_i8x16_i7x16_s", .s = 0x112, .i = .none },
+        .{ .n = "i32x4.relaxed_dot_i8x16_i7x16_add_s", .s = 0x113, .i = .none },
     };
     for (tbl) |e| if (std.mem.eql(u8, e.n, name)) return .{ .sub = e.s, .imm = e.i };
     return null;
@@ -2326,6 +2339,54 @@ test "assembles SIMD load-splat / load-lane / store-lane / widening + zero load"
         \\(module (memory 1) (func (export "f") (result i32)
         \\  (v128.store (i32.const 0) (v128.const i32x4 999 888 777 666))
         \\  (i32x4.extract_lane 0 (v128.load32_zero (i32.const 0)))))
+    , "f", &.{})));
+}
+
+test "v128 GC field fails loud (no silent slot corruption)" {
+    // A struct/array with a v128 field can't fit the flat one-slot-per-field
+    // object model; the GC op must trap rather than drop the high 64 bits.
+    try std.testing.expectError(error.UnsupportedInstruction, assembleAndRun(
+        \\(module (type $s (struct (field (mut v128))))
+        \\  (func (export "f") (result i32) (drop (struct.new_default $s)) (i32.const 1)))
+    , "f", &.{}));
+    try std.testing.expectError(error.UnsupportedInstruction, assembleAndRun(
+        \\(module (type $a (array (mut v128)))
+        \\  (func (export "f") (result i32) (drop (array.new_default $a (i32.const 3))) (i32.const 1)))
+    , "f", &.{}));
+}
+
+test "assembles relaxed-SIMD ops (madd / laneselect / swizzle / dot)" {
+    // f32x4.relaxed_madd: 2*3 + 4 = 10
+    try std.testing.expectEqual(@as(f32, 10), interp.asF32(try assembleAndRun(
+        \\(module (func (export "f") (result f32) (f32x4.extract_lane 0
+        \\  (f32x4.relaxed_madd (v128.const f32x4 2 0 0 0) (v128.const f32x4 3 0 0 0)
+        \\                      (v128.const f32x4 4 0 0 0)))))
+    , "f", &.{})));
+    // f32x4.relaxed_nmadd: -(2*3) + 10 = 4
+    try std.testing.expectEqual(@as(f32, 4), interp.asF32(try assembleAndRun(
+        \\(module (func (export "f") (result f32) (f32x4.extract_lane 0
+        \\  (f32x4.relaxed_nmadd (v128.const f32x4 2 0 0 0) (v128.const f32x4 3 0 0 0)
+        \\                       (v128.const f32x4 10 0 0 0)))))
+    , "f", &.{})));
+    // i32x4.relaxed_laneselect: all-ones mask picks the first operand (111)
+    try std.testing.expectEqual(@as(i32, 111), interp.asI32(try assembleAndRun(
+        \\(module (func (export "f") (result i32) (i32x4.extract_lane 0
+        \\  (i32x4.relaxed_laneselect (v128.const i32x4 111 0 0 0) (v128.const i32x4 222 0 0 0)
+        \\                            (v128.const i32x4 -1 0 0 0)))))
+    , "f", &.{})));
+    // i8x16.relaxed_swizzle: index 2 selects a[2] = 30
+    try std.testing.expectEqual(@as(i32, 30), interp.asI32(try assembleAndRun(
+        \\(module (func (export "f") (result i32) (i8x16.extract_lane_u 0
+        \\  (i8x16.relaxed_swizzle (v128.const i8x16 10 20 30 40 0 0 0 0 0 0 0 0 0 0 0 0)
+        \\                         (v128.const i8x16 2 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0)))))
+    , "f", &.{})));
+    // i32x4.relaxed_dot_i8x16_i7x16_add_s: (2*3+4*5)+(6*7+8*9)+100 = 240
+    try std.testing.expectEqual(@as(i32, 240), interp.asI32(try assembleAndRun(
+        \\(module (func (export "f") (result i32) (i32x4.extract_lane 0
+        \\  (i32x4.relaxed_dot_i8x16_i7x16_add_s
+        \\    (v128.const i8x16 2 4 6 8 0 0 0 0 0 0 0 0 0 0 0 0)
+        \\    (v128.const i8x16 3 5 7 9 0 0 0 0 0 0 0 0 0 0 0 0)
+        \\    (v128.const i32x4 100 0 0 0)))))
     , "f", &.{})));
 }
 

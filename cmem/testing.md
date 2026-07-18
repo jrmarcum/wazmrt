@@ -481,14 +481,19 @@ V8. **Decision:** build the shipped `.lib`/`.dll` (and the freestanding wasm —
 `design-decisions.md`. (Caveat: single machine; sizes + steady-state are solid, the µs/ms cold numbers
 are ±10% noisy.)
 
-## Reading the test count (updated 2026-07-18, Phase 8 rare-SIMD)
+## Reading the test count (updated 2026-07-18, Phase 8 relaxed-SIMD + GC-fail)
 
-`zig build test --summary all` prints **330** (326 pass, 4 skip), but there are **170 distinct tests**:
-160 in the core module (158 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
+`zig build test --summary all` prints **334** (330 pass, 4 skip), but there are **172 distinct tests**:
+162 in the core module (160 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
 `wasm_c_api.zig`, which imports `root.zig`, so it compiles and **re-runs the core module's tests too**
-(160 core + 10 C-ABI = 170), on top of the standalone `mod_tests` run (160) → 330 printed. Harmless —
-under a second — but **don't quote the printed number as a test count**; quote **158**, or the per-target
-numbers from `--summary all`. Two core tests skip on an unprivileged Windows box (the #17 real-symlink test and the
+(162 core + 10 C-ABI = 172), on top of the standalone `mod_tests` run (162) → 334 printed. Harmless —
+under a second — but **don't quote the printed number as a test count**; quote **160**, or the per-target
+numbers from `--summary all`.
+
+**Flaky-build gotcha:** `zig build`/`zig build test`/`wasi-gate` intermittently abort with a bare
+`error: Unexpected end` (no file/line). It's a **stale `.zig-cache`** artifact of this Zig fork, *not* a
+source error — it reproduces with all changes stashed and clears after `rm -rf .zig-cache`. If a build
+fails that way, wipe the cache and re-run; don't go hunting for a code cause. Two core tests skip on an unprivileged Windows box (the #17 real-symlink test and the
 traversal example gate — see below), so you'll usually see `2 skip` per run (`4` total).
 
 ## Exception-handling tests — `src/interp.zig` (2026-07-17, Phase 6)
@@ -543,7 +548,16 @@ immediate — a new `.mem_lane` assembler shape; per-op **natural-alignment defa
 or an omitted-`align=` `load8_splat` would be rejected as over-aligned). Also fixed a **latent validator
 bug**: the unary ops `extend`/`convert`/`trunc_sat`/`promote`/`demote`/`extadd_pairwise` were hitting the
 binary `else` default in `simdSig`, which would mis-count v128 operands for `drop`/`select` width tracking.
-**Remaining gaps (fail *loud*):** relaxed-SIMD ops; v128 GC-fields.
+
+**Relaxed-SIMD + GC-field close-out (2026-07-18):** 1 round-trip test in `wat.zig` covers relaxed ops
+(sub-opcodes ≥ `0x100`, decoded via the `readVarU32` sub): `relaxed_madd`/`nmadd` (double-rounding `a*b+c`),
+`relaxed_laneselect` (full bitselect), `relaxed_swizzle`, `relaxed_min`/`max`, `relaxed_trunc` (saturating),
+`relaxed_q15mulr_s`, and both `relaxed_dot` forms — each picking one of the two spec-permitted behaviors.
+The **v128 GC-field** gap (a v128 struct field / array element can't fit the flat one-`Value`-per-field
+object model) is closed by **failing loud**: `fieldIsV128` guards all struct/array `new`/`get`/`set` ops →
+`error.UnsupportedInstruction` instead of silently dropping the high 64 bits. 1 test asserts the trap
+(struct + array). **SIMD is now complete** — every 0xFD op decodes, validates, and either executes or
+traps cleanly; nothing silently corrupts.
 
 ## wasmtk WASI corpus — real-world conformance snapshot (2026-07-17)
 

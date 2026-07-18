@@ -56,6 +56,14 @@ pub fn asF64(v: Value) f64 {
 
 /// Narrow a value to a GC field's storage width before storing (packed i8/i16
 /// keep only their low bits; unpacked stores verbatim).
+/// A `v128` GC field/element would occupy two slots, but the flat
+/// one-`Value`-per-field object model can only hold one. Rather than silently
+/// drop the high 64 bits, GC ops fail loud (`UnsupportedInstruction`) on such a
+/// field. (The WasmGC × SIMD intersection; no mainstream toolchain emits it.)
+fn fieldIsV128(storage: Module.StorageType) bool {
+    return storage.unpacked() == .v128;
+}
+
 fn packField(storage: Module.StorageType, v: Value) Value {
     return switch (storage) {
         .val => v,
@@ -1090,6 +1098,7 @@ const Frame = struct {
                 // --- GC: struct objects ---
                 .struct_new => {
                     const sf = self.inst.module.structFields(instr.imm.gc_type).?;
+                    for (sf) |f| if (fieldIsV128(f.storage)) return error.UnsupportedInstruction;
                     const obj = try self.inst.arena.allocator().alloc(Value, sf.len);
                     const base = self.vstack.items.len - sf.len;
                     for (sf, 0..) |f, k| obj[k] = packField(f.storage, self.vstack.items[base + k]);
@@ -1099,6 +1108,7 @@ const Frame = struct {
                 },
                 .struct_new_default => {
                     const sf = self.inst.module.structFields(instr.imm.gc_type).?;
+                    for (sf) |f| if (fieldIsV128(f.storage)) return error.UnsupportedInstruction;
                     const obj = try self.inst.arena.allocator().alloc(Value, sf.len);
                     for (sf, 0..) |f, k| obj[k] = if (f.storage.unpacked().isRef()) null_ref else 0;
                     try self.pushU64(try self.inst.allocObject(instr.imm.gc_type, obj));
@@ -1109,6 +1119,7 @@ const Frame = struct {
                     const obj = try self.inst.gcObject(self.pop());
                     if (gf.field >= obj.len) return error.GcOutOfBounds;
                     const storage = self.inst.module.structFields(gf.type_index).?[gf.field].storage;
+                    if (fieldIsV128(storage)) return error.UnsupportedInstruction;
                     try self.pushU64(unpackField(storage, obj[gf.field], instr.op == .struct_get_s));
                     pc += 1;
                 },
@@ -1118,6 +1129,7 @@ const Frame = struct {
                     const obj = try self.inst.gcObject(self.pop());
                     if (gf.field >= obj.len) return error.GcOutOfBounds;
                     const storage = self.inst.module.structFields(gf.type_index).?[gf.field].storage;
+                    if (fieldIsV128(storage)) return error.UnsupportedInstruction;
                     obj[gf.field] = packField(storage, v);
                     pc += 1;
                 },
@@ -1125,6 +1137,7 @@ const Frame = struct {
                 // --- GC: array objects ---
                 .array_new => {
                     const f = self.inst.module.arrayField(instr.imm.gc_type).?;
+                    if (fieldIsV128(f.storage)) return error.UnsupportedInstruction;
                     const len = @as(u32, @bitCast(self.popI32()));
                     const init_v = packField(f.storage, self.pop());
                     const obj = try self.inst.arena.allocator().alloc(Value, len);
@@ -1134,6 +1147,7 @@ const Frame = struct {
                 },
                 .array_new_default => {
                     const f = self.inst.module.arrayField(instr.imm.gc_type).?;
+                    if (fieldIsV128(f.storage)) return error.UnsupportedInstruction;
                     const len = @as(u32, @bitCast(self.popI32()));
                     const obj = try self.inst.arena.allocator().alloc(Value, len);
                     @memset(obj, if (f.storage.unpacked().isRef()) null_ref else 0);
@@ -1143,6 +1157,7 @@ const Frame = struct {
                 .array_new_fixed => {
                     const tn = instr.imm.gc_type_n;
                     const f = self.inst.module.arrayField(tn.type_index).?;
+                    if (fieldIsV128(f.storage)) return error.UnsupportedInstruction;
                     const obj = try self.inst.arena.allocator().alloc(Value, tn.n);
                     const base = self.vstack.items.len - tn.n;
                     for (0..tn.n) |k| obj[k] = packField(f.storage, self.vstack.items[base + k]);
@@ -1152,6 +1167,7 @@ const Frame = struct {
                 },
                 .array_get, .array_get_s, .array_get_u => {
                     const f = self.inst.module.arrayField(instr.imm.gc_type).?;
+                    if (fieldIsV128(f.storage)) return error.UnsupportedInstruction;
                     const idx = @as(u32, @bitCast(self.popI32()));
                     const obj = try self.inst.gcObject(self.pop());
                     if (idx >= obj.len) return error.GcOutOfBounds;
@@ -1160,6 +1176,7 @@ const Frame = struct {
                 },
                 .array_set => {
                     const f = self.inst.module.arrayField(instr.imm.gc_type).?;
+                    if (fieldIsV128(f.storage)) return error.UnsupportedInstruction;
                     const v = self.pop();
                     const idx = @as(u32, @bitCast(self.popI32()));
                     const obj = try self.inst.gcObject(self.pop());
@@ -2203,13 +2220,52 @@ const Frame = struct {
         for (0..4) |i| r[i] = @as(i32, a[2 * i]) * @as(i32, b[2 * i]) +% @as(i32, a[2 * i + 1]) * @as(i32, b[2 * i + 1]);
         try self.pushV128(@bitCast(r));
     }
+    /// Relaxed fused multiply-add: `relaxed_madd` → a*b + c, `relaxed_nmadd` →
+    /// c - a*b. The spec permits double- or single-rounding; we take the simple
+    /// double-rounding form (a*b then +c). Operands: a (deepest), b, c (top).
+    fn simdFloatFma(self: *Frame, comptime Lane: type, comptime negate: bool) Error!void {
+        const Vec = @Vector(16 / @sizeOf(Lane), Lane);
+        const c: Vec = @bitCast(self.popV128());
+        const b: Vec = @bitCast(self.popV128());
+        const a: Vec = @bitCast(self.popV128());
+        const prod = a * b;
+        const r: Vec = if (negate) c - prod else prod + c;
+        try self.pushV128(@bitCast(r));
+    }
+    /// `i16x8.relaxed_dot_i8x16_i7x16_s`: signed i8 × i8 lane products, adjacent
+    /// pairs summed with signed saturation into i16 lanes. (Interpreting the
+    /// second operand as signed, and saturating the sum, are both permitted
+    /// relaxed choices.)
+    fn simdRelaxedDot(self: *Frame) Error!void {
+        const b: [16]i8 = @bitCast(self.popV128());
+        const a: [16]i8 = @bitCast(self.popV128());
+        var r: [8]i16 = undefined;
+        for (0..8) |i| r[i] = satTo(i16, @as(i32, a[2 * i]) * @as(i32, b[2 * i]) + @as(i32, a[2 * i + 1]) * @as(i32, b[2 * i + 1]));
+        try self.pushV128(@bitCast(r));
+    }
+    /// `i32x4.relaxed_dot_i8x16_i7x16_add_s`: the i8×i8 dot, pairwise-widened to
+    /// i32x4 (computed directly in i32 — the no-saturation relaxed choice), plus
+    /// an i32x4 accumulator. Operands: a (deepest), b, accumulator (top).
+    fn simdRelaxedDotAdd(self: *Frame) Error!void {
+        const c: [4]i32 = @bitCast(self.popV128());
+        const b: [16]i8 = @bitCast(self.popV128());
+        const a: [16]i8 = @bitCast(self.popV128());
+        var r: [4]i32 = undefined;
+        for (0..4) |i| {
+            const p0 = @as(i32, a[4 * i]) * @as(i32, b[4 * i]) + @as(i32, a[4 * i + 1]) * @as(i32, b[4 * i + 1]);
+            const p1 = @as(i32, a[4 * i + 2]) * @as(i32, b[4 * i + 2]) + @as(i32, a[4 * i + 3]) * @as(i32, b[4 * i + 3]);
+            r[i] = p0 +% p1 +% c[i];
+        }
+        try self.pushV128(@bitCast(r));
+    }
 
-    /// Execute a `0xFD` SIMD op. Covers const, load/store (incl. splat/extend/
-    /// zero and lane load/store), splat, lane get/set, shuffle/swizzle, bitwise,
-    /// comparisons, integer & float arithmetic, saturating add/sub, narrow/
-    /// extend/extmul, dot, q15, extadd_pairwise, conversions, any/all_true and
-    /// bitmask — via Zig `@Vector`. Only the relaxed-SIMD ops and v128 GC-fields
-    /// remain unimplemented (they trap `UnsupportedInstruction`).
+    /// Execute a `0xFD` SIMD op. Covers the **entire** fixed-width + relaxed SIMD
+    /// set: const, load/store (incl. splat/extend/zero and lane load/store),
+    /// splat, lane get/set, shuffle/swizzle, bitwise, comparisons, integer &
+    /// float arithmetic, saturating add/sub, narrow/extend/extmul, dot, q15,
+    /// extadd_pairwise, conversions, any/all_true, bitmask, and the relaxed ops
+    /// (`0x100`–`0x113`) — via Zig `@Vector`. A v128 in a GC field is the only
+    /// v128 case left unhandled; it traps in the struct/array ops, not here.
     fn execSimd(self: *Frame, s: opcode.Simd) Error!void {
         switch (s.sub) {
             0x0c => try self.pushV128(s.bytes), // v128.const
@@ -2544,6 +2600,39 @@ const Frame = struct {
             0xd9 => try self.simdCmp(i64, .gt),
             0xda => try self.simdCmp(i64, .le),
             0xdb => try self.simdCmp(i64, .ge),
+            // --- relaxed SIMD (sub-opcodes >= 0x100) -----------------------
+            0x100 => { // i8x16.relaxed_swizzle (out-of-range index -> 0)
+                const idx: [16]u8 = @bitCast(self.popV128());
+                const a: [16]u8 = @bitCast(self.popV128());
+                var r: [16]u8 = undefined;
+                for (0..16) |i| r[i] = if (idx[i] < 16) a[idx[i]] else 0;
+                try self.pushV128(@bitCast(r));
+            },
+            // relaxed_trunc — we take the saturating (trunc_sat) choice
+            0x101 => try self.simdTruncSat(f32, i32, false),
+            0x102 => try self.simdTruncSat(f32, u32, false),
+            0x103 => try self.simdTruncSat(f64, i32, true),
+            0x104 => try self.simdTruncSat(f64, u32, true),
+            // relaxed_madd / relaxed_nmadd
+            0x105 => try self.simdFloatFma(f32, false),
+            0x106 => try self.simdFloatFma(f32, true),
+            0x107 => try self.simdFloatFma(f64, false),
+            0x108 => try self.simdFloatFma(f64, true),
+            // relaxed_laneselect — full bitselect (a & m) | (b & ~m)
+            0x109, 0x10a, 0x10b, 0x10c => {
+                const m = self.popV128();
+                const b = self.popV128();
+                const a = self.popV128();
+                try self.pushV128((a & m) | (b & ~m));
+            },
+            // relaxed_min / relaxed_max — standard @min/@max choice
+            0x10d => try self.simdFloatBin(f32, .min),
+            0x10e => try self.simdFloatBin(f32, .max),
+            0x10f => try self.simdFloatBin(f64, .min),
+            0x110 => try self.simdFloatBin(f64, .max),
+            0x111 => try self.simdQ15mulrSat(), // relaxed_q15mulr_s (saturating)
+            0x112 => try self.simdRelaxedDot(),
+            0x113 => try self.simdRelaxedDotAdd(),
             else => return error.UnsupportedInstruction,
         }
     }

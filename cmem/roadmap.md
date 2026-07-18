@@ -225,8 +225,8 @@ final-component `path_open` TOCTOU tied to std bug #18. See #17.
 
 > ### ✅ 4.3 (2026-07-16). ✅ 4.4 + Phase 5 (2026-07-17). ✅ Phase 6 exception handling — core +
 > **6.1 (WAT/`.wast`) + 6.2 (tag imports) + 6.3 (legacy EH) COMPLETE (2026-07-17)**. Both EH encodings
-> run. ✅ **Phase 7 — multi-memory COMPLETE (2026-07-17)**. 🚧 **Phase 8 — SIMD: foundation + common
-> op set + drop/select fix (2026-07-17)**: the two-slot v128 model + **~140 ops** (splat/lane/shuffle/
+> run. ✅ **Phase 7 — multi-memory COMPLETE (2026-07-17)**. ✅ **Phase 8 — SIMD COMPLETE (2026-07-18)**:
+> the two-slot v128 model + **the full 0xFD set** (splat/lane/shuffle/
 > swizzle, comparisons, bitwise, int+float arith, shifts, any/all_true, bitmask, saturating add/sub,
 > **drop/select-v128 silent-corruption gap is CLOSED** — the validator now type-checks SIMD (`simdSig`)
 > and annotates each `drop`/`select` operand slot width; the interp runs it per-v128-function
@@ -239,9 +239,14 @@ final-component `path_open` TOCTOU tied to std bug #18. See #17.
 > comparisons, and the whole memory family (widening loadMxN, loadN_splat, load32/64_zero, loadN_lane/
 > storeN_lane with a new `.mem_lane` assembler shape + per-op natural-align defaults). Also fixed a latent
 > `simdSig` bug (unary extend/convert/trunc_sat/promote/demote were typed binary → drop/select mis-count).
-> ⇢ REMAINING (fail *loud*): (1) relaxed-SIMD ops; (2) v128 GC-fields (v128 globals DONE via parallel
-> high-64 array, fails loud only for the rare imported-v128-global-in-const-expr case). Or pivot to the
-> **signature path**.
+> ✅ **Relaxed-SIMD DONE (2026-07-18)** — all 20 relaxed ops (`0x100`–`0x113`; madd/nmadd, laneselect,
+> swizzle, min/max, trunc, q15mulr, both dot forms), each taking one spec-permitted behavior. ✅ **v128
+> GC-fields close-out (2026-07-18)** — a v128 struct field / array element can't fit the flat
+> one-`Value`-per-field object model, so `fieldIsV128` guards all struct/array new/get/set and **fails
+> loud** (owner-chosen over an invasive slot-width object-model rewrite; no toolchain emits it). **SIMD is
+> now complete**: every 0xFD op decodes, validates, and either executes or traps cleanly — nothing
+> silently corrupts. Only remaining v128 loose end is imported-v128-global-in-const-expr (fails loud,
+> rare). Next: pivot to the **signature path**.
 >
 > **Phase 8 — SIMD, foundational slice (2026-07-17).** Owner chose the **two-u64-slots** representation
 > for the 128-bit `v128` (no memory penalty for non-SIMD; correct; more work than widening). The
