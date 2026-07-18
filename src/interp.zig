@@ -247,6 +247,9 @@ pub const Instance = struct {
     module: *const Module,
     func_bodies: []FuncBody,
     globals: []Value,
+    /// High 64 bits of each global (only v128 globals use it; 0 otherwise), so a
+    /// v128 global's two slots are `globals[i]` (low) + `global_hi[i]` (high).
+    global_hi: []Value,
     imported_funcs: u32,
     /// Backing callables for imported functions (index-aligned with the first
     /// `imported_funcs` entries of the function index space).
@@ -438,8 +441,21 @@ pub const Instance = struct {
             if (i >= defined_start) break;
             globals[i] = gv;
         }
-        for (module.global_inits, 0..) |init_expr, gi|
-            globals[defined_start + gi] = try evalConstExpr(globals[0 .. defined_start + gi], init_expr);
+        // A v128 global needs 128 bits: `globals[i]` holds the low 64 and this
+        // parallel array the high 64 (0 for scalar globals). Keeping `globals`
+        // index-aligned means the const-expr evaluator is unchanged.
+        const global_hi = try a.alloc(Value, module.globals.len);
+        @memset(global_hi, 0);
+        for (module.global_inits, 0..) |init_expr, gi| {
+            const gidx = defined_start + gi;
+            if (module.globals[gidx].content == .v128) {
+                const v = try evalConstV128(init_expr); // a v128 global's init is v128.const
+                globals[gidx] = @truncate(v);
+                global_hi[gidx] = @truncate(v >> 64);
+            } else {
+                globals[gidx] = try evalConstExpr(globals[0..gidx], init_expr);
+            }
+        }
 
         // Linear memories (multi-memory): imported memories (the low indices)
         // borrow host-supplied shared objects; defined memories allocate their
@@ -542,6 +558,7 @@ pub const Instance = struct {
             .module = module,
             .func_bodies = bodies,
             .globals = globals,
+            .global_hi = global_hi,
             .imported_funcs = module.importedFuncCount(),
             .import_funcs = imports.funcs,
             .memories = memories,
@@ -1514,14 +1531,16 @@ const Frame = struct {
                     pc += 1;
                 },
                 .global_get => {
-                    // v128 globals (2 slots) are not represented yet — fail loud.
-                    if (self.inst.module.globals[instr.imm.global].content == .v128) return error.UnsupportedInstruction;
-                    try self.pushU64(self.inst.globals[instr.imm.global]);
+                    const gi = instr.imm.global;
+                    try self.pushU64(self.inst.globals[gi]);
+                    // A v128 global is two slots: low then high.
+                    if (self.inst.module.globals[gi].content == .v128) try self.pushU64(self.inst.global_hi[gi]);
                     pc += 1;
                 },
                 .global_set => {
-                    if (self.inst.module.globals[instr.imm.global].content == .v128) return error.UnsupportedInstruction;
-                    self.inst.globals[instr.imm.global] = self.pop();
+                    const gi = instr.imm.global;
+                    if (self.inst.module.globals[gi].content == .v128) self.inst.global_hi[gi] = self.pop(); // high (top)
+                    self.inst.globals[gi] = self.pop(); // low
                     pc += 1;
                 },
 
@@ -2420,6 +2439,19 @@ fn satTruncLane(comptime Int: type, x: anytype) Int {
     if (tf <= @as(f64, std.math.minInt(Int))) return std.math.minInt(Int);
     if (tf >= @as(f64, std.math.maxInt(Int))) return std.math.maxInt(Int);
     return @intFromFloat(tf);
+}
+
+/// Evaluate a v128 global's init const-expr (`v128.const <16 bytes> end`) to a
+/// u128. (A v128 global initialized from an imported v128 global is not
+/// supported — rare — and errors.)
+fn evalConstV128(expr: []const u8) Error!u128 {
+    var r = Reader.init(expr);
+    if ((try r.readByte()) != 0xfd) return error.UnsupportedInstruction;
+    if ((try r.readVarU32()) != 0x0c) return error.UnsupportedInstruction; // v128.const
+    var v: u128 = 0;
+    var i: u5 = 0;
+    while (i < 16) : (i += 1) v |= @as(u128, try r.readByte()) << (@as(u7, i) * 8);
+    return v;
 }
 
 /// Evaluate a constant offset expression (data / element segment offset) to an
@@ -3510,4 +3542,26 @@ test "SIMD: i16x8.extend_low_i8x16_s sign-extends" {
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
     try std.testing.expectEqual(@as(i32, -1), asI32(r[0]));
+}
+
+test "SIMD: a v128 global initializes, gets, and extracts a lane" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // global 0: (global v128 (v128.const i32x4 7 8 9 10))
+    const gbody = [_]u8{ 0x01, 0x7b, 0x00, 0xfd, 0x0c } ++ le32(7) ++ le32(8) ++ le32(9) ++ le32(10) ++ [_]u8{0x0b};
+    // f: global.get 0 ; i32x4.extract_lane 2 -> 9
+    const fbody = [_]u8{ 0x00, 0x23, 0x00, 0xfd, 0x1b, 0x02, 0x0b };
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x01, 0x7f } },
+        .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+        .{ .id = 6, .body = &gbody },
+        .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{&fbody}) },
+    });
+    var inst = try instantiate(bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("f", &.{});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(i32, 9), asI32(r[0]));
 }

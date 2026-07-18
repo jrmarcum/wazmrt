@@ -232,8 +232,8 @@ final-component `path_open` TOCTOU tied to std bug #18. See #17.
 > and annotates each `drop`/`select` operand slot width; the interp runs it per-v128-function
 > (`dropSelectWidths`, tolerant) and pops the right slots. avgr, popcnt, extend/narrow, int<->float
 > convert + trunc_sat, promote/demote are in too. ⇢ REMAINING: (1) a few rare ops (extmul, dot,
-> extadd_pairwise, q15mulr, lane load/store, relaxed) — fail *loud*; (2) **v128 globals** (rare, fails
-> loud — needs slot-indexed global storage + v128.const const-exprs); (3) the **WAT assembler** for v128
+> extadd_pairwise, q15mulr, lane load/store, relaxed) — fail *loud*; (2) ~~v128 globals~~ DONE (parallel high-64 array, fails
+> loud only for the rare imported-v128-global-in-const-expr case); (3) the **WAT assembler** for v128
 > (`.wat` authoring; binaries run). Or pivot to the **signature path**.
 >
 > **Phase 8 — SIMD, foundational slice (2026-07-17).** Owner chose the **two-u64-slots** representation

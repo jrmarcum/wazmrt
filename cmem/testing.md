@@ -483,10 +483,10 @@ are ±10% noisy.)
 
 ## Reading the test count (updated 2026-07-17, Phase 6)
 
-`zig build test --summary all` prints **326** (322 pass, 4 skip), but there are **163 distinct tests**:
-153 in the core module (151 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
+`zig build test --summary all` prints **328** (324 pass, 4 skip), but there are **164 distinct tests**:
+154 in the core module (152 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
 `wasm_c_api.zig`, which imports `root.zig`, so it compiles and **re-runs the core module's tests too**
-(153 core + 10 C-ABI = 163), on top of the standalone `mod_tests` run (153) → 326 printed. Harmless —
+(154 core + 10 C-ABI = 164), on top of the standalone `mod_tests` run (154) → 328 printed. Harmless —
 under a second — but **don't quote 294 as a test count**; quote **152**, or the per-target numbers from
 `--summary all`. Two core tests skip on an unprivileged Windows box (the #17 real-symlink test and the
 traversal example gate — see below), so you'll usually see `2 skip` per run (`4` total).
