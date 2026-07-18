@@ -483,11 +483,11 @@ are ±10% noisy.)
 
 ## Reading the test count (updated 2026-07-17, Phase 6)
 
-`zig build test --summary all` prints **280** (276 pass, 4 skip), but there are **145 distinct tests**:
-135 in the core module (133 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
+`zig build test --summary all` prints **288** (284 pass, 4 skip), but there are **149 distinct tests**:
+139 in the core module (137 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
 `wasm_c_api.zig`, which imports `root.zig`, so it compiles and **re-runs the core module's tests too**
-(135 core + 10 C-ABI = 145), on top of the standalone `mod_tests` run (135) → 280 printed. Harmless —
-under a second — but **don't quote 280 as a test count**; quote **145**, or the per-target numbers from
+(139 core + 10 C-ABI = 149), on top of the standalone `mod_tests` run (139) → 288 printed. Harmless —
+under a second — but **don't quote 288 as a test count**; quote **149**, or the per-target numbers from
 `--summary all`. Two core tests skip on an unprivileged Windows box (the #17 real-symlink test and the
 traversal example gate — see below), so you'll usually see `2 skip` per run (`4` total).
 
@@ -512,16 +512,21 @@ exception returns a value **and** `assert_trap` fires on an uncaught one. Also C
 **Phase 6.2 (tag imports):** 1 test in `interp.zig` imports a tag from `env`, throws + catches it by
 index 0, proving imported tags lead the tag index space.
 
+**Phase 6.3 (legacy EH):** 4 hand-built binary tests in `interp.zig` — `try`/`catch` binding a payload,
+a non-throwing try skipping its handler, `catch_all`, and `rethrow` from an inner catch reaching an
+outer one. They use the non-validating `instantiate` helper (the validator does not model legacy try).
+
 ## wasmtk WASI corpus — real-world conformance snapshot (2026-07-17)
 
 Not in the repo (sibling `../wasmtk/tests/wasi/wasm_wasi`, 336 compiled `wasm32-wasi` programs from a
 mix of source languages), so it's a *manual* check, not a CI gate. Ran each through the release CLI
-(stdin=/dev/null, 15 s timeout). **Result: 321 run fully, 2 are `_start`-less library modules, 3
-correctly trap** (they `throw` with no handler — an uncaught exception, which traps with a backtrace),
-**10 use the legacy EH encoding** (`try`/`catch`/`rethrow`) which is out of scope. **Zero runtime
-crashes; zero traps outside the 3 deliberate uncaught-throws.** The 21 that first failed with
-`UnknownExternKind` (tag imports) were fixed in Phase 6.2. Reproduce with a shell loop over the corpus;
-`error:`/`trap:` are printed but the CLI still exits 0, so classify on *output text*, not exit code.
+(stdin=/dev/null). **Result after Phase 6.1/6.2/6.3: 331 run fully, 2 are `_start`-less library
+modules, 3 correctly trap** (they `throw` with no handler — an uncaught exception, which traps with a
+backtrace). **Zero decode errors, zero runtime crashes, zero traps outside the 3 deliberate
+uncaught-throws.** History: the initial run had 21 `UnknownExternKind` (tag imports → fixed 6.2) and 10
+legacy-EH `UnsupportedOpcode` (`try`/`catch`/`rethrow` → fixed 6.3). Reproduce with a shell loop over
+the corpus; `error:`/`trap:` are printed but the CLI still exits 0, so classify on *output text*, not
+exit code (a whole-corpus run takes a few minutes — background it).
 
 ## Pin verification tests — `src/pin.zig` (2026-07-17, Phase 5)
 

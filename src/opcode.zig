@@ -40,6 +40,14 @@ pub const Op = enum(u8) {
     throw = 0x08, // immediate: a tag index — package operands into an exception + throw
     throw_ref = 0x0a, // rethrow the exnref on the stack (null → trap)
     try_table = 0x1f, // immediate: a block type + a vector of catch clauses
+    // Legacy exception handling (older LLVM/toolchains, Phase 6.3). `try` opens a
+    // block whose inline `catch`/`catch_all` handlers follow the body; `rethrow`
+    // re-raises a caught exception by label; `delegate` forwards to an outer try.
+    try_ = 0x06, // immediate: a block type
+    catch_ = 0x07, // immediate: a tag index — an inline handler for that tag
+    rethrow = 0x09, // immediate: a label (which enclosing try's caught exception)
+    delegate = 0x18, // immediate: a label (forward to an outer try)
+    catch_all = 0x19, // an inline handler for any tag
     // Typed function references (function-references proposal).
     call_ref = 0x14, // immediate: a type index (the func ref's signature)
     return_call_ref = 0x15,
@@ -491,11 +499,12 @@ const ImmKind = enum {
 /// pass that needs to walk instructions without fully decoding them).
 pub fn immediateKind(op: Op) ImmKind {
     return switch (@intFromEnum(op)) {
-        0x02, 0x03, 0x04 => .block_type,
-        0x08 => .tag, // throw <tagidx>
+        0x02, 0x03, 0x04, 0x06 => .block_type, // block/loop/if + legacy `try`
+        0x08, 0x07 => .tag, // throw / legacy `catch` — a tag index
         0x0a => .none, // throw_ref
+        0x19 => .none, // legacy `catch_all`
         0x1f => .try_table, // try_table <blocktype> vec(catch)
-        0x0c, 0x0d => .label,
+        0x0c, 0x0d, 0x09, 0x18 => .label, // br/br_if + legacy `rethrow`/`delegate`
         0x0e => .br_table,
         0x10 => .func,
         0x11 => .call_indirect,

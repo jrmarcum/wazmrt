@@ -163,12 +163,25 @@ const Label = struct {
     /// Non-empty only for a `try_table` label — its catch clauses, consulted
     /// when an exception unwinds through this frame (EH proposal, Phase 6).
     catches: []const opcode.Catch = &.{},
+    /// Non-null only for a legacy `try` label — its inline handlers (Phase 6.3).
+    legacy: ?LegacyTry = null,
+    /// The exception currently being handled in this legacy try's catch block,
+    /// for `rethrow` to re-raise. Set when a handler is entered.
+    caught: ?Exception = null,
 };
 
 /// A thrown exception in flight: the tag it carries and its value payload
 /// (arena-owned by the invocation). Boxed in `Instance.exn_store` when an
 /// `exnref` must be materialized (`catch_ref` / `throw_ref`).
 const Exception = struct { tag: u32, values: []const Value };
+
+/// One inline handler of a legacy `try` (Phase 6.3). `tag == null` is
+/// `catch_all`; `handler_pc` is the first instruction after the `catch`.
+const LegacyCatch = struct { tag: ?u32, handler_pc: usize };
+
+/// The catch handlers (and optional `delegate` label) of a legacy `try`,
+/// precomputed per try instruction so unwinding can find them.
+const LegacyTry = struct { handlers: []const LegacyCatch = &.{}, delegate: ?u32 = null };
 
 /// A defined function prepared for execution.
 const FuncBody = struct {
@@ -184,6 +197,9 @@ const FuncBody = struct {
     end_of: []const usize,
     /// For each `if` index: the `else` index, or `ir.len` if none.
     else_of: []const usize,
+    /// For each legacy `try` index: its catch handlers + optional delegate; null
+    /// elsewhere (Phase 6.3). Empty slice when there are no legacy trys.
+    try_info: []const ?LegacyTry,
 };
 
 /// One frame of a trap's call stack: where execution was when it trapped.
@@ -328,6 +344,7 @@ pub const Instance = struct {
                 .ir = ir,
                 .end_of = cf.end_of,
                 .else_of = cf.else_of,
+                .try_info = cf.try_info,
             };
         }
 
@@ -686,27 +703,64 @@ pub const Instance = struct {
     }
 };
 
-fn precomputeControlFlow(a: std.mem.Allocator, ir: []const opcode.Instr) Error!struct { end_of: []usize, else_of: []usize } {
+fn precomputeControlFlow(a: std.mem.Allocator, ir: []const opcode.Instr) Error!struct { end_of: []usize, else_of: []usize, try_info: []?LegacyTry } {
     const end_of = try a.alloc(usize, ir.len);
     const else_of = try a.alloc(usize, ir.len);
+    const try_info = try a.alloc(?LegacyTry, ir.len);
     @memset(end_of, 0);
     @memset(else_of, ir.len); // sentinel = "no else"
+    @memset(try_info, null);
 
+    // For a legacy `try`, its inline `catch`/`catch_all` handlers are collected as
+    // we pass them (the top opener is always the enclosing try — the body's nested
+    // blocks are balanced before the first catch). At the try's `end` we also
+    // point `end_of` at that end for every catch, so a normally-completing body or
+    // handler skips the remaining handlers.
     var stack: std.ArrayList(usize) = .empty;
+    var handlers: std.ArrayList(std.ArrayList(LegacyCatch)) = .empty; // parallel to `stack`
+    var catch_pcs: std.ArrayList(std.ArrayList(usize)) = .empty; // catch instr pcs, parallel
     for (ir, 0..) |instr, i| {
         switch (instr.op) {
-            .block, .loop, .@"if", .try_table => try stack.append(a, i),
+            .block, .loop, .@"if", .try_table, .try_ => {
+                try stack.append(a, i);
+                try handlers.append(a, .empty);
+                try catch_pcs.append(a, .empty);
+            },
             .@"else" => else_of[stack.items[stack.items.len - 1]] = i,
+            .catch_, .catch_all => {
+                const top = handlers.items.len - 1;
+                try handlers.items[top].append(a, .{
+                    .tag = if (instr.op == .catch_) instr.imm.tag else null,
+                    .handler_pc = i + 1,
+                });
+                try catch_pcs.items[top].append(a, i);
+            },
+            .delegate => {
+                const opener = stack.pop().?;
+                _ = handlers.pop();
+                _ = catch_pcs.pop();
+                // `delegate` terminates the try in place of an `end`.
+                end_of[opener] = i;
+                try_info[opener] = .{ .handlers = &.{}, .delegate = instr.imm.label };
+            },
             .end => {
                 if (stack.items.len == 0) continue; // the function's implicit end
                 const opener = stack.pop().?;
+                var hs = handlers.pop().?;
+                var cps = catch_pcs.pop().?;
                 end_of[opener] = i;
                 if (else_of[opener] != ir.len) end_of[else_of[opener]] = i;
+                if (ir[opener].op == .try_) {
+                    for (cps.items) |cp| end_of[cp] = i; // catch → skip to end on normal flow
+                    try_info[opener] = .{ .handlers = try hs.toOwnedSlice(a) };
+                }
+                hs.deinit(a);
+                cps.deinit(a);
             },
             else => {},
         }
     }
-    return .{ .end_of = end_of, .else_of = else_of };
+    return .{ .end_of = end_of, .else_of = else_of, .try_info = try_info };
 }
 
 const Frame = struct {
@@ -773,7 +827,10 @@ const Frame = struct {
     fn throwException(self: *Frame, exn: Exception) Error!?usize {
         var d: usize = 0;
         while (d < self.labels.items.len) : (d += 1) {
-            const label = self.labels.items[self.labels.items.len - 1 - d];
+            const idx = self.labels.items.len - 1 - d;
+            const label = self.labels.items[idx];
+            // try_table (exnref proposal): a matching catch branches OUT of the
+            // try_table to the clause's label.
             for (label.catches) |c| {
                 const matches = switch (c.kind) {
                     .catch_, .catch_ref => c.tag == exn.tag,
@@ -789,9 +846,9 @@ const Frame = struct {
                 }
                 switch (c.kind) {
                     .catch_ref, .catch_all_ref => {
-                        const idx = self.inst.exn_store.items.len;
+                        const eidx = self.inst.exn_store.items.len;
                         try self.inst.exn_store.append(self.inst.gpa, exn);
-                        try self.pushU64(@intCast(idx));
+                        try self.pushU64(@intCast(eidx));
                     },
                     else => {},
                 }
@@ -799,6 +856,20 @@ const Frame = struct {
                 // the try_table block); the try_table sits `d` deep, so branch to
                 // `d + c.label`.
                 return self.branch(@intCast(d + c.label));
+            }
+            // Legacy `try`: a matching inline handler runs INSIDE the try (the try
+            // label stays on the stack for `rethrow`/`br`).
+            if (label.legacy) |lt| {
+                for (lt.handlers) |h| {
+                    if (h.tag != null and h.tag.? != exn.tag) continue;
+                    self.vstack.shrinkRetainingCapacity(label.stack_base);
+                    if (h.tag != null) for (exn.values) |v| try self.pushU64(v); // catch pushes the payload
+                    // Drop the body's nested labels but keep this try; record the
+                    // caught exception for `rethrow`.
+                    self.labels.shrinkRetainingCapacity(idx + 1);
+                    self.labels.items[idx].caught = exn;
+                    return h.handler_pc;
+                }
             }
         }
         return null;
@@ -1068,6 +1139,42 @@ const Frame = struct {
                     const r = self.pop();
                     if (r == null_ref) return error.NullReference;
                     const exn = self.inst.exn_store.items[@intCast(r)];
+                    if (try self.throwException(exn)) |target| {
+                        pc = target;
+                    } else {
+                        self.inst.pending_exn = exn;
+                        return error.UncaughtException;
+                    }
+                },
+
+                // --- Legacy exception handling (Phase 6.3) ---
+                .try_ => {
+                    const params = self.blockArity(instr.imm.block_type, true);
+                    try self.labels.append(self.a, .{
+                        .is_loop = false,
+                        .arity = self.blockArity(instr.imm.block_type, false),
+                        .target = self.body.end_of[pc] + 1,
+                        .stack_base = self.vstack.items.len - params,
+                        .legacy = self.body.try_info[pc],
+                    });
+                    pc += 1;
+                },
+                // Reached only by normal control flow (the body or a prior handler
+                // completed): skip the remaining handlers to the `end`.
+                .catch_, .catch_all => pc = self.body.end_of[pc],
+                // `delegate`, reached normally, just ends the try like `end`.
+                .delegate => {
+                    _ = self.labels.pop();
+                    pc += 1;
+                },
+                .rethrow => {
+                    // Re-raise the exception caught by the try `label` levels out,
+                    // propagating from OUTSIDE that try (it already had its turn).
+                    const n = instr.imm.label;
+                    const tgt = self.labels.items[self.labels.items.len - 1 - n];
+                    const exn = tgt.caught orelse return error.UncaughtException;
+                    self.labels.shrinkRetainingCapacity(self.labels.items.len - 1 - n);
+                    self.vstack.shrinkRetainingCapacity(tgt.stack_base);
                     if (try self.throwException(exn)) |target| {
                         pc = target;
                     } else {
@@ -2349,4 +2456,103 @@ test "EH: an imported tag leads the tag index space and can be thrown + caught" 
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
     try std.testing.expectEqual(@as(i32, 42), asI32(r[0]));
+}
+
+// --- Legacy exception handling tests (Phase 6.3) ---------------------------
+// Older LLVM emits `try`/`catch`/`catch_all`/`rethrow` (not `try_table`). These
+// hand-built binaries exercise the interpreter directly (the validator does not
+// model legacy try, and the CLI run path does not validate).
+
+test "legacy EH: try/catch catches a thrown exception and binds its payload" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x02, 0x60, 0x01, 0x7f, 0x00, 0x60, 0x00, 0x01, 0x7f } },
+        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } }, // tag 0 : type 0 (param i32)
+        .{ .id = 3, .body = &.{ 0x01, 0x01 } },
+        .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{
+            // try (result i32) ; i32.const 42 ; throw 0 ; catch 0 ; end
+            &.{ 0x00, 0x06, 0x7f, 0x41, 0x2a, 0x08, 0x00, 0x07, 0x00, 0x0b, 0x0b },
+        }) },
+    });
+    var inst = try instantiate(bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("f", &.{});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(i32, 42), asI32(r[0])); // caught payload becomes the result
+}
+
+test "legacy EH: a try body that does not throw skips the catch handler" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x02, 0x60, 0x01, 0x7f, 0x00, 0x60, 0x00, 0x01, 0x7f } },
+        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } },
+        .{ .id = 3, .body = &.{ 0x01, 0x01 } },
+        .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{
+            // try (result i32) ; i32.const 7 ; catch 0 ; (unreached) ; end
+            &.{ 0x00, 0x06, 0x7f, 0x41, 0x07, 0x07, 0x00, 0x0b, 0x0b },
+        }) },
+    });
+    var inst = try instantiate(bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("f", &.{});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(i32, 7), asI32(r[0]));
+}
+
+test "legacy EH: catch_all catches any tag" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x02, 0x60, 0x00, 0x00, 0x60, 0x00, 0x01, 0x7f } }, // (func), (func()->i32)
+        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } },
+        .{ .id = 3, .body = &.{ 0x01, 0x01 } },
+        .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{
+            // try (result i32) ; throw 0 ; catch_all ; i32.const 5 ; end
+            &.{ 0x00, 0x06, 0x7f, 0x08, 0x00, 0x19, 0x41, 0x05, 0x0b, 0x0b },
+        }) },
+    });
+    var inst = try instantiate(bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("f", &.{});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(i32, 5), asI32(r[0]));
+}
+
+test "legacy EH: rethrow from an inner catch propagates to an outer catch" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x02, 0x60, 0x00, 0x00, 0x60, 0x00, 0x01, 0x7f } },
+        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } },
+        .{ .id = 3, .body = &.{ 0x01, 0x01 } },
+        .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{&.{
+            0x00,
+            0x06, 0x7f, // OUTER try (result i32)
+            0x06, 0x40, // INNER try (void)
+            0x08, 0x00, // throw 0
+            0x19, // catch_all (inner)
+            0x09, 0x00, // rethrow 0  (re-raise inner's exception)
+            0x0b, // end inner
+            0x41, 0x00, // i32.const 0 (not reached)
+            0x19, // catch_all (outer)
+            0x41, 0x09, // i32.const 9
+            0x0b, // end outer
+            0x0b, // end func
+        }}) },
+    });
+    var inst = try instantiate(bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("f", &.{});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(i32, 9), asI32(r[0]));
 }

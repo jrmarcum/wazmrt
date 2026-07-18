@@ -67,8 +67,17 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   things to preserve:** (1) on a successful call-site catch, reset `trap_len`/`trap_depth` (the unwinding
   frames recorded a would-be trace that must not leak into a later real trap); (2) `exn_store` and
   `pending_exn` are cleared per invocation — `exnref` payloads are invocation-arena memory and must never
-  outlive the call. Only the standardized **exnref** encoding is built; legacy `try`/`catch`/`delegate`
-  is out of scope.
+  outlive the call.
+- **Legacy `try`/`catch` runs its handler INSIDE the try; try_table branches OUT (2026-07-17, Phase 6.3).**
+  wasmtk's corpus turned up files from older LLVM that emit the *legacy* EH encoding
+  (`try`/`catch`/`catch_all`/`rethrow`, 0x06/0x07/0x19/0x09), so it's supported for compat (decode +
+  execute only — no assembler, and the CLI run path doesn't validate, so no validator either). The key
+  behavioral difference from try_table: a matching **legacy catch keeps the try's label on the stack**
+  and jumps to an inline handler pc, so `rethrow N`/`br` inside the handler still see the try; a
+  try_table catch *branches out* and pops it. Handlers are precomputed per `try` into `FuncBody.try_info`
+  (a normally-completing body/handler skips to `end` via `end_of[catch_pc]`). `rethrow N` re-raises the
+  try-N caught exception from **outside** that try (pop to try-N, then unwind). Both encodings share the
+  one `throwException` search and `error.UncaughtException` propagation.
 - **Pin verification hashes the bytes it runs, and the gate has no path to re-open (2026-07-17,
   Phase 5).** `verifyGate` (in `main.zig`) receives the **in-memory module buffer** and hashes *that*;
   it is handed the path only for messages and never re-reads the file. So the verified bytes provably

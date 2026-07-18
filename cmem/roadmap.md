@@ -224,9 +224,19 @@ incl. an adversarial fuzz + Phase 3 gate still 16/16. One documented residual: a
 final-component `path_open` TOCTOU tied to std bug #18. See #17.
 
 > ### ✅ 4.3 (2026-07-16). ✅ 4.4 + Phase 5 (2026-07-17). ✅ Phase 6 exception handling — core +
-> **6.1 (WAT/`.wast`) + 6.2 (tag imports) COMPLETE (2026-07-17)**. The exnref proposal works from text
-> and imported tags decode. ⇢ START HERE next: the next frontier (SIMD / multi-memory / the signature
-> path in `security-model.md`), **or legacy EH** (see the wasmtk result below).
+> **6.1 (WAT/`.wast`) + 6.2 (tag imports) + 6.3 (legacy EH) COMPLETE (2026-07-17)**. Both EH encodings
+> run. ⇢ START HERE next: the next frontier — **SIMD / multi-memory / the signature path** in
+> `security-model.md`.
+>
+> **6.3 — legacy EH (2026-07-17):** the older `try`/`catch`/`catch_all`/`rethrow`/`delegate` encoding
+> (0x06/0x07/0x19/0x09/0x18) that older LLVM emits — decode + execute (no assembler, no validator; the
+> CLI run path doesn't validate). Inline handlers precomputed per `try` (`FuncBody.try_info`); a
+> matching legacy catch runs INSIDE the try (label stays for `rethrow`/`br`), unlike a try_table catch
+> which branches out. `rethrow N` re-raises the try-N caught exception from OUTSIDE that try. 4 hand-built
+> binary tests. **wasmtk WASI corpus: 313 → 331 run** (the last 10 legacy-EH files now run); 2 library
+> modules (no `_start`), 3 correctly trap (deliberate uncaught `throw`), **0 decode errors, 0 unexpected
+> traps.** Deferred (low-value): the WAT assembler + validator for legacy `try` — toolchains emit binary,
+> and the `.wat` are just decompiled views.
 >
 > **6.2 — tag imports (2026-07-17):** ran the **wasmtk WASI corpus** (`../wasmtk/tests/wasi/wasm_wasi`,
 > 336 files) as a real-world conformance check. 21 failed to decode with `UnknownExternKind` — they
