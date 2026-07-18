@@ -347,6 +347,10 @@ pub const Instance = struct {
     pub const Imports = struct {
         funcs: []const HostFunc = &.{},
         globals: []const Value = &.{},
+        /// High 64 bits of each imported global (only v128 globals use it; the
+        /// low half is in `globals[i]`). May be shorter than `globals` — a
+        /// missing entry means 0, which is correct for every non-v128 global.
+        globals_hi: []const Value = &.{},
         memories: []const *Memory = &.{},
         tables: []const *Table = &.{},
     };
@@ -442,22 +446,26 @@ pub const Instance = struct {
 
         const globals = try a.alloc(Value, module.globals.len);
         @memset(globals, 0);
+        // A v128 global needs 128 bits: `globals[i]` holds the low 64 and this
+        // parallel array the high 64 (0 for scalar globals). Keeping `globals`
+        // index-aligned means the scalar const-expr evaluator is unchanged.
+        const global_hi = try a.alloc(Value, module.globals.len);
+        @memset(global_hi, 0);
         // Imported globals occupy the head of the index space; fill them from the
-        // host-supplied values. Defined globals (each with an init expr) follow.
+        // host-supplied values (both halves, for imported v128 globals). Defined
+        // globals (each with an init expr) follow.
         const defined_start = module.globals.len - module.global_inits.len;
         for (imports.globals, 0..) |gv, i| {
             if (i >= defined_start) break;
             globals[i] = gv;
+            if (i < imports.globals_hi.len) global_hi[i] = imports.globals_hi[i];
         }
-        // A v128 global needs 128 bits: `globals[i]` holds the low 64 and this
-        // parallel array the high 64 (0 for scalar globals). Keeping `globals`
-        // index-aligned means the const-expr evaluator is unchanged.
-        const global_hi = try a.alloc(Value, module.globals.len);
-        @memset(global_hi, 0);
         for (module.global_inits, 0..) |init_expr, gi| {
             const gidx = defined_start + gi;
             if (module.globals[gidx].content == .v128) {
-                const v = try evalConstV128(init_expr); // a v128 global's init is v128.const
+                // Init is `v128.const` or `global.get` of a preceding/imported
+                // v128 global — both need the 128-bit-aware evaluator.
+                const v = try evalConstV128(init_expr, globals[0..gidx], global_hi[0..gidx]);
                 globals[gidx] = @truncate(v);
                 global_hi[gidx] = @truncate(v >> 64);
             } else {
@@ -2671,12 +2679,18 @@ fn satTruncLane(comptime Int: type, x: anytype) Int {
     return @intFromFloat(tf);
 }
 
-/// Evaluate a v128 global's init const-expr (`v128.const <16 bytes> end`) to a
-/// u128. (A v128 global initialized from an imported v128 global is not
-/// supported — rare — and errors.)
-fn evalConstV128(expr: []const u8) Error!u128 {
+/// Evaluate a v128 global's init const-expr to a u128: either `v128.const <16
+/// bytes>` or `global.get <idx>` of a preceding/imported v128 global (whose two
+/// halves are read from `lo[idx]` / `hi[idx]`). Any other opcode errors.
+fn evalConstV128(expr: []const u8, lo: []const Value, hi: []const Value) Error!u128 {
     var r = Reader.init(expr);
-    if ((try r.readByte()) != 0xfd) return error.UnsupportedInstruction;
+    const op = try r.readByte();
+    if (op == 0x23) { // global.get of a preceding/imported v128 global
+        const idx = try r.readVarU32();
+        if (idx >= lo.len) return error.UndefinedGlobal;
+        return (@as(u128, hi[idx]) << 64) | lo[idx];
+    }
+    if (op != 0xfd) return error.UnsupportedInstruction;
     if ((try r.readVarU32()) != 0x0c) return error.UnsupportedInstruction; // v128.const
     var v: u128 = 0;
     var i: u5 = 0;

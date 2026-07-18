@@ -297,8 +297,13 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
     or v128 param/local — the common path pays nothing) and pops the right slots. **Tolerant:** on a
     validation error it keeps the widths captured before it — an error can only be at/after an
     unsupported op, which the interp traps on before any later drop/select runs, so those widths are
-    never used. Bonus: v128 modules now get real SIMD validation. Still unbuilt: exotic ops (fail loud),
-    v128 globals/GC-fields, WAT assembler for v128. Full list in `roadmap.md` Phase 8.
+    never used. Bonus: v128 modules now get real SIMD validation. **SIMD is now FULLY complete
+    (2026-07-18):** the entire 0xFD set — common ops, rare ops (extmul/dot/pairwise/q15/lane load-store),
+    and all 20 relaxed ops — executes; the WAT assembler authors every op; v128 globals work (parallel
+    `global_hi` array + `Imports.globals_hi` for imported v128 globals, `evalConstV128` handles both
+    `v128.const` and `global.get`). The one representable-but-unsupported case, **v128 in a GC struct/array
+    field** (would need a 2-slot object model), **fails loud** by owner's choice. No known v128 gaps. Full
+    list in `roadmap.md` Phase 8.
   - **Multi-memory — IN SCOPE; BUILT 2026-07-17 (Phase 7).** A module may have >1 linear memory;
     load/store/`memory.*` select by index. The runtime holds `Instance.memories: []*Memory` (imported
     lead, then defined); a load/store memarg's **alignment bit 6** flags an explicit memory index that

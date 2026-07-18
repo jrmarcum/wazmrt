@@ -243,10 +243,12 @@ final-component `path_open` TOCTOU tied to std bug #18. See #17.
 > swizzle, min/max, trunc, q15mulr, both dot forms), each taking one spec-permitted behavior. ✅ **v128
 > GC-fields close-out (2026-07-18)** — a v128 struct field / array element can't fit the flat
 > one-`Value`-per-field object model, so `fieldIsV128` guards all struct/array new/get/set and **fails
-> loud** (owner-chosen over an invasive slot-width object-model rewrite; no toolchain emits it). **SIMD is
-> now complete**: every 0xFD op decodes, validates, and either executes or traps cleanly — nothing
-> silently corrupts. Only remaining v128 loose end is imported-v128-global-in-const-expr (fails loud,
-> rare). Next: pivot to the **signature path**.
+> loud** (owner-chosen over an invasive slot-width object-model rewrite; no toolchain emits it). ✅
+> **Imported-v128-global const-expr DONE (2026-07-18)** — `evalConstV128` handles `global.get` of an
+> imported/preceding v128 global, and the host import ABI gained `Imports.globals_hi` so imported v128
+> globals carry both 64-bit halves. **SIMD is now FULLY complete**: every 0xFD op decodes, validates, and
+> either executes or traps cleanly — nothing silently corrupts, and there are **no known v128 gaps**.
+> Next: pivot to the **signature path**.
 >
 > **Phase 8 — SIMD, foundational slice (2026-07-17).** Owner chose the **two-u64-slots** representation
 > for the 128-bit `v128` (no memory penalty for non-SIMD; correct; more work than widening). The

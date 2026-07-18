@@ -2599,6 +2599,27 @@ test "reads an imported global from the host value" {
     try std.testing.expectEqual(@as(i32, 778), interp.asI32((try inst.invoke("get-y", &.{}))[0]));
 }
 
+test "v128 global inits from an imported v128 global (both 64-bit halves)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bin = try assemble(a,
+        \\(module
+        \\  (global (import "env" "v") v128)
+        \\  (global $w v128 (global.get 0))
+        \\  (func (export "lo") (result i32) (i32x4.extract_lane 0 (global.get $w)))
+        \\  (func (export "hi") (result i32) (i32x4.extract_lane 3 (global.get $w))))
+    );
+    var m = try Module.decode(a, bin);
+    // Imported v128 = i32x4 { 10, 20, 30, 40 }: low half is lanes 0/1, high 2/3.
+    const lo: interp.Value = 10 | (@as(u64, 20) << 32);
+    const hi: interp.Value = 30 | (@as(u64, 40) << 32);
+    var inst = try interp.Instance.initWithImports(a, &m, .{ .globals = &.{lo}, .globals_hi = &.{hi} });
+    // The defined global copied both halves — lane 0 from the low, lane 3 from the high.
+    try std.testing.expectEqual(@as(i32, 10), interp.asI32((try inst.invoke("lo", &.{}))[0]));
+    try std.testing.expectEqual(@as(i32, 40), interp.asI32((try inst.invoke("hi", &.{}))[0]));
+}
+
 fn hostAdd(args: []const interp.Value, results: []interp.Value) void {
     results[0] = interp.i32Value(interp.asI32(args[0]) +% interp.asI32(args[1]));
 }

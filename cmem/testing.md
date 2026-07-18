@@ -481,13 +481,13 @@ V8. **Decision:** build the shipped `.lib`/`.dll` (and the freestanding wasm —
 `design-decisions.md`. (Caveat: single machine; sizes + steady-state are solid, the µs/ms cold numbers
 are ±10% noisy.)
 
-## Reading the test count (updated 2026-07-18, Phase 8 relaxed-SIMD + GC-fail)
+## Reading the test count (updated 2026-07-18, Phase 8 SIMD fully complete)
 
-`zig build test --summary all` prints **334** (330 pass, 4 skip), but there are **172 distinct tests**:
-162 in the core module (160 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
+`zig build test --summary all` prints **336** (332 pass, 4 skip), but there are **173 distinct tests**:
+163 in the core module (161 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
 `wasm_c_api.zig`, which imports `root.zig`, so it compiles and **re-runs the core module's tests too**
-(162 core + 10 C-ABI = 172), on top of the standalone `mod_tests` run (162) → 334 printed. Harmless —
-under a second — but **don't quote the printed number as a test count**; quote **160**, or the per-target
+(163 core + 10 C-ABI = 173), on top of the standalone `mod_tests` run (163) → 336 printed. Harmless —
+under a second — but **don't quote the printed number as a test count**; quote **161**, or the per-target
 numbers from `--summary all`.
 
 **Flaky-build gotcha:** `zig build`/`zig build test`/`wasi-gate` intermittently abort with a bare
@@ -556,8 +556,16 @@ binary `else` default in `simdSig`, which would mis-count v128 operands for `dro
 The **v128 GC-field** gap (a v128 struct field / array element can't fit the flat one-`Value`-per-field
 object model) is closed by **failing loud**: `fieldIsV128` guards all struct/array `new`/`get`/`set` ops →
 `error.UnsupportedInstruction` instead of silently dropping the high 64 bits. 1 test asserts the trap
-(struct + array). **SIMD is now complete** — every 0xFD op decodes, validates, and either executes or
-traps cleanly; nothing silently corrupts.
+(struct + array).
+
+**Imported-v128-global const-expr (2026-07-18) — last v128 loose end closed.** A defined v128 global may
+init from `global.get` of an imported (or preceding) v128 global; `evalConstV128` now handles `global.get`
+(0x23) in addition to `v128.const`, reading both 64-bit halves from `globals`/`global_hi`. The host import
+ABI gained `Imports.globals_hi` (defaulted `&.{}` — a missing/short entry means high = 0, correct for every
+non-v128 global), and imported globals now fill both halves. 1 test: an imported `v128` global (i32x4
+{10,20,30,40}) copied into a defined global, reading lane 0 from the low half and lane 3 from the high.
+**SIMD is now fully complete** — every 0xFD op decodes, validates, and either executes or traps cleanly;
+nothing silently corrupts, and there are no known v128 gaps.
 
 ## wasmtk WASI corpus — real-world conformance snapshot (2026-07-17)
 
