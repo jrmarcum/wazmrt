@@ -88,7 +88,10 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   ownership; a user's `--no-verify`/`--verify` can only *raise* strictness (`pin.stricter`) and is
   refused under `enforce` (`pin.decide` returns `.deny` before consulting the opt-out). The whole
   matrix is the pure `pin.decide(policy, pinned, opt_out, tty)` — unit-tested; keep the CLI a thin shell
-  over it. Signature path (embedded key) is still design-only — see `security-model.md`.
+  over it. **Signature verify (embedded key) is now BUILT** (`src/sign.zig`, 2026-07-18): the CLI
+  `verifyGate` runs the Ed25519 signature check *before* the pin fallback (authenticated ⇒ no pin
+  needed; tampered-by-our-key ⇒ refused always), inert until a build sets `embedded_root_key`. The
+  publisher/rotation side stays design-only — see `security-model.md`.
 - **Read-only preopens ride the rights model, not a write-path check (2026-07-17, `--ro-dir`).** A
   `--ro-dir` preopen is just a dir fd whose rights omit `rights.write_mask` (write/create/delete/
   rename/link/truncate/set-times/allocate). It stays enforced for the *whole subtree* because
@@ -278,10 +281,10 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
       `dst <: src` and that the label's last type accepts the carried ref. Also completed the
       block-type decoder for the non-null synthetic tags (`readBlockType` gained anyref_nn…nullref_nn),
       needed for `(block (result (ref i31)) …)` around a cast-branch.
-  - **Deferred (until browser-standard):** **WASI preview 2/3** (component-model based), **SIMD** —
-    pulled in as the real corpus (`wasm_wasi`) demands. Typed/GC reference *value types* are already
-    *accepted* (P1) so such modules build.
-  - **SIMD (v128) — IN SCOPE; FOUNDATION BUILT 2026-07-17 (Phase 8).** Owner chose **two u64 slots per
+  - **Deferred (until browser-standard):** **WASI preview 2/3** (component-model based) — pulled in as
+    the real corpus (`wasm_wasi`) demands. Typed/GC reference *value types* are already *accepted* (P1)
+    so such modules build. (**SIMD is no longer deferred — COMPLETE 2026-07-18**, see below.)
+  - **SIMD (v128) — IN SCOPE; COMPLETE 2026-07-18 (Phase 8).** Owner chose **two u64 slots per
     v128** (not widening `Value` to u128 — that would 2x memory for every value in every program, against
     the small/fast vision; not boxing — that grows unbounded in SIMD loops). So a v128 occupies 2 stack
     slots. `slotWidth(vt)` (v128=2, else 1) threads through **locals** (`FuncBody.local_map`/`local_w`,

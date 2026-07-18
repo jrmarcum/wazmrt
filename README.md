@@ -41,8 +41,11 @@ compliance process, and for the ledger of any reused code.
 > (sockets deferred). It runs stock Zig-, C-, and Rust-compiled `wasm32-wasi`
 > binaries, checked by a build-graph conformance gate (`zig build wasi-gate`),
 > and can gate execution on a root-owned **pin database** of approved SHA-256
-> hashes (see *Verifying modules* below). Coming next: exception handling. Requires
-> Zig 0.16.
+> hashes, or verify an **Ed25519 signature** against an embedded root key (both
+> opt-in; see *Verifying modules* below). It also implements **exception
+> handling** (both the `exnref` proposal and the legacy `try`/`catch` encoding),
+> **multiple memories**, and the **complete SIMD (v128)** instruction set —
+> every fixed-width op plus the relaxed-SIMD extensions. Requires Zig 0.16.
 
 ## Build
 
@@ -111,7 +114,7 @@ empty. All preopen/`--env` flags are consumed by wazmrt; everything after `--`
 > symlink (`path_symlink`) needs OS privilege on Windows, so it is POSIX-only on
 > the write side; *following* host-placed symlinks works everywhere.
 
-### Verifying modules (pin database)
+### Verifying modules (pin database + signatures)
 
 wazmrt can gate execution on a **pin database** — a plaintext, content-addressed
 list of approved SHA-256 hashes. Register a module's hash:
@@ -137,7 +140,15 @@ looks them up. `--pins <path>` overrides the DB location; `--verify <mode>` can
 only *raise* strictness; `--no-verify` skips the check **but is refused under an
 `enforce` policy** — a user argument can never weaken a root-owned policy. The
 default is `off`, so verification is opt-in until a DB with a stricter `# mode:`
-is installed. Design + rationale: [`cmem/security-model.md`](cmem/security-model.md).
+is installed.
+
+**Signature verification.** A build can embed a trusted **Ed25519 root public
+key**; wazmrt then authenticates a module carrying a `"signature"` custom section
+(the signature covers every other byte) before running it — a module signed by
+the trusted key needs no pin, and one signed by that key whose bytes don't match
+is refused outright. This is **inert in the default build** (no key embedded), so
+it changes nothing until a release embeds a key; the publisher-side signing tools
+are still in progress. Design + rationale: [`cmem/security-model.md`](cmem/security-model.md).
 
 Implemented: stdout/stderr/stdin, args/environ, clocks, `poll_oneoff` (clock
 sleep), `random_get`, `proc_exit`, and the filesystem (`path_open`, `fd_read`/
@@ -182,8 +193,9 @@ ports bind to the same ABI. `zig build` installs both `wasm.h` and the small
 > is true — while a copy of a *type* object is a real deep clone.
 > `wasm_module_serialize` returns the original binary: wazmrt interprets a
 > decoded IR, so there is no AOT artifact, and `wasm_module_deserialize` simply
-> re-decodes. Exception-handling tags exist as type objects only — no module can
-> produce one, since EH is deferred.
+> re-decodes. Exception handling runs in the interpreter (both encodings), but the
+> C-ABI surface exposes tags only as `wasm_tagtype_t` type objects — throwing and
+> catching happen inside a module, not across the C boundary.
 
 ```c
 #include "wazmrt.h"   /* pulls in <wasm.h> */

@@ -169,8 +169,8 @@ API and a source grep misses them — which is exactly how this hid for months.
   interprets a decoded IR — there is no AOT artifact to emit, and a round-trip through the original
   bytes is honest and correct. **Cost: `wasm_module_new` now keeps a copy of the binary** (the decoder
   otherwise lets the input go). Paid only on the C ABI path, not the CLI.
-- **`wasm_tagtype_t`** exists as a type object though EH is deferred: the header declares it and it's
-  pure data. No module can produce one.
+- **`wasm_tagtype_t`** exists as a C-ABI type object; exception handling itself runs in the interpreter
+  (both encodings), but throwing/catching stays inside a module — the C boundary only sees the tag type.
 - ~86 ref functions and ~40 vec functions are **comptime-generated** from a table. That's the point:
   in that much near-identical bulk, a copy-paste slip (a `global` body under a `memory` name) compiles
   fine and stays invisible until an embedder hits it.
