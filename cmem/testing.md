@@ -481,14 +481,14 @@ V8. **Decision:** build the shipped `.lib`/`.dll` (and the freestanding wasm —
 `design-decisions.md`. (Caveat: single machine; sizes + steady-state are solid, the µs/ms cold numbers
 are ±10% noisy.)
 
-## Reading the test count (updated 2026-07-17, Phase 6)
+## Reading the test count (updated 2026-07-18, Phase 8 WAT-SIMD)
 
-`zig build test --summary all` prints **328** (324 pass, 4 skip), but there are **164 distinct tests**:
-154 in the core module (152 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
+`zig build test --summary all` prints **336** (332 pass, 4 skip), but there are **168 distinct tests**:
+158 in the core module (156 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
 `wasm_c_api.zig`, which imports `root.zig`, so it compiles and **re-runs the core module's tests too**
-(154 core + 10 C-ABI = 164), on top of the standalone `mod_tests` run (154) → 328 printed. Harmless —
-under a second — but **don't quote 294 as a test count**; quote **152**, or the per-target numbers from
-`--summary all`. Two core tests skip on an unprivileged Windows box (the #17 real-symlink test and the
+(158 core + 10 C-ABI = 168), on top of the standalone `mod_tests` run (158) → 336 printed. Harmless —
+under a second — but **don't quote the printed number as a test count**; quote **156**, or the per-target
+numbers from `--summary all`. Two core tests skip on an unprivileged Windows box (the #17 real-symlink test and the
 traversal example gate — see below), so you'll usually see `2 skip` per run (`4` total).
 
 ## Exception-handling tests — `src/interp.zig` (2026-07-17, Phase 6)
@@ -526,8 +526,15 @@ memory 0 untouched (index routing via the memarg bit-6 flag), `memory.copy` betw
 shuffle/swizzle, comparisons, bitwise, int+float arith, shifts, min/max, any/all_true, bitmask).
 The **drop/select-v128 width fix** adds 3 tests (drop a v128 and still read the value below it; `select`
 and `select_t` of two v128s pick the whole vector) — each would return the wrong scalar if drop/select
-popped one slot. **Remaining gaps (all fail *loud*):** exotic ops (saturating/narrow/extend/dot/
-conversions/lane-load-store); v128 globals/GC-fields; no WAT assembler for v128.
+popped one slot.
+
+**WAT-SIMD assembler (2026-07-18):** 4 round-trip tests in `wat.zig` assemble v128 *text* → binary →
+run: folded `i32x4.splat`+`add`+`extract_lane`; `v128.const i32x4`; flat-form `f32x4.add`; and a combined
+test covering `v128.store`/`v128.load` with `offset=`/`align=` memargs, `i8x16.shuffle` (16-byte immediate),
+and a signed `i8x16.const` lane (`-1` → `extract_lane_u` = 255). The assembler adds a ~130-entry
+name→sub-opcode table (`lookupSimd`) intercepted in both `emitFoldedOne`/`emitFlatOne`, immediate parsing
+for `v128.const` (all 6 shapes), lane index, shuffle bytes, and memarg. **Remaining gaps (all fail
+*loud*):** exotic ops (dot/extmul/extadd_pairwise/q15mulr/relaxed/lane-load-store); v128 GC-fields.
 
 ## wasmtk WASI corpus — real-world conformance snapshot (2026-07-17)
 

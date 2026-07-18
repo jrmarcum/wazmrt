@@ -1151,6 +1151,10 @@ fn emitExpr(ctx: *Ctx, s: Sexpr) Error!void {
 
 fn emitFoldedOne(ctx: *Ctx, l: []const Sexpr, i: usize) Error!usize {
     const kw = l[0].asAtom() orelse return error.UnknownInstr;
+    if (lookupSimd(kw)) |sd| {
+        _ = try emitSimd(ctx, sd, l, 1, true);
+        return i + 1;
+    }
     const op = lookupOp(kw) orelse return error.UnknownInstr;
     switch (op) {
         .block, .loop => try emitFoldedBlock(ctx, op, l),
@@ -1353,6 +1357,7 @@ fn emitFoldedIf(ctx: *Ctx, l: []const Sexpr) Error!void {
 
 /// A flat instruction at `items[i]` (`name` is its atom); return the next index.
 fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Error!usize {
+    if (lookupSimd(name)) |sd| return emitSimd(ctx, sd, items, i + 1, false);
     const op = lookupOp(name) orelse return error.UnknownInstr;
     switch (op) {
         .block, .loop, .@"if" => {
@@ -1774,6 +1779,141 @@ fn flatImmCount(op: Op) usize {
     };
 }
 
+// --- SIMD (v128) assembly (Phase 8) ----------------------------------------
+// Every 0xFD op is one `Op.simd` with a sub-opcode, so `lookupOp`/`stringToEnum`
+// can't reach them; this table maps the text name → sub-opcode + immediate shape.
+const SimdImm = enum { none, mem, lane, const_, shuffle };
+const SimdOp = struct { sub: u32, imm: SimdImm };
+
+fn lookupSimd(name: []const u8) ?SimdOp {
+    const E = struct { n: []const u8, s: u32, i: SimdImm };
+    const tbl = [_]E{
+        .{ .n = "v128.load", .s = 0x00, .i = .mem },       .{ .n = "v128.store", .s = 0x0b, .i = .mem },
+        .{ .n = "v128.const", .s = 0x0c, .i = .const_ },    .{ .n = "i8x16.shuffle", .s = 0x0d, .i = .shuffle },
+        .{ .n = "i8x16.swizzle", .s = 0x0e, .i = .none },
+        .{ .n = "i8x16.splat", .s = 0x0f, .i = .none },     .{ .n = "i16x8.splat", .s = 0x10, .i = .none },
+        .{ .n = "i32x4.splat", .s = 0x11, .i = .none },     .{ .n = "i64x2.splat", .s = 0x12, .i = .none },
+        .{ .n = "f32x4.splat", .s = 0x13, .i = .none },     .{ .n = "f64x2.splat", .s = 0x14, .i = .none },
+        .{ .n = "i8x16.extract_lane_s", .s = 0x15, .i = .lane }, .{ .n = "i8x16.extract_lane_u", .s = 0x16, .i = .lane },
+        .{ .n = "i8x16.replace_lane", .s = 0x17, .i = .lane },   .{ .n = "i16x8.extract_lane_s", .s = 0x18, .i = .lane },
+        .{ .n = "i16x8.extract_lane_u", .s = 0x19, .i = .lane }, .{ .n = "i16x8.replace_lane", .s = 0x1a, .i = .lane },
+        .{ .n = "i32x4.extract_lane", .s = 0x1b, .i = .lane },   .{ .n = "i32x4.replace_lane", .s = 0x1c, .i = .lane },
+        .{ .n = "i64x2.extract_lane", .s = 0x1d, .i = .lane },   .{ .n = "i64x2.replace_lane", .s = 0x1e, .i = .lane },
+        .{ .n = "f32x4.extract_lane", .s = 0x1f, .i = .lane },   .{ .n = "f32x4.replace_lane", .s = 0x20, .i = .lane },
+        .{ .n = "f64x2.extract_lane", .s = 0x21, .i = .lane },   .{ .n = "f64x2.replace_lane", .s = 0x22, .i = .lane },
+        .{ .n = "i8x16.eq", .s = 0x23, .i = .none }, .{ .n = "i8x16.ne", .s = 0x24, .i = .none }, .{ .n = "i8x16.lt_s", .s = 0x25, .i = .none }, .{ .n = "i8x16.lt_u", .s = 0x26, .i = .none }, .{ .n = "i8x16.gt_s", .s = 0x27, .i = .none }, .{ .n = "i8x16.gt_u", .s = 0x28, .i = .none }, .{ .n = "i8x16.le_s", .s = 0x29, .i = .none }, .{ .n = "i8x16.le_u", .s = 0x2a, .i = .none }, .{ .n = "i8x16.ge_s", .s = 0x2b, .i = .none }, .{ .n = "i8x16.ge_u", .s = 0x2c, .i = .none },
+        .{ .n = "i16x8.eq", .s = 0x2d, .i = .none }, .{ .n = "i16x8.ne", .s = 0x2e, .i = .none }, .{ .n = "i16x8.lt_s", .s = 0x2f, .i = .none }, .{ .n = "i16x8.lt_u", .s = 0x30, .i = .none }, .{ .n = "i16x8.gt_s", .s = 0x31, .i = .none }, .{ .n = "i16x8.gt_u", .s = 0x32, .i = .none }, .{ .n = "i16x8.le_s", .s = 0x33, .i = .none }, .{ .n = "i16x8.le_u", .s = 0x34, .i = .none }, .{ .n = "i16x8.ge_s", .s = 0x35, .i = .none }, .{ .n = "i16x8.ge_u", .s = 0x36, .i = .none },
+        .{ .n = "i32x4.eq", .s = 0x37, .i = .none }, .{ .n = "i32x4.ne", .s = 0x38, .i = .none }, .{ .n = "i32x4.lt_s", .s = 0x39, .i = .none }, .{ .n = "i32x4.lt_u", .s = 0x3a, .i = .none }, .{ .n = "i32x4.gt_s", .s = 0x3b, .i = .none }, .{ .n = "i32x4.gt_u", .s = 0x3c, .i = .none }, .{ .n = "i32x4.le_s", .s = 0x3d, .i = .none }, .{ .n = "i32x4.le_u", .s = 0x3e, .i = .none }, .{ .n = "i32x4.ge_s", .s = 0x3f, .i = .none }, .{ .n = "i32x4.ge_u", .s = 0x40, .i = .none },
+        .{ .n = "f32x4.eq", .s = 0x41, .i = .none }, .{ .n = "f32x4.ne", .s = 0x42, .i = .none }, .{ .n = "f32x4.lt", .s = 0x43, .i = .none }, .{ .n = "f32x4.gt", .s = 0x44, .i = .none }, .{ .n = "f32x4.le", .s = 0x45, .i = .none }, .{ .n = "f32x4.ge", .s = 0x46, .i = .none },
+        .{ .n = "f64x2.eq", .s = 0x47, .i = .none }, .{ .n = "f64x2.ne", .s = 0x48, .i = .none }, .{ .n = "f64x2.lt", .s = 0x49, .i = .none }, .{ .n = "f64x2.gt", .s = 0x4a, .i = .none }, .{ .n = "f64x2.le", .s = 0x4b, .i = .none }, .{ .n = "f64x2.ge", .s = 0x4c, .i = .none },
+        .{ .n = "v128.not", .s = 0x4d, .i = .none }, .{ .n = "v128.and", .s = 0x4e, .i = .none }, .{ .n = "v128.andnot", .s = 0x4f, .i = .none }, .{ .n = "v128.or", .s = 0x50, .i = .none }, .{ .n = "v128.xor", .s = 0x51, .i = .none }, .{ .n = "v128.bitselect", .s = 0x52, .i = .none }, .{ .n = "v128.any_true", .s = 0x53, .i = .none },
+        .{ .n = "i8x16.abs", .s = 0x60, .i = .none }, .{ .n = "i8x16.neg", .s = 0x61, .i = .none }, .{ .n = "i8x16.popcnt", .s = 0x62, .i = .none }, .{ .n = "i8x16.all_true", .s = 0x63, .i = .none }, .{ .n = "i8x16.bitmask", .s = 0x64, .i = .none }, .{ .n = "i8x16.narrow_i16x8_s", .s = 0x65, .i = .none }, .{ .n = "i8x16.narrow_i16x8_u", .s = 0x66, .i = .none }, .{ .n = "i8x16.shl", .s = 0x6b, .i = .none }, .{ .n = "i8x16.shr_s", .s = 0x6c, .i = .none }, .{ .n = "i8x16.shr_u", .s = 0x6d, .i = .none }, .{ .n = "i8x16.add", .s = 0x6e, .i = .none }, .{ .n = "i8x16.add_sat_s", .s = 0x6f, .i = .none }, .{ .n = "i8x16.add_sat_u", .s = 0x70, .i = .none }, .{ .n = "i8x16.sub", .s = 0x71, .i = .none }, .{ .n = "i8x16.sub_sat_s", .s = 0x72, .i = .none }, .{ .n = "i8x16.sub_sat_u", .s = 0x73, .i = .none }, .{ .n = "i8x16.min_s", .s = 0x76, .i = .none }, .{ .n = "i8x16.min_u", .s = 0x77, .i = .none }, .{ .n = "i8x16.max_s", .s = 0x78, .i = .none }, .{ .n = "i8x16.max_u", .s = 0x79, .i = .none }, .{ .n = "i8x16.avgr_u", .s = 0x7b, .i = .none },
+        .{ .n = "i16x8.abs", .s = 0x80, .i = .none }, .{ .n = "i16x8.neg", .s = 0x81, .i = .none }, .{ .n = "i16x8.all_true", .s = 0x83, .i = .none }, .{ .n = "i16x8.bitmask", .s = 0x84, .i = .none }, .{ .n = "i16x8.narrow_i32x4_s", .s = 0x85, .i = .none }, .{ .n = "i16x8.narrow_i32x4_u", .s = 0x86, .i = .none }, .{ .n = "i16x8.extend_low_i8x16_s", .s = 0x87, .i = .none }, .{ .n = "i16x8.extend_high_i8x16_s", .s = 0x88, .i = .none }, .{ .n = "i16x8.extend_low_i8x16_u", .s = 0x89, .i = .none }, .{ .n = "i16x8.extend_high_i8x16_u", .s = 0x8a, .i = .none }, .{ .n = "i16x8.shl", .s = 0x8b, .i = .none }, .{ .n = "i16x8.shr_s", .s = 0x8c, .i = .none }, .{ .n = "i16x8.shr_u", .s = 0x8d, .i = .none }, .{ .n = "i16x8.add", .s = 0x8e, .i = .none }, .{ .n = "i16x8.add_sat_s", .s = 0x8f, .i = .none }, .{ .n = "i16x8.add_sat_u", .s = 0x90, .i = .none }, .{ .n = "i16x8.sub", .s = 0x91, .i = .none }, .{ .n = "i16x8.sub_sat_s", .s = 0x92, .i = .none }, .{ .n = "i16x8.sub_sat_u", .s = 0x93, .i = .none }, .{ .n = "i16x8.mul", .s = 0x95, .i = .none }, .{ .n = "i16x8.min_s", .s = 0x96, .i = .none }, .{ .n = "i16x8.min_u", .s = 0x97, .i = .none }, .{ .n = "i16x8.max_s", .s = 0x98, .i = .none }, .{ .n = "i16x8.max_u", .s = 0x99, .i = .none }, .{ .n = "i16x8.avgr_u", .s = 0x9b, .i = .none },
+        .{ .n = "i32x4.abs", .s = 0xa0, .i = .none }, .{ .n = "i32x4.neg", .s = 0xa1, .i = .none }, .{ .n = "i32x4.all_true", .s = 0xa3, .i = .none }, .{ .n = "i32x4.bitmask", .s = 0xa4, .i = .none }, .{ .n = "i32x4.extend_low_i16x8_s", .s = 0xa7, .i = .none }, .{ .n = "i32x4.extend_high_i16x8_s", .s = 0xa8, .i = .none }, .{ .n = "i32x4.extend_low_i16x8_u", .s = 0xa9, .i = .none }, .{ .n = "i32x4.extend_high_i16x8_u", .s = 0xaa, .i = .none }, .{ .n = "i32x4.shl", .s = 0xab, .i = .none }, .{ .n = "i32x4.shr_s", .s = 0xac, .i = .none }, .{ .n = "i32x4.shr_u", .s = 0xad, .i = .none }, .{ .n = "i32x4.add", .s = 0xae, .i = .none }, .{ .n = "i32x4.sub", .s = 0xb1, .i = .none }, .{ .n = "i32x4.mul", .s = 0xb5, .i = .none }, .{ .n = "i32x4.min_s", .s = 0xb6, .i = .none }, .{ .n = "i32x4.min_u", .s = 0xb7, .i = .none }, .{ .n = "i32x4.max_s", .s = 0xb8, .i = .none }, .{ .n = "i32x4.max_u", .s = 0xb9, .i = .none },
+        .{ .n = "i64x2.abs", .s = 0xc0, .i = .none }, .{ .n = "i64x2.neg", .s = 0xc1, .i = .none }, .{ .n = "i64x2.all_true", .s = 0xc3, .i = .none }, .{ .n = "i64x2.bitmask", .s = 0xc4, .i = .none }, .{ .n = "i64x2.extend_low_i32x4_s", .s = 0xc7, .i = .none }, .{ .n = "i64x2.extend_high_i32x4_s", .s = 0xc8, .i = .none }, .{ .n = "i64x2.extend_low_i32x4_u", .s = 0xc9, .i = .none }, .{ .n = "i64x2.extend_high_i32x4_u", .s = 0xca, .i = .none }, .{ .n = "i64x2.shl", .s = 0xcb, .i = .none }, .{ .n = "i64x2.shr_s", .s = 0xcc, .i = .none }, .{ .n = "i64x2.shr_u", .s = 0xcd, .i = .none }, .{ .n = "i64x2.add", .s = 0xce, .i = .none }, .{ .n = "i64x2.sub", .s = 0xd1, .i = .none }, .{ .n = "i64x2.mul", .s = 0xd5, .i = .none },
+        .{ .n = "f32x4.ceil", .s = 0x67, .i = .none }, .{ .n = "f32x4.floor", .s = 0x68, .i = .none }, .{ .n = "f32x4.trunc", .s = 0x69, .i = .none }, .{ .n = "f32x4.abs", .s = 0xe0, .i = .none }, .{ .n = "f32x4.neg", .s = 0xe1, .i = .none }, .{ .n = "f32x4.sqrt", .s = 0xe3, .i = .none }, .{ .n = "f32x4.add", .s = 0xe4, .i = .none }, .{ .n = "f32x4.sub", .s = 0xe5, .i = .none }, .{ .n = "f32x4.mul", .s = 0xe6, .i = .none }, .{ .n = "f32x4.div", .s = 0xe7, .i = .none }, .{ .n = "f32x4.min", .s = 0xe8, .i = .none }, .{ .n = "f32x4.max", .s = 0xe9, .i = .none }, .{ .n = "f32x4.pmin", .s = 0xea, .i = .none }, .{ .n = "f32x4.pmax", .s = 0xeb, .i = .none }, .{ .n = "f32x4.convert_i32x4_s", .s = 0xfa, .i = .none }, .{ .n = "f32x4.convert_i32x4_u", .s = 0xfb, .i = .none }, .{ .n = "f32x4.demote_f64x2_zero", .s = 0x5f, .i = .none },
+        .{ .n = "f64x2.ceil", .s = 0x74, .i = .none }, .{ .n = "f64x2.floor", .s = 0x75, .i = .none }, .{ .n = "f64x2.trunc", .s = 0x7a, .i = .none }, .{ .n = "f64x2.abs", .s = 0xec, .i = .none }, .{ .n = "f64x2.neg", .s = 0xed, .i = .none }, .{ .n = "f64x2.sqrt", .s = 0xef, .i = .none }, .{ .n = "f64x2.add", .s = 0xf0, .i = .none }, .{ .n = "f64x2.sub", .s = 0xf1, .i = .none }, .{ .n = "f64x2.mul", .s = 0xf2, .i = .none }, .{ .n = "f64x2.div", .s = 0xf3, .i = .none }, .{ .n = "f64x2.min", .s = 0xf4, .i = .none }, .{ .n = "f64x2.max", .s = 0xf5, .i = .none }, .{ .n = "f64x2.pmin", .s = 0xf6, .i = .none }, .{ .n = "f64x2.pmax", .s = 0xf7, .i = .none }, .{ .n = "f64x2.promote_low_f32x4", .s = 0x5e, .i = .none }, .{ .n = "f64x2.convert_low_i32x4_s", .s = 0xfe, .i = .none }, .{ .n = "f64x2.convert_low_i32x4_u", .s = 0xff, .i = .none },
+        .{ .n = "i32x4.trunc_sat_f32x4_s", .s = 0xf8, .i = .none }, .{ .n = "i32x4.trunc_sat_f32x4_u", .s = 0xf9, .i = .none }, .{ .n = "i32x4.trunc_sat_f64x2_s_zero", .s = 0xfc, .i = .none }, .{ .n = "i32x4.trunc_sat_f64x2_u_zero", .s = 0xfd, .i = .none },
+    };
+    for (tbl) |e| if (std.mem.eql(u8, e.n, name)) return .{ .sub = e.s, .imm = e.i };
+    return null;
+}
+
+/// Emit a SIMD op: parse its immediate from `items[start..]`, emit operand
+/// sub-exprs (folded form only), then `0xFD sub imm`. Returns the next index.
+fn emitSimd(ctx: *Ctx, sd: SimdOp, items: []const Sexpr, start: usize, is_folded: bool) Error!usize {
+    var j = start;
+    var lane: u8 = 0;
+    var cbytes: [16]u8 = @splat(0);
+    var align_log2: u32 = 4; // natural alignment for a 16-byte v128 load/store
+    var offset: u64 = 0;
+    switch (sd.imm) {
+        .none => {},
+        .lane => {
+            if (j >= items.len) return error.BadImmediate;
+            lane = @intCast(@as(u32, @bitCast(@as(i32, @truncate(try parseWatI32(items[j]))))));
+            j += 1;
+        },
+        .shuffle => for (0..16) |k| {
+            if (j >= items.len) return error.BadImmediate;
+            cbytes[k] = @intCast(@as(u32, @bitCast(@as(i32, @truncate(try parseWatI32(items[j]))))));
+            j += 1;
+        },
+        .const_ => j = try parseV128Const(items, j, &cbytes),
+        .mem => while (j < items.len) {
+            const atom = items[j].asAtom() orelse break;
+            if (std.mem.startsWith(u8, atom, "offset=")) {
+                offset = std.fmt.parseInt(u64, atom[7..], 0) catch return error.BadImmediate;
+            } else if (std.mem.startsWith(u8, atom, "align=")) {
+                const by = std.fmt.parseInt(u32, atom[6..], 0) catch return error.BadImmediate;
+                if (by == 0 or (by & (by - 1)) != 0) return error.BadImmediate;
+                align_log2 = @ctz(by);
+            } else break;
+            j += 1;
+        },
+    }
+    if (is_folded) while (j < items.len) {
+        j = try emitOne(ctx, items, j);
+    };
+    try ctx.out.append(ctx.a, 0xfd);
+    try uleb(ctx.a, ctx.out, sd.sub);
+    switch (sd.imm) {
+        .none => {},
+        .lane => try ctx.out.append(ctx.a, lane),
+        .shuffle, .const_ => try ctx.out.appendSlice(ctx.a, &cbytes),
+        .mem => {
+            try uleb(ctx.a, ctx.out, align_log2);
+            try uleb(ctx.a, ctx.out, offset);
+        },
+    }
+    return j;
+}
+
+/// Parse a `v128.const <shape> <values…>` immediate into 16 little-endian bytes.
+fn parseV128Const(items: []const Sexpr, start: usize, out: *[16]u8) Error!usize {
+    var j = start;
+    if (j >= items.len) return error.BadImmediate;
+    const shape = items[j].asAtom() orelse return error.BadImmediate;
+    j += 1;
+    // Number of lane values that must follow the shape atom.
+    const count: usize = if (std.mem.eql(u8, shape, "i8x16")) 16 else if (std.mem.eql(u8, shape, "i16x8") or std.mem.eql(u8, shape, "f32x4") or std.mem.eql(u8, shape, "i32x4")) (if (std.mem.eql(u8, shape, "i16x8")) 8 else 4) else if (std.mem.eql(u8, shape, "i64x2") or std.mem.eql(u8, shape, "f64x2")) 2 else return error.BadImmediate;
+    if (j + count > items.len) return error.BadImmediate;
+    if (std.mem.eql(u8, shape, "i8x16")) {
+        for (0..16) |k| {
+            out[k] = @intCast(@as(u32, @bitCast(@as(i32, @truncate(try parseWatI32(items[j]))))) & 0xff);
+            j += 1;
+        }
+    } else if (std.mem.eql(u8, shape, "i16x8")) {
+        for (0..8) |k| {
+            std.mem.writeInt(u16, out[k * 2 ..][0..2], @truncate(@as(u64, @bitCast(try parseWatI32(items[j])))), .little);
+            j += 1;
+        }
+    } else if (std.mem.eql(u8, shape, "i32x4")) {
+        for (0..4) |k| {
+            std.mem.writeInt(u32, out[k * 4 ..][0..4], @truncate(@as(u64, @bitCast(try parseWatI32(items[j])))), .little);
+            j += 1;
+        }
+    } else if (std.mem.eql(u8, shape, "i64x2")) {
+        for (0..2) |k| {
+            std.mem.writeInt(u64, out[k * 8 ..][0..8], @bitCast(try parseWatI64(items[j])), .little);
+            j += 1;
+        }
+    } else if (std.mem.eql(u8, shape, "f32x4")) {
+        for (0..4) |k| {
+            const bits = floatLitBits(u32, f32, items[j].asAtom() orelse return error.BadImmediate) orelse return error.BadImmediate;
+            std.mem.writeInt(u32, out[k * 4 ..][0..4], bits, .little);
+            j += 1;
+        }
+    } else {
+        for (0..2) |k| {
+            const bits = floatLitBits(u64, f64, items[j].asAtom() orelse return error.BadImmediate) orelse return error.BadImmediate;
+            std.mem.writeInt(u64, out[k * 8 ..][0..8], bits, .little);
+            j += 1;
+        }
+    }
+    return j;
+}
+
 fn lookupOp(name: []const u8) ?Op {
     var buf: [64]u8 = undefined;
     if (name.len > buf.len) return null;
@@ -2024,6 +2164,58 @@ test "top-level export and a two-function module" {
         \\  (export "quad" (func $quad)))
     , "quad", &.{interp.i32Value(5)});
     try std.testing.expectEqual(@as(i32, 20), interp.asI32(v));
+}
+
+test "assembles SIMD folded splat+add+extract (v128)" {
+    const v = try assembleAndRun(
+        \\(module (func (export "f") (result i32)
+        \\  (i32x4.extract_lane 0
+        \\    (i32x4.add (i32x4.splat (i32.const 10)) (i32x4.splat (i32.const 32))))))
+    , "f", &.{});
+    try std.testing.expectEqual(@as(i32, 42), interp.asI32(v));
+}
+
+test "assembles SIMD v128.const with i32x4 shape" {
+    const v = try assembleAndRun(
+        \\(module (func (export "f") (result i32)
+        \\  (i32x4.extract_lane 2 (v128.const i32x4 1 2 3 4))))
+    , "f", &.{});
+    try std.testing.expectEqual(@as(i32, 3), interp.asI32(v));
+}
+
+test "assembles SIMD flat form (v128)" {
+    const v = try assembleAndRun(
+        \\(module (func (export "f") (result f32)
+        \\  v128.const f32x4 1.5 2.5 3.5 4.5
+        \\  v128.const f32x4 0.5 0.5 0.5 0.5
+        \\  f32x4.add
+        \\  f32x4.extract_lane 1))
+    , "f", &.{});
+    try std.testing.expectEqual(@as(f32, 3.0), interp.asF32(v));
+}
+
+test "assembles SIMD v128 load/store (memarg) + shuffle + signed i8x16.const" {
+    const store_load = try assembleAndRun(
+        \\(module (memory 1) (func (export "f") (result i32)
+        \\  (v128.store offset=16 (i32.const 0) (v128.const i32x4 100 200 300 400))
+        \\  (i32x4.extract_lane 1 (v128.load offset=16 align=16 (i32.const 0)))))
+    , "f", &.{});
+    try std.testing.expectEqual(@as(i32, 200), interp.asI32(store_load));
+
+    const shuffled = try assembleAndRun(
+        \\(module (func (export "f") (result i32)
+        \\  (i32x4.extract_lane 0
+        \\    (i8x16.shuffle 16 17 18 19 0 0 0 0 0 0 0 0 0 0 0 0
+        \\      (v128.const i32x4 0 0 0 0) (v128.const i32x4 777 0 0 0)))))
+    , "f", &.{});
+    try std.testing.expectEqual(@as(i32, 777), interp.asI32(shuffled));
+
+    const neg = try assembleAndRun(
+        \\(module (func (export "f") (result i32)
+        \\  (i8x16.extract_lane_u 15
+        \\    (v128.const i8x16 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 -1))))
+    , "f", &.{});
+    try std.testing.expectEqual(@as(i32, 255), interp.asI32(neg));
 }
 
 test "assembles a folded if/else" {
