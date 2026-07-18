@@ -10,6 +10,16 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    // ---- Signature trust anchor (build-time embed) -------------------------
+    // `-Droot-key=<64 hex chars>` embeds the Ed25519 root public key the CLI
+    // verifies module signatures against. Empty (the default) ⇒ verification is
+    // inert. Only main.zig reads it, so `build_options` is imported by the CLI
+    // module alone — sign.zig (compiled into every target via root.zig) stays
+    // free of build plumbing.
+    const root_key_hex = b.option([]const u8, "root-key", "Ed25519 root public key (64 hex chars) to embed as the signature trust anchor; empty ⇒ verification inert") orelse "";
+    const cli_options = b.addOptions();
+    cli_options.addOption([]const u8, "root_key_hex", root_key_hex);
+
     // ---- CLI front-end -----------------------------------------------------
     const exe = b.addExecutable(.{
         .name = "wazmrt",
@@ -17,7 +27,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "wazmrt", .module = mod }},
+            .imports = &.{
+                .{ .name = "wazmrt", .module = mod },
+                .{ .name = "build_options", .module = cli_options.createModule() },
+            },
         }),
     });
     b.installArtifact(exe);

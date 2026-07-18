@@ -464,14 +464,19 @@ Phase 5 "ship behind a default-OFF knob" precedent.
 - **Verified through the real binary:** keygen → sign → embed the printed key → an authenticated run
   (42) and a refused tampered run. Same "thin CLI over a tested library function" shape as `wazmrt pin`.
 
+**Release-time key injection — BUILT 2026-07-18.** `zig build -Droot-key=<64 hex>` embeds the trust
+anchor; empty (the default) ⇒ verification inert; a malformed value is a **build error**
+(`sign.rootKeyFromHex`'s `@compileError`). The threading problem (sign.zig is compiled into ~8 targets via
+`root.zig`) is sidestepped: **only `main.zig` reads the key**, so `build_options` is imported by the CLI
+module alone and `sign.zig` stays plumbing-free. The whole loop — keygen → sign → `-Droot-key` → verify —
+is proven through the real binary with no source edits.
+
 **Still open** (do NOT block the above):
 
 - Where the **private** key lives for a real publisher (HSM/YubiKey/KMS — the local `.key` file is the
   MVP; the design never wanted a private key on a *user's* machine, only the publisher's).
 - Keyring file + rotation (embedded root signs a keyring; PK→KEK→db).
-- How the embedded key is injected at release build — a `-Droot-key=<hex>` build option (recommended, but
-  it must thread through every module that compiles `root.zig` — ~8 targets) vs the committed constant
-  today. And the default policy (deny-unsigned out of the box vs opt-in).
+- Default policy (deny-unsigned out of the box vs opt-in) — still `off` today.
 
 **Resolved with data 2026-07-16:** ~~cold-start cost of hashing on every run~~ — **measured, negligible**
 (SHA-256 0.5% of instantiate, Ed25519 2.4%, both <0.15% of the process-startup floor). See the pin

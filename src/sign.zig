@@ -32,15 +32,34 @@ pub const section_name = "signature";
 /// Length of the signature section's *content* (payload after the name).
 pub const content_len = magic.len + 1 + pubkey_len + sig_len; // 7+1+32+64 = 104
 
-/// The build-time trust anchor: the root Ed25519 public key this binary trusts.
+/// Parse a build-time root-key hex string (`-Droot-key=<64 hex chars>`) into the
+/// trust anchor at **comptime**.
 ///
-/// `null` (the default) leaves signature verification **inert** — the CLI gate
-/// treats every module as unsigned, so behavior is byte-identical to a build
-/// with no signature support. A release build sets this to a real key whose
-/// *private* half is held only by the publisher (an HSM/YubiKey/KMS — never on
-/// a user's machine). Replacing it means rebuilding + re-signing wazmrt, which
-/// is exactly the point: the anchor's integrity == the verifier's integrity.
-pub const embedded_root_key: ?[pubkey_len]u8 = null;
+/// An empty string ⇒ `null` ⇒ signature verification stays **inert** (the CLI
+/// treats every module as unsigned, byte-identical to a build with no key). A
+/// 64-hex-char value ⇒ the 32-byte root public key. Anything else is a **build
+/// error**, so a typo'd key fails the build instead of silently disabling
+/// verification. The matching *private* key is held only by the publisher (an
+/// HSM/YubiKey/KMS — never on a user's machine); changing the anchor means
+/// rebuilding + re-signing wazmrt, which is the point: the anchor's integrity ==
+/// the verifier's integrity.
+pub fn rootKeyFromHex(comptime hex: []const u8) ?[pubkey_len]u8 {
+    if (hex.len == 0) return null;
+    if (hex.len != pubkey_len * 2)
+        @compileError("-Droot-key must be exactly 64 hex characters (a 32-byte Ed25519 public key)");
+    var key: [pubkey_len]u8 = undefined;
+    inline for (0..pubkey_len) |i|
+        key[i] = (@as(u8, hexNibble(hex[i * 2])) << 4) | hexNibble(hex[i * 2 + 1]);
+    return key;
+}
+fn hexNibble(comptime c: u8) u4 {
+    return switch (c) {
+        '0'...'9' => @intCast(c - '0'),
+        'a'...'f' => @intCast(c - 'a' + 10),
+        'A'...'F' => @intCast(c - 'A' + 10),
+        else => @compileError("-Droot-key contains a non-hex character"),
+    };
+}
 
 /// A parsed, well-formed signature section and its byte span within the module.
 pub const Located = struct {
@@ -200,6 +219,14 @@ const empty_module = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
 fn testKey(seed_byte: u8) Ed25519.KeyPair {
     const seed: [32]u8 = @splat(seed_byte);
     return Ed25519.KeyPair.generateDeterministic(seed) catch unreachable;
+}
+
+test "rootKeyFromHex: empty → null, 64 hex → key, endpoints correct" {
+    try std.testing.expectEqual(@as(?[pubkey_len]u8, null), rootKeyFromHex(""));
+    const k = rootKeyFromHex("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+    try std.testing.expect(k != null);
+    try std.testing.expectEqual(@as(u8, 0x00), k.?[0]);
+    try std.testing.expectEqual(@as(u8, 0xff), k.?[pubkey_len - 1]);
 }
 
 test "sign then verify → authenticated" {

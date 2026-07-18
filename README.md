@@ -155,10 +155,17 @@ wazmrt sign app.wasm app.signed.wasm --key mykey.key   # appends the signature
 ```
 
 `sign` accepts `.wat` too (it assembles first), and the signed module still runs
-in any other runtime (they ignore the custom section). Verification is **inert in
-the default build** — no root key is embedded, so nothing changes until a release
-build sets one (a local `.key` file is fine for testing; a real publisher keeps
-the private key in an HSM/YubiKey/KMS). Design + rationale:
+in any other runtime (they ignore the custom section). Embed the trust anchor at
+build time — the public key `sign` printed — to turn verification on:
+
+```
+zig build -Droot-key=<64-hex-char public key>
+```
+
+The default build embeds **no** key, so verification is **inert** (wazmrt runs
+any module) until you build with `-Droot-key`; an empty value keeps it inert and
+a malformed one is a build error. A local `.key` file is fine for testing; a real
+publisher keeps the private key in an HSM/YubiKey/KMS. Design + rationale:
 [`cmem/security-model.md`](cmem/security-model.md).
 
 Implemented: stdout/stderr/stdin, args/environ, clocks, `poll_oneoff` (clock

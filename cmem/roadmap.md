@@ -332,9 +332,12 @@ final-component `path_open` TOCTOU tied to std bug #18. See #17.
 > `Io`; private seed → `<name>.key`, public key printed to embed) and `wazmrt sign <in> <out> --key
 > <keyfile>` (assembles `.wat`, appends the `"signature"` section). Thin CLI over the tested `signModule`
 > + `pin.toHex`/`parseHex`; whole loop keygen→sign→embed→verify proven through the real binary. ⇢
-> REMAINING: private-key custody for a real publisher (HSM/YubiKey/KMS), keyring file + rotation
-> (PK→KEK→db), release-time key injection (`-Droot-key` build option — threads through ~8 targets), and
-> the deny-unsigned-by-default policy call. See `security-model.md`.
+> ✅ **Release key injection BUILT (2026-07-18).** `zig build -Droot-key=<64 hex>` embeds the trust anchor
+> (empty ⇒ inert; malformed ⇒ build error). `build_options` is imported only by `main.zig`, so `sign.zig`
+> (compiled into ~8 targets via `root.zig`) stays plumbing-free — no cross-target threading. Full loop
+> keygen → sign → `-Droot-key` → verify proven through the real binary, no source edits. ⇢ REMAINING:
+> private-key custody (HSM/YubiKey/KMS), keyring file + rotation (PK→KEK→db), and the deny-unsigned-by-
+> default policy call. See `security-model.md`.
 >
 > **The C ABI is NOT remaining work** — #20 (all 319 `wasm.h` fns) / #21 (mem-safety) / #22 (fuzz) are
 > DONE and 4.4 added a C conformance guest. Only two narrow, demand-driven residuals stay deferred:

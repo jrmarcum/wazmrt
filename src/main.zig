@@ -5,6 +5,12 @@ const std = @import("std");
 const Io = std.Io;
 
 const wazmrt = @import("wazmrt");
+const build_options = @import("build_options");
+
+/// The signature trust anchor embedded at build time via `-Droot-key=<hex>`
+/// (empty ⇒ `null` ⇒ verification inert). Only the CLI reads it, so the build
+/// option is wired only into this module — `sign.zig` stays plumbing-free.
+const embedded_root_key: ?[wazmrt.sign.pubkey_len]u8 = wazmrt.sign.rootKeyFromHex(build_options.root_key_hex);
 
 pub fn main(init: std.process.Init) !void {
     const arena: std.mem.Allocator = init.arena.allocator();
@@ -316,10 +322,11 @@ fn verifyGate(
 ) !bool {
     // Authenticity gate (signature) runs before the pin fallback: a module
     // signed by the trusted root key is authenticated and needs no pin. Inert
-    // unless this build embedded a root key (`sign.embedded_root_key != null`),
-    // so a default build behaves exactly as the pin-only path did. The bytes
-    // checked are the in-memory buffer we are about to run (TOCTOU-safe).
-    if (wazmrt.sign.embedded_root_key) |root| switch (wazmrt.sign.verify(bytes, root)) {
+    // unless this build embedded a root key (`-Droot-key`, i.e.
+    // `embedded_root_key != null`), so a default build behaves exactly as the
+    // pin-only path did. The bytes checked are the in-memory buffer we are about
+    // to run (TOCTOU-safe).
+    if (embedded_root_key) |root| switch (wazmrt.sign.verify(bytes, root)) {
         .authenticated => return true, // signed by the trusted root; skip the pin check
         .tampered => {
             try out.print("refusing to run {s}: signed by the trusted key but the bytes do not match (tampered or corrupt)\n", .{path});
