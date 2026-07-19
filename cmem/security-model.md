@@ -36,12 +36,36 @@ two are unrelated layers; do not let the 4.3 symlink decision block this work, o
 
 | | Question | Mechanism | Status |
 | --- | --- | --- | --- |
-| **Authenticity** | Is this the code I approved? | Signature verified against a trust anchor | **Not built** (this doc) |
+| **Authenticity** | Is this the code I approved? | Ed25519 signature / pin, vs a trust anchor | **BUILT** (Phase 5 + `sign.zig`, 2026-07-18) |
 | **Authority** | What may it touch once running? | Preopens + rights (the sandbox) | **Built** (#17, Phase 3) |
 
 They do not substitute for each other. **A validly-signed module is *authentic*, not *harmless*** — it
 still gets exactly the authority `--dir` hands it. A sandboxed module is contained but may be malicious
 code you never approved. Ship both or the story has a hole.
+
+### Authority scales with granted capabilities; authenticity is constant (2026-07-18)
+
+A subtle but load-bearing consequence, worth stating because the two wazmrt run paths differ:
+
+- **A wasm module has zero ambient authority.** Core wasm cannot make a syscall — its *only* channel to
+  the outside world is the **imports** the host wires at instantiation. No import for a thing ⇒ the module
+  physically cannot do that thing (capability-security by construction).
+- **`wazmrt <module> <export> [args]`** (a plain exported-function call) wires **no imports**
+  (`runFunction` → `Instance.init` = `initWithImports(..., .{})`). The function computes over its own
+  linear memory and returns a value; it **cannot read or write files** — a module that imports a file
+  function either fails to instantiate (`MissingImport`) or traps (`UnsupportedImportCall`) at the call.
+- **`wazmrt <module.wasm>`** (a WASI `_start` command) wires the `wasi_snapshot_preview1` imports —
+  *those imports are the file access*, gated by the preopen/rights sandbox.
+
+So the **authority/sandbox** measures (preopens, rights, symlink containment) are only relevant on the
+path that *grants* I/O (WASI). A bare function call is already maximally sandboxed — there is no capability
+to contain. But **authenticity applies to *both* paths equally**, and `verifyGate` already gates both
+(`will_execute` = an export invocation **or** `_start`): a tampered *pure-compute* module is still
+dangerous — a crypto routine returning a weak key, a validator that always says "valid", a pricing
+function with a backdoor never touch a file, yet you trust their *return value*. **Rule: authority is
+conditional on granted capabilities (zero for a bare function ⇒ no sandbox needed); authenticity is
+unconditional.** (Caveat: an **embedder** via the C-ABI/FFI chooses its own imports — if it grants file
+access it must sandbox that itself; the embedder run path is intentionally ungated for both properties.)
 
 ## What holds today (shipped, verified)
 
