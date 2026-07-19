@@ -8,9 +8,11 @@
 > **denies unsigned modules by default when *armed*** (a root key is embedded **or** a pin DB is present);
 > a **bare** build (no key, no DB) still runs any `.wasm` (byte-identical to before). `--no-verify`
 > overrides on the user's own machine, but a root `# mode: enforce` is absolute. Verification is
-> **CLI-only** — the C-ABI/embedder run path is intentionally ungated. **Still design (not built):** the
-> companion **keystore** project (`wasm-keys.json` — decided, see below) and its wazmrt-side reader; and
-> optional HSM key custody. **No key rotation** (rejected).
+> **CLI-only** — the C-ABI/embedder run path is intentionally ungated. **The authenticity path is
+> feature-complete** for the chosen **single-publisher / package-managed** model (store = root-owned pin
+> DB + one embedded `-Droot-key`); `wazmrt pin <dir>` bulk-pins a whole bundle. The companion **keystore**
+> project (`wasm-keys.json`) is **SHELVED as redundant** (multi-publisher only — see below). Only optional
+> remainder: publisher HSM key custody. **No key rotation** (rejected).
 >
 > **The authority/sandbox side was already built:** everything in "What holds today" (no exec, preopens,
 > rights) and the "DONE — WASI symlink traversal" section (`walkFull`, `path_symlink`/`path_readlink`,
