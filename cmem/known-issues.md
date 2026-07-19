@@ -11,6 +11,38 @@ This file tracks only what's left.
 
 Line numbers are hints (they drift) — the function/construct name is the durable anchor.
 
+## Code audit 2026-07-19 ("look for code issues") — 8 fixed, a few deferred
+
+**FIXED in git (`d0dddc5`)** — 3 parallel auditors (security / SIMD / sweep): **decodeSimd lane-bounds guard**
+(out-of-range extract/replace/load_lane/store_lane lane → was an OOB read, and an OOB **stack write** for
+replace/load_lane, since the CLI run path does NOT re-validate); **`sub_sat_u` unsigned-wide underflow**
+(→ 255/panic instead of 0); **`i64x2.all_true`/`bitmask`** (0xc3/0xc4 missing from `execSimd` → trapped);
+**demote/promote opcodes swapped** vs spec (0x5e/0x5f — interop break with external binaries);
+**`f32x4/f64x2.nearest`** (validated but unimplemented → trapped); **WAT `memory.size`/`memory.grow`**
+(no `.mem_index` emit arm); **`sign.findSignature` `payload_end - p` underflow** guard; dead `wStubBadf`
+removed. +2 regression test blocks.
+
+**#24 — `--pins <path>` / `--verify off` can weaken a root-owned pin policy — OPEN (owner decision)**
+`main.zig verifyGate` reads the pin DB *and its `# mode:` policy* from an invoker-controlled `--pins` path,
+and `--verify off` downgrades the armed default-deny when the DB has no explicit `# mode:`. Both contradict
+the model's "authority comes from the root-owned policy, not a runtime argument / `# mode: enforce` is
+absolute." Real bypass on a **multi-user** box (a non-root user runs `wazmrt evil.wasm --pins /tmp/mine`).
+On a single-user machine it's equivalent to `--no-verify` (already allowed by the ownership principle), so
+impact is the shared-system / root-mandated-enforce case. **Surfaces when:** anyone deploys wazmrt with a
+root-owned enforce DB on a multi-user system. Fix options (owner to pick): always read policy from the
+fixed default path and let `--pins` only *add* pins (never lower policy); or refuse `--pins`/`--verify`
+downgrades when the default DB mandates enforce; or gate these flags behind a dev/env opt-in.
+
+**Low-priority notes (safe today):**
+- `wasi.zig Wasi.init` — `w.fds.appendSlice(...) catch {}` swallows OOM registering the 3 stdio fds (init
+  then reports success with no stdio). Near-impossible; propagate for cleanliness someday.
+- `Module.zig skipConstExpr` — the byte-level const-expr skipper's `else => {}` would misread a `0xFB` GC
+  const-op *immediate* (e.g. `struct.new $t`) as opcodes; the "operand can't be mistaken for the
+  terminator" doc claim is overstated. Not triggerable (interp rejects GC const-exprs anyway; Reader is
+  bounds-checked). **Surfaces when:** GC const-expr support is added.
+- `wat.zig naturalAlign` and `validate.zig naturalAlignLog2` are byte-identical duplicated helpers (both
+  live). Could share; no correctness issue.
+
 ## #23 — Zig 0.16 Windows `Io` filesystem gaps found in WASI 4.3 (2026-07-16)
 
 Two more std holes on Windows, same family as #18 (which is the first). Both hit during 4.3; recheck all

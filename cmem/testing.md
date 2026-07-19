@@ -481,13 +481,13 @@ V8. **Decision:** build the shipped `.lib`/`.dll` (and the freestanding wasm —
 `design-decisions.md`. (Caveat: single machine; sizes + steady-state are solid, the µs/ms cold numbers
 are ±10% noisy.)
 
-## Reading the test count (updated 2026-07-18, signing CLI + -Droot-key)
+## Reading the test count (updated 2026-07-19, post code-audit)
 
-`zig build test --summary all` prints **352** (348 pass, 4 skip), but there are **181 distinct tests**:
-171 in the core module (169 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
+`zig build test --summary all` prints **356** (352 pass, 4 skip), but there are **183 distinct tests**:
+173 in the core module (171 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
 `wasm_c_api.zig`, which imports `root.zig`, so it compiles and **re-runs the core module's tests too**
-(171 core + 10 C-ABI = 181), on top of the standalone `mod_tests` run (171) → 352 printed. Harmless —
-under a second — but **don't quote the printed number as a test count**; quote **169**, or the per-target
+(173 core + 10 C-ABI = 183), on top of the standalone `mod_tests` run (173) → 356 printed. Harmless —
+under a second — but **don't quote the printed number as a test count**; quote **171**, or the per-target
 numbers from `--summary all`.
 
 ## Authenticity — Ed25519 signatures (`src/sign.zig` + CLI, 2026-07-18)
