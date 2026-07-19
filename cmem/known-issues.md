@@ -22,16 +22,13 @@ replace/load_lane, since the CLI run path does NOT re-validate); **`sub_sat_u` u
 (no `.mem_index` emit arm); **`sign.findSignature` `payload_end - p` underflow** guard; dead `wStubBadf`
 removed. +2 regression test blocks.
 
-**#24 — `--pins <path>` / `--verify off` can weaken a root-owned pin policy — OPEN (owner decision)**
-`main.zig verifyGate` reads the pin DB *and its `# mode:` policy* from an invoker-controlled `--pins` path,
-and `--verify off` downgrades the armed default-deny when the DB has no explicit `# mode:`. Both contradict
-the model's "authority comes from the root-owned policy, not a runtime argument / `# mode: enforce` is
-absolute." Real bypass on a **multi-user** box (a non-root user runs `wazmrt evil.wasm --pins /tmp/mine`).
-On a single-user machine it's equivalent to `--no-verify` (already allowed by the ownership principle), so
-impact is the shared-system / root-mandated-enforce case. **Surfaces when:** anyone deploys wazmrt with a
-root-owned enforce DB on a multi-user system. Fix options (owner to pick): always read policy from the
-fixed default path and let `--pins` only *add* pins (never lower policy); or refuse `--pins`/`--verify`
-downgrades when the default DB mandates enforce; or gate these flags behind a dev/env opt-in.
+**#24 — `--pins`/`--verify` could weaken a root-owned enforce — RESOLVED 2026-07-19**
+`verifyGate` now reads the **root-owned default path FIRST**; if it mandates `# mode: enforce`, `--pins`
+is ignored and `--verify` downgrades are skipped — both the pin set and the policy come from root, so no
+runtime flag can weaken it. When the default DB does **not** enforce (dev/unmanaged machines), `--pins`/
+`--verify` work as before. Owner chose "root enforce is absolute" (2026-07-19). E2E-verified: root-enforce
++ legit-pinned runs; root-enforce + `--pins attacker.pins` → **denied** (flag ignored); `--no-verify` still
+refused; root-`warn` + `--pins` still honored; bare build still runs everything.
 
 **Low-priority notes (safe today):**
 - `wasi.zig Wasi.init` — `w.fds.appendSlice(...) catch {}` swallows OOM registering the 3 stdio fds (init

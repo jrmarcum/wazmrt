@@ -514,7 +514,11 @@ is proven through the real binary with no source edits.
   tty, armed)` + `verifyGate`.
 - **User may override; root enforce is absolute.** The armed default-deny is overridable by `--no-verify`
   (the user owns their machine — the ownership principle), *but* a root-owned pin DB with `# mode: enforce`
-  denies **absolutely** (opt-out ignored). Signature-authenticated modules always run.
+  denies **absolutely** (opt-out ignored). Signature-authenticated modules always run. **Absolute means
+  absolute (#24, 2026-07-19):** `verifyGate` reads the **root-owned default path first**; if it enforces,
+  `--pins` (relocating the DB) is ignored and `--verify` downgrades are skipped — no runtime flag can
+  weaken a root enforce, on a multi-user box just as on the owner's own. `--pins`/`--verify` still work when
+  the default DB does not enforce (dev/unmanaged machines).
 - **Embedder path (wasmtk / rsxtk / C-ABI FFI) = run.** The gate lives only in the CLI (`verifyGate`); the
   C-ABI instantiate/run path has **no gate**, which is the intended default for embedders — they drive the
   runtime and expect to run what they load. (An embedder that wants verification can call `sign.verify` /

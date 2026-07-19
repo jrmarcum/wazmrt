@@ -403,17 +403,36 @@ fn verifyGate(
         .foreign, .unsigned => {}, // no trusted signature → fall through to the pin check
     };
 
-    const db_path = flagValue(rest, "--pins") orelse defaultPinsPath();
-    const db_text: ?[]const u8 = Io.Dir.cwd().readFileAlloc(io, db_path, arena, .limited(1 << 20)) catch |e| switch (e) {
-        error.FileNotFound => null, // no DB present
+    // The root-owned DEFAULT pin DB is authoritative: a runtime flag can never
+    // weaken a `# mode: enforce` it mandates (#24). Read it FIRST to learn the
+    // root policy; only when it does NOT enforce do `--pins`/`--verify` — dev /
+    // unmanaged-machine overrides — take effect. Under a root enforce, both the
+    // pin set and the policy come from root, so redirecting via `--pins` or
+    // lowering via `--verify` is ignored.
+    const default_path = defaultPinsPath();
+    const default_text: ?[]const u8 = Io.Dir.cwd().readFileAlloc(io, default_path, arena, .limited(1 << 20)) catch |e| switch (e) {
+        error.FileNotFound => null,
         else => {
-            try out.print("error: cannot read pin DB '{s}': {s}\n", .{ db_path, @errorName(e) });
+            try out.print("error: cannot read pin DB '{s}': {s}\n", .{ default_path, @errorName(e) });
             return false;
         },
     };
+    const root_enforce = if (default_text) |t| (wazmrt.pin.modeFromDb(t) orelse .off) == .enforce else false;
 
-    // The DB's `# mode:` is the root-owned policy (null if absent). A dev/user
-    // `--verify <mode>` may only RAISE strictness — never weaken a root enforce.
+    const pins_flag = if (root_enforce) null else flagValue(rest, "--pins");
+    const db_path = pins_flag orelse default_path;
+    const db_text: ?[]const u8 = if (pins_flag) |p|
+        (Io.Dir.cwd().readFileAlloc(io, p, arena, .limited(1 << 20)) catch |e| switch (e) {
+            error.FileNotFound => null,
+            else => {
+                try out.print("error: cannot read pin DB '{s}': {s}\n", .{ p, @errorName(e) });
+                return false;
+            },
+        })
+    else
+        default_text;
+
+    // The DB's `# mode:` is the effective policy (null if absent).
     var explicit: ?wazmrt.pin.Mode = null;
     var db: wazmrt.pin.Db = .empty;
     if (db_text) |text| {
@@ -424,7 +443,8 @@ fn verifyGate(
             return false;
         };
     }
-    if (flagValue(rest, "--verify")) |mv|
+    // `--verify` may only RAISE strictness, and is ignored under a root enforce.
+    if (!root_enforce) if (flagValue(rest, "--verify")) |mv|
         if (wazmrt.pin.modeFromStr(mv)) |m| {
             explicit = wazmrt.pin.stricter(explicit orelse .off, m);
         };

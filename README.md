@@ -142,9 +142,11 @@ the enforcement policy — `# mode: off | warn | enforce`:
 
 Before running, wazmrt hashes the exact in-memory bytes it is about to execute
 (so the verified bytes *are* the executed bytes — no swap-after-check race) and
-looks them up. `--pins <path>` overrides the DB location; `--verify <mode>` can
-only *raise* strictness; `--no-verify` skips the check **but is refused under an
-`enforce` policy** — a user argument can never weaken a root-owned policy.
+looks them up. `--pins <path>` overrides the DB location and `--verify <mode>`
+can *raise* strictness — **but only when the root-owned default DB does not
+`enforce`.** If it does, both flags are ignored and `--no-verify` is refused: a
+runtime argument can never weaken a root-mandated `enforce`, so the policy holds
+even against an unprivileged user on a shared machine.
 
 **Deny-by-default when armed.** Once verification is *armed* — a root key is
 embedded (see below) **or** a pin DB is present — the CLI **refuses** a module
