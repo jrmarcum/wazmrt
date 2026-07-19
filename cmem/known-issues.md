@@ -69,6 +69,61 @@ an i31 ref → `GcOutOfBounds`. Verified in **ReleaseFast** (shipped mode) via C
 `local.get 9` module → `error: instantiate: UndefinedLocal` (clean, no crash). WASI gate untouched
 (`main.zig` unchanged; the pin/verify path is orthogonal to execution).
 
+### Run-path hardening, 2nd pass — the stack-HEIGHT class — DONE 2026-07-19 (3rd "look for code issues")
+
+A follow-up 3-auditor pass found that the *stack-height* underflow the 1st pass only fixed for three
+opcodes (`struct.new`/`array.new_fixed`/`throw`) **survived in many more sites of the identical
+`vstack.items[items.len - N ..]` wild-base pattern** — and one was worse than anything the 1st pass
+touched. Lesson: the run path assumes a validated operand stack for *height*, and every `items.len - N`
+used as a slice/index base is a wild-pointer hazard on the unvalidated CLI path. All fixed in `interp.zig`
+via a `Frame.stackBase(n)` helper (`std.math.sub … catch error.StackUnderflow`) + a `peek()` helper:
+
+- **CRITICAL — the call opcodes (`call`/`call_indirect`/`call_ref`).** `args = items[items.len - np ..]`
+  underflowed to a wild base; `callFunction` then did `@memcpy(locals[0..args.len], args)` with **no
+  `args.len` check** — an unbounded out-of-bounds **WRITE** into the small `locals` buffer (arbitrary
+  memory corruption). Trigger: `(func (call 0))` calling a `(param i32)` function with an empty stack.
+- **HIGH — `branch` arity + block/loop/if/try_table entry `stack_base`.** `from = items.len - arity` and
+  `stack_base = items.len - params` underflowed → wild read/write on `br`/block-entry with too few
+  operands.
+- **MEDIUM — the call epilogue** (`@memcpy(res, items[items.len - n ..])`) and **`local.tee`** — OOB
+  reads on an under-producing function / short stack.
+- **LOW — `ref.cast`/`br_on_cast`/`br_on_cast_fail` peeks** (`items[items.len - 1]` on an empty stack).
+- **`@intCast` of attacker-controlled ref/func values** — `call_indirect`/`call_ref` cast a `u64` funcref
+  to `u32` (native ReleaseFast UB for a value ≥ 2³²) and `refMatches`/`definedFuncType` cast to `usize`
+  (wasm32 UB); all switched to `std.math.cast(… ) orelse trap`.
+- **`precomputeControlFlow` (load-time)** — a bare `else`/`catch`/`delegate` with no matching opener
+  underflowed the precompute control stack → OOB. Now `error.UnbalancedControl` at instantiation.
+
++5 regression tests (`test "hardening: …"`): the call wild-write, epilogue under-produce, branch-arity,
+and bare-`else` cases all trap `StackUnderflow`/`UnbalancedControl`. Also fixed **`opcode.zig` raw byte
+`0xDA`** — it decoded to `memory_fill` carrying the wrong `Imm` union (`.mem_reserved` vs the real
+`.mem_index` from the `0xFC 0x0B` path), a latent wrong-union read (was defanged only by `memBytes`'
+downstream bounds check); the raw byte is now rejected `UnsupportedOpcode`. All targets (native
+Debug/ReleaseFast + freestanding wasm32) build; 372→380 printed tests.
+
+**DEFERRED from the 3rd pass (real but lower severity, not yet fixed):**
+- **`wat.zig` — MEDIUM, memory-safety on the *host*.** The WAT assembler assumes well-formed s-expression
+  shape: unchecked `items[N]` indexing + `.asList().?`/`.asAtom().?`/`.string` wrong-union unwraps
+  throughout (`assembleModule`/`parseFunc`/`parseGlobal`/`parseTable`/`parseInstr`). Malformed `.wat`
+  (e.g. `(module (export "x"))` — missing the index target) → OOB read / wild-union deref / null-unwrap,
+  which is UB in the shipped ReleaseFast build. Reached **before** any verify gate via `wazmrt <file.wat>`,
+  `wazmrt sign <in.wat>`, and `wazmrt pin <dir>` (assembles every `.wat` found). **Surfaces when:** a user
+  assembles an untrusted/attacker-planted `.wat`. Fix: shape-checked accessors returning
+  `error.BadModuleField` instead of `.?`/`items[N]`, or route `.wat` assembly through a ReleaseSafe
+  boundary. (Threat model is weaker than the `.wasm` run path — a user assembling their own text — but
+  `pin <dir>` widens it.) **Owner decision pending on scope.**
+- **`sexpr.zig` parseList/parseValue — LOW (DoS).** Unbounded recursion on deeply-nested `((((…` → host
+  stack overflow. Same surface as above. Fix: a nesting-depth cap → `error.NestingTooDeep`.
+- **`Module.zig` struct-vector decoders — LOW (OOM amplification, not corruption).** ~14 sites
+  `alloc(T, count)` from an untrusted LEB *before* reading elements, with no `count > r.remaining()`
+  pre-check (byte-vec readers already do this via `readBytes`). A tiny module can force a huge alloc
+  *attempt* — but `Allocator.alloc`'s checked multiply returns `OutOfMemory` cleanly (even on wasm32), so
+  it is a failed request, not UB. Fix: reject `count > r.remaining()` before each `alloc`.
+- **`opcode.zig` other raw internal-tag leniency** (`0xE3–0xE5`, `0xED`, `0xF0–0xF2`, etc.) — accepted as
+  non-standard single-byte encodings, but they land on the *correct* union, so over-acceptance
+  (strictness), not memory-safety. **`Module.zig:1023`/`opcode.zig:766`** `@intCast` of a byte offset
+  truncates for a >4 GiB module (impractical; only a wrong trap-backtrace offset).
+
 **Low-priority notes (safe today):**
 - `wasi.zig Wasi.init` — `w.fds.appendSlice(...) catch {}` swallows OOM registering the 3 stdio fds (init
   then reports success with no stdio). Near-impossible; propagate for cleanliness someday.

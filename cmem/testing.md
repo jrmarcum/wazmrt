@@ -481,15 +481,16 @@ V8. **Decision:** build the shipped `.lib`/`.dll` (and the freestanding wasm —
 `design-decisions.md`. (Caveat: single machine; sizes + steady-state are solid, the µs/ms cold numbers
 are ±10% noisy.)
 
-## Reading the test count (updated 2026-07-19, post run-path hardening)
+## Reading the test count (updated 2026-07-19, post run-path hardening 2nd pass)
 
-`zig build test --summary all` prints **372** (368 pass, 4 skip), but there are **191 distinct tests**:
-181 in the core module (179 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
+`zig build test --summary all` prints **380** (376 pass, 4 skip), but there are **195 distinct tests**:
+185 in the core module (183 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
 `wasm_c_api.zig`, which imports `root.zig`, so it compiles and **re-runs the core module's tests too**
-(181 core + 10 C-ABI = 191), on top of the standalone `mod_tests` run (181) → 372 printed. Harmless —
-under a second — but **don't quote the printed number as a test count**; quote **179**, or the per-target
-numbers from `--summary all`. The last +4 are the run-path memory-safety `test "hardening: …"` blocks in
-`interp.zig` (see known-issues "Run-path memory-safety hardening — DONE 2026-07-19").
+(185 core + 10 C-ABI = 195), on top of the standalone `mod_tests` run (185) → 380 printed. Harmless —
+under a second — but **don't quote the printed number as a test count**; quote **183**, or the per-target
+numbers from `--summary all`. The run-path memory-safety `test "hardening: …"` blocks in `interp.zig` are
+now **9** (4 from the 1st pass + 5 from the 2nd: the `call` wild-write, epilogue under-produce,
+branch-arity, and bare-`else` cases) — see known-issues "Run-path hardening, 2nd pass".
 
 ## Authenticity — Ed25519 signatures (`src/sign.zig` + CLI, 2026-07-18)
 

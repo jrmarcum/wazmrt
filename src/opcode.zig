@@ -860,7 +860,9 @@ pub fn decodeBodyTracked(
             .global => .{ .global = try r.readVarU32() },
             .table => .{ .table = try r.readVarU32() },
             .mem => .{ .mem = try readMemArg(&r) },
-            .mem_reserved => .{ .mem_reserved = try r.readByte() },
+            // `.mem_reserved` (raw byte 0xDA) is rejected below: it is the internal
+            // tag for `memory.fill`, which only decodes via `0xFC 0x0B` (→ `.mem_index`).
+            // Accepting the raw byte here built the WRONG union variant.
             .mem_index => .{ .mem_index = try r.readVarU32() }, // memory.size / memory.grow
             .i32c => .{ .i32 = try r.readVarI32() },
             .i64c => .{ .i64 = try r.readVarI64() },
@@ -886,7 +888,7 @@ pub fn decodeBodyTracked(
             // reaching here means a raw synthetic-tag byte, which is malformed.
             // 0xFB/0xFC-prefixed ops are decoded via the prefix interceptions
             // above; reaching here means a raw synthetic-tag byte (malformed).
-            .elem, .data, .data_init, .mem_copy, .table_init, .table_copy, .gc_type, .gc_field, .gc_type_n, .ref_cast, .br_cast => return error.UnsupportedOpcode,
+            .elem, .data, .data_init, .mem_copy, .mem_reserved, .table_init, .table_copy, .gc_type, .gc_field, .gc_type_n, .ref_cast, .br_cast => return error.UnsupportedOpcode,
             .unsupported => return error.UnsupportedOpcode,
         };
         try list.append(a, .{ .op = op, .imm = imm });

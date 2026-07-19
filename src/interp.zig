@@ -137,6 +137,9 @@ pub const Error = Module.Error || error{
     /// Fewer operands on the value stack than an op consumes — only reachable
     /// from an unvalidated module (`struct.new`/`array.new_fixed`/`throw`).
     StackUnderflow,
+    /// A control instruction with no matching opener — a bare `else`/`catch`/
+    /// `delegate` in an unvalidated body (would underflow the precompute stack).
+    UnbalancedControl,
     /// A GC struct field / array element access outside the object's bounds
     /// (`array.get`/`.set` past the length, or a field index beyond a collapsed
     /// object's fields). Traps.
@@ -828,7 +831,7 @@ pub const Instance = struct {
         switch (target_head.top()) {
             .any => {
                 if (v & i31_tag != 0) return self.headMatches(.i31, null, rt.heap);
-                const idx: usize = @intCast(v);
+                const idx = std.math.cast(usize, v) orelse return false; // wasm32-safe
                 if (idx >= self.gc_heap.items.len) return false; // defensive
                 const obj = self.gc_heap.items[idx];
                 const kind: types.ValType.RefHeap = switch (self.module.comp_types[obj.type_index].kind()) {
@@ -859,7 +862,7 @@ pub const Instance = struct {
     /// The type index of a *defined* function (for `ref.cast` of a funcref to a
     /// concrete func type); null for an imported function (no type index kept).
     fn definedFuncType(self: *Instance, findex: Value) ?u32 {
-        const fi: u32 = @intCast(findex);
+        const fi = std.math.cast(u32, findex) orelse return null;
         const imported = self.module.importedFuncCount();
         if (fi < imported) return null;
         const d = fi - imported;
@@ -907,7 +910,10 @@ pub const Instance = struct {
 
         const n = typeSlots(body.type.results);
         const res = try a.alloc(Value, n);
-        @memcpy(res, frame.vstack.items[frame.vstack.items.len - n ..]);
+        // A malicious body may under-produce its declared results; trap rather
+        // than copy from a wild base before the value stack.
+        const rbase = try frame.stackBase(n);
+        @memcpy(res, frame.vstack.items[rbase..]);
         return res;
     }
 };
@@ -935,8 +941,12 @@ fn precomputeControlFlow(a: std.mem.Allocator, ir: []const opcode.Instr) Error!s
                 try handlers.append(a, .empty);
                 try catch_pcs.append(a, .empty);
             },
-            .@"else" => else_of[stack.items[stack.items.len - 1]] = i,
+            .@"else" => {
+                if (stack.items.len == 0) return error.UnbalancedControl; // bare `else`, no `if`
+                else_of[stack.items[stack.items.len - 1]] = i;
+            },
             .catch_, .catch_all => {
+                if (handlers.items.len == 0) return error.UnbalancedControl; // bare `catch`, no `try`
                 const top = handlers.items.len - 1;
                 try handlers.items[top].append(a, .{
                     .tag = if (instr.op == .catch_) instr.imm.tag else null,
@@ -945,7 +955,7 @@ fn precomputeControlFlow(a: std.mem.Allocator, ir: []const opcode.Instr) Error!s
                 try catch_pcs.items[top].append(a, i);
             },
             .delegate => {
-                const opener = stack.pop().?;
+                const opener = stack.pop() orelse return error.UnbalancedControl; // bare `delegate`, no `try`
                 _ = handlers.pop();
                 _ = catch_pcs.pop();
                 // `delegate` terminates the try in place of an `end`.
@@ -990,6 +1000,18 @@ const Frame = struct {
     fn pop(self: *Frame) Value {
         return self.vstack.pop().?;
     }
+    /// Base index of the top `n` value slots. The run path does not validate
+    /// operand-stack height, so a malicious module can reach an op with fewer
+    /// than `n` slots; `items.len - n` would underflow to a wild base and turn
+    /// a slice/`@memcpy` into out-of-bounds memory access. Trap instead.
+    fn stackBase(self: *Frame, n: usize) Error!usize {
+        return std.math.sub(usize, self.vstack.items.len, n) catch error.StackUnderflow;
+    }
+    /// Read the top value without popping, or trap on an empty stack.
+    fn peek(self: *Frame) Error!Value {
+        if (self.vstack.items.len == 0) return error.StackUnderflow;
+        return self.vstack.items[self.vstack.items.len - 1];
+    }
     fn pushI32(self: *Frame, v: i32) Error!void {
         try self.pushU64(i32Value(v));
     }
@@ -1021,7 +1043,7 @@ const Frame = struct {
         // when `n >= len`; the frame always has ≥1 label (the function itself).
         if (n >= self.labels.items.len) return error.UndefinedLabel;
         const label = self.labels.items[self.labels.items.len - 1 - n];
-        const from = self.vstack.items.len - label.arity;
+        const from = try self.stackBase(label.arity);
         std.mem.copyForwards(Value, self.vstack.items[label.stack_base..][0..label.arity], self.vstack.items[from..][0..label.arity]);
         self.vstack.shrinkRetainingCapacity(label.stack_base + label.arity);
         // A loop-continue keeps the loop's own label; a forward exit pops it too.
@@ -1299,35 +1321,35 @@ const Frame = struct {
                     pc += 1;
                 },
                 .ref_cast => {
-                    const v = self.vstack.items[self.vstack.items.len - 1]; // peek
+                    const v = try self.peek(); // peek (traps on empty stack)
                     if (!self.inst.refMatches(v, instr.imm.ref_cast)) return error.CastFailure;
                     pc += 1; // value stays on the stack with its new (validated) type
                 },
                 .br_on_cast => {
                     // The ref stays on the stack in both paths; branch iff it casts.
-                    const v = self.vstack.items[self.vstack.items.len - 1];
+                    const v = try self.peek();
                     pc = if (self.inst.refMatches(v, instr.imm.br_cast.dst)) try self.branch(instr.imm.br_cast.label) else pc + 1;
                 },
                 .br_on_cast_fail => {
-                    const v = self.vstack.items[self.vstack.items.len - 1];
+                    const v = try self.peek();
                     pc = if (!self.inst.refMatches(v, instr.imm.br_cast.dst)) try self.branch(instr.imm.br_cast.label) else pc + 1;
                 },
 
                 // --- Structured control flow ---
                 .block => {
                     const params = self.blockArity(instr.imm.block_type, true);
-                    try self.labels.append(self.a, .{ .is_loop = false, .arity = self.blockArity(instr.imm.block_type, false), .target = self.body.end_of[pc] + 1, .stack_base = self.vstack.items.len - params });
+                    try self.labels.append(self.a, .{ .is_loop = false, .arity = self.blockArity(instr.imm.block_type, false), .target = self.body.end_of[pc] + 1, .stack_base = try self.stackBase(params) });
                     pc += 1;
                 },
                 .loop => {
                     const params = self.blockArity(instr.imm.block_type, true);
-                    try self.labels.append(self.a, .{ .is_loop = true, .arity = params, .target = pc + 1, .stack_base = self.vstack.items.len - params });
+                    try self.labels.append(self.a, .{ .is_loop = true, .arity = params, .target = pc + 1, .stack_base = try self.stackBase(params) });
                     pc += 1;
                 },
                 .@"if" => {
                     const c = self.popI32();
                     const params = self.blockArity(instr.imm.block_type, true);
-                    try self.labels.append(self.a, .{ .is_loop = false, .arity = self.blockArity(instr.imm.block_type, false), .target = self.body.end_of[pc] + 1, .stack_base = self.vstack.items.len - params });
+                    try self.labels.append(self.a, .{ .is_loop = false, .arity = self.blockArity(instr.imm.block_type, false), .target = self.body.end_of[pc] + 1, .stack_base = try self.stackBase(params) });
                     if (c != 0) {
                         pc += 1;
                     } else {
@@ -1349,7 +1371,7 @@ const Frame = struct {
                         .is_loop = false,
                         .arity = self.blockArity(tt.block_type, false),
                         .target = self.body.end_of[pc] + 1,
-                        .stack_base = self.vstack.items.len - params,
+                        .stack_base = try self.stackBase(params),
                         .catches = tt.catches,
                     });
                     pc += 1;
@@ -1388,7 +1410,7 @@ const Frame = struct {
                         .is_loop = false,
                         .arity = self.blockArity(instr.imm.block_type, false),
                         .target = self.body.end_of[pc] + 1,
-                        .stack_base = self.vstack.items.len - params,
+                        .stack_base = try self.stackBase(params),
                         .legacy = self.body.try_info[pc],
                     });
                     pc += 1;
@@ -1433,12 +1455,13 @@ const Frame = struct {
                     const f = instr.imm.func;
                     const ft = self.inst.module.funcType(f) orelse return error.UndefinedFunc;
                     const np = typeSlots(ft.params); // param slots (v128 = 2)
-                    const args = self.vstack.items[self.vstack.items.len - np ..];
+                    const base = try self.stackBase(np);
+                    const args = self.vstack.items[base..];
                     const results = self.inst.callFunction(self.a, f, args, self.depth + 1) catch |e| {
                         pc = try self.onCallError(e); // caught here → resume; else re-raise
                         continue;
                     };
-                    self.vstack.shrinkRetainingCapacity(self.vstack.items.len - np);
+                    self.vstack.shrinkRetainingCapacity(base);
                     for (results) |r| try self.pushU64(r);
                     pc += 1;
                 },
@@ -1449,17 +1472,18 @@ const Frame = struct {
                     const slot = @as(u32, @bitCast(self.popI32())); // table element index (top of stack)
                     if (slot >= table.len) return error.TableOutOfBounds;
                     if (table[slot] == null_ref) return error.UninitializedElement;
-                    const f: u32 = @intCast(table[slot]); // funcref value = function index
+                    const f = std.math.cast(u32, table[slot]) orelse return error.UndefinedFunc; // funcref value = function index
                     const want = self.inst.module.funcSig(ci.type_index) orelse return error.UndefinedType;
                     const ft = self.inst.module.funcType(f) orelse return error.UndefinedFunc;
                     if (!funcTypeEqual(want, ft)) return error.IndirectTypeMismatch;
                     const np = typeSlots(ft.params); // param slots (v128 = 2)
-                    const args = self.vstack.items[self.vstack.items.len - np ..];
+                    const base = try self.stackBase(np);
+                    const args = self.vstack.items[base..];
                     const results = self.inst.callFunction(self.a, f, args, self.depth + 1) catch |e| {
                         pc = try self.onCallError(e);
                         continue;
                     };
-                    self.vstack.shrinkRetainingCapacity(self.vstack.items.len - np);
+                    self.vstack.shrinkRetainingCapacity(base);
                     for (results) |r| try self.pushU64(r);
                     pc += 1;
                 },
@@ -1468,15 +1492,16 @@ const Frame = struct {
                     // stack; a null ref traps.
                     const f_ref = self.pop();
                     if (f_ref == null_ref) return error.NullReference;
-                    const f: u32 = @intCast(f_ref);
+                    const f = std.math.cast(u32, f_ref) orelse return error.UndefinedFunc;
                     const ft = self.inst.module.funcType(f) orelse return error.UndefinedFunc;
                     const np = typeSlots(ft.params); // param slots (v128 = 2)
-                    const args = self.vstack.items[self.vstack.items.len - np ..];
+                    const base = try self.stackBase(np);
+                    const args = self.vstack.items[base..];
                     const results = self.inst.callFunction(self.a, f, args, self.depth + 1) catch |e| {
                         pc = try self.onCallError(e);
                         continue;
                     };
-                    self.vstack.shrinkRetainingCapacity(self.vstack.items.len - np);
+                    self.vstack.shrinkRetainingCapacity(base);
                     for (results) |r| try self.pushU64(r);
                     // return_call_ref is a tail call: the callee's results become
                     // ours (the epilogue takes the top `results.len`).
@@ -1649,7 +1674,8 @@ const Frame = struct {
                 .local_tee => {
                     const off = self.body.local_map[instr.imm.local];
                     const w = self.body.local_w[instr.imm.local];
-                    for (0..w) |k| self.locals[off + k] = self.vstack.items[self.vstack.items.len - w + k];
+                    const tb = try self.stackBase(w);
+                    for (0..w) |k| self.locals[off + k] = self.vstack.items[tb + k];
                     pc += 1;
                 },
                 .global_get => {
@@ -3993,4 +4019,77 @@ test "hardening: struct.set through a bogus (i31) ref traps, not an arbitrary wr
     var inst = try instantiate(bytes);
     defer destroy(&inst);
     try std.testing.expectError(error.GcOutOfBounds, inst.invoke("trap", &.{}));
+}
+
+test "hardening: a call with too few operands traps, not a wild memcpy into locals" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // type0 = (func (param i32)) ; type1 = (func)
+    // func0 = (func (param i32)) ; func1 = (func (call 0))  — calls func0 with an
+    // EMPTY stack, so `args = items[len - 1 ..]` would underflow to a wild base
+    // and callFunction's @memcpy(locals[0..args.len], args) would be an unbounded
+    // out-of-bounds WRITE. Must trap StackUnderflow instead.
+    const body0 = [_]u8{ 0x00, 0x0b };
+    const body1 = [_]u8{ 0x00, 0x10, 0x00, 0x0b };
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x02, 0x60, 0x01, 0x7f, 0x00, 0x60, 0x00, 0x00 } },
+        .{ .id = 3, .body = &.{ 0x02, 0x00, 0x01 } },
+        .{ .id = 7, .body = &.{ 0x01, 0x04, 't', 'r', 'a', 'p', 0x00, 0x01 } },
+        .{ .id = 10, .body = try ehCode(a, &.{ &body0, &body1 }) },
+    });
+    var inst = try instantiate(bytes);
+    defer destroy(&inst);
+    try std.testing.expectError(error.StackUnderflow, inst.invoke("trap", &.{}));
+}
+
+test "hardening: a function under-producing its declared results traps, not an OOB read" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (func (result i32)) with an empty body — the epilogue would copy 1 result
+    // slot from a base below the (empty) value stack. Must trap StackUnderflow.
+    const fbody = [_]u8{ 0x00, 0x0b };
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x01, 0x7f } },
+        .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+        .{ .id = 7, .body = &.{ 0x01, 0x04, 't', 'r', 'a', 'p', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{&fbody}) },
+    });
+    var inst = try instantiate(bytes);
+    defer destroy(&inst);
+    try std.testing.expectError(error.StackUnderflow, inst.invoke("trap", &.{}));
+}
+
+test "hardening: a branch whose arity exceeds the stack traps, not a wild copy" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (func (result i32) (block (result i32) (br 0)))  — the block is entered with
+    // an empty stack and `br 0` has arity 1, so `from = items.len - 1` underflows.
+    const fbody = [_]u8{ 0x00, 0x02, 0x7f, 0x0c, 0x00, 0x0b, 0x0b };
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x01, 0x7f } },
+        .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+        .{ .id = 7, .body = &.{ 0x01, 0x04, 't', 'r', 'a', 'p', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{&fbody}) },
+    });
+    var inst = try instantiate(bytes);
+    defer destroy(&inst);
+    try std.testing.expectError(error.StackUnderflow, inst.invoke("trap", &.{}));
+}
+
+test "hardening: a bare else with no matching if is rejected at load time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (func) body = else, end  — a stray `else` (0x05) underflows the precompute
+    // control stack. Must be rejected at instantiation (UnbalancedControl).
+    const fbody = [_]u8{ 0x00, 0x05, 0x0b };
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x00 } },
+        .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{&fbody}) },
+    });
+    try std.testing.expectError(error.UnbalancedControl, instantiate(bytes));
 }
