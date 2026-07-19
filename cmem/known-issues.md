@@ -494,9 +494,13 @@ is expected isn't caught (`local_tee` 96/1).
 and `(start …)` (#3, still dropped). `linking.wast`/`memory.wast` complete only under ReleaseFast (debug
 is too slow on their large grow tests), 19/84 and 66/13.
 
-### #2 — Validator over-acceptance (soundness) — MED
-`src/validate.zig` — several rules accept invalid modules. Not a wrong-output risk (execution traps
-safely); purely "should have been rejected at validation."
+### #2 — Validator over-acceptance (soundness) — **RESOLVED (2a–2e `645874c` 2026-07-09; 2f `bfe663e` 2026-07-19)**
+`src/validate.zig` — several rules accepted invalid modules (never a wrong-output risk — execution traps
+safely). **All closed** (verified in code 2026-07-19): 2a untyped `select` rejects ref operands
+(`:537`); 2b `select_t` checks its annotation; 2c load/store require a memory section (`:606/612/840`,
+`MissingMemory`); 2d `if` params/results; 2e `ref.is_null` rejects non-refs; **2f `br_table` now compares
+label value types (not just arity)** — `subtypeOf` both ways, safe in stack-polymorphic code. Original
+sub-item detail kept below for history.
 - **2a** untyped `select` (0x1b) accepts reference-typed operands (spec: numeric/vector only). `step`
   `.select, .select_t` (~264).
 - **2b** `select_t` (0x1c) ignores its `select_types` immediate — never checks operands against the
@@ -535,14 +539,20 @@ assemble/decode/`UnsupportedInstr` error no longer green-washes as a trap). The 
 instantiation-time runtime trap (e.g. an out-of-bounds active data/element segment). Matching the
 expected trap *text* is still not done (LOW — no test depends on it).
 
-### #6 — Invalid value-type bytes decode silently — MED/LOW
+### #6 — Invalid value-type bytes decode silently — **RESOLVED (module `3321921`; instruction immediates `bfe663e` 2026-07-19)**
+Module-structure valtypes validated (`Module.readValType`); the last piece — the `select_t` immediate,
+which read each type via a raw `@enumFromInt` — now rejects an unknown byte (`opcode.zig`). `ref.null`
+already used the validating `readHeapType`. Original detail below.
+### #6 (original) — Invalid value-type bytes decode silently — MED/LOW
 `src/Module.zig` (`readValTypes`, `readTableType`, `readGlobalType`, `decodeLocals`) and `src/opcode.zig`
 (`select_types`, `ref_type`) use `@enumFromInt(byte)` into the **non-exhaustive** `types.ValType`, so a
 garbage byte becomes an out-of-range enum with no `error.BadValType` (contrast `ExternKind`/`SectionId`,
 which *do* guard). **Surfaces when:** `assert_malformed` support, or any untrusted/fuzzed binary input.
 **Fix:** validate the byte against the known valtypes on decode.
 
-### #7 — const-expr `global.get` more permissive than spec — LOW
+### #7 — const-expr `global.get` more permissive than spec — **RESOLVED (`645874c`, 2026-07-09)**
+Restricted to a prior *immutable* global. Original detail below.
+### #7 (original) — const-expr `global.get` more permissive than spec — LOW
 `src/interp.zig` — `evalConstExpr` allows `global.get` of any *prior* global; §3.3.7 restricts
 const-expr `global.get` to *imported* globals. Bounds-checked, so no crash/wrong-value — a strictness
 gap only. **Surfaces when:** `assert_invalid` support.
@@ -646,8 +656,7 @@ custom section is rejected, §5.5.3), and the **data-count section** (id 12) is 
 against the data-segment count (`DataCountMismatch`, §5.5.16). `custom.wast` 5/3 → **8/0**;
 `binary-leb128.wast` → **58/1**. **Malformed-binary over-acceptance is now ~zero** across the
 negative-conformance files.
-**Still open (feature gaps, NOT malformed-handling):** `binary-leb128` (1) and `names.wast` (1) fail
-with `UnsupportedInstr`/`UnsupportedOpcode` — valid modules using an op/instruction the
-assembler/decoder doesn't support yet, unrelated to #16. #6's valtype-byte check for *instruction
-immediates* (`select_types`/`ref.null` heaptype in `opcode.zig`) also remains, but is instruction-level,
-not module structure.
+**Malformed-binary leniency: DONE.** #6's instruction-immediate valtype check (`select_t`) was the last
+piece — closed `bfe663e` (2026-07-19). **Only residual is feature gaps, NOT leniency:** `binary-leb128`
+(1) and `names.wast` (1) fail with `UnsupportedInstr`/`UnsupportedOpcode` — *valid* modules using an
+op/instruction the assembler/decoder doesn't support yet (the opposite of over-acceptance).
