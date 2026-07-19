@@ -132,7 +132,12 @@ pub fn findSignature(bytes: []const u8) FindResult {
         if (id == 0) { // custom section: name_len ++ name ++ content
             var p = payload_start;
             const name_len = readUleb(bytes, &p) orelse return .none;
-            if (name_len <= payload_end - p) {
+            // `readUleb` is bounded only by `bytes.len`, so a multi-byte name_len
+            // encoding can push `p` past this section's `payload_end`; guard
+            // `p <= payload_end` before the subtraction (else it underflows and
+            // the slice below panics — this scanner must stay bounds-safe on
+            // arbitrary input per the module doc).
+            if (p <= payload_end and name_len <= payload_end - p) {
                 const name = bytes[p .. p + name_len];
                 const content = bytes[p + name_len .. payload_end];
                 if (std.mem.eql(u8, name, section_name) and

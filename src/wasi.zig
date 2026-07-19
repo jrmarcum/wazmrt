@@ -1620,12 +1620,6 @@ fn wSchedYield(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     return ret(results, errno.success);
 }
 
-fn wStubBadf(ctx: *anyopaque, args: []const Value, results: []Value) bool {
-    _ = ctx;
-    _ = args;
-    return ret(results, errno.badf);
-}
-
 fn wStubNotsup(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     _ = ctx;
     _ = args;

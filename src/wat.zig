@@ -1682,6 +1682,8 @@ fn emitInstr(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
         .f64c => try floatBits(ctx, u64, try imm0(immediates)),
         .mem => try emitMemArg(ctx, op, immediates),
         .mem_reserved => try ctx.out.append(ctx.a, 0x00),
+        // `memory.size`/`memory.grow`: a single memory index, 0 in single-memory.
+        .mem_index => try ctx.out.append(ctx.a, 0x00),
         // Bulk memory: a data index (+ reserved memory index bytes, always 0).
         .data => try uleb(ctx.a, ctx.out, try parseIndex(try imm0(immediates))),
         .data_init => {
@@ -1831,8 +1833,8 @@ fn lookupSimd(name: []const u8) ?SimdOp {
         .{ .n = "i16x8.abs", .s = 0x80, .i = .none }, .{ .n = "i16x8.neg", .s = 0x81, .i = .none }, .{ .n = "i16x8.all_true", .s = 0x83, .i = .none }, .{ .n = "i16x8.bitmask", .s = 0x84, .i = .none }, .{ .n = "i16x8.narrow_i32x4_s", .s = 0x85, .i = .none }, .{ .n = "i16x8.narrow_i32x4_u", .s = 0x86, .i = .none }, .{ .n = "i16x8.extend_low_i8x16_s", .s = 0x87, .i = .none }, .{ .n = "i16x8.extend_high_i8x16_s", .s = 0x88, .i = .none }, .{ .n = "i16x8.extend_low_i8x16_u", .s = 0x89, .i = .none }, .{ .n = "i16x8.extend_high_i8x16_u", .s = 0x8a, .i = .none }, .{ .n = "i16x8.shl", .s = 0x8b, .i = .none }, .{ .n = "i16x8.shr_s", .s = 0x8c, .i = .none }, .{ .n = "i16x8.shr_u", .s = 0x8d, .i = .none }, .{ .n = "i16x8.add", .s = 0x8e, .i = .none }, .{ .n = "i16x8.add_sat_s", .s = 0x8f, .i = .none }, .{ .n = "i16x8.add_sat_u", .s = 0x90, .i = .none }, .{ .n = "i16x8.sub", .s = 0x91, .i = .none }, .{ .n = "i16x8.sub_sat_s", .s = 0x92, .i = .none }, .{ .n = "i16x8.sub_sat_u", .s = 0x93, .i = .none }, .{ .n = "i16x8.mul", .s = 0x95, .i = .none }, .{ .n = "i16x8.min_s", .s = 0x96, .i = .none }, .{ .n = "i16x8.min_u", .s = 0x97, .i = .none }, .{ .n = "i16x8.max_s", .s = 0x98, .i = .none }, .{ .n = "i16x8.max_u", .s = 0x99, .i = .none }, .{ .n = "i16x8.avgr_u", .s = 0x9b, .i = .none },
         .{ .n = "i32x4.abs", .s = 0xa0, .i = .none }, .{ .n = "i32x4.neg", .s = 0xa1, .i = .none }, .{ .n = "i32x4.all_true", .s = 0xa3, .i = .none }, .{ .n = "i32x4.bitmask", .s = 0xa4, .i = .none }, .{ .n = "i32x4.extend_low_i16x8_s", .s = 0xa7, .i = .none }, .{ .n = "i32x4.extend_high_i16x8_s", .s = 0xa8, .i = .none }, .{ .n = "i32x4.extend_low_i16x8_u", .s = 0xa9, .i = .none }, .{ .n = "i32x4.extend_high_i16x8_u", .s = 0xaa, .i = .none }, .{ .n = "i32x4.shl", .s = 0xab, .i = .none }, .{ .n = "i32x4.shr_s", .s = 0xac, .i = .none }, .{ .n = "i32x4.shr_u", .s = 0xad, .i = .none }, .{ .n = "i32x4.add", .s = 0xae, .i = .none }, .{ .n = "i32x4.sub", .s = 0xb1, .i = .none }, .{ .n = "i32x4.mul", .s = 0xb5, .i = .none }, .{ .n = "i32x4.min_s", .s = 0xb6, .i = .none }, .{ .n = "i32x4.min_u", .s = 0xb7, .i = .none }, .{ .n = "i32x4.max_s", .s = 0xb8, .i = .none }, .{ .n = "i32x4.max_u", .s = 0xb9, .i = .none },
         .{ .n = "i64x2.abs", .s = 0xc0, .i = .none }, .{ .n = "i64x2.neg", .s = 0xc1, .i = .none }, .{ .n = "i64x2.all_true", .s = 0xc3, .i = .none }, .{ .n = "i64x2.bitmask", .s = 0xc4, .i = .none }, .{ .n = "i64x2.extend_low_i32x4_s", .s = 0xc7, .i = .none }, .{ .n = "i64x2.extend_high_i32x4_s", .s = 0xc8, .i = .none }, .{ .n = "i64x2.extend_low_i32x4_u", .s = 0xc9, .i = .none }, .{ .n = "i64x2.extend_high_i32x4_u", .s = 0xca, .i = .none }, .{ .n = "i64x2.shl", .s = 0xcb, .i = .none }, .{ .n = "i64x2.shr_s", .s = 0xcc, .i = .none }, .{ .n = "i64x2.shr_u", .s = 0xcd, .i = .none }, .{ .n = "i64x2.add", .s = 0xce, .i = .none }, .{ .n = "i64x2.sub", .s = 0xd1, .i = .none }, .{ .n = "i64x2.mul", .s = 0xd5, .i = .none },
-        .{ .n = "f32x4.ceil", .s = 0x67, .i = .none }, .{ .n = "f32x4.floor", .s = 0x68, .i = .none }, .{ .n = "f32x4.trunc", .s = 0x69, .i = .none }, .{ .n = "f32x4.abs", .s = 0xe0, .i = .none }, .{ .n = "f32x4.neg", .s = 0xe1, .i = .none }, .{ .n = "f32x4.sqrt", .s = 0xe3, .i = .none }, .{ .n = "f32x4.add", .s = 0xe4, .i = .none }, .{ .n = "f32x4.sub", .s = 0xe5, .i = .none }, .{ .n = "f32x4.mul", .s = 0xe6, .i = .none }, .{ .n = "f32x4.div", .s = 0xe7, .i = .none }, .{ .n = "f32x4.min", .s = 0xe8, .i = .none }, .{ .n = "f32x4.max", .s = 0xe9, .i = .none }, .{ .n = "f32x4.pmin", .s = 0xea, .i = .none }, .{ .n = "f32x4.pmax", .s = 0xeb, .i = .none }, .{ .n = "f32x4.convert_i32x4_s", .s = 0xfa, .i = .none }, .{ .n = "f32x4.convert_i32x4_u", .s = 0xfb, .i = .none }, .{ .n = "f32x4.demote_f64x2_zero", .s = 0x5f, .i = .none },
-        .{ .n = "f64x2.ceil", .s = 0x74, .i = .none }, .{ .n = "f64x2.floor", .s = 0x75, .i = .none }, .{ .n = "f64x2.trunc", .s = 0x7a, .i = .none }, .{ .n = "f64x2.abs", .s = 0xec, .i = .none }, .{ .n = "f64x2.neg", .s = 0xed, .i = .none }, .{ .n = "f64x2.sqrt", .s = 0xef, .i = .none }, .{ .n = "f64x2.add", .s = 0xf0, .i = .none }, .{ .n = "f64x2.sub", .s = 0xf1, .i = .none }, .{ .n = "f64x2.mul", .s = 0xf2, .i = .none }, .{ .n = "f64x2.div", .s = 0xf3, .i = .none }, .{ .n = "f64x2.min", .s = 0xf4, .i = .none }, .{ .n = "f64x2.max", .s = 0xf5, .i = .none }, .{ .n = "f64x2.pmin", .s = 0xf6, .i = .none }, .{ .n = "f64x2.pmax", .s = 0xf7, .i = .none }, .{ .n = "f64x2.promote_low_f32x4", .s = 0x5e, .i = .none }, .{ .n = "f64x2.convert_low_i32x4_s", .s = 0xfe, .i = .none }, .{ .n = "f64x2.convert_low_i32x4_u", .s = 0xff, .i = .none },
+        .{ .n = "f32x4.ceil", .s = 0x67, .i = .none }, .{ .n = "f32x4.floor", .s = 0x68, .i = .none }, .{ .n = "f32x4.trunc", .s = 0x69, .i = .none }, .{ .n = "f32x4.nearest", .s = 0x6a, .i = .none }, .{ .n = "f32x4.abs", .s = 0xe0, .i = .none }, .{ .n = "f32x4.neg", .s = 0xe1, .i = .none }, .{ .n = "f32x4.sqrt", .s = 0xe3, .i = .none }, .{ .n = "f32x4.add", .s = 0xe4, .i = .none }, .{ .n = "f32x4.sub", .s = 0xe5, .i = .none }, .{ .n = "f32x4.mul", .s = 0xe6, .i = .none }, .{ .n = "f32x4.div", .s = 0xe7, .i = .none }, .{ .n = "f32x4.min", .s = 0xe8, .i = .none }, .{ .n = "f32x4.max", .s = 0xe9, .i = .none }, .{ .n = "f32x4.pmin", .s = 0xea, .i = .none }, .{ .n = "f32x4.pmax", .s = 0xeb, .i = .none }, .{ .n = "f32x4.convert_i32x4_s", .s = 0xfa, .i = .none }, .{ .n = "f32x4.convert_i32x4_u", .s = 0xfb, .i = .none }, .{ .n = "f32x4.demote_f64x2_zero", .s = 0x5e, .i = .none },
+        .{ .n = "f64x2.ceil", .s = 0x74, .i = .none }, .{ .n = "f64x2.floor", .s = 0x75, .i = .none }, .{ .n = "f64x2.trunc", .s = 0x7a, .i = .none }, .{ .n = "f64x2.nearest", .s = 0x94, .i = .none }, .{ .n = "f64x2.abs", .s = 0xec, .i = .none }, .{ .n = "f64x2.neg", .s = 0xed, .i = .none }, .{ .n = "f64x2.sqrt", .s = 0xef, .i = .none }, .{ .n = "f64x2.add", .s = 0xf0, .i = .none }, .{ .n = "f64x2.sub", .s = 0xf1, .i = .none }, .{ .n = "f64x2.mul", .s = 0xf2, .i = .none }, .{ .n = "f64x2.div", .s = 0xf3, .i = .none }, .{ .n = "f64x2.min", .s = 0xf4, .i = .none }, .{ .n = "f64x2.max", .s = 0xf5, .i = .none }, .{ .n = "f64x2.pmin", .s = 0xf6, .i = .none }, .{ .n = "f64x2.pmax", .s = 0xf7, .i = .none }, .{ .n = "f64x2.promote_low_f32x4", .s = 0x5f, .i = .none }, .{ .n = "f64x2.convert_low_i32x4_s", .s = 0xfe, .i = .none }, .{ .n = "f64x2.convert_low_i32x4_u", .s = 0xff, .i = .none },
         .{ .n = "i32x4.trunc_sat_f32x4_s", .s = 0xf8, .i = .none }, .{ .n = "i32x4.trunc_sat_f32x4_u", .s = 0xf9, .i = .none }, .{ .n = "i32x4.trunc_sat_f64x2_s_zero", .s = 0xfc, .i = .none }, .{ .n = "i32x4.trunc_sat_f64x2_u_zero", .s = 0xfd, .i = .none },
         // relaxed SIMD (sub-opcodes >= 0x100)
         .{ .n = "i8x16.relaxed_swizzle", .s = 0x100, .i = .none },
@@ -2387,6 +2389,61 @@ test "assembles relaxed-SIMD ops (madd / laneselect / swizzle / dot)" {
         \\    (v128.const i8x16 2 4 6 8 0 0 0 0 0 0 0 0 0 0 0 0)
         \\    (v128.const i8x16 3 5 7 9 0 0 0 0 0 0 0 0 0 0 0 0)
         \\    (v128.const i32x4 100 0 0 0)))))
+    , "f", &.{})));
+}
+
+test "SIMD audit regressions (sub_sat_u / nearest / i64x2 all_true+bitmask / demote opcode / lane bounds)" {
+    // sub_sat_u must saturate to 0 (was: unsigned wide underflowed → 255).
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(
+        \\(module (func (export "f") (result i32) (i8x16.extract_lane_u 0
+        \\  (i8x16.sub_sat_u (v128.const i8x16 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0)
+        \\                   (v128.const i8x16 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0)))))
+    , "f", &.{})));
+    // f32x4.nearest rounds ties to even: 2.5 → 2, 3.5 → 4.
+    try std.testing.expectEqual(@as(f32, 2), interp.asF32(try assembleAndRun(
+        \\(module (func (export "f") (result f32) (f32x4.extract_lane 0 (f32x4.nearest (v128.const f32x4 2.5 0 0 0)))))
+    , "f", &.{})));
+    try std.testing.expectEqual(@as(f32, 4), interp.asF32(try assembleAndRun(
+        \\(module (func (export "f") (result f32) (f32x4.extract_lane 1 (f32x4.nearest (v128.const f32x4 0 3.5 0 0)))))
+    , "f", &.{})));
+    // i64x2.all_true (0xc3) and i64x2.bitmask (0xc4) were missing → trapped.
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(
+        \\(module (func (export "f") (result i32) (i64x2.all_true (v128.const i64x2 1 2))))
+    , "f", &.{})));
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(
+        \\(module (func (export "f") (result i32) (i64x2.all_true (v128.const i64x2 1 0))))
+    , "f", &.{})));
+    try std.testing.expectEqual(@as(i32, 0b10), interp.asI32(try assembleAndRun(
+        \\(module (func (export "f") (result i32) (i64x2.bitmask (v128.const i64x2 1 -1))))
+    , "f", &.{})));
+    // demote/promote now use the spec opcodes: run correctly AND emit 0xfd 0x5e.
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(
+        \\(module (func (export "f") (result i32) (i32x4.extract_lane 0
+        \\  (i32x4.trunc_sat_f32x4_s (f32x4.demote_f64x2_zero (v128.const f64x2 1.5 2.5))))))
+    , "f", &.{})));
+    {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const bin = try assemble(arena.allocator(),
+            \\(module (func (export "f") (result i32) (i32x4.extract_lane 0
+            \\  (i32x4.trunc_sat_f32x4_s (f32x4.demote_f64x2_zero (v128.const f64x2 1.5 2.5))))))
+        );
+        try std.testing.expect(std.mem.indexOf(u8, bin, &[_]u8{ 0xfd, 0x5e }) != null); // demote = 0x5e (spec)
+    }
+    // An out-of-range lane index is rejected at DECODE (memory-safety guard): the
+    // interp indexes a fixed [2]u64 by it, so lane 5 would be an OOB access.
+    try std.testing.expectError(error.UnsupportedOpcode, assembleAndRun(
+        \\(module (func (export "f") (result i64) (i64x2.extract_lane 5 (v128.const i64x2 1 2))))
+    , "f", &.{}));
+}
+
+test "assembles memory.size / memory.grow (WAT was missing the .mem_index arm)" {
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(
+        \\(module (memory 1) (func (export "f") (result i32) (memory.size)))
+    , "f", &.{})));
+    // memory.grow returns the previous size in pages (1), then memory is 3.
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(
+        \\(module (memory 1) (func (export "f") (result i32) (memory.grow (i32.const 2))))
     , "f", &.{})));
 }
 

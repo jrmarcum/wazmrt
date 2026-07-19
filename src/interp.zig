@@ -1970,7 +1970,11 @@ const Frame = struct {
     /// `Lane`'s range (signedness of `Lane` decides signed vs unsigned saturation).
     fn simdSatAddSub(self: *Frame, comptime Lane: type, comptime is_add: bool) Error!void {
         const N = 16 / @sizeOf(Lane);
-        const Wide = std.meta.Int(@typeInfo(Lane).int.signedness, @bitSizeOf(Lane) + 1);
+        // A *signed* wide, two bits larger, holds every result: unsigned add can
+        // reach 2·(2^bits−1) and any subtraction can go negative (an unsigned
+        // wide would UNDERFLOW on `sub_sat_u` when a<b — the exact case it exists
+        // to saturate to 0). `satTo` then clamps to `Lane`'s range.
+        const Wide = std.meta.Int(.signed, @bitSizeOf(Lane) + 2);
         const b: [N]Lane = @bitCast(self.popV128());
         const a: [N]Lane = @bitCast(self.popV128());
         var r: [N]Lane = undefined;
@@ -2054,9 +2058,17 @@ const Frame = struct {
         };
         try self.pushV128(@bitCast(r));
     }
-    /// A lane-wise unary op on float lanes. (ceil/floor/trunc/nearest — which
-    /// need round-to-even — are not wired yet; see the SIMD gap notes.)
-    fn simdFloatUn(self: *Frame, comptime Lane: type, comptime op: enum { abs, neg, sqrt, ceil, floor, trunc }) Error!void {
+    /// A lane-wise unary op on float lanes. `nearest` is round-ties-to-even
+    /// (via the scalar `rintEven`, no `@Vector` builtin for it); the rest map to
+    /// vector builtins.
+    fn simdFloatUn(self: *Frame, comptime Lane: type, comptime op: enum { abs, neg, sqrt, ceil, floor, trunc, nearest }) Error!void {
+        if (op == .nearest) {
+            const N = 16 / @sizeOf(Lane);
+            var arr: [N]Lane = @bitCast(self.popV128());
+            for (0..N) |i| arr[i] = rintEven(Lane, arr[i]);
+            try self.pushV128(@bitCast(arr));
+            return;
+        }
         const Vec = @Vector(16 / @sizeOf(Lane), Lane);
         const a: Vec = @bitCast(self.popV128());
         const r: Vec = switch (op) {
@@ -2066,6 +2078,7 @@ const Frame = struct {
             .ceil => @ceil(a),
             .floor => @floor(a),
             .trunc => @trunc(a),
+            .nearest => unreachable, // handled above
         };
         try self.pushV128(@bitCast(r));
     }
@@ -2471,6 +2484,8 @@ const Frame = struct {
             0xb9 => try self.simdIntMinMax(u32, true),
             // i64x2
             0xc1 => try self.simdIntUn(i64, .neg),
+            0xc3 => try self.simdAllTrue(u64),
+            0xc4 => try self.simdBitmask(u64),
             0xcb => try self.simdShift(u64, .shl),
             0xcc => try self.simdShift(i64, .shr),
             0xcd => try self.simdShift(u64, .shr),
@@ -2484,6 +2499,7 @@ const Frame = struct {
             0x67 => try self.simdFloatUn(f32, .ceil),
             0x68 => try self.simdFloatUn(f32, .floor),
             0x69 => try self.simdFloatUn(f32, .trunc),
+            0x6a => try self.simdFloatUn(f32, .nearest),
             0xe4 => try self.simdFloatBin(f32, .add),
             0xe5 => try self.simdFloatBin(f32, .sub),
             0xe6 => try self.simdFloatBin(f32, .mul),
@@ -2499,6 +2515,7 @@ const Frame = struct {
             0x74 => try self.simdFloatUn(f64, .ceil),
             0x75 => try self.simdFloatUn(f64, .floor),
             0x7a => try self.simdFloatUn(f64, .trunc),
+            0x94 => try self.simdFloatUn(f64, .nearest),
             0xf0 => try self.simdFloatBin(f64, .add),
             0xf1 => try self.simdFloatBin(f64, .sub),
             0xf2 => try self.simdFloatBin(f64, .mul),
@@ -2547,14 +2564,14 @@ const Frame = struct {
             0xf9 => try self.simdTruncSat(f32, u32, false),
             0xfc => try self.simdTruncSat(f64, i32, true), // ..._f64x2_s_zero
             0xfd => try self.simdTruncSat(f64, u32, true),
-            0x5e => { // f64x2.promote_low_f32x4
-                const src: [4]f32 = @bitCast(self.popV128());
-                const dst = [2]f64{ src[0], src[1] };
-                try self.pushV128(@bitCast(dst));
-            },
-            0x5f => { // f32x4.demote_f64x2_zero
+            0x5e => { // f32x4.demote_f64x2_zero  (spec opcode 0x5e)
                 const src: [2]f64 = @bitCast(self.popV128());
                 const dst = [4]f32{ @floatCast(src[0]), @floatCast(src[1]), 0, 0 };
+                try self.pushV128(@bitCast(dst));
+            },
+            0x5f => { // f64x2.promote_low_f32x4  (spec opcode 0x5f)
+                const src: [4]f32 = @bitCast(self.popV128());
+                const dst = [2]f64{ src[0], src[1] };
                 try self.pushV128(@bitCast(dst));
             },
             // widening loads: load8x8 / load16x4 / load32x2 (s/u)

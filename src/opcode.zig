@@ -647,6 +647,21 @@ fn readMemArg(r: *Reader) DecodeError!MemArg {
 /// stores, +lane for load/store-lane, 16 bytes for `v128.const`/`shuffle`, a
 /// lane byte for extract/replace_lane, nothing otherwise). Decoding is complete
 /// for the whole family; execution supports a subset (`interp.execSimd`).
+/// Lanes addressable by an extract/replace/lane-load-store lane immediate. An
+/// out-of-range lane must be rejected **at decode** — the CLI run path does not
+/// re-validate, and the interpreter indexes a fixed `[N]Lane` array by this
+/// byte, so an unchecked value is an out-of-bounds read (and, for replace/
+/// load_lane, an out-of-bounds *write*). Not a lane op → 255 (never rejects).
+fn simdLaneCount(sub: u32) u8 {
+    return switch (sub) {
+        0x15, 0x16, 0x17, 0x54, 0x58 => 16, // i8x16 lanes / *8_lane
+        0x18, 0x19, 0x1a, 0x55, 0x59 => 8, // i16x8 lanes / *16_lane
+        0x1b, 0x1c, 0x1f, 0x20, 0x56, 0x5a => 4, // i32x4/f32x4 / *32_lane
+        0x1d, 0x1e, 0x21, 0x22, 0x57, 0x5b => 2, // i64x2/f64x2 / *64_lane
+        else => 255,
+    };
+}
+
 fn decodeSimd(r: *Reader, sub: u32) DecodeError!Instr {
     var s: Simd = .{ .sub = sub };
     switch (sub) {
@@ -654,6 +669,7 @@ fn decodeSimd(r: *Reader, sub: u32) DecodeError!Instr {
         0x54...0x5b => { // v128.load/store lane: memarg + a lane index
             s.mem = try readMemArg(r);
             s.lane = try r.readByte();
+            if (s.lane >= simdLaneCount(sub)) return error.UnsupportedOpcode;
         },
         0x0c, 0x0d => { // v128.const / i8x16.shuffle: 16 immediate bytes (LE)
             var v: u128 = 0;
@@ -661,7 +677,10 @@ fn decodeSimd(r: *Reader, sub: u32) DecodeError!Instr {
             while (i < 16) : (i += 1) v |= @as(u128, try r.readByte()) << (@as(u7, i) * 8);
             s.bytes = v;
         },
-        0x15...0x22 => s.lane = try r.readByte(), // extract_lane / replace_lane
+        0x15...0x22 => { // extract_lane / replace_lane
+            s.lane = try r.readByte();
+            if (s.lane >= simdLaneCount(sub)) return error.UnsupportedOpcode;
+        },
         else => {}, // all other SIMD ops take no immediate
     }
     return .{ .op = .simd, .imm = .{ .simd = s } };
