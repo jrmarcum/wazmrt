@@ -520,10 +520,16 @@ is proven through the real binary with no source edits.
 - Fixed in passing: **`wazmrt pin` now assembles a `.wat` before hashing**, so a pinned `.wat` matches the
   *binary* the gate hashes at run time (previously it hashed the source text → never matched).
 
-### DECIDED 2026-07-18 (owner) — the trusted-keys database + a companion keystore project
+### The trusted-keys database + companion keystore project — SUPERSEDED 2026-07-18 (NOT being built)
+
+> **Status: shelved.** These decisions were locked on the morning of 2026-07-18, but the package-manager
+> survey later that day (see the next subsection) showed a multi-key keystore is redundant for the chosen
+> **single-publisher / package-managed** model. The design below is kept as a **reference in case
+> wazmrt ever goes multi-publisher** — it is not on the build path. The store is the root-owned pin DB
+> plus the single embedded `-Droot-key`.
 
 A **companion project** (separate from wazmrt) generates Ed25519 keypairs and registers the **public**
-keys in a database that wazmrt reads as its trust anchors. Decisions locked before that project starts:
+keys in a database that wazmrt reads as its trust anchors. Decisions that *would* apply if it were built:
 
 - **File:** `wasm-keys.json` — **JSON** (multi-field key records fit JSON far better than the line-based
   `pins` format; `std.json`, no new dep). Stays **plaintext** (integrity, not secrecy) and the reader must
@@ -556,10 +562,10 @@ keys in a database that wazmrt reads as its trust anchors. Decisions locked befo
 }
 ```
 
-wazmrt-side work (a later wazmrt increment, not the companion project): load + ownership-check
-`wasm-keys.json`; gather trusted keys (`-Droot-key` ∪ DB); a `"signature"` section is authenticated iff
-its key is in the trusted set **and** the Ed25519 signature verifies. Extends today's single-key
-`sign.verify`.
+wazmrt-side work (would have been a later increment — **NOT being built**, see the SUPERSEDED note above):
+load + ownership-check `wasm-keys.json`; gather trusted keys (`-Droot-key` ∪ DB); a `"signature"` section
+authenticated iff its key is in the trusted set **and** the Ed25519 signature verifies. Today's single-key
+`sign.verify` + `-Droot-key` is the shipped design.
 
 ### Package-manager verification survey (2026-07-18) — and whether we even need a keys store
 
@@ -597,28 +603,33 @@ DB *is* that manifest; **directory hashing has no precedent — avoid it.** Sour
 3. **`wasm-keys.json` multi-key store** — trust **multiple independent publishers'** keys, added without
    rebuilding wazmrt.
 
-**The survey's steer:** tiers 1–2 already match what the lean field models do; the separate multi-key
-keystore (tier 3, the companion project) earns its complexity **only if wazmrt becomes a multi-publisher
-platform**. For single-publisher / package-managed distribution it is **redundant** — pins (from the
-package manager) + one embedded key cover it. **So the companion keystore project is conditional on the
-distribution model, not a given.** Pending owner decision.
+**DECIDED 2026-07-18 (owner): single-publisher / package-managed → tiers 1–2.** The store is the
+**root-owned pin DB** (the installer records each `.wasm`'s SHA-256 from the verified package — the
+Homebrew/Scoop/RPM-metadata model), plus the **single embedded `-Droot-key`** for our own signed modules
+that run without a pin (Nix's one-trusted-key model). **`wasm-keys.json` / the companion keystore project
+is NOT being built** — tier 3 is redundant for single-publisher distribution. The schema above stays only
+as a reference *if* a multi-publisher need ever arises. **Consequence: the wazmrt authenticity path is
+feature-complete** — pin verify + signature verify + `keygen`/`sign` + `-Droot-key` + deny-when-armed —
+with **no keystore reader to build**. The install side (running `wazmrt pin` per module) is the packager's
+job, not wazmrt code.
 
-**Still open** (does NOT block the above):
+**Still open** (all OPTIONAL — the authenticity path is otherwise feature-complete):
 
-- Private-key custody hardening for a real publisher (HSM/YubiKey/KMS — the local `.key` file is the MVP;
-  the design never wanted a private key on a *user's* machine, only the publisher's).
-- The Windows ownership/ACL check for the keys file (POSIX `stat` is straightforward; Windows is the work).
+- Private-key custody hardening for the (single) publisher (HSM/YubiKey/KMS — the local `.key` file is the
+  MVP; the design never wanted a private key on a *user's* machine, only the publisher's).
+- Install-side ergonomics (optional): a bulk `wazmrt pin <dir>` so a packager can pin every `.wasm` it
+  installs in one step. Not required — the packager can loop `wazmrt pin` today.
+- (The Windows ownership/ACL check is **no longer needed** — it was for the shelved keys file.)
 
 **Resolved with data 2026-07-16:** ~~cold-start cost of hashing on every run~~ — **measured, negligible**
 (SHA-256 0.5% of instantiate, Ed25519 2.4%, both <0.15% of the process-startup floor). See the pin
 section above and `testing.md`.
 - ~~Default policy: deny-unsigned out of the box, or opt-in?~~ — **RESOLVED 2026-07-18: deny-unsigned when
   *armed* (key embedded or pin DB present); bare build permissive. See "default policy" above.**
-- ~~Scope: is the keyring genuinely a separate project?~~ — **2026-07-18: IF built, yes — a companion
-  project writes `wasm-keys.json` (boundary + schema above). But the package-manager survey (above)
-  reopened *whether it is needed at all*: it's tier 3, warranted only for a multi-publisher platform;
-  single-publisher / package-managed distribution needs only pins + one embedded key. Conditional on the
-  distribution model — pending owner decision.**
+- ~~Scope: is the keyring genuinely a separate project?~~ — **RESOLVED 2026-07-18: moot — the keystore is
+  NOT being built. Owner chose single-publisher / package-managed, so the store is the pin DB + one
+  embedded `-Droot-key` (tiers 1–2); the multi-key `wasm-keys.json` (tier 3) is redundant. See the
+  SUPERSEDED note and the tiering above.**
 - ~~Does `--ro-dir` jump the queue ahead of the rest of 4.3?~~ — **resolved: built in 4.4 (2026-07-17).**
 - ~~Revocation/rotation story~~ — **RESOLVED 2026-07-18: NO rotation (owner rejected it). One embedded
   key + an ownership-trusted static keys DB; rebuild to change the anchor.**

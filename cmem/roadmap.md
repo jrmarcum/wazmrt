@@ -345,14 +345,14 @@ final-component `path_open` TOCTOU tied to std bug #18. See #17.
 > bad option). Implemented as `pin.decide(explicit, pinned, opt_out, tty, armed)` + `verifyGate`; also
 > fixed `wazmrt pin` to assemble `.wat` before hashing.
 >
-> 🚧 **Trusted-keys DB DECIDED (2026-07-18, owner) — build pending.** A **companion project** (separate
-> repo) generates Ed25519 keypairs and registers **public** keys in `wasm-keys.json` (JSON, plaintext,
-> fail-closed) at `<wazmrt-dir>/security/`, trusted via an **ownership check** (root/admin-owned, not
-> user-writable — not the path). It holds **public keys only**, augments `-Droot-key`, and leaves the
-> `pins` hash DB separate; **no rotation**. Schema + rationale in `security-model.md`. ⇢ wazmrt-side work
-> (a later wazmrt increment): load + ownership-check the DB and verify a signature against **any** trusted
-> key (extends the single-key `sign.verify`; the Windows ACL check is the hard part). ⇢ Otherwise
-> optional: private-key custody hardening (HSM/YubiKey/KMS). See `security-model.md`.
+> ✅ **Trusted-keys DB / companion keystore — SHELVED, NOT being built (2026-07-18).** Decided in the
+> morning, then reversed the same day after a package-manager verification survey (deep-research, 21
+> sources): a multi-key keystore is **redundant for the chosen single-publisher / package-managed model**.
+> The store is the **root-owned pin DB** (installer records each `.wasm`'s SHA-256 — the Homebrew/Scoop/
+> RPM-metadata model) **plus the single embedded `-Droot-key`** (Nix's one-trusted-key model). No
+> `wasm-keys.json`, no reader, no ownership-check code. **The wazmrt authenticity path is feature-complete**
+> (pin + signature verify + `keygen`/`sign` + `-Droot-key` + deny-when-armed). ⇢ Optional only: publisher
+> private-key custody (HSM), and a bulk `wazmrt pin <dir>` install convenience. See `security-model.md`.
 >
 > **The C ABI is NOT remaining work** — #20 (all 319 `wasm.h` fns) / #21 (mem-safety) / #22 (fuzz) are
 > DONE and 4.4 added a C conformance guest. Only two narrow, demand-driven residuals stay deferred:
