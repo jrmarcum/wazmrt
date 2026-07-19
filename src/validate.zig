@@ -498,6 +498,16 @@ const FuncValidator = struct {
                 for (instr.imm.br_table.labels) |l| {
                     const lt = try self.labelTypesAt(l);
                     if (lt.len != default_lt.len) return error.TypeMismatch;
+                    // #2f: every target label must be type-compatible with the
+                    // default, not merely equal in arity. `popVals` catches a
+                    // mismatch in reachable code but NOT in stack-polymorphic
+                    // (post-`unreachable`) code, where the operand stack is
+                    // `unknown`. `subtypeOf` both ways rejects only genuinely
+                    // incompatible pairs (under single inheritance no common
+                    // operand type exists), so it never rejects a valid
+                    // subtyped `br_table`.
+                    for (lt, default_lt) |a, b|
+                        if (!subtypeOf(self.module, a, b) and !subtypeOf(self.module, b, a)) return error.TypeMismatch;
                     try self.popVals(lt);
                     try self.pushVals(lt);
                 }

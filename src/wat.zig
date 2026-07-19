@@ -2437,6 +2437,26 @@ test "SIMD audit regressions (sub_sat_u / nearest / i64x2 all_true+bitmask / dem
     , "f", &.{}));
 }
 
+test "#2f: br_table with mismatched label types (unreachable code) is rejected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Otherwise valid: the block yields f64 → drop → i32.const → the func's i32.
+    // But `br_table 0 1` targets label 0 (the f64 block) and label 1 (the func,
+    // result i32) — incompatible. After `unreachable` the stack is polymorphic,
+    // so `popVals` can't catch it; the cross-label type check (#2f) must.
+    const bin = try assemble(a,
+        \\(module (func (result i32)
+        \\  (block (result f64)
+        \\    unreachable
+        \\    (br_table 0 1 (i32.const 0)))
+        \\  drop
+        \\  (i32.const 5)))
+    );
+    var m = try Module.decode(a, bin);
+    try std.testing.expectError(error.TypeMismatch, validate(a, &m));
+}
+
 test "assembles memory.size / memory.grow (WAT was missing the .mem_index arm)" {
     try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(
         \\(module (memory 1) (func (export "f") (result i32) (memory.size)))

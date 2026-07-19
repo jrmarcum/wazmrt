@@ -863,7 +863,14 @@ pub fn decodeBodyTracked(
             .select_types => blk: {
                 const n = try r.readVarU32();
                 const tys = try a.alloc(types.ValType, n);
-                for (tys) |*t| t.* = @enumFromInt(try r.readByte());
+                for (tys) |*t| {
+                    t.* = @enumFromInt(try r.readByte());
+                    // #6: reject an unknown value-type byte rather than silently
+                    // building a bogus `ValType`. (A single byte can't encode a
+                    // concrete `(ref $t)` — bit 31 is clear — so `isValid` is
+                    // exactly the abstract/numeric set here.)
+                    if (!t.isValid()) return error.UnsupportedOpcode;
+                }
                 break :blk .{ .select_types = tys };
             },
             .ref_type => .{ .ref_type = try readHeapType(&r) },
@@ -922,6 +929,18 @@ test "decodes a br_table" {
     try std.testing.expectEqual(@as(usize, 1), instrs.len);
     try std.testing.expectEqualSlices(u32, &.{ 0, 1 }, instrs[0].imm.br_table.labels);
     try std.testing.expectEqual(@as(u32, 2), instrs[0].imm.br_table.default);
+}
+
+test "#6: select_t rejects an invalid value-type byte at decode" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // select_t (0x1c), 1 result type, 0x50 — not a value type → rejected.
+    try std.testing.expectError(error.UnsupportedOpcode, decodeBody(a, &[_]u8{ 0x1c, 0x01, 0x50 }));
+    // A valid typed select (i32 = 0x7f) still decodes.
+    const ok = try decodeBody(a, &[_]u8{ 0x1c, 0x01, 0x7f, 0x0b });
+    try std.testing.expectEqual(Op.select_t, ok[0].op);
+    try std.testing.expectEqual(types.ValType.i32, ok[0].imm.select_types[0]);
 }
 
 test "decodes a SIMD (0xFD) op: v128.const" {
