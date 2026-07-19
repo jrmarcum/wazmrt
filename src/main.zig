@@ -138,51 +138,111 @@ pub fn main(init: std.process.Init) !void {
 
 // ===== Phase 5 — pin verification (see cmem/security-model.md, roadmap.md §5) =====
 
-/// `wazmrt pin <file> [--db <path>]` — SHA-256 a module and emit its pin line.
-/// Prints `<hex>  <file>` (redirect/append into a root-owned pin DB); with
-/// `--db <path>` also appends it there. Meant to be run with privilege by an
-/// installer — the runtime only ever *reads* the DB.
+/// One computed pin: the module's hex digest and a human label (its path).
+const PinEntry = struct { hex: wazmrt.pin.Hex, label: []const u8 };
+
+/// `wazmrt pin <file|dir> [--db <path>]` — SHA-256 a module (or every `.wasm`/
+/// `.wat` under a directory, recursively) and emit its pin line(s). Prints
+/// `<hex>  <label>` (redirect/append into a root-owned pin DB); with `--db
+/// <path>` also appends there. Meant to be run with privilege by an installer —
+/// the runtime only ever *reads* the DB. The **directory** form lets a packager
+/// pin a whole bundle in one step.
 fn pinSubcommand(arena: std.mem.Allocator, io: Io, out: *Io.Writer, rest: []const []const u8) !void {
-    var file: ?[]const u8 = null;
+    var target: ?[]const u8 = null;
     var db_path: ?[]const u8 = null;
     var i: usize = 0;
     while (i < rest.len) : (i += 1) {
         if (std.mem.eql(u8, rest[i], "--db") and i + 1 < rest.len) {
             db_path = rest[i + 1];
             i += 1;
-        } else if (file == null and !std.mem.startsWith(u8, rest[i], "--")) {
-            file = rest[i];
+        } else if (target == null and !std.mem.startsWith(u8, rest[i], "--")) {
+            target = rest[i];
         }
     }
-    if (file == null) {
-        try out.print("usage: wazmrt pin <file> [--db <path>]\n", .{});
+    if (target == null) {
+        try out.print("usage: wazmrt pin <file|dir> [--db <path>]\n", .{});
         return;
     }
-    var bytes: []const u8 = Io.Dir.cwd().readFileAlloc(io, file.?, arena, .limited(64 << 20)) catch |e| {
-        try out.print("error: cannot read '{s}': {s}\n", .{ file.?, @errorName(e) });
+
+    const st = Io.Dir.cwd().statFile(io, target.?, .{}) catch |e| {
+        try out.print("error: cannot stat '{s}': {s}\n", .{ target.?, @errorName(e) });
         return;
     };
-    // A `.wat` is assembled first, so the pinned hash matches the *binary* the
-    // gate actually hashes at run time (not the source text).
-    if (std.mem.endsWith(u8, file.?, ".wat")) bytes = wazmrt.wat.assemble(arena, bytes) catch |e| {
-        try out.print("error: cannot assemble '{s}': {s}\n", .{ file.?, @errorName(e) });
-        return;
-    };
-    const hex = wazmrt.pin.hashHex(bytes);
-    try out.print("{s}  {s}\n", .{ &hex, file.? });
+
+    var entries: std.ArrayList(PinEntry) = .empty;
+    if (st.kind == .directory) {
+        collectDirPins(arena, io, out, target.?, &entries) catch |e| {
+            try out.print("error: cannot scan '{s}': {s}\n", .{ target.?, @errorName(e) });
+            return;
+        };
+        if (entries.items.len == 0) {
+            try out.print("(no .wasm/.wat files under {s})\n", .{target.?});
+            return;
+        }
+        // Deterministic output regardless of directory-iteration order.
+        std.mem.sort(PinEntry, entries.items, {}, pinEntryLess);
+    } else {
+        const hex = hashModuleFile(arena, io, target.?) catch |e| {
+            try out.print("error: cannot pin '{s}': {s}\n", .{ target.?, @errorName(e) });
+            return;
+        };
+        try entries.append(arena, .{ .hex = hex, .label = target.? });
+    }
+
+    for (entries.items) |e| try out.print("{s}  {s}\n", .{ &e.hex, e.label });
     if (db_path) |p| {
-        appendPinLine(arena, io, p, &hex, file.?) catch |e| {
+        appendPinLines(arena, io, p, entries.items) catch |e| {
             try out.print("error: cannot append to pin DB '{s}': {s}\n", .{ p, @errorName(e) });
             return;
         };
-        try out.print("pinned to {s}\n", .{p});
+        try out.print("pinned {d} module(s) to {s}\n", .{ entries.items.len, p });
     }
 }
 
-/// Append one `<hex>  <label>` line to a pin DB, rewriting the whole (small)
-/// file. If the parent directory is missing the write fails — that is the
-/// installer's job to create, and a clear error beats silently succeeding.
-fn appendPinLine(arena: std.mem.Allocator, io: Io, path: []const u8, hex: []const u8, label: []const u8) !void {
+/// Hash the module at `path`, assembling a `.wat` first so the pinned digest
+/// matches the *binary* the gate hashes at run time (not the source text).
+fn hashModuleFile(arena: std.mem.Allocator, io: Io, path: []const u8) !wazmrt.pin.Hex {
+    var bytes: []const u8 = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 << 20));
+    if (std.mem.endsWith(u8, path, ".wat")) bytes = try wazmrt.wat.assemble(arena, bytes);
+    return wazmrt.pin.hashHex(bytes);
+}
+
+fn pinEntryLess(_: void, a: PinEntry, b: PinEntry) bool {
+    return std.mem.lessThan(u8, a.label, b.label);
+}
+
+/// Recursively collect a pin for every `.wasm`/`.wat` under `dir_path`. A file
+/// that can't be read or assembled is skipped with a warning (one bad module
+/// shouldn't abort pinning a whole bundle).
+fn collectDirPins(arena: std.mem.Allocator, io: Io, out: *Io.Writer, dir_path: []const u8, entries: *std.ArrayList(PinEntry)) !void {
+    var dir = try Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+    var walker = try dir.walk(arena);
+    defer walker.deinit();
+    while (try walker.next(io)) |ent| {
+        if (ent.kind != .file) continue;
+        const is_wat = std.mem.endsWith(u8, ent.basename, ".wat");
+        if (!is_wat and !std.mem.endsWith(u8, ent.basename, ".wasm")) continue;
+        // Read via the entry's own directory handle + basename (avoids
+        // NameTooLong on deep trees). `ent.path`/`ent.basename` are invalidated
+        // by the next `walker.next`, so copy the label now.
+        var bytes: []const u8 = ent.dir.readFileAlloc(io, ent.basename, arena, .limited(64 << 20)) catch |e| {
+            try out.print("warning: skipping '{s}': {s}\n", .{ ent.path, @errorName(e) });
+            continue;
+        };
+        if (is_wat) bytes = wazmrt.wat.assemble(arena, bytes) catch |e| {
+            try out.print("warning: skipping '{s}': cannot assemble ({s})\n", .{ ent.path, @errorName(e) });
+            continue;
+        };
+        const label = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir_path, ent.path });
+        try entries.append(arena, .{ .hex = wazmrt.pin.hashHex(bytes), .label = label });
+    }
+}
+
+/// Append `<hex>  <label>` lines to a pin DB, rewriting the whole (small) file.
+/// If the parent directory is missing the write fails — that is the installer's
+/// job to create, and a clear error beats silently succeeding.
+fn appendPinLines(arena: std.mem.Allocator, io: Io, path: []const u8, entries: []const PinEntry) !void {
     const prev: []const u8 = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch |e| switch (e) {
         error.FileNotFound => "",
         else => return e,
@@ -190,10 +250,12 @@ fn appendPinLine(arena: std.mem.Allocator, io: Io, path: []const u8, hex: []cons
     var buf: std.ArrayList(u8) = .empty;
     try buf.appendSlice(arena, prev);
     if (prev.len > 0 and prev[prev.len - 1] != '\n') try buf.append(arena, '\n');
-    try buf.appendSlice(arena, hex);
-    try buf.appendSlice(arena, "  ");
-    try buf.appendSlice(arena, label);
-    try buf.append(arena, '\n');
+    for (entries) |e| {
+        try buf.appendSlice(arena, &e.hex);
+        try buf.appendSlice(arena, "  ");
+        try buf.appendSlice(arena, e.label);
+        try buf.append(arena, '\n');
+    }
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = buf.items });
 }
 

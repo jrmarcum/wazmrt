@@ -613,7 +613,11 @@ thin shell over `decide`, computing `armed = embedded_root_key != null or db_pre
 verified manually** (not yet a build-graph gate): bare/no-DB runs; a **present DB arms deny** (unpinned
 refused, `--no-verify` overrides with a warning, pinned runs); `# mode: enforce` + `--no-verify` **STILL
 refuses**; a **keyed build** (`-Droot-key`) denies an unsigned module and authenticates a signed one;
-corrupt DB fails closed. `wazmrt pin` assembles a `.wat` first so its hash matches the run-time binary.
+corrupt DB fails closed. `wazmrt pin` assembles a `.wat` first so its hash matches the run-time binary,
+and **`wazmrt pin <dir>`** (2026-07-18) recursively pins every `.wasm`/`.wat` under a directory (skips
+non-modules, sorts, one `--db` write) — CLI-verified: 3-module bundle incl. a nested subdir, `readme.txt`
+skipped, empty-dir and missing-path messages. (Pin subcommand has no unit tests — a thin Io/file wrapper,
+like `keygen`/`sign`; the core `hash`/`Db`/`decide` logic is covered above.)
 
 ## Compiled-program conformance gate — `zig build wasi-gate` (2026-07-17, Phase 4.4)
 

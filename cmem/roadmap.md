@@ -351,8 +351,10 @@ final-component `path_open` TOCTOU tied to std bug #18. See #17.
 > The store is the **root-owned pin DB** (installer records each `.wasm`'s SHA-256 — the Homebrew/Scoop/
 > RPM-metadata model) **plus the single embedded `-Droot-key`** (Nix's one-trusted-key model). No
 > `wasm-keys.json`, no reader, no ownership-check code. **The wazmrt authenticity path is feature-complete**
-> (pin + signature verify + `keygen`/`sign` + `-Droot-key` + deny-when-armed). ⇢ Optional only: publisher
-> private-key custody (HSM), and a bulk `wazmrt pin <dir>` install convenience. See `security-model.md`.
+> (pin + signature verify + `keygen`/`sign` + `-Droot-key` + deny-when-armed). ✅ **Bulk `wazmrt pin <dir>`
+> BUILT (2026-07-18)** — recursively pins every `.wasm`/`.wat` under a directory (assembles `.wat`; skips
+> non-modules; sorted; one `--db` write), so a packager pins a whole bundle in one step. ⇢ Optional only:
+> publisher private-key custody (HSM). See `security-model.md`.
 >
 > **The C ABI is NOT remaining work** — #20 (all 319 `wasm.h` fns) / #21 (mem-safety) / #22 (fuzz) are
 > DONE and 4.4 added a C conformance guest. Only two narrow, demand-driven residuals stay deferred:

@@ -617,8 +617,10 @@ job, not wazmrt code.
 
 - Private-key custody hardening for the (single) publisher (HSM/YubiKey/KMS — the local `.key` file is the
   MVP; the design never wanted a private key on a *user's* machine, only the publisher's).
-- Install-side ergonomics (optional): a bulk `wazmrt pin <dir>` so a packager can pin every `.wasm` it
-  installs in one step. Not required — the packager can loop `wazmrt pin` today.
+- ~~Install-side ergonomics: a bulk `wazmrt pin <dir>`~~ — **BUILT 2026-07-18.** `wazmrt pin` now accepts
+  a **directory** and recursively pins every `.wasm`/`.wat` under it (assembling `.wat` first so the hash
+  matches the run-time binary; non-module files skipped; sorted, appended to `--db` in one write). Lets a
+  packager pin a whole bundle in one step — the per-module install-time pinning the survey recommends.
 - (The Windows ownership/ACL check is **no longer needed** — it was for the shelved keys file.)
 
 **Resolved with data 2026-07-16:** ~~cold-start cost of hashing on every run~~ — **measured, negligible**

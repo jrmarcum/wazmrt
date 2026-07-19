@@ -122,7 +122,13 @@ list of approved SHA-256 hashes. Register a module's hash:
 ```
 wazmrt pin app.wasm                     # prints:  <sha256>  app.wasm
 wazmrt pin app.wasm --db /etc/wazmrt/pins   # …and appends it to the DB
+wazmrt pin ./bundle --db /etc/wazmrt/pins   # pin every .wasm/.wat under a dir (recursive)
 ```
+
+The **directory** form pins a whole application bundle in one step — it walks the
+tree, hashes each `.wasm`/`.wat` (assembling `.wat` first so the hash matches the
+binary that runs), and appends them all. A `.wat` is assembled before hashing;
+non-module files are skipped.
 
 The database is meant to be **root-owned and read-only to the user** (created at
 install time, with privilege); wazmrt only ever reads it. Its first line may set
