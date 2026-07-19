@@ -158,8 +158,14 @@ fn pinSubcommand(arena: std.mem.Allocator, io: Io, out: *Io.Writer, rest: []cons
         try out.print("usage: wazmrt pin <file> [--db <path>]\n", .{});
         return;
     }
-    const bytes = Io.Dir.cwd().readFileAlloc(io, file.?, arena, .limited(64 << 20)) catch |e| {
+    var bytes: []const u8 = Io.Dir.cwd().readFileAlloc(io, file.?, arena, .limited(64 << 20)) catch |e| {
         try out.print("error: cannot read '{s}': {s}\n", .{ file.?, @errorName(e) });
+        return;
+    };
+    // A `.wat` is assembled first, so the pinned hash matches the *binary* the
+    // gate actually hashes at run time (not the source text).
+    if (std.mem.endsWith(u8, file.?, ".wat")) bytes = wazmrt.wat.assemble(arena, bytes) catch |e| {
+        try out.print("error: cannot assemble '{s}': {s}\n", .{ file.?, @errorName(e) });
         return;
     };
     const hex = wazmrt.pin.hashHex(bytes);
@@ -337,28 +343,28 @@ fn verifyGate(
 
     const db_path = flagValue(rest, "--pins") orelse defaultPinsPath();
     const db_text: ?[]const u8 = Io.Dir.cwd().readFileAlloc(io, db_path, arena, .limited(1 << 20)) catch |e| switch (e) {
-        error.FileNotFound => null, // no DB ⇒ no policy ⇒ dev default (off)
+        error.FileNotFound => null, // no DB present
         else => {
             try out.print("error: cannot read pin DB '{s}': {s}\n", .{ db_path, @errorName(e) });
             return false;
         },
     };
 
-    var policy: wazmrt.pin.Mode = .off;
+    // The DB's `# mode:` is the root-owned policy (null if absent). A dev/user
+    // `--verify <mode>` may only RAISE strictness — never weaken a root enforce.
+    var explicit: ?wazmrt.pin.Mode = null;
     var db: wazmrt.pin.Db = .empty;
     if (db_text) |text| {
-        if (wazmrt.pin.modeFromDb(text)) |m| policy = m;
+        explicit = wazmrt.pin.modeFromDb(text);
         db = wazmrt.pin.Db.parse(arena, text) catch |e| {
             // A corrupt/truncated DB fails CLOSED — never silently "not listed".
             try out.print("error: pin DB '{s}' is corrupt ({s}); refusing to run\n", .{ db_path, @errorName(e) });
             return false;
         };
     }
-    // A dev `--verify <mode>` flag may only RAISE strictness above the policy,
-    // never lower it — a user argument cannot weaken a root-owned enforce.
     if (flagValue(rest, "--verify")) |mv|
         if (wazmrt.pin.modeFromStr(mv)) |m| {
-            policy = wazmrt.pin.stricter(policy, m);
+            explicit = wazmrt.pin.stricter(explicit orelse .off, m);
         };
 
     // Hash the in-memory bytes we are about to execute (TOCTOU-safe), then let
@@ -369,15 +375,28 @@ fn verifyGate(
     const tty = Io.File.stdin().isTty(io) catch false;
     const hex = wazmrt.pin.toHex(digest);
 
-    switch (wazmrt.pin.decide(policy, pinned, opt_out, tty)) {
+    // Verification is "armed" — deny an unsigned/unpinned module by default —
+    // when a root key is embedded OR a pin DB is present, i.e. a real deployment
+    // rather than a bare dev build (which runs everything). A signature-verified
+    // module already returned above; this governs the *unsigned* case.
+    const armed = embedded_root_key != null or db_text != null;
+    const would_block = wazmrt.pin.decide(explicit, pinned, false, tty, armed) != .run;
+
+    switch (wazmrt.pin.decide(explicit, pinned, opt_out, tty, armed)) {
         .run => {
-            // Note when we ran something the policy would otherwise stop.
-            if (policy == .warn and !pinned)
+            // We only reach `.run` here for an unpinned module by overriding a
+            // block with --no-verify (or via an explicit `# mode: off`). Note the
+            // override so it is never silent.
+            if (would_block and opt_out)
                 try out.print("warning: running unverified module {s} (sha256 {s}) — --no-verify\n", .{ path, &hex });
             return true;
         },
         .deny => {
-            const why = if (policy == .enforce) "policy=enforce" else "unpinned; no TTY to confirm — pass --no-verify to allow";
+            const why = if (explicit) |m| switch (m) {
+                .enforce => "policy=enforce (root-owned; not overridable)",
+                .warn => "unpinned; no TTY to confirm — pass --no-verify to allow",
+                .off => unreachable, // `off` never denies
+            } else "unsigned and not pinned — sign it, pin it, or pass --no-verify to allow on your own machine";
             try out.print("refusing to run unverified module: {s}\n  sha256 {s}\n  (not in pin DB {s}; {s})\n", .{ path, &hex, db_path, why });
             return false;
         },

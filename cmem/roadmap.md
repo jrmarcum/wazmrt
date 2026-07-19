@@ -335,9 +335,16 @@ final-component `path_open` TOCTOU tied to std bug #18. See #17.
 > ✅ **Release key injection BUILT (2026-07-18).** `zig build -Droot-key=<64 hex>` embeds the trust anchor
 > (empty ⇒ inert; malformed ⇒ build error). `build_options` is imported only by `main.zig`, so `sign.zig`
 > (compiled into ~8 targets via `root.zig`) stays plumbing-free — no cross-target threading. Full loop
-> keygen → sign → `-Droot-key` → verify proven through the real binary, no source edits. ⇢ REMAINING:
-> private-key custody (HSM/YubiKey/KMS), keyring file + rotation (PK→KEK→db), and the deny-unsigned-by-
-> default policy call. See `security-model.md`.
+> keygen → sign → `-Droot-key` → verify proven through the real binary, no source edits.
+>
+> ✅ **Default policy DECIDED + BUILT (2026-07-18, owner).** CLI **denies unsigned** when verification is
+> **armed** (root key embedded OR pin DB present); a bare build stays permissive. `--no-verify` overrides
+> on the user's own machine, but a root-owned `# mode: enforce` is **absolute**. Signature-authenticated OR
+> pinned ⇒ run. The **embedder path (wasmtk/rsxtk/C-ABI FFI) has no gate** — intended default: run.
+> Custody = publish-SHA-256-and-pin (signatures and pins both count). **No key rotation** (rejected as a
+> bad option). Implemented as `pin.decide(explicit, pinned, opt_out, tty, armed)` + `verifyGate`; also
+> fixed `wazmrt pin` to assemble `.wat` before hashing. ⇢ REMAINING (optional): private-key custody
+> hardening (HSM/YubiKey/KMS). See `security-model.md`.
 >
 > **The C ABI is NOT remaining work** — #20 (all 319 `wasm.h` fns) / #21 (mem-safety) / #22 (fuzz) are
 > DONE and 4.4 added a C conformance guest. Only two narrow, demand-driven residuals stay deferred:

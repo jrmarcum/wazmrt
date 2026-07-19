@@ -604,13 +604,16 @@ exit code (a whole-corpus run takes a few minutes — background it).
 known SHA-256 vectors (empty/"abc"); `parseHex` round-trip + case-insensitivity + reject; `Db.parse`
 (comments/labels/blanks, `contains`, and **loud-on-corruption** — a mangled content line is
 `error.InvalidPinLine`, so a truncated DB fails closed, not silently short); `modeFromStr`; `stricter`
-(never lowers); `modeFromDb` (`# mode:` directive); and **`decide` — the full enforcement/precedence
-matrix** (off/pinned → run; enforce+unpinned → deny regardless of opt-out/TTY; warn+unpinned →
-opt-out runs, else TTY prompts / non-TTY denies). The CLI (`main.zig` `verifyGate`) is a thin shell
-over `decide`. **End-to-end verified manually** (not yet a build-graph gate): off runs; enforce+pin
-runs; enforce+wrong/absent refuses; warn+no-tty refuses; warn+`--no-verify` runs; **enforce+`--no-verify`
-STILL refuses** (precedence); corrupt DB fails closed; `wazmrt pin --db` appends and the module then
-runs under `enforce`.
+(never lowers); `modeFromDb` (`# mode:` directive); and **`decide` — the full precedence matrix**, now
+`decide(explicit: ?Mode, pinned, opt_out, tty, armed)` (2026-07-18 deny-by-default work): pinned → run;
+explicit `# mode: off` → run, `enforce` → deny **absolutely** (opt-out/TTY ignored), `warn` → opt-out
+runs / TTY prompts / non-TTY denies; **no explicit mode + `armed` → deny an unsigned/unpinned module but
+`--no-verify` overrides (no prompt)**; no explicit mode + **not armed** → run. The CLI (`verifyGate`) is a
+thin shell over `decide`, computing `armed = embedded_root_key != null or db_present`. **End-to-end
+verified manually** (not yet a build-graph gate): bare/no-DB runs; a **present DB arms deny** (unpinned
+refused, `--no-verify` overrides with a warning, pinned runs); `# mode: enforce` + `--no-verify` **STILL
+refuses**; a **keyed build** (`-Droot-key`) denies an unsigned module and authenticates a signed one;
+corrupt DB fails closed. `wazmrt pin` assembles a `.wat` first so its hash matches the run-time binary.
 
 ## Compiled-program conformance gate — `zig build wasi-gate` (2026-07-17, Phase 4.4)
 

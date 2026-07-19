@@ -106,20 +106,33 @@ pub fn modeFromDb(text: []const u8) ?Mode {
 
 pub const Action = enum { run, deny, prompt };
 
-/// The pure decision the CLI gate makes once it knows the effective `policy`,
-/// whether the module is `pinned`, whether a non-interactive `opt_out`
-/// (`--no-verify`) was passed, and whether stdin is a `tty`. Kept pure so the
-/// whole enforcement/precedence matrix is unit-testable without any I/O.
+/// The pure decision the CLI gate makes for a module that is **not**
+/// signature-authenticated (that case is handled earlier and always runs).
+/// Inputs: the DB's `explicit` `# mode:` (null if the DB has no directive, or
+/// there is no DB); whether the module is `pinned`; whether a non-interactive
+/// `opt_out` (`--no-verify`) was passed; whether stdin is a `tty`; and whether
+/// verification is `armed` (a root key is embedded **or** a pin DB is present).
+/// Kept pure so the whole precedence matrix is unit-testable without any I/O.
 ///
-/// The load-bearing line is `policy == .enforce` returning `.deny` *before* the
-/// opt-out is consulted: an opt-out (or a prompt) can never satisfy an enforce
-/// policy — authority comes from the root-owned policy, not a runtime argument.
-pub fn decide(policy: Mode, pinned: bool, opt_out: bool, tty: bool) Action {
-    if (policy == .off or pinned) return .run;
-    if (policy == .enforce) return .deny;
-    // policy == .warn, module unpinned:
-    if (opt_out) return .run;
-    return if (tty) .prompt else .deny;
+/// Precedence:
+///   1. `pinned` → run (approved by the DB).
+///   2. explicit `# mode:` (root-owned) wins when present: `off` runs all,
+///      `enforce` denies **absolutely** (opt-out/tty cannot rescue — authority
+///      comes from the root-owned policy, not a runtime argument), `warn`
+///      prompts (tty) or denies unless opted out.
+///   3. no explicit mode: if `armed`, deny an unsigned/unpinned module — but the
+///      user **may** override with `--no-verify` on their own machine; if not
+///      armed (bare build, no key, no DB) there is nothing to verify against, so
+///      run.
+pub fn decide(explicit: ?Mode, pinned: bool, opt_out: bool, tty: bool, armed: bool) Action {
+    if (pinned) return .run;
+    if (explicit) |m| return switch (m) {
+        .off => .run,
+        .enforce => .deny, // absolute: opt-out/tty ignored
+        .warn => if (opt_out) .run else if (tty) .prompt else .deny,
+    };
+    if (!armed) return .run; // nothing to verify against
+    return if (opt_out) .run else .deny; // armed default-deny, user-overridable
 }
 
 pub const ParseError = error{ InvalidPinLine, OutOfMemory };
@@ -229,21 +242,32 @@ test "stricter never lowers" {
 }
 
 test "decide: the enforcement/precedence matrix" {
-    // off, or pinned under any policy → always run (no prompt, no deny).
-    for ([_]Mode{ .off, .warn, .enforce }) |m| {
-        try std.testing.expectEqual(Action.run, decide(m, true, false, false));
+    const arm = true;
+    const bare = false;
+    // Pinned → always run, regardless of mode / armed / anything.
+    for ([_]?Mode{ null, .off, .warn, .enforce }) |m| {
+        try std.testing.expectEqual(Action.run, decide(m, true, false, false, arm));
+        try std.testing.expectEqual(Action.run, decide(m, true, false, false, bare));
     }
-    try std.testing.expectEqual(Action.run, decide(.off, false, false, false));
 
-    // enforce + unpinned → deny, and NO opt-out / TTY can rescue it.
-    try std.testing.expectEqual(Action.deny, decide(.enforce, false, false, true));
-    try std.testing.expectEqual(Action.deny, decide(.enforce, false, true, true)); // opt-out ignored
-    try std.testing.expectEqual(Action.deny, decide(.enforce, false, true, false));
-
+    // Explicit `# mode:` wins when present (armed value is irrelevant).
+    try std.testing.expectEqual(Action.run, decide(.off, false, false, false, arm)); // operator allows all
+    // enforce + unpinned → deny, and NO opt-out / TTY can rescue it (root mandate).
+    try std.testing.expectEqual(Action.deny, decide(.enforce, false, false, true, arm));
+    try std.testing.expectEqual(Action.deny, decide(.enforce, false, true, true, arm)); // opt-out ignored
+    try std.testing.expectEqual(Action.deny, decide(.enforce, false, true, false, bare));
     // warn + unpinned: opt-out runs; else TTY prompts, non-TTY denies.
-    try std.testing.expectEqual(Action.run, decide(.warn, false, true, false));
-    try std.testing.expectEqual(Action.prompt, decide(.warn, false, false, true));
-    try std.testing.expectEqual(Action.deny, decide(.warn, false, false, false));
+    try std.testing.expectEqual(Action.run, decide(.warn, false, true, false, arm));
+    try std.testing.expectEqual(Action.prompt, decide(.warn, false, false, true, arm));
+    try std.testing.expectEqual(Action.deny, decide(.warn, false, false, false, arm));
+
+    // No explicit mode: armed → deny an unsigned/unpinned module, but --no-verify
+    // (opt_out) lets the machine's owner override; a TTY does NOT prompt (deny).
+    try std.testing.expectEqual(Action.deny, decide(null, false, false, false, arm));
+    try std.testing.expectEqual(Action.deny, decide(null, false, false, true, arm)); // no prompt
+    try std.testing.expectEqual(Action.run, decide(null, false, true, false, arm)); // --no-verify overrides
+    // No explicit mode and NOT armed (bare build, no key/DB) → run everything.
+    try std.testing.expectEqual(Action.run, decide(null, false, false, false, bare));
 }
 
 test "modeFromDb reads the # mode: directive, ignores other comments" {

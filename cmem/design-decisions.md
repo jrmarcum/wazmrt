@@ -86,16 +86,23 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   verify/run seam** — if you need the bytes, thread the existing buffer through. The enforcement
   *policy* lives in the **root-owned** pin DB (`# mode:` directive), so authority comes from the file's
   ownership; a user's `--no-verify`/`--verify` can only *raise* strictness (`pin.stricter`) and is
-  refused under `enforce` (`pin.decide` returns `.deny` before consulting the opt-out). The whole
-  matrix is the pure `pin.decide(policy, pinned, opt_out, tty)` — unit-tested; keep the CLI a thin shell
-  over it. **Signatures are now BUILT** (`src/sign.zig` + `wazmrt keygen`/`sign`, 2026-07-18): the CLI
+  refused under a root `enforce`. **Deny-unsigned-when-armed (owner decision, 2026-07-18):** the pure
+  decision is now `pin.decide(explicit: ?Mode, pinned, opt_out, tty, armed)`. `armed` = a root key is
+  embedded **or** a pin DB is present (`verifyGate` computes it) — a *real deployment*. When armed and
+  there is no explicit `# mode:`, an unsigned/unpinned module is **denied**, but `--no-verify` overrides
+  (the user owns their machine); an explicit root `# mode: enforce` is **absolute** (opt-out ignored). A
+  **bare** build (no key, no DB) is *not armed* → runs everything, so dev/tests/`wasi-gate` are
+  unaffected. **The gate is CLI-only** — the C-ABI/embedder run path has none, the intended permissive
+  default for wasmtk/rsxtk/FFI. **No key rotation** (owner rejected it — one embedded key; rebuild to
+  change). Keep the CLI a thin shell over `decide`. **Signatures are BUILT** (`src/sign.zig` + `wazmrt
+  keygen`/`sign`, 2026-07-18): the CLI
   `verifyGate` runs the Ed25519 signature check *before* the pin fallback (authenticated ⇒ no pin
   needed; tampered-by-our-key ⇒ refused always); the publisher tools (`wazmrt keygen`/`sign`) generate a
   keypair and sign modules. The trust anchor is embedded via **`-Droot-key=<hex>`** (empty ⇒ inert;
   malformed ⇒ build error). **Build-plumbing invariant:** only `main.zig` reads the key, so
   `build_options` is imported by the **CLI module alone** — never wire it into `sign.zig`/`root.zig`, or
   every one of the ~8 targets that compile them (cabi/dll/wasm/bench/tests) would have to provide it. Only
-  private-key custody (HSM), keyring/rotation stay design-only — see `security-model.md`.
+  optional private-key custody hardening (HSM) stays design-only — see `security-model.md`.
 - **Read-only preopens ride the rights model, not a write-path check (2026-07-17, `--ro-dir`).** A
   `--ro-dir` preopen is just a dir fd whose rights omit `rights.write_mask` (write/create/delete/
   rename/link/truncate/set-times/allocate). It stays enforced for the *whole subtree* because

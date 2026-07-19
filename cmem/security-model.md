@@ -471,12 +471,34 @@ anchor; empty (the default) ⇒ verification inert; a malformed value is a **bui
 module alone and `sign.zig` stays plumbing-free. The whole loop — keygen → sign → `-Droot-key` → verify —
 is proven through the real binary with no source edits.
 
-**Still open** (do NOT block the above):
+### DECIDED 2026-07-18 (owner) — default policy + custody, and NO rotation
 
-- Where the **private** key lives for a real publisher (HSM/YubiKey/KMS — the local `.key` file is the
-  MVP; the design never wanted a private key on a *user's* machine, only the publisher's).
-- Keyring file + rotation (embedded root signs a keyring; PK→KEK→db).
-- Default policy (deny-unsigned out of the box vs opt-in) — still `off` today.
+- **No key rotation.** The keyring / PK→KEK→db rotation idea is **rejected** ("a bad option"). There is one
+  embedded root key; changing it means rebuilding + re-signing wazmrt (the anchor's integrity == the
+  verifier's, so that is acceptable and simpler than a rotation layer to attack).
+- **Custody = publish-and-pin.** The publisher publishes a **SHA-256** of the module; the operator
+  validates it and saves it to the (root-owned) **pin DB** for verification before use. Signatures and
+  pins are *both* "approved" paths — a module runs if signature-authenticated **or** pinned. This keeps
+  the private-signing-key custody problem light (HSM optional; the hash path needs no signing key at all).
+- **CLI default = deny unsigned — BUILT.** When verification is **armed** — a root key is embedded
+  (`-Droot-key`) **or** a pin DB is present — the wazmrt CLI **denies** a module that is neither
+  signature-authenticated nor pinned. A **bare** build (no key, no DB) stays permissive (nothing to verify
+  against), so dev/tests/`wasi-gate` are unaffected. Implemented in `pin.decide(explicit, pinned, opt_out,
+  tty, armed)` + `verifyGate`.
+- **User may override; root enforce is absolute.** The armed default-deny is overridable by `--no-verify`
+  (the user owns their machine — the ownership principle), *but* a root-owned pin DB with `# mode: enforce`
+  denies **absolutely** (opt-out ignored). Signature-authenticated modules always run.
+- **Embedder path (wasmtk / rsxtk / C-ABI FFI) = run.** The gate lives only in the CLI (`verifyGate`); the
+  C-ABI instantiate/run path has **no gate**, which is the intended default for embedders — they drive the
+  runtime and expect to run what they load. (An embedder that wants verification can call `sign.verify` /
+  the pin API itself.)
+- Fixed in passing: **`wazmrt pin` now assembles a `.wat` before hashing**, so a pinned `.wat` matches the
+  *binary* the gate hashes at run time (previously it hashed the source text → never matched).
+
+**Still open** (does NOT block the above):
+
+- Private-key custody hardening for a real publisher (HSM/YubiKey/KMS — the local `.key` file is the MVP;
+  the design never wanted a private key on a *user's* machine, only the publisher's).
 
 **Resolved with data 2026-07-16:** ~~cold-start cost of hashing on every run~~ — **measured, negligible**
 (SHA-256 0.5% of instantiate, Ed25519 2.4%, both <0.15% of the process-startup floor). See the pin

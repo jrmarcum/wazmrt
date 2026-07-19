@@ -138,9 +138,17 @@ Before running, wazmrt hashes the exact in-memory bytes it is about to execute
 (so the verified bytes *are* the executed bytes — no swap-after-check race) and
 looks them up. `--pins <path>` overrides the DB location; `--verify <mode>` can
 only *raise* strictness; `--no-verify` skips the check **but is refused under an
-`enforce` policy** — a user argument can never weaken a root-owned policy. The
-default is `off`, so verification is opt-in until a DB with a stricter `# mode:`
-is installed.
+`enforce` policy** — a user argument can never weaken a root-owned policy.
+
+**Deny-by-default when armed.** Once verification is *armed* — a root key is
+embedded (see below) **or** a pin DB is present — the CLI **refuses** a module
+that is neither signature-verified nor pinned. A plain build with no key and no
+DB stays permissive (nothing to verify against), so development is unaffected.
+You can override an armed default-deny with `--no-verify` on your own machine,
+but a root-owned `# mode: enforce` is absolute. Verification is **CLI-only**:
+running a module through an embedder (wasmtk / rsxtk / the C-ABI over FFI) has no
+gate — the embedder decides — which is the expected behavior for those. (`wazmrt
+pin` assembles a `.wat` first, so a pinned `.wat` matches the binary that runs.)
 
 **Signature verification.** A build can embed a trusted **Ed25519 root public
 key**; wazmrt then authenticates a module carrying a `"signature"` custom section
