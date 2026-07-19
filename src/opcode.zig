@@ -578,7 +578,10 @@ pub fn immediateKind(op: Op) ImmKind {
 /// non-negative values are a type index.
 fn readBlockType(r: *Reader) DecodeError!BlockType {
     const v = try r.readVarI64();
-    if (v >= 0) return .{ .type_index = @intCast(v) };
+    if (v >= 0) {
+        if (v > std.math.maxInt(u32)) return error.UnsupportedOpcode; // guard the @intCast
+        return .{ .type_index = @intCast(v) };
+    }
     return switch (v) {
         -64 => .empty,
         -1 => .{ .value = .i32 },
@@ -714,7 +717,10 @@ fn readTryTable(r: *Reader, a: std.mem.Allocator) (DecodeError || std.mem.Alloca
 /// type index; negative values are the abstract heap-type codes.
 pub fn readHeapType(r: *Reader) DecodeError!HeapType {
     const v = try r.readVarI64(); // s33
-    if (v >= 0) return .{ .concrete = @intCast(v) };
+    if (v >= 0) {
+        if (v > std.math.maxInt(u32)) return error.UnsupportedOpcode; // guard the @intCast
+        return .{ .concrete = @intCast(v) };
+    }
     return switch (v) {
         -0x10 => .func,
         -0x11 => .extern_,
@@ -929,6 +935,13 @@ test "decodes a br_table" {
     try std.testing.expectEqual(@as(usize, 1), instrs.len);
     try std.testing.expectEqualSlices(u32, &.{ 0, 1 }, instrs[0].imm.br_table.labels);
     try std.testing.expectEqual(@as(u32, 2), instrs[0].imm.br_table.default);
+}
+
+test "rejects a block type index that overflows u32 (s33 @intCast guard)" {
+    // `block` (0x02) with a type-index s33 encoding 2^32 (> u32 max) — must be
+    // rejected before the @intCast, not panic.
+    const body = [_]u8{ 0x02, 0x80, 0x80, 0x80, 0x80, 0x10 };
+    try std.testing.expectError(error.UnsupportedOpcode, decodeBody(std.testing.allocator, &body));
 }
 
 test "#6: select_t rejects an invalid value-type byte at decode" {

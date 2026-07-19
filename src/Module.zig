@@ -556,6 +556,7 @@ fn readValType(r: *Reader, kinds: []const CompKind) Error!types.ValType {
 fn readHeapTypeRef(r: *Reader, nullable: bool, kinds: []const CompKind) Error!types.ValType {
     const ht = try r.readVarI64(); // s33
     if (ht >= 0) {
+        if (ht > std.math.maxInt(u32)) return error.IndexOutOfRange; // guard the @intCast (s33 can hold up to 2^63)
         const ti: u32 = @intCast(ht);
         if (ti >= kinds.len) return error.IndexOutOfRange;
         const head: types.ValType.RefHeap = switch (kinds[ti]) {
@@ -693,7 +694,14 @@ fn decodeSubType(d: *Decoder, r: *Reader, comp: *std.ArrayList(CompType), supers
         _ = try r.readByte();
         const ns = try r.readVarU32();
         if (ns > 1) return error.BadType; // MVP allows at most one supertype
-        if (ns == 1) super = try r.readVarU32();
+        if (ns == 1) {
+            super = try r.readVarU32();
+            // A supertype must be a PRIOR type (a lower index than this one,
+            // whose index is `comp.items.len` — it hasn't been appended yet). This
+            // makes the supertype chain strictly decreasing, so `isSubtype`'s walk
+            // can't loop forever on a self- or forward-referential supertype.
+            if (super.? >= comp.items.len) return error.BadType;
+        }
     }
     try comp.append(d.a, try decodeCompType(d, r));
     try supers.append(d.a, super);
@@ -1063,6 +1071,13 @@ test "rejects a reserved global-mutability byte" {
     const bytes = types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
         [_]u8{ 0x06, 0x04, 0x01, 0x7f, 0x02, 0x0b };
     try std.testing.expectError(error.MalformedFlag, Module.decode(std.testing.allocator, &bytes));
+}
+
+test "rejects a self-referential supertype (would otherwise hang isSubtype)" {
+    // type section: one type = sub (0x50) with supertype [0] (itself), func [] -> [].
+    const bytes = types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+        [_]u8{ 0x01, 0x07, 0x01, 0x50, 0x01, 0x00, 0x60, 0x00, 0x00 };
+    try std.testing.expectError(error.BadType, Module.decode(std.testing.allocator, &bytes));
 }
 
 test "decodes and resolves type/import/function/export sections" {
