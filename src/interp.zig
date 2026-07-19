@@ -125,6 +125,18 @@ pub const Error = Module.Error || error{
     IndirectTypeMismatch,
     /// A type index out of range.
     UndefinedType,
+    /// A local index out of range (rejected by the load-time index check).
+    UndefinedLocal,
+    /// An element-segment index out of range.
+    UndefinedElement,
+    /// A data-segment index out of range.
+    UndefinedData,
+    /// A branch label depth beyond the enclosing label stack (`br`/`br_if`/
+    /// `br_table`/`br_on_*`/`rethrow` from an unvalidated module).
+    UndefinedLabel,
+    /// Fewer operands on the value stack than an op consumes — only reachable
+    /// from an unvalidated module (`struct.new`/`array.new_fixed`/`throw`).
+    StackUnderflow,
     /// A GC struct field / array element access outside the object's bounds
     /// (`array.get`/`.set` past the length, or a field index beyond a collapsed
     /// object's fields). Traps.
@@ -359,10 +371,76 @@ pub const Instance = struct {
         return initWithImports(gpa, module, .{});
     }
 
+    /// Reject a function body whose static index immediates are out of range,
+    /// ONCE at instantiation, so the hot interpreter loop can index locals /
+    /// globals / tables / segments / GC-type tables without per-op checks. The
+    /// counts checked here (`module.globals`/`tables`/`memories` are full index
+    /// spaces; `funcType`/`funcSig`/`structFields`/`arrayField`/`tagType` handle
+    /// their spaces) are exactly what the interpreter trusts at run time. Memory
+    /// indices (guarded by `memBytes`), `call`/`call_ref` (guarded by
+    /// `funcType`), branch depths, and dynamic ref-values are checked elsewhere.
+    fn checkStaticIndices(module: *const Module, num_locals: usize, ir: []const opcode.Instr) Error!void {
+        for (ir) |instr| {
+            // A GC type index's required KIND depends on the op, so switch on it.
+            switch (instr.op) {
+                .struct_new, .struct_new_default => if (module.structFields(instr.imm.gc_type) == null) return error.UndefinedType,
+                .array_new, .array_new_default, .array_get, .array_get_s, .array_get_u, .array_set => if (module.arrayField(instr.imm.gc_type) == null) return error.UndefinedType,
+                // `array_len` (imm = .none) and `array_new_fixed` (imm = .gc_type_n, checked below) carry no `.gc_type` — do not read it here.
+                else => {},
+            }
+            switch (instr.imm) {
+                .local => |x| if (x >= num_locals) return error.UndefinedLocal,
+                .global => |x| if (x >= module.globals.len) return error.UndefinedGlobal,
+                .table => |x| if (x >= module.tables.len) return error.NoTable,
+                .elem => |x| if (x >= module.elements.len) return error.UndefinedElement,
+                .data => |x| if (x >= module.data.len) return error.UndefinedData,
+                .table_init => |x| {
+                    if (x.table >= module.tables.len) return error.NoTable;
+                    if (x.elem >= module.elements.len) return error.UndefinedElement;
+                },
+                .table_copy => |x| if (x.dst >= module.tables.len or x.src >= module.tables.len) return error.NoTable,
+                .call_indirect => |x| {
+                    if (x.table >= module.tables.len) return error.NoTable;
+                    if (module.funcSig(x.type_index) == null) return error.UndefinedType;
+                },
+                .mem_init => |x| if (x.data >= module.data.len) return error.UndefinedData, // the memory index is checked by memBytes
+                .gc_field => |x| {
+                    const fs = module.structFields(x.type_index) orelse return error.UndefinedType;
+                    if (x.field >= fs.len) return error.GcOutOfBounds; // #GC3: bound field vs the STATIC type, not the object
+                },
+                .gc_type_n => |x| if (module.arrayField(x.type_index) == null) return error.UndefinedType,
+                .tag => |x| if (module.tagType(x) == null) return error.UndefinedType,
+                .block_type => |x| switch (x) {
+                    .type_index => |ti| if (module.funcSig(ti) == null) return error.UndefinedType,
+                    else => {},
+                },
+                else => {},
+            }
+        }
+    }
+
     pub fn initWithImports(gpa: std.mem.Allocator, module: *const Module, imports: Imports) Error!Instance {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const a = arena.allocator();
+
+        // A v128 can reach a `drop`/`select` from outside a function's own body:
+        // a `global.get` of a v128 global, or a `call` whose signature returns
+        // v128. Detect those module-wide so the per-function gate below never
+        // misses a v128 and mis-sizes drop/select (a stack-desync hazard).
+        var module_has_v128 = false;
+        for (module.globals) |g| if (g.content == .v128) {
+            module_has_v128 = true;
+            break;
+        };
+        if (!module_has_v128) for (0..module.comp_types.len) |ti| {
+            const fs = module.funcSig(@intCast(ti)) orelse continue;
+            for (fs.results) |r| if (r == .v128) {
+                module_has_v128 = true;
+                break;
+            };
+            if (module_has_v128) break;
+        };
 
         const bodies = try a.alloc(FuncBody, module.functions.len);
         for (module.functions, module.code, bodies) |type_index, code, *body| {
@@ -371,13 +449,20 @@ pub const Instance = struct {
             for (code.locals) |l| local_count += l.count;
 
             const ir = try opcode.decodeBody(a, code.body);
+            // The CLI run path does not type-check the module, so guard every
+            // static index immediate ONCE here (zero per-execution cost) — the
+            // interpreter then trusts them in the hot loop. Dynamic ref-values
+            // (GC heap refs, exnrefs) and branch depths are bounds-checked at
+            // their (cold) use sites instead.
+            try checkStaticIndices(module, local_count, ir);
             const cf = try precomputeControlFlow(a, ir);
 
             // v128 `drop`/`select` pop two slots, not one. A function can only
-            // hold a v128 if it has a SIMD op or a v128 param/local, so only then
-            // do we run the (validator-backed) width annotation — the common path
-            // pays nothing and every drop/select is width 1.
-            var has_v128 = false;
+            // hold a v128 if a v128 global/call-result exists in the module, or
+            // it has a SIMD op or a v128 param/local — only then do we run the
+            // (validator-backed) width annotation; the common path pays nothing
+            // and every drop/select is width 1.
+            var has_v128 = module_has_v128;
             for (ft.params) |p| if (p == .v128) {
                 has_v128 = true;
             };
@@ -725,7 +810,12 @@ pub const Instance = struct {
     /// The field/element slice of a non-null GC reference, or a trap on null.
     fn gcObject(self: *Instance, ref: Value) Error![]Value {
         if (ref == null_ref) return error.NullReference;
-        return self.gc_heap.items[@intCast(ref)].fields;
+        // `ref` is a raw stack value on the unvalidated run path — it may be any
+        // integer (or a tagged i31). Bounds-check before indexing the heap, else
+        // `struct.set`/`array.set` is an arbitrary-write primitive.
+        const idx = std.math.cast(usize, ref) orelse return error.GcOutOfBounds;
+        if (idx >= self.gc_heap.items.len) return error.GcOutOfBounds;
+        return self.gc_heap.items[idx].fields;
     }
 
     /// Does GC reference value `v` match target reference type `rt`
@@ -925,7 +1015,11 @@ const Frame = struct {
         return asF64(self.pop());
     }
 
-    fn branch(self: *Frame, n: u32) usize {
+    fn branch(self: *Frame, n: u32) Error!usize {
+        // Label depth is control-flow-relative (not a static count), so it is
+        // bounds-checked here rather than at load time. `len - 1 - n` underflows
+        // when `n >= len`; the frame always has ≥1 label (the function itself).
+        if (n >= self.labels.items.len) return error.UndefinedLabel;
         const label = self.labels.items[self.labels.items.len - 1 - n];
         const from = self.vstack.items.len - label.arity;
         std.mem.copyForwards(Value, self.vstack.items[label.stack_base..][0..label.arity], self.vstack.items[from..][0..label.arity]);
@@ -974,7 +1068,7 @@ const Frame = struct {
                 // The clause's label index is relative to the try_table (label 0 =
                 // the try_table block); the try_table sits `d` deep, so branch to
                 // `d + c.label`.
-                return self.branch(@intCast(d + c.label));
+                return try self.branch(@intCast(d + c.label));
             }
             // Legacy `try`: a matching inline handler runs INSIDE the try (the try
             // label stays on the stack for `rethrow`/`br`).
@@ -1108,7 +1202,7 @@ const Frame = struct {
                     const sf = self.inst.module.structFields(instr.imm.gc_type).?;
                     for (sf) |f| if (fieldIsV128(f.storage)) return error.UnsupportedInstruction;
                     const obj = try self.inst.arena.allocator().alloc(Value, sf.len);
-                    const base = self.vstack.items.len - sf.len;
+                    const base = std.math.sub(usize, self.vstack.items.len, sf.len) catch return error.StackUnderflow;
                     for (sf, 0..) |f, k| obj[k] = packField(f.storage, self.vstack.items[base + k]);
                     self.vstack.shrinkRetainingCapacity(base);
                     try self.pushU64(try self.inst.allocObject(instr.imm.gc_type, obj));
@@ -1167,7 +1261,7 @@ const Frame = struct {
                     const f = self.inst.module.arrayField(tn.type_index).?;
                     if (fieldIsV128(f.storage)) return error.UnsupportedInstruction;
                     const obj = try self.inst.arena.allocator().alloc(Value, tn.n);
-                    const base = self.vstack.items.len - tn.n;
+                    const base = std.math.sub(usize, self.vstack.items.len, tn.n) catch return error.StackUnderflow;
                     for (0..tn.n) |k| obj[k] = packField(f.storage, self.vstack.items[base + k]);
                     self.vstack.shrinkRetainingCapacity(base);
                     try self.pushU64(try self.inst.allocObject(tn.type_index, obj));
@@ -1212,11 +1306,11 @@ const Frame = struct {
                 .br_on_cast => {
                     // The ref stays on the stack in both paths; branch iff it casts.
                     const v = self.vstack.items[self.vstack.items.len - 1];
-                    pc = if (self.inst.refMatches(v, instr.imm.br_cast.dst)) self.branch(instr.imm.br_cast.label) else pc + 1;
+                    pc = if (self.inst.refMatches(v, instr.imm.br_cast.dst)) try self.branch(instr.imm.br_cast.label) else pc + 1;
                 },
                 .br_on_cast_fail => {
                     const v = self.vstack.items[self.vstack.items.len - 1];
-                    pc = if (!self.inst.refMatches(v, instr.imm.br_cast.dst)) self.branch(instr.imm.br_cast.label) else pc + 1;
+                    pc = if (!self.inst.refMatches(v, instr.imm.br_cast.dst)) try self.branch(instr.imm.br_cast.label) else pc + 1;
                 },
 
                 // --- Structured control flow ---
@@ -1262,8 +1356,8 @@ const Frame = struct {
                 },
                 .throw => {
                     const tag = instr.imm.tag;
-                    const ft = self.inst.module.tagType(tag).?; // validated
-                    const base = self.vstack.items.len - ft.params.len;
+                    const ft = self.inst.module.tagType(tag).?; // load-time checked (checkStaticIndices)
+                    const base = std.math.sub(usize, self.vstack.items.len, ft.params.len) catch return error.StackUnderflow;
                     const exn: Exception = .{ .tag = tag, .values = try self.a.dupe(Value, self.vstack.items[base..]) };
                     self.vstack.shrinkRetainingCapacity(base);
                     if (try self.throwException(exn)) |target| {
@@ -1276,7 +1370,9 @@ const Frame = struct {
                 .throw_ref => {
                     const r = self.pop();
                     if (r == null_ref) return error.NullReference;
-                    const exn = self.inst.exn_store.items[@intCast(r)];
+                    const ei = std.math.cast(usize, r) orelse return error.NullReference;
+                    if (ei >= self.inst.exn_store.items.len) return error.NullReference; // exnref out of range (unvalidated module)
+                    const exn = self.inst.exn_store.items[ei];
                     if (try self.throwException(exn)) |target| {
                         pc = target;
                     } else {
@@ -1309,6 +1405,7 @@ const Frame = struct {
                     // Re-raise the exception caught by the try `label` levels out,
                     // propagating from OUTSIDE that try (it already had its turn).
                     const n = instr.imm.label;
+                    if (n >= self.labels.items.len) return error.UndefinedLabel; // unvalidated module
                     const tgt = self.labels.items[self.labels.items.len - 1 - n];
                     const exn = tgt.caught orelse return error.UncaughtException;
                     self.labels.shrinkRetainingCapacity(self.labels.items.len - 1 - n);
@@ -1320,15 +1417,15 @@ const Frame = struct {
                         return error.UncaughtException;
                     }
                 },
-                .br => pc = self.branch(instr.imm.label),
+                .br => pc = try self.branch(instr.imm.label),
                 .br_if => {
-                    if (self.popI32() != 0) pc = self.branch(instr.imm.label) else pc += 1;
+                    if (self.popI32() != 0) pc = try self.branch(instr.imm.label) else pc += 1;
                 },
                 .br_table => {
                     const i = self.popI32();
                     const t = instr.imm.br_table;
                     const idx: u32 = if (i >= 0 and @as(usize, @intCast(i)) < t.labels.len) t.labels[@intCast(i)] else t.default;
-                    pc = self.branch(idx);
+                    pc = try self.branch(idx);
                 },
                 .@"return" => pc = ir.len,
 
@@ -1394,7 +1491,7 @@ const Frame = struct {
                 .br_on_null => {
                     const r = self.pop();
                     if (r == null_ref) {
-                        pc = self.branch(instr.imm.label); // null → branch (ref dropped)
+                        pc = try self.branch(instr.imm.label); // null → branch (ref dropped)
                     } else {
                         try self.pushU64(r); // non-null → keep the ref, fall through
                         pc += 1;
@@ -1404,7 +1501,7 @@ const Frame = struct {
                     const r = self.pop();
                     if (r != null_ref) {
                         try self.pushU64(r); // non-null → keep the ref for the label
-                        pc = self.branch(instr.imm.label);
+                        pc = try self.branch(instr.imm.label);
                     } else {
                         pc += 1; // null → ref consumed, fall through
                     }
@@ -3825,4 +3922,75 @@ test "SIMD: a v128 global initializes, gets, and extracts a lane" {
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
     try std.testing.expectEqual(@as(i32, 9), asI32(r[0]));
+}
+
+// --- Run-path memory-safety hardening: an unvalidated (malicious) module must
+// trap, never index out of bounds. The CLI run path does not validate, so these
+// modules decode cleanly and are rejected by the interpreter's own guards
+// (`checkStaticIndices` at load time; bounds checks at cold GC/EH/branch sites).
+
+test "hardening: local.get past the local count is rejected at load time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (func (result i32) (local.get 9))  — the function declares no locals.
+    const fbody = [_]u8{ 0x00, 0x20, 0x09, 0x0b };
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x01, 0x7f } },
+        .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{&fbody}) },
+    });
+    try std.testing.expectError(error.UndefinedLocal, instantiate(bytes));
+}
+
+test "hardening: global.get of a nonexistent global is rejected at load time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (func (result i32) (global.get 3))  — the module declares no globals.
+    const fbody = [_]u8{ 0x00, 0x23, 0x03, 0x0b };
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x01, 0x7f } },
+        .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{&fbody}) },
+    });
+    try std.testing.expectError(error.UndefinedGlobal, instantiate(bytes));
+}
+
+test "hardening: a branch past the label stack traps instead of underflowing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (func (result i32) (br 5))  — only the function label exists (depth 1).
+    // Branch depth is control-flow-relative, so it is checked at run time.
+    const fbody = [_]u8{ 0x00, 0x0c, 0x05, 0x0b };
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x01, 0x7f } },
+        .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+        .{ .id = 7, .body = &.{ 0x01, 0x04, 't', 'r', 'a', 'p', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{&fbody}) },
+    });
+    var inst = try instantiate(bytes);
+    defer destroy(&inst);
+    try std.testing.expectError(error.UndefinedLabel, inst.invoke("trap", &.{}));
+}
+
+test "hardening: struct.set through a bogus (i31) ref traps, not an arbitrary write" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // type 0: (struct (field (mut i32))) ; type 1: (func) for the export.
+    // (func (struct.set 0 0 (ref.i31 (i32.const 5)) (i32.const 42)))
+    // The i31 ref is not a heap object; gcObject must reject the index rather
+    // than treat 5 as a heap slot and write field 0 (an arbitrary-write hole).
+    const fbody = [_]u8{ 0x00, 0x41, 0x05, 0xfb, 0x1c, 0x41, 0x2a, 0xfb, 0x05, 0x00, 0x00, 0x0b };
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x02, 0x5f, 0x01, 0x7f, 0x01, 0x60, 0x00, 0x00 } },
+        .{ .id = 3, .body = &.{ 0x01, 0x01 } },
+        .{ .id = 7, .body = &.{ 0x01, 0x04, 't', 'r', 'a', 'p', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{&fbody}) },
+    });
+    var inst = try instantiate(bytes);
+    defer destroy(&inst);
+    try std.testing.expectError(error.GcOutOfBounds, inst.invoke("trap", &.{}));
 }

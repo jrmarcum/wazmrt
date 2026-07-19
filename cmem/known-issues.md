@@ -30,6 +30,45 @@ runtime flag can weaken it. When the default DB does **not** enforce (dev/unmana
 + legit-pinned runs; root-enforce + `--pins attacker.pins` → **denied** (flag ignored); `--no-verify` still
 refused; root-`warn` + `--pins` still honored; bare build still runs everything.
 
+**Run-path memory-safety hardening — DONE 2026-07-19** (second "look for code issues" pass)
+
+Reaffirms the standing goal: *"maintaining memory safety is a massive project goal"* / *"never introduce
+exploitable holes."* The CLI **run path** (`runFunction`/`runWasi`) does **not** validate the module before
+executing — only the inspect path does. So the interpreter trusted immediates and stack values a malicious
+module controls. Owner chose **"harden the interpreter"** (vs. validate-before-run). Fixes, all in
+`src/interp.zig`:
+
+- **`checkStaticIndices`** — a load-time pass run once per function body in `initWithImports` (zero
+  per-execution cost). Bounds-checks every *static* index immediate against its module index space:
+  local, global, table, elem, data, `table.init`/`table.copy`, `call_indirect` (table + type),
+  `memory.init` data, struct/array `gc_type` (with struct-vs-array kind), `gc_field` (type **and** field
+  index — the field is bounded vs the STATIC type), `gc_type_n`, `tag`, and `block_type` type index.
+  Rejects with `UndefinedLocal`/`UndefinedGlobal`/`NoTable`/`UndefinedElement`/`UndefinedData`/
+  `UndefinedType`/`GcOutOfBounds` before the hot loop ever runs. *Gotcha fixed during dev:* `array.len`
+  carries `imm = .none` (not `.gc_type`) — reading `.gc_type` for it was a wrong-union panic; excluded.
+- **`gcObject`** (the critical one) — bounds-checks the *dynamic* GC ref before indexing `gc_heap`. Was an
+  **arbitrary-write primitive** via `struct.set`/`array.set` with a bogus/i31 ref → `GcOutOfBounds`.
+- **`throw_ref`** — bounds-checks the exnref against `exn_store` before indexing.
+- **`branch`** (now `Error!usize`) + **`rethrow`** — bounds-check the label depth (`n < labels.len`)
+  before indexing the label stack; label depth is control-flow-relative so it can't be a static count →
+  checked at its cold use site. Traps `UndefinedLabel`. Covers `br`/`br_if`/`br_table`/`br_on_*`/
+  try_table catch-branch and legacy `rethrow`.
+- **Stack-underflow bases** (`struct.new`/`array.new_fixed`/`throw`) — `len - N` used `std.math.sub` so a
+  too-short stack traps `StackUnderflow` instead of a *wild* OOB read. (Plain `pop()` remains
+  `pop().?` — panics-clean on empty, the interp's accepted stack-*height* baseline; these three were worse
+  because the wild base reads far away.)
+- **Core#6 `has_v128` gate** — the drop/select 2-slot width annotation was gated only on this function's
+  params/locals/simd-ops, missing a v128 arriving via `global.get` of a v128 global or a call **returning**
+  v128 → drop/select mis-sized on a *valid* module (stack desync). Now OR'd with a module-level
+  `module_has_v128` (any v128 global or any signature with v128 in results).
+
+All guards are cross-target-safe (`std.math.cast`, not `u64 >= usize`) so the freestanding wasm32 build
+still compiles. 4 regression tests in `interp.zig` (`test "hardening: …"`) prove each malicious module
+**traps** (not OOB): `local.get`/`global.get` OOB rejected at load; `br 5` traps at run; `struct.set` via
+an i31 ref → `GcOutOfBounds`. Verified in **ReleaseFast** (shipped mode) via CLI: `add.wasm` runs (30);
+`local.get 9` module → `error: instantiate: UndefinedLocal` (clean, no crash). WASI gate untouched
+(`main.zig` unchanged; the pin/verify path is orthogonal to execution).
+
 **Low-priority notes (safe today):**
 - `wasi.zig Wasi.init` — `w.fds.appendSlice(...) catch {}` swallows OOM registering the 3 stdio fds (init
   then reports success with no stdio). Near-impossible; propagate for cleanliness someday.

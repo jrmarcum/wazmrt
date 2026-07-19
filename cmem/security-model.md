@@ -69,6 +69,19 @@ conditional on granted capabilities (zero for a bare function ⇒ no sandbox nee
 unconditional.** (Caveat: an **embedder** via the C-ABI/FFI chooses its own imports — if it grants file
 access it must sandbox that itself; the embedder run path is intentionally ungated for both properties.)
 
+### The run path is ungated for *authority/validation* but not *memory safety* (2026-07-19)
+
+The CLI run path (`runFunction`/`runWasi`) does **not** type-validate the module before executing — only
+the inspect path does. "Not validated" must never mean "memory-unsafe": a malicious/malformed module runs
+untrusted immediates and stack values, and the interpreter must **trap, never corrupt memory** (the project
+ships ReleaseFast/ReleaseSmall, so an unchecked OOB is real UB). So the interpreter self-defends:
+`checkStaticIndices` bounds-checks every static index immediate once at load time, and cold GC/EH/branch
+sites bounds-check the dynamic values they consume (`gcObject`, `throw_ref`, `branch`/`rethrow` label
+depth, `struct.new`/`array.new_fixed`/`throw` stack bases). A bogus GC ref into `struct.set` was an
+**arbitrary-write primitive** before this — now `GcOutOfBounds`. See known-issues "Run-path memory-safety
+hardening — DONE 2026-07-19". (The *validator* is still the right tool for spec-conformance/UX; hardening
+is the floor that guarantees safety even when it is bypassed.)
+
 ## What holds today (shipped, verified)
 
 - **A guest cannot execute anything.** Verified against the full WASI preview-1 surface (45 functions):
