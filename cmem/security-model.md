@@ -2,14 +2,15 @@
 
 > ## ⚠️ STATUS: AUTHENTICITY is now BUILT (verify side); the SANDBOX was already BUILT
 >
-> **Both authenticity mechanisms now exist** (updated 2026-07-18): **pin verification** (Phase 5 —
-> `src/pin.zig`, root-owned SHA-256 allow-list) and **Ed25519 signature verification** (`src/sign.zig` —
-> a `"signature"` custom section verified against an embedded root key). Both are wired into the CLI
-> `verifyGate` and both are **default-OFF** (no pin DB / `embedded_root_key == null` ⇒ wazmrt still runs
-> any `.wasm`, byte-identical to before) until an operator turns them on. So the runtime *can* verify;
-> it just doesn't by default yet. The **"Keystore"** section and the **"DECIDED — rejected mechanisms"**
-> block remain design/rationale for the still-unbuilt **publisher/rotation** side (signing CLI, keyring,
-> key custody) — not yet a description of shipped code.
+> **The authenticity path is now BUILT** (updated 2026-07-18): **pin verification** (Phase 5 —
+> `src/pin.zig`, root-owned SHA-256 allow-list) and **Ed25519 signatures** — verify (`src/sign.zig`),
+> publisher CLI (`wazmrt keygen`/`sign`), and build-time trust anchor (`-Droot-key=<hex>`). The CLI
+> **denies unsigned modules by default when *armed*** (a root key is embedded **or** a pin DB is present);
+> a **bare** build (no key, no DB) still runs any `.wasm` (byte-identical to before). `--no-verify`
+> overrides on the user's own machine, but a root `# mode: enforce` is absolute. Verification is
+> **CLI-only** — the C-ABI/embedder run path is intentionally ungated. **Still design (not built):** the
+> companion **keystore** project (`wasm-keys.json` — decided, see below) and its wazmrt-side reader; and
+> optional HSM key custody. **No key rotation** (rejected).
 >
 > **The authority/sandbox side was already built:** everything in "What holds today" (no exec, preopens,
 > rights) and the "DONE — WASI symlink traversal" section (`walkFull`, `path_symlink`/`path_readlink`,
@@ -429,16 +430,16 @@ the deliverable that prevents that.
 **Settled, do not re-litigate** (reasoning in "DECIDED" above): pin mechanism (verified-install,
 root-owned) · no encryption · no machine-binding.
 
-**SCHEDULED TO BUILD NEXT (owner, 2026-07-17): the pin path.** The pin half of the design — install-time
-root-owned plaintext pin DB + pre-run SHA-256 check, read-once so the verified bytes *are* the run bytes
-(TOCTOU-safe) — is fully decided and needs none of the open signature decisions below. It is **Phase 5**
-in `roadmap.md` (plan there). Enforcement ships behind an explicit knob, default OFF, until "default
-policy" below is settled.
+**BUILT (Phase 5, 2026-07-17): the pin path.** Install-time root-owned plaintext pin DB + pre-run SHA-256
+check, read-once so the verified bytes *are* the run bytes (TOCTOU-safe). The "default policy" question it
+originally deferred is now settled — deny-unsigned when armed (see above).
 
 **RESOLVED 2026-07-18 (owner) — and the verify mechanism is BUILT (`src/sign.zig`):**
 
-- Trust anchor: **embedded-in-binary root key** (`sign.embedded_root_key: ?[32]u8`). Rotation/keyring is
-  a clean later layer (embedded root signs a keyring file — Secure Boot's PK→KEK→db), deferred.
+- Trust anchor: **embedded-in-binary root key**, set at build time via **`-Droot-key=<hex>`**
+  (`sign.rootKeyFromHex`; empty ⇒ inert). Plus the **ownership-trusted `wasm-keys.json`** keys DB (see
+  above) that augments it. **No rotation** — the signed-keyring / PK→KEK→db idea is **rejected**, not
+  deferred.
 - Signature format: **roll our own minimal** — an Ed25519 signature over the canonical bytes, in a
   `"signature"` custom section (`magic ++ algo ++ pubkey ++ sig`). Chosen after confirming the prior-art
   `wasmsign2` format is **not** a Bytecode Alliance item: it's an individual's PoC under the independent
@@ -450,9 +451,9 @@ policy" below is settled.
 Ed25519 over every byte except the signature section, no alloc); `signModule` (library signing helper);
 the CLI `verifyGate` runs the signature check **before** the pin fallback — a module signed by the trusted
 root is authenticated and needs no pin; a module signed *by our key* whose bytes don't match is refused
-**always** (even default-off); unsigned/foreign fall through to the pin path. **Inert until a build embeds
-a root key** (`embedded_root_key == null` by default → byte-identical to the pin-only path), matching the
-Phase 5 "ship behind a default-OFF knob" precedent.
+**always**; unsigned/foreign fall through to the pin path. **Inert until a build embeds a root key** (no
+`-Droot-key` ⇒ `sign.rootKeyFromHex("")` = null ⇒ byte-identical to the pin-only path). When armed, the
+unsigned case is denied by default (see "default policy" above).
 
 **Publisher signing CLI — BUILT 2026-07-18 (`src/main.zig`):**
 
@@ -545,7 +546,10 @@ its key is in the trusted set **and** the Ed25519 signature verifies. Extends to
 **Resolved with data 2026-07-16:** ~~cold-start cost of hashing on every run~~ — **measured, negligible**
 (SHA-256 0.5% of instantiate, Ed25519 2.4%, both <0.15% of the process-startup floor). See the pin
 section above and `testing.md`.
-- Default policy: deny-unsigned out of the box, or opt-in?
-- Scope: is the keyring genuinely a separate project (owner's lean), and where is the boundary?
+- ~~Default policy: deny-unsigned out of the box, or opt-in?~~ — **RESOLVED 2026-07-18: deny-unsigned when
+  *armed* (key embedded or pin DB present); bare build permissive. See "default policy" above.**
+- ~~Scope: is the keyring genuinely a separate project?~~ — **RESOLVED 2026-07-18: yes — a companion
+  keystore project writes `wasm-keys.json`; boundary + schema in "the trusted-keys database" above.**
 - ~~Does `--ro-dir` jump the queue ahead of the rest of 4.3?~~ — **resolved: built in 4.4 (2026-07-17).**
-- Revocation/rotation story — the boring part everyone skips.
+- ~~Revocation/rotation story~~ — **RESOLVED 2026-07-18: NO rotation (owner rejected it). One embedded
+  key + an ownership-trusted static keys DB; rebuild to change the anchor.**

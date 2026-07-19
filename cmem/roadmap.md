@@ -320,7 +320,7 @@ final-component `path_open` TOCTOU tied to std bug #18. See #17.
 > warn+`--no-verify` runs; enforce+`--no-verify` STILL refuses; corrupt DB fails closed).
 >
 > ✅ **Signature VERIFY mechanism BUILT (2026-07-18, `src/sign.zig`).** Owner decisions locked: trust
-> anchor = **embedded root key** (`sign.embedded_root_key`), format = **roll-our-own minimal** Ed25519
+> anchor = **embedded root key** (`-Droot-key` → `sign.rootKeyFromHex`), format = **roll-our-own minimal** Ed25519
 > over a `"signature"` custom section (governance-checked: wasmsign2 is an individual PoC / WASM-CG
 > tool-convention, not Bytecode Alliance). `verify()` returns unsigned/authenticated/foreign/tampered via
 > **streaming Ed25519** (Zig stdlib, no third-party crypto, no alloc); the CLI gate runs the signature
