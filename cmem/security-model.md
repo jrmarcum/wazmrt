@@ -561,6 +561,48 @@ wazmrt-side work (a later wazmrt increment, not the companion project): load + o
 its key is in the trusted set **and** the Ed25519 signature verifies. Extends today's single-key
 `sign.verify`.
 
+### Package-manager verification survey (2026-07-18) — and whether we even need a keys store
+
+Researched (deep-research: 21 sources, 24 adversarially-confirmed claims) how the major package managers
+verify installed files, to decide whether wazmrt needs a separate keys store or can lean on the field's
+per-file verification.
+
+| Tool | Mechanism | Trust anchor | Granularity / addressing | Dir as opaque blob? |
+| --- | --- | --- | --- | --- |
+| **RPM/dnf** | Signature (GPG) over repo metadata `repomd.xml`; per-package SHA-256 inside it; + per-package GPG sig | GPG keyring (imported) | per-package + signed hash-index | No |
+| **pacman** | Signature (GPG) — detached `.sig` per package | `pacman-key` keyring, master-key WoT | per-package | No |
+| **Flatpak/OSTree** | Signature over the OSTree **commit** (Merkle root) | GPG / ed25519 keys | content-addressed **Merkle DAG** | No (Merkle root) |
+| **Snap** | Signature (Ed25519) — assertion chain; `snap-revision` holds SHA3-384 of the `.snap` | Canonical root/brand keys | whole squashfs artifact | Artifact, not dir |
+| **Nix** | Signature (Ed25519) over each store path's `.narinfo` | `trusted-public-keys` (Ed25519, often **one** key) | content-addressed; NAR = canonical serialization | No (canonical NAR) |
+| **Homebrew** | Checksum (SHA-256) in the Ruby formula | git/GitHub over HTTPS (**no keys store**) | per-file, flat git-tracked manifest | No |
+| **Scoop** | Checksum (SHA-256) in the JSON manifest | git/GitHub over HTTPS (**no keys store**) | per-file, flat git-tracked JSON manifest | No |
+
+**Two archetypes:** (a) **signed manifest/index of hashes** (RPM `repomd`, pacman, Snap, Homebrew, Scoop);
+(b) **content-addressed + signed root** (Nix NAR/`.narinfo`, Flatpak OSTree commit). **Universal finding:
+NONE checksum a raw directory as an opaque blob** — the whole-tree ones hash a *canonical serialization*
+or a *Merkle root*, always under a signature. The unit is per-file/per-artifact, with the *list/root*
+authenticated as a whole by a signature **or** a trusted git-over-HTTPS channel. **Bundle implication:** a
+signed manifest of per-module hashes (rpm/homebrew/scoop) **or** sign each module (nix). Our root-owned pin
+DB *is* that manifest; **directory hashing has no precedent — avoid it.** Sources: `ostreedev.github.io`,
+`nixos.org/manual/nix`, `snapcraft.io/docs`, `docs.brew.sh`, ScoopInstaller wiki, `pulpproject.org`.
+
+**Do we even need `wasm-keys.json`? Three tiers — pick by distribution model (OPEN):**
+
+1. **Pin DB only, no keys store** — depend on the package manager's per-file verification; the installer
+   records each `.wasm`'s SHA-256 into the root-owned pin DB (the Homebrew/Scoop/RPM-metadata model — those
+   have **no per-user keys store at all**). Simplest; trust = ownership + the package manager's own chain.
+2. **Pin DB + the single embedded `-Droot-key`** — per-module signatures against **one** key (this *is*
+   Nix's tiny `trusted-public-keys`, usually one key). Lets *our own* signed modules run anywhere without a
+   pin, no separate store.
+3. **`wasm-keys.json` multi-key store** — trust **multiple independent publishers'** keys, added without
+   rebuilding wazmrt.
+
+**The survey's steer:** tiers 1–2 already match what the lean field models do; the separate multi-key
+keystore (tier 3, the companion project) earns its complexity **only if wazmrt becomes a multi-publisher
+platform**. For single-publisher / package-managed distribution it is **redundant** — pins (from the
+package manager) + one embedded key cover it. **So the companion keystore project is conditional on the
+distribution model, not a given.** Pending owner decision.
+
 **Still open** (does NOT block the above):
 
 - Private-key custody hardening for a real publisher (HSM/YubiKey/KMS — the local `.key` file is the MVP;
@@ -572,8 +614,11 @@ its key is in the trusted set **and** the Ed25519 signature verifies. Extends to
 section above and `testing.md`.
 - ~~Default policy: deny-unsigned out of the box, or opt-in?~~ — **RESOLVED 2026-07-18: deny-unsigned when
   *armed* (key embedded or pin DB present); bare build permissive. See "default policy" above.**
-- ~~Scope: is the keyring genuinely a separate project?~~ — **RESOLVED 2026-07-18: yes — a companion
-  keystore project writes `wasm-keys.json`; boundary + schema in "the trusted-keys database" above.**
+- ~~Scope: is the keyring genuinely a separate project?~~ — **2026-07-18: IF built, yes — a companion
+  project writes `wasm-keys.json` (boundary + schema above). But the package-manager survey (above)
+  reopened *whether it is needed at all*: it's tier 3, warranted only for a multi-publisher platform;
+  single-publisher / package-managed distribution needs only pins + one embedded key. Conditional on the
+  distribution model — pending owner decision.**
 - ~~Does `--ro-dir` jump the queue ahead of the rest of 4.3?~~ — **resolved: built in 4.4 (2026-07-17).**
 - ~~Revocation/rotation story~~ — **RESOLVED 2026-07-18: NO rotation (owner rejected it). One embedded
   key + an ownership-trusted static keys DB; rebuild to change the anchor.**
