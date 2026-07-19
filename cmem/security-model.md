@@ -495,10 +495,52 @@ is proven through the real binary with no source edits.
 - Fixed in passing: **`wazmrt pin` now assembles a `.wat` before hashing**, so a pinned `.wat` matches the
   *binary* the gate hashes at run time (previously it hashed the source text → never matched).
 
+### DECIDED 2026-07-18 (owner) — the trusted-keys database + a companion keystore project
+
+A **companion project** (separate from wazmrt) generates Ed25519 keypairs and registers the **public**
+keys in a database that wazmrt reads as its trust anchors. Decisions locked before that project starts:
+
+- **File:** `wasm-keys.json` — **JSON** (multi-field key records fit JSON far better than the line-based
+  `pins` format; `std.json`, no new dep). Stays **plaintext** (integrity, not secrecy) and the reader must
+  **fail closed** (malformed/unparseable → trust no keys → deny when armed, never "empty ⇒ allow").
+- **Location:** `<wazmrt-dir>/security/wasm-keys.json` — a `security/` directory **next to the executable**
+  (portable; travels with the binary). Trust is anchored by an **ownership check**, not the path: wazmrt
+  trusts the file **only if it is owned by root/admin and not writable by the invoking user**; a
+  user-writable keys file is ignored (it is forgeable, so it provides zero authenticity — the same TOFU
+  reasoning that put `pins` at `/etc/wazmrt/`). This keeps "authority from ownership" while allowing a
+  portable location. (Impl note: POSIX = `stat` st_uid/perms; Windows ACL check is the harder part.)
+- **Contents:** **public keys only** — a list of trusted verification keys. wazmrt authenticates a module
+  whose `"signature"` section verifies under **any** key in the DB, so publishers can be added **without
+  rebuilding wazmrt**. It **augments** the embedded `-Droot-key` (which stays as an optional
+  always-trusted fallback / bootstrap). The existing line-based **`pins` hash DB is untouched** — pins and
+  keys are complementary "approved" paths (custody = publish-a-SHA-256-and-pin **or** sign-with-a-trusted-
+  key). **No rotation** — the DB is static and ownership-trusted, not a signed keyring.
+
+**Schema (the contract the companion tool writes and wazmrt reads):**
+
+```json
+{
+  "version": 1,
+  "keys": [
+    { "id": "acme-prod",           // short human/owner identifier (logged on verify)
+      "alg": "ed25519",            // only ed25519 today
+      "public_key": "<64 hex>",    // 32-byte Ed25519 public key, lowercase hex
+      "label": "ACME release key", // free-text description
+      "added": "2026-07-18" }      // ISO date (auditability; optional)
+  ]
+}
+```
+
+wazmrt-side work (a later wazmrt increment, not the companion project): load + ownership-check
+`wasm-keys.json`; gather trusted keys (`-Droot-key` ∪ DB); a `"signature"` section is authenticated iff
+its key is in the trusted set **and** the Ed25519 signature verifies. Extends today's single-key
+`sign.verify`.
+
 **Still open** (does NOT block the above):
 
 - Private-key custody hardening for a real publisher (HSM/YubiKey/KMS — the local `.key` file is the MVP;
   the design never wanted a private key on a *user's* machine, only the publisher's).
+- The Windows ownership/ACL check for the keys file (POSIX `stat` is straightforward; Windows is the work).
 
 **Resolved with data 2026-07-16:** ~~cold-start cost of hashing on every run~~ — **measured, negligible**
 (SHA-256 0.5% of instantiate, Ed25519 2.4%, both <0.15% of the process-startup floor). See the pin

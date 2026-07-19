@@ -343,8 +343,16 @@ final-component `path_open` TOCTOU tied to std bug #18. See #17.
 > pinned ⇒ run. The **embedder path (wasmtk/rsxtk/C-ABI FFI) has no gate** — intended default: run.
 > Custody = publish-SHA-256-and-pin (signatures and pins both count). **No key rotation** (rejected as a
 > bad option). Implemented as `pin.decide(explicit, pinned, opt_out, tty, armed)` + `verifyGate`; also
-> fixed `wazmrt pin` to assemble `.wat` before hashing. ⇢ REMAINING (optional): private-key custody
-> hardening (HSM/YubiKey/KMS). See `security-model.md`.
+> fixed `wazmrt pin` to assemble `.wat` before hashing.
+>
+> 🚧 **Trusted-keys DB DECIDED (2026-07-18, owner) — build pending.** A **companion project** (separate
+> repo) generates Ed25519 keypairs and registers **public** keys in `wasm-keys.json` (JSON, plaintext,
+> fail-closed) at `<wazmrt-dir>/security/`, trusted via an **ownership check** (root/admin-owned, not
+> user-writable — not the path). It holds **public keys only**, augments `-Droot-key`, and leaves the
+> `pins` hash DB separate; **no rotation**. Schema + rationale in `security-model.md`. ⇢ wazmrt-side work
+> (a later wazmrt increment): load + ownership-check the DB and verify a signature against **any** trusted
+> key (extends the single-key `sign.verify`; the Windows ACL check is the hard part). ⇢ Otherwise
+> optional: private-key custody hardening (HSM/YubiKey/KMS). See `security-model.md`.
 >
 > **The C ABI is NOT remaining work** — #20 (all 319 `wasm.h` fns) / #21 (mem-safety) / #22 (fuzz) are
 > DONE and 4.4 added a C conformance guest. Only two narrow, demand-driven residuals stay deferred:
