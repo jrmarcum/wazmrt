@@ -1,5 +1,22 @@
 # Roadmap
 
+## Status (2026-07-19) — feature-complete core; hardening + CLI ergonomics pass
+
+Everything through the **authenticity path** is built (see the dated sections below): decode → validate →
+execute, full text toolchain, reference types / GC / function-references, WASI preview 1 + sandbox,
+exception handling (both encodings), multi-memory, **complete SIMD**, and **Ed25519 signatures + pin
+verification** (`keygen`/`sign`/`-Droot-key`, deny-unsigned-when-armed). Since then, three **memory-safety
+hardening passes** (2026-07-19, from repeated "look for code issues" audits — full ledger in
+`known-issues.md`): (1) the CLI **run path doesn't validate before executing**, so the interpreter now
+self-defends — `checkStaticIndices` at load + cold-site bounds checks (`gcObject`/`throw_ref`/`branch`);
+(2) the **stack-HEIGHT wild-base class** — call opcodes were an unbounded `@memcpy` **write** into locals
+(CRITICAL) — closed via a `Frame.stackBase`/`peek` helper across calls/branch/block-entry/epilogue/
+`local.tee`; (3) the **WAT assembler + decoder** hardened against malformed input (shape-checked
+accessors → `BadModuleField`; `sexpr` depth cap; `Reader.readVecLen` kills OOM amplification). Owner
+decisions: **harden the interpreter** (not validate-before-run); **shape-checked accessors** for wat.zig.
+Also added CLI **`-h`/`--help`** (full option/subcommand descriptions) and **`-v`/`--version`**. 197
+distinct unit tests; native Debug/ReleaseFast + freestanding wasm32 all build.
+
 ## Status (2026-07-02) — runtime executes; text toolchain in progress
 
 The full pipeline runs end-to-end: **decode → validate → execute** (int/float/memory), verified on the

@@ -20,7 +20,7 @@ wazmrt/
 │   └── wazmrt.h           # C ABI header — the contract for universalWasmLoader-*
 ├── src/
 │   ├── root.zig           # Public library surface (pub re-exports; wasm-friendly, libc-free)
-│   ├── main.zig           # CLI: summarize a .wasm, or run mode `wazmrt <file> <export> [args…]`
+│   ├── main.zig           # CLI: summarize a .wasm, or run `wazmrt <file> <export> [args…]`; pin/keygen/sign subcommands; -h/--help + -v/--version
 │   ├── types.zig          # Format constants, SectionId, DecodeError set
 │   ├── Reader.zig         # Zero-copy cursor: bounds-checked reads + LEB128/SLEB (file-as-struct)
 │   ├── Module.zig         # Decoded module: sections + resolved imports/exports + code (file-as-struct)
@@ -62,7 +62,7 @@ The pipeline, in order: **decode → validate → execute**, with a text front-e
 ## Build targets (see architecture.md)
 
 - `zig build`      → native CLI `wazmrt` + C-ABI static lib `wazmrt` + installs `wasm.h` + `wazmrt.h`
-- `zig build test` → runs the unit tests (**181 distinct**, 352 printed as of 2026-07-18; see `testing.md`)
+- `zig build test` → runs the unit tests (**197 distinct**, 384 printed as of 2026-07-19; see `testing.md`)
 - `zig build -Droot-key=<64 hex>` → embeds the Ed25519 signature trust anchor (empty ⇒ verification inert)
 - `zig build wasi-gate` → compiles real `wasm32-wasi` guests (Zig + C via `zig cc`; Rust with `-Drust-gate=true`) and runs them through wazmrt asserting stdout
 - `zig build wasm` → builds the runtime itself as a freestanding `wasm32` module

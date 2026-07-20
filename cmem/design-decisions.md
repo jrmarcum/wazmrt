@@ -78,6 +78,28 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   (a normally-completing body/handler skips to `end` via `end_of[catch_pc]`). `rethrow N` re-raises the
   try-N caught exception from **outside** that try (pop to try-N, then unwind). Both encodings share the
   one `throwException` search and `error.UncaughtException` propagation.
+- **The run path is unvalidated, so the interpreter self-defends — HARDEN, don't validate-before-run
+  (owner, 2026-07-19).** The CLI run path (`runFunction`/`runWasi`) executes a module **without type-
+  validating it first** (only the inspect path validates). Since wazmrt ships ReleaseFast/ReleaseSmall,
+  an unchecked OOB is real UB, so the interpreter must **trap, never index out of bounds**, on any
+  malformed/malicious module. Owner chose **harden the interpreter** over running the validator on the run
+  path (which would regress legacy-EH modules the validator doesn't cover, and cost startup). Mechanism:
+  `checkStaticIndices` bounds-checks every *static* index immediate ONCE at instantiation; *dynamic* values
+  are checked at their cold use sites. **The recurring trap is the stack-HEIGHT wild-base pattern:** any
+  `vstack.items[items.len - N ..]` used as a slice/index base underflows to a wild pointer on a short
+  stack — the call opcodes made it an unbounded `@memcpy` **write** into `locals`. **Rule: never compute a
+  value-stack base as a raw `items.len - N`; go through `Frame.stackBase(n)` / `peek()`** (they trap
+  `StackUnderflow`). GC/exn refs go through `gcObject`/`throw_ref` bounds checks; branch/rethrow label
+  depth is checked in `branch`. Two audit passes (2026-07-19) closed the class; full ledger in
+  `known-issues.md` ("Run-path memory-safety hardening").
+- **The WAT assembler never derefs parser output unchecked — shape-checked accessors (owner, 2026-07-19).**
+  `sexpr.parseAll` only balances parens/strings; it does NOT validate shape, so malformed `.wat` (reached
+  before any verify gate via `wazmrt file.wat` / `sign` / `pin <dir>`) must yield `error.BadModuleField`,
+  never a raw `items[N]` OOB or a wrong-union `.?`/`.string` deref (UB in ReleaseFast). **Rule: every
+  parser-derived access in `wat.zig` goes through `wantList`/`wantAtom`/`wantStr`/`nth`/`fieldStr`/`strAt`
+  — no bare `items[N]`, no `.asList().?`/`.asAtom().?`/`.string`.** `sexpr.zig` also caps nesting depth
+  (`max_depth = 1024` → `NestingTooDeep`) and `Reader.readVecLen()` rejects a vec count > remaining bytes
+  (OOM-amplification guard) at every pre-alloc site.
 - **Pin verification hashes the bytes it runs, and the gate has no path to re-open (2026-07-17,
   Phase 5).** `verifyGate` (in `main.zig`) receives the **in-memory module buffer** and hashes *that*;
   it is handed the path only for messages and never re-reads the file. So the verified bytes provably
