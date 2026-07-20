@@ -280,6 +280,38 @@ start>end excluded range, no over-shift). `Module.zig`/`opcode.zig` `@intCast` a
 >4 GiB truncation; `wasi.zig` remaining casts are widening (`u64→i96` nanoseconds), host-bounded (argv), or
 impractical (4-billion fds); `wast.zig`/`wasm_c_api.zig` casts are widening or page/entry-count-bounded.
 
+### Latent-class census — DONE 2026-07-20 (8th "check for code issues", memory-safety-only) — NO NEW ISSUES
+
+After 7 fix-heavy passes the explicit-bounds/`@intCast` surface was saturated, so this pass censused the
+memory-unsafety *classes* the prior passes hadn't systematically swept. **All clean — nothing to fix:**
+
+- **`std.debug.assert`-as-guard — ABSENT.** Zero `std.debug.assert`/`assert(` in `src/` (an assert guarding a
+  bounds op would be a no-op in ReleaseFast — the class simply doesn't exist here).
+- **Pointer/slice held across an ArrayList/HashMap mutation (use-after-realloc) — CLEAN tree-wide** (agent
+  sweep). There are **zero** `getPtr`/`getOrPut`/`addOne`/`getLast` calls and no `&list.items[i]` captures in
+  the tree; the two `for (…) |*x|` captures (`wat.zig:406` mutates only *other* lists; the interp call-arg
+  slices `vstack.items[base..]` are `@memcpy`'d into the callee's fresh `locals` before the callee runs and
+  the caller only grows `vstack` *after* the call returns) are safe. Re-confirmed with fresh reasoning:
+  `gc_heap`/`exn_store`/`vstack`/`labels` (arena-backed `.fields`, by-value `exn`, build-then-append order),
+  the WASI `fds` table (`ResolvedPath.dir` is an `Io.Dir` *value*, no `*FdEntry` held across `put()`), and the
+  `sigs`/`ctx.out` assembler lists.
+- **`unreachable`/`orelse unreachable` — none reachable on attacker input.** Every non-test site is dead by
+  construction (the interp load/store `else` and `instr.imm.mem` access are gated by the main-loop op-dispatch;
+  `wat.zig`'s `switch (kind∈0..3)` / `emitRefCast` op switches are exhaustive over what's dispatched) or a
+  caller-guaranteed type invariant (`types.zig refHeap`'s `else`s can't fire — concrete-ref kind bits are only
+  ever 0/1/2, and all callers guard `isRef` first: `wasm_c_api.zig:354` `if (!v.isRef()) return 0;`,
+  `validate.zig` `isSubtype` guards its operands).
+- **Residual wrong-union `.?` / pointer casts — none on untrusted input.** The only `.asList().?` outside the
+  hardened `wat.zig`/`wast.zig` are in `sexpr.zig` *tests*; every `@ptrCast(@alignCast(ctx))` in `wasi.zig`
+  casts the **wazmrt-supplied** host-func context (`&wasi`), never guest data; the C-ABI `@ptrCast`/
+  `@fieldParentPtr` were verified in the 6th pass.
+
+Conclusion: no new memory-unsafe issue this pass. The run path, decode, assembler, `.wast` runner, C ABI,
+WASI, validator, and crypto have each now been swept for memory safety multiple times from complementary
+angles (bounds/OOB, `@intCast` overflow, lifecycle/UAF, use-after-realloc, `unreachable`/assert). Remaining
+open items are the previously-logged **non-memory-safety** LOWs (validator inspect-path DoS, `br_on_non_null`
+reject-valid, C-ABI trap-frame borrowed instance).
+
 **Low-priority notes (safe today):**
 - `wasi.zig Wasi.init` — `w.fds.appendSlice(...) catch {}` swallows OOM registering the 3 stdio fds (init
   then reports success with no stdio). Near-impossible; propagate for cleanliness someday.
