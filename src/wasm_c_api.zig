@@ -706,6 +706,14 @@ const Instance = struct {
     hdr: RefHeader = .{ .tag = .instance },
     inst: root.Instance,
     host_funcs: []interp.Instance.HostFunc = &.{},
+    /// Handles held on the backed import externs (func trampoline ctx, and the
+    /// Refs owning imported host memories/tables). The instance borrows those for
+    /// its whole life, but the wasm-c-api contract lets the embedder delete the
+    /// externs right after `wasm_instance_new` — so we retain them here and
+    /// release them when the instance is freed. Without this, delete-import-then-
+    /// call (or any guest memory access) is a use-after-free. Imported globals are
+    /// copied by value, so they need no handle.
+    import_refs: []*Ref = &.{},
     /// The module this was instantiated from, with a handle held. `inst.module`
     /// points into `module.inner` and is dereferenced on every call, so the
     /// module must outlive the instance — but the wasm-c-api contract lets the
@@ -1063,38 +1071,54 @@ export fn wasm_instance_new(store: ?*Store, module: ?*const Module, imports: ?*c
     var gvals: std.ArrayList(interp.Value) = .empty;
     var mems: std.ArrayList(*interp.Instance.Memory) = .empty;
     var tbls: std.ArrayList(*interp.Instance.Table) = .empty;
+    // Backed import externs the instance will borrow — retained below so they
+    // survive the embedder deleting them right after `wasm_instance_new`.
+    var import_ref_list: std.ArrayList(*Ref) = .empty;
     defer gvals.deinit(alloc);
     defer mems.deinit(alloc);
     defer tbls.deinit(alloc);
+    defer import_ref_list.deinit(alloc);
     for (m.inner.imports, 0..) |imp, i| {
         const ext: ?*Ref = if (imports) |v| (if (i < v.size) v.data[i] else null) else null;
         switch (imp.type) {
             .func => {
-                const hf: interp.Instance.HostFunc = if (ext != null and ext.?.host != null)
-                    .{ .native_env = .{ .ctx = ext.?, .call = hostTrampoline } }
-                else
-                    .{ .native_env = .{ .ctx = &unbacked_marker, .call = unbackedTrap } };
+                const hf: interp.Instance.HostFunc = if (ext != null and ext.?.host != null) blk: {
+                    import_ref_list.append(alloc, ext.?) catch return null; // its ctx is borrowed by the trampoline
+                    break :blk .{ .native_env = .{ .ctx = ext.?, .call = hostTrampoline } };
+                } else .{ .native_env = .{ .ctx = &unbacked_marker, .call = unbackedTrap } };
                 host_funcs.append(alloc, hf) catch return null;
             },
             .global => gvals.append(alloc, if (ext) |e| (if (e.host_global) |hg| hg.value else 0) else 0) catch return null,
             .memory => if (ext) |e| {
-                if (e.host_memory) |mem| mems.append(alloc, mem) catch return null;
+                if (e.host_memory) |mem| {
+                    mems.append(alloc, mem) catch return null;
+                    import_ref_list.append(alloc, e) catch return null; // `e` owns `mem`
+                }
             },
             .table => if (ext) |e| {
-                if (e.host_table) |tbl| tbls.append(alloc, tbl) catch return null;
+                if (e.host_table) |tbl| {
+                    tbls.append(alloc, tbl) catch return null;
+                    import_ref_list.append(alloc, e) catch return null; // `e` owns `tbl`
+                }
             },
             // An imported tag needs no host backing (EH proposal) — it is a local
             // tag identity in the module's tag index space.
             .tag => {},
         }
     }
+    // Own the import-ref list (this function returns `?*Instance`, not an error
+    // union, so `errdefer` is unavailable — each `return null` below frees it
+    // explicitly until `wi` takes ownership).
+    const import_refs = import_ref_list.toOwnedSlice(alloc) catch return null;
 
     const wi = alloc.create(Instance) catch {
         host_funcs.deinit(alloc);
+        alloc.free(import_refs);
         return null;
     };
     const funcs = host_funcs.toOwnedSlice(alloc) catch {
         host_funcs.deinit(alloc);
+        alloc.free(import_refs);
         alloc.destroy(wi);
         return null;
     };
@@ -1110,13 +1134,20 @@ export fn wasm_instance_new(store: ?*Store, module: ?*const Module, imports: ?*c
             .tables = tbls.items,
         }) catch |e| {
             alloc.free(funcs);
+            alloc.free(import_refs); // not retained yet — just free the slice
             alloc.destroy(wi);
             if (trap_out) |t| t.* = makeTrap(@errorName(e));
             return null;
         },
         .host_funcs = funcs,
+        .import_refs = import_refs,
         .module = @constCast(m),
     };
+    // Retain a handle on each backed import extern for the instance's lifetime
+    // (symmetric with the module handle below and released in
+    // `wasm_instance_delete`), so deleting an import after `wasm_instance_new`
+    // can't free memory the running instance still borrows.
+    for (import_refs) |r| retain(&r.hdr);
     // The instance now points into `m.inner` for its whole life; hold a handle
     // so the embedder deleting the module doesn't free it out from under us.
     retain(&wi.module.hdr);
@@ -1126,8 +1157,10 @@ export fn wasm_instance_new(store: ?*Store, module: ?*const Module, imports: ?*c
 export fn wasm_instance_delete(instance: ?*Instance) void {
     const wi = instance orelse return;
     if (!release(&wi.hdr)) return; // export handles / copies still hold it
-    wi.inst.deinit();
+    wi.inst.deinit(); // stop borrowing the import memories/tables/func ctx first
     if (wi.host_funcs.len != 0) alloc.free(wi.host_funcs);
+    for (wi.import_refs) |r| refDelete(r); // drop our handle on each backed import
+    if (wi.import_refs.len != 0) alloc.free(wi.import_refs);
     wasm_module_delete(wi.module); // drop our handle on the module
     alloc.destroy(wi);
 }
@@ -1279,20 +1312,22 @@ export fn wasm_func_call(func: ?*const Ref, args: ?*const ValVec, results: ?*Val
     const wi = r.instance.?;
     const ft = wi.inst.module.funcType(r.index) orelse return makeTrap("undefined function");
 
-    const n = if (args) |a| a.size else 0;
+    // A `size > 0` vec with a null `data` is malformed; treat it as empty rather
+    // than dereferencing null (matches `vecSlice`'s guard elsewhere in this file).
+    const n = if (args) |a| (if (a.data == null) 0 else a.size) else 0;
     const argv = alloc.alloc(interp.Value, n) catch return makeTrap("out of memory");
     defer alloc.free(argv);
-    if (args) |a| for (argv, 0..) |*slot, i| {
+    if (args) |a| if (a.data != null) for (argv, 0..) |*slot, i| {
         slot.* = valToSlot(a.data[i]);
     };
 
     const res = wi.inst.invokeIndex(r.index, argv) catch |e| return makeTrapFrom(@errorName(e), wi);
     defer alloc.free(res);
 
-    if (results) |out| {
+    if (results) |out| if (out.data != null) {
         const m = @min(out.size, @min(res.len, ft.results.len));
         for (0..m) |i| out.data[i] = slotToVal(ft.results[i], res[i]);
-    }
+    };
     return null; // success
 }
 
@@ -1500,8 +1535,13 @@ export fn wasm_table_delete(t: ?*Ref) void {
 /// `wasm_ref_delete` really frees it.
 fn refFromTableValue(owner: *const Ref, v: interp.Value) ?*RefHeader {
     if (v == interp.null_ref) return null;
+    // A funcref slot holds a small function index; an externref slot holds a host
+    // pointer (`@intFromPtr`, always > u32 on a 64-bit host). Cast safely rather
+    // than `@intCast` (UB on overflow in ReleaseFast) — an out-of-u32 value yields
+    // null, matching the funcref-only contract (we don't invent an externref handle).
+    const idx = std.math.cast(u32, v) orelse return null;
     const r = alloc.create(Ref) catch return null;
-    r.* = .{ .kind = EXTERN_FUNC, .instance = refRetainInstance(owner.instance), .index = @intCast(v) };
+    r.* = .{ .kind = EXTERN_FUNC, .instance = refRetainInstance(owner.instance), .index = idx };
     return &r.hdr;
 }
 
@@ -1631,10 +1671,24 @@ export fn wasm_tagtype_delete(tt: ?*TagType) void {
 }
 
 export fn wasm_importtype_new(module: ?*ByteVec, name: ?*ByteVec, ext: ?*anyopaque) ?*ImportType {
-    // Takes ownership of all three.
-    const m = module orelse return null;
-    const n = name orelse return null;
-    const it = alloc.create(ImportType) catch return null;
+    // Takes ownership of all three — free whatever was already passed on any
+    // early exit, so a null arg or an OOM doesn't leak the moved-in storage.
+    const m = module orelse {
+        if (name) |n| wasm_byte_vec_delete(n);
+        freeExternType(ext);
+        return null;
+    };
+    const n = name orelse {
+        wasm_byte_vec_delete(m);
+        freeExternType(ext);
+        return null;
+    };
+    const it = alloc.create(ImportType) catch {
+        wasm_byte_vec_delete(m);
+        wasm_byte_vec_delete(n);
+        freeExternType(ext);
+        return null;
+    };
     it.* = .{ .module = m.*, .name = n.*, .ext = ext };
     m.* = .{ .size = 0, .data = null }; // moved out
     n.* = .{ .size = 0, .data = null };
@@ -1642,8 +1696,15 @@ export fn wasm_importtype_new(module: ?*ByteVec, name: ?*ByteVec, ext: ?*anyopaq
 }
 
 export fn wasm_exporttype_new(name: ?*ByteVec, ext: ?*anyopaque) ?*ExportType {
-    const n = name orelse return null;
-    const et = alloc.create(ExportType) catch return null;
+    const n = name orelse {
+        freeExternType(ext);
+        return null;
+    };
+    const et = alloc.create(ExportType) catch {
+        wasm_byte_vec_delete(n);
+        freeExternType(ext);
+        return null;
+    };
     et.* = .{ .name = n.*, .ext = ext };
     n.* = .{ .size = 0, .data = null }; // moved out
     return et;
@@ -2553,6 +2614,62 @@ test "an instance keeps its module alive after the embedder deletes it" {
     try std.testing.expectEqual(@as(i32, 42), res_buf[0].of.i32);
 
     wasm_instance_delete(inst);
+}
+
+test "an instance keeps an imported memory alive after the embedder deletes it" {
+    // The callback.c pattern: the embedder deletes the import extern right after
+    // wasm_instance_new. The instance borrows the host memory, so it must hold a
+    // handle — else the guest's i32.load reads freed memory (a use-after-free),
+    // and the retain/release must still balance (no leak / double-free).
+    const e = wasm_engine_new().?;
+    defer wasm_engine_delete(e);
+    const s = wasm_store_new(e).?;
+    defer wasm_store_delete(s);
+
+    var arena = std.heap.ArenaAllocator.init(alloc); // wat.assemble needs an arena
+    defer arena.deinit();
+    const wbin = root.wat.assemble(arena.allocator(),
+        \\(module
+        \\  (import "env" "mem" (memory 1))
+        \\  (func (export "run") (result i32) (i32.load (i32.const 0))))
+    ) catch unreachable;
+    var bin: ByteVec = undefined;
+    wasm_byte_vec_new(&bin, wbin.len, wbin.ptr);
+    defer wasm_byte_vec_delete(&bin);
+    const m = wasm_module_new(s, &bin).?;
+    defer wasm_module_delete(m);
+
+    // Host memory import; store i32 42 (LE) at offset 0.
+    var lim: Limits = .{ .min = 1, .max = 1 };
+    const mt = wasm_memorytype_new(&lim).?;
+    defer wasm_memorytype_delete(mt);
+    const mem = wasm_memory_new(s, mt).?;
+    const data = wasm_memory_data(mem);
+    data[0] = 42;
+    data[1] = 0;
+    data[2] = 0;
+    data[3] = 0;
+
+    // Borrowed stack view of the imports (a C array, not an owned vec).
+    var items = [_]?*Ref{wasm_memory_as_extern(mem)};
+    var imports: ExternVec = .{ .size = 1, .data = &items };
+
+    var trap: ?*Trap = null;
+    const inst = wasm_instance_new(s, m, &imports, &trap).?;
+
+    wasm_memory_delete(mem); // embedder is done — the instance must keep it alive
+
+    var exps: ExternVec = undefined;
+    wasm_instance_exports(inst, &exps);
+    defer wasm_extern_vec_delete(&exps);
+    const f = wasm_extern_as_func(exps.data[0]).?;
+    var res_buf = [_]Val{undefined};
+    var res: ValVec = .{ .size = 1, .data = &res_buf };
+    const t = wasm_func_call(f, null, &res);
+    try std.testing.expect(t == null);
+    try std.testing.expectEqual(@as(i32, 42), res_buf[0].of.i32); // read from the still-alive imported memory
+
+    wasm_instance_delete(inst); // last handle → the memory is freed exactly once here
 }
 
 // --- Lifecycle fuzz (known-issues #22) -------------------------------------
