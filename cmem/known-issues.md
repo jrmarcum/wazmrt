@@ -254,6 +254,32 @@ all three targets building. **CLEAN this pass:** the C-ABI `c6ff764e` retain/rel
 EA, GC-heap/`exn_store` lifecycle, and SIMD lane indexing are all overflow-safe (`@as(u64,x)+n>len` form,
 arena-backed `.fields`, by-value label/exn capture).
 
+### `@intCast` census — DONE 2026-07-20 (7th "check for code issues", memory-safety-only)
+
+A systematic sweep of **every `@intCast` in `src/`** (classify each: comptime-safe / bounds-checked-before /
+attacker-controlled-unchecked) plus a deep-arithmetic re-audit of `validate.zig` + `sign.zig`. Found and
+FIXED two attacker-reachable `@intCast`-out-of-range UB (ReleaseFast illegal behavior):
+
+- **`wat.zig` SIMD lane/shuffle** (`emitSimd` `.lane`/`.shuffle`/`.mem_lane`, 3 sites) — a `.wat`-parsed lane
+  or shuffle index was `@intCast(u32→u8)` with **no mask or bound**, so `(i32x4.extract_lane 999)` /
+  `(i8x16.shuffle 999 …)` (reachable via `wazmrt file.wat`/`sign`/`pin <dir>`) was cast-out-of-range UB. Now
+  `std.math.cast(u8, …) orelse error.BadImmediate` (an index in `[laneCount,255]` still flows to the
+  decoder's lane-bounds check; the `i8x16.const` case at `parseV128Const` already masked with `& 0xff`, and
+  the other const shapes use `@truncate` — all safe). +2 test cases.
+- **`interp.zig` try_table catch** (`throwException`, `:1106`) — `branch(@intCast(d + c.label))` where
+  `c.label` is an unvalidated `u32` catch-clause label and `d` the try depth: a `c.label` near `u32max` made
+  `d + c.label` overflow (add-overflow on wasm32; cast-out-of-range on 64-bit) **before** `branch`'s own
+  bounds check. Now `std.math.cast(u32, @as(u64,d)+c.label) orelse error.UndefinedLabel` (verified by
+  review; a hand-built try_table with a `u32max` label is impractical to encode for a unit test).
+
+**CLEAN (verified):** `validate.zig` (deep arithmetic re-audit — `n_imported_globals` can't underflow;
+`popVal`/`popCtrl`/`labelTypesAt` guard the frame stack; `dropSelectWidths` `w[pc]` in-bounds since both
+passes `decodeBody` the same bytes deterministically; all type/index immediates flow through bounds-checking
+accessors); `sign.zig` (`findSignature`/`canonicalVerify`/`readUleb` bounds hold adversarially — no
+start>end excluded range, no over-shift). `Module.zig`/`opcode.zig` `@intCast` all guarded or the logged
+>4 GiB truncation; `wasi.zig` remaining casts are widening (`u64→i96` nanoseconds), host-bounded (argv), or
+impractical (4-billion fds); `wast.zig`/`wasm_c_api.zig` casts are widening or page/entry-count-bounded.
+
 **Low-priority notes (safe today):**
 - `wasi.zig Wasi.init` — `w.fds.appendSlice(...) catch {}` swallows OOM registering the 3 stdio fds (init
   then reports success with no stdio). Near-impossible; propagate for cleanliness someday.

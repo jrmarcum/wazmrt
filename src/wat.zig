@@ -1919,12 +1919,12 @@ fn emitSimd(ctx: *Ctx, sd: SimdOp, items: []const Sexpr, start: usize, is_folded
         .none => {},
         .lane => {
             if (j >= items.len) return error.BadImmediate;
-            lane = @intCast(@as(u32, @bitCast(@as(i32, @truncate(try parseWatI32(items[j]))))));
+            lane = std.math.cast(u8, @as(u32, @bitCast(@as(i32, @truncate(try parseWatI32(items[j])))))) orelse return error.BadImmediate;
             j += 1;
         },
         .shuffle => for (0..16) |k| {
             if (j >= items.len) return error.BadImmediate;
-            cbytes[k] = @intCast(@as(u32, @bitCast(@as(i32, @truncate(try parseWatI32(items[j]))))));
+            cbytes[k] = std.math.cast(u8, @as(u32, @bitCast(@as(i32, @truncate(try parseWatI32(items[j])))))) orelse return error.BadImmediate;
             j += 1;
         },
         .const_ => j = try parseV128Const(items, j, &cbytes),
@@ -1942,7 +1942,7 @@ fn emitSimd(ctx: *Ctx, sd: SimdOp, items: []const Sexpr, start: usize, is_folded
             }
             if (sd.imm == .mem_lane) { // a lane index follows the memarg
                 if (j >= items.len) return error.BadImmediate;
-                lane = @intCast(@as(u32, @bitCast(@as(i32, @truncate(try parseWatI32(items[j]))))));
+                lane = std.math.cast(u8, @as(u32, @bitCast(@as(i32, @truncate(try parseWatI32(items[j])))))) orelse return error.BadImmediate;
                 j += 1;
             }
         },
@@ -2257,6 +2257,10 @@ test "assembler rejects malformed forms without indexing out of bounds" {
     }
     // A folded `(if () ())` with an empty then/else form reports BadImmediate.
     try std.testing.expectError(error.BadImmediate, assemble(a, "(module (func (if () ())))"));
+    // A SIMD lane / shuffle index that doesn't fit a byte must error, not
+    // `@intCast(u32→u8)`-overflow (UB in ReleaseFast).
+    try std.testing.expectError(error.BadImmediate, assemble(a, "(module (func (i32x4.extract_lane 999)))"));
+    try std.testing.expectError(error.BadImmediate, assemble(a, "(module (func (i8x16.shuffle 999 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0)))"));
 }
 
 test "parser rejects a deeply-nested paren bomb instead of overflowing the stack" {

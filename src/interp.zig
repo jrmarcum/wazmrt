@@ -1102,8 +1102,11 @@ const Frame = struct {
                 }
                 // The clause's label index is relative to the try_table (label 0 =
                 // the try_table block); the try_table sits `d` deep, so branch to
-                // `d + c.label`.
-                return try self.branch(@intCast(d + c.label));
+                // `d + c.label`. `c.label` is an unvalidated u32 from the module, so
+                // sum in u64 and reject an over-u32 total (it can't name a real
+                // label anyway) rather than `@intCast`-overflow (UB in ReleaseFast).
+                const target_label = std.math.cast(u32, @as(u64, d) + c.label) orelse return error.UndefinedLabel;
+                return try self.branch(target_label);
             }
             // Legacy `try`: a matching inline handler runs INSIDE the try (the try
             // label stays on the stack for `rethrow`/`br`).
