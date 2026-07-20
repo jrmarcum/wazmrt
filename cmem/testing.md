@@ -481,19 +481,19 @@ V8. **Decision:** build the shipped `.lib`/`.dll` (and the freestanding wasm —
 `design-decisions.md`. (Caveat: single machine; sizes + steady-state are solid, the µs/ms cold numbers
 are ±10% noisy.)
 
-## Reading the test count (updated 2026-07-20, post hardening-refactor re-audit)
+## Reading the test count (updated 2026-07-20, post un-swept-surface audit)
 
-`zig build test --summary all` prints **386** (382 pass, 4 skip), but there are **198 distinct tests**:
-188 in the core module (186 pass + 2 skip) + 10 C-ABI. Recent malformed-input/hardening tests: the
-`wat.zig` `assembler rejects malformed forms …` case now covers 11 shape-malformed `.wat` → `BadModuleField`
-(+ a folded `(if () ())` → `BadImmediate`) plus the 5000-deep paren bomb → `NestingTooDeep`; and
-`interp.zig` gained a branch-**destination** OOB-write trap (the 4th-audit finding). The `cabi_tests`
-target's root is `wasm_c_api.zig`, which imports `root.zig`, so it compiles and **re-runs the core module's
-tests too** (188 core + 10 C-ABI = 198), on top of the standalone `mod_tests` run (188) → 386 printed.
-Harmless — under a second — but **don't quote the printed number as a test count**; quote **186**, or the
-per-target numbers from `--summary all`. The run-path memory-safety `test "hardening: …"` blocks in `interp.zig` are
-now **10** (across three passes: the `call` wild-write, epilogue under-produce, branch-arity, branch-**destination**
-OOB-write, and bare-`else` cases) — see known-issues "Run-path hardening" (2nd/3rd passes).
+`zig build test --summary all` prints **389** (385 pass, 4 skip), but there are **200 distinct tests**:
+189 in the core module (187 pass + 2 skip) + 11 C-ABI. The `cabi_tests` target's root is `wasm_c_api.zig`,
+which imports `root.zig`, so it compiles and **re-runs the core module's tests too** (189 core + 11 C-ABI =
+200), on top of the standalone `mod_tests` run (189) → 389 printed. Harmless — under a second — but
+**don't quote the printed number as a test count**; quote **187**, or the per-target numbers from
+`--summary all`. The 5th-audit malformed-input tests: `wast.zig` `runner rejects malformed commands …` (12
+shapes) and a C-ABI import-memory-lifetime test (delete an imported memory after instantiation, then
+`i32.load` → 42) join the existing `wat.zig` malformed-`.wat` case (11 shapes + paren bomb) and the **10**
+`interp.zig` `test "hardening: …"` blocks (the `call` wild-write, epilogue under-produce, branch-arity,
+branch-**destination** OOB-write, bare-`else`) — see known-issues "Run-path hardening" + "Un-swept-surface
+audit".
 
 ## Authenticity — Ed25519 signatures (`src/sign.zig` + CLI, 2026-07-18)
 

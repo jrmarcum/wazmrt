@@ -169,6 +169,61 @@ Lesson reinforced: a mechanical (sed) or single-variant fix closes the case it t
 mirror — always sweep for the *sibling* pattern (source vs dest, twin index, guarded-here-not-there).
 198 distinct tests; native Debug/ReleaseFast + wasm32 all build.
 
+### Un-swept-surface audit — DONE 2026-07-20 (5th "check for code issues")
+
+Prior passes intensely covered the run path + assembler; this pass aimed 3 auditors at files **untouched
+this session**: `wast.zig`, `wasm_c_api.zig`, and `wasi.zig`/`validate.zig`/`sign.zig`/`pin.zig`.
+
+- **`wast.zig` (the `.wast` runner, reachable via `wazmrt file.wast`) — 9 shape-safety holes, FIXED.** It
+  shares the `sexpr` front-end with `wat.zig` but was **not** touched by the assembler hardening — the
+  *sibling file* — so it kept the same unchecked pattern: every `assert_*` handler indexed `form[1]`/
+  `form[2..]` unchecked, and `runAction`/`parseConst`/`matches`/`register` indexed `list[0]`/`list[i]`/
+  `list[1]` and deref'd `.string` (wrong-union) on parsed input. Added `nth`/`asStr` accessors + `form.len`
+  guards → `error.BadCommand`/`BadValue`; `@intCast(ref.func idx)` → `@bitCast` (a negative index is
+  bogus-not-UB). +1 test (12 malformed shapes). Valid `.wast` unaffected (inline conformance tests pass).
+- **`wasm_c_api.zig` (embedder C ABI) — import-extern USE-AFTER-FREE (HIGH), FIXED.** The Instance wrapper
+  retained a handle on its Module (#20/#21/#22) but **not on the backed import externs** — the exact
+  lifetime mirror. A func import stored the `*Ref` as trampoline ctx; memory/table imports borrowed the
+  Ref-owned `*Memory`/`*Table`; none retained. The canonical callback.c pattern (delete the import externs
+  right after `wasm_instance_new`) freed them while the running instance still borrowed them → UAF on the
+  next call / any guest memory access. Fix: store `import_refs` on the wrapper, `retain` each in
+  `wasm_instance_new`, `refDelete` each in `wasm_instance_delete` (symmetric with the module handle);
+  globals are copied by value. Also **MEDIUM**: `wasm_table_get` `@intCast(u64→u32)` on an externref slot
+  (host pointer > u32) → ReleaseFast UB → now `std.math.cast → null` (funcref-only contract); **LOW**:
+  `wasm_func_call` null-`data` deref on a `size>0` vec; `wasm_importtype_new`/`wasm_exporttype_new` leaked
+  moved-in args on null/OOM early-returns. +1 regression test (import a host memory, delete it, then
+  `i32.load` → 42; the #22 fuzz only ever used the import-free `add` module).
+- **`pin.zig` `modeFromDb` — MEDIUM security, FIXED.** A present `# mode:` with an unrecognized value
+  (typo `enfroce`, casing `Enforce`, inline comment `enforce # prod`, empty) returned `null` =
+  indistinguishable from "no directive", so `verifyGate` saw no enforce and `--no-verify` could override
+  the armed default-deny — silently downgrading the **absolute** root enforce (#24). Now fails **closed**
+  → `.enforce` (strictest), matching the hash lines' `InvalidPinLine` posture. +4 test cases.
+
+**CLEAN (examined, no real defect):** `sign.zig` (`findSignature`/`verify` bounds-safe, can't wrongly
+authenticate), `wasi.zig` sandbox core (`resolve`/`walkFull` escape-resistant, rights only narrow, no
+fd-pointer-across-realloc), `validate.zig` (no accept-invalid / OOB), `pin.zig` apart from `modeFromDb`.
+
+**DEFERRED LOWs from the 5th pass** (not memory-safety / not run-path):
+- **`validate.zig array_new_fixed` (`:744`) + locals expansion (`:191`) — inspect-path CPU/OOM DoS.** A huge
+  `array.new_fixed n` (up to 2³²) in **unreachable** code makes the validator's `popExpect` loop spin ~4e9
+  times (`popVal` returns `.unknown`, never underflows); likewise a huge `local` run-length drives a
+  multi-GB append. Only on the **inspect** path (`wazmrt <module>` summary), never the run path (which
+  self-defends in `interp`, not the validator) — so CPU/memory exhaustion inspecting a hostile module, not
+  a safety/execution issue. **Fix if wanted:** cap the count (mirror `readVecLen`).
+- **`validate.zig br_on_non_null` (`:815`) — reject-valid (conformance).** Hard-codes the label's last type
+  to `funcref`/`externref`, wrongly rejecting a valid GC/typed-ref label (`i31ref`/`anyref`/`(ref $t)`/…).
+  Inspect-path only, no safety impact. Fix: accept any last-type reference the popped ref subtypes.
+- **`wasi.zig` (`:748`/`:823`/`:1557…`) — hardening.** `gatherIovecs`/`fd_read`/`poll_oneoff` form a guest-
+  controlled byte offset in **u32** before the (correct, widening) `readU32`/`slice` bounds check. Contained
+  today (the pre-alloc size check / the subsequent fault check bound the reachable index below overflow), so
+  **not exploitable** — but deviates from the file's widen-then-check discipline. Compute those offsets in
+  `u64`.
+- **`wasm_c_api.zig` trap frames (`makeTrapFrom`) — LOW.** A `Trap`'s snapshotted frames store a borrowed
+  `*Instance` without retaining it; `wasm_frame_instance` after `wasm_instance_delete` hands back a dangling
+  pointer. It's a *borrowed* accessor (header doesn't mark it `own`), so arguably caller error — the one
+  spot departing from the "a stored `*Instance` owns a handle" discipline. Retain in the frame + release in
+  `wasm_trap_delete` if airtight is wanted.
+
 **Low-priority notes (safe today):**
 - `wasi.zig Wasi.init` — `w.fds.appendSlice(...) catch {}` swallows OOM registering the 3 stdio fds (init
   then reports success with no stdio). Near-impossible; propagate for cleanliness someday.
