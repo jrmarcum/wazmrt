@@ -305,6 +305,12 @@ memory-unsafety *classes* the prior passes hadn't systematically swept. **All cl
   hardened `wat.zig`/`wast.zig` are in `sexpr.zig` *tests*; every `@ptrCast(@alignCast(ctx))` in `wasi.zig`
   casts the **wazmrt-supplied** host-func context (`&wasi`), never guest data; the C-ABI `@ptrCast`/
   `@fieldParentPtr` were verified in the 6th pass.
+- **Byte-copy primitives (`@memcpy`/`@memset`/`copyForwards`/`copyBackwards`) — CLEAN** (added 2026-07-20).
+  `@memcpy` is UB on unequal lengths or overlap; every site uses `dst[..][0..n]`/`src[..][0..n]` (equal `n`,
+  bounds-checked `x+n>len` first) with distinct buffers, or the overlap-safe `copy{Forwards,Backwards}` for a
+  same-buffer `memory.copy`/`table.copy`. `callFunction`'s `@memcpy(locals[0..args.len], args)` can't OOB-slice
+  because `args.len = typeSlots(callee params) ≤ num_local_slots = locals.len`. `@memset` always fills a whole
+  slice. `sign.zig`'s copies into `loc.key`/`loc.sig` are guarded by `content.len == 104`.
 
 Conclusion: no new memory-unsafe issue this pass. The run path, decode, assembler, `.wast` runner, C ABI,
 WASI, validator, and crypto have each now been swept for memory safety multiple times from complementary
