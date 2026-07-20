@@ -227,4 +227,50 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(cabi_tests).step);
+
+    // ---- ReleaseSafe test run (`zig build test-safe`) ----------------------
+    // The same suite compiled with the optimizer ON but safety checks KEPT
+    // (bounds, integer overflow, out-of-range @intCast, .? on null, reaching
+    // `unreachable`). A memory-safety bug that only manifests in an optimized
+    // build — or the malformed-input fuzz's OOB/overflow — trips a panic here
+    // instead of being silent UB in the shipped ReleaseFast/ReleaseSmall builds.
+    // Kept a separate step so the default `test` stays a fast Debug run.
+    {
+        const mod_tests_safe = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        }) });
+        const cabi_tests_safe = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wasm_c_api.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        }) });
+        const test_safe_step = b.step("test-safe", "Run the test suite under ReleaseSafe (optimized + safety checks kept)");
+        test_safe_step.dependOn(&b.addRunArtifact(mod_tests_safe).step);
+        test_safe_step.dependOn(&b.addRunArtifact(cabi_tests_safe).step);
+    }
+
+    // ---- Spec-conformance runner (`zig build conformance -Dtestsuite=<dir>`) -
+    // Walks a WebAssembly spec-testsuite checkout (a directory of `.wast` files),
+    // runs each through the in-process `.wast` runner, aggregates pass/fail, and
+    // fails the build if any assertion fails. The corpus is NOT vendored (it is
+    // large and lives upstream / on removable media — see cmem/testing.md), so
+    // point the step at a local checkout:
+    //   git clone https://github.com/WebAssembly/testsuite
+    //   zig build conformance -Dtestsuite=path/to/testsuite
+    // With no `-Dtestsuite`, the runner prints how to use it and exits 0.
+    {
+        const testsuite = b.option([]const u8, "testsuite", "Directory of spec-testsuite .wast files for `zig build conformance`");
+        const conf = b.addExecutable(.{ .name = "conformance", .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/conformance.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "wazmrt", .module = mod }},
+        }) });
+        const run_conf = b.addRunArtifact(conf);
+        run_conf.addArg(testsuite orelse ""); // empty ⇒ the runner prints guidance
+        const conf_step = b.step("conformance", "Run the spec testsuite (.wast) — needs -Dtestsuite=<dir>");
+        conf_step.dependOn(&run_conf.step);
+    }
 }

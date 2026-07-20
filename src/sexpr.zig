@@ -53,6 +53,10 @@ pub const Error = error{
     /// List nesting exceeded `max_depth` — refuses a `((((…`-bomb that would
     /// otherwise overflow the host stack via `parseList`/`parseValue` recursion.
     NestingTooDeep,
+    /// A character that starts no value and that `skipTrivia` does not consume —
+    /// today only a lone `;` (`;;` line comments and `(;` block comments are
+    /// trivia; a single `;` is not valid `.wat`).
+    UnexpectedChar,
 } || std.mem.Allocator.Error;
 
 /// Cap on `(`-nesting. Real `.wat`/`.wast` nests a few dozen deep at most; this
@@ -114,7 +118,19 @@ const Parser = struct {
             '(' => self.parseList(),
             ')' => error.UnexpectedParen,
             '"' => .{ .string = try self.parseString() },
-            else => .{ .atom = self.parseAtom() },
+            // A lone `;`: `skipTrivia` consumes only `;;` and `(;`, and
+            // `parseAtom` treats `;` as a terminator — so it would return an
+            // empty atom WITHOUT advancing `pos`, and the `parseAll`/`parseList`
+            // loops would append empty atoms forever. `(module) ; x` — 12 bytes —
+            // hung the CLI at 10 GB RSS. Reject it instead.
+            ';' => error.UnexpectedChar,
+            else => blk: {
+                const at = self.parseAtom();
+                // Belt-and-braces: no delimiter added to `parseAtom` in future
+                // may reintroduce a zero-progress loop.
+                if (at.len == 0) break :blk error.UnexpectedChar;
+                break :blk .{ .atom = at };
+            },
         };
     }
 

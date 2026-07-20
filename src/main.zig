@@ -50,6 +50,20 @@ pub fn main(init: std.process.Init) !void {
 
     // .wast script mode: parse + run the assertions, print a pass/fail summary.
     if (std.mem.endsWith(u8, path, ".wast")) {
+        // `runScript` INSTANTIATES AND INVOKES the script's modules — including
+        // `(module binary "…")` raw payloads — so this path executes and must be
+        // gated exactly like a module. It used to `return` before the gate below,
+        // which meant `wazmrt payload.wast` ran unpinned, unsigned wasm even
+        // under a root-owned `# mode: enforce` that this project documents as
+        // absolute. Any wasm can be wrapped in a `.wast`, and the attacker
+        // chooses the extension, so the bypass needed no privilege.
+        //
+        // Hashing the script bytes is the right granularity: every module the
+        // script runs is *contained in* those bytes, so authorizing the script
+        // authorizes exactly what it can execute — the same
+        // hash-what-you-execute property `verifyGate` has for a module.
+        if (!(try verifyGate(arena, io, out, bytes, path, args[2..]))) return;
+
         const s = wazmrt.wast.runScript(arena, bytes) catch |e| {
             try out.print("error: cannot run '{s}': {s}\n", .{ path, @errorName(e) });
             return;
@@ -195,6 +209,8 @@ fn printHelp(out: *Io.Writer, prog: []const u8) !void {
         \\  --dir <host>[:<guest>]      grant a read-write preopen (the guest's only files)
         \\  --ro-dir <host>[:<guest>]   grant a read-only preopen (no write/create/delete)
         \\  --env KEY=VALUE             set one environment variable for the guest
+        \\  --max-memory <size>         linear-memory ceiling for a WASI command (default 1G; e.g. 512M, 2G)
+        \\                              the default ceiling applies to every run mode
         \\  --                          end wazmrt flags; the rest is the guest's argv
         \\
         \\VERIFICATION FLAGS (authenticity — see the pin DB / signatures)
@@ -435,13 +451,51 @@ fn defaultPinsPath() []const u8 {
         "/etc/wazmrt/pins";
 }
 
-/// The wazmrt-flag region: args after the module path up to `--` (guest argv).
+/// The wazmrt-flag region: the LEADING run of recognized wazmrt flags after the
+/// module path, ending at `--` or at the first argument that is not one of ours.
+///
 /// Verify flags must sit here so a guest arg that happens to read `--no-verify`
-/// is never mistaken for one of ours.
+/// is never mistaken for one of ours. Scanning everything before `--` did not
+/// achieve that: the common WASI form has no `--` at all
+/// (`wazmrt prog.wasm install --yes`), so the guest's own argv was still
+/// searched and `--yes`/`--no-verify` anywhere in it silently disabled
+/// verification. This mirrors exactly the run `runWasi` consumes, so the two
+/// agree on where our flags stop and the guest's argv begins.
 fn flagRegion(rest: []const []const u8) []const []const u8 {
-    for (rest, 0..) |a, i| if (std.mem.eql(u8, a, "--")) return rest[0..i];
-    return rest;
+    const two = [_][]const u8{ "--dir", "--ro-dir", "--env", "--verify", "--pins", "--max-memory" };
+    const one = [_][]const u8{ "--no-verify", "--yes" };
+    var i: usize = 0;
+    outer: while (i < rest.len) {
+        if (std.mem.eql(u8, rest[i], "--")) break;
+        for (two) |f| if (std.mem.eql(u8, rest[i], f) and i + 1 < rest.len) {
+            i += 2;
+            continue :outer;
+        };
+        for (one) |f| if (std.mem.eql(u8, rest[i], f)) {
+            i += 1;
+            continue :outer;
+        };
+        break; // first non-flag argument — everything from here is the guest's
+    }
+    return rest[0..i];
 }
+/// Parse a `--max-memory` size: a decimal count of bytes with an optional
+/// `K`/`M`/`G` suffix (`512M`, `2G`, `1073741824`). Returns null if unparseable
+/// or if the multiplier overflows, so the caller can fail loudly rather than
+/// silently running with the default.
+fn parseSize(s: []const u8) ?usize {
+    if (s.len == 0) return null;
+    const mult: usize = switch (s[s.len - 1]) {
+        'k', 'K' => 1 << 10,
+        'm', 'M' => 1 << 20,
+        'g', 'G' => 1 << 30,
+        else => 1,
+    };
+    const digits = if (mult == 1) s else s[0 .. s.len - 1];
+    const n = std.fmt.parseInt(usize, digits, 10) catch return null;
+    return std.math.mul(usize, n, mult) catch null;
+}
+
 fn hasFlag(rest: []const []const u8, name: []const u8) bool {
     for (flagRegion(rest)) |a| if (std.mem.eql(u8, a, name)) return true;
     return false;
@@ -654,8 +708,9 @@ fn runWasi(
     var stdin_buffer: [4096]u8 = undefined;
     var stdin_file_reader: Io.File.Reader = .init(.stdin(), io, &stdin_buffer);
 
-    const seed: u64 = @intCast(@max(Io.Timestamp.now(io, .awake).nanoseconds, 0));
-    var wasi = wazmrt.wasi.Wasi.init(arena, io, out, err_w, seed);
+    // No seed: `random_get` is a CSPRNG seeded lazily from OS entropy inside
+    // `Wasi` (it used to be a timestamp-seeded Xoshiro256++). See `Wasi.csprng`.
+    var wasi = wazmrt.wasi.Wasi.init(arena, io, out, err_w);
     defer wasi.deinit();
     wasi.stdin = &stdin_file_reader.interface;
 
@@ -663,11 +718,21 @@ fn runWasi(
     //   --dir <host>[:<guest>]      read-write preopen (the guest's only files)
     //   --ro-dir <host>[:<guest>]   read-only preopen (no write/create/delete)
     //   --env KEY=VAL               one environment variable for the guest
+    //   --max-memory <size>         linear-memory ceiling (default 1G)
     //   --                          end of wazmrt flags; the rest is guest argv
     var environ: std.ArrayList([]const u8) = .empty;
+    var max_memory: usize = interp.default_max_memory_bytes;
     var rest = wasi_args;
     flags: while (rest.len >= 1) {
         const flag = rest[0];
+        if (std.mem.eql(u8, flag, "--max-memory") and rest.len >= 2) {
+            max_memory = parseSize(rest[1]) orelse {
+                try out.print("error: --max-memory '{s}': expected a size like 512M or 2G\n", .{rest[1]});
+                return 1;
+            };
+            rest = rest[2..];
+            continue :flags;
+        }
         const ro = std.mem.eql(u8, flag, "--ro-dir");
         if ((std.mem.eql(u8, flag, "--dir") or ro) and rest.len >= 2) {
             const spec = rest[1];
@@ -724,7 +789,7 @@ fn runWasi(
             try funcs.append(arena, .{ .native_env = .{ .ctx = &wasi, .call = unresolvedImport } });
     }
 
-    var inst = try interp.Instance.initWithImports(arena, module, .{ .funcs = funcs.items });
+    var inst = try interp.Instance.initWithImports(arena, module, .{ .funcs = funcs.items, .max_memory_bytes = max_memory });
     defer inst.deinit();
     wasi.memory = inst.memory0(); // module memory now exists
 
@@ -764,7 +829,16 @@ fn runFunction(
         try out.print("error: no exported function '{s}'\n", .{name});
         return;
     };
-    const ft = module.funcType(fi).?;
+    // `fi` came from the export section, which the decoder does NOT cross-check
+    // against the function space (a repeated `function` section appends to the
+    // space but replaces `module.functions`, so the two can disagree). The run
+    // path never validates, so an out-of-range export index reaches here and the
+    // old `.?` was a null unwrap — undefined data in ReleaseFast, i.e. a segfault
+    // from a 31-byte module. Fail loud instead.
+    const ft = module.funcType(fi) orelse {
+        try out.print("error: export '{s}' names an out-of-range function index {d}\n", .{ name, fi });
+        return;
+    };
     if (arg_strings.len != ft.params.len) {
         try out.print("error: '{s}' takes {d} arg(s), got {d}\n", .{ name, ft.params.len, arg_strings.len });
         return;

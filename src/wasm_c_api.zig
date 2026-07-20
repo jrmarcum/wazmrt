@@ -444,6 +444,16 @@ fn freeExternType(ext: ?*anyopaque) void {
             alloc.destroy(tt);
         },
         EXTERN_MEMORY => alloc.destroy(@as(*MemoryType, @ptrCast(@alignCast(p)))),
+        // `wasm_tagtype_new`/`copyExternType` both allocate a TagType plus an
+        // owned FuncType (and its two valtype vecs). Without this arm every
+        // `wasm_tagtype_delete`/`wasm_externtype_delete`/`wasm_tagtype_vec_delete`
+        // was a silent no-op — the only `wasm_X_new` in the file with no working
+        // destructor, so a new/delete loop grew the heap without bound.
+        EXTERN_TAG => {
+            const tt: *TagType = @ptrCast(@alignCast(p));
+            if (tt.functype) |f| freeExternType(@ptrCast(f));
+            alloc.destroy(tt);
+        },
         else => {},
     }
 }
@@ -1025,11 +1035,21 @@ fn hostTrampoline(ctx: *anyopaque, args: []const interp.Value, results: []interp
     var argvec: ValVec = undefined;
     wasm_val_vec_new_uninitialized(&argvec, args.len);
     defer wasm_val_vec_delete(&argvec);
+    // On OOM the vec comes back with a null `data`, which the loops below would
+    // dereference — every other site in this file checks it.
+    if (args.len != 0 and argvec.data == null) return false;
     for (0..args.len) |i| argvec.data[i] = slotToValKind(valTypeVecKind(&ft.params, i), args[i]);
 
     var resvec: ValVec = undefined;
     wasm_val_vec_new_uninitialized(&resvec, results.len);
     defer wasm_val_vec_delete(&resvec);
+    // Every slot is read back below, but `wasm_instance_new` never checks the
+    // supplied host functype against the import it backs — so a callback that
+    // honestly declares fewer results (or simply leaves a slot unwritten) would
+    // hand the guest raw uninitialized heap. Zero first: disclosure, not UB, but
+    // the guest must never observe host heap contents.
+    if (results.len != 0 and resvec.data == null) return false;
+    @memset(resvec.data[0..results.len], .{ .kind = 1, .of = .{ .i64 = 0 } }); // WASM_I64
 
     const trap = if (hc.with_env) |cb| cb(hc.env, &argvec, &resvec) else if (hc.plain) |cb| cb(&argvec, &resvec) else return false;
     if (trap) |t| {
@@ -2097,6 +2117,19 @@ export fn wasm_ref_delete(r: ?*RefHeader) void {
 export fn wasm_ref_copy(r: ?*const RefHeader) ?*RefHeader {
     const h = r orelse return null;
     const m: *RefHeader = @constCast(h);
+    // Same rule as `RefApi.copy` (the typed `wasm_X_copy`): an export handle's
+    // storage belongs to its extern vec, which frees it outright in
+    // `wasm_extern_vec_delete` regardless of the refcount. Retaining here would
+    // hand back a pointer that vec later frees — and the subsequent
+    // `wasm_ref_delete` would then `release()` into freed heap and could destroy
+    // it a second time. Duplicate instead, exactly as the typed copy does.
+    if (h.tag == .extern_obj) {
+        const src: *const Ref = @alignCast(@fieldParentPtr("hdr", h));
+        if (src.vec_owned) {
+            const dup = dupExportHandle(src) orelse return null;
+            return &dup.hdr;
+        }
+    }
     retain(m);
     return m;
 }

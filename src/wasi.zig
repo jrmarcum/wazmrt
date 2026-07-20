@@ -326,22 +326,52 @@ pub const Wasi = struct {
     args: []const []const u8 = &.{},
     environ: []const []const u8 = &.{},
     exit_code: ?u32 = null,
-    rng: std.Random.DefaultPrng,
+    /// The guest-visible CSPRNG for `random_get`, seeded lazily from OS entropy
+    /// on first use (`csprng`). Null until then, or if entropy was unavailable.
+    rng: ?std.Random.DefaultCsprng = null,
     /// Guest fd -> host resource, indexed by fd. 0/1/2 are stdio; preopens land
     /// at 3+ (the convention every wasi-libc expects). A hole is a closed fd.
     fds: std.ArrayList(?FdEntry) = .empty,
 
-    pub fn init(gpa: std.mem.Allocator, io: Io, stdout: *Io.Writer, stderr: *Io.Writer, seed: u64) Wasi {
+    pub fn init(gpa: std.mem.Allocator, io: Io, stdout: *Io.Writer, stderr: *Io.Writer) Wasi {
         var w: Wasi = .{
             .io = io,
             .gpa = gpa,
             .stdout = stdout,
             .stderr = stderr,
-            .rng = std.Random.DefaultPrng.init(seed),
         };
         // fds 0-2 are always the standard streams.
         w.fds.appendSlice(gpa, &.{ .stdin, .stdout, .stderr }) catch {};
         return w;
+    }
+
+    /// The guest's CSPRNG, seeded on first use from OS entropy; null if entropy
+    /// was unavailable.
+    ///
+    /// WASI preview-1 specifies `random_get` as **cryptographically secure** —
+    /// it is what a guest's `getrandom()` compiles to, so guest key material,
+    /// tokens, nonces and (in Rust) HashMap seeds all come from here. This was a
+    /// `DefaultPrng` (Xoshiro256++) seeded from `Io.Timestamp.now`, i.e. output
+    /// an attacker could search knowing roughly when the process started.
+    ///
+    /// Seeded from `io.randomSecure`, **not** `io.random`: the latter documents
+    /// a fallback to "a less secure mechanism" on failure, and an `Io` with no
+    /// randomness uses `noRandom`, which fills the buffer with **zeros**. Silent
+    /// weak randomness is exactly the failure mode being fixed, so entropy
+    /// failure returns null and `random_get` reports `EIO` rather than handing
+    /// the guest predictable bytes.
+    ///
+    /// Seeding is lazy so a guest that never asks for randomness pays no syscall
+    /// (instantiation is on the measured cold-start path). Streaming from a
+    /// ChaCha CSPRNG rather than syscalling per call is what `std.crypto.random`
+    /// itself does.
+    fn csprng(self: *Wasi) ?*std.Random.DefaultCsprng {
+        if (self.rng == null) {
+            var seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
+            self.io.randomSecure(&seed) catch return null;
+            self.rng = std.Random.DefaultCsprng.init(seed);
+        }
+        return if (self.rng) |*r| r else null;
     }
 
     pub fn deinit(self: *Wasi) void {
@@ -669,6 +699,29 @@ fn argU32(args: []const Value, i: usize) u32 {
     return @bitCast(interp.asI32(args[i]));
 }
 
+/// Wrap a WASI implementation in a declared-arity guard.
+///
+/// WASI host functions are bound by NAME alone (`main.zig` → `Wasi.hostFunc`),
+/// and nothing checks that the module's *declared* import signature matches the
+/// arity the implementation reads. `interp.callFunction` sizes the `args` slice
+/// from the module's declaration, so a module importing
+/// `(import "wasi_snapshot_preview1" "fd_write" (func))` — zero params — made
+/// every `argU32(args, 0..3)` read run off the end of the value stack. That is
+/// an unchecked OOB read of host memory in the shipped ReleaseFast build; a
+/// four-line `.wat` segfaulted the runtime.
+///
+/// A real WASI guest always declares the spec signature, so requiring it costs
+/// nothing; a module that lies about it is malformed and traps loudly rather
+/// than reading past the stack (the project's prefer-hard-abort rule).
+fn guardArity(comptime f: CallFn, comptime min_args: usize) CallFn {
+    return struct {
+        fn call(ctx: *anyopaque, args: []const Value, results: []Value) bool {
+            if (args.len < min_args) return false; // -> error.HostTrap
+            return f(ctx, args, results);
+        }
+    }.call;
+}
+
 /// Set the errno result (all WASI funcs but `proc_exit` return an `errno` i32).
 fn ret(results: []Value, e: u32) bool {
     if (results.len != 0) results[0] = interp.i32Value(@bitCast(e));
@@ -676,53 +729,57 @@ fn ret(results: []Value, e: u32) bool {
 }
 
 fn callFor(name: []const u8) CallFn {
+    // The trailing number is the preview-1 parameter count — the arity the guest
+    // MUST declare for the import. See `guardArity`: it is the bound every
+    // `argU32(args, N)` below relies on, so it must never be lower than the
+    // highest index the implementation reads.
     const map = .{
-        .{ "proc_exit", wProcExit },
-        .{ "fd_write", wFdWrite },
-        .{ "fd_read", wFdRead },
-        .{ "fd_close", wFdClose },
-        .{ "fd_seek", wFdSeek },
-        .{ "fd_tell", wFdTell },
-        .{ "fd_pread", wFdPread },
-        .{ "fd_pwrite", wFdPwrite },
-        .{ "fd_sync", wFdSync },
-        .{ "fd_datasync", wFdSync }, // Io.File.sync flushes contents + metadata
-        .{ "fd_fdstat_get", wFdFdstatGet },
-        .{ "fd_fdstat_set_flags", wFdFdstatSetFlags },
-        .{ "fd_filestat_get", wFdFilestatGet },
-        .{ "fd_filestat_set_size", wFdFilestatSetSize },
-        .{ "fd_filestat_set_times", wFdFilestatSetTimes },
-        .{ "fd_allocate", wFdAllocate },
-        .{ "fd_readdir", wFdReaddir },
-        .{ "fd_renumber", wFdRenumber },
-        .{ "fd_advise", wSchedYield }, // advisory only — success is honest
-        .{ "fd_prestat_get", wFdPrestatGet },
-        .{ "fd_prestat_dir_name", wFdPrestatDirName },
-        .{ "path_open", wPathOpen },
-        .{ "path_filestat_get", wPathFilestatGet },
-        .{ "path_filestat_set_times", wPathFilestatSetTimes },
-        .{ "path_create_directory", wPathCreateDirectory },
-        .{ "path_remove_directory", wPathRemoveDirectory },
-        .{ "path_unlink_file", wPathUnlinkFile },
-        .{ "path_rename", wPathRename },
-        .{ "path_link", wPathLink },
-        .{ "path_symlink", wPathSymlink },
-        .{ "path_readlink", wPathReadlink },
-        .{ "args_sizes_get", wArgsSizesGet },
-        .{ "args_get", wArgsGet },
-        .{ "environ_sizes_get", wEnvironSizesGet },
-        .{ "environ_get", wEnvironGet },
-        .{ "clock_time_get", wClockTimeGet },
-        .{ "clock_res_get", wClockResGet },
-        .{ "poll_oneoff", wPollOneoff },
-        .{ "random_get", wRandomGet },
-        .{ "sched_yield", wSchedYield },
-        .{ "proc_raise", wProcRaise },
+        .{ "proc_exit", wProcExit, 1 },
+        .{ "fd_write", wFdWrite, 4 },
+        .{ "fd_read", wFdRead, 4 },
+        .{ "fd_close", wFdClose, 1 },
+        .{ "fd_seek", wFdSeek, 4 },
+        .{ "fd_tell", wFdTell, 2 },
+        .{ "fd_pread", wFdPread, 5 },
+        .{ "fd_pwrite", wFdPwrite, 5 },
+        .{ "fd_sync", wFdSync, 1 },
+        .{ "fd_datasync", wFdSync, 1 }, // Io.File.sync flushes contents + metadata
+        .{ "fd_fdstat_get", wFdFdstatGet, 2 },
+        .{ "fd_fdstat_set_flags", wFdFdstatSetFlags, 2 },
+        .{ "fd_filestat_get", wFdFilestatGet, 2 },
+        .{ "fd_filestat_set_size", wFdFilestatSetSize, 2 },
+        .{ "fd_filestat_set_times", wFdFilestatSetTimes, 4 },
+        .{ "fd_allocate", wFdAllocate, 3 },
+        .{ "fd_readdir", wFdReaddir, 5 },
+        .{ "fd_renumber", wFdRenumber, 2 },
+        .{ "fd_advise", wSchedYield, 4 }, // advisory only — success is honest
+        .{ "fd_prestat_get", wFdPrestatGet, 2 },
+        .{ "fd_prestat_dir_name", wFdPrestatDirName, 3 },
+        .{ "path_open", wPathOpen, 9 },
+        .{ "path_filestat_get", wPathFilestatGet, 5 },
+        .{ "path_filestat_set_times", wPathFilestatSetTimes, 7 },
+        .{ "path_create_directory", wPathCreateDirectory, 3 },
+        .{ "path_remove_directory", wPathRemoveDirectory, 3 },
+        .{ "path_unlink_file", wPathUnlinkFile, 3 },
+        .{ "path_rename", wPathRename, 6 },
+        .{ "path_link", wPathLink, 7 },
+        .{ "path_symlink", wPathSymlink, 5 },
+        .{ "path_readlink", wPathReadlink, 6 },
+        .{ "args_sizes_get", wArgsSizesGet, 2 },
+        .{ "args_get", wArgsGet, 2 },
+        .{ "environ_sizes_get", wEnvironSizesGet, 2 },
+        .{ "environ_get", wEnvironGet, 2 },
+        .{ "clock_time_get", wClockTimeGet, 3 },
+        .{ "clock_res_get", wClockResGet, 2 },
+        .{ "poll_oneoff", wPollOneoff, 4 },
+        .{ "random_get", wRandomGet, 2 },
+        .{ "sched_yield", wSchedYield, 0 },
+        .{ "proc_raise", wProcRaise, 1 },
     };
     inline for (map) |m| {
-        if (std.mem.eql(u8, name, m[0])) return m[1];
+        if (std.mem.eql(u8, name, m[0])) return guardArity(m[1], m[2]);
     }
-    return wStubNotsup;
+    return wStubNotsup; // reads no args — safe at any declared arity
 }
 
 // --- Implementations -------------------------------------------------------
@@ -1615,11 +1672,14 @@ fn wProcRaise(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     return false; // -> error.HostTrap
 }
 
-/// `random_get(buf, len)` — fill `buf` with pseudo-random bytes.
+/// `random_get(buf, len)` — fill `buf` with cryptographically secure random
+/// bytes (see `Wasi.csprng`; `EIO` if the host has no entropy source, never
+/// weak bytes).
 fn wRandomGet(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const w: *Wasi = @ptrCast(@alignCast(ctx));
     const buf = w.slice(argU32(args, 0), argU32(args, 1)) orelse return ret(results, errno.fault);
-    w.rng.random().bytes(buf);
+    const rng = w.csprng() orelse return ret(results, errno.io);
+    rng.random().bytes(buf);
     return ret(results, errno.success);
 }
 
@@ -1642,9 +1702,11 @@ fn testWasi(mem: *Memory, stdout: *Io.Writer) Wasi {
         .memory = mem,
         .stdout = stdout,
         .stderr = stdout,
-        .io = undefined,
+        // A real `Io`, not `undefined`: `random_get` seeds its CSPRNG through
+        // `io.randomSecure` on first use, so an undefined `io` would be a wild
+        // vtable call. (`rng` defaults to null — seeded lazily.)
+        .io = std.testing.io,
         .gpa = std.testing.allocator,
-        .rng = std.Random.DefaultPrng.init(0),
     };
     w.fds.appendSlice(std.testing.allocator, &.{ .stdin, .stdout, .stderr }) catch unreachable;
     return w;
@@ -1862,7 +1924,7 @@ test "symlink traversal: in-sandbox links follow, escaping links refused (#17/4.
     var mem = Memory{ .bytes = &mem_bytes, .max = null };
     var obuf: [8]u8 = undefined;
     var ow = Io.Writer.fixed(&obuf);
-    var w = Wasi.init(gpa, tio, &ow, &ow, 0);
+    var w = Wasi.init(gpa, tio, &ow, &ow);
     defer w.deinit(); // closes the preopen (owned) + any fd path_open opened
     w.memory = &mem;
     try w.fds.append(gpa, .{ .dir = .{ .handle = pre, .preopen_name = null, .owned = true } });
@@ -1962,7 +2024,7 @@ test "symlink resolver fuzz: no adversarial topology reaches outside the preopen
     var mem = Memory{ .bytes = &mem_bytes, .max = null };
     var obuf: [8]u8 = undefined;
     var ow = Io.Writer.fixed(&obuf);
-    var w = Wasi.init(gpa, tio, &ow, &ow, 0);
+    var w = Wasi.init(gpa, tio, &ow, &ow);
     defer w.deinit();
     w.memory = &mem;
     try w.fds.append(gpa, .{ .dir = .{ .handle = pre, .preopen_name = null, .owned = true } });
@@ -2145,4 +2207,45 @@ test "args_sizes_get + args_get round-trip argv into memory" {
     const p1 = w.readU32(20).?;
     try std.testing.expectEqualStrings("prog", std.mem.sliceTo(mem_bytes[p0..], 0));
     try std.testing.expectEqualStrings("hi", std.mem.sliceTo(mem_bytes[p1..], 0));
+}
+
+test "random_get returns real entropy, not zeros or a predictable stream" {
+    // `random_get` is WASI's CSPRNG — a guest's `getrandom()`, so its key
+    // material, nonces and (in Rust) HashMap seeds come from here. It used to be
+    // Xoshiro256++ seeded from `Io.Timestamp.now`, i.e. searchable by anyone who
+    // knew roughly when the process started.
+    //
+    // Two regressions are worth pinning: seeding from `io.random` (which
+    // documents a fallback to "a less secure mechanism", and is `noRandom` —
+    // all zeros — on an `Io` without randomness), and reverting to a
+    // deterministically-seeded PRNG. A fresh `Wasi` must therefore produce
+    // non-constant bytes, and two independent instances must not agree.
+    var mem_bytes = [_]u8{0} ** 64;
+    var mem = Memory{ .bytes = &mem_bytes, .max = null };
+    var obuf: [8]u8 = undefined;
+    var ow = Io.Writer.fixed(&obuf);
+
+    var results = [_]Value{interp.i32Value(-1)};
+    const call = [_]Value{ interp.i32Value(0), interp.i32Value(32) }; // buf=0, len=32
+
+    var w1 = testWasi(&mem, &ow);
+    defer w1.fds.deinit(std.testing.allocator);
+    try std.testing.expect(wRandomGet(&w1, &call, &results));
+    try std.testing.expectEqual(errno.success, @as(u32, @bitCast(interp.asI32(results[0]))));
+    const first = mem_bytes[0..32].*;
+
+    // Not all zeros — the `noRandom`/unseeded signature.
+    try std.testing.expect(!std.mem.allEqual(u8, &first, 0));
+
+    // A second draw from the same instance differs (the stream advances).
+    try std.testing.expect(wRandomGet(&w1, &call, &results));
+    try std.testing.expect(!std.mem.eql(u8, &first, mem_bytes[0..32]));
+
+    // A separate instance does not reproduce the first stream. With real
+    // entropy this collides with probability 2^-256; with any fixed seed it
+    // would collide every run.
+    var w2 = testWasi(&mem, &ow);
+    defer w2.fds.deinit(std.testing.allocator);
+    try std.testing.expect(wRandomGet(&w2, &call, &results));
+    try std.testing.expect(!std.mem.eql(u8, &first, mem_bytes[0..32]));
 }

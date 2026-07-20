@@ -26,6 +26,73 @@ const Op = opcode.Op;
 /// WebAssembly linear-memory page size (64 KiB).
 pub const page_size = 64 * 1024;
 
+/// Linear memory is allocated from the **OS page allocator**, never from the
+/// instance's general-purpose allocator.
+///
+/// Fresh OS mappings are demand-zero — `NtAllocateVirtualMemory(.COMMIT)` on
+/// Windows and `mmap(MAP_ANONYMOUS)` on POSIX both guarantee zero-filled pages,
+/// and `std.heap.PageAllocator` goes straight to those and back with no
+/// free-list or recycling. So a declared memory minimum costs **address space,
+/// not resident memory**, and needs no eager `@memset`.
+///
+/// A general-purpose allocator cannot be used here: it hands back recycled
+/// blocks holding old host data, which the guest must never observe — hence the
+/// eager zero-fill the old code needed, which is what made a **38-byte** module
+/// declaring `(memory 65535)` cost **4 GB of RSS and 2.85 s**. The zeroing
+/// guarantee is the load-bearing property; `test "memory is zero-initialized"`
+/// pins it.
+const memory_allocator = std.heap.page_allocator;
+
+/// Alignment for guest linear memory. The page allocator page-aligns anyway;
+/// naming it keeps `rawAlloc`/`rawFree`/`rawRemap` in agreement (they must be
+/// passed the same alignment).
+const guest_mem_align: std.mem.Alignment = .fromByteUnits(16);
+
+/// Allocate `n` bytes of guest-visible linear memory — demand-zero and NOT
+/// poisoned.
+///
+/// This goes through `rawAlloc` rather than `Allocator.alloc` deliberately:
+/// `std.mem.Allocator` fills every allocation with `undefined` when runtime
+/// safety is on, which in a Debug/ReleaseSafe build is `0xAA`. That poison
+/// would (a) make the guest read `0xAA` where the spec requires **zero** — a
+/// wrong answer that differs by build mode, the nastiest kind — and (b) touch
+/// every page, destroying the laziness this whole path exists for. A 1 GiB
+/// declaration measured 1029 MB RSS and returned `0xAAAAAAAA` to the guest
+/// before this was fixed. `rawAlloc` skips the poison and hands back the OS
+/// mapping as-is, which the OS guarantees is zero-filled.
+fn allocGuestMemory(n: usize) error{OutOfMemory}![]u8 {
+    if (n == 0) return &.{};
+    const p = memory_allocator.rawAlloc(n, guest_mem_align, @returnAddress()) orelse
+        return error.OutOfMemory;
+    return p[0..n];
+}
+
+fn freeGuestMemory(buf: []u8) void {
+    if (buf.len == 0) return;
+    memory_allocator.rawFree(buf, guest_mem_align, @returnAddress());
+}
+
+/// Grow guest memory to `n` bytes (`n >= old.len`), keeping the tail zero.
+/// A remap extends the mapping with fresh (zero) pages; the fallback lands in a
+/// fresh mapping whose bytes past the copy are already zero. Either way no
+/// `@memset` — a 4 GiB grow must not touch 4 GiB.
+fn growGuestMemory(old: []u8, n: usize) error{OutOfMemory}![]u8 {
+    if (old.len == 0) return allocGuestMemory(n);
+    if (memory_allocator.rawRemap(old, guest_mem_align, n, @returnAddress())) |p| return p[0..n];
+    const new = try allocGuestMemory(n);
+    @memcpy(new[0..old.len], old);
+    freeGuestMemory(old);
+    return new;
+}
+
+/// Default ceiling on the linear memory one instance may allocate, summed over
+/// all its memories (multi-memory), applied at instantiation *and* at
+/// `memory.grow`. Address space is still finite, so lazy pages alone do not
+/// bound a hostile module. 1 GiB is far above any realistic guest — the wasmtk
+/// WASI corpus sits orders of magnitude below it. Override per-instance via
+/// `Imports.max_memory_bytes` (CLI: `--max-memory`).
+pub const default_max_memory_bytes: usize = 1 << 30;
+
 /// A runtime value: a raw 64-bit slot reinterpreted per the (validated) type.
 pub const Value = u64;
 
@@ -152,6 +219,16 @@ pub const Error = Module.Error || error{
     /// to propagate a `throw` across frames; if it reaches the top of a call it
     /// is an uncaught exception, which traps (EH proposal, Phase 6).
     UncaughtException,
+    /// The module's declared linear memory (at instantiation, or after a
+    /// `memory.grow`) exceeds this instance's `max_memory_bytes` budget. A tiny
+    /// module can declare gigabytes, so the ceiling is what keeps a hostile
+    /// input from exhausting address space. Raise it with `--max-memory`.
+    MemoryLimitExceeded,
+    /// The function section and the code section declared different counts. The
+    /// validator also rejects this (`validate.CountMismatch`), but the CLI *run*
+    /// path never validates, so instantiation must reject it itself — the two
+    /// slices are iterated in lockstep below.
+    CountMismatch,
 };
 
 /// Null reference sentinel — on the value stack (`ref.null`) and as an
@@ -284,6 +361,9 @@ pub const Instance = struct {
     memories: []*Memory,
     /// How many leading entries of `memories` are imported (borrowed, not freed).
     imported_memories: usize,
+    /// Ceiling on total linear memory for this instance, carried so `memory.grow`
+    /// enforces the same budget instantiation did.
+    max_memory_bytes: usize,
     /// Reference tables, one shared `*Table` per module table (imports first, so
     /// an imported table reflects the exporter's growth). The outer slice is
     /// `gpa`-owned; `tables[0..imported_tables]` are borrowed objects.
@@ -368,6 +448,10 @@ pub const Instance = struct {
         globals_hi: []const Value = &.{},
         memories: []const *Memory = &.{},
         tables: []const *Table = &.{},
+        /// Ceiling on linear memory this instance may allocate, summed over all
+        /// its memories and enforced again by `memory.grow`. See
+        /// `default_max_memory_bytes`.
+        max_memory_bytes: usize = default_max_memory_bytes,
     };
 
     pub fn init(gpa: std.mem.Allocator, module: *const Module) Error!Instance {
@@ -417,6 +501,14 @@ pub const Instance = struct {
                     .type_index => |ti| if (module.funcSig(ti) == null) return error.UndefinedType,
                     else => {},
                 },
+                // `try_table` carries its block type INSIDE the immediate, so the
+                // `.block_type` arm above never sees it — `blockArity` would then
+                // `.?`-unwrap a null `funcSig` and iterate a garbage slice. Check
+                // the nested block type the same way (sibling of the arm above).
+                .try_table => |tt| switch (tt.block_type) {
+                    .type_index => |ti| if (module.funcSig(ti) == null) return error.UndefinedType,
+                    else => {},
+                },
                 else => {},
             }
         }
@@ -444,6 +536,15 @@ pub const Instance = struct {
             };
             if (module_has_v128) break;
         };
+
+        // The multi-object `for` below requires all three lengths to be equal;
+        // unequal is illegal behavior, and in ReleaseFast (unchecked) it iterates
+        // the FIRST object's length — reading `Module.Code` structs past the end
+        // of the code slice and handing their garbage `body` ptr/len straight to
+        // `decodeBody`. The decoder does not compare the two section counts (only
+        // `validate` does, and the run path skips it), so a module declaring N
+        // functions with M < N code bodies reaches here. Reject it first.
+        if (module.functions.len != module.code.len) return error.CountMismatch;
 
         const bodies = try a.alloc(FuncBody, module.functions.len);
         for (module.functions, module.code, bodies) |type_index, code, *body| {
@@ -569,9 +670,10 @@ pub const Instance = struct {
         errdefer gpa.free(memories);
         var built: usize = 0;
         errdefer for (memories[imported_memories..built]) |m| { // free only owned ones built so far
-            gpa.free(m.bytes);
+            freeGuestMemory(m.bytes);
             gpa.destroy(m);
         };
+        var total_memory_bytes: usize = 0;
         for (module.memories, 0..) |mt, i| {
             if (i < imported_memories) {
                 if (i >= imports.memories.len) return error.MissingImport;
@@ -581,10 +683,14 @@ pub const Instance = struct {
                 // build) `min * page_size` would overflow, so multiply with an
                 // overflow check → clean OOM (harmless on 64-bit: 2^32 × 2^16 fits).
                 const nbytes = std.math.mul(usize, @as(usize, mt.limits.min), page_size) catch return error.OutOfMemory;
-                const buf = try gpa.alloc(u8, nbytes);
-                @memset(buf, 0);
+                // Budget across ALL defined memories, not per memory — otherwise
+                // multi-memory trivially multiplies past the ceiling.
+                total_memory_bytes = std.math.add(usize, total_memory_bytes, nbytes) catch return error.MemoryLimitExceeded;
+                if (total_memory_bytes > imports.max_memory_bytes) return error.MemoryLimitExceeded;
+                // Demand-zero OS pages: no eager @memset — see `memory_allocator`.
+                const buf = try allocGuestMemory(nbytes);
                 const mem_obj = gpa.create(Memory) catch |e| {
-                    gpa.free(buf);
+                    freeGuestMemory(buf);
                     return e;
                 };
                 mem_obj.* = .{ .bytes = buf, .max = mt.limits.max };
@@ -671,6 +777,7 @@ pub const Instance = struct {
             .import_funcs = imports.funcs,
             .memories = memories,
             .imported_memories = imported_memories,
+            .max_memory_bytes = imports.max_memory_bytes,
             .tables = tables,
             .imported_tables = n_imported_tables,
             .elem_values = elem_values,
@@ -683,7 +790,7 @@ pub const Instance = struct {
         // Free only owned (defined) memories/tables; imported ones belong to the
         // exporting instance.
         for (self.memories[self.imported_memories..]) |m| {
-            self.gpa.free(m.bytes);
+            freeGuestMemory(m.bytes); // linear memory is page-allocator owned
             self.gpa.destroy(m);
         }
         self.gpa.free(self.memories);
@@ -997,12 +1104,33 @@ const Frame = struct {
     func_index: u32,
     vstack: std.ArrayList(Value) = .empty,
     labels: std.ArrayList(Label) = .empty,
+    /// Set by `pop` when the operand stack was empty. See `pop`.
+    underflowed: bool = false,
 
     fn pushU64(self: *Frame, v: Value) Error!void {
         try self.vstack.append(self.a, v);
     }
+    /// Pop one operand slot.
+    ///
+    /// The run path does not validate, so a malicious body can consume more
+    /// operands than it produced — `(func (export "f") drop)` reaches here with
+    /// an empty stack. The old `vstack.pop().?` was a null unwrap: a panic in
+    /// Debug/ReleaseSafe and **undefined behaviour in the shipped ReleaseFast
+    /// build**, where the optimizer may assume the stack is non-empty.
+    ///
+    /// Making this `Error!Value` would mean `try` at 237 call sites in the hot
+    /// loop, so instead underflow yields a *defined* 0 and raises a flag that
+    /// `run`'s dispatch loop turns into `error.StackUnderflow` before the next
+    /// instruction. At most one instruction executes with a substituted 0, and
+    /// that cannot escape the sandbox: every consumer of a popped value — memory
+    /// addresses, table/GC/element indices, branch depths — is independently
+    /// bounds-checked, so a 0 is merely wrong, never unsafe.
     fn pop(self: *Frame) Value {
-        return self.vstack.pop().?;
+        return self.vstack.pop() orelse {
+            @branchHint(.cold); // only a malformed body gets here
+            self.underflowed = true;
+            return 0;
+        };
     }
     /// Base index of the top `n` value slots. The run path does not validate
     /// operand-stack height, so a malicious module can reach an op with fewer
@@ -1743,6 +1871,18 @@ const Frame = struct {
                 },
             }
         }
+        // Catches both ways the loop ends: falling off the last instruction, and
+        // `return` (which sets `pc = ir.len`). The *other* ways control leaves a
+        // frame — call arguments, `branch`, the epilogue — already trap on a
+        // short stack via `stackBase`/`peek`, so this one check completes the
+        // coverage without costing a branch per instruction (measured: a
+        // per-instruction check cost ~12%, 250 → 220 Mops/s).
+        //
+        // Deferring the trap to here is safe because `pop` substitutes a
+        // *defined* 0: every consumer of a popped value — memory addresses,
+        // table/GC/element indices, branch depths — is independently
+        // bounds-checked, so the interim value is wrong, never unsafe.
+        if (self.underflowed) return error.StackUnderflow;
     }
 
     /// The integer arithmetic / comparison / bitwise / conversion opcodes.
@@ -2035,9 +2175,16 @@ const Frame = struct {
         const limit: u64 = @min(m.max orelse 65536, 65536);
         if (old_pages + delta > limit) return self.pushI32(-1);
         const nbytes = std.math.mul(usize, @intCast(old_pages + delta), page_size) catch return self.pushI32(-1);
-        const new_buf = self.inst.gpa.realloc(old, nbytes) catch
+        // Same budget instantiation enforced: otherwise a module declaring a
+        // small minimum could just grow past the ceiling. `memory.grow` reports
+        // failure as -1 (spec), so this is a clean refusal, not a trap.
+        if (nbytes > self.inst.max_memory_bytes) return self.pushI32(-1);
+        // Page-allocator owned, and the grown tail is demand-zero either way:
+        // a resize-in-place commits fresh (zero) pages, and a move lands in a
+        // fresh mapping whose bytes past the copy are already zero. So no
+        // @memset — which is the point, a 4 GiB grow must not touch 4 GiB.
+        const new_buf = growGuestMemory(old, nbytes) catch
             return self.pushI32(-1);
-        @memset(new_buf[old.len..], 0);
         m.bytes = new_buf; // shared object → visible to importers
         try self.pushI32(@intCast(old_pages));
     }
@@ -3977,6 +4124,58 @@ test "SIMD: a v128 global initializes, gets, and extracts a lane" {
 // trap, never index out of bounds. The CLI run path does not validate, so these
 // modules decode cleanly and are rejected by the interpreter's own guards
 // (`checkStaticIndices` at load time; bounds checks at cold GC/EH/branch sites).
+
+test "hardening: guest linear memory is zero-initialized, in every build mode" {
+    // THE load-bearing invariant behind allocating linear memory with `rawAlloc`
+    // from the page allocator: OS pages are zero, so no eager `@memset` is
+    // needed. Going through `Allocator.alloc` instead would poison the memory
+    // with `undefined` (0xAA) whenever runtime safety is on — the guest would
+    // read 0xAA where the spec says 0, *and* every page would be touched,
+    // costing 1029 MB RSS for a 1 GiB declaration. This test is what catches
+    // that regression; it is meaningful precisely because tests run in Debug.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (memory 2) — two pages, no data segments, nothing ever written.
+    const bytes = try ehModule(a, &.{
+        .{ .id = 5, .body = &.{ 0x01, 0x00, 0x02 } },
+    });
+    var inst = try instantiate(bytes);
+    defer destroy(&inst);
+    const mem = inst.memory0().?.bytes;
+    try std.testing.expectEqual(@as(usize, 2 * page_size), mem.len);
+    for (mem) |b| try std.testing.expectEqual(@as(u8, 0), b);
+}
+
+test "hardening: a memory minimum past the budget is refused, not allocated" {
+    // A 38-byte module declaring `(memory 65535)` used to cost 4 GB of RSS and
+    // 2.85 s; the budget refuses it in microseconds.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try ehModule(a, &.{
+        .{ .id = 5, .body = &.{ 0x01, 0x00, 0xff, 0xff, 0x03 } }, // min = 65535 pages ≈ 4 GiB
+    });
+    try std.testing.expectError(error.MemoryLimitExceeded, instantiate(bytes));
+}
+
+test "hardening: popping an empty operand stack traps instead of unwrapping null" {
+    // `(func (export "f") drop)` — consumes an operand it never produced. The
+    // run path does not validate, so this reaches `Frame.pop` with an empty
+    // stack; the old `vstack.pop().?` was a null unwrap (UB in ReleaseFast).
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fbody = [_]u8{ 0x00, 0x1a, 0x0b }; // no locals; drop; end
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x00 } },
+        .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{&fbody}) },
+    });
+    var inst = try instantiate(bytes);
+    defer destroy(&inst);
+    try std.testing.expectError(error.StackUnderflow, inst.invokeIndex(0, &.{}));
+}
 
 test "hardening: local.get past the local count is rejected at load time" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

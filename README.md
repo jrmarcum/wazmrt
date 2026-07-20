@@ -55,8 +55,10 @@ zig build run -- <file.wasm>       # summarize, or run _start (WASI command)
 zig build run -- <file.wat>        # assemble .wat, then the same
 zig build run -- <file.wasm> <export> [args…]   # run an exported function
 zig build test                     # unit tests
+zig build test-safe                # the same suite under ReleaseSafe (optimized, safety checks kept)
 zig build wasi-gate                # compile Zig+C wasm32-wasi programs, run them, assert output
                                    #   add -Drust-gate=true to also cross-check a rustc build
+zig build conformance -Dtestsuite=<dir>   # run a WebAssembly spec-testsuite checkout (.wast)
 zig build wasm                     # build the runtime itself as a wasm module
 zig build dll                      # C-ABI shared library (for FFI: Deno, ctypes, …)
 zig build c-smoke                  # build + run the C example (needs no external deps)
@@ -67,6 +69,11 @@ zig build bench                    # interpreter microbenchmark (ReleaseFast)
 Run `wazmrt --help` (`-h`) for the full list of run modes, WASI/verification
 flags, and subcommands, or `wazmrt --version` (`-v`) for the version and whether
 this build embeds a signature trust anchor.
+
+The spec testsuite is not vendored — clone it and point the step at it
+(`git clone https://github.com/WebAssembly/testsuite`); with no `-Dtestsuite` the
+step just prints usage. If `zig build` ever fails with a bare `error: Unexpected`
+before doing any work, the local `.zig-cache` is corrupt — `rm -rf .zig-cache`.
 
 The runtime loads over FFI from any host language: `zig build dll` produces a
 libc-free `wazmrt.dll`, and [`examples/deno_ffi.mjs`](examples/deno_ffi.mjs)
@@ -104,6 +111,13 @@ from, the read-only-ness propagates to the whole subtree — nothing opened unde
 environment variable visible to the guest; the guest's environment is otherwise
 empty. All preopen/`--env` flags are consumed by wazmrt; everything after `--`
 (or the first non-flag) is the guest's `argv`.
+
+A guest's linear memory is capped at **1 GiB** by default — a module declares its
+own memory size, and a few bytes can ask for gigabytes. Raise or lower it with
+`--max-memory <size>` (`512M`, `2G`, or a plain byte count); a module that asks
+for more is refused with `MemoryLimitExceeded`. Memory within the cap costs
+address space rather than RAM — it is committed by the OS as the guest touches
+it, so declaring a large memory is cheap until it is used.
 
 > **Scope of the sandbox.** Containment is enforced two ways: **lexically** (a
 > guest cannot name a path outside its preopens) and **through the filesystem**
@@ -146,7 +160,9 @@ the enforcement policy — `# mode: off | warn | enforce`:
 
 Before running, wazmrt hashes the exact in-memory bytes it is about to execute
 (so the verified bytes *are* the executed bytes — no swap-after-check race) and
-looks them up. `--pins <path>` overrides the DB location and `--verify <mode>`
+looks them up. This covers **every** form that executes, including `.wast`
+scripts — a `.wast` runs the modules it contains, so it is gated as a unit and
+`wazmrt pin script.wast` is what authorizes it. `--pins <path>` overrides the DB location and `--verify <mode>`
 can *raise* strictness — **but only when the root-owned default DB does not
 `enforce`.** If it does, both flags are ignored and `--no-verify` is refused: a
 runtime argument can never weaken a root-mandated `enforce`, so the policy holds
@@ -192,7 +208,10 @@ Implemented: stdout/stderr/stdin, args/environ, clocks, `poll_oneoff` (clock
 sleep), `random_get`, `proc_exit`, and the filesystem (`path_open`, `fd_read`/
 `fd_write`/`fd_seek`/`fd_tell`/`fd_pread`/`fd_pwrite`/`fd_sync`, `fd_readdir`,
 `*_filestat_get`/`*_filestat_set_times`, `fd_allocate`, create/unlink/rename,
-`path_symlink`/`path_readlink`, `path_link`). Not implemented: sockets — those
+`path_symlink`/`path_readlink`, `path_link`). `random_get` is a real CSPRNG
+(ChaCha seeded from OS entropy), so a guest's `getrandom()` is safe for key
+material; if the host offers no entropy source it returns `EIO` rather than weak
+bytes. Not implemented: sockets — those
 return `ENOTSUP` rather than trapping, so a module still instantiates and fails
 gracefully. Note `path_link`/`path_symlink` need OS support/privilege that is
 absent on unprivileged Windows (they return `ENOTSUP` there; both work on POSIX).

@@ -328,6 +328,184 @@ reject-valid, C-ABI trap-frame borrowed instance).
 - `wat.zig naturalAlign` and `validate.zig naturalAlignLog2` are byte-identical duplicated helpers (both
   live). Could share; no correctness issue.
 
+### Untrusted-input DoS + name-bound-import class — DONE 2026-07-20 (10th "check for code issues") — 10 FIXED
+
+The first pass in a while to find **crashes reachable from a handful of bytes**. The prior nine passes had
+saturated the *explicit-index* surface; this one's finds all sit in classes those sweeps structurally could
+not see: a **parser that fails to advance** (no index involved), **imports bound by name without checking the
+declared type**, and **two parallel arrays the decoder never cross-checks**. Four auditors (interp/opcode ·
+new uncommitted work · wat/sexpr/Module/Reader · wasi/c-api/main/pin/sign/validate), each finding traced to a
+concrete input and re-verified against the rebuilt CLI.
+
+**The one that matters most — `sexpr.zig` lone `;` → infinite loop. CRITICAL.**
+`skipTrivia` consumes `;;` and `(;` but **not** a bare `;`; `parseAtom` treats `;` as a terminator, so it
+returns an **empty** atom **without advancing `pos`**, and `parseAll`/`parseList` append empty atoms forever.
+`(module) ; x` — **12 bytes** — hung the shipped CLI at **10.4 GB RSS in 12 s**. Reachable pre-gate from
+`wazmrt file.wat`, `file.wast`, `sign`, and `pin <dir>` (which assembles every `.wat` it walks). Fixed:
+`parseValue` rejects a lone `;` → `error.UnexpectedChar`, **plus** a zero-progress guard (`at.len == 0`) so no
+future `parseAtom` delimiter can reintroduce the class. *Lesson: the `NestingTooDeep` fix (3rd pass) hardened
+this same file against a `((((`-bomb — but a depth cap only sees recursion, not a loop that never advances.
+`;;` and `(;` were handled; the single-char case fell between them.*
+
+**`wasi.zig` — host imports bound by NAME only, declared arity never checked. HIGH (host segfault).**
+`main.zig` wires `wasi.hostFunc(imp.name)`; `interp.callFunction` sizes the `args` slice from the **module's**
+declaration. So `(import "wasi_snapshot_preview1" "fd_write" (func))` — zero params — made every
+`argU32(args, 0..3)` read past the end of the value stack. **Verified: exit 139 from a 4-line `.wat`.** Also
+reproduced via `path_open`/`poll_oneoff`/`fd_seek`/`random_get`/`args_get`; a *partly*-short arity doesn't
+crash but silently leaks one stack slot into guest-visible results (`fd_seek`'s `delta`/`whence`). Fixed with
+a comptime `guardArity(f, n)` wrapper on every entry in `callFor`'s map, `n` = the preview-1 parameter count;
+short call → `false` → `error.HostTrap` (hard abort, per the project rule), never a silent errno. Arities were
+cross-checked against the highest index each implementation actually reads, so none can be under-declared.
+
+**`main.zig:767` — `module.funcType(fi).?` on an export index the decoder never cross-checks. HIGH (segfault).**
+`Module.decode` enforces no section-order/no-duplicate rules: a **second** `function` section *appends* to
+`func_space` but *replaces* `module.functions`, so an export index the decoder accepted can be out of range for
+`funcType`. The run path never validates, so it reached a null unwrap → **exit 139 from a 31-byte module**
+(verified). Fixed: `orelse` → a named error. *Note this fires before `Instance.init`, so the CountMismatch
+guard below does not cover it.*
+
+**`interp.zig initWithImports` — `for (module.functions, module.code, bodies)` with unequal lengths. HIGH.**
+Zig requires equal lengths; unequal is illegal behavior, and in **ReleaseFast** it iterates the *first*
+object's length — reading `Module.Code` structs past the end of the code slice and handing their garbage
+`body` ptr/len straight to `decodeBody`. Only `validate.zig:62` compared the two section counts, and the CLI
+run path never validates. Fixed: `error.CountMismatch` at the top of `initWithImports`. (Left `Module.decode`
+alone deliberately — rejecting there would reclassify an *invalid* module as *malformed* and could move
+`assert_invalid`/`assert_malformed` conformance results.)
+
+**`interp.zig checkStaticIndices` — `try_table`'s block type was never bounds-checked. HIGH.**
+The `.block_type` arm covers `block`/`loop`/`if`/legacy `try`, but `try_table` carries its block type *inside*
+the `.try_table` immediate, so it fell to `else => {}`. `blockArity` then `.?`-unwrapped a null `funcSig` and
+iterated a garbage slice, whose length became the label arity that `branch` copies with. Fixed: a `.try_table`
+arm mirroring the `.block_type` one. **The sibling-of-a-fixed-site pattern again** — exactly what the 4th pass
+warned about.
+
+**`wat.zig parseTable` — two unguarded `items[i]`. HIGH (wrong-union deref in ReleaseFast).**
+`(module (table))`, `(table $t)`, `(table (export "x"))` leave `i == items.len` at the `isRefType(items[i])`
+probe; `(table 1)` / `(table 1 2)` run out at the element-type read after min/max (the *max* probe was
+guarded, its twin was not). The sibling paths had all been hardened in the 3rd/4th passes — `parseTable` is
+the mirror the sweep missed, **for the third pass running**. Fixed via `nth`.
+
+**`wasm_c_api.zig wasm_ref_copy` — use-after-free + double-free. HIGH.**
+`RefApi.copy` (the typed `wasm_X_copy`) *duplicates* a `vec_owned` export handle because
+`wasm_extern_vec_delete` calls `destroyRef` unconditionally, ignoring the refcount. `wasm_ref_copy` — the base
+`wasm_ref_t` copy the header declares — was a plain `retain`, so
+`wasm_ref_copy(wasm_extern_as_ref(exports.data[0]))` then `wasm_extern_vec_delete` then `wasm_ref_delete`
+released into freed heap and could destroy it twice. All header-sanctioned calls, no misuse. Fixed by applying
+the same dup rule. *Why #22's fuzzer missed it: it only ever obtains refs from `wasm_table_get`, never from
+`wasm_extern_as_ref` + `wasm_ref_copy`.*
+
+**`wasm_c_api.zig hostTrampoline` — uninitialized heap disclosed to the guest. MEDIUM.**
+`resvec` comes from `wasm_val_vec_new_uninitialized` and **every** slot is read back, but `wasm_instance_new`
+never checks the host functype against the import it backs — so a callback declaring fewer results (or leaving
+a slot unwritten) handed the guest raw host heap. Fixed: zero the vec first, plus null-`data` guards on both
+vecs (OOM would have dereferenced null).
+
+**`wasm_c_api.zig freeExternType` — `wasm_tagtype_delete` was a silent no-op. MEDIUM (unbounded leak).**
+`EXTERN_TAG` fell into `else => {}` while `wasm_tagtype_new`/`copyExternType` both allocate a TagType **and**
+an owned FuncType with two valtype vecs. The only `wasm_X_new` in the file with no working destructor. Fixed.
+
+**`main.zig flagRegion` — guest argv could disable signature verification. MEDIUM (security).**
+The doc comment already stated the rule ("a guest arg that happens to read `--no-verify` is never mistaken for
+one of ours") but the code only truncated at an explicit `--`. The common WASI form has no `--`
+(`wazmrt prog.wasm install --yes`), so the **guest's own arguments** were scanned and `--yes`/`--no-verify`
+anywhere in them set `opt_out` → `pin.decide(...)` returned `.run`. Bounded by root `# mode: enforce`, so it
+failed open only in armed-default and `warn` modes — i.e. the ordinary deployment. Fixed: `flagRegion` now
+consumes only the **leading run of recognized wazmrt flags**, mirroring exactly what `runWasi` consumes.
+
+**DEFERRED — owner decisions, deliberately not taken unilaterally:**
+- ~~**Eager memory commit — a 38-byte module costs 4 GB.**~~ **FIXED 2026-07-20** (owner chose *lazy pages +
+  a cap*, default 1 GiB with `--max-memory`) — see "Linear memory: lazy pages + a budget" below.
+- ~~**`random_get` is not a CSPRNG.**~~ **FIXED 2026-07-20** — `std.Random.DefaultCsprng` (ChaCha) seeded
+  lazily from **`io.randomSecure`**; `Wasi.init` no longer takes a seed. `randomSecure` (not `io.random`,
+  which falls back to "a less secure mechanism" and is `noRandom` = **all zeros** on an `Io` without
+  randomness); entropy failure → **`EIO`**, never weak bytes. Seeding through `Io` rather than
+  `std.crypto.random` kept the freestanding-wasm target building; lazy seeding kept cold-start at
+  1.11 µs/run. Details in `security-model.md`.
+- ~~**`.wast` bypasses `verifyGate` entirely.**~~ **FIXED 2026-07-20** — `verifyGate` now runs on the script
+  bytes before `runScript`. Hashing the *script* is the right granularity: every module it executes is
+  contained in those bytes, so authorizing the script authorizes exactly what it can run. E2E-verified:
+  unpinned `.wast` under enforce → refused; `wazmrt pin <f>.wast` → runs; bare build (no DB) → unchanged.
+  *Lesson: the gate was attached to the "module" path, not to **every path that executes** — when adding an
+  input form to `main.zig`, ask "does this execute?", not "is this a module?".* See `security-model.md`.
+- Still-open LOWs from earlier passes, re-confirmed: `validate.zig` inspect-path DoS (`array_new_fixed`,
+  locals expansion, **plus** a newly-measured `pushCtrl` `dupe(bool, local_init)` per control frame — a 512 KB
+  module drove **767 MB** peak, ~1500× amplification), `br_on_non_null` reject-valid, C-ABI trap-frame borrowed
+  `*Instance`, `wasi.zig` u32-before-widening offsets (add `writeStringVec` to that site list), `keygen`
+  writing the Ed25519 seed with default (world-readable) permissions, `--verify <bad>` silently ignored,
+  `wasm_instance_new` import-loop `host_funcs` OOM leak, `wat.zig` `(table N …)` unbounded `alloc(Sexpr, min)`
+  (clean OOM fail). *(`Frame.pop`'s unguarded `vstack.pop().?` was on this list; **FIXED 2026-07-20** — see
+  "Operand-stack underflow" below.)*
+
+**Verification:** `zig build test` **389/393 (4 skipped)** and `zig build test-safe` (ReleaseSafe — where
+out-of-range `@intCast`/OOB/null-unwrap panic instead of being silent UB) **389/393**, both matching the
+pre-change baseline; `c-smoke` OK (319/319 symbols); `wasi-gate` exit 0; every reproducer re-run against the
+rebuilt CLI; `examples/*.wat` and a comment-heavy `.wat` still assemble (the `;` fix does not touch `;;`/`(;`).
+
+**Environment note (not a code defect):** the repo's local `.zig-cache` was corrupt — *every* `zig build`
+invocation, including `zig build --help`, failed with a bare `error: Unexpected`. It looks exactly like a
+build break. `rm -rf .zig-cache` clears it; this pass worked around it with `ZIG_LOCAL_CACHE_DIR`.
+
+### Linear memory: lazy pages + a budget — DONE 2026-07-20 (10th-pass deferred item #1)
+
+**Was:** `Instance.init` allocated *and eagerly zero-filled* every declared memory minimum, so a **38-byte**
+module declaring `(memory 65535)` cost **4054 MB RSS / 2.85 s**, and multi-memory multiplied it. **Owner
+chose "lazy pages + a cap"** (1 GiB default, `--max-memory` to change).
+
+**Now:** linear memory comes from `std.heap.page_allocator` instead of the instance allocator. Fresh OS
+mappings are **demand-zero** (`NtAllocateVirtualMemory(.COMMIT)` / `mmap(MAP_ANONYMOUS)`; `PageAllocator`
+goes straight to those and back with **no free-list**, verified in std source), so a declared minimum costs
+*address space*, not resident memory, and needs no `@memset`. A per-instance budget
+(`Imports.max_memory_bytes`, default `default_max_memory_bytes` = 1 GiB) is summed across **all** memories
+and enforced again in `memory.grow` (which reports failure as `-1`, per spec, not a trap).
+
+Measured: 4 GiB declaration **2.85 s / 4054 MB → 0.05 s / ~0 MB** (`MemoryLimitExceeded`); a 1 GiB
+declaration (at the cap) instantiates in **0.15 s at ~0 MB RSS** and the guest reads **0**; `hello_wasi`
+unchanged.
+
+**The trap that nearly shipped — `std.mem.Allocator.alloc` poisons.** The first version used
+`memory_allocator.alloc`, and the 1 GiB probe came back **1029 MB RSS with the guest reading
+`0xAAAAAAAA`**. `std.mem.Allocator.allocBytesWithAlignment` does `if (runtime_safety) @memset(byte_slice,
+undefined)` — so under Debug/ReleaseSafe every allocation is filled with `0xAA`. That both touched every
+page (destroying the laziness) **and** made the guest observe `0xAA` where the spec requires zero — a
+wrong answer *that differs by build mode*, which is the worst kind to ship. Fixed by going through
+`rawAlloc`/`rawFree`/`rawRemap` (`allocGuestMemory`/`freeGuestMemory`/`growGuestMemory`), which skip the
+poison. **`test "hardening: guest linear memory is zero-initialized, in every build mode"` pins it, and is
+meaningful precisely because the suite runs in Debug.** *Lesson: "the allocator returns zeroed pages" is
+false for `Allocator.alloc` under safety — measure the bytes the guest actually sees, don't reason about
+it.*
+
+### Operand-stack underflow: `Frame.pop` — DONE 2026-07-20 (10th-pass deferred item #4)
+
+**Was:** `fn pop` was `self.vstack.pop().?`. `(func (export "f") drop)` consumes an operand it never
+produced, so on the unvalidated run path this reached a **null unwrap** — panic in Debug/ReleaseSafe,
+**undefined behaviour in the shipped ReleaseFast build** (the optimizer may assume the stack is non-empty).
+
+**Now:** underflow yields a *defined* `0` and sets `Frame.underflowed`, which the end of `run`'s dispatch
+loop turns into `error.StackUnderflow`. Converting `pop` to `Error!Value` was rejected: **237 pop-family
+call sites** in the hot loop.
+
+**Why deferring the trap to the end of the loop is safe:** the substituted `0` cannot escape the sandbox —
+every consumer of a popped value (memory addresses, table/GC/element indices, branch depths) is
+independently bounds-checked, so the interim value is *wrong, never unsafe*. The end-of-loop check catches
+both exits (falling off the last instruction, and `return`, which sets `pc = ir.len`); the other ways
+control leaves a frame — call arguments, `branch`, the epilogue — already trap via `stackBase`/`peek`.
+
+**Perf — measured, and the reason for the shape (`zig build bench`, ReleaseFast):**
+
+| variant | steady-state |
+| --- | --- |
+| baseline (`.?`, UB) | 248–252 Mops/s |
+| flag, no `@branchHint` | 218–226 Mops/s (**−12%**) |
+| flag + `@branchHint(.cold)` | **244–250 Mops/s (parity)** |
+| + per-instruction check (hinted) | 212–216 Mops/s (−13%) |
+
+Two non-obvious results: `.?` is *fast* because it lets the optimizer elide the length check entirely, so
+any real check costs — but **`@branchHint(.cold)` on the underflow arm recovers all of it**. And a
+per-instruction `if (underflowed)` in the dispatch loop costs ~13% *even hinted*, which is why the check
+lives at the loop exit, not inside it. **Rule: when adding a guard to the interpreter's hot loop, mark the
+failure arm `@branchHint(.cold)` and benchmark — this is the same lesson as the `noinline recordTrap` result
+in #19.**
+
 ## #23 — Zig 0.16 Windows `Io` filesystem gaps found in WASI 4.3 (2026-07-16)
 
 Two more std holes on Windows, same family as #18 (which is the first). Both hit during 4.3; recheck all

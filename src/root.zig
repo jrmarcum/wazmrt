@@ -46,4 +46,5 @@ test {
     _ = wast;
     _ = pin;
     _ = sign;
+    _ = @import("fuzz.zig"); // malformed-input fuzz targets (see fuzz.zig)
 }

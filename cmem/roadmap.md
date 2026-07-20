@@ -17,6 +17,32 @@ decisions: **harden the interpreter** (not validate-before-run); **shape-checked
 Also added CLI **`-h`/`--help`** (full option/subcommand descriptions) and **`-v`/`--version`**. 197
 distinct unit tests; native Debug/ReleaseFast + freestanding wasm32 all build.
 
+**Update 2026-07-20 — passes 4–10.** Passes 4–9 were increasingly clean censuses of the *explicit-index*
+surface (integer-overflow UB, `@intCast`, use-after-realloc, `unreachable`, byte-copy primitives), ending
+with two no-new-issue passes. The **10th pass then found 10 issues including two segfaults and a
+12-byte hang**, because its finds were in classes an index sweep structurally cannot see: a parser that
+**fails to advance** (`sexpr.zig`'s lone `;` — `(module) ; x` hung the CLI at 10.4 GB), **imports bound by
+name with the declared arity unchecked** (a 4-line `.wat` segfaulted the WASI path), and **cross-section
+properties only the validator checked** while the run path skips validation (a 31-byte module segfaulted
+via `funcType(fi).?`). Also a C-ABI `wasm_ref_copy` use-after-free/double-free and a verification bypass
+where `flagRegion` scanned *guest* argv. Then the three items held back for an owner decision were taken
+too: **linear memory = lazy OS pages + a 1 GiB budget** (`--max-memory`; 4 GiB declaration 2.85 s/4054 MB →
+0.05 s/~0 MB), **`Frame.pop` operand-stack underflow** (defined `0` + a flag trapped at loop exit;
+`@branchHint(.cold)` is what keeps it free — see design-decisions), and **`random_get` is now a real CSPRNG**
+(ChaCha seeded from `io.randomSecure`, `EIO` rather than weak bytes). At that point 206 distinct tests,
+green under Debug *and* ReleaseSafe, with `c-smoke`, `wasi-gate` and the freestanding `wasm` target passing
+and steady-state back at ~263 Mops/s. Then the last two audit items: **`.wast` no longer bypasses
+`verifyGate`** (it executed before the gate, so any wasm wrapped in a `.wast` ran unpinned under a root
+enforce), and **the fuzz targets were rebuilt to mutation-not-generation** — they had been reaching
+essentially nothing (0 decodes in 20 000 inputs), now 519 decoded / 387 instantiated / 142 assembled per
+sweep, with the sweep **asserting its own coverage** so it cannot silently degrade again; 800 k deep-run
+iterations across Debug and ReleaseSafe found no crashes. **207 distinct tests** (403 printed).
+**Still open:** the `validate.zig` inspect-path DoS + accept-invalid element check; the conformance gate
+needs a baseline before it can be CI; the fuzz targets still swallow `OutOfMemory`; and the previously
+logged LOWs.
+*Standing lesson from this sequence: a run of clean passes means the current lens is exhausted, not that
+the code is clean — change the lens.*
+
 ## Status (2026-07-02) — runtime executes; text toolchain in progress
 
 The full pipeline runs end-to-end: **decode → validate → execute** (int/float/memory), verified on the

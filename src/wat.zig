@@ -777,9 +777,14 @@ fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef
     while (i < items.len and eqKw(items[i], "export")) : (i += 1)
         try exports.append(a, .{ .name = try fieldStr(items[i], 1), .kind = 1, .index = table_index });
     try table_names.append(a, name);
-    if (isRefType(items[i])) {
+    // `(table)`, `(table $t)`, `(table (export "x"))` all leave `i == items.len`
+    // here — the sibling of the guards `parseGlobal`/`parseElem`/the inline-import
+    // branch already got. Unguarded this reads an adjacent `Sexpr` and switches on
+    // a garbage union tag (UB in the shipped ReleaseFast build).
+    const shape = try nth(items, i);
+    if (isRefType(shape)) {
         // (table reftype (elem …))
-        const et = try parseValType(items[i], type_names);
+        const et = try parseValType(shape, type_names);
         i += 1;
         if (i < items.len and eqKw(items[i], "elem")) {
             // Inline active elem at offset 0. Items are either bare func indices
@@ -797,14 +802,16 @@ fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef
             try tables.append(a, .{ .min = 0, .max = null, .elem = et });
         }
     } else {
-        const min = try parseIndex(items[i]);
+        const min = try parseIndex(shape);
         i += 1;
         var max: ?u32 = null;
         if (i < items.len and !isRefType(items[i])) {
             max = try parseIndex(items[i]);
             i += 1;
         }
-        const et = try parseValType(items[i], type_names);
+        // `(table 1)` / `(table 1 2)` run out of items here — the twin-index
+        // pattern: the `max` probe above is guarded, this read was not.
+        const et = try parseValType(try nth(items, i), type_names);
         i += 1;
         try tables.append(a, .{ .min = min, .max = max, .elem = et });
         // Table initializer expression `(table N reftype initexpr)`: fill all N

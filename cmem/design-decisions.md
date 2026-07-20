@@ -100,6 +100,60 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   — no bare `items[N]`, no `.asList().?`/`.asAtom().?`/`.string`.** `sexpr.zig` also caps nesting depth
   (`max_depth = 1024` → `NestingTooDeep`) and `Reader.readVecLen()` rejects a vec count > remaining bytes
   (OOM-amplification guard) at every pre-alloc site.
+- **Every tokenizer loop must make progress (2026-07-20, 10th pass).** A depth cap catches runaway
+  *recursion*; it cannot catch a loop that simply never advances `pos`. `sexpr.parseAtom` treated `;` as a
+  terminator and returned an **empty** atom without consuming it, so `parseAll`/`parseList` appended empty
+  atoms forever — `(module) ; x`, **12 bytes**, hung the CLI at 10.4 GB. **Rule: `parseValue` rejects any
+  character that starts no value and that `skipTrivia` does not consume (`error.UnexpectedChar`), and
+  `parseAtom` returning zero bytes is itself an error** — so adding a delimiter to `parseAtom` later cannot
+  silently reintroduce the class. Note the trivia asymmetry that caused it: `;;` and `(;` were handled, the
+  single-character case fell between them.
+- **A host import's declared signature is untrusted input (2026-07-20, 10th pass).** WASI functions are
+  bound by **name** (`main.zig` → `wasi.hostFunc(imp.name)`) while the *module* decides the declared arity,
+  and `interp.callFunction` sizes the `args` slice from that declaration — so
+  `(import "wasi_snapshot_preview1" "fd_write" (func))` made `argU32(args, 0..3)` read past the value
+  stack (**segfault from a 4-line `.wat`**). `checkStaticIndices` cannot see this: no index immediate is
+  involved. **Rule: every entry in `wasi.callFor`'s map carries its preview-1 parameter count and is wrapped
+  in `guardArity`; a short call traps (`HostTrap`) rather than returning a plausible errno.** Do not
+  "simplify" the arity column away.
+- **The run path must re-check what only the validator checked (2026-07-20, 10th pass).** `Module.decode`
+  enforces no section-order and no duplicate-section rules, so decoder-accepted modules can be internally
+  inconsistent: a repeated `function` section leaves `func_space` and `module.functions` disagreeing
+  (→ `funcType(fi).?` segfaulted from **31 bytes**), and the function/code section counts can differ
+  (→ a multi-object `for` over unequal-length slices, which in ReleaseFast iterates the *first* length and
+  reads `Module.Code` structs OOB). Only `validate.zig` compared these, and the CLI run path never
+  validates. **Rule: any cross-section consistency property you rely on at run time must be re-checked
+  there (`CountMismatch` in `initWithImports`, `orelse` on `funcType`) — never inherited from the
+  validator.** Corollary for multi-object `for`: unequal lengths are *illegal behavior*, unchecked in
+  ReleaseFast — guard the lengths before the loop whenever the slices come from separate sections.
+- **Linear memory is page-allocator memory obtained via `rawAlloc` — never `Allocator.alloc` (owner,
+  2026-07-20).** Guest memory must be **zero** and must cost address space rather than RSS. Both follow from
+  taking fresh OS mappings (`PageAllocator` → `NtAllocateVirtualMemory`/`mmap`, no free-list, OS-guaranteed
+  zero-fill) **and bypassing `std.mem.Allocator`'s poison**: `allocBytesWithAlignment` does
+  `if (runtime_safety) @memset(byte_slice, undefined)`, i.e. fills with `0xAA` in Debug/ReleaseSafe. Using
+  the plain `alloc` measured **1029 MB RSS for a 1 GiB declaration with the guest reading `0xAAAAAAAA`** —
+  a build-mode-dependent wrong answer. **Rule: guest-visible buffers go through
+  `allocGuestMemory`/`freeGuestMemory`/`growGuestMemory`; never `gpa.alloc` + assume zero, and never add an
+  eager `@memset` "for safety" — it reintroduces the 4 GB cost.** Pinned by
+  `test "hardening: guest linear memory is zero-initialized, in every build mode"`.
+- **A linear-memory budget, enforced at instantiation AND at `memory.grow` (owner, 2026-07-20).** Lazy pages
+  bound RSS but not address space, so `Imports.max_memory_bytes` (default `default_max_memory_bytes` =
+  **1 GiB**, CLI `--max-memory`) is summed over **all** of an instance's memories and re-checked by
+  `memory.grow` — otherwise a small declared minimum simply grows past the ceiling. Grow reports refusal as
+  `-1` (spec-correct), instantiation as `error.MemoryLimitExceeded`.
+- **Hot-loop guards are `@branchHint(.cold)` + benchmarked (2026-07-20).** Making `Frame.pop` safe cost
+  **−12%** (250 → 220 Mops/s) until the underflow arm was marked `@branchHint(.cold)`, which restored
+  parity (244–250) — `.?` is fast precisely because it lets the optimizer delete the check, so any real
+  check must be hinted. A per-instruction `if (underflowed)` in the dispatch loop cost **−13% even hinted**,
+  which is why that check sits at the **loop exit**, not inside it (safe because `pop` substitutes a defined
+  `0` and every consumer is independently bounds-checked; `return` also exits via `pc = ir.len`, and
+  call/branch/epilogue already trap via `stackBase`/`peek`). **Rule: never add an unhinted branch to
+  `Frame.run`'s loop, and re-run `zig build bench` when you touch `pop`/`push`/dispatch.** Same lesson as
+  `noinline recordTrap` (#19).
+- **`zig build test-safe` is the memory-safety gate (2026-07-20).** The suite under **ReleaseSafe** —
+  optimizer on, safety checks kept — so out-of-range `@intCast`, OOB, and null-unwrap panic loudly instead
+  of being silent UB in the shipped ReleaseFast/ReleaseSmall builds. **Run it alongside `zig build test`
+  after any memory-safety change**; a Debug-only pass does not prove the shipped build safe.
 - **Pin verification hashes the bytes it runs, and the gate has no path to re-open (2026-07-17,
   Phase 5).** `verifyGate` (in `main.zig`) receives the **in-memory module buffer** and hashes *that*;
   it is handed the path only for messages and never re-reads the file. So the verified bytes provably

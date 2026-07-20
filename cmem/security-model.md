@@ -82,6 +82,27 @@ depth, `struct.new`/`array.new_fixed`/`throw` stack bases). A bogus GC ref into 
 hardening — DONE 2026-07-19". (The *validator* is still the right tool for spec-conformance/UX; hardening
 is the floor that guarantees safety even when it is bypassed.)
 
+**Where that floor was still missing — 10th pass, 2026-07-20.** Nine passes of hardening had swept the
+*explicit-index* surface, but the run path was still reachable to two segfaults, because the gap was never
+an index check:
+
+- **Anything the decoder accepts but never cross-checks.** `Module.decode` enforces no section-order and no
+  duplicate-section rules, so a repeated `function` section makes `func_space` and `module.functions`
+  disagree, and the function/code section counts can differ. Only `validate.zig` compared them — and the run
+  path skips it. Result: `module.funcType(fi).?` on an export index → segfault from **31 bytes**, and a
+  multi-object `for` over unequal-length slices → OOB reads in ReleaseFast. **The rule this yields: every
+  cross-section consistency property the validator checks is a property the run path must re-check itself,
+  or not depend on.**
+- **Host imports resolved by name without checking the declared type.** WASI functions were bound by name
+  alone while the *module* decides how many arguments it declares — so a lying import declaration made the
+  handlers read past the value stack (segfault from a **4-line `.wat`**). `checkStaticIndices` cannot see
+  this: there is no index immediate involved. **Rule: an import is untrusted input too — validate the
+  declared signature at bind time, not just the body's indices.**
+
+Both are fixed (`CountMismatch`, an `orelse` on `funcType`, and a comptime arity guard on every WASI entry).
+`zig build test-safe` (ReleaseSafe) now exists specifically so this class panics loudly in CI instead of
+being silent UB in the shipped build.
+
 ## What holds today (shipped, verified)
 
 - **A guest cannot execute anything.** Verified against the full WASI preview-1 surface (45 functions):
@@ -99,6 +120,66 @@ is the floor that guarantees safety even when it is bypassed.)
 **Therefore the only way a guest introduces code to the machine is: it writes a file, and something
 *else* with real privilege executes it.** The wasm side is inert throughout. Privilege is always
 supplied by the host, the shell, the orchestrator, or the user.
+
+### Verification-bypass findings, 10th audit pass (2026-07-20)
+
+Two ways the authenticity gate did **not** hold as documented. One fixed, one open:
+
+- **FIXED — guest argv could turn verification off.** `flagRegion` was meant to stop a guest argument that
+  happens to read `--no-verify` from being taken as ours (its doc comment said exactly that), but it only
+  truncated at an explicit `--`. The ordinary WASI invocation has no `--`
+  (`wazmrt prog.wasm install --yes`), so the **guest's own arguments were scanned**, and `--yes`/
+  `--no-verify` anywhere in them set `opt_out` → `decide()` returned `.run`. A root-owned `# mode: enforce`
+  still denied, so it failed open in armed-default and `warn` modes — the ordinary deployment. Now
+  `flagRegion` consumes only the leading run of recognized wazmrt flags, mirroring `runWasi` exactly.
+  *General lesson: a comment asserting an invariant is not the invariant. This one drifted silently because
+  no test invoked wazmrt without a `--`.*
+- **FIXED 2026-07-20 — `.wast` files were not gated at all.** `main.zig`'s `.wast` branch called
+  `wast.runScript` and `return`ed **before** `verifyGate`, and `runScript` instantiates and invokes,
+  including `(module binary "…")` raw payloads. So `wazmrt payload.wast` ran unpinned, unsigned wasm even
+  under a root-owned `# mode: enforce` — which this document states no runtime flag can weaken. Any wasm can
+  be wrapped in a `.wast`, and whoever supplies the file chooses the extension, so the bypass needed no
+  privilege. Bounded while it lasted: `wast.zig` wires only `spectest` imports, so the executed code had
+  **no WASI authority** — a policy/authenticity bypass and a CPU/memory cost, not filesystem access. `.wat`
+  was never affected (assembled, then gated).
+  **Fix:** `verifyGate` now runs on the script bytes before `runScript`. Hashing the *script* is the right
+  granularity — every module it executes is contained in those bytes, so authorizing the script authorizes
+  exactly what it can run, preserving the same hash-what-you-execute property the module path has.
+  Verified end to end: under `--verify enforce` an unpinned `.wast` is refused (`not in pin DB …;
+  policy=enforce (root-owned; not overridable)`), `wazmrt pin <file>.wast` then lets it run, and a bare
+  build with no pin DB runs it unchanged.
+  *Lesson: the gate was placed on the "module" path rather than on **every path that executes**. When
+  adding a new input form to `main.zig`, the question is not "is this a module?" but "does this execute?"*
+
+### `random_get` is now cryptographic — FIXED 2026-07-20
+
+**Was:** `Wasi.rng` was `std.Random.DefaultPrng` (Xoshiro256++, non-cryptographic) seeded from
+`Io.Timestamp.now(io, .awake)` at process start. WASI preview-1 specifies `random_get` as a CSPRNG and it
+is what a guest's `getrandom()` compiles to — so guest key material, session tokens, nonces, UUIDs and (in
+Rust) HashMap seeds were predictable to anyone who knew the approximate start time. It sat oddly beside the
+authenticity story: verify an Ed25519 signature on the module, then hand that module a predictable RNG.
+Note the direction of harm — it endangered the **guest**, not the host, which is easy to under-rate when
+the threat model is written host-first.
+
+**Now:** `Wasi.rng` is a `std.Random.DefaultCsprng` (ChaCha) seeded from **`io.randomSecure`**, lazily on
+first use (`Wasi.csprng`). `Wasi.init` no longer takes a seed at all.
+
+Three decisions worth keeping:
+- **`randomSecure`, not `random`.** `Io.random` documents a fallback to "a less secure mechanism upon
+  failure", and an `Io` without randomness uses `noRandom`, which fills the buffer with **zeros**. Silent
+  weak randomness is the exact failure being fixed, so entropy failure returns null and `random_get`
+  reports **`EIO`** rather than handing the guest predictable bytes — fail loud, per the project rule.
+- **Seeded from `Io`, not `std.crypto.random`.** `Wasi` already holds an `Io`, so the entropy call is a
+  vtable call rather than a direct OS dependency. This is what resolved the freestanding-wasm concern
+  (`root.zig` re-exports `wasi`): `zig build wasm` still builds, verified.
+- **Lazy seeding.** Instantiation is on the measured cold-start path, so a guest that never asks for
+  randomness pays no syscall — `zig build bench` cold-start stayed at **1.11 µs/run**. Streaming from a
+  ChaCha CSPRNG rather than syscalling per call is what `std.crypto.random` itself does.
+
+Verified end to end: the same guest run three times printed `19a3b6cb720909d6`, `ce59c1e14ff216da`,
+`08680fb7424d67cc`. `test "random_get returns real entropy, not zeros or a predictable stream"` pins
+non-zero output, a stream that advances, and two instances not agreeing — and was confirmed non-vacuous by
+temporarily reseeding deterministically and watching it fail.
 
 ## Authenticity design (NOT BUILT)
 
