@@ -795,12 +795,16 @@ fn wFdWrite(ctx: *anyopaque, args: []const Value, results: []Value) bool {
                 at = f.handle.length(w.io) catch |err| return ret(results, errnoFor(err));
             total = f.handle.writePositional(w.io, vecs, at) catch |err|
                 return ret(results, errnoFor(err));
-            f.offset = at + total;
+            f.offset = std.math.add(u64, at, total) catch return ret(results, errno.fbig);
         },
         .stdin => return ret(results, errno.notcapable),
         .dir => return ret(results, errno.isdir),
     }
-    if (!w.writeU32(nwritten_ptr, @intCast(total))) return ret(results, errno.fault);
+    // `total` is a u64 sum of (possibly overlapping) iovec lengths — it can exceed
+    // u32 even with modest memory; narrow it safely rather than `@intCast` (UB in
+    // ReleaseFast on overflow).
+    const n32 = std.math.cast(u32, total) orelse return ret(results, errno.fbig);
+    if (!w.writeU32(nwritten_ptr, n32)) return ret(results, errno.fault);
     return ret(results, errno.success);
 }
 
@@ -838,12 +842,15 @@ fn wFdRead(ctx: *anyopaque, args: []const Value, results: []Value) bool {
             // readPositional returns 0 at end-of-file rather than erroring.
             total = f.handle.readPositional(w.io, vecs, f.offset) catch |err|
                 return ret(results, errnoFor(err));
-            f.offset += total;
+            f.offset = std.math.add(u64, f.offset, total) catch return ret(results, errno.fbig);
         },
         .stdout, .stderr => return ret(results, errno.notcapable),
         .dir => return ret(results, errno.isdir),
     }
-    if (!w.writeU32(nread_ptr, @intCast(total))) return ret(results, errno.fault);
+    // A file read can exceed u32 (files aren't capped at 4 GiB, and iovecs may
+    // overlap); narrow safely rather than `@intCast` (UB on overflow).
+    const n32 = std.math.cast(u32, total) orelse return ret(results, errno.fbig);
+    if (!w.writeU32(nread_ptr, n32)) return ret(results, errno.fault);
     return ret(results, errno.success);
 }
 
@@ -879,7 +886,8 @@ fn preadWrite(ctx: *anyopaque, args: []const Value, results: []Value, comptime d
         .write => f.handle.writePositional(w.io, vecs, offset),
     } catch |err| return ret(results, errnoFor(err));
 
-    if (!w.writeU32(argU32(args, 4), @intCast(n))) return ret(results, errno.fault);
+    const n32 = std.math.cast(u32, n) orelse return ret(results, errno.fbig); // avoid @intCast UB when the transfer exceeds u32
+    if (!w.writeU32(argU32(args, 4), n32)) return ret(results, errno.fault);
     return ret(results, errno.success);
 }
 
@@ -935,6 +943,7 @@ fn wFdSeek(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     };
     const target = base + delta;
     if (target < 0) return ret(results, errno.inval); // seeking before byte 0
+    if (target > std.math.maxInt(u64)) return ret(results, errno.inval); // above u64 (CUR compounds) — avoid @intCast UB
     f.offset = @intCast(target);
     if (!w.writeU64(argU32(args, 3), f.offset)) return ret(results, errno.fault);
     return ret(results, errno.success);

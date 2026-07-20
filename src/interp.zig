@@ -577,7 +577,11 @@ pub const Instance = struct {
                 if (i >= imports.memories.len) return error.MissingImport;
                 memories[i] = imports.memories[i];
             } else {
-                const buf = try gpa.alloc(u8, @as(usize, mt.limits.min) * page_size);
+                // `min` is an unvalidated varU32; on a 32-bit `usize` (the wasm32
+                // build) `min * page_size` would overflow, so multiply with an
+                // overflow check → clean OOM (harmless on 64-bit: 2^32 × 2^16 fits).
+                const nbytes = std.math.mul(usize, @as(usize, mt.limits.min), page_size) catch return error.OutOfMemory;
+                const buf = try gpa.alloc(u8, nbytes);
                 @memset(buf, 0);
                 const mem_obj = gpa.create(Memory) catch |e| {
                     gpa.free(buf);
@@ -2021,9 +2025,14 @@ const Frame = struct {
         const m = self.inst.memories[mem_idx];
         const old = m.bytes;
         const old_pages: u64 = old.len / page_size;
-        const limit: u64 = m.max orelse 65536; // wasm32 hard cap
+        // Clamp to the architectural cap (spec: ≤ 2^16 pages) so an unvalidated
+        // `m.max` can't authorize an oversized grow; `old_pages + delta ≤ limit`
+        // then fits `usize` on every target. Multiply with an overflow check so
+        // 65536×page_size (= 2^32, one past u32) fails cleanly on the wasm32 build.
+        const limit: u64 = @min(m.max orelse 65536, 65536);
         if (old_pages + delta > limit) return self.pushI32(-1);
-        const new_buf = self.inst.gpa.realloc(old, @intCast((old_pages + delta) * page_size)) catch
+        const nbytes = std.math.mul(usize, @intCast(old_pages + delta), page_size) catch return self.pushI32(-1);
+        const new_buf = self.inst.gpa.realloc(old, nbytes) catch
             return self.pushI32(-1);
         @memset(new_buf[old.len..], 0);
         m.bytes = new_buf; // shared object → visible to importers

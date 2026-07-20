@@ -224,6 +224,36 @@ fd-pointer-across-realloc), `validate.zig` (no accept-invalid / OOB), `pin.zig` 
   spot departing from the "a stored `*Instance` owns a handle" discipline. Retain in the frame + release in
   `wasm_trap_delete` if airtight is wanted.
 
+### Integer-overflow-UB sweep — DONE 2026-07-20 (6th "check for code issues", memory-safety-only)
+
+Targeted pass ("fix any memory-unsafe issues"): 3 auditors re-checked the C-ABI import-ref lifecycle
+(commit `c6ff764e`), the `wasi.zig` guest-memory paths, and the `interp.zig` exec/instantiation memory ops.
+Two of the three came back **clean** (see below); `wasi.zig` had a real class the earlier "contained-u32-
+offset" note missed — **unchecked `@intCast`/`+` narrowings of 64-bit byte counts → ReleaseFast integer UB**
+on the *shipped native* target. All FIXED:
+
+- **`wasi.zig` `fd_write`/`fd_read`/`fd_pread`/`fd_pwrite`** — the `nwritten`/`nread` value is `@intCast(total)`
+  → `u32`, but `total` is a `u64` sum of (possibly **overlapping**) iovec lengths / a file byte count, which
+  can exceed `u32` (trigger: a 64 MiB memory + 64 overlapping 64 MiB iovecs → `total = 2³²`; or a >4 GiB
+  file). Now `std.math.cast(u32, …) orelse errno.fbig`. The paired `f.offset = at + total` / `+= total`
+  (u64 add) → `std.math.add … catch errno.fbig`.
+- **`wasi.zig` `fd_seek`** — `f.offset = @intCast(target)` (i128→u64) was guarded only for `target < 0`; a
+  `CUR` seek with `delta = i64.max` **compounds** `f.offset` past `u64` → `@intCast` UB. Added the upper
+  guard → `errno.inval`.
+- **`interp.zig` memory alloc + `memoryGrow`** — `min * page_size` / `(old_pages+delta) * page_size` are fine
+  on 64-bit (`2³² × 2¹⁶` fits `u64`) but overflow on the **wasm32** build (`usize = u32`), and `memoryGrow`'s
+  `limit` didn't clamp an unvalidated `m.max` to the architectural 2¹⁶-page cap. Now `std.math.mul(usize, …)
+  catch OOM/-1` and `limit = @min(m.max orelse 65536, 65536)`. Harmless on 64-bit (allocation of an oversized
+  memory just fails); closes the wasm32 UB and is spec-correct (memory ≤ 2¹⁶ pages).
+
+These trigger only at multi-GB scale or on wasm32, so a native Debug unit test would need impractical huge
+allocations — verified by code review (a checked cast replaces each unchecked one), the clean full suite, and
+all three targets building. **CLEAN this pass:** the C-ABI `c6ff764e` retain/release is balanced (no
+`vec_owned`/export-handle ref enters `import_refs`; error paths leak-free; delete ordering correct; no
+`destroyRef` recursion), and the `interp.zig` data/element-segment init, bulk `memory.*`/`table.*`, load/store
+EA, GC-heap/`exn_store` lifecycle, and SIMD lane indexing are all overflow-safe (`@as(u64,x)+n>len` form,
+arena-backed `.fields`, by-value label/exn capture).
+
 **Low-priority notes (safe today):**
 - `wasi.zig Wasi.init` — `w.fds.appendSlice(...) catch {}` swallows OOM registering the 3 stdio fds (init
   then reports success with no stdio). Near-impossible; propagate for cleanliness someday.
