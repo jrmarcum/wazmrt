@@ -64,6 +64,10 @@ zig build ffi-demo                 # build the DLL + run examples/deno_ffi.mjs (
 zig build bench                    # interpreter microbenchmark (ReleaseFast)
 ```
 
+Run `wazmrt --help` (`-h`) for the full list of run modes, WASI/verification
+flags, and subcommands, or `wazmrt --version` (`-v`) for the version and whether
+this build embeds a signature trust anchor.
+
 The runtime loads over FFI from any host language: `zig build dll` produces a
 libc-free `wazmrt.dll`, and [`examples/deno_ffi.mjs`](examples/deno_ffi.mjs)
 `Deno.dlopen`s it and drives the standard wasm-c-api to instantiate and call a

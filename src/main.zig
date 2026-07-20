@@ -22,13 +22,16 @@ pub fn main(init: std.process.Init) !void {
     defer out.flush() catch {};
 
     const args = try init.minimal.args.toSlice(arena);
+    const prog = if (args.len > 0) args[0] else "wazmrt";
     if (args.len < 2) {
-        try out.print("wazmrt {s}\nusage: {s} <module.wasm>\n", .{
-            wazmrt.version,
-            if (args.len > 0) args[0] else "wazmrt",
-        });
+        try printUsage(out, prog);
         return;
     }
+
+    // `-h`/`--help` and `-v`/`--version` are only recognized as the FIRST arg, so
+    // a `--help` in a guest's argv (`wazmrt prog.wasm -- --help`) is never ours.
+    if (isFlag(args[1], "-h", "--help")) return printHelp(out, prog);
+    if (isFlag(args[1], "-v", "--version")) return printVersion(out);
 
     // `wazmrt pin <file> [--db <path>]` — hash a module for the pin DB (Phase 5).
     if (std.mem.eql(u8, args[1], "pin")) return pinSubcommand(arena, io, out, args[2..]);
@@ -134,6 +137,91 @@ pub fn main(init: std.process.Init) !void {
         return;
     };
     try out.print("  validation: OK\n", .{});
+}
+
+/// True if `arg` is either the short or long spelling of a flag.
+fn isFlag(arg: []const u8, short: []const u8, long: []const u8) bool {
+    return std.mem.eql(u8, arg, short) or std.mem.eql(u8, arg, long);
+}
+
+/// Brief usage, printed with no arguments. Points at `--help` for the full list.
+fn printUsage(out: *Io.Writer, prog: []const u8) !void {
+    try out.print(
+        \\wazmrt {s} — a WebAssembly runtime (decode, validate, execute; WASI preview 1)
+        \\
+        \\usage: {s} <module.wasm|.wat|.wast> [export] [args...]
+        \\       {s} <pin|keygen|sign> ...
+        \\
+        \\Run '{s} --help' for the full list of options and subcommands.
+        \\
+    , .{ wazmrt.version, prog, prog, prog });
+}
+
+/// Version info: `-v` / `--version`. Also reports whether this build embedded a
+/// signature trust anchor (`-Droot-key`), which determines the default policy.
+fn printVersion(out: *Io.Writer) !void {
+    try out.print("wazmrt {s} (abi {d})\n", .{ wazmrt.version, wazmrt.abi_version });
+    if (embedded_root_key != null)
+        try out.print("signature trust anchor: embedded (verification armed)\n", .{})
+    else
+        try out.print("signature trust anchor: none (build with -Droot-key=<hex> to embed one)\n", .{});
+}
+
+/// Full help: `-h` / `--help`. Describes every run mode, flag, and subcommand.
+fn printHelp(out: *Io.Writer, prog: []const u8) !void {
+    try out.print(
+        \\wazmrt {s} — a WebAssembly runtime (decode, validate, execute; WASI preview 1)
+        \\
+        \\A <module> is a `.wasm` binary or a `.wat` text file (assembled on the fly).
+        \\
+        \\USAGE
+        \\  {s} <module> <export> [args...]   invoke an exported function and print results
+        \\  {s} <module> [wasi-flags] [-- argv]  run a WASI `_start` command module
+        \\  {s} <module>                      summarize + validate (no matching export/_start)
+        \\  {s} <script.wast>                 run a spec-test (.wast) script
+        \\  {s} <subcommand> ...              pin / keygen / sign (below)
+        \\  {s} -h | --help | -v | --version
+        \\
+        \\RUN MODES
+        \\  {s} add.wasm add 2 3
+        \\      Instantiate and call `add` with args 2 and 3 (parsed per the function's
+        \\      parameter types: i32/i64/f32/f64). No imports are wired, so a bare
+        \\      function call has zero I/O capability.
+        \\  {s} prog.wasm --dir .:/ -- foo bar
+        \\      If the module exports `_start`, run it as a WASI command. wazmrt flags
+        \\      precede the guest argv; `--` ends them and passes the rest to the guest.
+        \\
+        \\WASI FLAGS (before `--`)
+        \\  --dir <host>[:<guest>]      grant a read-write preopen (the guest's only files)
+        \\  --ro-dir <host>[:<guest>]   grant a read-only preopen (no write/create/delete)
+        \\  --env KEY=VALUE             set one environment variable for the guest
+        \\  --                          end wazmrt flags; the rest is the guest's argv
+        \\
+        \\VERIFICATION FLAGS (authenticity — see the pin DB / signatures)
+        \\  --pins <path>               use this pin DB instead of the default;
+        \\                              ignored under a root-owned `# mode: enforce`
+        \\  --verify off|warn|enforce   raise verification strictness (never lowers it)
+        \\  --no-verify, --yes          run an unverified module (refused under enforce)
+        \\      Default pin DB: {s}
+        \\
+        \\SUBCOMMANDS
+        \\  pin <file|dir> [--db <path>]
+        \\      SHA-256 a module (or every `.wasm`/`.wat` under a directory, recursively)
+        \\      and print its pin line(s) for a root-owned allow-list. With --db, also
+        \\      append them there. Meant to be run with privilege by an installer.
+        \\  keygen [--out <name>]
+        \\      Generate an Ed25519 signing keypair: writes `<name>.key` (private — keep
+        \\      secret) and prints the public key to embed as the trust anchor.
+        \\  sign <in.wasm|.wat> <out.wasm> --key <keyfile>
+        \\      Sign a module with the private key, appending a "signature" custom section.
+        \\      The signed module still runs anywhere; wazmrt authenticates it when the
+        \\      matching root key is embedded (-Droot-key).
+        \\
+        \\OPTIONS
+        \\  -h, --help                  show this help and exit
+        \\  -v, --version               show version information and exit
+        \\
+    , .{ wazmrt.version, prog, prog, prog, prog, prog, prog, prog, prog, defaultPinsPath() });
 }
 
 // ===== Phase 5 — pin verification (see cmem/security-model.md, roadmap.md §5) =====
