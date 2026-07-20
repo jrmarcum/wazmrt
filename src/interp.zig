@@ -1044,6 +1044,12 @@ const Frame = struct {
         if (n >= self.labels.items.len) return error.UndefinedLabel;
         const label = self.labels.items[self.labels.items.len - 1 - n];
         const from = try self.stackBase(label.arity);
+        // `from` guards the SOURCE (arity ≤ items.len); the DESTINATION needs the
+        // stronger `stack_base + arity ≤ items.len`. On the unvalidated run path a
+        // block can reach its `br` with fewer than `arity` operands above the
+        // recorded base (`from < stack_base`) — copying `arity` slots to
+        // `items[stack_base..]` would then write past the value stack. Trap.
+        if (from < label.stack_base) return error.StackUnderflow;
         std.mem.copyForwards(Value, self.vstack.items[label.stack_base..][0..label.arity], self.vstack.items[from..][0..label.arity]);
         self.vstack.shrinkRetainingCapacity(label.stack_base + label.arity);
         // A loop-continue keeps the loop's own label; a forward exit pops it too.
@@ -1073,7 +1079,10 @@ const Frame = struct {
                 };
                 if (!matches) continue;
                 // Discard everything the try_table body pushed (incl. any call
-                // args in flight), back to its entry height.
+                // args in flight), back to its entry height. On the unvalidated
+                // run path the body may have popped BELOW that base; shrinking to a
+                // height above `items.len` would resurrect stale slots — trap.
+                if (label.stack_base > self.vstack.items.len) return error.StackUnderflow;
                 self.vstack.shrinkRetainingCapacity(label.stack_base);
                 switch (c.kind) {
                     .catch_, .catch_ref => for (exn.values) |v| try self.pushU64(v),
@@ -1097,6 +1106,7 @@ const Frame = struct {
             if (label.legacy) |lt| {
                 for (lt.handlers) |h| {
                     if (h.tag != null and h.tag.? != exn.tag) continue;
+                    if (label.stack_base > self.vstack.items.len) return error.StackUnderflow;
                     self.vstack.shrinkRetainingCapacity(label.stack_base);
                     if (h.tag != null) for (exn.values) |v| try self.pushU64(v); // catch pushes the payload
                     // Drop the body's nested labels but keep this try; record the
@@ -1431,6 +1441,7 @@ const Frame = struct {
                     const tgt = self.labels.items[self.labels.items.len - 1 - n];
                     const exn = tgt.caught orelse return error.UncaughtException;
                     self.labels.shrinkRetainingCapacity(self.labels.items.len - 1 - n);
+                    if (tgt.stack_base > self.vstack.items.len) return error.StackUnderflow;
                     self.vstack.shrinkRetainingCapacity(tgt.stack_base);
                     if (try self.throwException(exn)) |target| {
                         pc = target;
@@ -4068,6 +4079,26 @@ test "hardening: a branch whose arity exceeds the stack traps, not a wild copy" 
     // (func (result i32) (block (result i32) (br 0)))  — the block is entered with
     // an empty stack and `br 0` has arity 1, so `from = items.len - 1` underflows.
     const fbody = [_]u8{ 0x00, 0x02, 0x7f, 0x0c, 0x00, 0x0b, 0x0b };
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x01, 0x7f } },
+        .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+        .{ .id = 7, .body = &.{ 0x01, 0x04, 't', 'r', 'a', 'p', 0x00, 0x00 } },
+        .{ .id = 10, .body = try ehCode(a, &.{&fbody}) },
+    });
+    var inst = try instantiate(bytes);
+    defer destroy(&inst);
+    try std.testing.expectError(error.StackUnderflow, inst.invoke("trap", &.{}));
+}
+
+test "hardening: a branch whose destination base exceeds the stack traps, not an OOB write" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (func (result i32) (i32.const 7) (block (result i32) (br 0)))
+    // The block is entered ABOVE the const (stack_base = 1) but under-produces, so
+    // `from = 0 < stack_base = 1`: copying arity=1 slot to items[1..] would write
+    // one past the value stack. Distinct from the arity-underflow case above.
+    const fbody = [_]u8{ 0x00, 0x41, 0x07, 0x02, 0x7f, 0x0c, 0x00, 0x0b, 0x0b };
     const bytes = try ehModule(a, &.{
         .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x01, 0x7f } },
         .{ .id = 3, .body = &.{ 0x01, 0x00 } },

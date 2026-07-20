@@ -130,6 +130,45 @@ Debug/ReleaseFast + freestanding wasm32) build; 372→380 printed tests.
   they land on the *correct* union, so over-acceptance only. **`Module.zig:1023`/`opcode.zig:766`**
   `@intCast` of a byte offset truncates for a >4 GiB module (impractical; only a wrong trap-backtrace offset).
 
+### Run-path hardening, 3rd pass — verifying the 2nd pass's own refactor — DONE 2026-07-20 (4th "check for code issues")
+
+A follow-up 3-auditor pass reviewed the code the 2nd/3rd passes *changed* (the sed-driven `wat.zig` accessor
+refactor, the `Frame.stackBase`/`peek` interp refactor, `readVecLen`, and the CLI `-h`/`-v`). It found the
+hardening was mostly sound but had **left holes of its own kind** — the sed and the underflow-guard both
+closed one variant and missed a sibling:
+
+- **`interp.zig` `branch` — HIGH, OOB WRITE.** The 2nd pass guarded the branch **source** base
+  (`from = stackBase(arity)` ⇒ `arity ≤ items.len`) but not the **destination**:
+  `copyForwards(dst = items[label.stack_base..][0..arity], …)` needs the stronger
+  `stack_base + arity ≤ items.len`. `label.stack_base` is the *absolute* height recorded at block entry;
+  on the unvalidated path a block can reach its `br` with fewer than `arity` operands above that base
+  (`from < stack_base`), so the destination re-slice writes past the value stack — an amplifiable OOB
+  **write** (K-result block ⇒ ~K slots). Trigger: `(func (result i32) (i32.const 7) (block (result i32)
+  (br 0)))`. Fixed: `if (from < label.stack_base) return error.StackUnderflow;` (on a VALID module
+  `from == stack_base`, so it never fires). Covers `br`/`br_if`/`br_table`/`br_on_*` + the try_table catch
+  branch. +1 regression test.
+- **`interp.zig` EH unwind — LOW.** `throwException` (try_table + legacy catch) and `rethrow` shrink the
+  value stack to a caught label's `stack_base` without checking it's ≤ the current height; if the body
+  popped below the base, `shrinkRetainingCapacity` *grows* `items.len` (its assert is compiled out in
+  ReleaseFast), resurrecting stale slots as live values. Not an OOB write (within capacity; a bogus
+  resurrected ref is caught by `gcObject`), but now traps `StackUnderflow` at all three sites.
+- **`wat.zig` — 4 more raw-index holes the sed refactor MISSED** (malformed `.wat`, reachable pre-gate via
+  `wazmrt file.wat`/`sign`/`pin <dir>`; each a wild `Sexpr`-union read → deref of a garbage `[]const u8`):
+  (1) `parseGlobal` `gt[0]`/`gt[gt.len-1]` on an empty type list — the **sibling `parseImport` GOT this
+  exact guard in the refactor but `parseGlobal` was left out** (`(global ())`); (2) the memory-limits
+  fall-through `else` `parseIndex(items[mi])` — its `items[mi+1]` twin was guarded, this one wasn't
+  (`(memory)`); (3) `parseElem` active-table `(wantList(items[i]))[1]` — the `.asList()` was wrapped but
+  the `[1]` left raw (`(elem (table))`); (4) folded-`if` `then_form[1..]`/`ef[1..]` on an empty form
+  (`(if () ())`). All now `error.BadModuleField`/`BadImmediate`; +4 test cases.
+- **`main.zig` CLI `-h`/`-v` — CLEAN.** No verify-gate bypass (help/version `return` before any read/decode/
+  execute), no OOB arg indexing (`args.len < 2` guard + short-circuit/slice access), guest argv still can't
+  inject verify flags (`flagRegion` truncates at `--`), help text matches real flags. Only note: a file
+  literally named `-h`/`-v`/`--help`/`--version` in cwd is shadowed (standard flags-vs-files tradeoff).
+
+Lesson reinforced: a mechanical (sed) or single-variant fix closes the case it targets and leaves its
+mirror — always sweep for the *sibling* pattern (source vs dest, twin index, guarded-here-not-there).
+198 distinct tests; native Debug/ReleaseFast + wasm32 all build.
+
 **Low-priority notes (safe today):**
 - `wasi.zig Wasi.init` — `w.fds.appendSlice(...) catch {}` swallows OOM registering the 3 stdio fds (init
   then reports success with no stdio). Near-impossible; propagate for cleanliness someday.

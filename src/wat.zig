@@ -288,7 +288,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 off[1] = .{ .atom = "0" };
                 try datas.append(a, .{ .mem_index = 0, .offset_form = .{ .list = off }, .bytes = bytes.items });
             } else {
-                mem_min = try parseIndex(items[mi]);
+                mem_min = try parseIndex(try nth(items, mi));
                 if (mi + 1 < items.len) mem_max = try parseIndex(items[mi + 1]);
             }
         } else if (std.mem.eql(u8, kw, "data")) {
@@ -847,7 +847,7 @@ fn parseElem(a: std.mem.Allocator, items: []const Sexpr, elems: *List(ElemDef), 
     } else {
         if (i < items.len and eqKw(items[i], "table")) {
             mode = .active;
-            table_index = try resolveByName(table_names, (try wantList(items[i]))[1]);
+            table_index = try resolveByName(table_names, try nth(try wantList(items[i]), 1));
             i += 1;
         }
         if (i < items.len and isOffsetForm(items[i])) {
@@ -904,6 +904,7 @@ fn parseGlobal(a: std.mem.Allocator, items: []const Sexpr, globals: *List(Global
     var mutable = false;
     var valtype: V = undefined;
     if (items[i].asList()) |gt| {
+        if (gt.len == 0) return error.BadModuleField; // `(global ())` — empty type list
         if (eqAtom(gt[0], "mut")) {
             mutable = true;
             valtype = try parseValType(gt[gt.len - 1], type_names);
@@ -1377,6 +1378,7 @@ fn emitFoldedIf(ctx: *Ctx, l: []const Sexpr) Error!void {
     }
     if (j >= l.len) return error.BadImmediate;
     const then_form = l[j].asList() orelse return error.BadImmediate;
+    if (then_form.len == 0) return error.BadImmediate; // must be `(then …)`, not `()`
     j += 1;
     const else_form: ?[]const Sexpr = if (j < l.len) l[j].asList() else null;
 
@@ -1385,6 +1387,7 @@ fn emitFoldedIf(ctx: *Ctx, l: []const Sexpr) Error!void {
     try ctx.labels.append(ctx.a, label);
     try emitSeq(ctx, then_form[1..]);
     if (else_form) |ef| {
+        if (ef.len == 0) return error.BadImmediate; // `(else …)`, not `()`
         try ctx.out.append(ctx.a, @intFromEnum(Op.@"else"));
         try emitSeq(ctx, ef[1..]);
     }
@@ -2245,10 +2248,15 @@ test "assembler rejects malformed forms without indexing out of bounds" {
         "(module (type))", // type missing its body
         "(module (func (type)))", // inline (type) missing the index
         "(module (memory (import \"m\" \"n\")))", // memory import missing min
+        "(module (memory))", // memory missing its limits (else-branch index)
+        "(module (global ()))", // global's type list is empty
+        "(module (elem (table)))", // active elem's (table) missing the index
     };
     for (cases) |src| {
         try std.testing.expectError(error.BadModuleField, assemble(a, src));
     }
+    // A folded `(if () ())` with an empty then/else form reports BadImmediate.
+    try std.testing.expectError(error.BadImmediate, assemble(a, "(module (func (if () ())))"));
 }
 
 test "parser rejects a deeply-nested paren bomb instead of overflowing the stack" {
