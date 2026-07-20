@@ -40,6 +40,39 @@ pub const Error = sexpr.Error || error{
     ImportAfterDefinition,
 } || std.mem.Allocator.Error;
 
+// --- Shape-checked s-expression accessors -----------------------------------
+// The parser only balances parens/strings; it does NOT validate that a form has
+// the shape the assembler expects. Malformed `.wat` must therefore yield
+// `error.BadModuleField`, never an unchecked `items[N]` OOB read or a
+// wrong-union `.?`/`.string` deref (both UB in the shipped ReleaseFast build).
+// Every access derived from parser output goes through these.
+
+fn wantList(s: Sexpr) Error![]const Sexpr {
+    return s.asList() orelse error.BadModuleField;
+}
+fn wantAtom(s: Sexpr) Error![]const u8 {
+    return s.asAtom() orelse error.BadModuleField;
+}
+fn wantStr(s: Sexpr) Error![]const u8 {
+    return switch (s) {
+        .string => |x| x,
+        else => error.BadModuleField,
+    };
+}
+/// The i-th element of a form, or `error.BadModuleField` if the form is too short.
+fn nth(items: []const Sexpr, i: usize) Error!Sexpr {
+    return if (i < items.len) items[i] else error.BadModuleField;
+}
+/// The i-th field of a sub-form `s` as a string (e.g. `(export "name")` → i=1),
+/// shape-checked end to end: `s` must be a list, long enough, with a string there.
+fn fieldStr(s: Sexpr, i: usize) Error![]const u8 {
+    return wantStr(try nth(try wantList(s), i));
+}
+/// The i-th element of an already-unwrapped form as a string (`items[i].string`).
+fn strAt(items: []const Sexpr, i: usize) Error![]const u8 {
+    return wantStr(try nth(items, i));
+}
+
 const Func = struct {
     name: ?[]const u8 = null,
     params: List(V) = .empty,
@@ -104,7 +137,7 @@ const ImportedMemory = struct { module: []const u8, name: []const u8, min: u32, 
 pub fn assemble(a: std.mem.Allocator, src: []const u8) Error![]const u8 {
     for (try sexpr.parseAll(a, src)) |form| {
         if (form.keyword()) |kw| {
-            if (std.mem.eql(u8, kw, "module")) return assembleModule(a, form.asList().?);
+            if (std.mem.eql(u8, kw, "module")) return assembleModule(a, (try wantList(form)));
         }
     }
     return error.NotAModule;
@@ -151,13 +184,13 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     for (module[start..]) |field| {
         const kw = field.keyword() orelse continue;
         if (std.mem.eql(u8, kw, "type")) {
-            try type_names.append(a, typeDefName(field.asList().?));
-            try type_forms.append(a, field.asList().?);
+            try type_names.append(a, typeDefName((try wantList(field))));
+            try type_forms.append(a, (try wantList(field)));
         } else if (std.mem.eql(u8, kw, "rec")) {
-            for (field.asList().?[1..]) |t| {
+            for ((try wantList(field))[1..]) |t| {
                 if (std.mem.eql(u8, t.keyword() orelse continue, "type")) {
-                    try type_names.append(a, typeDefName(t.asList().?));
-                    try type_forms.append(a, t.asList().?);
+                    try type_names.append(a, typeDefName((try wantList(t))));
+                    try type_forms.append(a, (try wantList(t)));
                 }
             }
         }
@@ -172,7 +205,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     var seen_definition = false;
     for (module[start..]) |field| {
         const kw = field.keyword() orelse return error.BadModuleField;
-        const items = field.asList().?;
+        const items = (try wantList(field));
         if (fieldIsImport(kw, items)) {
             if (seen_definition) return error.ImportAfterDefinition;
         } else if (isDefKind(kw)) {
@@ -190,15 +223,15 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             try func_names.append(a, f.name);
         } else if (std.mem.eql(u8, kw, "export")) {
             // (export "name" (func|table|memory|global $id|N))
-            const name = items[1].string;
-            const target = items[2].asList().?;
-            const tkw = target[0].asAtom().?;
+            const name = (try strAt(items, 1));
+            const target = (try wantList(try nth(items, 2)));
+            const tkw = (try wantAtom(try nth(target, 0)));
             const kind: u8 = if (std.mem.eql(u8, tkw, "func")) 0 else if (std.mem.eql(u8, tkw, "table")) 1 else if (std.mem.eql(u8, tkw, "memory")) 2 else if (std.mem.eql(u8, tkw, "global")) 3 else return error.BadModuleField;
             const idx: u32 = switch (kind) {
-                0 => try resolveByName(func_names.items, target[1]),
-                1 => try resolveByName(table_names.items, target[1]),
+                0 => try resolveByName(func_names.items, try nth(target, 1)),
+                1 => try resolveByName(table_names.items, try nth(target, 1)),
                 2 => 0, // single memory
-                3 => try resolveByName(global_names.items, target[1]),
+                3 => try resolveByName(global_names.items, try nth(target, 1)),
                 else => unreachable,
             };
             try exports.append(a, .{ .name = name, .kind = kind, .index = idx });
@@ -208,7 +241,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             // (tag $name? (type $t) | (param …)*) — an exception tag names a type
             // index (params = the exception's value types; no results).
             var j: usize = 1;
-            const nm = if (isId(items[j])) blk: {
+            const nm = if (j < items.len and isId(items[j])) blk: {
                 defer j += 1;
                 break :blk items[j].asAtom();
             } else null;
@@ -218,11 +251,11 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             while (j < items.len) : (j += 1) {
                 const tkw = items[j].keyword() orelse break;
                 if (std.mem.eql(u8, tkw, "type")) {
-                    type_ref = try resolveType(type_names.items, items[j].asList().?[1]);
+                    type_ref = try resolveType(type_names.items, try nth(try wantList(items[j]), 1));
                 } else if (std.mem.eql(u8, tkw, "param")) {
-                    try parseDecls(a, items[j].asList().?, &params, null, type_names.items);
+                    try parseDecls(a, (try wantList(items[j])), &params, null, type_names.items);
                 } else if (std.mem.eql(u8, tkw, "result")) {
-                    try parseDecls(a, items[j].asList().?, &results, null, type_names.items);
+                    try parseDecls(a, (try wantList(items[j])), &results, null, type_names.items);
                 } else break;
             }
             try tag_types.append(a, type_ref orelse try internSig(a, &sigs, params.items, results.items));
@@ -231,19 +264,19 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             var mi: usize = 1;
             if (mi < items.len and isId(items[mi])) mi += 1; // optional $name
             while (mi < items.len and eqKw(items[mi], "export")) : (mi += 1)
-                try exports.append(a, .{ .name = items[mi].asList().?[1].string, .kind = 2, .index = 0 });
+                try exports.append(a, .{ .name = try fieldStr(items[mi], 1), .kind = 2, .index = 0 });
             if (mi < items.len and eqKw(items[mi], "import")) {
                 // (memory (export …)* (import "m" "n") min max?)
-                const imp = items[mi].asList().?;
+                const imp = (try wantList(items[mi]));
                 mi += 1;
-                const mmin = try parseIndex(items[mi]);
+                const mmin = try parseIndex(try nth(items, mi));
                 const mmax: ?u32 = if (mi + 1 < items.len) try parseIndex(items[mi + 1]) else null;
-                try mem_imports.append(a, .{ .module = imp[1].string, .name = imp[2].string, .min = mmin, .max = mmax });
+                try mem_imports.append(a, .{ .module = (try strAt(imp, 1)), .name = (try strAt(imp, 2)), .min = mmin, .max = mmax });
             } else if (mi < items.len and eqKw(items[mi], "data")) {
                 // (memory (data "…")) — size the memory to the bytes and append an
                 // active data segment at offset 0.
                 var bytes: List(u8) = .empty;
-                for (items[mi].asList().?[1..]) |it| switch (it) {
+                for ((try wantList(items[mi]))[1..]) |it| switch (it) {
                     .string => |sbytes| try bytes.appendSlice(a, sbytes),
                     else => {},
                 };
@@ -294,19 +327,19 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             const exp_start = ti;
             while (ti < items.len and eqKw(items[ti], "export")) ti += 1;
             if (ti < items.len and eqKw(items[ti], "import")) {
-                const imp = items[ti].asList().?;
+                const imp = (try wantList(items[ti]));
                 const tidx: u32 = @intCast(table_names.items.len);
                 for (items[exp_start..ti]) |ex|
-                    try exports.append(a, .{ .name = ex.asList().?[1].string, .kind = 1, .index = tidx });
+                    try exports.append(a, .{ .name = try fieldStr(ex, 1), .kind = 1, .index = tidx });
                 ti += 1;
-                const tmin = try parseIndex(items[ti]);
+                const tmin = try parseIndex(try nth(items, ti));
                 ti += 1;
                 var tmax: ?u32 = null;
                 if (ti < items.len and !isRefType(items[ti])) {
                     tmax = try parseIndex(items[ti]);
                     ti += 1;
                 }
-                try table_imports.append(a, .{ .module = imp[1].string, .name = imp[2].string, .min = tmin, .max = tmax, .elem = try parseValType(items[ti], type_names.items) });
+                try table_imports.append(a, .{ .module = (try strAt(imp, 1)), .name = (try strAt(imp, 2)), .min = tmin, .max = tmax, .elem = try parseValType(try nth(items, ti), type_names.items) });
                 try table_names.append(a, tname);
             } else {
                 try parseTable(a, items, &tables, &table_names, &elems, &elem_names, &exports, type_names.items);
@@ -315,11 +348,11 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             try parseElem(a, items, &elems, &elem_names, table_names.items, type_names.items);
         } else if (std.mem.eql(u8, kw, "import")) {
             // (import "m" "n" (func …) | (global …)) — func + global imports.
-            const desc = items[3].asList() orelse return error.BadModuleField;
-            const dkw = desc[0].asAtom() orelse return error.BadModuleField;
+            const desc = try wantList(try nth(items, 3));
+            const dkw = try wantAtom(try nth(desc, 0));
             if (std.mem.eql(u8, dkw, "func")) {
                 const f = try parseFunc(a, desc, type_names.items); // reuse: parses $id + typeuse
-                try func_imports.append(a, .{ .module = items[1].string, .name = items[2].string, .type_ref = f.type_ref, .params = f.params.items, .results = f.results.items });
+                try func_imports.append(a, .{ .module = (try strAt(items, 1)), .name = (try strAt(items, 2)), .type_ref = f.type_ref, .params = f.params.items, .results = f.results.items });
                 try func_names.append(a, f.name);
             } else if (std.mem.eql(u8, dkw, "table")) {
                 // (import "m" "n" (table $id? min max? reftype)) — imported tables
@@ -330,23 +363,23 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                     tname = desc[ti].atom;
                     ti += 1;
                 }
-                const tmin = try parseIndex(desc[ti]);
+                const tmin = try parseIndex(try nth(desc, ti));
                 ti += 1;
                 var tmax: ?u32 = null;
                 if (ti < desc.len and !isRefType(desc[ti])) {
                     tmax = try parseIndex(desc[ti]);
                     ti += 1;
                 }
-                try table_imports.append(a, .{ .module = items[1].string, .name = items[2].string, .min = tmin, .max = tmax, .elem = try parseValType(desc[ti], type_names.items) });
+                try table_imports.append(a, .{ .module = (try strAt(items, 1)), .name = (try strAt(items, 2)), .min = tmin, .max = tmax, .elem = try parseValType(try nth(desc, ti), type_names.items) });
                 try table_names.append(a, tname);
             } else if (std.mem.eql(u8, dkw, "memory")) {
                 // (import "m" "n" (memory $id? min max?)) — the single memory 0.
                 var mi2: usize = 1;
                 if (mi2 < desc.len and isId(desc[mi2])) mi2 += 1;
-                const mmin = try parseIndex(desc[mi2]);
+                const mmin = try parseIndex(try nth(desc, mi2));
                 mi2 += 1;
                 const mmax: ?u32 = if (mi2 < desc.len) try parseIndex(desc[mi2]) else null;
-                try mem_imports.append(a, .{ .module = items[1].string, .name = items[2].string, .min = mmin, .max = mmax });
+                try mem_imports.append(a, .{ .module = (try strAt(items, 1)), .name = (try strAt(items, 2)), .min = mmin, .max = mmax });
             } else {
                 try parseImport(a, items, &global_imports, &global_names, type_names.items); // global
             }
@@ -632,6 +665,7 @@ fn fieldIsImport(kw: []const u8, items: []const Sexpr) bool {
     while (i < items.len) : (i += 1) {
         if (items[i].asAtom() != null) continue; // $id
         const l = items[i].asList() orelse return false;
+        if (l.len == 0) return false;
         const h = l[0].asAtom() orelse return false;
         if (std.mem.eql(u8, h, "import")) return true;
         if (std.mem.eql(u8, h, "export")) continue;
@@ -653,7 +687,7 @@ fn typeDefName(items: []const Sexpr) ?[]const u8 {
 fn parseTypeBody(a: std.mem.Allocator, items: []const Sexpr, type_names: []const ?[]const u8, sigs: *List(Sig), gc_types: *List(GcTypeDef), gc_supers: *List(?Sexpr)) Error!void {
     var i: usize = 1;
     if (i < items.len and isId(items[i])) i += 1; // skip $name (already collected)
-    var body = items[i].asList() orelse return error.BadModuleField;
+    var body = try wantList(try nth(items, i));
     // Unwrap a `(sub final? $super? <comptype>)`: the inner comptype is the last
     // element; a supertype id among the middle elements (skipping `final`) is
     // captured so the type section can emit the sub form (GC MVP: ≤1 supertype).
@@ -669,14 +703,14 @@ fn parseTypeBody(a: std.mem.Allocator, items: []const Sexpr, type_names: []const
     }
     try gc_supers.append(a, super_ref);
 
-    const kw = body[0].asAtom() orelse return error.BadModuleField;
+    const kw = try wantAtom(try nth(body, 0));
     if (std.mem.eql(u8, kw, "func")) {
         var params: List(V) = .empty;
         var results: List(V) = .empty;
         for (body[1..]) |part| {
             const pk = part.keyword() orelse continue;
-            if (std.mem.eql(u8, pk, "param")) try parseDecls(a, part.asList().?, &params, null, type_names);
-            if (std.mem.eql(u8, pk, "result")) try parseDecls(a, part.asList().?, &results, null, type_names);
+            if (std.mem.eql(u8, pk, "param")) try parseDecls(a, (try wantList(part)), &params, null, type_names);
+            if (std.mem.eql(u8, pk, "result")) try parseDecls(a, (try wantList(part)), &results, null, type_names);
         }
         try sigs.append(a, .{ .params = params.items, .results = results.items });
         try gc_types.append(a, .func);
@@ -684,7 +718,7 @@ fn parseTypeBody(a: std.mem.Allocator, items: []const Sexpr, type_names: []const
         var fields: List(GcField) = .empty;
         for (body[1..]) |part| {
             if (std.mem.eql(u8, part.keyword() orelse continue, "field"))
-                try parseFieldGroup(a, part.asList().?, &fields, type_names);
+                try parseFieldGroup(a, (try wantList(part)), &fields, type_names);
         }
         try sigs.append(a, .{ .params = &.{}, .results = &.{} }); // placeholder
         try gc_types.append(a, .{ .@"struct" = fields.items });
@@ -695,7 +729,7 @@ fn parseTypeBody(a: std.mem.Allocator, items: []const Sexpr, type_names: []const
         const is_field_form = std.mem.eql(u8, body[1].keyword() orelse "", "field");
         const elem: GcField = if (is_field_form) blk: {
             var fields: List(GcField) = .empty;
-            try parseFieldGroup(a, body[1].asList().?, &fields, type_names);
+            try parseFieldGroup(a, (try wantList(body[1])), &fields, type_names);
             if (fields.items.len != 1) return error.BadModuleField;
             break :blk fields.items[0];
         } else try parseFieldElem(body[1], type_names);
@@ -741,7 +775,7 @@ fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef
     }
     // Inline exports: `(table $id? (export "x")* …)`.
     while (i < items.len and eqKw(items[i], "export")) : (i += 1)
-        try exports.append(a, .{ .name = items[i].asList().?[1].string, .kind = 1, .index = table_index });
+        try exports.append(a, .{ .name = try fieldStr(items[i], 1), .kind = 1, .index = table_index });
     try table_names.append(a, name);
     if (isRefType(items[i])) {
         // (table reftype (elem …))
@@ -750,7 +784,7 @@ fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef
         if (i < items.len and eqKw(items[i], "elem")) {
             // Inline active elem at offset 0. Items are either bare func indices
             // (`(elem $f $g)`) or const-expr forms (`(elem (ref.func $f) …)`).
-            const inner = items[i].asList().?[1..];
+            const inner = (try wantList(items[i]))[1..];
             const count: u32 = @intCast(inner.len);
             try tables.append(a, .{ .min = count, .max = count, .elem = et });
             if (inner.len != 0 and inner[0].asList() != null) {
@@ -813,7 +847,7 @@ fn parseElem(a: std.mem.Allocator, items: []const Sexpr, elems: *List(ElemDef), 
     } else {
         if (i < items.len and eqKw(items[i], "table")) {
             mode = .active;
-            table_index = try resolveByName(table_names, items[i].asList().?[1]);
+            table_index = try resolveByName(table_names, (try wantList(items[i]))[1]);
             i += 1;
         }
         if (i < items.len and isOffsetForm(items[i])) {
@@ -839,6 +873,7 @@ fn parseElem(a: std.mem.Allocator, items: []const Sexpr, elems: *List(ElemDef), 
 /// `(ref …)` reftype and from a `(ref.func …)` element expression.
 fn isOffsetForm(s: Sexpr) bool {
     const l = s.asList() orelse return false;
+    if (l.len == 0) return false;
     const kw = l[0].asAtom() orelse return false;
     return std.mem.eql(u8, kw, "offset") or std.mem.eql(u8, kw, "i32.const") or std.mem.eql(u8, kw, "global.get");
 }
@@ -854,12 +889,12 @@ fn parseGlobal(a: std.mem.Allocator, items: []const Sexpr, globals: *List(Global
     // The global-space index this entry will occupy (imports precede definitions).
     const idx: u32 = @intCast(global_names.items.len);
     while (i < items.len and eqKw(items[i], "export")) : (i += 1)
-        try exports.append(a, .{ .name = items[i].asList().?[1].string, .kind = 3, .index = idx });
+        try exports.append(a, .{ .name = try fieldStr(items[i], 1), .kind = 3, .index = idx });
     // Optional inline import: `(import "module" "name")`.
     var imp: ?struct { module: []const u8, name: []const u8 } = null;
     if (i < items.len and eqKw(items[i], "import")) {
-        const l = items[i].asList().?;
-        imp = .{ .module = l[1].string, .name = l[2].string };
+        const l = (try wantList(items[i]));
+        imp = .{ .module = (try strAt(l, 1)), .name = (try strAt(l, 2)) };
         i += 1;
     }
     // Global type: `valtype` or `(mut valtype)`. A list may be either the
@@ -892,10 +927,10 @@ fn parseGlobal(a: std.mem.Allocator, items: []const Sexpr, globals: *List(Global
 /// Top-level `(import "m" "n" (global $id? (mut? valtype)))`. Only global imports
 /// are assembled today; a func/table/memory import errors (honest, not silent).
 fn parseImport(a: std.mem.Allocator, items: []const Sexpr, global_imports: *List(ImportedGlobal), global_names: *List(?[]const u8), type_names: []const ?[]const u8) Error!void {
-    const module = items[1].string;
-    const name = items[2].string;
-    const desc = items[3].asList() orelse return error.BadModuleField;
-    const dkw = desc[0].asAtom() orelse return error.BadModuleField;
+    const module = (try strAt(items, 1));
+    const name = (try strAt(items, 2));
+    const desc = try wantList(try nth(items, 3));
+    const dkw = try wantAtom(try nth(desc, 0));
     if (!std.mem.eql(u8, dkw, "global")) return error.UnsupportedInstr; // func/table/memory imports
     var di: usize = 1;
     var gname: ?[]const u8 = null;
@@ -905,11 +940,13 @@ fn parseImport(a: std.mem.Allocator, items: []const Sexpr, global_imports: *List
     }
     var mutable = false;
     var valtype: V = undefined;
-    if (desc[di].asList()) |gt| {
+    const gtype = try nth(desc, di);
+    if (gtype.asList()) |gt| {
+        if (gt.len == 0) return error.BadModuleField;
         mutable = eqAtom(gt[0], "mut");
         valtype = try parseValType(gt[gt.len - 1], type_names);
     } else {
-        valtype = try parseValType(desc[di], type_names);
+        valtype = try parseValType(gtype, type_names);
     }
     try global_imports.append(a, .{ .module = module, .name = name, .valtype = valtype, .mutable = mutable });
     try global_names.append(a, gname);
@@ -976,13 +1013,13 @@ fn parseFunc(a: std.mem.Allocator, form: []const Sexpr, type_names: []const ?[]c
     }
     while (i < form.len) : (i += 1) {
         const kw = form[i].keyword() orelse break; // start of the body
-        const list = form[i].asList().?;
+        const list = (try wantList(form[i]));
         if (std.mem.eql(u8, kw, "export")) {
-            try f.exports.append(a, list[1].string);
+            try f.exports.append(a, (try strAt(list, 1)));
         } else if (std.mem.eql(u8, kw, "import")) {
-            f.import = .{ .module = list[1].string, .name = list[2].string }; // (import "m" "n")
+            f.import = .{ .module = (try strAt(list, 1)), .name = (try strAt(list, 2)) }; // (import "m" "n")
         } else if (std.mem.eql(u8, kw, "type")) {
-            f.type_ref = list[1]; // (type $t)
+            f.type_ref = try nth(list, 1); // (type $t)
         } else if (std.mem.eql(u8, kw, "param")) {
             try parseDecls(a, list, &f.params, &f.local_names, type_names);
         } else if (std.mem.eql(u8, kw, "result")) {
@@ -1150,7 +1187,7 @@ fn emitExpr(ctx: *Ctx, s: Sexpr) Error!void {
 }
 
 fn emitFoldedOne(ctx: *Ctx, l: []const Sexpr, i: usize) Error!usize {
-    const kw = l[0].asAtom() orelse return error.UnknownInstr;
+    const kw = (try nth(l, 0)).asAtom() orelse return error.UnknownInstr;
     if (lookupSimd(kw)) |sd| {
         _ = try emitSimd(ctx, sd, l, 1, true);
         return i + 1;
@@ -1205,7 +1242,7 @@ fn parseCallIndirectType(ctx: *Ctx, items: []const Sexpr, start: usize) Error!st
     var results: List(V) = .empty;
     while (j < items.len and items[j].keyword() != null) : (j += 1) {
         const kw = items[j].keyword().?;
-        if (std.mem.eql(u8, kw, "type")) type_ref = items[j].asList().?[1] else if (std.mem.eql(u8, kw, "param")) try parseDecls(ctx.a, items[j].asList().?, &params, null, ctx.type_names) else if (std.mem.eql(u8, kw, "result")) try parseDecls(ctx.a, items[j].asList().?, &results, null, ctx.type_names) else break;
+        if (std.mem.eql(u8, kw, "type")) type_ref = try nth(try wantList(items[j]), 1) else if (std.mem.eql(u8, kw, "param")) try parseDecls(ctx.a, (try wantList(items[j])), &params, null, ctx.type_names) else if (std.mem.eql(u8, kw, "result")) try parseDecls(ctx.a, (try wantList(items[j])), &results, null, ctx.type_names) else break;
     }
     const idx = if (type_ref) |tr| try resolveType(ctx.type_names, tr) else try internSig(ctx.a, ctx.sigs, params.items, results.items);
     return .{ .idx = idx, .table = table, .next = j };
@@ -1228,7 +1265,7 @@ fn emitCallIndirect(ctx: *Ctx, type_index: u32, table: u32) Error!void {
 fn emitFoldedSelect(ctx: *Ctx, l: []const Sexpr) Error!void {
     var j: usize = 1;
     var tys: List(V) = .empty;
-    while (j < l.len and eqKw(l[j], "result")) : (j += 1) try parseDecls(ctx.a, l[j].asList().?, &tys, null, ctx.type_names);
+    while (j < l.len and eqKw(l[j], "result")) : (j += 1) try parseDecls(ctx.a, (try wantList(l[j])), &tys, null, ctx.type_names);
     while (j < l.len) j = try emitOne(ctx, l, j); // operands
     try emitSelect(ctx, tys.items);
 }
@@ -1403,7 +1440,7 @@ fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Erro
         .select => {
             var j = i + 1;
             var tys: List(V) = .empty;
-            while (j < items.len and eqKw(items[j], "result")) : (j += 1) try parseDecls(ctx.a, items[j].asList().?, &tys, null, ctx.type_names);
+            while (j < items.len and eqKw(items[j], "result")) : (j += 1) try parseDecls(ctx.a, (try wantList(items[j])), &tys, null, ctx.type_names);
             try emitSelect(ctx, tys.items);
             return j;
         },
@@ -1511,11 +1548,11 @@ fn parseBlockTypeSig(ctx: *Ctx, l: []const Sexpr, j: *usize) Error!BlockTy {
     while (j.* < l.len) {
         const kw = l[j.*].keyword() orelse break;
         if (std.mem.eql(u8, kw, "type")) {
-            type_ref = try resolveType(ctx.type_names, l[j.*].asList().?[1]);
+            type_ref = try resolveType(ctx.type_names, try nth(try wantList(l[j.*]), 1));
         } else if (std.mem.eql(u8, kw, "param")) {
-            try parseDecls(ctx.a, l[j.*].asList().?, &params, null, ctx.type_names);
+            try parseDecls(ctx.a, try wantList(l[j.*]), &params, null, ctx.type_names);
         } else if (std.mem.eql(u8, kw, "result")) {
-            try parseDecls(ctx.a, l[j.*].asList().?, &results, null, ctx.type_names);
+            try parseDecls(ctx.a, try wantList(l[j.*]), &results, null, ctx.type_names);
         } else break;
         j.* += 1;
     }
@@ -2190,6 +2227,37 @@ fn assembleAndRun(src: []const u8, name: []const u8, args: []const interp.Value)
     var inst = try interp.Instance.init(a, &m);
     const r = try inst.invoke(name, args);
     return r[0];
+}
+
+test "assembler rejects malformed forms without indexing out of bounds" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Each of these is shape-malformed: the assembler must return an error, never
+    // read `items[N]` past a short form or unwrap a wrong-union `.?` (UB in
+    // ReleaseFast). Pre-hardening several of these crashed / read OOB.
+    const cases = [_][]const u8{
+        "(module (export \"x\"))", // export missing its (kind $id) target
+        "(module (export))", // export missing even the name
+        "(module (export \"x\" foo))", // target is an atom, not a list
+        "(module (import \"m\"))", // import missing name + desc
+        "(module (import \"m\" \"n\"))", // import missing the desc form
+        "(module (type))", // type missing its body
+        "(module (func (type)))", // inline (type) missing the index
+        "(module (memory (import \"m\" \"n\")))", // memory import missing min
+    };
+    for (cases) |src| {
+        try std.testing.expectError(error.BadModuleField, assemble(a, src));
+    }
+}
+
+test "parser rejects a deeply-nested paren bomb instead of overflowing the stack" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.appendNTimes(a, '(', 5000); // far past the nesting cap
+    try std.testing.expectError(error.NestingTooDeep, assemble(a, buf.items));
 }
 
 test "assembles and runs a folded add" {

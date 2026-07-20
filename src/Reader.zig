@@ -42,6 +42,16 @@ pub fn readBytes(self: *Reader, n: usize) types.DecodeError![]const u8 {
     return slice;
 }
 
+/// Read a `vec(…)` length and reject one larger than the bytes that remain:
+/// every element needs ≥1 byte, so a larger count is malformed. Use this (not
+/// `readVarU32`) whenever the count feeds an `alloc`, so a tiny module can't
+/// force a huge allocation from an untrusted count (OOM amplification).
+pub fn readVecLen(self: *Reader) types.DecodeError!u32 {
+    const n = try self.readVarU32();
+    if (n > self.remaining()) return error.UnexpectedEof;
+    return n;
+}
+
 /// Read a fixed 32-bit little-endian integer (used for the format version).
 pub fn readU32Le(self: *Reader) types.DecodeError!u32 {
     const b = try self.readBytes(4);

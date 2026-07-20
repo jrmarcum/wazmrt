@@ -107,22 +107,28 @@ Debug/ReleaseFast + freestanding wasm32) build; 372→380 printed tests.
   throughout (`assembleModule`/`parseFunc`/`parseGlobal`/`parseTable`/`parseInstr`). Malformed `.wat`
   (e.g. `(module (export "x"))` — missing the index target) → OOB read / wild-union deref / null-unwrap,
   which is UB in the shipped ReleaseFast build. Reached **before** any verify gate via `wazmrt <file.wat>`,
-  `wazmrt sign <in.wat>`, and `wazmrt pin <dir>` (assembles every `.wat` found). **Surfaces when:** a user
-  assembles an untrusted/attacker-planted `.wat`. Fix: shape-checked accessors returning
-  `error.BadModuleField` instead of `.?`/`items[N]`, or route `.wat` assembly through a ReleaseSafe
-  boundary. (Threat model is weaker than the `.wasm` run path — a user assembling their own text — but
-  `pin <dir>` widens it.) **Owner decision pending on scope.**
-- **`sexpr.zig` parseList/parseValue — LOW (DoS).** Unbounded recursion on deeply-nested `((((…` → host
-  stack overflow. Same surface as above. Fix: a nesting-depth cap → `error.NestingTooDeep`.
-- **`Module.zig` struct-vector decoders — LOW (OOM amplification, not corruption).** ~14 sites
-  `alloc(T, count)` from an untrusted LEB *before* reading elements, with no `count > r.remaining()`
-  pre-check (byte-vec readers already do this via `readBytes`). A tiny module can force a huge alloc
-  *attempt* — but `Allocator.alloc`'s checked multiply returns `OutOfMemory` cleanly (even on wasm32), so
-  it is a failed request, not UB. Fix: reject `count > r.remaining()` before each `alloc`.
-- **`opcode.zig` other raw internal-tag leniency** (`0xE3–0xE5`, `0xED`, `0xF0–0xF2`, etc.) — accepted as
-  non-standard single-byte encodings, but they land on the *correct* union, so over-acceptance
-  (strictness), not memory-safety. **`Module.zig:1023`/`opcode.zig:766`** `@intCast` of a byte offset
-  truncates for a >4 GiB module (impractical; only a wrong trap-backtrace offset).
+  `wazmrt sign <in.wat>`, and `wazmrt pin <dir>` (assembles every `.wat` found).
+  **FIXED 2026-07-19** (owner chose shape-checked accessors): added `wantList`/`wantAtom`/`wantStr`/`nth`/
+  `fieldStr`/`strAt` helpers to `wat.zig` and routed **every** parser-derived access through them — all
+  `.asList().?`/`.asAtom().?`/`.string` wrong-union derefs (35 sites) and the ungated `items[N]`/`target[N]`/
+  `desc[N]`/`body[N]`/`[1]`-after-unwrap indexes across the module/import/export/tag/memory/type/func/global
+  parsers now return `error.BadModuleField`. A `test "assembler rejects malformed forms …"` runs 8 malformed
+  inputs; verified in ReleaseFast via CLI (`wazmrt evil.wat` → `error: cannot assemble … : BadModuleField`,
+  no crash). *(Discovered while testing: a bare `(tag)` is a VALID empty tag `()→()`, not malformed — the
+  old code crashed on it; the fix makes it assemble.)*
+- **`sexpr.zig` parseList/parseValue — LOW (DoS). FIXED 2026-07-19.** Added a `max_depth = 1024` nesting cap
+  (`Parser.depth` + check in `parseList`) → `error.NestingTooDeep`; a `((((…`-bomb no longer overflows the
+  host stack. Regression test with 5000-deep parens.
+- **`Module.zig`/`opcode.zig` alloc-before-read OOM amplification — LOW (clean fail). FIXED 2026-07-19.**
+  Added `Reader.readVecLen()` (reads a vec count and rejects `> remaining()`, since each element needs ≥1
+  byte) and applied it at every pre-alloc count read: import/export/function/tag/element/data/code sections,
+  valtype/local/funcvec/exprvec/GC-field vectors (`Module.zig`), and `try_table`/`br_table`/`select_types`
+  (`opcode.zig`). Byte-vec/name readers were already safe (`readBytes` precedes their alloc). A tiny module
+  can no longer force a huge alloc *attempt*.
+- **STILL DEFERRED (strictness / impractical, not memory-safety):** `opcode.zig` other raw internal-tag
+  leniency (`0xE3–0xE5`, `0xED`, `0xF0–0xF2`, etc.) — accepted as non-standard single-byte encodings, but
+  they land on the *correct* union, so over-acceptance only. **`Module.zig:1023`/`opcode.zig:766`**
+  `@intCast` of a byte offset truncates for a >4 GiB module (impractical; only a wrong trap-backtrace offset).
 
 **Low-priority notes (safe today):**
 - `wasi.zig Wasi.init` — `w.fds.appendSlice(...) catch {}` swallows OOM registering the 3 stdio fds (init

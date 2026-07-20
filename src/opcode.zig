@@ -694,7 +694,7 @@ fn decodeSimd(r: *Reader, sub: u32) DecodeError!Instr {
 /// 3=catch_all_ref), a tag index for the non-`all` kinds, then a label index.
 fn readTryTable(r: *Reader, a: std.mem.Allocator) (DecodeError || std.mem.Allocator.Error)!Imm {
     const bt = try readBlockType(r);
-    const n = try r.readVarU32();
+    const n = try r.readVecLen();
     const catches = try a.alloc(Catch, n);
     for (catches) |*c| {
         const kind: CatchKind = switch (try r.readByte()) {
@@ -845,7 +845,7 @@ pub fn decodeBodyTracked(
             .block_type => .{ .block_type = try readBlockType(&r) },
             .label => .{ .label = try r.readVarU32() },
             .br_table => blk: {
-                const n = try r.readVarU32();
+                const n = try r.readVecLen();
                 const labels = try a.alloc(u32, n);
                 for (labels) |*l| l.* = try r.readVarU32();
                 break :blk .{ .br_table = .{ .labels = labels, .default = try r.readVarU32() } };
@@ -869,7 +869,7 @@ pub fn decodeBodyTracked(
             .f32c => .{ .f32 = try r.readF32Bits() },
             .f64c => .{ .f64 = try r.readF64Bits() },
             .select_types => blk: {
-                const n = try r.readVarU32();
+                const n = try r.readVecLen();
                 const tys = try a.alloc(types.ValType, n);
                 for (tys) |*t| {
                     t.* = @enumFromInt(try r.readByte());

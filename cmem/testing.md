@@ -481,13 +481,15 @@ V8. **Decision:** build the shipped `.lib`/`.dll` (and the freestanding wasm —
 `design-decisions.md`. (Caveat: single machine; sizes + steady-state are solid, the µs/ms cold numbers
 are ±10% noisy.)
 
-## Reading the test count (updated 2026-07-19, post run-path hardening 2nd pass)
+## Reading the test count (updated 2026-07-19, post assembler + decode hardening)
 
-`zig build test --summary all` prints **380** (376 pass, 4 skip), but there are **195 distinct tests**:
-185 in the core module (183 pass + 2 skip) + 10 C-ABI. The `cabi_tests` target's root is
+`zig build test --summary all` prints **384** (380 pass, 4 skip), but there are **197 distinct tests**:
+187 in the core module (185 pass + 2 skip) + 10 C-ABI. The last +2 are the `wat.zig` malformed-input
+tests (`assembler rejects malformed forms …` — 8 shape-malformed `.wat` → `BadModuleField`; and the
+5000-deep paren bomb → `NestingTooDeep`), added with the shape-checked-accessor hardening. The `cabi_tests` target's root is
 `wasm_c_api.zig`, which imports `root.zig`, so it compiles and **re-runs the core module's tests too**
-(185 core + 10 C-ABI = 195), on top of the standalone `mod_tests` run (185) → 380 printed. Harmless —
-under a second — but **don't quote the printed number as a test count**; quote **183**, or the per-target
+(187 core + 10 C-ABI = 197), on top of the standalone `mod_tests` run (187) → 384 printed. Harmless —
+under a second — but **don't quote the printed number as a test count**; quote **185**, or the per-target
 numbers from `--summary all`. The run-path memory-safety `test "hardening: …"` blocks in `interp.zig` are
 now **9** (4 from the 1st pass + 5 from the 2nd: the `call` wild-write, epilogue under-produce,
 branch-arity, and bare-`else` cases) — see known-issues "Run-path hardening, 2nd pass".

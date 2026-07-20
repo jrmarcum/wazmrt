@@ -581,7 +581,7 @@ fn readHeapTypeRef(r: *Reader, nullable: bool, kinds: []const CompKind) Error!ty
 }
 
 fn readValTypes(a: std.mem.Allocator, r: *Reader, kinds: []const CompKind) Error![]const types.ValType {
-    const n = try r.readVarU32();
+    const n = try r.readVecLen();
     const vts = try a.alloc(types.ValType, n);
     for (vts) |*v| v.* = try readValType(r, kinds);
     return vts;
@@ -715,7 +715,7 @@ fn decodeCompType(d: *Decoder, r: *Reader) Error!CompType {
             .results = try readValTypes(d.a, r, d.type_kinds),
         } },
         0x5f => blk: {
-            var n = try r.readVarU32();
+            var n = try r.readVecLen();
             const fs = try d.a.alloc(FieldType, n);
             var i: usize = 0;
             while (n > 0) : (n -= 1) {
@@ -805,7 +805,7 @@ fn funcTypeAt(d: *Decoder, type_index: u32) Error!FuncType {
 }
 
 fn decodeImportSection(d: *Decoder, r: *Reader) Error![]const Import {
-    const count = try r.readVarU32();
+    const count = try r.readVecLen();
     const list = try d.a.alloc(Import, count);
     for (list) |*imp| {
         imp.module = try readName(d.a, r);
@@ -846,7 +846,7 @@ fn decodeImportSection(d: *Decoder, r: *Reader) Error![]const Import {
 }
 
 fn decodeFunctionSection(d: *Decoder, r: *Reader) Error![]const u32 {
-    const count = try r.readVarU32();
+    const count = try r.readVecLen();
     const list = try d.a.alloc(u32, count);
     for (list) |*i| {
         i.* = try r.readVarU32();
@@ -858,7 +858,7 @@ fn decodeFunctionSection(d: *Decoder, r: *Reader) Error![]const u32 {
 /// Tag section (§5.5.14, EH proposal): a vector of tags, each an attribute byte
 /// (0x00 = exception) followed by a type index. Returns the type indices.
 fn decodeTagSection(d: *Decoder, r: *Reader) Error![]const u32 {
-    const count = try r.readVarU32();
+    const count = try r.readVecLen();
     const list = try d.a.alloc(u32, count);
     for (list) |*i| {
         const attr = try r.readByte();
@@ -888,7 +888,7 @@ fn decodeGlobalSection(d: *Decoder, r: *Reader) Error!void {
 }
 
 fn decodeExportSection(d: *Decoder, r: *Reader) Error![]const Export {
-    const count = try r.readVarU32();
+    const count = try r.readVecLen();
     const list = try d.a.alloc(Export, count);
     for (list) |*e| {
         e.name = try readName(d.a, r);
@@ -912,7 +912,7 @@ fn spaceAt(comptime T: type, space: std.ArrayList(T), index: u32) Error!T {
 }
 
 fn decodeLocals(a: std.mem.Allocator, r: *Reader, kinds: []const CompKind) Error![]const Local {
-    const n = try r.readVarU32();
+    const n = try r.readVecLen();
     const locals = try a.alloc(Local, n);
     for (locals) |*l| {
         l.count = try r.readVarU32();
@@ -942,7 +942,7 @@ fn readConstExprBytes(a: std.mem.Allocator, r: *Reader) Error![]const u8 {
 }
 
 fn readFuncVec(a: std.mem.Allocator, r: *Reader) Error![]const u32 {
-    const n = try r.readVarU32();
+    const n = try r.readVecLen();
     const funcs = try a.alloc(u32, n);
     for (funcs) |*f| f.* = try r.readVarU32();
     return funcs;
@@ -950,7 +950,7 @@ fn readFuncVec(a: std.mem.Allocator, r: *Reader) Error![]const u32 {
 
 /// Read a vector of element const-expressions (each terminated by `end`).
 fn readExprVec(a: std.mem.Allocator, r: *Reader) Error![]const []const u8 {
-    const n = try r.readVarU32();
+    const n = try r.readVecLen();
     const exprs = try a.alloc([]const u8, n);
     for (exprs) |*e| e.* = try readConstExprBytes(a, r);
     return exprs;
@@ -962,7 +962,7 @@ const no_exprs: []const []const u8 = &.{};
 /// Decode the element section (§5.5.12): all 8 flag variants — active /
 /// passive / declarative, in either the func-index or const-expr form.
 fn decodeElementSection(d: *Decoder, r: *Reader) Error![]const Element {
-    const count = try r.readVarU32();
+    const count = try r.readVecLen();
     const list = try d.a.alloc(Element, count);
     for (list) |*e| {
         const flags = try r.readVarU32();
@@ -990,7 +990,7 @@ fn decodeElementSection(d: *Decoder, r: *Reader) Error![]const Element {
 }
 
 fn decodeDataSection(d: *Decoder, r: *Reader) Error![]const DataSegment {
-    const count = try r.readVarU32();
+    const count = try r.readVecLen();
     const list = try d.a.alloc(DataSegment, count);
     for (list) |*seg| {
         switch (try r.readVarU32()) { // segment flags (§5.5.14)
@@ -1006,7 +1006,7 @@ fn decodeDataSection(d: *Decoder, r: *Reader) Error![]const DataSegment {
 /// `payload_base` is the code section payload's absolute offset in the module,
 /// so each body can record where its bytes live in the original binary.
 fn decodeCodeSection(d: *Decoder, r: *Reader, payload_base: usize) Error![]const Code {
-    const count = try r.readVarU32();
+    const count = try r.readVecLen();
     const list = try d.a.alloc(Code, count);
     for (list) |*c| {
         // Each entry is a byte-counted (locals ++ body) blob; decode within it

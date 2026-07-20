@@ -50,7 +50,14 @@ pub const Error = error{
     UnterminatedString,
     UnterminatedList,
     BadEscape,
+    /// List nesting exceeded `max_depth` — refuses a `((((…`-bomb that would
+    /// otherwise overflow the host stack via `parseList`/`parseValue` recursion.
+    NestingTooDeep,
 } || std.mem.Allocator.Error;
+
+/// Cap on `(`-nesting. Real `.wat`/`.wast` nests a few dozen deep at most; this
+/// is a stack-overflow guard against adversarial input, not a real limit.
+const max_depth: usize = 1024;
 
 /// Parse an entire source into its sequence of top-level forms. Everything is
 /// allocated from `a` (typically an arena).
@@ -69,6 +76,7 @@ const Parser = struct {
     src: []const u8,
     pos: usize = 0,
     a: std.mem.Allocator,
+    depth: usize = 0,
 
     fn skipTrivia(self: *Parser) void {
         while (self.pos < self.src.len) {
@@ -111,6 +119,9 @@ const Parser = struct {
     }
 
     fn parseList(self: *Parser) Error!Sexpr {
+        self.depth += 1;
+        defer self.depth -= 1;
+        if (self.depth > max_depth) return error.NestingTooDeep;
         self.pos += 1; // consume '('
         var items: std.ArrayList(Sexpr) = .empty;
         while (true) {
