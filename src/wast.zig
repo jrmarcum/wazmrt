@@ -29,6 +29,23 @@ const Sexpr = sexpr.Sexpr;
 
 pub const Error = sexpr.Error || error{ BadCommand, BadValue } || std.mem.Allocator.Error;
 
+// Shape-checked accessors — the `.wast` runner operates on parser output whose
+// shape is NOT validated (the parser only balances parens/strings). Malformed
+// `.wast` (reached via `wazmrt <file.wast>`) must error, never index a parsed
+// s-expression out of bounds or deref a wrong-union `.string` (UB in ReleaseFast).
+
+/// The i-th element of a command/action form, or `error.BadCommand` if too short.
+fn nth(items: []const Sexpr, i: usize) Error!Sexpr {
+    return if (i < items.len) items[i] else error.BadCommand;
+}
+/// A form as a string literal (an action/register name), or `error.BadCommand`.
+fn asStr(s: Sexpr) Error![]const u8 {
+    return switch (s) {
+        .string => |x| x,
+        else => error.BadCommand,
+    };
+}
+
 pub const Summary = struct {
     passed: usize = 0,
     failed: usize = 0,
@@ -101,7 +118,7 @@ const Runner = struct {
             // the `$id`-named module if given, else the current module.
             const list = cmd.asList().?;
             const target = if (list.len > 2 and isId(list[2])) self.module_names.get(list[2].atom) else self.current;
-            if (target) |inst| try self.modules.put(self.a, list[1].string, inst);
+            if (target) |inst| try self.modules.put(self.a, try asStr(try nth(list, 1)), inst);
         } else if (std.mem.eql(u8, kw, "invoke") or std.mem.eql(u8, kw, "get")) {
             _ = self.runAction(cmd) catch |e| self.fail("action failed: {s}", .{@errorName(e)});
         } else {
@@ -255,10 +272,10 @@ const Runner = struct {
     /// the target is unavailable (so assertions skip rather than spuriously fail).
     fn runAction(self: *Runner, action: Sexpr) ![]Value {
         const list = action.asList() orelse return error.BadCommand;
-        const kw = list[0].asAtom() orelse return error.BadCommand;
+        const kw = (try nth(list, 0)).asAtom() orelse return error.BadCommand;
         var i: usize = 1;
         const inst = self.actionTarget(list, &i) orelse return error.NoTarget;
-        const name = list[i].string;
+        const name = try asStr(try nth(list, i));
         i += 1;
         if (std.mem.eql(u8, kw, "invoke")) {
             const args = try self.a.alloc(Value, list.len - i);
@@ -293,6 +310,7 @@ const Runner = struct {
     }
 
     fn assertReturn(self: *Runner, form: []const Sexpr) Error!void {
+        if (form.len < 2) return self.fail("assert_return: missing action", .{});
         const results = self.runAction(form[1]) catch |e| {
             if (e == error.NoTarget) { // module didn't build / unknown $name — can't run
                 self.summary.skipped += 1;
@@ -330,6 +348,7 @@ const Runner = struct {
     /// or a reference literal (`(ref.null …)`, `(ref.extern N)`, `(ref.func N)`).
     fn parseConst(self: *Runner, form: Sexpr) Error!Value {
         const list = form.asList() orelse return error.BadValue;
+        if (list.len == 0) return error.BadValue;
         const kw = list[0].asAtom() orelse return error.BadValue;
         // `ref.null` carries an ignorable heaptype; `ref.func` payload is a func
         // index (used directly); `ref.extern` payload is a host value (interned).
@@ -340,8 +359,9 @@ const Runner = struct {
         }
         if (std.mem.eql(u8, kw, "ref.func")) {
             if (list.len < 2) return null_ref -% 1; // bare `(ref.func)` — any non-null
-            return @intCast(try parseInt(list[1].asAtom() orelse return error.BadValue));
+            return @bitCast(try parseInt(list[1].asAtom() orelse return error.BadValue)); // @bitCast: a negative index is bogus but must not be UB
         }
+        if (list.len < 2) return error.BadValue;
         const lit = list[1].asAtom() orelse return error.BadValue;
         if (std.mem.eql(u8, kw, "i32.const")) return interp.i32Value(@truncate(try parseInt(lit)));
         if (std.mem.eql(u8, kw, "i64.const")) return interp.i64Value(try parseInt(lit));
@@ -354,6 +374,7 @@ const Runner = struct {
     /// the `nan:canonical` / `nan:arithmetic` matchers for floats and references.
     fn matches(self: *Runner, got: Value, exp_form: Sexpr) Error!bool {
         const list = exp_form.asList() orelse return error.BadValue;
+        if (list.len == 0) return error.BadValue;
         const kw = list[0].asAtom() orelse return error.BadValue;
         // Reference matchers: `(ref.null …)` ⇒ null; a bare `(ref.func)` /
         // `(ref.extern)` ⇒ any non-null; with a payload ⇒ exact.
@@ -364,8 +385,9 @@ const Runner = struct {
         }
         if (std.mem.eql(u8, kw, "ref.func")) {
             if (list.len < 2) return got != null_ref;
-            return got == @as(Value, @intCast(try parseInt(list[1].asAtom() orelse return error.BadValue)));
+            return got == @as(Value, @bitCast(try parseInt(list[1].asAtom() orelse return error.BadValue)));
         }
+        if (list.len < 2) return error.BadValue;
         const lit = list[1].asAtom() orelse return error.BadValue;
         if (std.mem.eql(u8, kw, "f32.const")) return floatMatches(f32, got, lit);
         if (std.mem.eql(u8, kw, "f64.const")) return floatMatches(f64, got, lit);
@@ -374,11 +396,12 @@ const Runner = struct {
     }
 
     fn assertTrap(self: *Runner, form: []const Sexpr) Error!void {
+        if (form.len < 2) return self.fail("assert_trap: missing operand", .{});
         // `assert_trap (module …)` — instantiation itself must trap (e.g. an
         // active data/element segment out of bounds). Build it in isolation and
         // require a genuine runtime trap; it does not become the current module.
         if (form[1].asList()) |inner| {
-            if (std.mem.eql(u8, inner[0].asAtom() orelse "", "module")) {
+            if (inner.len != 0 and std.mem.eql(u8, inner[0].asAtom() orelse "", "module")) {
                 if (self.buildModule(inner)) |_| {
                     self.fail("assert_trap: module instantiated without trapping", .{});
                 } else |e| {
@@ -400,6 +423,7 @@ const Runner = struct {
     /// `assert_exhaustion (invoke …) "call stack exhausted"` — expects the call
     /// depth limit to trip (a runtime trap), not any other error.
     fn assertExhaustion(self: *Runner, form: []const Sexpr) Error!void {
+        if (form.len < 2) return self.fail("assert_exhaustion: missing action", .{});
         if (self.runAction(form[1])) |_| {
             self.fail("assert_exhaustion: expected exhaustion, got a result", .{});
         } else |e| {
@@ -412,6 +436,7 @@ const Runner = struct {
     /// failing means we wrongly accepted an invalid/malformed module. Does not
     /// touch `self.current`.
     fn assertRejected(self: *Runner, form: []const Sexpr) Error!void {
+        if (form.len < 2) return self.fail("assert_invalid: malformed command", .{});
         const inner = form[1].asList() orelse {
             self.fail("assert_invalid: malformed command", .{});
             return;
@@ -437,6 +462,7 @@ const Runner = struct {
     /// time; a non-link error (decode/validate/runtime) does not count. Does not
     /// touch `self.current`.
     fn assertUnlinkable(self: *Runner, form: []const Sexpr) Error!void {
+        if (form.len < 2) return self.fail("assert_unlinkable: malformed command", .{});
         const inner = form[1].asList() orelse {
             self.fail("assert_unlinkable: malformed command", .{});
             return;
@@ -645,6 +671,32 @@ test "runs assert_return and assert_trap over a module" {
     const s = try runScript(std.testing.allocator, src);
     try std.testing.expectEqual(@as(usize, 4), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "runner rejects malformed commands without indexing out of bounds" {
+    // Each is shape-malformed: the runner must error or record a failure, never
+    // index a parsed s-expression past its end / deref a wrong-union `.string`
+    // (a Debug panic here, UB in ReleaseFast). Pre-hardening these read `form[1]`/
+    // `list[i]`/`list[0]` OOB. Reaching the end of the loop is the assertion.
+    const cases = [_][]const u8{
+        "(assert_return)", // missing action
+        "(assert_return ())", // action is an empty list
+        "(assert_trap)", // missing operand
+        "(assert_trap ())", // operand is an empty list → inner[0]
+        "(assert_exhaustion)",
+        "(assert_invalid)",
+        "(assert_unlinkable)",
+        "(register)", // missing name → list[1]
+        "(module (func (export \"f\"))) (invoke)", // missing name
+        "(module (func (export \"f\"))) (invoke \"f\" (i32.const))", // const w/o literal
+        "(module (func (export \"f\"))) (invoke \"f\" ())", // arg is an empty list
+        "(module (func (export \"f\"))) (register)",
+    };
+    for (cases) |src| {
+        // Either outcome (error or a recorded failure) is fine; the point is that
+        // no path indexes out of bounds.
+        _ = runScript(std.testing.allocator, src) catch {};
+    }
 }
 
 fn buildAndValidate(a: std.mem.Allocator, src: []const u8) !void {
