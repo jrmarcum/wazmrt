@@ -99,7 +99,13 @@ pub fn modeFromDb(text: []const u8) ?Mode {
         const body = std.mem.trim(u8, line[1..], " \t");
         const prefix = "mode:";
         if (std.mem.startsWith(u8, body, prefix))
-            return modeFromStr(std.mem.trim(u8, body[prefix.len..], " \t"));
+            // A present `# mode:` directive with an unrecognized value fails
+            // CLOSED — the strictest mode, never silently `null` ("no policy",
+            // which `--no-verify` could then override). A typo (`# mode: enfroce`),
+            // capitalization, or an inline trailing comment must not downgrade a
+            // root-intended enforce. Matches the hash lines' fail-closed posture
+            // (a mangled line → `InvalidPinLine`).
+            return modeFromStr(std.mem.trim(u8, body[prefix.len..], " \t")) orelse .enforce;
     }
     return null;
 }
@@ -275,4 +281,10 @@ test "modeFromDb reads the # mode: directive, ignores other comments" {
     try std.testing.expectEqual(Mode.warn, modeFromDb("#mode:warn\n").?);
     try std.testing.expectEqual(@as(?Mode, null), modeFromDb("# just a comment\ndeadbeef\n"));
     try std.testing.expectEqual(@as(?Mode, null), modeFromDb(""));
+    // A present `# mode:` with an unrecognized value fails CLOSED (→ enforce),
+    // never silently null — a typo/casing/inline-comment can't downgrade enforce.
+    try std.testing.expectEqual(Mode.enforce, modeFromDb("# mode: enfroce\n").?);
+    try std.testing.expectEqual(Mode.enforce, modeFromDb("# mode: Enforce\n").?);
+    try std.testing.expectEqual(Mode.enforce, modeFromDb("# mode: enforce # prod\n").?);
+    try std.testing.expectEqual(Mode.enforce, modeFromDb("# mode:\n").?); // empty value
 }
