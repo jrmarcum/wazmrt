@@ -6,10 +6,19 @@
 //! interpreter. `decodeBody` turns a function's raw body bytes (captured in
 //! `Module.Code.body`) into a flat `[]Instr` with pre-parsed immediates.
 //!
-//! **Scope today:** the core MVP instruction set (`0x00`–`0xC4`) plus the basic
-//! reference-type ops (`ref.null`/`ref.is_null`/`ref.func`, `0xD0`–`0xD2`). The
-//! `0xFC` (bulk-memory / saturating-truncation) and `0xFD` (SIMD) prefixes decode
-//! to `error.UnsupportedOpcode` — a clean, documented boundary to expand from.
+//! **Scope today (corrected 2026-07-21 — this header had gone badly stale):**
+//! the core instruction set (`0x00`–`0xC4`), the reference-type and typed-ref
+//! ops (`0xD0`–`0xD6`), the **complete** `0xFC` prefix (saturating truncation,
+//! bulk memory, table ops), the **complete** `0xFD` SIMD set, the `0xFB` GC ops,
+//! and exception handling in both encodings. The old claim that `0xFC`/`0xFD`
+//! "decode to `error.UnsupportedOpcode`" has been false since Phase 1 / Phase 8.
+//!
+//! **`Op` values `0xD7`–`0xFA` are INTERNAL tags**, not wire bytes: they name ops
+//! whose real encoding is `0xFB`/`0xFC` + a LEB sub-opcode. `decodeBody` rejects
+//! a raw byte in that range — accepting one executed a non-standard encoding as
+//! a real instruction (see `cmem/design-decisions.md`, "guard the property, not
+//! a proxy for it").
+//!
 //! Control-flow nesting and branch-target resolution are *not* done here; that
 //! belongs to validation.
 

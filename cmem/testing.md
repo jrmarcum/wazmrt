@@ -500,7 +500,23 @@ meaningful *because* the suite runs in Debug), **`a memory minimum past the budg
 allocated`**, **`popping an empty operand stack traps instead of unwrapping null`**, and **`random_get
 returns real entropy, not zeros or a predictable stream`** (non-zero output, an advancing stream, and two
 instances not agreeing — confirmed non-vacuous by temporarily reseeding deterministically and watching it
-fail). The 5th-audit malformed-input tests: `wast.zig` `runner rejects malformed commands …` (12
+fail).
+
+**The 2026-07-21 closeout additions (5 tests):** `opcode.zig` **`rejects raw internal-tag bytes that are
+not real single-byte opcodes`** (the tags the old kind-based guard structurally could not catch, the range
+endpoints, and that the real ops just below the boundary still decode); `validate.zig`
+**`memory-touching ops require an in-range memory`** and **`br_on_non_null accepts any reference label
+type`** — both written with the newly-accepted *and* still-rejected cases so the fixes cannot drift into
+over-acceptance; `wasm_c_api.zig` **`a trap keeps its instance alive after the embedder deletes it`**; and
+the split-out `fuzz` text target.
+
+**Read the trap-lifetime test before writing another lifetime test.** Its first version compared
+`wasm_frame_instance(origin)` against the original pointer — which **passes against freed memory**, since
+comparing a stored pointer never dereferences it. It was made real by calling `wasm_instance_exports`
+*through* the frame's instance, then verified by deleting the retain and confirming a crash (exit 3).
+A lifetime test must dereference, not compare.
+
+The 5th-audit malformed-input tests: `wast.zig` `runner rejects malformed commands …` (12
 shapes) and a C-ABI import-memory-lifetime test (delete an imported memory after instantiation, then
 `i32.load` → 42) join the existing `wat.zig` malformed-`.wat` case (11 shapes + paren bomb) and the **10**
 `interp.zig` `test "hardening: …"` blocks (the `call` wild-write, epilogue under-produce, branch-arity,

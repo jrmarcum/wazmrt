@@ -5,11 +5,20 @@
 //!
 //! Scope matches the decoder: the core-MVP instruction set. It checks the
 //! function/code count match (deferred from decode), local/global/func/type
-//! index bounds, structured control flow, and operand-stack typing. Memory
-//! presence and load/store alignment are not yet enforced (documented leniency).
+//! index bounds, structured control flow, operand-stack typing, and — since
+//! 2026-07-21 — that every memory-touching op names an **in-range** memory
+//! (scalar loads/stores, SIMD loads/stores, `memory.size`/`grow`) plus
+//! load/store alignment. (This header previously said memory presence and
+//! alignment were "not yet enforced"; that leniency is gone.)
 //!
 //! `validate` does not mutate the module; it decodes each body to IR in a scratch
-//! arena and type-checks it.
+//! arena and type-checks it. It is also a **C-ABI entry point**
+//! (`wasm_module_validate`), so "the validator accepted it" is a promise to an
+//! embedder, not just a developer convenience — see `cmem/design-decisions.md`.
+//!
+//! Resource caps live here too (`max_ctrl_depth`, `max_locals`): a tiny module
+//! could otherwise drive gigabytes of validator state. **Their cost is a
+//! product** — read both before changing either.
 
 const std = @import("std");
 const types = @import("types.zig");

@@ -173,6 +173,32 @@ Two ways the authenticity gate did **not** hold as documented. One fixed, one op
   both the inspect and run paths. See `design-decisions.md`; note the two validator caps bound a
   **product**.
 
+### Guest-pointer arithmetic is now uniformly widen-then-check — CLOSED 2026-07-21
+
+Every WASI syscall takes guest pointers and lengths, so the file's rule is: **compute in u64, bounds-check,
+narrow only after**. A u32 computation that wraps produces a *small* offset, which then **passes the very
+check it should have failed** — the check is still there, it is just being asked about the wrong address.
+
+That class was closed in three stages, which is worth recording because each stage looked complete at the
+time: the **6th pass** fixed `fd_write`/`fd_read`/`pread`/`pwrite`/`seek`; the **10th** found
+`writeStringVec` (`args_get`/`environ_get`); and **2026-07-21** found the last three —
+`gatherIovecs`, `fd_read`'s stdin path, and `poll_oneoff` — all computing `base + i * stride` in u32.
+They now share `Wasi.arrayOffset(base, i, stride)`, which does the arithmetic in u64 and requires the
+**whole element** to fit, so a caller may still form `iov + 4` for the length field in u32 without
+wrapping. None was demonstrably exploitable (the reachable element counts kept the index below the wrap),
+but "contained by arithmetic that happens not to overflow today" is not a boundary.
+
+**Rule: never index a guest array with u32 arithmetic — go through `Wasi.arrayOffset`.**
+
+### C-ABI object lifetimes: the last borrower — FIXED 2026-07-21
+
+A `wasm_trap_t` outlives the call that produced it, and `wasm_frame_instance` hands its stored `*Instance`
+back to the embedder — but the trap's frames only *borrowed* it. So `wasm_instance_delete` right after
+catching a trap (an ordinary sequence, no misuse) left every frame dangling. The frames now retain the
+instance; `wasm_trap_delete` releases it. This was the **last** site departing from the file's
+"a stored `*Instance` owns a handle" discipline, which earlier passes established after #21 and #22 found
+the same shape in exports, imported memories, and the module handle.
+
 ### `random_get` is now cryptographic — FIXED 2026-07-20
 
 **Was:** `Wasi.rng` was `std.Random.DefaultPrng` (Xoshiro256++, non-cryptographic) seeded from
