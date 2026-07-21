@@ -579,7 +579,13 @@ fn readHeapTypeRef(r: *Reader, nullable: bool, kinds: []const CompKind) Error!ty
         -0x15 => .{ .structref, .structref_nn }, // struct
         -0x16 => .{ .arrayref, .arrayref_nn }, // array
         -0x0f => .{ .nullref, .nullref_nn }, // none
-        else => .{ .externref, .externref_nn }, // exn/other → opaque
+        -0x17 => .{ .exnref, .exnref_nn }, // exn (EH proposal) — was folded into externref
+        // An undefined heap-type code used to decode as `externref` ("other →
+        // opaque"), so a malformed type was thereafter indistinguishable from a
+        // real externref in validation, the C-ABI type objects, and the `.wast`
+        // linker's import check. `readValType` and `opcode.readHeapType` both
+        // reject — this was the one reader that fell through.
+        else => return error.BadValType,
     };
     return if (nullable) both[0] else both[1];
 }

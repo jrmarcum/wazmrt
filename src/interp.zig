@@ -661,9 +661,16 @@ pub const Instance = struct {
         // host-supplied values (both halves, for imported v128 globals). Defined
         // globals (each with an init expr) follow.
         const defined_start = module.globals.len - module.global_inits.len;
+        // A short `imports.globals` used to leave the rest at the `@memset` zero,
+        // so a module importing a global the host never supplied silently read
+        // **0** instead of failing — while imported memories and tables both
+        // return `MissingImport` a few lines below. The asymmetric sibling.
+        if (defined_start > imports.globals.len) return error.MissingImport;
         for (imports.globals, 0..) |gv, i| {
             if (i >= defined_start) break;
             globals[i] = gv;
+            // NOTE: a short `globals_hi` is fine — it is only meaningful for v128
+            // globals and 0 is correct for every scalar one.
             if (i < imports.globals_hi.len) global_hi[i] = imports.globals_hi[i];
         }
         for (module.global_inits, 0..) |init_expr, gi| {
@@ -986,6 +993,20 @@ pub const Instance = struct {
     fn headMatches(self: *Instance, actual: types.ValType.RefHeap, actual_ti: ?u32, target: opcode.HeapType) bool {
         switch (target) {
             .concrete => |t| return actual_ti != null and self.module.isSubtype(actual_ti.?, t),
+            // `nofunc`/`noextern` are the UNINHABITED bottoms of the func/extern
+            // hierarchies: only a null reference has those types, and `refMatches`
+            // has already answered for null (`v == null_ref` → `rt.nullable`). So
+            // a non-null value reaching here never matches.
+            //
+            // Without this, `Module.refHead` maps `nofunc → .func` and
+            // `noextern → .extern_` — collapsing each bottom into its own TOP — so
+            // `ref.test (ref nofunc)` answered **1** for any funcref (spec: 0),
+            // and the corresponding `ref.cast` succeeded where it must trap,
+            // letting a value flow on with a type it does not have.
+            // (`none`, the `any`-hierarchy bottom, was already correct: `refHead`
+            // maps it to `.none` and `RefHeap.sub(x, .none)` holds only for
+            // `x == .none`.)
+            .nofunc, .noextern => return false,
             else => {
                 const th = self.module.refHead(target) catch return false;
                 return actual.sub(th);

@@ -691,6 +691,13 @@ fn simdLaneCount(sub: u32) u8 {
     };
 }
 
+/// Highest `0xFD` sub-opcode wazmrt implements — the tail of the relaxed-SIMD
+/// range (`0x113`, `relaxed_dot_add`). Anything above it is not a SIMD op we
+/// know, and `decodeSimd` rejects it rather than letting it decode with no
+/// immediate (which also caused the following bytes to be re-read as
+/// instructions). Raise this when adding sub-opcodes past it.
+const max_simd_sub: u32 = 0x113;
+
 /// Does this `0xFD` sub-opcode carry a memarg (i.e. touch linear memory)?
 /// The `Simd` immediate always has a `mem` field (defaulted), so its presence
 /// cannot distinguish these — kept beside `decodeSimd`, whose switch is the
@@ -715,14 +722,29 @@ fn decodeSimd(r: *Reader, sub: u32) DecodeError!Instr {
         0x0c, 0x0d => { // v128.const / i8x16.shuffle: 16 immediate bytes (LE)
             var v: u128 = 0;
             var i: u5 = 0;
-            while (i < 16) : (i += 1) v |= @as(u128, try r.readByte()) << (@as(u7, i) * 8);
+            while (i < 16) : (i += 1) {
+                const b = try r.readByte();
+                // `i8x16.shuffle`'s 16 bytes are LANE INDICES selecting from the
+                // two 16-byte operands, so each must be < 32. Extract/replace and
+                // load/store_lane are bounds-checked (below / above); shuffle was
+                // the missed sibling, and an out-of-range index silently produced
+                // 0. `v128.const` (0x0c) has no such constraint — its bytes are
+                // literal data.
+                if (sub == 0x0d and b >= 32) return error.UnsupportedOpcode;
+                v |= @as(u128, b) << (@as(u7, i) * 8);
+            }
             s.bytes = v;
         },
         0x15...0x22 => { // extract_lane / replace_lane
             s.lane = try r.readByte();
             if (s.lane >= simdLaneCount(sub)) return error.UnsupportedOpcode;
         },
-        else => {}, // all other SIMD ops take no immediate
+        // An undefined `0xFD` sub-opcode used to decode AND validate, trapping
+        // only at execution — so `wasm_module_validate` lied to the embedder, and
+        // because the unknown sub consumes no immediate, following bytes were
+        // re-interpreted as instructions. `0x113` is the highest implemented
+        // (the relaxed-SIMD tail); reject anything past it.
+        else => if (sub > max_simd_sub) return error.UnsupportedOpcode,
     }
     return .{ .op = .simd, .imm = .{ .simd = s } };
 }
