@@ -214,6 +214,19 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   index** — type confusion, not merely a wrong number. The binary decoder was already safe (it bounds `ti`
   by the declared type count first); the text assembler was not. **Rule: every path that builds a concrete
   ref checks the width first** — the mask is a storage detail, never an input filter.
+- **Guest array offsets go through `Wasi.arrayOffset` (2026-07-21).** `base + i * stride` in **u32** wraps,
+  and a wrapped (small) offset then *passes* the bounds check it should have failed — inverting the
+  widen-then-check discipline. The helper does the arithmetic in u64 and requires the **whole element** to
+  fit, so callers may still form `iov + 4` in u32 safely. **Rule: never index a guest array with u32
+  arithmetic.** With this, the class opened in the 6th pass (`fd_write`/`seek`) and continued in the 10th
+  (`writeStringVec`) is closed across the file.
+- **Anything that outlives a call and stores a `*Instance` must RETAIN it (2026-07-21).** Trap frames
+  were the last borrower: a `wasm_trap_t` outlives the call that produced it and `wasm_frame_instance`
+  hands the pointer back, so `wasm_instance_delete` right after catching a trap left every frame dangling.
+  One retain covers the frame array; `wasm_trap_delete` releases it. **Corollary for tests:** the first
+  regression test compared `wasm_frame_instance(...)` to the original pointer, which **passes against
+  freed memory** — a lifetime test must *dereference*, not compare. Verified by removing the retain and
+  watching the test crash.
 - **`zig build test-safe` is the memory-safety gate (2026-07-20).** The suite under **ReleaseSafe** —
   optimizer on, safety checks kept — so out-of-range `@intCast`, OOB, and null-unwrap panic loudly instead
   of being silent UB in the shipped ReleaseFast/ReleaseSmall builds. **Run it alongside `zig build test`

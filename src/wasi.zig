@@ -333,7 +333,12 @@ pub const Wasi = struct {
     /// at 3+ (the convention every wasi-libc expects). A hole is a closed fd.
     fds: std.ArrayList(?FdEntry) = .empty,
 
-    pub fn init(gpa: std.mem.Allocator, io: Io, stdout: *Io.Writer, stderr: *Io.Writer) Wasi {
+    /// Returns an error rather than swallowing it: registering fds 0–2 used to
+    /// `catch {}`, so an OOM produced a `Wasi` that reported success while
+    /// having **no stdio at all** — every `fd_write(1)` would then be `EBADF`,
+    /// which looks like a guest bug rather than a host allocation failure.
+    /// Near-impossible in practice; propagating it costs one `try` per caller.
+    pub fn init(gpa: std.mem.Allocator, io: Io, stdout: *Io.Writer, stderr: *Io.Writer) error{OutOfMemory}!Wasi {
         var w: Wasi = .{
             .io = io,
             .gpa = gpa,
@@ -341,7 +346,7 @@ pub const Wasi = struct {
             .stderr = stderr,
         };
         // fds 0-2 are always the standard streams.
-        w.fds.appendSlice(gpa, &.{ .stdin, .stdout, .stderr }) catch {};
+        try w.fds.appendSlice(gpa, &.{ .stdin, .stdout, .stderr });
         return w;
     }
 
@@ -445,6 +450,24 @@ pub const Wasi = struct {
     fn bytes(self: *Wasi) ?[]u8 {
         return if (self.memory) |m| m.bytes else null;
     }
+    /// Byte offset of element `i` of a `stride`-byte guest array based at
+    /// `base`, or null if it would leave the 32-bit guest address space.
+    ///
+    /// The callers used to compute `base + i * stride` in **u32**, which wraps —
+    /// and a wrapped (small) offset then *passes* the bounds check it should
+    /// have failed. Contained today by the element counts reachable, but it
+    /// inverts this file's widen-then-check discipline, so the arithmetic is
+    /// done in u64 and narrowed only after checking. (Same class the 6th pass
+    /// fixed in `fd_write`/`seek` and the 10th in `writeStringVec`.)
+    /// Returns null unless the WHOLE element fits, so callers may safely form
+    /// `off + k` for `k < stride` (e.g. the `iov + 4` length field) in u32
+    /// without wrapping.
+    fn arrayOffset(base: u32, i: u32, stride: u32) ?u32 {
+        const off = @as(u64, base) + @as(u64, i) * @as(u64, stride);
+        if (off + @as(u64, stride) > std.math.maxInt(u32)) return null;
+        return @intCast(off);
+    }
+
     fn readU32(self: *Wasi, off: u32) ?u32 {
         const b = self.bytes() orelse return null;
         if (@as(u64, off) + 4 > b.len) return null;
@@ -823,7 +846,11 @@ fn gatherIovecs(w: *Wasi, iovs: u32, iovs_len: u32, results: []Value) ?[][]u8 {
     };
     var i: u32 = 0;
     while (i < iovs_len) : (i += 1) {
-        const iov = iovs + i * 8; // { buf: u32, buf_len: u32 }
+        const iov = Wasi.arrayOffset(iovs, i, 8) orelse { // { buf: u32, buf_len: u32 }
+            w.gpa.free(vecs);
+            _ = ret(results, errno.fault);
+            return null;
+        };
         const buf = w.readU32(iov) orelse {
             w.gpa.free(vecs);
             _ = ret(results, errno.fault);
@@ -902,7 +929,7 @@ fn wFdRead(ctx: *anyopaque, args: []const Value, results: []Value) bool {
             if (w.stdin) |src| {
                 var i: u32 = 0;
                 while (i < iovs_len) : (i += 1) {
-                    const iov = iovs + i * 8;
+                    const iov = Wasi.arrayOffset(iovs, i, 8) orelse return ret(results, errno.fault);
                     const buf = w.readU32(iov) orelse return ret(results, errno.fault);
                     const len = w.readU32(iov + 4) orelse return ret(results, errno.fault);
                     if (len == 0) continue;
@@ -1651,7 +1678,7 @@ fn wPollOneoff(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     // than a false "ready".
     var i: u32 = 0;
     while (i < nsubs) : (i += 1) {
-        const s = in + i * sub_size;
+        const s = Wasi.arrayOffset(in, i, sub_size) orelse return ret(results, errno.fault);
         const userdata = w.readU64(s) orelse return ret(results, errno.fault);
         const tag = (w.slice(s + 8, 1) orelse return ret(results, errno.fault))[0];
         if (tag == 1 or tag == 2) { // fd_read / fd_write
@@ -1667,7 +1694,7 @@ fn wPollOneoff(ctx: *anyopaque, args: []const Value, results: []Value) bool {
         var min_ns: ?i96 = null;
         i = 0;
         while (i < nsubs) : (i += 1) {
-            const s = in + i * sub_size;
+            const s = Wasi.arrayOffset(in, i, sub_size) orelse return ret(results, errno.fault);
             const tag = (w.slice(s + 8, 1) orelse return ret(results, errno.fault))[0];
             if (tag != 0) continue; // clock
             const id = w.readU32(s + 16) orelse return ret(results, errno.fault);
@@ -1682,7 +1709,7 @@ fn wPollOneoff(ctx: *anyopaque, args: []const Value, results: []Value) bool {
         w.io.sleep(.fromNanoseconds(ns), .awake) catch {};
         i = 0;
         while (i < nsubs) : (i += 1) {
-            const s = in + i * sub_size;
+            const s = Wasi.arrayOffset(in, i, sub_size) orelse return ret(results, errno.fault);
             const tag = (w.slice(s + 8, 1) orelse return ret(results, errno.fault))[0];
             if (tag != 0) continue;
             const userdata = w.readU64(s) orelse return ret(results, errno.fault);
@@ -1955,7 +1982,7 @@ test "symlink traversal: in-sandbox links follow, escaping links refused (#17/4.
     var mem = Memory{ .bytes = &mem_bytes, .max = null };
     var obuf: [8]u8 = undefined;
     var ow = Io.Writer.fixed(&obuf);
-    var w = Wasi.init(gpa, tio, &ow, &ow);
+    var w = try Wasi.init(gpa, tio, &ow, &ow);
     defer w.deinit(); // closes the preopen (owned) + any fd path_open opened
     w.memory = &mem;
     try w.fds.append(gpa, .{ .dir = .{ .handle = pre, .preopen_name = null, .owned = true } });
@@ -2055,7 +2082,7 @@ test "symlink resolver fuzz: no adversarial topology reaches outside the preopen
     var mem = Memory{ .bytes = &mem_bytes, .max = null };
     var obuf: [8]u8 = undefined;
     var ow = Io.Writer.fixed(&obuf);
-    var w = Wasi.init(gpa, tio, &ow, &ow);
+    var w = try Wasi.init(gpa, tio, &ow, &ow);
     defer w.deinit();
     w.memory = &mem;
     try w.fds.append(gpa, .{ .dir = .{ .handle = pre, .preopen_name = null, .owned = true } });

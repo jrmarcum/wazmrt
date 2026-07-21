@@ -731,7 +731,7 @@ fn runWasi(
 
     // No seed: `random_get` is a CSPRNG seeded lazily from OS entropy inside
     // `Wasi` (it used to be a timestamp-seeded Xoshiro256++). See `Wasi.csprng`.
-    var wasi = wazmrt.wasi.Wasi.init(arena, io, out, err_w);
+    var wasi = try wazmrt.wasi.Wasi.init(arena, io, out, err_w);
     defer wasi.deinit();
     wasi.stdin = &stdin_file_reader.interface;
 

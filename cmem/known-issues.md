@@ -641,6 +641,38 @@ gate a C-ABI embedder calls, so "the validator accepts it" has to be worth somet
 C-ABI) — +2 tests, each with both the newly-accepted and still-rejected cases so the fixes can't drift
 into over-acceptance. `c-smoke` 319/319, `wasi-gate` (real compiled guests) + freestanding `wasm` green.
 
+### Hardening batch (items 4–6) — DONE 2026-07-21 — the remaining list is now CLOSED
+
+- **`wasi.zig` u32-before-widening offsets — the last three sites.** `gatherIovecs`, `fd_read`'s stdin
+  path and `poll_oneoff` (×3) all computed `base + i * stride` in **u32**, which wraps — and a wrapped
+  (small) offset then *passes* the bounds check it should have failed. Now one
+  `Wasi.arrayOffset(base, i, stride)` doing the arithmetic in u64. It deliberately requires the **whole
+  element** to fit, so callers can still form `iov + 4` for the length field in u32 without wrapping.
+  This closes the class the 6th pass opened (`fd_write`/`seek`) and the 10th continued
+  (`writeStringVec`) — the whole file is now widen-then-check.
+- **C-ABI trap frames now OWN their instance.** A `wasm_trap_t` outlives the call that produced it and
+  `wasm_frame_instance` hands the stored pointer back, but the frames only *borrowed* it — so
+  `wasm_instance_delete` right after catching a trap (an ordinary embedder sequence) left every frame
+  dangling. This was the one site departing from the file's "a stored `*Instance` owns a handle" rule.
+  One `retain` covers the whole frame array (all frames name the same instance); `wasm_trap_delete`
+  releases it.
+  *Test-quality note worth keeping:* the first version of the regression test compared
+  `wasm_frame_instance(origin)` to the original pointer — which **passes against freed memory**, because
+  it never dereferences. Made non-vacuous by calling `wasm_instance_exports` *through* the frame's
+  instance; verified by removing the retain and watching it crash (exit 3). **A lifetime test that only
+  compares pointer values tests nothing.**
+- **`Wasi.init` no longer swallows OOM** registering fds 0–2. It returned a `Wasi` that reported success
+  while having **no stdio at all**, so every `fd_write(1)` would be `EBADF` — a host allocation failure
+  disguised as a guest bug. Now `error{OutOfMemory}!Wasi`; three callers gained a `try`.
+
+**Verification:** `test`/`test-safe` **416 printed (412 pass, 4 skip) = 214 distinct** (202 core + 11
+C-ABI + the new trap-lifetime test). `c-smoke` 319/319, `wasi-gate` + freestanding `wasm` green.
+
+**The remaining-issues list from the 10th pass is now closed** except two items that cannot be closed
+here: **#8** (upstream Zig `Io` bug — only an upstream fix helps; it is also what holds #17's
+final-component `path_open` TOCTOU open) and `Module.zig skipConstExpr`'s GC-immediate gap, which stays
+latent until GC const-exprs are implemented.
+
 ## #23 — Zig 0.16 Windows `Io` filesystem gaps found in WASI 4.3 (2026-07-16)
 
 Two more std holes on Windows, same family as #18 (which is the first). Both hit during 4.3; recheck all

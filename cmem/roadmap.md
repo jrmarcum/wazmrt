@@ -57,9 +57,16 @@ a coverage corpus. **211 distinct tests** (411 printed).
 GC/typed-ref labels; SIMD memory ops and `memory.size`/`grow` now require an in-range memory (as does the
 scalar path, which never bounded the memarg's memory index); and `concreteRef`'s 28-bit mask no longer
 truncates a large type index into a small valid one. **213 distinct tests** (415 printed).
-**Still open:** the hardening trio (`gatherIovecs`/`fd_read`/`poll_oneoff` u32-before-widening offsets,
-the C-ABI trap-frame borrowed `*Instance`, `Wasi.init` swallowing OOM) — next.
-`skipConstExpr`'s GC-immediate gap stays latent until GC const-exprs land; **#8** waits on upstream Zig.
+**Hardening batch (items 4–6) — DONE 2026-07-21, closing the remaining list:** the last three
+u32-before-widening guest-array offsets now go through `Wasi.arrayOffset` (u64 arithmetic, whole-element
+fit), C-ABI trap frames **retain** their instance instead of borrowing it, and `Wasi.init` propagates OOM
+instead of returning a `Wasi` with no stdio. **214 distinct tests** (416 printed).
+
+**The 10th pass's remaining-issues list is closed.** Only two items survive, neither closable here:
+**#8** (upstream Zig `Io` bug — also what holds #17's final-component `path_open` TOCTOU open; recheck on
+every Zig upgrade) and `skipConstExpr`'s GC-immediate gap, latent until GC const-exprs are implemented.
+Known scope gaps remain as scope, not defects: legacy EH has no assembler/validator support, and the C ABI
+still defers shared-mutable imported globals + externref table slots via `wasm_table_get`.
 *Standing lesson from this sequence: a run of clean passes means the current lens is exhausted, not that
 the code is clean — change the lens.*
 

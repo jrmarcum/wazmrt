@@ -917,6 +917,12 @@ fn makeTrapFrom(msg: []const u8, wi: *Instance) ?*Trap {
     if (src.len == 0) return t;
 
     const frames = alloc.alloc(Frame, src.len) catch return t;
+    // A `wasm_trap_t` outlives the call that produced it, and `wasm_frame_instance`
+    // hands this pointer back — so the frames must OWN the instance, not borrow
+    // it. Previously `wasm_instance_delete` right after catching a trap left
+    // every frame's `instance` dangling. One retain covers the whole array (all
+    // frames name the same instance); `wasm_trap_delete` releases it.
+    retain(&wi.hdr);
     for (src, frames) |s, *dst| {
         // Byte offsets are resolved here, on the error path, rather than tracked
         // during execution (see `Instance.frameOffset`).
@@ -1630,7 +1636,11 @@ export fn wasm_trap_delete(trap: ?*Trap) void {
     const t = trap orelse return;
     if (!release(&t.hdr)) return; // a `wasm_trap_copy` handle still holds it
     wasm_byte_vec_delete(&t.message);
-    if (t.frames.len != 0) alloc.free(t.frames);
+    if (t.frames.len != 0) {
+        // Balance the single retain `makeTrapFrom` took for the whole array.
+        if (t.frames[0].instance) |wi| wasm_instance_delete(wi);
+        alloc.free(t.frames);
+    }
     alloc.destroy(t);
 }
 
@@ -3029,4 +3039,68 @@ fn fuzzOneInput(_: void, smith: *std.testing.Smith) !void {
     // ~5% stop chance per step: sequences long enough to build interesting
     // ownership graphs, bounded so a single input still terminates.
     while (!smith.eosWeightedSimple(20, 1)) try fuzzStep(&w, d);
+}
+
+/// `(func (export "boom") unreachable)` — traps on call, producing a backtrace.
+const test_trap_module = [_]u8{
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+    0x03, 0x02, 0x01, 0x00,
+    0x07, 0x08, 0x01, 0x04, 'b', 'o', 'o', 'm', 0x00, 0x00,
+    0x0a, 0x05, 0x01, 0x03, 0x00, 0x00, 0x0b,
+};
+
+test "a trap keeps its instance alive after the embedder deletes it" {
+    // `wasm_trap_t` outlives the call that produced it, and `wasm_frame_instance`
+    // hands the stored pointer back — so the frames must OWN the instance. They
+    // used to borrow it, so deleting the instance right after catching a trap
+    // (an ordinary embedder sequence) left every frame dangling. This is the one
+    // spot that departed from the file's "a stored *Instance owns a handle" rule.
+    const e = wasm_engine_new().?;
+    defer wasm_engine_delete(e);
+    const s = wasm_store_new(e).?;
+    defer wasm_store_delete(s);
+    var bin: ByteVec = undefined;
+    wasm_byte_vec_new(&bin, test_trap_module.len, &test_trap_module);
+    defer wasm_byte_vec_delete(&bin);
+
+    const m = wasm_module_new(s, &bin).?;
+    defer wasm_module_delete(m);
+    var trap: ?*Trap = null;
+    var none: ExternVec = undefined;
+    wasm_extern_vec_new_empty(&none);
+    const inst = wasm_instance_new(s, m, &none, &trap).?;
+
+    var exps: ExternVec = undefined;
+    wasm_instance_exports(inst, &exps);
+    const f = wasm_extern_as_func(exps.data[0]).?;
+    var args: ValVec = .{ .size = 0, .data = null };
+    var res: ValVec = .{ .size = 0, .data = null };
+    const t = wasm_func_call(f, &args, &res) orelse return error.ExpectedTrap;
+    wasm_extern_vec_delete(&exps);
+
+    // The embedder is done with the instance, but still holds the trap.
+    wasm_instance_delete(inst);
+
+    // Reading the frame's instance must not touch freed memory, and the frame
+    // data must still be intact.
+    var frames: FrameVec = undefined;
+    wasm_trap_trace(t, &frames);
+    defer wasm_frame_vec_delete(&frames);
+    try std.testing.expect(frames.size >= 1);
+    const origin = wasm_trap_origin(t) orelse return error.ExpectedOrigin;
+    defer wasm_frame_delete(origin);
+    const fi = wasm_frame_instance(origin).?;
+    try std.testing.expectEqual(inst, fi);
+
+    // DEREFERENCE it — comparing the stored pointer value alone would pass even
+    // against freed memory, which made an earlier version of this test vacuous.
+    // Going through the frame's instance is what a `wasm_frame_instance` caller
+    // actually does, and it is only sound because the frames hold a handle.
+    var again: ExternVec = undefined;
+    wasm_instance_exports(fi, &again);
+    defer wasm_extern_vec_delete(&again);
+    try std.testing.expectEqual(@as(usize, 1), again.size);
+
+    wasm_trap_delete(t); // releases the frames' handle on the instance
 }
