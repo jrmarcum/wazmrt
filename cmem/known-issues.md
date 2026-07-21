@@ -728,7 +728,26 @@ wrong functions (`valTypesEqual`, `imm0`, `simdNaturalAlign`) — the sibling pa
 **reverted uncommitted fixes**. Nothing committed was lost. **When fanning out agents that may build or
 test, commit before and between batches** — do not leave verified work uncommitted while agents run.
 
-**BACKLOG — reported by this pass, NOT yet verified or fixed.** The fall-through and dead-code sweeps
+**BACKLOG ITEM 1 — VERIFIED AND FIXED 2026-07-21: `assert_invalid`/`assert_malformed` counted OUR OWN
+limitations as passes.** `assertRejected` scored **any** error as a pass, with no filter — while
+`assert_trap` (`isRuntimeTrap`) and `assert_unlinkable` (`isLinkError`) both filter theirs. So a module we
+simply could not **build** counted as evidence that the module was invalid. Verified: a file containing
+`(assert_malformed (module quote …))` (unimplemented → `BadCommand`) and an unknown mnemonic
+(→ `UnknownInstr`) reported **`2 passed, 0 failed, 0 skipped`**; both are now `skipped`, while genuinely
+ill-typed and inconsistent-section modules still pass. Fixed with `isOurLimitation`, deliberately
+conservative — an ambiguous error (e.g. `UnsupportedOpcode`, which could be a truly bad byte *or* an
+opcode we haven't implemented) is classed as **ours**, because mis-classifying that way under-reports
+passes (honest) whereas the reverse inflates them (the bug). +1 test covering both directions.
+
+**⚠ CONSEQUENCE FOR THE RECORDED CONFORMANCE NUMBERS.** Every spec-testsuite snapshot in `testing.md`
+was measured with the green-washing in place, so the pass counts are **upper bounds, not measurements** —
+any `assert_invalid`/`assert_malformed` we failed to build was counted as a pass. This file's own note
+that align.wast's cases "arrive via `(module quote …)`, still `BadCommand`" describes exactly that: those
+were being counted as passes. **The snapshots must be re-measured before they are quoted again.**
+*Lesson: a test harness that treats "we couldn't run it" as "it passed" reports the shape of its own gaps
+as success — and the more gaps, the better the score looks.*
+
+**BACKLOG — the rest, reported by this pass, NOT yet verified or fixed.** The fall-through and dead-code sweeps
 returned ~40 further findings. One that was checked **did not reproduce** (a claimed unclosed-block
 infinite loop: the repro exited cleanly, `validation: FAILED — ControlUnderflow`), which is why the rest
 are recorded as *claims* pending individual verification rather than as defects. Highest-value to check

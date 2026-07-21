@@ -443,9 +443,41 @@ const Runner = struct {
         };
         if (self.tryBuild(inner)) |_| {
             self.fail("assert_invalid/malformed: module was accepted (should be rejected)", .{});
-        } else |_| {
+        } else |e| if (isOurLimitation(e)) {
+            // We failed to BUILD the module for a reason of our own — an
+            // unimplemented command form or an instruction the assembler doesn't
+            // know. That is not evidence the module is invalid, and counting it
+            // as a pass green-washed the conformance numbers with our own gaps:
+            // `(module quote …)` (unimplemented → `BadCommand`) and any unknown
+            // mnemonic (→ `UnknownInstr`) both scored as passes. `assert_trap`
+            // and `assert_unlinkable` already filter their verdicts this way;
+            // this was the arm that did not.
+            self.summary.skipped += 1;
+        } else {
             self.summary.passed += 1;
         }
+    }
+
+    /// True if `e` means "wazmrt cannot build this", as opposed to "the module is
+    /// genuinely invalid/malformed".
+    ///
+    /// Deliberately conservative: a mis-classification here under-reports passes
+    /// (honest) whereas the reverse inflates them (the bug this fixes). When an
+    /// error is ambiguous — `UnsupportedOpcode` could be a truly bad byte *or* an
+    /// opcode we have not implemented — it belongs on this list.
+    fn isOurLimitation(e: anyerror) bool {
+        return switch (e) {
+            error.BadCommand, // e.g. `(module quote …)`, not implemented
+            error.NotAModule,
+            error.UnknownInstr, // the assembler doesn't know this mnemonic
+            error.UnsupportedInstr,
+            error.UnknownIdentifier,
+            error.UnsupportedOpcode, // ambiguous → treat as ours
+            error.UnsupportedInstruction,
+            error.OutOfMemory, // a resource failure is not a verdict
+            => true,
+            else => false,
+        };
     }
 
     /// Decode + validate a module form without instantiating or recording it.
@@ -870,4 +902,39 @@ test "exception handling: assert_return on a caught exn, assert_trap on an uncau
     const s = try runScript(std.testing.allocator, src);
     try std.testing.expectEqual(@as(usize, 2), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "assert_invalid/malformed does not count OUR limitations as passes" {
+    // `assertRejected` used to score ANY error as a pass, so a module we simply
+    // could not BUILD — an unimplemented command form, or a mnemonic our
+    // assembler doesn't know — inflated the conformance numbers with our own
+    // gaps. `assert_trap` and `assert_unlinkable` already filtered their
+    // verdicts; this was the arm that didn't.
+    const gpa = std.testing.allocator;
+
+    // (a) `(module quote …)` is unimplemented -> BadCommand -> must SKIP.
+    {
+        const src = "(assert_malformed (module quote \"not wasm\") \"unexpected token\")";
+        const s = try runScript(gpa, src);
+        try std.testing.expectEqual(@as(usize, 0), s.passed);
+        try std.testing.expectEqual(@as(usize, 0), s.failed);
+        try std.testing.expectEqual(@as(usize, 1), s.skipped);
+    }
+
+    // (b) an unknown mnemonic is an ASSEMBLER gap, not evidence of invalidity.
+    {
+        const src = "(assert_invalid (module (func (result i32) (some.bogus.instruction))) \"type mismatch\")";
+        const s = try runScript(gpa, src);
+        try std.testing.expectEqual(@as(usize, 0), s.passed);
+        try std.testing.expectEqual(@as(usize, 1), s.skipped);
+    }
+
+    // (c) a genuinely ill-typed module must still PASS — the fix must not turn
+    //     real rejections into skips.
+    {
+        const src = "(assert_invalid (module (func (result i32) (i64.const 1))) \"type mismatch\")";
+        const s = try runScript(gpa, src);
+        try std.testing.expectEqual(@as(usize, 1), s.passed);
+        try std.testing.expectEqual(@as(usize, 0), s.skipped);
+    }
 }

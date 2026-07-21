@@ -83,6 +83,16 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
 
 ## Spec-testsuite conformance snapshot (2026-07-02, `wast.zig` MVP)
 
+> ⚠ **These pass counts are UPPER BOUNDS, not measurements.** Every snapshot below was taken while
+> `assertRejected` counted **any** error as a pass — so any `assert_invalid`/`assert_malformed` module
+> wazmrt could not *build* (an unimplemented command form, an unknown mnemonic) scored as a pass rather
+> than a skip. Fixed 2026-07-21 (`isOurLimitation`); see known-issues, 11th pass. The note further down
+> that align.wast's cases "arrive via `(module quote …)`, still `BadCommand`" describes exactly the
+> inflation. **Re-run the corpus before quoting any number here.**
+>
+> *Lesson: a harness that treats "we couldn't run it" as "it passed" reports the shape of its own gaps as
+> success — and the more gaps it has, the better it scores.*
+
 Run a `.wast` file directly: `wazmrt <file.wast>` → `N passed, N failed, N skipped`. Against
 `module/wasm_wast/testsuite-main` (the official suite):
 
@@ -486,8 +496,8 @@ are ±10% noisy.)
 `zig build test --summary all` prints **419 total (415 pass, 4 skip)**, but there are **216 distinct
 tests**: 203 in the core module (201 pass + 2 skip) + 13 C-ABI. The `cabi_tests` target's root is
 `wasm_c_api.zig`, which imports `root.zig`, so it compiles and **re-runs the core module's tests too**
-(203 core + 13 C-ABI = 216), on top of the standalone `mod_tests` run (203) → 419 printed. Harmless —
-about a second — but **don't quote the printed number as a test count**; quote **201**, or the per-target
+(204 core + 13 C-ABI = 217), on top of the standalone `mod_tests` run (204) → 421 printed. Harmless —
+about a second — but **don't quote the printed number as a test count**; quote **202**, or the per-target
 numbers from `--summary all`.
 
 *(Was 389 printed / 200 distinct before `src/fuzz.zig` added 2 blocks and the 10th-pass memory/underflow/CSPRNG
