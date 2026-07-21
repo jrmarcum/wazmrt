@@ -1340,6 +1340,14 @@ fn emitExpr(ctx: *Ctx, s: Sexpr) Error!void {
 
 fn emitFoldedOne(ctx: *Ctx, l: []const Sexpr, i: usize) Error!usize {
     const kw = (try nth(l, 0)).asAtom() orelse return error.UnknownInstr;
+    // Legacy folded `try` (older-LLVM EH): `try` and `catch` are not enum-named
+    // (`try_`/`catch_`), and the form is structural (`(do …)` + clause lists), so
+    // it is intercepted here before `lookupOp`. The binary it emits is exactly
+    // what the decoder already reads (Phase 6.3), so execution is already proven.
+    if (std.mem.eql(u8, kw, "try")) {
+        try emitFoldedTry(ctx, l);
+        return i + 1;
+    }
     if (lookupSimd(kw)) |sd| {
         _ = try emitSimd(ctx, sd, l, 1, true);
         return i + 1;
@@ -1510,6 +1518,61 @@ fn emitCatchClauses(ctx: *Ctx, items: []const Sexpr, j: *usize) Error!void {
         if (c.tag) |t| try uleb(ctx.a, ctx.out, t);
         try uleb(ctx.a, ctx.out, c.label);
     }
+}
+
+/// Legacy folded `try` (older-LLVM exception handling, Phase 6.3):
+///   `(try $label? blocktype? (do instr*) (catch $tag instr*)* (catch_all instr*)?)`
+///   `(try $label? blocktype? (do instr*) (delegate $label))`
+///
+/// Emits the flat legacy encoding the decoder consumes: `try_ bt … catch tag …
+/// catch_all … end`, or `try_ bt … delegate label` (delegate replaces `end`).
+/// The try's own label is on the stack while the body and handlers are emitted,
+/// so a `$label`/`rethrow`/`delegate` operand resolves against the same depth
+/// model the interpreter uses at run time.
+fn emitFoldedTry(ctx: *Ctx, l: []const Sexpr) Error!void {
+    var j: usize = 1;
+    const label = parseOptLabel(l, &j);
+    const bt = try parseBlockTypeSig(ctx, l, &j);
+
+    if (j >= l.len) return error.BadImmediate;
+    const do_form = l[j].asList() orelse return error.BadImmediate;
+    if (do_form.len == 0 or !eqAtom(do_form[0], "do")) return error.BadImmediate;
+    j += 1;
+
+    try ctx.out.append(ctx.a, @intFromEnum(Op.try_));
+    try emitBlockTypeSig(ctx, bt);
+    try ctx.labels.append(ctx.a, label);
+    try emitSeq(ctx, do_form[1..]);
+
+    // A `(delegate $l)` forwards an exception to an enclosing try in place of
+    // running local handlers. The RUNTIME does not implement that routing —
+    // `precomputeControlFlow` records the delegate label but `throwException`
+    // never consults it, so a delegated exception unwinds as if the delegate
+    // weren't there. Emitting it would assemble a module that VALIDATES yet
+    // silently mis-routes at run time, which is exactly the "bytes don't match
+    // the source" failure this assembler refuses elsewhere. Reject loudly until
+    // the interpreter routes it. (No corpus file uses it; `catch`/`catch_all`/
+    // `rethrow` are fully supported.)
+    if (j < l.len) if (l[j].asList()) |d| {
+        if (d.len != 0 and eqAtom(d[0], "delegate")) return error.UnsupportedInstr;
+    };
+
+    while (j < l.len) : (j += 1) {
+        const cl = l[j].asList() orelse return error.BadImmediate;
+        if (cl.len == 0) return error.BadImmediate;
+        const ckw = cl[0].asAtom() orelse return error.BadImmediate;
+        if (std.mem.eql(u8, ckw, "catch")) {
+            if (cl.len < 2) return error.BadImmediate;
+            try ctx.out.append(ctx.a, @intFromEnum(Op.catch_));
+            try uleb(ctx.a, ctx.out, try resolveByName(ctx.tag_names, cl[1]));
+            try emitSeq(ctx, cl[2..]);
+        } else if (std.mem.eql(u8, ckw, "catch_all")) {
+            try ctx.out.append(ctx.a, @intFromEnum(Op.catch_all));
+            try emitSeq(ctx, cl[1..]);
+        } else return error.BadImmediate; // only catch/catch_all/delegate may follow `(do …)`
+    }
+    try ctx.out.append(ctx.a, @intFromEnum(Op.end));
+    _ = ctx.labels.pop();
 }
 
 /// `(if $label? blocktype? cond? (then instr*) (else instr*)?)`
@@ -3901,4 +3964,66 @@ test "assembler index-space gaps closed (13th pass)" {
     _ = try assemble(a, "(module (memory $m 1) (func (result i32) (memory.size $m)))");
     try std.testing.expectError(error.UnknownIdentifier, assemble(a, "(module (memory $m 1) (func (result i32) (memory.size $nope)))"));
     try std.testing.expectError(error.UnsupportedInstr, assemble(a, "(module (memory $m 1) (func (result i32) (memory.size 7)))"));
+}
+
+test "legacy folded try assembles, validates, and runs (catch + catch_all + rethrow)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // catch binds the exception's payload; catch_all is the fallback. f(1) takes
+    // the normal path (1); f(0) throws 99, caught by `catch $t`, + 1000 = 1099.
+    // Assemble → decode → VALIDATE (not just the raw run path) → execute.
+    {
+        const src =
+            \\(module (tag $t (param i32))
+            \\  (func (export "f") (param i32) (result i32)
+            \\    (try (result i32)
+            \\      (do
+            \\        (if (i32.eqz (local.get 0)) (then (throw $t (i32.const 99))))
+            \\        (i32.const 1))
+            \\      (catch $t (i32.add (i32.const 1000)))
+            \\      (catch_all (i32.const -1)))))
+        ;
+        const bin = try assemble(a, src);
+        var m = try Module.decode(a, bin);
+        try validate(a, &m); // the gap: the interp ran legacy EH the validator rejected
+        try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(src, "f", &.{1})));
+        try std.testing.expectEqual(@as(i32, 1099), interp.asI32(try assembleAndRun(src, "f", &.{0})));
+    }
+
+    // rethrow 0 re-raises the exception the enclosing catch is handling, so it
+    // reaches the outer try's handler (5).
+    {
+        const src =
+            \\(module (tag $t (param i32))
+            \\  (func (export "f") (result i32)
+            \\    (try (result i32)
+            \\      (do (try (result i32) (do (throw $t (i32.const 5))) (catch $t (drop) (rethrow 0))))
+            \\      (catch $t))))
+        ;
+        const bin = try assemble(a, src);
+        var m = try Module.decode(a, bin);
+        try validate(a, &m);
+        try std.testing.expectEqual(@as(i32, 5), interp.asI32(try assembleAndRun(src, "f", &.{})));
+    }
+
+    // The validator now REJECTS a legacy-EH module that is ill-typed: a `catch`
+    // handler that fails to produce the try's declared result. (Before this pass
+    // legacy EH was not validated at all, so such a module was accepted.)
+    {
+        const bin = try assemble(a,
+            \\(module (tag $t)
+            \\  (func (export "f") (result i32)
+            \\    (try (result i32) (do (i32.const 1)) (catch $t))))
+        );
+        var m = try Module.decode(a, bin);
+        try std.testing.expectError(error.StackUnderflow, validate(a, &m));
+    }
+
+    // `delegate` is rejected at assembly: the interpreter records its label but
+    // never routes an exception through it, so emitting it would produce a module
+    // that validates yet mis-runs.
+    try std.testing.expectError(error.UnsupportedInstr, assemble(a,
+        "(module (tag $t) (func (try (do (nop)) (delegate 0))))"));
 }

@@ -54,6 +54,9 @@ pub const Error = Module.Error || error{
     ControlUnderflow,
     UnknownLabel,
     MismatchedElse,
+    /// A legacy `catch`/`catch_all`/`delegate` whose enclosing opener is not a
+    /// legacy `try` (older-LLVM exception handling).
+    MismatchedCatch,
     UndefinedLocal,
     /// A `local.get` of a non-defaultable (non-nullable ref) local before it was
     /// set (function-references local initialization, §3.3.5).
@@ -379,7 +382,7 @@ pub fn dropSelectWidths(a: std.mem.Allocator, module: *const Module, ft: Module.
 
 const StackType = union(enum) { val: V, unknown };
 
-const FrameKind = enum { block, loop, if_, else_, try_table };
+const FrameKind = enum { block, loop, if_, else_, try_table, try_legacy, catch_legacy };
 
 const Frame = struct {
     kind: FrameKind,
@@ -613,6 +616,51 @@ const FuncValidator = struct {
                 if (ft.results.len != 0) return error.InvalidTag; // tags never produce results
                 try self.popVals(ft.params); // consume the exception's operands
                 self.setUnreachable(); // control transfers; the rest is dead
+            },
+
+            // Legacy exception handling (older-LLVM encoding, Phase 6.3). The
+            // interpreter has always executed these, but the validator had no
+            // arms for them — so a legacy-EH module ran on the raw path yet was
+            // rejected by `validate` (and thus by the `.wast` runner and the
+            // summarize path). A `try` opens a block-typed frame; each `catch`/
+            // `catch_all` closes the preceding section (which must produce the
+            // try's results) and opens a handler that starts with the tag's
+            // params; `end`/`delegate` close the construct.
+            .try_ => {
+                const s = try self.blockSig(instr.imm.block_type);
+                try self.popVals(s.pop);
+                try self.pushCtrl(.try_legacy, s.pop, s.push);
+            },
+            .catch_, .catch_all => {
+                const frame = try self.popCtrl();
+                if (frame.kind != .try_legacy and frame.kind != .catch_legacy) return error.MismatchedCatch;
+                // The handler starts from the try's ENTRY init state — locals set
+                // in the body (or a prior handler) are not guaranteed on the path
+                // that reached this catch via a thrown exception (§ same rule as
+                // `else`).
+                @memcpy(self.local_init, frame.init_snapshot);
+                const start: []const V = if (instr.op == .catch_) blk: {
+                    const ft = self.module.tagType(instr.imm.tag) orelse return error.UndefinedTag;
+                    if (ft.results.len != 0) return error.InvalidTag;
+                    break :blk ft.params; // the caught exception's operands
+                } else empty; // catch_all binds nothing
+                try self.pushCtrl(.catch_legacy, start, frame.end);
+            },
+            .delegate => {
+                // `delegate l` forwards to an enclosing handler and terminates the
+                // try in place of `end`, so the body must have produced the try's
+                // results and `l` must name a real enclosing construct.
+                const frame = try self.popCtrl();
+                if (frame.kind != .try_legacy) return error.MismatchedCatch;
+                _ = try self.labelTypesAt(instr.imm.label); // range-check the target
+                @memcpy(self.local_init, frame.init_snapshot);
+                try self.pushVals(frame.end);
+            },
+            .rethrow => {
+                // Re-raise the exception caught `l` levels out. `l` must resolve,
+                // and control transfers, so the rest of the block is dead.
+                _ = try self.labelTypesAt(instr.imm.label);
+                self.setUnreachable();
             },
             .throw_ref => {
                 _ = try self.popExpect(.exnref);
