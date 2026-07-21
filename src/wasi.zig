@@ -518,6 +518,27 @@ fn isAbsoluteTarget(t: []const u8) bool {
     return t.len >= 2 and t[1] == ':'; // drive-qualified
 }
 
+/// True if a *relative* symlink target lexically climbs above its own directory
+/// (`../../x`), tracking depth so an in-sandbox `a/../b` is still allowed.
+///
+/// wazmrt itself is not fooled by such a link — `walkFull` contains the escape
+/// at follow time — but `cmem/security-model.md` requires refusing an obviously
+/// escaping target **at creation**: the guest can otherwise plant a landmine for
+/// the *next* privileged reader (a host `tar`, `cp -L`, or the next pipeline
+/// stage), which is an orchestrator invariant the runtime cannot enforce later.
+fn escapesRelative(t: []const u8) bool {
+    var depth: isize = 0;
+    var it = std.mem.splitAny(u8, t, "/\\");
+    while (it.next()) |seg| {
+        if (seg.len == 0 or std.mem.eql(u8, seg, ".")) continue;
+        if (std.mem.eql(u8, seg, "..")) {
+            depth -= 1;
+            if (depth < 0) return true;
+        } else depth += 1;
+    }
+    return false;
+}
+
 /// Resolve `guest_path` from `start` to `(dir, name)`, **following symlinks
 /// through a handle stack** — the RESOLVE_BENEATH model in userspace, secure by
 /// construction (see `cmem/security-model.md` for the full argument):
@@ -1369,7 +1390,8 @@ fn wPathLink(ctx: *anyopaque, args: []const Value, results: []Value) bool {
 fn wPathSymlink(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const w: *Wasi = @ptrCast(@alignCast(ctx));
     const target = w.slice(argU32(args, 0), argU32(args, 1)) orelse return ret(results, errno.fault);
-    if (isAbsoluteTarget(target)) return ret(results, errno.notcapable); // don't plant an escape
+    // Don't plant an escape: absolute, or lexically climbing above its own dir.
+    if (isAbsoluteTarget(target) or escapesRelative(target)) return ret(results, errno.notcapable);
     if (std.mem.indexOfScalar(u8, target, 0) != null) return ret(results, errno.inval);
     var rp = resolveArg(w, argU32(args, 2), argU32(args, 3), argU32(args, 4), rights.path_open, false, results) orelse
         return true;
@@ -1546,13 +1568,22 @@ fn wEnvironGet(ctx: *anyopaque, args: []const Value, results: []Value) bool {
 /// Write a `char**` vector (args/environ): the pointer array at `ptrs`, the
 /// NUL-terminated strings packed at `buf`.
 fn writeStringVec(w: *Wasi, ptrs: u32, buf: u32, strings: []const []const u8, results: []Value) bool {
-    var p = buf;
+    // Form the guest offsets in u64 and narrow only after the bounds check.
+    // Computing `ptrs + i*4` and `p += len+1` in u32 could wrap (a 4 GiB memory
+    // plus ≥2 entries), and a wrapped offset would then pass a check it should
+    // have failed. Contained today by the sizes involved, but this file's rule
+    // is widen-then-check — the 6th pass fixed the same class in fd_write/read.
+    var p: u64 = buf;
     for (strings, 0..) |s, i| {
-        if (!w.writeU32(ptrs + @as(u32, @intCast(i)) * 4, p)) return ret(results, errno.fault);
-        const dst = w.slice(p, @intCast(s.len + 1)) orelse return ret(results, errno.fault);
+        const slot = @as(u64, ptrs) + @as(u64, i) * 4;
+        const need = @as(u64, s.len) + 1;
+        if (slot > std.math.maxInt(u32) or p > std.math.maxInt(u32) or
+            p + need > std.math.maxInt(u32)) return ret(results, errno.fault);
+        if (!w.writeU32(@intCast(slot), @intCast(p))) return ret(results, errno.fault);
+        const dst = w.slice(@intCast(p), @intCast(need)) orelse return ret(results, errno.fault);
         @memcpy(dst[0..s.len], s);
         dst[s.len] = 0;
-        p += @intCast(s.len + 1);
+        p += need;
     }
     return ret(results, errno.success);
 }
@@ -2248,4 +2279,26 @@ test "random_get returns real entropy, not zeros or a predictable stream" {
     defer w2.fds.deinit(std.testing.allocator);
     try std.testing.expect(wRandomGet(&w2, &call, &results));
     try std.testing.expect(!std.mem.eql(u8, &first, mem_bytes[0..32]));
+}
+
+test "symlink targets that lexically escape are refused at creation" {
+    // wazmrt itself is not fooled (walkFull contains the escape at follow time),
+    // but security-model.md requires refusing at *creation* so the guest cannot
+    // plant a landmine for the next privileged reader (host `tar`, `cp -L`, …).
+    const esc = escapesRelative;
+    try std.testing.expect(esc("../outside"));
+    try std.testing.expect(esc("a/../../outside"));
+    try std.testing.expect(esc("..\\outside")); // Windows separator
+    try std.testing.expect(esc("./../x"));
+
+    // In-sandbox paths that merely *contain* `..` must still be allowed.
+    try std.testing.expect(!esc("sub"));
+    try std.testing.expect(!esc("a/../b"));
+    try std.testing.expect(!esc("./a/b"));
+    try std.testing.expect(!esc("a/b/../.."));
+
+    // Absolute targets are handled by the separate lexical check.
+    try std.testing.expect(isAbsoluteTarget("/etc/passwd"));
+    try std.testing.expect(isAbsoluteTarget("C:\\secret"));
+    try std.testing.expect(!isAbsoluteTarget("sub/file"));
 }

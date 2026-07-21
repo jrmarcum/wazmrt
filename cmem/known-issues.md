@@ -506,6 +506,74 @@ lives at the loop exit, not inside it. **Rule: when adding a guard to the interp
 failure arm `@branchHint(.cold)` and benchmark — this is the same lesson as the `noinline recordTrap` result
 in #19.**
 
+### Deferred-item cleanup — DONE 2026-07-20 (closing the 10th pass's "still open" list)
+
+**Resource caps (`validate.zig` + `interp.zig`).** Three amplifiers a tiny module could trigger:
+- **Control nesting** — every `pushCtrl` `dupe`s the whole local-init vector, so cost is depth × locals: a
+  512 KB module (2 000 locals, 262 144 nested blocks) drove **767 MB** peak. Now `max_ctrl_depth = 1024`
+  → `NestingTooDeep` (also matching `sexpr.zig`'s parser cap, so nothing reachable from text can exceed it).
+- **Locals** — the run-length form lets a few bytes ask for billions; the old loop appended one at a time.
+  Now summed in u64 and capped at `max_locals = 50 000` (wasmtime's own default). **The two caps must be
+  read together: the snapshot cost is their PRODUCT**, so a generous locals cap silently reinstates the
+  amplification (2²⁰ × 1024 would still be ~1 GB); 50 000 × 1024 bounds it at ~51 MB.
+- **The run path had the same hole** — `interp` expanded locals with no cap, and `local_count` is `usize`,
+  which on the **wasm32 build is 32 bits and would wrap**. Now summed in u64 against the same
+  `validate.max_locals` (exported for this) → `error.TooManyLocals`.
+- **`array_new_fixed`** — `n` is an unvalidated u32 and in *unreachable* code `popExpect` returns
+  `.unknown` instead of underflowing, so the loop could spin ~4e9 times. Bounded by the body's instruction
+  count, which **cannot reject a valid module** (every operand needs ≥1 instruction to produce it).
+
+**`wat.zig` `(table N reftype initexpr)`** synthesized `N` `Sexpr` copies — `(table 4000000000 …)`, 48
+bytes, asked for ~96 GB. Capped at 2²⁰ → `BadImmediate` (0.095 s, was a 96 GB alloc attempt).
+
+**`wasi.zig`:**
+- **`path_symlink` now refuses a lexically escaping relative target** (`../../x`) at *creation*, not just
+  absolute ones — `security-model.md` requires this so the guest cannot plant a landmine for the next
+  privileged reader (host `tar`, `cp -L`, the next pipeline stage). `escapesRelative` tracks depth, so an
+  in-sandbox `a/../b` is still allowed. **Does not affect `examples/wasi_symlink_traversal.zig`**, which
+  plants its links externally via `ln -s` and tests *following*, not creation.
+- **`writeStringVec`** (`args_get`/`environ_get`) formed guest offsets in u32 before the widening bounds
+  check — the 4th site of the logged class. Now computed in u64 and narrowed only after checking.
+
+**`wasm_c_api.zig` `wasm_instance_new`** leaked the `host_funcs` buffer on the import loop's
+`catch return null` paths. Fixed with a plain `defer host_funcs.deinit(alloc)` — sound because
+`toOwnedSlice` empties the list on success — and the two now-redundant explicit `deinit`s on the later
+error paths were removed (they would have been double-deinits).
+
+**`main.zig` `--verify <garbage>` now fails closed** instead of being silently ignored. It can only *raise*
+strictness, so ignoring a typo silently dropped the user's intended extra strictness — the opposite posture
+to `modeFromDb`'s 5th-pass fix. **`keygen` writes the Ed25519 private seed 0600** on POSIX (was 0644 after
+umask — world-readable, for the one file in the project that must not be). Windows has no mode bit here, so
+the file inherits the directory ACL; the honest mitigation there stays the documented one (HSM / don't put
+the key on a shared path).
+
+**A 10th-pass finding that was WRONG — recorded so it is not "fixed" again.** The audit reported
+`validate.zig`'s active-element/table check as accept-invalid, claiming
+`elem.elem_type.nullable() != tet.nullable()` compared two booleans. **`ValType.nullable()` returns the
+*nullable form of the type*, not a predicate** — so the line already compared heap types with nullability
+normalized away, which is correct. Verified empirically: an `externref` segment against a `funcref` table
+is rejected `TypeMismatch`. A comment at the site now says so. *Lesson: an audit finding is a hypothesis;
+this one survived a plausible-sounding write-up and died on a two-minute check.*
+
+**Conformance gate is now usable.** `zig build conformance` gated on **zero** failures, which upstream has
+never satisfied here (this file's own snapshot records linking 37, return_call_ref 9, …) — a forever-red
+step gates nothing and teaches people to ignore it. Added `-Dbaseline=<file>` (expected failures per file;
+`error <path>` for files the runner cannot parse) and `-Dwrite-baseline=true` to generate one. It now fails
+only on **regressions**, reports improvements, and with no baseline explains why it is strict and how to
+adopt one. All five paths verified on a synthetic corpus: no-baseline → fail; write → generate; check →
+pass; a new failure → fail; a fixed failure → pass + "improved".
+
+**Fuzz targets now detect allocation amplification.** They `catch` `OutOfMemory` (a malformed input
+legitimately producing one is not a bug), which made the whole amplification class — the very thing
+`readVecLen`, the memory budget and the table cap exist to prevent — **invisible by construction**. The
+sweep now runs under a 64 MB `Budget` allocator and asserts it was never exceeded, and that `live` returns
+to **0** (a leak check independent of the testing allocator's). Both hold today.
+
+**Verification:** `test` and `test-safe` now print **407 (403 pass, 4 skip)** = **209 distinct** (198 core
++ 11 C-ABI), up from 403/207 — the resource-cap regression test and the symlink-escape test, plus the
+budget/live assertions folded into the existing sweep. `c-smoke` 319/319, `wasi-gate` + freestanding `wasm`
+green, steady-state ~240 Mops/s.
+
 ## #23 — Zig 0.16 Windows `Io` filesystem gaps found in WASI 4.3 (2026-07-16)
 
 Two more std holes on Windows, same family as #18 (which is the first). Both hit during 4.3; recheck all

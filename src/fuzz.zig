@@ -81,6 +81,61 @@ const Reached = struct {
     assembled: usize = 0,
 };
 
+/// An allocator that refuses to exceed a live-bytes budget, and remembers that
+/// it refused.
+///
+/// The targets `catch` `error.OutOfMemory` (a malformed input legitimately
+/// producing one is not a bug), which used to make allocation-amplification
+/// **invisible by construction** — the class `Reader.readVecLen`, the linear
+/// memory budget and the `(table N …)` cap all exist to prevent. Running under a
+/// budget turns it into an oracle instead: after every cap in the pipeline, a
+/// ≤8 KB input has no business allocating tens of MB, so a refusal means a gap.
+const Budget = struct {
+    child: std.mem.Allocator,
+    live: usize = 0,
+    limit: usize,
+    exceeded: bool = false,
+
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *Budget = @ptrCast(@alignCast(ctx));
+        if (self.live + len > self.limit) {
+            self.exceeded = true;
+            return null;
+        }
+        const p = self.child.rawAlloc(len, a, ra) orelse return null;
+        self.live += len;
+        return p;
+    }
+    fn resize(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *Budget = @ptrCast(@alignCast(ctx));
+        if (new_len > buf.len and self.live + (new_len - buf.len) > self.limit) {
+            self.exceeded = true;
+            return false;
+        }
+        if (!self.child.rawResize(buf, a, new_len, ra)) return false;
+        self.live = self.live + new_len - buf.len;
+        return true;
+    }
+    fn remap(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *Budget = @ptrCast(@alignCast(ctx));
+        if (new_len > buf.len and self.live + (new_len - buf.len) > self.limit) {
+            self.exceeded = true;
+            return null;
+        }
+        const p = self.child.rawRemap(buf, a, new_len, ra) orelse return null;
+        self.live = self.live + new_len - buf.len;
+        return p;
+    }
+    fn free(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *Budget = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(buf, a, ra);
+        self.live -= buf.len;
+    }
+    fn allocator(self: *Budget) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+};
+
 /// Decode bytes as a wasm binary; if they decode, instantiate with no imports.
 /// Exercises the bounded front half of the pipeline: LEB/section decoding,
 /// `checkStaticIndices`, control-flow precompute, active data/element-segment
@@ -189,6 +244,14 @@ test "fuzz: deterministic mutation sweep (runs every `zig build test`)" {
     const rand = prng.random();
     var r: Reached = .{};
 
+    // Every input here is ≤8 KB, and the pipeline caps allocation at each stage
+    // (`readVecLen`, the linear-memory budget, `max_locals`, the table-init cap),
+    // so nothing should need anywhere near 64 MB live. Exceeding it means an
+    // amplification path with no cap — which the `catch`-and-ignore of
+    // `OutOfMemory` would otherwise hide completely.
+    var budget = Budget{ .child = std.testing.allocator, .limit = 64 << 20 };
+    const ga = budget.allocator();
+
     var buf: [8192]u8 = undefined;
     var i: usize = 0;
     while (i < 4000) : (i += 1) {
@@ -202,7 +265,7 @@ test "fuzz: deterministic mutation sweep (runs every `zig build test`)" {
         // load-time index checks are reached), sometimes a burst (which usually
         // does not, exercising the decoder's rejection paths).
         mutate(rand, bin, 1 + rand.uintLessThan(usize, if (i % 4 == 0) 16 else 2));
-        tryDecodeAndInstantiate(std.testing.allocator, bin, &r);
+        tryDecodeAndInstantiate(ga, bin, &r);
 
         // --- text side: corrupt a valid .wat ---
         const src = seed_wat[rand.uintLessThan(usize, seed_wat.len)];
@@ -219,7 +282,7 @@ test "fuzz: deterministic mutation sweep (runs every `zig build test`)" {
             }
             if (text.len == 0) break;
         }
-        tryAssemble(std.testing.allocator, text, &r);
+        tryAssemble(ga, text, &r);
     }
 
     // Coverage assertions — the point of this rewrite. Without these the targets
@@ -227,6 +290,13 @@ test "fuzz: deterministic mutation sweep (runs every `zig build test`)" {
     // previous version did for months while appearing to fuzz three subsystems.
     // The thresholds are deliberately loose (any regression to ~0 trips them)
     // so ordinary mutation-rate drift does not cause flakes.
+    // No ≤8 KB input should have needed 64 MB live. A refusal means an
+    // allocation path with no cap — the class the `catch`-and-ignore of
+    // `OutOfMemory` would otherwise hide entirely.
+    try std.testing.expect(!budget.exceeded);
+    // And nothing may be left allocated once every arena/instance is torn down.
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+
     try std.testing.expect(r.decoded > 100); // decoder accepted mutated modules
     try std.testing.expect(r.instantiated > 100); // …and instantiation ran
     try std.testing.expect(r.assembled > 10); // assembler ran to completion

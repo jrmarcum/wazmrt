@@ -59,6 +59,8 @@ zig build test-safe                # the same suite under ReleaseSafe (optimized
 zig build wasi-gate                # compile Zig+C wasm32-wasi programs, run them, assert output
                                    #   add -Drust-gate=true to also cross-check a rustc build
 zig build conformance -Dtestsuite=<dir>   # run a WebAssembly spec-testsuite checkout (.wast)
+                                   #   -Dbaseline=<file>        gate on regressions, not zero failures
+                                   #   -Dwrite-baseline=true    generate that baseline from today's run
 zig build wasm                     # build the runtime itself as a wasm module
 zig build dll                      # C-ABI shared library (for FFI: Deno, ctypes, …)
 zig build c-smoke                  # build + run the C example (needs no external deps)
@@ -72,7 +74,10 @@ this build embeds a signature trust anchor.
 
 The spec testsuite is not vendored — clone it and point the step at it
 (`git clone https://github.com/WebAssembly/testsuite`); with no `-Dtestsuite` the
-step just prints usage. If `zig build` ever fails with a bare `error: Unexpected`
+step just prints usage. Upstream has known failures against wazmrt today, so
+generate a baseline once (`-Dbaseline=conf.txt -Dwrite-baseline=true`) and then
+pass `-Dbaseline=conf.txt`: the step fails on **regressions**, and reports a file
+that improved so you can re-generate. If `zig build` ever fails with a bare `error: Unexpected`
 before doing any work, the local `.zig-cache` is corrupt — `rm -rf .zig-cache`.
 
 The runtime loads over FFI from any host language: `zig build dll` produces a

@@ -20,6 +20,23 @@ const Reader = @import("Reader.zig");
 const V = types.ValType;
 const Op = opcode.Op;
 
+/// Cap on control nesting. Every `pushCtrl` snapshots the whole local-init
+/// vector, so cost is depth × locals: a 512 KB module (2 000 locals, 262 144
+/// nested blocks) drove **767 MB** peak — ~1500× amplification — on the inspect
+/// path. Real code nests a few dozen deep; 1024 also matches `sexpr.zig`'s
+/// parser cap, so nothing reachable from `.wat`/`.wast` text can exceed it.
+const max_ctrl_depth: usize = 1024;
+
+/// Cap on a function's locals (params + declared). The binary run-length form
+/// (`count: u32` per run) lets a handful of bytes ask for billions.
+///
+/// This and `max_ctrl_depth` must be read together: the snapshot cost is their
+/// **product**, so a generous locals cap silently reinstates the amplification
+/// (2^20 locals × 1024 frames would still be ~1 GB). 50 000 — matching
+/// wasmtime's own default — bounds the worst case at ~51 MB while staying far
+/// above anything a compiler emits.
+pub const max_locals: u64 = 50_000;
+
 pub const Error = Module.Error || error{
     CountMismatch,
     TypeMismatch,
@@ -32,6 +49,14 @@ pub const Error = Module.Error || error{
     /// A `local.get` of a non-defaultable (non-nullable ref) local before it was
     /// set (function-references local initialization, §3.3.5).
     UninitializedLocal,
+    /// Control nesting exceeded `max_ctrl_depth`. Each frame snapshots the whole
+    /// local-init vector, so depth × locals is a memory amplifier: a 512 KB
+    /// module (2 000 locals, 262 144 nested blocks) drove **767 MB** peak before
+    /// this cap.
+    NestingTooDeep,
+    /// A function declared more than `max_locals` locals. The run-length local
+    /// encoding lets a handful of bytes ask for billions.
+    TooManyLocals,
     UndefinedGlobal,
     ImmutableGlobal,
     UndefinedFunc,
@@ -87,6 +112,11 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
             const tet = module.tables[elem.table_index].element;
             // Family match (nullable-normalized) — non-nullability isn't enforced
             // on segment application, and the flag-4 binary form can't carry it.
+            // NOTE (2026-07-20): `ValType.nullable()` returns the *nullable form
+            // of the type*, not a bool, so this compares heap types with
+            // nullability normalized away — which is correct. A 10th-pass audit
+            // reported it as an accept-invalid bug on the assumption that
+            // `nullable()` was a predicate; verified false. Don't "fix" it again.
             if (elem.elem_type.nullable() != tet.nullable()) return error.TypeMismatch;
             try validateConstExpr(module, elem.offset_expr, .i32, all_globals);
         }
@@ -188,6 +218,12 @@ fn validateFunction(a: std.mem.Allocator, module: *const Module, ft: Module.Func
     // locals = parameters ++ declared locals (expanded from run-length form).
     var locals: std.ArrayList(V) = .empty;
     try locals.appendSlice(a, ft.params);
+    // The run-length form means a few bytes can ask for billions of locals, and
+    // the old loop appended them one at a time — multi-GB from a tiny module.
+    // Sum first (checked), reject past the cap, then expand.
+    var declared: u64 = 0;
+    for (code.locals) |l| declared += l.count;
+    if (declared + ft.params.len > max_locals) return error.TooManyLocals;
     for (code.locals) |l| {
         var n = l.count;
         while (n > 0) : (n -= 1) try locals.append(a, l.type);
@@ -202,7 +238,7 @@ fn validateFunction(a: std.mem.Allocator, module: *const Module, ft: Module.Func
     const local_init = try a.alloc(bool, locals.items.len);
     for (local_init, locals.items, 0..) |*init, t, i| init.* = i < n_params or !t.isNonNullRef();
 
-    var v: FuncValidator = .{ .a = a, .module = module, .locals = locals.items, .results = ft.results, .local_init = local_init, .widths = widths };
+    var v: FuncValidator = .{ .a = a, .module = module, .locals = locals.items, .results = ft.results, .local_init = local_init, .widths = widths, .body_len = instrs.len };
     // The whole body is an implicit block of type [] -> results; its trailing
     // `end` closes this frame.
     try v.pushCtrl(.block, empty, ft.results);
@@ -269,6 +305,10 @@ const FuncValidator = struct {
     widths: ?[]u8 = null,
     /// Index of the instruction currently being checked (for `widths`).
     pc: usize = 0,
+    /// Instruction count of the body being checked. Used as a sound upper bound
+    /// on how many operands an instruction can legitimately consume (see
+    /// `array_new_fixed`).
+    body_len: usize = 0,
 
     /// Record the slot width of a `drop`/`select` operand at the current pc
     /// (2 for v128, else 1) when width-capture is on.
@@ -328,6 +368,7 @@ const FuncValidator = struct {
     }
 
     fn pushCtrl(self: *FuncValidator, kind: FrameKind, start: []const V, end: []const V) Error!void {
+        if (self.ctrls.items.len >= max_ctrl_depth) return error.NestingTooDeep;
         try self.ctrls.append(self.a, .{
             .kind = kind,
             .start = start,
@@ -740,6 +781,13 @@ const FuncValidator = struct {
             .array_new_fixed => {
                 const tn = instr.imm.gc_type_n;
                 const f = self.module.arrayField(tn.type_index) orelse return error.UndefinedType;
+                // `n` is an unvalidated u32. In *unreachable* code `popExpect`
+                // returns `.unknown` instead of underflowing, so the loop would
+                // spin up to 2^32 times on a tiny module. Every operand must have
+                // been produced by at least one instruction, so a valid `n` can
+                // never exceed the body's instruction count — bounding by it
+                // kills the spin without being able to reject a valid module.
+                if (tn.n > self.body_len) return error.StackUnderflow;
                 var k: u32 = 0;
                 while (k < tn.n) : (k += 1) _ = try self.popExpect(f.storage.unpacked());
                 try self.pushValT(V.concreteRef(false, .array, tn.type_index));
@@ -1103,4 +1151,70 @@ test "rejects function/code count mismatch" {
     var m = try Module.decode(std.testing.allocator, &bytes);
     defer m.deinit();
     try std.testing.expectError(error.CountMismatch, validate(std.testing.allocator, &m));
+}
+
+test "resource caps: a huge locals run and deep nesting are refused, not expanded" {
+    // Both are amplifiers a tiny module can trigger, and the snapshot cost is
+    // their PRODUCT (each control frame dupes the whole local-init vector).
+    // Before the caps, a 512 KB module drove ~767 MB peak on the inspect path.
+    const gpa = std.testing.allocator;
+
+    // (func) with one locals run of count 0xFFFFFFFF — 37 bytes total.
+    const many_locals = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 } ++
+        [_]u8{ 0x01, 0x04, 0x01, 0x60, 0x00, 0x00 } ++
+        [_]u8{ 0x03, 0x02, 0x01, 0x00 } ++
+        [_]u8{ 0x0a, 0x0a, 0x01, 0x08, 0x01, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x7f, 0x0b };
+    {
+        var m = try Module.decode(gpa, &many_locals);
+        defer m.deinit();
+        try std.testing.expectError(error.TooManyLocals, validate(gpa, &m));
+    }
+
+    // A body of `block` × (max_ctrl_depth + 1) then matching `end`s.
+    {
+        const depth = max_ctrl_depth + 1;
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        try body.append(gpa, 0x00); // no locals
+        for (0..depth) |_| try body.appendSlice(gpa, &.{ 0x02, 0x40 }); // block (empty type)
+        for (0..depth) |_| try body.append(gpa, 0x0b); // end
+        try body.append(gpa, 0x0b); // function's own end
+
+        var sec: std.ArrayList(u8) = .empty;
+        defer sec.deinit(gpa);
+        try sec.append(gpa, 0x01); // one body
+        var lenbuf: [5]u8 = undefined;
+        var n: usize = 0;
+        var v: u32 = @intCast(body.items.len);
+        while (true) : (n += 1) { // uleb128
+            const b: u8 = @intCast(v & 0x7f);
+            v >>= 7;
+            lenbuf[n] = if (v != 0) b | 0x80 else b;
+            if (v == 0) break;
+        }
+        try sec.appendSlice(gpa, lenbuf[0 .. n + 1]);
+        try sec.appendSlice(gpa, body.items);
+
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(gpa);
+        try bytes.appendSlice(gpa, &.{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 });
+        try bytes.appendSlice(gpa, &.{ 0x01, 0x04, 0x01, 0x60, 0x00, 0x00 });
+        try bytes.appendSlice(gpa, &.{ 0x03, 0x02, 0x01, 0x00 });
+        try bytes.append(gpa, 0x0a);
+        var slen: [5]u8 = undefined;
+        var sn: usize = 0;
+        var sv: u32 = @intCast(sec.items.len);
+        while (true) : (sn += 1) {
+            const b: u8 = @intCast(sv & 0x7f);
+            sv >>= 7;
+            slen[sn] = if (sv != 0) b | 0x80 else b;
+            if (sv == 0) break;
+        }
+        try bytes.appendSlice(gpa, slen[0 .. sn + 1]);
+        try bytes.appendSlice(gpa, sec.items);
+
+        var m = try Module.decode(gpa, bytes.items);
+        defer m.deinit();
+        try std.testing.expectError(error.NestingTooDeep, validate(gpa, &m));
+    }
 }

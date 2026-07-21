@@ -376,7 +376,21 @@ fn keygenSubcommand(arena: std.mem.Allocator, io: Io, out: *Io.Writer, rest: []c
     const pub_hex = wazmrt.pin.toHex(kp.public_key.bytes);
     const key_path = try std.fmt.allocPrint(arena, "{s}.key", .{name});
     const key_text = try std.fmt.allocPrint(arena, "{s}\n", .{&seed_hex});
-    Io.Dir.cwd().writeFile(io, .{ .sub_path = key_path, .data = key_text }) catch |e| {
+    // The Ed25519 *private* seed. Default file permissions are 0644 after umask
+    // on POSIX — i.e. world-readable, for the one file in this project that must
+    // not be. Create it 0600. Windows has no mode bit here (`Permissions` is an
+    // attribute set), so the file inherits the directory ACL; the honest
+    // mitigation there is the documented one — keep the key off shared paths, or
+    // hold it in an HSM.
+    const key_perms: Io.File.Permissions = if (@import("builtin").os.tag == .windows)
+        .default_file
+    else
+        @enumFromInt(0o600);
+    Io.Dir.cwd().writeFile(io, .{
+        .sub_path = key_path,
+        .data = key_text,
+        .flags = .{ .permissions = key_perms },
+    }) catch |e| {
         try out.print("error: cannot write '{s}': {s}\n", .{ key_path, @errorName(e) });
         return;
     };
@@ -586,10 +600,17 @@ fn verifyGate(
         };
     }
     // `--verify` may only RAISE strictness, and is ignored under a root enforce.
-    if (!root_enforce) if (flagValue(rest, "--verify")) |mv|
-        if (wazmrt.pin.modeFromStr(mv)) |m| {
-            explicit = wazmrt.pin.stricter(explicit orelse .off, m);
+    if (!root_enforce) if (flagValue(rest, "--verify")) |mv| {
+        // Fail closed on a typo. `--verify` can only raise strictness, so
+        // silently ignoring an unparseable value meant the user's *intended*
+        // extra strictness was dropped without a word — the opposite posture to
+        // `pin.modeFromDb`, which was fixed to fail closed in the 5th pass.
+        const m = wazmrt.pin.modeFromStr(mv) orelse {
+            try out.print("error: --verify '{s}': expected off, warn or enforce\n", .{mv});
+            return false;
         };
+        explicit = wazmrt.pin.stricter(explicit orelse .off, m);
+    };
 
     // Hash the in-memory bytes we are about to execute (TOCTOU-safe), then let
     // the pure decision function pick the action from the security matrix.

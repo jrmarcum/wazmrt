@@ -262,6 +262,8 @@ pub fn build(b: *std.Build) void {
     // With no `-Dtestsuite`, the runner prints how to use it and exits 0.
     {
         const testsuite = b.option([]const u8, "testsuite", "Directory of spec-testsuite .wast files for `zig build conformance`");
+        const baseline = b.option([]const u8, "baseline", "Expected-failure baseline file — gates on REGRESSIONS instead of zero failures");
+        const write_baseline = b.option(bool, "write-baseline", "Write today's results to -Dbaseline=<file> instead of checking against it") orelse false;
         const conf = b.addExecutable(.{ .name = "conformance", .root_module = b.createModule(.{
             .root_source_file = b.path("tools/conformance.zig"),
             .target = target,
@@ -270,7 +272,9 @@ pub fn build(b: *std.Build) void {
         }) });
         const run_conf = b.addRunArtifact(conf);
         run_conf.addArg(testsuite orelse ""); // empty ⇒ the runner prints guidance
-        const conf_step = b.step("conformance", "Run the spec testsuite (.wast) — needs -Dtestsuite=<dir>");
+        run_conf.addArg(baseline orelse ""); // empty ⇒ gate on zero failures
+        run_conf.addArg(if (write_baseline) "write" else "check");
+        const conf_step = b.step("conformance", "Run the spec testsuite (.wast) — needs -Dtestsuite=<dir>; add -Dbaseline=<file> to gate on regressions");
         conf_step.dependOn(&run_conf.step);
     }
 }

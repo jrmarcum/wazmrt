@@ -59,6 +59,12 @@ fn wantStr(s: Sexpr) Error![]const u8 {
         else => error.BadModuleField,
     };
 }
+
+/// Cap on the synthesized element copies for `(table N reftype initexpr)`. `N`
+/// is attacker-written text and each copy is an `Sexpr`, so an unbounded `N`
+/// turns 48 bytes into a request for tens of GB. 2^20 entries is far beyond any
+/// real table literal.
+const max_table_init_copies: u32 = 1 << 20;
 /// The i-th element of a form, or `error.BadModuleField` if the form is too short.
 fn nth(items: []const Sexpr, i: usize) Error!Sexpr {
     return if (i < items.len) items[i] else error.BadModuleField;
@@ -820,6 +826,12 @@ fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef
         // encoding is not required for the execution assertions).
         if (i < items.len and items[i].asList() != null) {
             const init_expr = items[i];
+            // `min` is attacker-written text: `(table 4000000000 funcref (…))` —
+            // 48 bytes — asks for ~96 GB of `Sexpr`. `alloc` overflow-checks the
+            // multiply so it fails cleanly rather than corrupting, but it is the
+            // text-side twin of the OOM amplification `Reader.readVecLen` closed
+            // on the binary side, so bound it the same way.
+            if (min > max_table_init_copies) return error.BadImmediate;
             const copies = try a.alloc(Sexpr, min);
             for (copies) |*c| c.* = init_expr;
             try elems.append(a, .{ .mode = .active, .table_index = table_index, .offset_form = null, .elem_type = et, .expr_form = true, .funcs = &.{}, .exprs = copies });

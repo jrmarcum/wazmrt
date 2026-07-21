@@ -37,9 +37,17 @@ enforce), and **the fuzz targets were rebuilt to mutation-not-generation** — t
 essentially nothing (0 decodes in 20 000 inputs), now 519 decoded / 387 instantiated / 142 assembled per
 sweep, with the sweep **asserting its own coverage** so it cannot silently degrade again; 800 k deep-run
 iterations across Debug and ReleaseSafe found no crashes. **207 distinct tests** (403 printed).
-**Still open:** the `validate.zig` inspect-path DoS + accept-invalid element check; the conformance gate
-needs a baseline before it can be CI; the fuzz targets still swallow `OutOfMemory`; and the previously
-logged LOWs.
+Finally the whole still-open list was closed the same day: `validate.zig` resource caps (nesting + locals,
+whose **product** is the real bound) applied on the run path too, `array_new_fixed` bounded by instruction
+count, the `(table N …)` copy cap, `path_symlink` refusing escaping targets at creation, `writeStringVec`
+u64 offsets, the `host_funcs` OOM leak, `--verify` failing closed, `keygen` writing the key 0600, a
+**conformance baseline** (`-Dbaseline` / `-Dwrite-baseline`) so that step gates on regressions instead of a
+zero upstream never reached, and a **`Budget` allocator** making allocation amplification visible to the
+fuzzer. **209 distinct tests** (407 printed), green under Debug and ReleaseSafe. One reported finding —
+"accept-invalid element type" — turned out to be **wrong** and is recorded as such at the site.
+**Still open:** the fuzz targets share one `--fuzz` corpus; assorted logged LOWs
+(`skipConstExpr` GC immediates, duplicated `naturalAlign` helpers, `opcode.zig` tag leniency,
+`ValType.concreteRef` 28-bit index truncation, C-ABI trap-frame borrowed `*Instance`).
 *Standing lesson from this sequence: a run of clean passes means the current lens is exhausted, not that
 the code is clean — change the lens.*
 

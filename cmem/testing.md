@@ -483,11 +483,11 @@ are ±10% noisy.)
 
 ## Reading the test count (updated 2026-07-20, post 10th audit pass)
 
-`zig build test --summary all` prints **403 total (399 pass, 4 skip)**, but there are **207 distinct
-tests**: 196 in the core module (194 pass + 2 skip) + 11 C-ABI. The `cabi_tests` target's root is
+`zig build test --summary all` prints **407 total (403 pass, 4 skip)**, but there are **209 distinct
+tests**: 198 in the core module (196 pass + 2 skip) + 11 C-ABI. The `cabi_tests` target's root is
 `wasm_c_api.zig`, which imports `root.zig`, so it compiles and **re-runs the core module's tests too**
-(196 core + 11 C-ABI = 207), on top of the standalone `mod_tests` run (196) → 403 printed. Harmless —
-about a second — but **don't quote the printed number as a test count**; quote **194**, or the per-target
+(198 core + 11 C-ABI = 209), on top of the standalone `mod_tests` run (198) → 407 printed. Harmless —
+about a second — but **don't quote the printed number as a test count**; quote **196**, or the per-target
 numbers from `--summary all`.
 
 *(Was 389 printed / 200 distinct before `src/fuzz.zig` added 2 blocks and the 10th-pass memory/underflow/CSPRNG
@@ -520,7 +520,12 @@ the in-process runner, fails the build on any assertion failure. Corpus is not v
 today** — the snapshots in this file record known upstream failures (linking 100/**37**, return_call_ref
 38/**9**, call_ref 30/**1**, global 109/**1**, f32/f64 2498/**2**), so as written it gates against *zero*
 failures rather than against regressions. Needs a baseline/allow-list (expected-failures file or
-`-Dmax-failures=N`) before it can serve as CI.
+`-Dmax-failures=N`) before it can serve as CI. **BASELINE ADDED 2026-07-20:** `-Dbaseline=<file>` holds the
+expected failure count per `.wast` (`error <path>` for files the runner cannot parse), and
+`-Dwrite-baseline=true` generates one. The step then fails only on **regressions**, reports improvements
+(prompting a re-generate), and with no baseline explains why it is strict rather than silently staying red.
+Verified on a synthetic corpus across all five paths: no-baseline → fail; write → generate; check → pass;
+a new failure → fail; a fixed failure → pass + "improved".
 
 **`src/fuzz.zig`** — feeds arbitrary bytes to the binary decoder + instantiation and to the WAT assembler,
 asserting they only ever *error*. Two test blocks: a `std.testing.fuzz` target (coverage-guided under
@@ -555,10 +560,16 @@ Deep runs on the rebuilt targets: **400 000 iterations under Debug and 400 000 u
 seed, ~19 s each — no crashes.** That is real evidence the earlier hardening holds, and evidence the old
 targets structurally could not have produced.
 
-**Still open:** both targets `catch` and discard `error.OutOfMemory`, so allocation-amplification remains
-invisible to them (a budget-limiting allocator would fix it); the two targets still share one `--fuzz`
-corpus. `instantiationTooBig()` skips modules whose mutated `(memory N)` names a huge minimum, so the sweep
-doesn't spend its time reserving address space.
+**Allocation amplification is now detected (2026-07-20).** The targets `catch` `error.OutOfMemory` — a
+malformed input legitimately producing one is not a bug — which made the entire amplification class
+*invisible by construction*, i.e. exactly what `Reader.readVecLen`, the linear-memory budget and the
+`(table N …)` cap exist to prevent. The sweep now runs under a **64 MB `Budget` allocator** and asserts it
+was never exceeded (no ≤8 KB input should need that much after every cap in the pipeline) **and** that
+`live` returns to **0** — a leak check independent of the testing allocator's. Both hold.
+
+**Still open:** the two targets share one `--fuzz` corpus, so an input good for the decoder is noise for
+the assembler. `instantiationTooBig()` skips modules whose mutated `(memory N)` names a huge minimum, so
+the sweep doesn't spend its time reserving address space.
 
 ## Authenticity — Ed25519 signatures (`src/sign.zig` + CLI, 2026-07-18)
 

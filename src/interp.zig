@@ -219,6 +219,9 @@ pub const Error = Module.Error || error{
     /// to propagate a `throw` across frames; if it reaches the top of a call it
     /// is an uncaught exception, which traps (EH proposal, Phase 6).
     UncaughtException,
+    /// A function declared more than `validate.max_locals` locals. The binary
+    /// run-length encoding lets a handful of bytes ask for billions.
+    TooManyLocals,
     /// The module's declared linear memory (at instantiation, or after a
     /// `memory.grow`) exceeds this instance's `max_memory_bytes` budget. A tiny
     /// module can declare gigabytes, so the ceiling is what keeps a hostile
@@ -549,8 +552,16 @@ pub const Instance = struct {
         const bodies = try a.alloc(FuncBody, module.functions.len);
         for (module.functions, module.code, bodies) |type_index, code, *body| {
             const ft = module.funcSig(type_index) orelse return error.UndefinedType;
-            var local_count: usize = ft.params.len;
-            for (code.locals) |l| local_count += l.count;
+            // The run-length local encoding lets a few bytes ask for billions of
+            // locals. `local_count` is `usize`, which on the wasm32 build is 32
+            // bits and would WRAP — a small alloc followed by indices bounded to
+            // the wrapped count, so not OOB today, but a multi-GB allocation
+            // attempt on 64-bit either way. Sum in u64 and apply the same cap the
+            // validator uses.
+            var declared: u64 = ft.params.len;
+            for (code.locals) |l| declared += l.count;
+            if (declared > @import("validate.zig").max_locals) return error.TooManyLocals;
+            const local_count: usize = @intCast(declared);
 
             const ir = try opcode.decodeBody(a, code.body);
             // The CLI run path does not type-check the module, so guard every

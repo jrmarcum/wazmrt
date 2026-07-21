@@ -1098,6 +1098,10 @@ export fn wasm_instance_new(store: ?*Store, module: ?*const Module, imports: ?*c
     defer mems.deinit(alloc);
     defer tbls.deinit(alloc);
     defer import_ref_list.deinit(alloc);
+    // `host_funcs` IS handed to the instance, but via `toOwnedSlice`, which
+    // empties the list — so this `defer` is a no-op on success and covers every
+    // `catch return null` in the loop below, which previously leaked its buffer.
+    defer host_funcs.deinit(alloc);
     for (m.inner.imports, 0..) |imp, i| {
         const ext: ?*Ref = if (imports) |v| (if (i < v.size) v.data[i] else null) else null;
         switch (imp.type) {
@@ -1131,13 +1135,13 @@ export fn wasm_instance_new(store: ?*Store, module: ?*const Module, imports: ?*c
     // explicitly until `wi` takes ownership).
     const import_refs = import_ref_list.toOwnedSlice(alloc) catch return null;
 
+    // (`host_funcs` is freed by the `defer` above on every path; freeing it here
+    // too would be a double-deinit.)
     const wi = alloc.create(Instance) catch {
-        host_funcs.deinit(alloc);
         alloc.free(import_refs);
         return null;
     };
     const funcs = host_funcs.toOwnedSlice(alloc) catch {
-        host_funcs.deinit(alloc);
         alloc.free(import_refs);
         alloc.destroy(wi);
         return null;
