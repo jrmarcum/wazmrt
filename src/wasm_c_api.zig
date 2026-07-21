@@ -349,9 +349,16 @@ fn valkindOf(v: types.ValType) Valkind {
         .f64 => 3,
         else => {
             // Any reference maps to the two base wasm-c-api ref kinds by family
-            // (func → funcref, everything else → externref). Non-ref/unknown
-            // (e.g. v128) has no base valkind — default to i32.
-            if (!v.isRef()) return 0;
+            // (func → funcref, everything else → externref).
+            //
+            // v128 has NO wasm-c-api valkind — the header predates SIMD — so
+            // there is no correct answer. It used to report `WASM_I32` (0), a
+            // *plausible wrong* one: a `(global v128)` import was described as
+            // i32, and a v128 result occupies **two** interpreter slots, so the
+            // mislabel also misaligned every following result. `anyref` (128) is
+            // still wrong but is at least not a number the embedder will try to
+            // read as one; the real fix is a v128 kind in the header.
+            if (!v.isRef()) return if (v == .v128) 128 else 0;
             return if (v.refHeap() == .func) 129 else 128;
         },
     };
@@ -817,7 +824,17 @@ fn externKindToC(k: types.ExternKind) Externkind {
         .global => EXTERN_GLOBAL,
         .table => EXTERN_TABLE,
         .memory => EXTERN_MEMORY,
-        else => EXTERN_FUNC,
+        // A tag is EXTERN_TAG, not a function. The decoder accepts tag exports,
+        // so `else => EXTERN_FUNC` built a `Ref{ .kind = EXTERN_FUNC, .index =
+        // <tag index> }` — `wasm_extern_as_func` then succeeded and
+        // `wasm_func_call` resolved `funcType(tag index)`, executing **a
+        // different, unrelated function** if the arity happened to match.
+        .tag => EXTERN_TAG,
+        // `ExternKind` is non-exhaustive (an unknown kind byte decodes rather
+        // than crashing). EXTERN_TAG is the safe default here: unlike
+        // EXTERN_FUNC it is not callable, so an unknown kind cannot be cast to a
+        // func and invoked.
+        else => EXTERN_TAG,
     };
 }
 
@@ -1125,13 +1142,30 @@ export fn wasm_instance_new(store: ?*Store, module: ?*const Module, imports: ?*c
         const ext: ?*Ref = if (imports) |v| (if (i < v.size) v.data[i] else null) else null;
         switch (imp.type) {
             .func => {
-                const hf: interp.Instance.HostFunc = if (ext != null and ext.?.host != null) blk: {
-                    import_ref_list.append(alloc, ext.?) catch return null; // its ctx is borrowed by the trampoline
-                    break :blk .{ .native_env = .{ .ctx = ext.?, .call = hostTrampoline } };
-                } else .{ .native_env = .{ .ctx = &unbacked_marker, .call = unbackedTrap } };
-                host_funcs.append(alloc, hf) catch return null;
+                // An extern with `host == null` is an INSTANCE-EXPORT function
+                // (only `wasm_func_new` sets `host`). Passing one as an import is
+                // the canonical linking pattern, and it used to fall through to
+                // `unbackedTrap` — instantiation succeeded and the call trapped
+                // later, blaming the guest for a link we silently didn't make.
+                // Module-to-module linking is not implemented, so fail here.
+                if (ext) |e| {
+                    if (e.host == null) return null; // cannot link an instance export yet
+                    import_ref_list.append(alloc, e) catch return null; // its ctx is borrowed by the trampoline
+                    host_funcs.append(alloc, .{ .native_env = .{ .ctx = e, .call = hostTrampoline } }) catch return null;
+                } else {
+                    // Nothing supplied: keep the trap-on-call stub, so a module
+                    // that never calls the import still runs.
+                    host_funcs.append(alloc, .{ .native_env = .{ .ctx = &unbacked_marker, .call = unbackedTrap } }) catch return null;
+                }
             },
-            .global => gvals.append(alloc, if (ext) |e| (if (e.host_global) |hg| hg.value else 0) else 0) catch return null,
+            .global => {
+                // Was: a supplied-but-unusable extern silently became **0**.
+                // Skipping instead leaves `gvals` short, which `Instance.init`
+                // now reports as `MissingImport` (batch A) rather than reading 0.
+                const e = ext orelse continue;
+                const hg = e.host_global orelse return null; // instance-export global: not linkable yet
+                gvals.append(alloc, hg.value) catch return null;
+            },
             .memory => if (ext) |e| {
                 if (e.host_memory) |mem| {
                     mems.append(alloc, mem) catch return null;
@@ -1535,10 +1569,16 @@ fn tableObj(r: *const Ref) ?*interp.Instance.Table {
 
 export fn wasm_table_new(store: ?*Store, tt: ?*const TableType, init: ?*Ref) ?*Ref {
     _ = store;
-    _ = init; // entries start uninitialized (null) — typed-init is a later slice
     const t = tt orelse return null;
     const entries = alloc.alloc(interp.Value, t.limits.min) catch return null;
-    @memset(entries, std.math.maxInt(u64)); // null_ref
+    // The header contracts every entry initialized to `init`. Ignoring it handed
+    // the embedder a plausible non-NULL table that was silently all-nulls;
+    // `tableValueFromRef` (two functions away) is exactly the conversion needed.
+    const init_val = tableValueFromRef(if (init) |r| &r.hdr else null) orelse {
+        alloc.free(entries); // `init` is not a funcref — the table can't hold it
+        return null;
+    };
+    @memset(entries, init_val);
     const tbl = alloc.create(interp.Instance.Table) catch {
         alloc.free(entries);
         return null;
