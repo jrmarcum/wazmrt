@@ -244,7 +244,20 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             const idx: u32 = switch (kind) {
                 0 => try resolveByName(func_names.items, try nth(target, 1)),
                 1 => try resolveByName(table_names.items, try nth(target, 1)),
-                2 => 0, // single memory
+                // The assembler models a SINGLE memory, so 0 is the only valid
+                // index — but this used to return 0 without looking at the target
+                // at all, so `(export "m" (memory $doesnotexist))` and
+                // `(memory 7)` both silently exported memory 0. That is the
+                // canonical "unresolved `$name` became index 0" bug; the other
+                // three kinds all go through `resolveByName`, which reports
+                // `UnknownIdentifier`.
+                2 => blk: {
+                    const t = try nth(target, 1);
+                    const at = try wantAtom(t);
+                    if (at.len != 0 and at[0] == '$') return error.UnknownIdentifier;
+                    if (try parseIndex(t) != 0) return error.UnsupportedInstr; // multi-memory: not assembled
+                    break :blk 0;
+                },
                 3 => try resolveByName(global_names.items, try nth(target, 1)),
                 else => unreachable,
             };
@@ -302,6 +315,13 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 off[1] = .{ .atom = "0" };
                 try datas.append(a, .{ .mem_index = 0, .offset_form = .{ .list = off }, .bytes = bytes.items });
             } else {
+                // `mem_min`/`mem_max` are a SINGLE memory, so a second
+                // `(memory …)` used to overwrite the first — `(memory 1)(memory 3)`
+                // silently assembled as one 3-page memory and every `memory.*`
+                // and data segment collapsed onto index 0. Multi-memory decodes
+                // and executes (Phase 7); only the text syntax is unimplemented,
+                // and "deferred" must not mean "emits wrong bytes".
+                if (mem_min != null) return error.UnsupportedInstr;
                 mem_min = try parseIndex(try nth(items, mi));
                 if (mi + 1 < items.len) mem_max = try parseIndex(items[mi + 1]);
             }
@@ -401,8 +421,14 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             // (start $f | N) — resolve after the func index space is complete.
             if (items.len < 2) return error.BadModuleField;
             start_ref = items[1];
-        } else {
-            // `type` handled in the pre-pass.
+        } else if (!std.mem.eql(u8, kw, "type") and !std.mem.eql(u8, kw, "rec")) {
+            // Anything else is a typo or an unsupported field, and silently
+            // dropping it assembled a module MISSING what the source asked for:
+            // `(exprot "g" (func 0))` vanished and the export simply didn't
+            // exist. Emitting a module that doesn't match its source is the
+            // canonical failure this project's audit protocol names.
+            // (`type`/`rec` are handled by the pre-pass above.)
+            return error.BadModuleField;
         }
     }
 
@@ -722,17 +748,26 @@ fn parseTypeBody(a: std.mem.Allocator, items: []const Sexpr, type_names: []const
         var params: List(V) = .empty;
         var results: List(V) = .empty;
         for (body[1..]) |part| {
-            const pk = part.keyword() orelse continue;
-            if (std.mem.eql(u8, pk, "param")) try parseDecls(a, (try wantList(part)), &params, null, type_names);
-            if (std.mem.eql(u8, pk, "result")) try parseDecls(a, (try wantList(part)), &results, null, type_names);
+            // An unrecognised part used to be skipped, so
+            // `(type $t (func (parm i32) (reslt i32)))` interned `() -> ()` and a
+            // `call_indirect` against `$t` then checked the WRONG signature.
+            const pk = part.keyword() orelse return error.BadModuleField;
+            if (std.mem.eql(u8, pk, "param")) {
+                try parseDecls(a, (try wantList(part)), &params, null, type_names);
+            } else if (std.mem.eql(u8, pk, "result")) {
+                try parseDecls(a, (try wantList(part)), &results, null, type_names);
+            } else return error.BadModuleField;
         }
         try sigs.append(a, .{ .params = params.items, .results = results.items });
         try gc_types.append(a, .func);
     } else if (std.mem.eql(u8, kw, "struct")) {
         var fields: List(GcField) = .empty;
         for (body[1..]) |part| {
-            if (std.mem.eql(u8, part.keyword() orelse continue, "field"))
-                try parseFieldGroup(a, (try wantList(part)), &fields, type_names);
+            // Same rule as the `func` arm above: a mistyped part must not be
+            // silently dropped, or the struct is assembled with missing fields.
+            if (!std.mem.eql(u8, part.keyword() orelse return error.BadModuleField, "field"))
+                return error.BadModuleField;
+            try parseFieldGroup(a, (try wantList(part)), &fields, type_names);
         }
         try sigs.append(a, .{ .params = &.{}, .results = &.{} }); // placeholder
         try gc_types.append(a, .{ .@"struct" = fields.items });
@@ -1814,9 +1849,18 @@ fn emitMemArg(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
     var offset: u64 = 0;
     var align_log2: u32 = opcode.naturalAlignLog2(op);
     for (immediates) |imm| {
+        // A non-atom here is an operand sub-expression in the folded form, not a
+        // memarg — skip those. But an ATOM that is neither `offset=` nor `align=`
+        // is a typo, and ignoring it silently loaded the wrong address:
+        // `(i32.load offest=4 (i32.const 0))` read offset 0. The flat path is
+        // safe by construction (it stops at the first non-memarg atom and
+        // `lookupOp` then fails); the folded path harvests every leading atom as
+        // an immediate, so it needs the check here — the asymmetry WAS the bug.
         const atom = imm.asAtom() orelse continue;
         if (std.mem.startsWith(u8, atom, "offset=")) {
             offset = std.fmt.parseInt(u64, atom[7..], 0) catch return error.BadImmediate;
+        } else if (!std.mem.startsWith(u8, atom, "align=")) {
+            return error.BadImmediate;
         } else if (std.mem.startsWith(u8, atom, "align=")) {
             const bytes = std.fmt.parseInt(u32, atom[6..], 0) catch return error.BadImmediate;
             // Alignment must be a non-zero power of two (§6.5.8); otherwise
