@@ -12,6 +12,17 @@ const build_options = @import("build_options");
 /// option is wired only into this module — `sign.zig` stays plumbing-free.
 const embedded_root_key: ?[wazmrt.sign.pubkey_len]u8 = wazmrt.sign.rootKeyFromHex(build_options.root_key_hex);
 
+/// Exit status for a wazmrt-side failure (unreadable file, bad module, refused
+/// by the verify gate, guest trap). A guest's own `proc_exit` code is passed
+/// through unchanged instead.
+///
+/// This matters beyond tidiness: `main` used to print every failure and `return`,
+/// so the process exited **0** for a missing file, an undecodable module, a
+/// failed assembly, a guest trap — and, worst, for a **verify-gate refusal**, so
+/// `wazmrt --verify enforce prog.wasm && deploy` proceeded after wazmrt had
+/// refused to run the module.
+const exit_failure: u8 = 1;
+
 pub fn main(init: std.process.Init) !void {
     const arena: std.mem.Allocator = init.arena.allocator();
     const io = init.io;
@@ -19,33 +30,59 @@ pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const out = &stdout_file_writer.interface;
-    defer out.flush() catch {};
 
+    const code = run(init, arena, io, out) catch |e| blk: {
+        out.print("error: {s}\n", .{@errorName(e)}) catch {};
+        break :blk exit_failure;
+    };
+    // Flush BEFORE exiting — `std.process.exit` does not run deferred code, so a
+    // buffered final line would be lost.
+    out.flush() catch {};
+    if (code != 0) std.process.exit(code);
+}
+
+/// The CLI body. Returns the process exit status.
+fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer) !u8 {
     const args = try init.minimal.args.toSlice(arena);
     const prog = if (args.len > 0) args[0] else "wazmrt";
     if (args.len < 2) {
         try printUsage(out, prog);
-        return;
+        return exit_failure; // invoked with no arguments
     }
 
     // `-h`/`--help` and `-v`/`--version` are only recognized as the FIRST arg, so
     // a `--help` in a guest's argv (`wazmrt prog.wasm -- --help`) is never ours.
-    if (isFlag(args[1], "-h", "--help")) return printHelp(out, prog);
-    if (isFlag(args[1], "-v", "--version")) return printVersion(out);
+    if (isFlag(args[1], "-h", "--help")) {
+        try printHelp(out, prog);
+        return 0;
+    }
+    if (isFlag(args[1], "-v", "--version")) {
+        try printVersion(out);
+        return 0;
+    }
 
     // `wazmrt pin <file> [--db <path>]` — hash a module for the pin DB (Phase 5).
-    if (std.mem.eql(u8, args[1], "pin")) return pinSubcommand(arena, io, out, args[2..]);
+    if (std.mem.eql(u8, args[1], "pin")) {
+        try pinSubcommand(arena, io, out, args[2..]);
+        return 0;
+    }
 
     // Publisher-side signing tools (authenticity):
     //   wazmrt keygen [--out <name>]                    — new Ed25519 keypair
     //   wazmrt sign <in> <out> --key <keyfile>          — sign a module
-    if (std.mem.eql(u8, args[1], "keygen")) return keygenSubcommand(arena, io, out, args[2..]);
-    if (std.mem.eql(u8, args[1], "sign")) return signSubcommand(arena, io, out, args[2..]);
+    if (std.mem.eql(u8, args[1], "keygen")) {
+        try keygenSubcommand(arena, io, out, args[2..]);
+        return 0;
+    }
+    if (std.mem.eql(u8, args[1], "sign")) {
+        try signSubcommand(arena, io, out, args[2..]);
+        return 0;
+    }
 
     const path = args[1];
     var bytes: []const u8 = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 << 20)) catch |e| {
         try out.print("error: cannot read '{s}': {s}\n", .{ path, @errorName(e) });
-        return;
+        return exit_failure;
     };
 
     // .wast script mode: parse + run the assertions, print a pass/fail summary.
@@ -62,28 +99,30 @@ pub fn main(init: std.process.Init) !void {
         // script runs is *contained in* those bytes, so authorizing the script
         // authorizes exactly what it can execute — the same
         // hash-what-you-execute property `verifyGate` has for a module.
-        if (!(try verifyGate(arena, io, out, bytes, path, args[2..]))) return;
+        if (!(try verifyGate(arena, io, out, bytes, path, args[2..]))) return exit_failure;
 
         const s = wazmrt.wast.runScript(arena, bytes) catch |e| {
             try out.print("error: cannot run '{s}': {s}\n", .{ path, @errorName(e) });
-            return;
+            return exit_failure;
         };
         try out.print("{s}: {d} passed, {d} failed, {d} skipped\n", .{ path, s.passed, s.failed, s.skipped });
         if (s.first_failure) |f| try out.print("  first failure: {s}\n", .{f});
-        return;
+        // A .wast with failing assertions is a failing run — it used to exit 0,
+        // so a CI step running the testsuite could never notice.
+        return if (s.failed != 0) exit_failure else 0;
     }
 
     // .wat text: assemble to a binary, then treat it like a .wasm.
     if (std.mem.endsWith(u8, path, ".wat")) {
         bytes = wazmrt.wat.assemble(arena, bytes) catch |e| {
             try out.print("error: cannot assemble '{s}': {s}\n", .{ path, @errorName(e) });
-            return;
+            return exit_failure;
         };
     }
 
     var module = wazmrt.decode(arena, bytes) catch |e| {
         try out.print("error: cannot decode '{s}': {s}\n", .{ path, @errorName(e) });
-        return;
+        return exit_failure;
     };
     defer module.deinit();
 
@@ -93,14 +132,13 @@ pub fn main(init: std.process.Init) !void {
     // summarize path below never executes, so it is never gated.
     const will_execute = (args.len >= 3 and findExport(&module, args[2]) != null) or
         findExport(&module, "_start") != null;
-    if (will_execute and !(try verifyGate(arena, io, out, bytes, path, args[2..]))) return;
+    if (will_execute and !(try verifyGate(arena, io, out, bytes, path, args[2..]))) return exit_failure;
 
     // Run mode: `wazmrt <module.wasm> <export> [args...]` — invoke and print.
     // A trailing arg only selects an export if it actually names one; otherwise
     // it belongs to the WASI command below (`--dir …`, guest argv, …).
     if (args.len >= 3 and findExport(&module, args[2]) != null) {
-        try runFunction(arena, out, &module, args[2], args[3..]);
-        return;
+        return try runFunction(arena, out, &module, args[2], args[3..]);
     }
 
     // WASI command: `wazmrt <module.wasm> [--dir <host>[:<guest>]]... [args...]`
@@ -108,10 +146,12 @@ pub fn main(init: std.process.Init) !void {
     if (findExport(&module, "_start")) |start_index| {
         const code = runWasi(arena, io, out, &module, path, start_index, args[2..]) catch |e| {
             if (e != AlreadyReported) try out.print("trap: {s}\n", .{@errorName(e)});
-            return;
+            return exit_failure; // a trap is a failed run
         };
+        // Pass the GUEST's own exit code through: `proc_exit(1)` used to be
+        // merely printed as "(exit 1)" while the process still exited 0.
         if (code != 0) try out.print("(exit {d})\n", .{code});
-        return;
+        return std.math.cast(u8, code) orelse exit_failure;
     }
 
     try out.print("{s}: valid wasm v{d}, {d} section(s)\n", .{ path, module.version, module.sections.len });
@@ -148,9 +188,10 @@ pub fn main(init: std.process.Init) !void {
 
     wazmrt.validate(arena, &module) catch |e| {
         try out.print("  validation: FAILED — {s}\n", .{@errorName(e)});
-        return;
+        return exit_failure; // the inspect path reports invalidity in its status
     };
     try out.print("  validation: OK\n", .{});
+    return 0;
 }
 
 /// True if `arg` is either the short or long spelling of a flag.
@@ -838,7 +879,7 @@ fn runFunction(
     module: *const wazmrt.Module,
     name: []const u8,
     arg_strings: []const [:0]const u8,
-) !void {
+) !u8 {
     const interp = wazmrt.interp;
 
     // Resolve the export to a function index + signature.
@@ -848,7 +889,7 @@ fn runFunction(
     }
     const fi = func_index orelse {
         try out.print("error: no exported function '{s}'\n", .{name});
-        return;
+        return exit_failure;
     };
     // `fi` came from the export section, which the decoder does NOT cross-check
     // against the function space (a repeated `function` section appends to the
@@ -858,11 +899,11 @@ fn runFunction(
     // from a 31-byte module. Fail loud instead.
     const ft = module.funcType(fi) orelse {
         try out.print("error: export '{s}' names an out-of-range function index {d}\n", .{ name, fi });
-        return;
+        return exit_failure;
     };
     if (arg_strings.len != ft.params.len) {
         try out.print("error: '{s}' takes {d} arg(s), got {d}\n", .{ name, ft.params.len, arg_strings.len });
-        return;
+        return exit_failure;
     }
 
     // Parse each argument according to its declared parameter type.
@@ -875,26 +916,26 @@ fn runFunction(
             .f64 => interp.f64Value(try std.fmt.parseFloat(f64, s)),
             else => {
                 try out.print("error: unsupported parameter type {s}\n", .{@tagName(pt)});
-                return;
+                return exit_failure;
             },
         };
     }
 
     var inst = interp.Instance.init(arena, module) catch |e| {
         try out.print("error: instantiate: {s}\n", .{@errorName(e)});
-        return;
+        return exit_failure;
     };
     defer inst.deinit();
 
     inst.runStart() catch |e| {
         try out.print("trap: start: ", .{});
         try printTrap(arena, out, module, &inst, e);
-        return;
+        return exit_failure;
     };
 
     const results = inst.invokeIndex(fi, call_args) catch |e| {
         try printTrap(arena, out, module, &inst, e);
-        return;
+        return exit_failure;
     };
 
     for (results, ft.results, 0..) |res, rt, i| {
@@ -908,4 +949,5 @@ fn runFunction(
         }
     }
     try out.print("\n", .{});
+    return 0;
 }
