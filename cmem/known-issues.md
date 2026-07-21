@@ -747,6 +747,60 @@ were being counted as passes. **The snapshots must be re-measured before they ar
 *Lesson: a test harness that treats "we couldn't run it" as "it passed" reports the shape of its own gaps
 as success — and the more gaps, the better the score looks.*
 
+### BACKLOG CLEARED — 2026-07-21 — batches A–E
+
+Everything below was verified against the built CLI before and after. Grouped by file.
+
+**A — interp / decoder.** A **missing imported global silently read 0** while imported memories and
+tables both `MissingImport` (asymmetric sibling; was `0`, now `MissingImport`). **`headMatches` folded
+`nofunc`/`noextern` into their own TOPS** — `Module.refHead` maps `nofunc → .func`, so
+`ref.test (ref nofunc)` on a funcref answered **1** where the spec says **0**, and the matching `ref.cast`
+*succeeded where it must trap*, letting a value flow on with a type it does not have. (`none` was already
+correct.) **`readHeapTypeRef` decoded an undefined heap type as `externref`** ("other → opaque"), so a
+malformed type was indistinguishable from a real externref everywhere downstream; it also folded `exn`
+into externref. **An undefined `0xFD` sub-opcode decoded AND validated** — `wasm_module_validate` lied,
+and since an unknown sub consumes no immediate the following bytes were re-read as instructions.
+**`i8x16.shuffle` lane indices ≥ 32 were accepted** and silently produced 0 (extract/replace and
+load/store_lane were bounds-checked — shuffle was the missed sibling *again*).
+
+**B — the assembler emitting wrong bytes.** Five silent drops, the canonical failure this protocol names.
+An unrecognised **module field** (`(exprot …)` → the export simply vanished); an unrecognised part of
+`(type (func …))`/`(struct …)` (`(parm i32)` → interned `() → ()`, so `call_indirect` checked the **wrong
+signature**); an unrecognised **memarg atom** (`offest=4` → silently loaded address 0 — the flat path was
+safe, only the folded path harvests every leading atom, and that asymmetry *was* the bug); **`(export "m"
+(memory X))` returned 0 without looking at X** (the canonical "unresolved `$name` became index 0"); and a
+second `(memory …)` **overwrote the first**, collapsing multi-memory onto index 0. *"Deferred" must never
+mean "emits wrong bytes."*
+
+**C — WASI answering the wrong question with ESUCCESS.** `clockOf` was `if (id == 0) .real else .awake`,
+so `clock_time_get(2)` — what CPU-time profiling compiles to — returned since-boot **wall** time labelled
+as CPU time, and undefined ids were accepted. `poll_oneoff` **swallowed sleep cancellation** then reported
+the clock event as success, so `sleep(60)` returned instantly claiming it slept and `while (!done)
+sleep(1)` became a 100 % CPU spin. `errnoFor` had no `NotLink` arm, so `readlink` on a regular file
+returned **EIO** where the standard probe idiom expects **EINVAL**. `fd_fdstat_set_flags` stored flags it
+never honours, so `O_DSYNC` returned success *and* `fd_fdstat_get` **confirmed** it while nothing synced.
+`fd_sync`/`fd_datasync` returned ESUCCESS for directories and stdin with no rights check — `fsync(dirfd)`
+after a rename is the standard durability idiom.
+
+**D — C ABI.** `externKindToC`'s `else => EXTERN_FUNC` turned an exported **tag** into a function handle,
+so `wasm_func_call` resolved `funcType(tag index)` and **executed a different, unrelated function** when
+the arity matched. `wasm_instance_new` **silently mis-linked**: only `wasm_func_new` sets `Ref.host`, so an
+extern from `wasm_instance_exports` — the canonical linking pattern — fell through to `unbackedTrap`
+(instantiation succeeded, the call trapped later, blaming the guest), and an exported global substituted
+**0**. `wasm_table_new` ignored `init` and filled with nulls against the header's contract. `valkindOf`
+reported v128 as `WASM_I32` — a *plausible wrong* answer that also misaligned every following result,
+since a v128 occupies two slots.
+
+**E — CLI exit status.** `main` printed and `return`ed, so the process exited **0** for every failure
+including a **verify-gate refusal** — `wazmrt --verify enforce prog.wasm && deploy` proceeded after wazmrt
+refused. The body is now `fn run(…) !u8`; `main` flushes *then* `process.exit` (which skips defers).
+Guest `proc_exit` codes pass through. *Two of the first readings were wrong for harness reasons — a pipe
+masked the status, and flags before the export name made `will_execute` false — both re-tested properly.
+Check the harness before believing a negative result.*
+
+**Not reproduced, deliberately not "fixed":** a claimed unclosed-block infinite loop. The crafted module
+exits cleanly with `validation: FAILED — ControlUnderflow`. Recorded so it is not re-reported.
+
 **BACKLOG — the rest, reported by this pass, NOT yet verified or fixed.** The fall-through and dead-code sweeps
 returned ~40 further findings. One that was checked **did not reproduce** (a claimed unclosed-block
 infinite loop: the repro exited cleanly, `validation: FAILED — ControlUnderflow`), which is why the rest

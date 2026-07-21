@@ -70,8 +70,15 @@ minNum/maxNum, not the NaN-propagating `fmin`/`fmax` the scalar path uses, so `f
 memory** (collateral from the lazy-pages change), an `errdefer` slice with start > end, and **null
 inverted both ways** in the C-ABI val path. **216 distinct tests** (419 printed).
 **Highest-value testing gap now open: no `simd_*.wast` has ever been run** — that absence is what hid the
-min/max bug for eleven passes. ~40 further findings from this pass are logged in `known-issues.md` as
-**unverified claims** (one checked did not reproduce), to be confirmed individually before any fix.
+min/max bug for eleven passes.
+
+**The ~40-item backlog was then verified and cleared in batches A–E (2026-07-21):** interp/decoder
+(missing imported global read 0; `ref.test (ref nofunc)` answered 1 where the spec says 0, and the matching
+`ref.cast` succeeded where it must trap; undefined heap type decoded as `externref`; undefined `0xFD` sub
+decoded *and validated*; `shuffle` lanes ≥ 32 accepted), **five assembler silent-drops** that emitted
+modules not matching their source, **five WASI syscalls** reporting ESUCCESS for work they didn't do, four
+**C-ABI** faults (an exported *tag* was callable as a function), and the **CLI exiting 0 on every failure
+including a verify-gate refusal**. One claim did not reproduce and is recorded as not-a-defect.
 
 **The 10th pass's remaining-issues list is closed.** Only two items survive, neither closable here:
 **#8** (upstream Zig `Io` bug — also what holds #17's final-component `path_open` TOCTOU open; recheck on

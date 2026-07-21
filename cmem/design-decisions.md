@@ -242,6 +242,20 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   lazy-pages change left behind in `wasm_memory_new`/`grow`/`destroyRef` until it was caught.
   **Rule: `Memory.bytes` is never touched by `alloc`.** *Meta-lesson: changing who owns an allocation is
   not local — sweep every file that frees or grows it, not just the one you edited.*
+- **The CLI's exit status is part of its contract (2026-07-21).** `main` used to print every failure and
+  `return`, exiting **0** for a missing file, a bad module, a guest trap, a failing `.wast` — and for a
+  **verify-gate refusal**, so `wazmrt --verify enforce prog.wasm && deploy` proceeded after wazmrt refused
+  to run it. The body is `fn run(…) !u8`; `main` **flushes before `process.exit`** (which does not run
+  deferred code). **Rule: a wazmrt-side failure exits non-zero, and a guest's own `proc_exit` code passes
+  through unchanged** — never collapse the two.
+- **"Deferred" must never mean "emits wrong bytes" (2026-07-21).** The assembler had five silent drops —
+  an unknown module field, an unknown `(type (func …))` part, an unrecognised memarg atom, an unresolved
+  `(memory $x)` export, and a second `(memory …)` — each of which produced a module that did not match its
+  source (a missing export, the **wrong signature** for `call_indirect`, a load from the wrong address,
+  multi-memory collapsed onto index 0). **Rule: an unrecognised form is an error. If a feature is
+  unimplemented, return `UnsupportedInstr` — never assemble something plausible.** Note the recurring
+  shape: the *flat* instruction path was safe by construction while the *folded* path was not, so the
+  asymmetry between two paths for the same syntax was itself the bug.
 - **`zig build test-safe` is the memory-safety gate (2026-07-20).** The suite under **ReleaseSafe** —
   optimizer on, safety checks kept — so out-of-range `@intCast`, OOB, and null-unwrap panic loudly instead
   of being silent UB in the shipped ReleaseFast/ReleaseSmall builds. **Run it alongside `zig build test`
