@@ -523,6 +523,23 @@ const ImmKind = enum {
 
 /// Classify an opcode's immediate. Reused by the decoder (and, later, by any
 /// pass that needs to walk instructions without fully decoding them).
+/// The natural alignment of a memory access, **as a log2 exponent** (the form
+/// the memarg carries): 0 for 8-bit, 1 for 16-bit, 2 for 32-bit, 3 for 64-bit.
+///
+/// Lives here because both the assembler (which defaults a missing `align=`)
+/// and the validator (which rejects `align=` larger than natural) need exactly
+/// this table; they previously kept byte-identical private copies, one of them
+/// misnamed `naturalAlign` as though it returned a byte count.
+pub fn naturalAlignLog2(op: Op) u32 {
+    return switch (op) {
+        .i32_load8_s, .i32_load8_u, .i64_load8_s, .i64_load8_u, .i32_store8, .i64_store8 => 0,
+        .i32_load16_s, .i32_load16_u, .i64_load16_s, .i64_load16_u, .i32_store16, .i64_store16 => 1,
+        .i32_load, .f32_load, .i32_store, .f32_store, .i64_load32_s, .i64_load32_u, .i64_store32 => 2,
+        .i64_load, .f64_load, .i64_store, .f64_store => 3,
+        else => 0,
+    };
+}
+
 pub fn immediateKind(op: Op) ImmKind {
     return switch (@intFromEnum(op)) {
         0x02, 0x03, 0x04, 0x06 => .block_type, // block/loop/if + legacy `try`
@@ -763,7 +780,11 @@ pub fn decodeBodyTracked(
 
     while (!r.atEnd()) {
         // Where this instruction starts, before its opcode byte is consumed.
-        if (offsets) |o| try o.append(a, @intCast(r.pos));
+        // Saturating for the same reason as `Module.body_offset`: `r.pos` is a
+        // `usize` and this list is `u32`, so a >4 GiB body would make the cast
+        // out-of-range (UB in ReleaseFast). These offsets only label trap
+        // backtraces, so clamping is cosmetic where the cast was not.
+        if (offsets) |o| try o.append(a, std.math.cast(u32, r.pos) orelse std.math.maxInt(u32));
         const b0 = try r.readByte();
         if (b0 == 0xfb) {
             // 0xFB-prefixed GC op: a LEB sub-opcode picks the internal Op tag,
@@ -839,6 +860,18 @@ pub fn decodeBodyTracked(
             try list.append(a, try decodeSimd(&r, try r.readVarU32()));
             continue;
         }
+        // `0xd7..0xfa` are wazmrt's INTERNAL tags for ops whose real wire form is
+        // `0xFB`/`0xFC` + a LEB sub-opcode (handled above). A raw byte in that
+        // range is not a valid single-byte wasm opcode, so accepting it executed
+        // a non-standard encoding as if it were e.g. `table.grow`.
+        //
+        // The pre-existing guard rejected by *immediate kind*, which catches only
+        // the tags whose kind is unreachable from any real single-byte op — it
+        // could never catch `0xe3–0xe5` (`.table`) or `0xed`/`0xf0–0xf2`
+        // (`.none`), whose kinds are legitimately reachable. A range check is the
+        // property that actually holds. (`0xd0–0xd6` are real ops; `0xfb–0xfd`
+        // are prefixes consumed above, and both sit outside this range.)
+        if (b0 >= 0xd7 and b0 <= 0xfa) return error.UnsupportedOpcode;
         const op: Op = @enumFromInt(b0);
         const imm: Imm = switch (immediateKind(op)) {
             .none => .none,
@@ -972,4 +1005,32 @@ test "decodes a SIMD (0xFD) op: v128.const" {
 test "rejects a genuinely unknown opcode" {
     const body = [_]u8{0xff}; // 0xff is not a defined opcode or prefix
     try std.testing.expectError(error.UnsupportedOpcode, decodeBody(std.testing.allocator, &body));
+}
+
+test "rejects raw internal-tag bytes that are not real single-byte opcodes" {
+    // `0xd7..0xfa` are wazmrt's internal Op tags for ops whose real wire form is
+    // `0xFB`/`0xFC` + a sub-opcode. Accepting the raw byte executed a
+    // non-standard encoding as a real instruction. The pre-existing guard was by
+    // immediate *kind*, so it could not catch tags whose kind is also reachable
+    // from a genuine single-byte op — these are exactly those cases.
+    const tags = [_]u8{
+        0xe3, 0xe4, 0xe5, // table.grow/size/fill  (kind .table — also a real kind)
+        0xed, // array.len              (kind .none  — also a real kind)
+        0xf0, 0xf1, 0xf2, // ref.i31 / i31.get_s/u  (kind .none)
+        0xd7, 0xdb, 0xfa, // range endpoints + the SIMD tag
+    };
+    for (tags) |b| {
+        const body = [_]u8{b};
+        try std.testing.expectError(error.UnsupportedOpcode, decodeBody(std.testing.allocator, &body));
+    }
+
+    // The real single-byte ops just below the range must still decode.
+    for ([_]u8{ 0xd1, 0xd4, 0xd6 }) |b| { // ref.is_null / ref.as_non_null / br_on_non_null
+        const body = if (b == 0xd6) [_]u8{ b, 0x00 } else [_]u8{ b, 0x0b }; // br_on_non_null takes a label
+        const ir = decodeBody(std.testing.allocator, &body) catch |e| {
+            std.debug.print("byte 0x{x} unexpectedly rejected: {s}\n", .{ b, @errorName(e) });
+            return e;
+        };
+        defer std.testing.allocator.free(ir);
+    }
 }

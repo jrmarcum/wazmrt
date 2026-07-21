@@ -90,7 +90,18 @@ pub fn main(init: std.process.Init) !void {
 
     var walker = try dir.walk(arena);
     defer walker.deinit();
-    while (try walker.next(io)) |ent| {
+    while (true) {
+        // Per-*file* errors are already handled gracefully below; a directory
+        // iteration error used to propagate and abandon the entire run, so one
+        // unreadable subdirectory would discard every result gathered so far.
+        // Count it like a bad file and stop walking, keeping what we have.
+        const maybe = walker.next(io) catch |e| {
+            try out.print("  ! directory walk stopped: {s}\n", .{@errorName(e)});
+            bad_files += 1;
+            regressions += 1;
+            break;
+        };
+        const ent = maybe orelse break;
         if (ent.kind != .file) continue;
         if (!std.mem.endsWith(u8, ent.basename, ".wast")) continue;
         files += 1;

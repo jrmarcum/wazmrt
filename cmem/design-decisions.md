@@ -183,6 +183,20 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   prevent, **invisible by construction**. The sweep runs under a 64 MB `Budget` allocator and asserts it
   was never exceeded *and* that live bytes return to 0. **Rule: if a target catches an error class, add an
   independent oracle for it**, or that class is untested no matter how many inputs run.
+- **Guard the property, not a proxy for it (2026-07-21).** `Op` values `0xd7..0xfa` are *internal tags*
+  for ops whose real encoding is `0xFB`/`0xFC` + a sub-opcode, so a **raw** byte in that range is not a
+  valid single-byte opcode. The original guard rejected by *immediate kind*, which is only a proxy: it
+  could never catch a tag whose kind is also reachable from a genuine single-byte op (`0xe3–0xe5` →
+  `.table`, `0xed`/`0xf0–0xf2` → `.none`), so it was silently partial for months. The check is now the
+  **byte range**, which is the property that actually holds. **Rule: when rejecting an encoding, test the
+  encoding.** (`0xd0–0xd6` are real ops and `0xfb–0xfd` are prefixes consumed earlier — both outside the
+  range, so the boundary is exact.)
+- **Offsets that only label diagnostics saturate, never `@intCast` (2026-07-21).** `Module.body_offset`
+  and `opcode`'s per-instruction offset list are `u32` fed from `usize`. A >4 GiB module made both casts
+  out-of-range — UB in ReleaseFast — and while the CLI's 64 MB read cap makes that unreachable there, the
+  **C ABI takes arbitrary embedder bytes**. They now clamp: these values only name a line in a trap
+  backtrace, so a wrong number is cosmetic where the cast was undefined. **Rule: a `usize → u32` narrowing
+  on module-derived data is either checked or saturating — never a bare `@intCast`.**
 - **`zig build test-safe` is the memory-safety gate (2026-07-20).** The suite under **ReleaseSafe** —
   optimizer on, safety checks kept — so out-of-range `@intCast`, OOB, and null-unwrap panic loudly instead
   of being silent UB in the shipped ReleaseFast/ReleaseSmall builds. **Run it alongside `zig build test`

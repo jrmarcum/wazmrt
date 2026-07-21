@@ -896,7 +896,7 @@ const FuncValidator = struct {
                 // natural alignment, and a linear memory must exist.
                 if (opcode.immediateKind(instr.op) == .mem) {
                     if (self.module.memories.len == 0) return error.MissingMemory;
-                    if (instr.imm.mem.alignment > naturalAlignLog2(instr.op)) return error.InvalidAlignment;
+                    if (instr.imm.mem.alignment > opcode.naturalAlignLog2(instr.op)) return error.InvalidAlignment;
                 }
                 const s = simpleSig(instr.op) orelse return error.UnsupportedOpcode;
                 try self.popVals(s.pop);
@@ -907,16 +907,6 @@ const FuncValidator = struct {
 };
 
 /// Natural alignment (log2 of the access size in bytes) for a load/store opcode.
-fn naturalAlignLog2(op: Op) u32 {
-    return switch (op) {
-        .i32_load8_s, .i32_load8_u, .i64_load8_s, .i64_load8_u, .i32_store8, .i64_store8 => 0,
-        .i32_load16_s, .i32_load16_u, .i64_load16_s, .i64_load16_u, .i32_store16, .i64_store16 => 1,
-        .i32_load, .f32_load, .i32_store, .f32_store, .i64_load32_s, .i64_load32_u, .i64_store32 => 2,
-        .i64_load, .f64_load, .i64_store, .f64_store => 3,
-        else => 0,
-    };
-}
-
 fn valTypesEqual(a: []const V, b: []const V) bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| if (x != y) return false;

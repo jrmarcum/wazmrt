@@ -197,15 +197,23 @@ test "fuzz: the seed corpus assembles, decodes and instantiates" {
     try std.testing.expectEqual(seed_wat.len, r.instantiated);
 }
 
-fn fuzzOne(_: void, smith: *std.testing.Smith) anyerror!void {
+// The binary and text targets are kept SEPARATE. They previously shared one
+// `std.testing.fuzz` call, which means one shared coverage corpus: an input that
+// is interesting to the binary decoder is noise to the text assembler and vice
+// versa, so the guided fuzzer spends roughly half its budget on inputs that
+// cannot improve coverage for the target it is feeding. Two targets, two
+// corpora.
+
+/// Binary target: use the fuzzer's bytes as the *corruption* applied over a
+/// valid seed module, so the coverage-guided engine steers real modules rather
+/// than random noise (which never decodes — see the file header).
+fn fuzzBinary(_: void, smith: *std.testing.Smith) anyerror!void {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const bins = try seedBinaries(a);
 
     var r: Reached = .{};
-    // Use the fuzzer's bytes as the corruption, applied over a seed, so the
-    // coverage-guided engine steers real modules rather than random noise.
     var buf: [4096]u8 = undefined;
     const n = smith.slice(&buf);
     const base = bins[n % bins.len];
@@ -216,8 +224,18 @@ fn fuzzOne(_: void, smith: *std.testing.Smith) anyerror!void {
         copy[8 + (i % (copy.len - 8))] ^= b;
     }
     tryDecodeAndInstantiate(std.testing.allocator, copy, &r);
+}
 
-    // Text side: splice the fuzzer's bytes into a seed's WAT source.
+/// Text target: splice the fuzzer's bytes into a valid seed's WAT source, so a
+/// top-level `(module …)` survives and the assembler is actually reached.
+fn fuzzText(_: void, smith: *std.testing.Smith) anyerror!void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var r: Reached = .{};
+    var buf: [4096]u8 = undefined;
+    const n = smith.slice(&buf);
     const src = seed_wat[n % seed_wat.len];
     const text = try a.alloc(u8, src.len + n);
     @memcpy(text[0..src.len], src);
@@ -225,8 +243,12 @@ fn fuzzOne(_: void, smith: *std.testing.Smith) anyerror!void {
     tryAssemble(std.testing.allocator, text, &r);
 }
 
-test "fuzz: malformed bytes never crash decode / instantiate / assemble" {
-    try std.testing.fuzz({}, fuzzOne, .{});
+test "fuzz: malformed bytes never crash decode / instantiate" {
+    try std.testing.fuzz({}, fuzzBinary, .{});
+}
+
+test "fuzz: malformed text never crashes the assembler" {
+    try std.testing.fuzz({}, fuzzText, .{});
 }
 
 test "fuzz: deterministic mutation sweep (runs every `zig build test`)" {

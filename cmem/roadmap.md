@@ -48,9 +48,15 @@ u64 offsets, the `host_funcs` OOM leak, `--verify` failing closed, `keygen` writ
 zero upstream never reached, and a **`Budget` allocator** making allocation amplification visible to the
 fuzzer. **209 distinct tests** (407 printed), green under Debug and ReleaseSafe. One reported finding —
 "accept-invalid element type" — turned out to be **wrong** and is recorded as such at the site.
-**Still open:** the fuzz targets share one `--fuzz` corpus; assorted logged LOWs
-(`skipConstExpr` GC immediates, duplicated `naturalAlign` helpers, `opcode.zig` tag leniency,
-`ValType.concreteRef` 28-bit index truncation, C-ABI trap-frame borrowed `*Instance`).
+**2026-07-21 — cleanup batch (owner sequenced the leftovers 9–13 → 1–3 → 4–6, deferring the Zig `Io` bug
+to upstream):** `opcode.zig` raw internal-tag bytes now rejected (the old guard tested a *proxy* — immediate
+kind — so it was silently partial), duplicated align helpers consolidated, trap-backtrace offsets saturate
+instead of `@intCast`, `conformance` survives an unreadable directory, and the fuzz targets no longer share
+a coverage corpus. **211 distinct tests** (411 printed).
+**Still open:** `validate.zig` `br_on_non_null` reject-valid + the SIMD/`memory.size` presence checks +
+`ValType.concreteRef` 28-bit truncation (next), then the hardening trio (`gatherIovecs`/`fd_read`/
+`poll_oneoff` u32 offsets, the C-ABI trap-frame borrowed `*Instance`, `Wasi.init` swallowing OOM).
+`skipConstExpr`'s GC-immediate gap stays latent until GC const-exprs land; **#8** waits on upstream Zig.
 *Standing lesson from this sequence: a run of clean passes means the current lens is exhausted, not that
 the code is clean — change the lens.*
 

@@ -1020,7 +1020,14 @@ fn decodeCodeSection(d: *Decoder, r: *Reader, payload_base: usize) Error![]const
         c.body = owned;
         // `entry` ends at r.pos, so it began at r.pos - entry.len; the body
         // starts er.pos into it (past the locals vector).
-        c.body_offset = @intCast(payload_base + (r.pos - entry.len) + er.pos);
+        // Saturate rather than `@intCast`: `body_offset` is a `u32` and this sum
+        // is a `usize`, so a >4 GiB module (impossible via the CLI's 64 MB read
+        // cap, but the C ABI takes arbitrary embedder bytes) made the cast
+        // out-of-range — illegal behaviour in the shipped ReleaseFast build.
+        // The offset is only ever used to label a trap backtrace, so a clamped
+        // value is a cosmetically wrong line number instead of UB.
+        c.body_offset = std.math.cast(u32, payload_base + (r.pos - entry.len) + er.pos) orelse
+            std.math.maxInt(u32);
     }
     return list;
 }

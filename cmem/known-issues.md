@@ -574,6 +574,42 @@ to **0** (a leak check independent of the testing allocator's). Both hold today.
 budget/live assertions folded into the existing sweep. `c-smoke` 319/319, `wasi-gate` + freestanding `wasm`
 green, steady-state ~240 Mops/s.
 
+### Cleanup batch (items 9–13 of the remaining list) — DONE 2026-07-21
+
+Owner sequenced the leftovers 9–13 → 1–3 → 4–6, deferring **#8** (the Zig 0.16 Windows `Io` bug) since
+only an upstream fix can close it. This is the first batch.
+
+- **`opcode.zig` raw internal-tag leniency — now REJECTED.** `0xd7..0xfa` are wazmrt's internal `Op` tags
+  for ops whose real wire form is `0xFB`/`0xFC` + a LEB sub-opcode, so a **raw** byte in that range is not
+  a valid single-byte opcode — yet it was accepted and executed as, e.g., `table.grow`. The pre-existing
+  guard rejected by *immediate kind*, which structurally could only catch tags whose kind is unreachable
+  from a genuine single-byte op; it could never catch `0xe3–0xe5` (`.table`) or `0xed`/`0xf0–0xf2`
+  (`.none`), whose kinds are legitimately reachable. Replaced with the property that actually holds — a
+  **byte-range check** (`0xd0–0xd6` are real ops; `0xfb–0xfd` are prefixes consumed earlier; both sit
+  outside the range). +1 test covering the previously-uncatchable tags, the range endpoints, and that the
+  real ops just below the boundary still decode. *Lesson: the earlier fix guarded a proxy for the property
+  (kind) instead of the property itself (encoding), so it was silently partial.*
+- **Duplicated align helpers consolidated.** `wat.zig naturalAlign` and `validate.zig naturalAlignLog2`
+  were byte-identical, and the `wat.zig` name was **wrong** — it returns a log2 exponent, not a byte count.
+  Now one `opcode.naturalAlignLog2` (both files already import `opcode`), which is also the right home:
+  the assembler defaults a missing `align=` from it and the validator rejects `align=` above it.
+- **`@intCast` of a byte offset → saturating.** `Module.body_offset` and `opcode`'s per-instruction offset
+  list are `u32` fed from `usize`; a >4 GiB module made both casts out-of-range — illegal behaviour in
+  ReleaseFast. Unreachable via the CLI (64 MB read cap) but the **C ABI takes arbitrary embedder bytes**.
+  Now `std.math.cast(...) orelse maxInt(u32)`: these offsets only label trap backtraces, so clamping is
+  cosmetic where the cast was UB.
+- **`tools/conformance.zig` no longer abandons a run on one bad directory.** `try walker.next(io)`
+  propagated, discarding every result gathered so far; per-*file* errors were already handled. Now counted
+  like a bad file, and the walk stops keeping what it has.
+- **The two fuzz targets are split.** They shared one `std.testing.fuzz` call and therefore one coverage
+  corpus — an input interesting to the binary decoder is noise to the text assembler, so roughly half the
+  guided budget was spent on inputs that could not improve the target being fed. Now `fuzzBinary` and
+  `fuzzText`, two corpora.
+
+**Verification:** `test`/`test-safe` **411 printed (407 pass, 4 skip) = 211 distinct** (200 core + 11
+C-ABI) — +2 this batch: the internal-tag rejection test and the split-out text fuzz target. `c-smoke`
+319/319, `wasi-gate` + freestanding `wasm` green, and the conformance baseline flow re-checked end to end.
+
 ## #23 — Zig 0.16 Windows `Io` filesystem gaps found in WASI 4.3 (2026-07-16)
 
 Two more std holes on Windows, same family as #18 (which is the first). Both hit during 4.3; recheck all

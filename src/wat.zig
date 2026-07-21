@@ -1796,7 +1796,7 @@ fn resolveLabel(ctx: *Ctx, s: Sexpr) Error!u32 {
 
 fn emitMemArg(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
     var offset: u64 = 0;
-    var align_log2: u32 = naturalAlign(op);
+    var align_log2: u32 = opcode.naturalAlignLog2(op);
     for (immediates) |imm| {
         const atom = imm.asAtom() orelse continue;
         if (std.mem.startsWith(u8, atom, "offset=")) {
@@ -1814,16 +1814,6 @@ fn emitMemArg(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
 }
 
 /// Natural alignment (log2 of the access size) for a load/store opcode.
-fn naturalAlign(op: Op) u32 {
-    return switch (op) {
-        .i32_load8_s, .i32_load8_u, .i64_load8_s, .i64_load8_u, .i32_store8, .i64_store8 => 0,
-        .i32_load16_s, .i32_load16_u, .i64_load16_s, .i64_load16_u, .i32_store16, .i64_store16 => 1,
-        .i32_load, .f32_load, .i32_store, .f32_store, .i64_load32_s, .i64_load32_u, .i64_store32 => 2,
-        .i64_load, .f64_load, .i64_store, .f64_store => 3,
-        else => 0,
-    };
-}
-
 fn imm0(immediates: []const Sexpr) Error!Sexpr {
     if (immediates.len == 0) return error.BadImmediate;
     return immediates[0];

@@ -483,11 +483,11 @@ are ±10% noisy.)
 
 ## Reading the test count (updated 2026-07-20, post 10th audit pass)
 
-`zig build test --summary all` prints **407 total (403 pass, 4 skip)**, but there are **209 distinct
-tests**: 198 in the core module (196 pass + 2 skip) + 11 C-ABI. The `cabi_tests` target's root is
+`zig build test --summary all` prints **411 total (407 pass, 4 skip)**, but there are **211 distinct
+tests**: 200 in the core module (198 pass + 2 skip) + 11 C-ABI. The `cabi_tests` target's root is
 `wasm_c_api.zig`, which imports `root.zig`, so it compiles and **re-runs the core module's tests too**
-(198 core + 11 C-ABI = 209), on top of the standalone `mod_tests` run (198) → 407 printed. Harmless —
-about a second — but **don't quote the printed number as a test count**; quote **196**, or the per-target
+(200 core + 11 C-ABI = 211), on top of the standalone `mod_tests` run (200) → 411 printed. Harmless —
+about a second — but **don't quote the printed number as a test count**; quote **198**, or the per-target
 numbers from `--summary all`.
 
 *(Was 389 printed / 200 distinct before `src/fuzz.zig` added 2 blocks and the 10th-pass memory/underflow/CSPRNG
