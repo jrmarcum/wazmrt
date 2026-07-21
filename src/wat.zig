@@ -173,6 +173,14 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     var func_names: List(?[]const u8) = .empty;
     var exports: List(ExportDef) = .empty;
     var datas: List(DataSeg) = .empty;
+    // Data-segment names (index-aligned with `datas`). Data was the only index
+    // space with no name table, so `memory.init $d` / `data.drop $d` were a hard
+    // `BadImmediate` while the sibling `elem.drop $e` / `table.init $e` resolved
+    // fine — an asymmetry with no reason behind it.
+    var data_names: List(?[]const u8) = .empty;
+    // Module-level `(export …)` forms, resolved after every field is parsed so a
+    // forward reference works (see the `export` arm).
+    var pending_exports: List([]const Sexpr) = .empty;
     var tables: List(TableDef) = .empty;
     var table_names: List(?[]const u8) = .empty;
     var elems: List(ElemDef) = .empty;
@@ -197,6 +205,14 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     var func_imports: List(ImportedFunc) = .empty;
     var mem_min: ?u32 = null;
     var mem_max: ?u32 = null;
+    // The memory's `$name`, if it declared one. Memories are the only index
+    // space with no name table (the assembler models a single memory), which
+    // made `(export "mem" (memory $m))` a hard `UnknownIdentifier` — even though
+    // index 0 is the only answer it could possibly have. Since `(memory $m 1)`
+    // is *accepted* at declaration, the pair looked supported and then failed,
+    // and binaryen emits exactly that pair. Recording the one name is enough to
+    // resolve it while still rejecting a name that was never declared.
+    var mem_name: ?[]const u8 = null;
     var start_ref: ?Sexpr = null;
 
     const start: usize = if (module.len > 1 and isId(module[1])) 2 else 1; // skip optional module $name
@@ -246,32 +262,15 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             }
             try func_names.append(a, f.name);
         } else if (std.mem.eql(u8, kw, "export")) {
-            // (export "name" (func|table|memory|global $id|N))
-            const name = (try strAt(items, 1));
-            const target = (try wantList(try nth(items, 2)));
-            const tkw = (try wantAtom(try nth(target, 0)));
-            const kind: u8 = if (std.mem.eql(u8, tkw, "func")) 0 else if (std.mem.eql(u8, tkw, "table")) 1 else if (std.mem.eql(u8, tkw, "memory")) 2 else if (std.mem.eql(u8, tkw, "global")) 3 else return error.BadModuleField;
-            const idx: u32 = switch (kind) {
-                0 => try resolveByName(func_names.items, try nth(target, 1)),
-                1 => try resolveByName(table_names.items, try nth(target, 1)),
-                // The assembler models a SINGLE memory, so 0 is the only valid
-                // index — but this used to return 0 without looking at the target
-                // at all, so `(export "m" (memory $doesnotexist))` and
-                // `(memory 7)` both silently exported memory 0. That is the
-                // canonical "unresolved `$name` became index 0" bug; the other
-                // three kinds all go through `resolveByName`, which reports
-                // `UnknownIdentifier`.
-                2 => blk: {
-                    const t = try nth(target, 1);
-                    const at = try wantAtom(t);
-                    if (at.len != 0 and at[0] == '$') return error.UnknownIdentifier;
-                    if (try parseIndex(t) != 0) return error.UnsupportedInstr; // multi-memory: not assembled
-                    break :blk 0;
-                },
-                3 => try resolveByName(global_names.items, try nth(target, 1)),
-                else => unreachable,
-            };
-            try exports.append(a, .{ .name = name, .kind = kind, .index = idx });
+            // (export "name" (func|table|memory|global|tag $id|N))
+            //
+            // Resolution is DEFERRED to after the field loop: a module-level
+            // export may name something declared later in the file, and binaryen
+            // emits exactly that order (all exports, then the funcs). Resolving
+            // in-pass reported `UnknownIdentifier` for a perfectly good module.
+            // Inline `(export …)` fields stay immediate — they can only refer to
+            // the item they sit inside.
+            try pending_exports.append(a, items);
         } else if (std.mem.eql(u8, kw, "global")) {
             try parseGlobal(a, items, &globals, &global_imports, &global_names, &exports, type_names.items);
         } else if (std.mem.eql(u8, kw, "tag")) {
@@ -285,6 +284,16 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             var type_ref: ?u32 = null;
             var params: List(V) = .empty;
             var results: List(V) = .empty;
+            // An inline `(export "…")` used to fall through to the `else break`,
+            // which terminated the loop — so the export was never emitted AND the
+            // `(param …)` that followed it was never read, leaving the tag with an
+            // empty `() -> ()` signature. Both losses were silent and the module
+            // still validated: 15 of 666 corpus files (binaryen/TS output) lost
+            // their `__exn_tag` export this way while reporting VALIDATE-OK.
+            //
+            // The tag's index is its position in the tag index space, which the
+            // `tag_names` length gives (imported tags are appended there too).
+            var tag_exports: List([]const u8) = .empty;
             while (j < items.len) : (j += 1) {
                 const tkw = items[j].keyword() orelse break;
                 if (std.mem.eql(u8, tkw, "type")) {
@@ -293,13 +302,21 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                     try parseDecls(a, (try wantList(items[j])), &params, null, type_names.items);
                 } else if (std.mem.eql(u8, tkw, "result")) {
                     try parseDecls(a, (try wantList(items[j])), &results, null, type_names.items);
+                } else if (std.mem.eql(u8, tkw, "export")) {
+                    try tag_exports.append(a, try fieldStr(items[j], 1));
                 } else break;
             }
+            const tag_index: u32 = @intCast(tag_names.items.len);
+            for (tag_exports.items) |en|
+                try exports.append(a, .{ .name = en, .kind = 4, .index = tag_index });
             try tag_types.append(a, type_ref orelse try internSig(a, &sigs, params.items, results.items));
             try tag_names.append(a, nm);
         } else if (std.mem.eql(u8, kw, "memory")) {
             var mi: usize = 1;
-            if (mi < items.len and isId(items[mi])) mi += 1; // optional $name
+            if (mi < items.len and isId(items[mi])) {
+                mem_name = items[mi].asAtom(); // so `(export … (memory $m))` resolves
+                mi += 1;
+            }
             while (mi < items.len and eqKw(items[mi], "export")) : (mi += 1)
                 try exports.append(a, .{ .name = try fieldStr(items[mi], 1), .kind = 2, .index = 0 });
             if (mi < items.len and eqKw(items[mi], "import")) {
@@ -323,6 +340,9 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 const off = try a.alloc(Sexpr, 2);
                 off[0] = .{ .atom = "i32.const" };
                 off[1] = .{ .atom = "0" };
+                // Keep `data_names` index-aligned with `datas`: this inline
+                // `(memory (data …))` form has no `$id` of its own.
+                try data_names.append(a, null);
                 try datas.append(a, .{ .mem_index = 0, .offset_form = .{ .list = off }, .bytes = bytes.items });
             } else {
                 // `mem_min`/`mem_max` are a SINGLE memory, so a second
@@ -340,7 +360,12 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             // offset is present, else passive. Only memory 0 is supported, so a
             // `(memory …)` prefix is parsed but folds to index 0.
             var di: usize = 1;
-            if (di < items.len and isId(items[di])) di += 1; // $id
+            var dname: ?[]const u8 = null;
+            if (di < items.len and isId(items[di])) {
+                dname = items[di].asAtom();
+                di += 1; // $id
+            }
+            try data_names.append(a, dname);
             if (di < items.len) if (items[di].asList()) |l| {
                 if (l.len >= 1 and eqAtom(l[0], "memory")) di += 1; // (memory idx) — single memory
             };
@@ -442,6 +467,46 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         }
     }
 
+    // Module-level exports, resolved now that every index space is complete.
+    // Doing this in-pass rejected forward references — and binaryen emits all
+    // the exports BEFORE the functions they name, so most real optimizer output
+    // hit it.
+    for (pending_exports.items) |items| {
+        const name = (try strAt(items, 1));
+        const target = (try wantList(try nth(items, 2)));
+        const tkw = (try wantAtom(try nth(target, 0)));
+        const kind: u8 = if (std.mem.eql(u8, tkw, "func")) 0 else if (std.mem.eql(u8, tkw, "table")) 1 else if (std.mem.eql(u8, tkw, "memory")) 2 else if (std.mem.eql(u8, tkw, "global")) 3 else if (std.mem.eql(u8, tkw, "tag")) 4 else return error.BadModuleField;
+        const idx: u32 = switch (kind) {
+            0 => try resolveByName(func_names.items, try nth(target, 1)),
+            1 => try resolveByName(table_names.items, try nth(target, 1)),
+            // The assembler models a SINGLE memory, so 0 is the only valid index
+            // — but this used to return 0 without looking at the target at all,
+            // so `(export "m" (memory $doesnotexist))` and `(memory 7)` both
+            // silently exported memory 0. That is the canonical "unresolved
+            // `$name` became index 0" bug; every other kind goes through
+            // `resolveByName`, which reports `UnknownIdentifier`.
+            2 => blk: {
+                const t = try nth(target, 1);
+                const at = try wantAtom(t);
+                if (at.len != 0 and at[0] == '$') {
+                    // Single memory, so the only resolvable name is the one the
+                    // `(memory $m …)` declared — but it must MATCH, or an
+                    // undeclared name would silently become index 0, which is the
+                    // bug this arm exists to prevent.
+                    const declared = mem_name orelse return error.UnknownIdentifier;
+                    if (!std.mem.eql(u8, declared, at)) return error.UnknownIdentifier;
+                    break :blk 0;
+                }
+                if (try parseIndex(t) != 0) return error.UnsupportedInstr; // multi-memory: not assembled
+                break :blk 0;
+            },
+            3 => try resolveByName(global_names.items, try nth(target, 1)),
+            4 => try resolveByName(tag_names.items, try nth(target, 1)),
+            else => unreachable,
+        };
+        try exports.append(a, .{ .name = name, .kind = kind, .index = idx });
+    }
+
     // Function type indices (`(type $t)` reference, else intern the inline sig),
     // then pre-encode bodies (which may intern block-type sigs / resolve
     // call_indirect type refs), so the type section is complete before emit.
@@ -471,7 +536,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     }
 
     var bodies: List([]const u8) = .empty;
-    for (funcs.items) |f| try bodies.append(a, try encodeBody(a, f, func_names.items, &sigs, type_names.items, global_names.items, table_names.items, elem_names.items, tag_names.items));
+    for (funcs.items) |f| try bodies.append(a, try encodeBody(a, f, func_names.items, &sigs, type_names.items, global_names.items, table_names.items, elem_names.items, tag_names.items, data_names.items, mem_name));
 
     // Pre-encode every const-expr-bearing section (global inits, element and data
     // exprs/offsets) BEFORE the type section, mirroring the function-body path, so
@@ -1227,12 +1292,18 @@ const Ctx = struct {
     /// Exception-tag names (index-aligned with the tag index space), for
     /// resolving `$e` in `throw $e` and `(catch $e …)` (EH proposal, Phase 6).
     tag_names: []const ?[]const u8 = &.{},
+    /// Data-segment names (index-aligned with the data index space), for
+    /// resolving `$d` in `memory.init` / `data.drop`.
+    data_names: []const ?[]const u8 = &.{},
+    /// The single memory's `$name`, if declared — the memory index space has no
+    /// name table because there is only ever one entry in it.
+    mem_name: ?[]const u8 = null,
     /// Control-flow label stack (innermost last), for resolving `br $name` to a
     /// relative depth.
     labels: List(?[]const u8) = .empty,
 };
 
-fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, table_names: []const ?[]const u8, elem_names: []const ?[]const u8, tag_names: []const ?[]const u8) Error![]const u8 {
+fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, table_names: []const ?[]const u8, elem_names: []const ?[]const u8, tag_names: []const ?[]const u8, data_names: []const ?[]const u8, mem_name: ?[]const u8) Error![]const u8 {
     var body: List(u8) = .empty;
     // Locals vector: one (count=1, type) group per declared local.
     try uleb(a, &body, f.locals.items.len);
@@ -1240,7 +1311,7 @@ fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, si
         try uleb(a, &body, 1);
         try emitValType(a, &body, t);
     }
-    var ctx: Ctx = .{ .a = a, .out = &body, .local_names = f.local_names.items, .func_names = func_names, .sigs = sigs, .type_names = type_names, .global_names = global_names, .table_names = table_names, .elem_names = elem_names, .tag_names = tag_names };
+    var ctx: Ctx = .{ .a = a, .out = &body, .local_names = f.local_names.items, .func_names = func_names, .sigs = sigs, .type_names = type_names, .global_names = global_names, .table_names = table_names, .elem_names = elem_names, .tag_names = tag_names, .data_names = data_names, .mem_name = mem_name };
     try emitSeq(&ctx, f.body);
     try body.append(a, @intFromEnum(Op.end)); // implicit function end
     return body.items;
@@ -1514,7 +1585,14 @@ fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Erro
             try ctx.out.append(ctx.a, @intFromEnum(Op.br_table));
             var j = i + 1;
             var labels: List(Sexpr) = .empty;
-            while (j < items.len and items[j].asAtom() != null) : (j += 1) {
+            // `asAtom() != null` swallowed the FOLLOWING INSTRUCTIONS as labels
+            // (`end`, `i32.const`, `return` … are all atoms), so `resolveLabel`
+            // then failed and flat `br_table` could never assemble — despite the
+            // module header claiming flat `br*` support, and despite this being
+            // `wasm2wat`'s default output shape. `isIndexAtom` is the right
+            // predicate and the sibling `.table_init`/`.elem_drop`/`.table_copy`
+            // arm already uses it.
+            while (j < items.len and isIndexAtom(items[j])) : (j += 1) {
                 try labels.append(ctx.a, items[j]);
             }
             try emitBrTable(ctx, labels.items);
@@ -1803,11 +1881,33 @@ fn emitInstr(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
         .mem => try emitMemArg(ctx, op, immediates),
         .mem_reserved => try ctx.out.append(ctx.a, 0x00),
         // `memory.size`/`memory.grow`: a single memory index, 0 in single-memory.
-        .mem_index => try ctx.out.append(ctx.a, 0x00),
+        // The operand used to be emitted as 0 WITHOUT BEING LOOKED AT, so
+        // `(memory.size 7)`, `(memory.fill 7 …)` and even `(memory.size $nope)`
+        // all assembled, validated and ran against memory 0. Every other index
+        // space reports `UnknownIdentifier` for an unknown `$name`; this was the
+        // sole silent acceptor, and a live trap for the multi-memory text support
+        // the header defers. Check it now, and fail loudly when it isn't 0.
+        .mem_index => {
+            if (immediates.len != 0) {
+                const t = immediates[0];
+                if (t.asAtom()) |at| {
+                    if (at.len != 0 and at[0] == '$') {
+                        const declared = ctx.mem_name orelse return error.UnknownIdentifier;
+                        if (!std.mem.eql(u8, declared, at)) return error.UnknownIdentifier;
+                    } else if (try parseIndex(t) != 0) {
+                        return error.UnsupportedInstr; // multi-memory: not assembled
+                    }
+                }
+            }
+            try ctx.out.append(ctx.a, 0x00);
+        },
         // Bulk memory: a data index (+ reserved memory index bytes, always 0).
-        .data => try uleb(ctx.a, ctx.out, try parseIndex(try imm0(immediates))),
+        // `resolveByName`, not `parseIndex`: data was the only index space whose
+        // operand was numeric-only, so `data.drop $d` / `memory.init $d` failed
+        // with `BadImmediate` while `elem.drop $e` / `table.init $e` resolved.
+        .data => try uleb(ctx.a, ctx.out, try resolveByName(ctx.data_names, try imm0(immediates))),
         .data_init => {
-            try uleb(ctx.a, ctx.out, try parseIndex(try imm0(immediates)));
+            try uleb(ctx.a, ctx.out, try resolveByName(ctx.data_names, try imm0(immediates)));
             try ctx.out.append(ctx.a, 0x00); // reserved memory index
         },
         .mem_copy => try ctx.out.appendSlice(ctx.a, &.{ 0x00, 0x00 }), // reserved dst, src
@@ -3715,4 +3815,90 @@ test "EH wat: catch labels resolve by name to an enclosing block" {
     ;
     // The throw carries i32 9 to $out; the trailing i32.const 0 is skipped.
     try std.testing.expectEqual(@as(i32, 9), interp.asI32(try assembleAndRun(src, "f", &.{})));
+}
+
+
+
+test "assembler index-space gaps closed (13th pass)" {
+    // Six independent gaps, grouped because they are all "an index space the
+    // assembler could not name". Each made real toolchain output either fail to
+    // assemble or — worse — assemble into something not matching its source.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // (1) An inline `(export …)` on a tag used to terminate the field loop, so
+    // the export vanished AND the `(param …)` after it was never read, leaving an
+    // empty `() -> ()` signature — silently, in a module that still validated.
+    // 7 - 11 = -4 proves both params survived; the export is checked directly.
+    {
+        const src =
+            \\(module (tag $t (export "e") (param i32 i32))
+            \\  (func (export "f") (result i32)
+            \\    (block $h (result i32 i32)
+            \\      (try_table (result i32) (catch $t $h)
+            \\        (i32.const 7) (i32.const 11) (throw $t)
+            \\        (return (i32.const -1))))
+            \\    (i32.sub)))
+        ;
+        const bin = try assemble(a, src);
+        const m = try Module.decode(a, bin);
+        var found = false;
+        for (m.exports) |e| {
+            if (std.mem.eql(u8, e.name, "e")) found = true;
+        }
+        try std.testing.expect(found);
+        try std.testing.expectEqual(@as(i32, -4), interp.asI32(try assembleAndRun(src, "f", &.{})));
+    }
+
+    // (2) Module-level exports resolve AFTER all fields, so a forward reference
+    // works. binaryen emits every export before the funcs they name, which made
+    // this the largest single blocker in the real-world corpus.
+    try std.testing.expectEqual(@as(i32, 42), interp.asI32(try assembleAndRun(
+        "(module (export \"f\" (func $later)) (func $later (result i32) (i32.const 42)))",
+        "f",
+        &.{},
+    )));
+
+    // (3) `(export "memory" (memory $m))` — memories have no name table (there is
+    // only ever one), so this was a hard UnknownIdentifier even though 0 is the
+    // only possible answer. An UNDECLARED name must still be rejected, or the
+    // "unresolved $name silently became 0" bug comes back.
+    _ = try assemble(a, "(module (memory $m 1) (export \"memory\" (memory $m)))");
+    try std.testing.expectError(error.UnknownIdentifier, assemble(a, "(module (memory $m 1) (export \"memory\" (memory $nope)))"));
+
+    // (4) Flat (non-folded) `br_table`: the label scan accepted ANY atom, so it
+    // swallowed the following instructions (`end`, `i32.const`, `return`) as
+    // labels and then failed to resolve them. This is wasm2wat's default shape.
+    // targets = [2, 0], default = 1.
+    {
+        const src =
+            \\(module (func (export "f") (param i32) (result i32)
+            \\  block block block local.get 0 br_table 2 0 1 end i32.const 10 return end
+            \\  i32.const 20 return end i32.const 30))
+        ;
+        try std.testing.expectEqual(@as(i32, 30), interp.asI32(try assembleAndRun(src, "f", &.{0})));
+        try std.testing.expectEqual(@as(i32, 10), interp.asI32(try assembleAndRun(src, "f", &.{1})));
+        try std.testing.expectEqual(@as(i32, 20), interp.asI32(try assembleAndRun(src, "f", &.{2})));
+    }
+
+    // (5) Data segments had no name table, so `memory.init $d` / `data.drop $d`
+    // were BadImmediate while the sibling elem forms resolved fine.
+    {
+        const src =
+            \\(module (memory 1) (data $d "hello")
+            \\  (func (export "f") (result i32)
+            \\    (memory.init $d (i32.const 0) (i32.const 0) (i32.const 5))
+            \\    (data.drop $d)
+            \\    (i32.load8_u (i32.const 0))))
+        ;
+        try std.testing.expectEqual(@as(i32, 'h'), interp.asI32(try assembleAndRun(src, "f", &.{})));
+    }
+
+    // (6) The memory-index immediate was emitted as 0 WITHOUT being read, so
+    // `(memory.size 7)` and even `(memory.size $nope)` assembled and ran against
+    // memory 0 — the sole silent acceptor among the index spaces.
+    _ = try assemble(a, "(module (memory $m 1) (func (result i32) (memory.size $m)))");
+    try std.testing.expectError(error.UnknownIdentifier, assemble(a, "(module (memory $m 1) (func (result i32) (memory.size $nope)))"));
+    try std.testing.expectError(error.UnsupportedInstr, assemble(a, "(module (memory $m 1) (func (result i32) (memory.size 7)))"));
 }
