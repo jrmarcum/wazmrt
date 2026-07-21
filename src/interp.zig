@@ -393,6 +393,12 @@ pub const Instance = struct {
     /// each `invokeIndex`, so it always describes the most recent failed call.
     /// Read it with `trapFrames()`.
     trap_frames: [max_trap_frames]TrapFrame = undefined,
+    /// How deep we already are in nested `invokeIndex` calls on THIS instance.
+    /// A host callback may call back in (`wasm_func_call` from inside a host
+    /// function), and each entry used to restart the depth budget at 0 — so the
+    /// guest could grow the native stack without limit. Carried into
+    /// `callFunction` so re-entries share one budget.
+    reentry_depth: usize = 0,
     trap_len: usize = 0,
     /// True call depth at the trap; exceeds `trap_len` when the stack was deeper
     /// than `max_trap_frames`, so a truncated backtrace can say it was truncated.
@@ -866,17 +872,41 @@ pub const Instance = struct {
         const ft = self.module.funcType(func_index) orelse return error.UndefinedFunc;
         if (args.len != typeSlots(ft.params)) return error.BadArgCount;
 
-        // Any trace left over describes an older call, not this one.
+        // SAVE/RESTORE, not clear. A host callback may re-enter this instance
+        // (`wasm_func_call` from inside a host function is a documented
+        // wasm-c-api pattern), and unconditionally zeroing this state destroyed
+        // what the SUSPENDED outer invocation still owned: its live exnrefs
+        // silently re-bound to the inner invocation's exceptions — a wrong
+        // answer, no trap — or vanished, giving `NullReference`.
+        //
+        // Restoring on exit means a nested invoke appends and then truncates
+        // back, so the outer invocation sees exactly the state it left.
+        const saved_pending = self.pending_exn;
+        const saved_exn_len = self.exn_store.items.len;
+        const saved_depth = self.reentry_depth;
+        defer {
+            self.pending_exn = saved_pending;
+            self.exn_store.shrinkRetainingCapacity(saved_exn_len);
+            self.reentry_depth = saved_depth;
+        }
+        // The TRAP TRACE is deliberately NOT save/restored: it must outlive the
+        // invocation so the caller can read `trapFrames()` after a trap (that is
+        // the whole point of #19's backtrace, and a test pins it). Reset it at
+        // entry as before — a trace left over describes an older call.
         self.trap_len = 0;
         self.trap_depth = 0;
-        // Exceptions never outlive the invocation that raised them (their payload
-        // is invocation-arena memory); start each call with a clean store.
         self.pending_exn = null;
-        self.exn_store.clearRetainingCapacity();
 
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
-        const results = try self.callFunction(scratch.allocator(), func_index, args, 0);
+        // The call-depth budget must be shared across re-entries: each nested
+        // invoke used to start at 0, so `max_call_depth` never fired while the
+        // NATIVE stack kept growing — a guest whose host callback calls back in
+        // once per invocation overflowed the host stack (observed at ~600
+        // re-entries, exit code 5). Carry the depth in.
+        self.reentry_depth = saved_depth + 1;
+        if (self.reentry_depth > max_call_depth) return error.CallStackExhausted;
+        const results = try self.callFunction(scratch.allocator(), func_index, args, self.reentry_depth);
 
         const owned = try self.gpa.alloc(Value, results.len);
         @memcpy(owned, results);

@@ -1238,6 +1238,8 @@ export fn wasm_instance_new(store: ?*Store, module: ?*const Module, imports: ?*c
             if (trap_out) |t| t.* = makeTrap(@errorName(e));
             return null;
         },
+        // NOTE: the start function is run just below, after this literal — see
+        // the `runStart` call. §4.5.5 makes it part of instantiation.
         .host_funcs = funcs,
         .import_refs = import_refs,
         .module = @constCast(m),
@@ -1250,6 +1252,17 @@ export fn wasm_instance_new(store: ?*Store, module: ?*const Module, imports: ?*c
     // The instance now points into `m.inner` for its whole life; hold a handle
     // so the embedder deleting the module doesn't free it out from under us.
     retain(&wi.module.hdr);
+
+    // §4.5.5: the start function runs as PART OF INSTANTIATION. This was never
+    // called here — `runStart` appeared only in `main.zig` and `wast.zig` — so
+    // module-level initialization was silently skipped for every C-ABI embedder
+    // (a `(start $s)` setting a global left it at 0), and a *trapping* start
+    // reported success even though `trap_out` exists precisely to report it.
+    wi.inst.runStart() catch |e| {
+        if (trap_out) |t| t.* = makeTrapFrom(@errorName(e), wi);
+        wasm_instance_delete(wi);
+        return null;
+    };
     return wi;
 }
 

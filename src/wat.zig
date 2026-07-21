@@ -115,7 +115,17 @@ const ExportDef = struct { name: []const u8, kind: u8, index: u32 };
 /// `(global.get …)`.
 const DataSeg = struct { mem_index: u32, offset_form: ?Sexpr, bytes: []const u8 };
 /// A function type (for the type section): params → results.
-const Sig = struct { params: []const V, results: []const V };
+const Sig = struct {
+    params: []const V,
+    results: []const V,
+    /// True for the slot a struct/array type definition occupies. `sigs` is
+    /// index-aligned with the type section, so GC definitions reserve a slot with
+    /// an empty placeholder signature — and `internSig` would otherwise hand an
+    /// implicit `() -> ()` FUNCTION signature the STRUCT's index, making the
+    /// function section point at a non-func type (`BadType` at decode). It only
+    /// worked when a real `(func)` type happened to be declared first.
+    gc_placeholder: bool = false,
+};
 
 /// A GC struct field / array element (assembler side): storage type + mutability.
 const GcStorage = union(enum) { val: V, i8, i16 };
@@ -769,7 +779,7 @@ fn parseTypeBody(a: std.mem.Allocator, items: []const Sexpr, type_names: []const
                 return error.BadModuleField;
             try parseFieldGroup(a, (try wantList(part)), &fields, type_names);
         }
-        try sigs.append(a, .{ .params = &.{}, .results = &.{} }); // placeholder
+        try sigs.append(a, .{ .params = &.{}, .results = &.{}, .gc_placeholder = true });
         try gc_types.append(a, .{ .@"struct" = fields.items });
     } else if (std.mem.eql(u8, kw, "array")) {
         if (body.len < 2) return error.BadModuleField;
@@ -782,7 +792,7 @@ fn parseTypeBody(a: std.mem.Allocator, items: []const Sexpr, type_names: []const
             if (fields.items.len != 1) return error.BadModuleField;
             break :blk fields.items[0];
         } else try parseFieldElem(body[1], type_names);
-        try sigs.append(a, .{ .params = &.{}, .results = &.{} }); // placeholder
+        try sigs.append(a, .{ .params = &.{}, .results = &.{}, .gc_placeholder = true });
         try gc_types.append(a, .{ .array = elem });
     } else return error.BadModuleField;
 }
@@ -2171,6 +2181,7 @@ fn floatLitBits(comptime U: type, comptime F: type, lit: []const u8) ?U {
 
 fn internSig(a: std.mem.Allocator, sigs: *List(Sig), params: []const V, results: []const V) Error!u32 {
     for (sigs.items, 0..) |sig, i| {
+        if (sig.gc_placeholder) continue; // a struct/array slot is not a func type
         if (std.mem.eql(V, sig.params, params) and std.mem.eql(V, sig.results, results)) return @intCast(i);
     }
     try sigs.append(a, .{ .params = params, .results = results });
