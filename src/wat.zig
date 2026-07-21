@@ -961,7 +961,8 @@ fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef
 /// True if the form is a reference type: `funcref` / `externref` / `(ref …)`.
 fn isRefType(s: Sexpr) bool {
     if (s.asList()) |l| return l.len >= 1 and eqAtom(l[0], "ref");
-    return eqAtom(s, "funcref") or eqAtom(s, "externref");
+    // `anyfunc` is the pre-standard spelling of `funcref`.
+    return eqAtom(s, "funcref") or eqAtom(s, "externref") or eqAtom(s, "anyfunc");
 }
 
 /// `(elem $id? mode? tableuse? offset? kind item*)` — active / passive /
@@ -1255,6 +1256,9 @@ fn stringToValType(atom: []const u8) ?V {
         .{ "i32", V.i32 },             .{ "i64", V.i64 },             .{ "f32", V.f32 },
         .{ "f64", V.f64 },             .{ "v128", V.v128 },
         .{ "funcref", V.funcref },     .{ "nullfuncref", V.funcref },
+        // `anyfunc` is the pre-standard spelling of `funcref` (MVP-era tools and
+        // hand-written .wat still emit it, e.g. `(table N anyfunc)`).
+        .{ "anyfunc", V.funcref },
         .{ "externref", V.externref }, .{ "nullexternref", V.externref },
         // The WasmGC `any` hierarchy — each shorthand its own value type.
         .{ "anyref", V.anyref },       .{ "eqref", V.eqref },
@@ -3268,6 +3272,19 @@ test "dispatches call_indirect through distinct named tables" {
     ;
     try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(src, "via0", &.{})));
     try std.testing.expectEqual(@as(i32, 2), interp.asI32(try assembleAndRun(src, "via1", &.{})));
+}
+
+test "anyfunc is accepted as the pre-standard spelling of funcref" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // `(table N anyfunc)` (MVP-era tools still emit it) must assemble, validate,
+    // and produce a byte-identical module to the `funcref` spelling.
+    const with_anyfunc = try assemble(a, "(module (table 4 anyfunc) (func $f) (elem (i32.const 0) $f))");
+    const with_funcref = try assemble(a, "(module (table 4 funcref) (func $f) (elem (i32.const 0) $f))");
+    try std.testing.expectEqualSlices(u8, with_funcref, with_anyfunc);
+    var m = try Module.decode(a, with_anyfunc);
+    try validate(a, &m);
 }
 
 test "assembles reference types (ref.null / ref.func / ref.is_null)" {
