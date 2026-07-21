@@ -143,6 +143,25 @@ pub const ValType = enum(u32) {
         };
     }
 
+    /// The NON-nullable form of a reference type (nullable → non-null; others
+    /// as-is). The inverse of `nullable`, needed by `ref.as_non_null` and
+    /// `br_on_null`, whose whole purpose is to remove nullability.
+    pub fn nonNull(self: ValType) ValType {
+        if (self.isConcrete()) return @enumFromInt(@intFromEnum(self) & ~nullable_bit);
+        return switch (self) {
+            .funcref => .funcref_nn,
+            .externref => .externref_nn,
+            .anyref => .anyref_nn,
+            .eqref => .eqref_nn,
+            .i31ref => .i31ref_nn,
+            .structref => .structref_nn,
+            .arrayref => .arrayref_nn,
+            .exnref => .exnref_nn,
+            .nullref => .nullref_nn,
+            else => self,
+        };
+    }
+
     /// The nullable form of a reference type (non-null → nullable; others as-is).
     pub fn nullable(self: ValType) ValType {
         if (self.isConcrete()) return @enumFromInt(@intFromEnum(self) | nullable_bit);

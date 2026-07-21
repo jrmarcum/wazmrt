@@ -74,6 +74,8 @@ pub const Error = Module.Error || error{
     UndefinedTag,
     /// A tag whose type produces results (tags must have empty results).
     InvalidTag,
+    /// Two exports share a name (§3.4.10 requires them pairwise distinct).
+    DuplicateExport,
     UndefinedTable,
     UndefinedElem,
     /// A `memory.init`/`data.drop` data-segment index out of range.
@@ -137,6 +139,23 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
         if (!seg.active) continue;
         if (seg.mem_index >= module.memories.len) return error.MissingMemory;
         try validateConstExpr(module, seg.offset_expr, .i32, all_globals);
+    }
+
+    // Tag types (§3.2, EH): a tag's type must be `[t1*] → []`. `throw` checked
+    // this at its use site but the TAG SECTION ITSELF was never walked, so a
+    // module declaring `(tag (type $ft))` with a result-producing `$ft`
+    // validated — and could be exported or imported.
+    for (module.tags) |ti| {
+        const ft = module.funcSig(ti) orelse return error.UndefinedType;
+        if (ft.results.len != 0) return error.InvalidTag;
+    }
+
+    // Export names must be pairwise distinct (§3.4.10). Linear scan: export
+    // counts are small, and this avoids an allocation on the validate path.
+    for (module.exports, 0..) |e, i| {
+        for (module.exports[i + 1 ..]) |o| {
+            if (std.mem.eql(u8, e.name, o.name)) return error.DuplicateExport;
+        }
     }
 
     // Start function (§3.5.5): must be a defined/imported function of type [] → [].
@@ -585,7 +604,10 @@ const FuncValidator = struct {
             .call_indirect => {
                 const ci = instr.imm.call_indirect;
                 if (ci.table >= self.module.tables.len) return error.UndefinedTable;
-                if (self.module.tables[ci.table].element != .funcref) return error.TypeMismatch;
+                // Spec §3.3.8: the table.s reftype must MATCH `(ref null func)`, not
+                // equal `funcref` exactly — a `(table 1 (ref null $ft))` or
+                // `(table 1 (ref func))` is valid and was rejected.
+                if (!subtypeOf(self.module, self.module.tables[ci.table].element, .funcref)) return error.TypeMismatch;
                 const ft = self.module.funcSig(ci.type_index) orelse return error.UndefinedType;
                 _ = try self.popExpect(.i32);
                 try self.popVals(ft.params);
@@ -900,7 +922,14 @@ const FuncValidator = struct {
                 try self.pushValT(if (instr.op == .br_on_cast) src_vt else dst_vt);
             },
 
-            .ref_as_non_null => try self.pushVal(try self.popRef()),
+            // Spec: `[(ref null ht)] -> [(ref ht)]` — the op EXISTS to remove
+            // nullability, but this pushed the operand back unchanged, so
+            // `(func (param funcref) (result (ref func)) (ref.as_non_null …))` —
+            // the canonical null-check idiom — was rejected TypeMismatch.
+            .ref_as_non_null => switch (try self.popRef()) {
+                .val => |v| try self.pushValT(v.nonNull()),
+                .unknown => try self.pushVal(.unknown),
+            },
             .br_on_null => {
                 // Pop the ref; on branch pass [t*] to the label, on fall-through
                 // keep the (now non-null) ref.
@@ -908,7 +937,14 @@ const FuncValidator = struct {
                 const lt = try self.labelTypesAt(instr.imm.label);
                 try self.popVals(lt);
                 try self.pushVals(lt);
-                try self.pushVal(r);
+                // Fall-through means the ref was NOT null, so it narrows to the
+                // non-nullable form (`br_on_null l : [t* (ref null ht)] -> [t* (ref ht)]`).
+                // Re-pushing it unchanged rejected the canonical
+                // `(call $use (br_on_null $b (local.get 0)))` idiom.
+                switch (r) {
+                    .val => |v| try self.pushValT(v.nonNull()),
+                    .unknown => try self.pushVal(.unknown),
+                }
             },
             .br_on_non_null => {
                 // Spec (function-references):
