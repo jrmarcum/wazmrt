@@ -411,7 +411,7 @@ fn appendPinLines(arena: std.mem.Allocator, io: Io, path: []const u8, entries: [
 /// to embed as the verifier's trust anchor. The private key file must be kept
 /// secret (a production signer would hold it in an HSM/YubiKey/KMS instead).
 fn keygenSubcommand(arena: std.mem.Allocator, io: Io, out: *Io.Writer, rest: []const []const u8) !void {
-    const name = flagValue(rest, "--out") orelse "wazmrt_root";
+    const name = subcommandFlagValue(rest, "--out") orelse "wazmrt_root";
     const kp = wazmrt.sign.Ed25519.KeyPair.generate(io); // entropy from the Io
     const seed_hex = wazmrt.pin.toHex(kp.secret_key.seed());
     const pub_hex = wazmrt.pin.toHex(kp.public_key.bytes);
@@ -444,7 +444,7 @@ fn keygenSubcommand(arena: std.mem.Allocator, io: Io, out: *Io.Writer, rest: []c
 /// custom section). The signed module still runs in any runtime; wazmrt (with a
 /// matching embedded root key) authenticates it before executing.
 fn signSubcommand(arena: std.mem.Allocator, io: Io, out: *Io.Writer, rest: []const []const u8) !void {
-    const keyfile = flagValue(rest, "--key");
+    const keyfile = subcommandFlagValue(rest, "--key");
     var pos: [2][]const u8 = undefined;
     var n: usize = 0;
     var i: usize = 0;
@@ -560,6 +560,25 @@ fn flagValue(rest: []const []const u8, name: []const u8) ?[]const u8 {
     var i: usize = 0;
     while (i + 1 < region.len) : (i += 1)
         if (std.mem.eql(u8, region[i], name)) return region[i + 1];
+    return null;
+}
+
+/// `flagValue` for a SUBCOMMAND's own flags (`keygen --out`, `sign --key`),
+/// which searches all of `rest`.
+///
+/// It cannot go through `flagRegion`: that scan stops at the first argument
+/// which is not a *run-mode* flag, deliberately, so a guest's argv can never
+/// smuggle in `--no-verify`. `--out`/`--key` are in neither of its lists, so the
+/// region was always empty and both flags were silently ignored — `keygen --out
+/// mykey` wrote `wazmrt_root.key`, and `sign` could not be invoked at all in any
+/// argument order because its required `--key` never resolved.
+///
+/// Safe here precisely because these subcommands take no guest argv: everything
+/// after the subcommand name belongs to us.
+fn subcommandFlagValue(rest: []const []const u8, name: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i + 1 < rest.len) : (i += 1)
+        if (std.mem.eql(u8, rest[i], name)) return rest[i + 1];
     return null;
 }
 
@@ -938,8 +957,26 @@ fn runFunction(
         return exit_failure;
     };
 
-    for (results, ft.results, 0..) |res, rt, i| {
+    // `results` is a SLOT array and a v128 occupies two slots, so it cannot be
+    // walked in lockstep with `ft.results`. The old multi-object `for` did
+    // exactly that: with any v128 result the two lengths differ, which is
+    // *illegal behaviour* in Zig — it panicked in Debug/ReleaseSafe, and in the
+    // shipped ReleaseFast build it printed the raw slots and exited 0, silently
+    // dropping the other results (and reading past `ft.results` for a lone
+    // v128).
+    var si: usize = 0;
+    for (ft.results, 0..) |rt, i| {
         if (i != 0) try out.print(" ", .{});
+        const w = interp.slotWidth(rt);
+        if (si + w > results.len) break; // defensive: arity already agreed above
+        if (rt == .v128) {
+            // Low half first on the stack; print as one 128-bit hex value.
+            try out.print("0x{x:0>16}{x:0>16}", .{ results[si + 1], results[si] });
+            si += 2;
+            continue;
+        }
+        const res = results[si];
+        si += 1;
         switch (rt) {
             .i32 => try out.print("{d}", .{interp.asI32(res)}),
             .i64 => try out.print("{d}", .{interp.asI64(res)}),

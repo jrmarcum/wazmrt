@@ -1110,6 +1110,18 @@ fn hostTrampoline(ctx: *anyopaque, args: []const interp.Value, results: []interp
     const hc = ref.host orelse return false;
     const ft = ref.functype orelse return false;
 
+    // `args`/`results` are SLOT arrays; `ft.params`/`ft.results` are indexed by
+    // value. The loops below pair them position-by-position, which is sound only
+    // while every type occupies one slot. A `wasm_valtype_t` cannot even express
+    // v128 (`wasm.h` has no such valkind), so if the import this callback backs
+    // uses one, the slot count exceeds the declared arity and the two walks drift
+    // apart — silently feeding the callback the wrong values.
+    //
+    // `wasm_instance_new` never checks the supplied host functype against the
+    // import it backs, so this is the only place that disagreement can be caught.
+    // Refuse (→ `error.HostTrap`) rather than invent arguments.
+    if (args.len != ft.params.size or results.len != ft.results.size) return false;
+
     var argvec: ValVec = undefined;
     wasm_val_vec_new_uninitialized(&argvec, args.len);
     defer wasm_val_vec_delete(&argvec);
@@ -1444,6 +1456,15 @@ export fn wasm_func_call(func: ?*const Ref, args: ?*const ValVec, results: ?*Val
     const wi = r.instance.?;
     const ft = wi.inst.module.funcType(r.index) orelse return makeTrap("undefined function");
 
+    // `wasm.h` has no v128 valkind (the enum stops at WASM_EXTERNREF = 128), so a
+    // v128 simply cannot be carried in a `wasm_val_t`. Returning one anyway meant
+    // handing the embedder a WASM_ANYREF whose `.of.ref` was the vector's low half
+    // punned as a pointer — a wild free waiting for `wasm_ref_delete`. Refuse
+    // instead: an explicit trap is a far better answer than a plausible-looking
+    // corrupt one.
+    for (ft.params) |p| if (p == .v128) return makeTrap("v128 parameter is not representable in wasm_val_t");
+    for (ft.results) |t| if (t == .v128) return makeTrap("v128 result is not representable in wasm_val_t");
+
     // A `size > 0` vec with a null `data` is malformed; treat it as empty rather
     // than dereferencing null (matches `vecSlice`'s guard elsewhere in this file).
     const n = if (args) |a| (if (a.data == null) 0 else a.size) else 0;
@@ -1456,9 +1477,20 @@ export fn wasm_func_call(func: ?*const Ref, args: ?*const ValVec, results: ?*Val
     const res = wi.inst.invokeIndex(r.index, argv) catch |e| return makeTrapFrom(@errorName(e), wi);
     defer alloc.free(res);
 
+    // `res` is a SLOT array — a v128 is two slots — while `out.data` is indexed
+    // by RESULT. Indexing both with `i` silently paired the wrong slot with the
+    // wrong type from the first v128 onwards: `(result i32 v128 i32)` handed back
+    // 3 for the third result instead of 22.
     if (results) |out| if (out.data != null) {
-        const m = @min(out.size, @min(res.len, ft.results.len));
-        for (0..m) |i| out.data[i] = slotToVal(ft.results[i], res[i]);
+        var si: usize = 0;
+        var vi: usize = 0;
+        while (vi < ft.results.len and vi < out.size) : (vi += 1) {
+            const rt = ft.results[vi];
+            const w = interp.slotWidth(rt);
+            if (si + w > res.len) break;
+            out.data[vi] = slotToVal(rt, res[si]);
+            si += w;
+        }
     };
     return null; // success
 }

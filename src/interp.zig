@@ -109,6 +109,20 @@ pub const default_max_memory_bytes: usize = 1 << 30;
 /// the field slices is bounded only indirectly. It is a backstop, not a budget.
 pub const max_gc_objects: usize = 1 << 24;
 
+/// Cap on live boxed exceptions (`exn_store`) per invocation. `catch_ref` /
+/// `catch_all_ref` box an exception so it can become an `exnref` value, and
+/// nothing bounded that: a guest loop catching by reference grew the store
+/// without limit, the same guest-driven host allocation `max_gc_objects` exists
+/// to prevent. Entries are released at the end of the invocation, so this bounds
+/// a single call rather than the instance's lifetime.
+pub const max_exn_boxes: usize = 1 << 20;
+
+/// `exn_store` capacity retained between invocations. Reuse is worth keeping for
+/// ordinary sizes, but `shrinkRetainingCapacity` alone pinned the historical PEAK
+/// on the instance forever — measured at ~124 MiB after a catch-heavy loop, on an
+/// instance holding nothing. Above this, the buffer is returned to the allocator.
+pub const exn_store_keep_capacity: usize = 4096;
+
 /// A runtime value: a raw 64-bit slot reinterpreted per the (validated) type.
 pub const Value = u64;
 
@@ -234,6 +248,10 @@ pub const Error = Module.Error || error{
     /// collector, nothing is ever reclaimed, so this is the backstop that keeps
     /// a guest allocation loop from exhausting host memory. Traps.
     GcHeapExhausted,
+    /// An invocation boxed more than `max_exn_boxes` exceptions via
+    /// `catch_ref`/`catch_all_ref`. Like `GcHeapExhausted`, our limitation rather
+    /// than a §4.2 trap. Traps.
+    ExnStoreExhausted,
     /// `ref.cast` to a type the value is not an instance of. Traps.
     CastFailure,
     /// A host-function import callback signaled a trap (C ABI `wasm_func_new`).
@@ -275,7 +293,13 @@ const i31_tag: Value = @as(Value, 1) << 63;
 /// Stack slots a value type occupies: a `v128` is **two** `u64` slots (SIMD),
 /// every other type is one. Only v128 differs, so a module with no v128 keeps
 /// the "one value = one slot" model unchanged.
-fn slotWidth(vt: types.ValType) u32 {
+///
+/// `pub` because every consumer of an argument/result SLOT array has to walk it
+/// by this width rather than by value index. Both out-of-module consumers — the
+/// CLI's result printer and the C ABI's `wasm_func_call`/`hostTrampoline` — had
+/// independently written `for (results, ft.results)`, which silently pairs the
+/// wrong slot with the wrong type as soon as any v128 appears.
+pub fn slotWidth(vt: types.ValType) u32 {
     return if (vt == .v128) 2 else 1;
 }
 /// Total stack slots a list of value types occupies.
@@ -854,10 +878,22 @@ pub const Instance = struct {
                 if (elem.table_index >= tables.len) return error.NoTable;
                 const tbl = tables[elem.table_index].entries;
                 const offset = try evalConstOffset(module, globals, elem.offset_expr);
-                for (vals, 0..) |v, k| {
-                    if (@as(u64, offset) + k >= tbl.len) return error.TableOutOfBounds;
-                    tbl[offset + k] = v;
-                }
+                // Bound the WHOLE range before writing anything, exactly as the
+                // active-data branch above does. The check used to sit inside the
+                // loop, so an over-long segment wrote a partial prefix and *then*
+                // failed instantiation.
+                //
+                // That is not merely untidy: for an IMPORTED table, `tbl` is the
+                // exporting instance's live shared storage, so the writes outlive
+                // the instantiation that was rejected. A module which fails to
+                // instantiate could thereby install entries into another module's
+                // table and make it dispatch through slots it never populated —
+                // the importer chooses the function indices, and the *owning*
+                // module reinterprets them. `call_indirect`'s type check still
+                // applies, so it is wrong-function dispatch rather than memory
+                // unsafety, but the entry point is a module that was REJECTED.
+                if (@as(u64, offset) + vals.len > tbl.len) return error.TableOutOfBounds;
+                for (vals, 0..) |v, k| tbl[offset + k] = v;
             }
         }
 
@@ -941,6 +977,15 @@ pub const Instance = struct {
         defer {
             self.pending_exn = saved_pending;
             self.exn_store.shrinkRetainingCapacity(saved_exn_len);
+            // Retaining capacity is right for the common case (the next invoke
+            // reuses it), but it pins the PEAK on the instance forever: a loop
+            // catching millions of exnrefs left ~124 MiB attached to an otherwise
+            // idle instance, outside every budget. Give the memory back once it
+            // is both empty and unreasonably large, keeping the fast path for
+            // ordinary sizes.
+            if (saved_exn_len == 0 and self.exn_store.capacity > exn_store_keep_capacity) {
+                self.exn_store.clearAndFree(self.gpa);
+            }
             self.reentry_depth = saved_depth;
         }
         // The TRAP TRACE is deliberately NOT save/restored: it must outlive the
@@ -993,6 +1038,26 @@ pub const Instance = struct {
         if (self.trap_len == max_trap_frames) return; // keep the innermost frames
         self.trap_frames[self.trap_len] = .{ .func_index = func_index, .pc = pc };
         self.trap_len += 1;
+    }
+
+    /// Append a cross-module callee's trap frames to this instance's trace.
+    ///
+    /// A trap's backtrace is read off whichever instance the embedder invoked,
+    /// but the frames of a module-linked callee are recorded on the *callee*.
+    /// Called as the error crosses back over the boundary, so the callee's frames
+    /// (already innermost-first) land ahead of this instance's own — which are
+    /// appended afterwards by `recordTrap` as the error keeps unwinding.
+    fn adoptTrapFrames(self: *Instance, callee: *const Instance) void {
+        for (callee.trapFrames()) |f| {
+            self.trap_depth += 1;
+            if (self.trap_len == max_trap_frames) continue; // keep the innermost
+            self.trap_frames[self.trap_len] = f;
+            self.trap_len += 1;
+        }
+        // Frames the callee itself had to drop still happened: carry their count
+        // so `trapTruncated()` stays honest across the boundary.
+        if (callee.trap_depth > callee.trap_len)
+            self.trap_depth += callee.trap_depth - callee.trap_len;
     }
 
     /// Byte offset of `frame`'s instruction within its function body, and within
@@ -1121,22 +1186,40 @@ pub const Instance = struct {
             if (func_index >= self.import_funcs.len) return error.UnsupportedImportCall;
             switch (self.import_funcs[func_index]) {
                 // Cross-module call: run in the exporting instance's context.
-                .wasm => |w| return w.instance.callFunction(a, w.func_index, args, depth + 1) catch |e| {
-                    // `pending_exn` is per-Instance, but an exception unwinding
-                    // out of a cross-module call must stay findable by the
-                    // CALLER's handlers — otherwise `onCallError` sees null on
-                    // this instance and a `try_table (catch_all …)` around the
-                    // call could never fire. Hand it across the boundary.
-                    //
-                    // The payload lifetime is sound: the callee ran on `a`, the
-                    // caller's own invocation scratch arena.
-                    if (e == error.UncaughtException) {
-                        if (w.instance.pending_exn) |exn| {
-                            self.pending_exn = exn;
-                            w.instance.pending_exn = null;
+                .wasm => |w| {
+                    // The trap trace is per-Instance and only `invoke` resets it —
+                    // but a module-linked callee is entered through here, never
+                    // through `invoke`. Its trace therefore accumulated frames
+                    // from every trap it had ever taken, pinning at
+                    // `max_trap_frames` frames drawn from unrelated invocations
+                    // and leaving `trapTruncated()` permanently true.
+                    w.instance.trap_len = 0;
+                    w.instance.trap_depth = 0;
+                    return w.instance.callFunction(a, w.func_index, args, depth + 1) catch |e| {
+                        // `pending_exn` is per-Instance, but an exception
+                        // unwinding out of a cross-module call must stay findable
+                        // by the CALLER's handlers — otherwise `onCallError` sees
+                        // null on this instance and a `try_table (catch_all …)`
+                        // around the call could never fire. Hand it across the
+                        // boundary.
+                        //
+                        // The payload lifetime is sound: the callee ran on `a`,
+                        // the caller's own invocation scratch arena.
+                        if (e == error.UncaughtException) {
+                            if (w.instance.pending_exn) |exn| {
+                                self.pending_exn = exn;
+                                w.instance.pending_exn = null;
+                            }
                         }
-                    }
-                    return e;
+                        // Take the callee's frames as our own innermost ones. The
+                        // embedder reads the trace off the instance IT called, so
+                        // without this the backtrace for a cross-instance trap was
+                        // missing the frame that actually faulted. Our own frames
+                        // are appended after, as this error unwinds — which keeps
+                        // the whole trace innermost-first.
+                        self.adoptTrapFrames(w.instance);
+                        return e;
+                    };
                 },
                 .native => |f| {
                     const ft = self.module.funcType(func_index) orelse return error.UndefinedFunc;
@@ -1373,6 +1456,7 @@ const Frame = struct {
                 switch (c.kind) {
                     .catch_ref, .catch_all_ref => {
                         const eidx = self.inst.exn_store.items.len;
+                        if (eidx >= max_exn_boxes) return error.ExnStoreExhausted;
                         try self.inst.exn_store.append(self.inst.gpa, exn);
                         try self.pushU64(@intCast(eidx));
                     },

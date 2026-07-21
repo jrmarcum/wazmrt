@@ -596,10 +596,11 @@ fn isRuntimeTrap(e: anyerror) bool {
         error.CallStackExhausted,
         error.UncaughtException, // an uncaught exception traps (EH proposal)
         => true,
-        // Deliberately NOT listed: `error.GcHeapExhausted`. It is OUR cap on an
-        // uncollected GC heap, not a §4.2 trap — admitting it here would let a
-        // module that merely allocates a lot satisfy an `assert_trap` meant for
-        // real trapping behaviour, which is exactly what this filter prevents.
+        // Deliberately NOT listed: `error.GcHeapExhausted` and
+        // `error.ExnStoreExhausted`. Both are OUR resource caps, not §4.2 traps —
+        // admitting them here would let a module that merely allocates a lot (or
+        // catches a lot) satisfy an `assert_trap` meant for real trapping
+        // behaviour, which is exactly what this filter prevents.
         else => false,
     };
 }
@@ -1080,6 +1081,56 @@ test "exception handling: an exception crossing a module boundary is catchable b
     ;
     const s = try runScript(std.testing.allocator, src);
     try std.testing.expectEqual(@as(usize, 1), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "v128 among multiple results keeps the other results aligned" {
+    // A v128 occupies TWO slots, so any consumer walking a result array in
+    // lockstep with the result TYPES drifts from the first v128 onwards. This
+    // shape — i32, v128, i32 — is the minimal case that catches it: the trailing
+    // 22 came back as 3 through the C ABI, and the CLI dropped both i32s.
+    const src =
+        \\(module (func (export "g") (result i32 v128 i32)
+        \\  (i32.const 11) (v128.const i32x4 1 2 3 4) (i32.const 22)))
+        \\(assert_return (invoke "g")
+        \\  (i32.const 11) (v128.const i32x4 1 2 3 4) (i32.const 22))
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 1), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "a rejected module cannot leave entries in another module's table" {
+    // The active-element loop used to bounds-check per entry, so an over-long
+    // segment wrote a partial prefix and *then* failed instantiation. For an
+    // IMPORTED table that storage belongs to the exporter and outlives the
+    // rejected instantiation — so a module that FAILED TO INSTANTIATE could
+    // install entries into another module's table.
+    //
+    // Here $A never populates its own table and keeps `$secret` unexported. The
+    // importing module is rejected (offset 2 + 3 entries > 4 slots), after which
+    // $A's `call_indirect` through slot 2 must still trap. Before the fix it
+    // returned 1337 — $A dispatching to a function it never installed, chosen by
+    // a module that was refused.
+    const src =
+        \\(module $A
+        \\  (type $r (func (result i32)))
+        \\  (table (export "t") 4 funcref)
+        \\  (func $secret (type $r) (i32.const 1337))
+        \\  (func (export "at") (param i32) (result i32)
+        \\    (call_indirect (type $r) (local.get 0))))
+        \\(register "A" $A)
+        \\(assert_trap
+        \\  (module
+        \\    (import "A" "t" (table 4 funcref))
+        \\    (type $r (func (result i32)))
+        \\    (func $f (type $r) (i32.const 1337))
+        \\    (elem (i32.const 2) $f $f $f))
+        \\  "out of bounds table access")
+        \\(assert_trap (invoke $A "at" (i32.const 2)) "uninitialized element")
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 2), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
 
