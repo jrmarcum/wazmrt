@@ -74,6 +74,9 @@ pub const Error = Module.Error || error{
     UndefinedTag,
     /// A tag whose type produces results (tags must have empty results).
     InvalidTag,
+    /// A memory/table limits pair violates §3.2.5 — `min > max`, or a bound past
+    /// the type ceiling (2^16 pages for a memory).
+    InvalidLimits,
     /// Two exports share a name (§3.4.10 requires them pairwise distinct).
     DuplicateExport,
     UndefinedTable,
@@ -139,6 +142,23 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
         if (!seg.active) continue;
         if (seg.mem_index >= module.memories.len) return error.MissingMemory;
         try validateConstExpr(module, seg.offset_expr, .i32, all_globals);
+    }
+
+    // Limits (§3.2.5): `min <= max`, and each is bounded by the type's ceiling —
+    // 2^16 pages for a memory, 2^32-1 entries for a table. Neither half was
+    // checked, so `(memory 5 2)` and `(memory 70000)` both validated. Contained
+    // at run time (instantiation clamps and the `--max-memory` budget refuses),
+    // but the validator is a C-ABI entry point and should say so itself.
+    for (module.memories) |mt| {
+        if (mt.limits.min > 0x1_0000) return error.InvalidLimits;
+        if (mt.limits.max) |mx| {
+            if (mx > 0x1_0000 or mt.limits.min > mx) return error.InvalidLimits;
+        }
+    }
+    for (module.tables) |tt| {
+        if (tt.limits.max) |mx| {
+            if (tt.limits.min > mx) return error.InvalidLimits;
+        }
     }
 
     // Tag types (§3.2, EH): a tag's type must be `[t1*] → []`. `throw` checked
@@ -689,7 +709,10 @@ const FuncValidator = struct {
             .table_init => {
                 const tet = try self.tableElemType(instr.imm.table_init.table);
                 if (instr.imm.table_init.elem >= self.module.elements.len) return error.UndefinedElem;
-                if (self.module.elements[instr.imm.table_init.elem].elem_type != tet) return error.TypeMismatch;
+                // Spec: the segment.s reftype must be a SUBTYPE of the table.s, not
+                // equal to it — an `(elem (ref func) …)` into a `funcref` table is
+                // valid and was rejected.
+                if (!subtypeOf(self.module, self.module.elements[instr.imm.table_init.elem].elem_type, tet)) return error.TypeMismatch;
                 _ = try self.popExpect(.i32); // n
                 _ = try self.popExpect(.i32); // src
                 _ = try self.popExpect(.i32); // dst
@@ -736,7 +759,8 @@ const FuncValidator = struct {
             .table_copy => {
                 const dt = try self.tableElemType(instr.imm.table_copy.dst);
                 const st = try self.tableElemType(instr.imm.table_copy.src);
-                if (dt != st) return error.TypeMismatch;
+                // Same rule as table.init: src <: dst, not equality.
+                if (!subtypeOf(self.module, st, dt)) return error.TypeMismatch;
                 _ = try self.popExpect(.i32); // n
                 _ = try self.popExpect(.i32); // src
                 _ = try self.popExpect(.i32); // dst
