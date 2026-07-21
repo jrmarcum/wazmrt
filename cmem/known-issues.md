@@ -877,13 +877,48 @@ alignment left open).
 **Verification:** 421 printed / 417 pass, Debug **and** ReleaseSafe, `c-smoke` 319/319, `wasi-gate`,
 freestanding `wasm`. Every fix has a before/after reproduction.
 
-**Still open from this pass:** cross-module exceptions cannot be *caught* by the importer (the
-`orelse return e` fix made it safe, not correct — the in-flight exception needs to be a property of the
-invocation, not of `Instance`); `ref.test`/`ref.cast` don't check the operand's hierarchy; SIMD memarg
-alignment unchecked; `C.refs` not tracked for `ref.func`; `br_on_cast` fall-through over-approximated; the
-GC heap grows per-invocation forever (fine for a program, an unbounded per-call leak for a long-lived
-C-ABI host); `.wast` module memories leak (page-allocator bytes outside the runner arena); `frameOffset`
-leaks `br_table`/`select_types` side allocations under a non-arena allocator.
+**The still-open list from this pass is now CLOSED (2026-07-21).** All eight, in order:
+
+- **SIMD memarg alignment** — `simdNaturalAlign` lived in `wat.zig` while the scalar authority was
+  `opcode.naturalAlignLog2`; moved to `opcode.simdNaturalAlignLog2` (one-authority rule, same reason
+  `simdIsMemoryOp` sits next to `decodeSimd`) and wired into the validator's `.simd` arm.
+  `v128.store align=64` → `InvalidAlignment`; plain `v128.store` still valid.
+- **`ref.test`/`ref.cast` operand hierarchy** — `ref.test (ref func)` applied to an `externref` now
+  `TypeMismatch` instead of type-checking against a disjoint hierarchy.
+- **`br_on_cast` fall-through nullability** — was over-approximated, so a *valid* module
+  (`(call $use (br_on_cast $l anyref (ref null i31) …))`) was rejected; now narrowed correctly.
+- **`frameOffset` side allocations** — new `opcode.freeBody` frees the `br_table`/`select_types`
+  arrays, so the path no longer leaks under a non-arena allocator.
+- **`.wast` module memories** — guest memories are page-allocator bytes *outside* the runner arena, so
+  the arena's `deinit` never touched them. `Runner.instances` now tracks every instance and `runScript`
+  releases them (plus `spectest_memory`). An instance is registered *before* `runStart`, so a module
+  whose start function traps still gives its memory back.
+- **Cross-module exceptions are now CATCHABLE by the importer.** `pending_exn` hangs off `Instance`, so
+  an exception unwinding out of an imported function was parked on the *callee's* instance where the
+  caller's `onCallError` could never find it: a `try_table (catch_all …)` around the call silently
+  failed to fire and the invocation trapped `UncaughtException`. `callFunction`'s `.wasm` arm now hands
+  the exception to the caller's instance on the way out. The payload lifetime was never the problem —
+  the callee already runs on the *caller's* invocation arena. The earlier `orelse return e` stays as the
+  safety net. *(The regression test was checked by disabling the fix and confirming it fails — the
+  lesson from the vacuous trap-lifetime test, applied up front this time.)*
+- **`C.refs` now tracked for `ref.func`** (§3.4.10, "undeclared function reference"). We checked that
+  the funcidx *existed* but never that it was *declared*, so a body could forge a reference to any
+  function in the module — including one deliberately left unexported and unreferenced. The validator
+  now builds a `DynamicBitSetUnmanaged` over the function index space from the four declaring positions
+  (exports, start, global inits, element segments — a `ref.func` in any const-expr declares too) and the
+  body validator's `.ref_func` arm rejects anything outside it with `UndeclaredFuncRef`. `refs` is
+  `?*const`, and `dropSelectWidths` passes **null**: that pass is a *lowering*, not a verdict, and a
+  C.refs rejection there would only truncate the width table it exists to fill. Enforcing this exposed
+  **two of our own fixtures that were invalid per spec** — both fixed with `(elem declare func $f)`,
+  which the assembler already supported end to end.
+- **GC heap growth** — a tracing collector stays out of scope (the documented proposal-scope decision),
+  but *unbounded* was the real exposure: `struct.new` in a loop is a guest-driven host allocation with
+  no ceiling. Capped at `max_gc_objects` (2^24 = 16 Mi) → `error.GcHeapExhausted`, matching how every
+  other guest-driven resource here is bounded. It is **deliberately not** in `isRuntimeTrap`: it is our
+  limitation, not a §4.2 trap, and admitting it would let a merely-allocation-heavy module satisfy an
+  `assert_trap`. Note it counts **objects**, not payload bytes — a backstop, not a budget.
+
+**Verification after the closeout:** 425 printed / 421 pass (4 skipped = the 2 known skips × 2 runners).
 
 ## #23 — Zig 0.16 Windows `Io` filesystem gaps found in WASI 4.3 (2026-07-16)
 

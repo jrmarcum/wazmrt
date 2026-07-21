@@ -698,6 +698,37 @@ fn simdLaneCount(sub: u32) u8 {
 /// instructions). Raise this when adding sub-opcodes past it.
 const max_simd_sub: u32 = 0x113;
 
+/// Free an instruction stream from `decodeBody`/`decodeBodyTracked`, including
+/// the SIDE allocations some immediates own — `br_table`'s label array and typed
+/// `select`'s type vector are separate allocations, so `a.free(ir)` alone leaks
+/// them. Harmless under an arena (every caller but one), but `frameOffset` runs
+/// on the C ABI's general-purpose allocator, so a long-lived embedder that
+/// trapped repeatedly in a function containing `br_table` grew without bound.
+pub fn freeBody(a: std.mem.Allocator, ir: []const Instr) void {
+    for (ir) |instr| switch (instr.imm) {
+        .br_table => |bt| a.free(bt.labels),
+        .select_types => |ts| a.free(ts),
+        else => {},
+    };
+    a.free(ir);
+}
+
+/// The natural (maximum-allowed) alignment of a SIMD memory access, as a log2.
+/// Lives here for the same reason as `simdIsMemoryOp` and `naturalAlignLog2` —
+/// one authority. The assembler uses it to default a missing `align=`; the
+/// validator uses it to reject an over-aligned memarg (§6.5.8). They kept
+/// separate copies until 2026-07-21, so the validator simply had no SIMD
+/// alignment check at all.
+pub fn simdNaturalAlignLog2(sub: u32) u32 {
+    return switch (sub) {
+        0x07, 0x54, 0x58 => 0, // 1-byte: load8_splat, load8_lane, store8_lane
+        0x08, 0x55, 0x59 => 1, // 2-byte
+        0x09, 0x5c, 0x56, 0x5a => 2, // 4-byte: load32_splat/zero/lane, store32_lane
+        0x01...0x06, 0x0a, 0x5d, 0x57, 0x5b => 3, // 8-byte: loadMxN, load64_splat/zero/lane, store64_lane
+        else => 4, // 16-byte: v128.load / v128.store
+    };
+}
+
 /// Does this `0xFD` sub-opcode carry a memarg (i.e. touch linear memory)?
 /// The `Simd` immediate always has a `mem` field (defaulted), so its presence
 /// cannot distinguish these — kept beside `decodeSimd`, whose switch is the

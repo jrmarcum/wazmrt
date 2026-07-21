@@ -1976,23 +1976,13 @@ fn lookupSimd(name: []const u8) ?SimdOp {
 /// The natural (maximum-allowed) alignment, as a log2, for a SIMD memory op —
 /// used as the `align=` default. Wrong here means the validator rejects an
 /// omitted-align load8_splat/load_lane as over-aligned.
-fn simdNaturalAlign(sub: u32) u32 {
-    return switch (sub) {
-        0x07, 0x54, 0x58 => 0, // 1-byte: load8_splat, load8_lane, store8_lane
-        0x08, 0x55, 0x59 => 1, // 2-byte
-        0x09, 0x5c, 0x56, 0x5a => 2, // 4-byte: load32_splat/zero/lane, store32_lane
-        0x01...0x06, 0x0a, 0x5d, 0x57, 0x5b => 3, // 8-byte: loadMxN, load64_splat/zero/lane, store64_lane
-        else => 4, // 16-byte: v128.load / v128.store
-    };
-}
-
 /// Emit a SIMD op: parse its immediate from `items[start..]`, emit operand
 /// sub-exprs (folded form only), then `0xFD sub imm`. Returns the next index.
 fn emitSimd(ctx: *Ctx, sd: SimdOp, items: []const Sexpr, start: usize, is_folded: bool) Error!usize {
     var j = start;
     var lane: u8 = 0;
     var cbytes: [16]u8 = @splat(0);
-    var align_log2: u32 = simdNaturalAlign(sd.sub);
+    var align_log2: u32 = opcode.simdNaturalAlignLog2(sd.sub);
     var offset: u64 = 0;
     switch (sd.imm) {
         .none => {},
@@ -3063,7 +3053,7 @@ test "GC i31: validator rejects i31.get on a non-i31 reference" {
     const a = arena.allocator();
     // i31.get_s wants (ref null i31); a funcref is a disjoint hierarchy.
     const bad = try assemble(a,
-        \\(module (func $f)
+        \\(module (func $f) (elem declare func $f)
         \\  (func (export "x") (result i32) (i31.get_s (ref.func $f))))
     );
     var mbad = try Module.decode(a, bad);

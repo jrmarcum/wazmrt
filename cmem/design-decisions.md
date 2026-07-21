@@ -67,7 +67,11 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   things to preserve:** (1) on a successful call-site catch, reset `trap_len`/`trap_depth` (the unwinding
   frames recorded a would-be trace that must not leak into a later real trap); (2) `exn_store` and
   `pending_exn` are cleared per invocation — `exnref` payloads are invocation-arena memory and must never
-  outlive the call.
+  outlive the call. **(3) `pending_exn` is per-`Instance`, but an exception is a property of the
+  INVOCATION** — so when one unwinds out of a *cross-module* call it must be moved to the caller's
+  instance, or the caller's `onCallError` looks at its own null `pending_exn` and the importer's
+  `try_table` can never fire. `callFunction`'s `.wasm` arm does that hand-off (2026-07-21); the payload
+  is safe to carry because the callee ran on the *caller's* invocation arena.
 - **Legacy `try`/`catch` runs its handler INSIDE the try; try_table branches OUT (2026-07-17, Phase 6.3).**
   wasmtk's corpus turned up files from older LLVM that emit the *legacy* EH encoding
   (`try`/`catch`/`catch_all`/`rethrow`, 0x06/0x07/0x19/0x09), so it's supported for compat (decode +
@@ -434,7 +438,12 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
         group (`Reader.peekByte` added).
       - **2b — heap + ops.** `Instance.gc_heap: ArrayList([]Value)` — one field/element slice per object,
         **arena-backed, no collector** (leak-until-instance-dies; size cost accepted, likely opt-in
-        later). A struct/array **reference value is the object's heap index** (small, never aliases
+        later). Because nothing is ever reclaimed, allocation is **capped at `max_gc_objects`**
+        (2^24 objects → `error.GcHeapExhausted`, 2026-07-21): a guest `struct.new` loop is an unbounded
+        *host* allocation driven purely by guest control flow, and every other guest-driven resource
+        here is bounded the same way. It counts objects, not payload — a backstop, not a budget, and
+        not a §4.2 trap (so it is excluded from `isRuntimeTrap`, else an allocation-heavy module could
+        satisfy an `assert_trap`). A struct/array **reference value is the object's heap index** (small, never aliases
         `null_ref`). Ops (all `0xFB`-prefixed except `ref.eq`=`0xd3`): `struct.new`/`new_default`/
         `get`/`get_s`/`get_u`/`set`, `array.new`/`new_default`/`new_fixed`/`get`/`get_s`/`get_u`/`set`/
         `len`, `ref.eq`. Packed fields store masked (`packField`) and widen on read (`unpackField`:

@@ -69,6 +69,10 @@ pub const Error = Module.Error || error{
     UndefinedGlobal,
     ImmutableGlobal,
     UndefinedFunc,
+    /// `ref.func x` in a function body where `x` is not in C.refs — the function
+    /// exists, but nothing outside the code section declares it (§3.4.10,
+    /// "undeclared function reference"). Add `(elem declare func $x)`.
+    UndeclaredFuncRef,
     UndefinedType,
     /// A `throw`/catch tag index out of range (EH proposal).
     UndefinedTag,
@@ -100,12 +104,27 @@ pub const Error = Module.Error || error{
 pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
     if (module.functions.len != module.code.len) return error.CountMismatch;
 
+    // C.refs (§3.4.10, "undeclared function reference"): `ref.func x` inside a
+    // FUNCTION BODY is well-typed only if `x` also occurs somewhere *outside*
+    // the code section — a global initializer, an element segment, an export,
+    // or the start function. That rule is why `(elem declare func $f)` exists:
+    // it is the way to admit a reference to a function nothing else mentions.
+    //
+    // Populated below as the module-level structures are walked, then consulted
+    // by the body validator's `.ref_func` arm. Sized over the whole function
+    // index space (imports first, then defined) so a raw funcidx indexes it.
+    const n_funcs = module.importedFuncCount() + module.functions.len;
+    var refs = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_funcs);
+    defer refs.deinit(gpa);
+    for (module.exports) |e| if (e.type.kind() == .func and e.index < n_funcs) refs.set(e.index);
+    if (module.start) |si| if (si < n_funcs) refs.set(si);
+
     // Global init const-exprs: each must be a constant expression producing
     // exactly the declared type. Defined globals occupy the tail of the space.
     const n_imported_globals: u32 = @intCast(module.globals.len - module.global_inits.len);
     for (module.global_inits, 0..) |init_expr, i| {
         const self_index = n_imported_globals + @as(u32, @intCast(i));
-        try validateConstExpr(module, init_expr, module.globals[self_index].content, self_index);
+        try validateConstExpr(module, init_expr, module.globals[self_index].content, self_index, &refs);
     }
 
     // Active-segment *offset* const-exprs may reference any immutable global —
@@ -119,8 +138,11 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
     // element const-expr must produce the segment's element type; an active
     // segment targets an existing type-compatible table with a valid i32 offset.
     for (module.elements) |elem| {
-        for (elem.funcs) |fi| if (module.funcType(fi) == null) return error.UndefinedFunc;
-        for (elem.exprs) |ex| try validateConstExpr(module, ex, elem.elem_type, n_imported_globals);
+        for (elem.funcs) |fi| {
+            if (module.funcType(fi) == null) return error.UndefinedFunc;
+            if (fi < n_funcs) refs.set(fi); // a segment entry declares the function
+        }
+        for (elem.exprs) |ex| try validateConstExpr(module, ex, elem.elem_type, n_imported_globals, &refs);
         if (elem.mode == .active) {
             if (elem.table_index >= module.tables.len) return error.UndefinedTable;
             const tet = module.tables[elem.table_index].element;
@@ -132,7 +154,7 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
             // reported it as an accept-invalid bug on the assumption that
             // `nullable()` was a predicate; verified false. Don't "fix" it again.
             if (elem.elem_type.nullable() != tet.nullable()) return error.TypeMismatch;
-            try validateConstExpr(module, elem.offset_expr, .i32, all_globals);
+            try validateConstExpr(module, elem.offset_expr, .i32, all_globals, null);
         }
     }
 
@@ -141,7 +163,7 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
     for (module.data) |seg| {
         if (!seg.active) continue;
         if (seg.mem_index >= module.memories.len) return error.MissingMemory;
-        try validateConstExpr(module, seg.offset_expr, .i32, all_globals);
+        try validateConstExpr(module, seg.offset_expr, .i32, all_globals, null);
     }
 
     // Limits (§3.2.5): `min <= max`, and each is bounded by the type's ceiling —
@@ -189,7 +211,7 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
 
     for (module.functions, module.code) |type_index, code| {
         const ft = module.funcSig(type_index) orelse return error.UndefinedType;
-        try validateFunction(arena.allocator(), module, ft, code, null);
+        try validateFunction(arena.allocator(), module, ft, code, null, &refs);
         _ = arena.reset(.retain_capacity);
     }
 }
@@ -198,7 +220,7 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
 /// `add`/`sub`/`mul`). It must produce exactly one value of `expected`. A
 /// `global.get x` may reference only a *prior* (`x < self_index`) *immutable*
 /// global; anything outside the const-expr opcode set is rejected.
-fn validateConstExpr(module: *const Module, expr: []const u8, expected: V, self_index: u32) Error!void {
+fn validateConstExpr(module: *const Module, expr: []const u8, expected: V, self_index: u32, refs: ?*std.DynamicBitSetUnmanaged) Error!void {
     var r = Reader.init(expr);
     var stack: [8]V = undefined;
     var sp: usize = 0;
@@ -242,6 +264,9 @@ fn validateConstExpr(module: *const Module, expr: []const u8, expected: V, self_
             0xd2 => { // ref.func x
                 const fi = try r.readVarU32();
                 if (module.funcType(fi) == null) return error.UndefinedFunc;
+                // A `ref.func` outside the code section DECLARES that function
+                // (C.refs), which is what makes it referenceable from a body.
+                if (refs) |set| if (fi < set.bit_length) set.set(fi);
                 // Concrete `(ref $ftype)` for a defined func; abstract for imports.
                 if (module.funcTypeIndex(fi)) |ti|
                     try push(&stack, &sp, V.concreteRef(false, .func, ti))
@@ -262,7 +287,7 @@ fn validateConstExpr(module: *const Module, expr: []const u8, expected: V, self_
     if (sp != 1 or !subtypeOf(module, stack[0], expected)) return error.TypeMismatch;
 }
 
-fn validateFunction(a: std.mem.Allocator, module: *const Module, ft: Module.FuncType, code: Module.Code, widths: ?[]u8) Error!void {
+fn validateFunction(a: std.mem.Allocator, module: *const Module, ft: Module.FuncType, code: Module.Code, widths: ?[]u8, refs: ?*const std.DynamicBitSetUnmanaged) Error!void {
     // locals = parameters ++ declared locals (expanded from run-length form).
     var locals: std.ArrayList(V) = .empty;
     try locals.appendSlice(a, ft.params);
@@ -286,7 +311,7 @@ fn validateFunction(a: std.mem.Allocator, module: *const Module, ft: Module.Func
     const local_init = try a.alloc(bool, locals.items.len);
     for (local_init, locals.items, 0..) |*init, t, i| init.* = i < n_params or !t.isNonNullRef();
 
-    var v: FuncValidator = .{ .a = a, .module = module, .locals = locals.items, .results = ft.results, .local_init = local_init, .widths = widths, .body_len = instrs.len };
+    var v: FuncValidator = .{ .a = a, .module = module, .refs = refs, .locals = locals.items, .results = ft.results, .local_init = local_init, .widths = widths, .body_len = instrs.len };
     // The whole body is an implicit block of type [] -> results; its trailing
     // `end` closes this frame.
     try v.pushCtrl(.block, empty, ft.results);
@@ -316,7 +341,10 @@ pub fn dropSelectWidths(a: std.mem.Allocator, module: *const Module, ft: Module.
     };
     const widths = try a.alloc(u8, instrs.len);
     @memset(widths, 1);
-    validateFunction(a, module, ft, code, widths) catch {};
+    // `refs` is null: this is a LOWERING pass, not a verdict — the caller has
+    // already validated (or will), and a C.refs rejection here would only
+    // truncate the width table it is trying to fill in.
+    validateFunction(a, module, ft, code, widths, null) catch {};
     return widths;
 }
 
@@ -340,6 +368,9 @@ const Frame = struct {
 const FuncValidator = struct {
     a: std.mem.Allocator,
     module: *const Module,
+    /// Declared function references (C.refs). Null in lowering-only passes,
+    /// where a C.refs verdict is not wanted.
+    refs: ?*const std.DynamicBitSetUnmanaged,
     locals: []const V,
     results: []const V,
     /// Whether each local is currently known-initialized (params + defaultable
@@ -675,6 +706,12 @@ const FuncValidator = struct {
                 // embedder calling `wasm_module_validate` relies on.
                 if (opcode.simdIsMemoryOp(instr.imm.simd.sub))
                     try self.requireMemory(instr.imm.simd.mem.memory);
+                // …and the memarg alignment rule (§6.5.8, `align <= N/8`), which the
+                // scalar path enforces but this arm skipped entirely, so
+                // `v128.store align=64` validated.
+                if (opcode.simdIsMemoryOp(instr.imm.simd.sub) and
+                    instr.imm.simd.mem.alignment > opcode.simdNaturalAlignLog2(instr.imm.simd.sub))
+                    return error.InvalidAlignment;
                 const s = simdSig(instr.imm.simd.sub);
                 try self.popVals(s.pop);
                 try self.pushVals(s.push);
@@ -776,6 +813,11 @@ const FuncValidator = struct {
             },
             .ref_func => {
                 if (self.module.funcType(instr.imm.func) == null) return error.UndefinedFunc;
+                // C.refs (§3.4.10): a body may only reference a function some
+                // module-level construct declared — an export, the start, a global
+                // init, or an element segment (`(elem declare func $f)` exists
+                // precisely to declare an otherwise-unmentioned function).
+                if (self.refs) |set| if (!set.isSet(instr.imm.func)) return error.UndeclaredFuncRef;
                 // A function reference is non-null and, for a defined function,
                 // carries its concrete type (`(ref $ftype)`); imported funcs fall
                 // back to the abstract funcref head (no type index kept).
@@ -913,12 +955,16 @@ const FuncValidator = struct {
             // GC casts. `ref.test` consumes a reference and yields i32; `ref.cast`
             // passes the reference through with the target's (collapsed) type,
             // trapping at runtime on a failed cast.
+            // Spec: `ref.test rt : [rt.] -> [i32]` with `rt <: rt.` — the operand and
+            // the target must share a TOP type. Popping any reference accepted
+            // `ref.test (ref func)` on an `externref`. Contained at run time
+            // (`refMatches` answers 0), so this is conformance.
             .ref_test => {
-                _ = try self.popRef();
+                _ = try self.popExpect((try refTypeValType(self.module, instr.imm.ref_cast)).refHeap().top().valType(true));
                 try self.pushValT(.i32);
             },
             .ref_cast => {
-                _ = try self.popRef();
+                _ = try self.popExpect((try refTypeValType(self.module, instr.imm.ref_cast)).refHeap().top().valType(true));
                 try self.pushValT(try refTypeValType(self.module, instr.imm.ref_cast));
             },
 
@@ -943,7 +989,14 @@ const FuncValidator = struct {
                 try self.pushVals(prefix);
                 // Fall-through leaves the ref: `src` for br_on_cast (not dst),
                 // narrowed to `dst` for br_on_cast_fail (it is dst).
-                try self.pushValT(if (instr.op == .br_on_cast) src_vt else dst_vt);
+                // Spec: the fall-through type is `rt1  rt2`. When the cast target is
+                // NULLABLE, a null would have branched, so the fall-through ref is
+                // non-null — pushing `src_vt` unchanged over-approximated and
+                // rejected valid code that feeds it to a `(ref …)` parameter.
+                try self.pushValT(if (instr.op == .br_on_cast)
+                    (if (dst_vt.isNonNullRef()) src_vt else src_vt.nonNull())
+                else
+                    dst_vt);
             },
 
             // Spec: `[(ref null ht)] -> [(ref ht)]` — the op EXISTS to remove
@@ -1376,6 +1429,39 @@ test "validator: memory-touching ops require an in-range memory" {
     }
 }
 
+test "validator: ref.func in a body requires the function to be declared (C.refs)" {
+    // §3.4.10 "undeclared function reference". We type-checked that the funcidx
+    // EXISTS but never that it was declared, so a body could forge a reference
+    // to any function in the module — including one the module deliberately
+    // kept unexported and unreferenced.
+    const gpa = std.testing.allocator;
+    const wat = @import("wat.zig");
+
+    const cases = [_]struct { src: []const u8, ok: bool }{
+        // Nothing outside the code section mentions $f -> undeclared.
+        .{ .src = "(module (func $f) (func (export \"g\") (result funcref) (ref.func $f)))", .ok = false },
+        // Each of the four declaring positions in turn.
+        .{ .src = "(module (func $f) (elem declare func $f) (func (export \"g\") (result funcref) (ref.func $f)))", .ok = true },
+        .{ .src = "(module (func $f) (export \"f\" (func $f)) (func (export \"g\") (result funcref) (ref.func $f)))", .ok = true },
+        .{ .src = "(module (func $f) (global funcref (ref.func $f)) (func (export \"g\") (result funcref) (ref.func $f)))", .ok = true },
+        .{ .src = "(module (func $f) (start $f) (func (export \"g\") (result funcref) (ref.func $f)))", .ok = true },
+        // An ACTIVE segment declares it just as well as a declarative one.
+        .{ .src = "(module (func $f) (table 1 funcref) (elem (i32.const 0) $f) (func (export \"g\") (result funcref) (ref.func $f)))", .ok = true },
+    };
+    for (cases) |c| {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const bin = try wat.assemble(arena.allocator(), c.src);
+        var m = try Module.decode(gpa, bin);
+        defer m.deinit();
+        if (c.ok) {
+            try validate(gpa, &m);
+        } else {
+            try std.testing.expectError(error.UndeclaredFuncRef, validate(gpa, &m));
+        }
+    }
+}
+
 test "validator: br_on_non_null accepts any reference label type" {
     // The label's last type must be a REFERENCE (spec: C.labels[l] = [t* (ref ht)]).
     // This used to hard-code funcref/externref, wrongly rejecting every valid
@@ -1384,7 +1470,8 @@ test "validator: br_on_non_null accepts any reference label type" {
     const wat = @import("wat.zig");
 
     const cases = [_]struct { src: []const u8, ok: bool }{
-        .{ .src = "(module (func $g) (func (export \"f\") (result funcref) (block (result funcref) (br_on_non_null 0 (ref.func $g)) (ref.null func))))", .ok = true },
+        // `(elem declare …)` puts $g in C.refs so the body may `ref.func` it.
+        .{ .src = "(module (func $g) (elem declare func $g) (func (export \"f\") (result funcref) (block (result funcref) (br_on_non_null 0 (ref.func $g)) (ref.null func))))", .ok = true },
         // i31ref: a valid GC label that the old check rejected.
         .{ .src = "(module (func (export \"f\") (param i31ref) (result i31ref) (block (result i31ref) (br_on_non_null 0 (local.get 0)) (ref.null i31))))", .ok = true },
         .{ .src = "(module (func (export \"f\") (param anyref) (result anyref) (block (result anyref) (br_on_non_null 0 (local.get 0)) (ref.null any))))", .ok = true },

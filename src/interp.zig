@@ -96,6 +96,19 @@ pub fn growGuestMemory(old: []u8, n: usize) error{OutOfMemory}![]u8 {
 /// `Imports.max_memory_bytes` (CLI: `--max-memory`).
 pub const default_max_memory_bytes: usize = 1 << 30;
 
+/// Cap on live GC objects per instance. There is no collector (a documented
+/// proposal-scope decision), so `struct.new`/`array.new` in a loop grows the
+/// heap for the whole instance lifetime — an unbounded host allocation driven
+/// entirely by guest control flow. Every other guest-driven resource here is
+/// capped (linear memory, call depth, control depth, locals); this is the same
+/// treatment: a runaway allocator gets a deterministic `GcHeapExhausted` trap
+/// instead of taking the host's memory with it.
+///
+/// 16 Mi objects is far past any real workload and still bounds the outer list
+/// at ~256 MiB. Note this counts OBJECTS, not their payload — the arena holding
+/// the field slices is bounded only indirectly. It is a backstop, not a budget.
+pub const max_gc_objects: usize = 1 << 24;
+
 /// A runtime value: a raw 64-bit slot reinterpreted per the (validated) type.
 pub const Value = u64;
 
@@ -217,6 +230,10 @@ pub const Error = Module.Error || error{
     /// (`array.get`/`.set` past the length, or a field index beyond a collapsed
     /// object's fields). Traps.
     GcOutOfBounds,
+    /// The instance allocated more than `max_gc_objects` GC objects. With no
+    /// collector, nothing is ever reclaimed, so this is the backstop that keeps
+    /// a guest allocation loop from exhausting host memory. Traps.
+    GcHeapExhausted,
     /// `ref.cast` to a type the value is not an instance of. Traps.
     CastFailure,
     /// A host-function import callback signaled a trap (C ABI `wasm_func_new`).
@@ -415,7 +432,9 @@ pub const Instance = struct {
     /// index — rides in the object, so `ref.test`/`ref.cast` can check it).
     /// Objects live for the instance's lifetime (arena-backed field slices; no
     /// collector yet — a size cost accepted per the proposal-scope decision).
-    /// `gpa`-owned outer list.
+    /// Because nothing is ever reclaimed, allocation is bounded by
+    /// `max_gc_objects` so a guest allocation loop traps instead of exhausting
+    /// the host. `gpa`-owned outer list.
     gc_heap: std.ArrayList(HeapObject) = .empty,
 
     /// A heap-allocated GC object: its declared type index (RTT) and its struct
@@ -961,7 +980,7 @@ pub const Instance = struct {
         defer offsets.deinit(a);
         // We want the offsets, not the IR — free the decode's other output.
         const ir = opcode.decodeBodyTracked(a, code.body, &offsets) catch return null;
-        a.free(ir);
+        opcode.freeBody(a, ir); // frees br_table/select_types side allocations too
         if (frame.pc >= offsets.items.len) return null;
         const in_func = offsets.items[frame.pc];
         return .{ .func = in_func, .module = code.body_offset + in_func };
@@ -982,6 +1001,7 @@ pub const Instance = struct {
     /// with the `null_ref` sentinel or a tagged i31 (bit 63 set).
     fn allocObject(self: *Instance, type_index: u32, fields: []Value) Error!Value {
         const idx = self.gc_heap.items.len;
+        if (idx >= max_gc_objects) return error.GcHeapExhausted;
         try self.gc_heap.append(self.gpa, .{ .type_index = type_index, .fields = fields });
         return @intCast(idx);
     }
@@ -1066,7 +1086,23 @@ pub const Instance = struct {
             if (func_index >= self.import_funcs.len) return error.UnsupportedImportCall;
             switch (self.import_funcs[func_index]) {
                 // Cross-module call: run in the exporting instance's context.
-                .wasm => |w| return w.instance.callFunction(a, w.func_index, args, depth + 1),
+                .wasm => |w| return w.instance.callFunction(a, w.func_index, args, depth + 1) catch |e| {
+                    // `pending_exn` is per-Instance, but an exception unwinding
+                    // out of a cross-module call must stay findable by the
+                    // CALLER's handlers — otherwise `onCallError` sees null on
+                    // this instance and a `try_table (catch_all …)` around the
+                    // call could never fire. Hand it across the boundary.
+                    //
+                    // The payload lifetime is sound: the callee ran on `a`, the
+                    // caller's own invocation scratch arena.
+                    if (e == error.UncaughtException) {
+                        if (w.instance.pending_exn) |exn| {
+                            self.pending_exn = exn;
+                            w.instance.pending_exn = null;
+                        }
+                    }
+                    return e;
+                },
                 .native => |f| {
                     const ft = self.module.funcType(func_index) orelse return error.UndefinedFunc;
                     const results = try a.alloc(Value, typeSlots(ft.results));

@@ -60,6 +60,16 @@ pub fn runScript(gpa: std.mem.Allocator, src: []const u8) Error!Summary {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     var r: Runner = .{ .a = arena.allocator() };
+    // Guest linear memory is PAGE-ALLOCATOR owned, so the arena above does NOT
+    // reclaim it — every `(memory N)` in every module, plus every `memory.grow`,
+    // leaked for the life of the process, and `tools/conformance.zig`'s careful
+    // per-file arena did not help either. Deinit the instances explicitly.
+    defer {
+        for (r.instances.items) |inst| inst.deinit();
+        // The shared `spectest` memory is BORROWED by every importer, so no
+        // instance frees it — but its bytes are page-allocator owned too.
+        if (r.spectest_memory) |m| interp.freeGuestMemory(m.bytes);
+    }
     for (try sexpr.parseAll(r.a, src)) |cmd| try r.command(cmd);
     return r.summary;
 }
@@ -68,6 +78,9 @@ const HostFunc = interp.Instance.HostFunc;
 
 const Runner = struct {
     a: std.mem.Allocator,
+    /// Every instance built by this script, so their page-allocator memories can
+    /// be released (the runner arena cannot reclaim those). See `runScript`.
+    instances: std.ArrayList(*interp.Instance) = .empty,
     current: ?*interp.Instance = null,
     /// Registered modules (`(register "name")`), for cross-module imports.
     modules: std.StringHashMapUnmanaged(*interp.Instance) = .{},
@@ -133,6 +146,9 @@ const Runner = struct {
         try validate(self.a, m);
         const inst = try self.a.create(interp.Instance);
         inst.* = try interp.Instance.initWithImports(self.a, m, try self.resolveImports(m));
+        // Register before `runStart`: even if the start function traps, the
+        // instance already owns page-allocator memory that must be released.
+        try self.instances.append(self.a, inst);
         try inst.runStart(); // §4.5.5 — a trap here means instantiation failed
         return inst;
     }
@@ -545,6 +561,10 @@ fn isRuntimeTrap(e: anyerror) bool {
         error.CallStackExhausted,
         error.UncaughtException, // an uncaught exception traps (EH proposal)
         => true,
+        // Deliberately NOT listed: `error.GcHeapExhausted`. It is OUR cap on an
+        // uncollected GC heap, not a §4.2 trap — admitting it here would let a
+        // module that merely allocates a lot satisfy an `assert_trap` meant for
+        // real trapping behaviour, which is exactly what this filter prevents.
         else => false,
     };
 }
@@ -910,6 +930,35 @@ test "exception handling: assert_return on a caught exn, assert_trap on an uncau
     ;
     const s = try runScript(std.testing.allocator, src);
     try std.testing.expectEqual(@as(usize, 2), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "exception handling: an exception crossing a module boundary is catchable by the importer" {
+    // `pending_exn` hangs off `Instance`, so an exception unwinding out of an
+    // imported function used to be parked on the CALLEE's instance where the
+    // caller's `onCallError` could never find it: a `try_table (catch_all …)`
+    // wrapped around the call silently failed to fire and the whole invocation
+    // trapped `UncaughtException` instead. `callFunction`'s cross-module arm
+    // now hands the exception to the caller's instance on the way out.
+    //
+    // `$r` stays 0 only if the catch_all really fired; 1 means the callee never
+    // threw, and a trap means the exception escaped uncaught.
+    const src =
+        \\(module (tag $t) (func (export "boom") (throw $t)))
+        \\(register "callee")
+        \\(module
+        \\  (import "callee" "boom" (func $boom))
+        \\  (func (export "go") (result i32)
+        \\    (local $r i32)
+        \\    (block $b
+        \\      (try_table (catch_all $b)
+        \\        (call $boom)
+        \\        (local.set $r (i32.const 1))))
+        \\    (local.get $r)))
+        \\(assert_return (invoke "go") (i32.const 0))
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 1), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
 
