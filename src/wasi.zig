@@ -123,6 +123,12 @@ fn errnoFor(e: anyerror) u32 {
         error.LockViolation => errno.busy,
         error.FileLocksUnsupported, error.OperationUnsupported => errno.notsup,
         error.FileSystem, error.InputOutput, error.HardwareFailure => errno.io,
+        // `readlink` on a non-symlink must be EINVAL, not EIO: "readlink →
+        // EINVAL means not a symlink" is the standard probe idiom in ported
+        // `ls`/`find`/Rust/Go code, so EIO makes those report a hard I/O error
+        // for an ordinary file. `UnsupportedReparsePointType` is the Windows
+        // junction case and answers the same question.
+        error.NotLink, error.UnsupportedReparsePointType => errno.inval,
         else => errno.io,
     };
 }
@@ -1073,10 +1079,17 @@ fn wFdSync(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const w: *Wasi = @ptrCast(@alignCast(ctx));
     const e = w.get(argU32(args, 0)) orelse return ret(results, errno.badf);
     switch (e.*) {
-        .file => |f| f.handle.sync(w.io) catch |err| return ret(results, errnoFor(err)),
+        .file => |f| {
+            // Every sibling checks rights; this one didn't.
+            if (f.rights_base & rights.fd_sync == 0) return ret(results, errno.notcapable);
+            f.handle.sync(w.io) catch |err| return ret(results, errnoFor(err));
+        },
         .stdout => w.stdout.flush() catch return ret(results, errno.io),
         .stderr => w.stderr.flush() catch return ret(results, errno.io),
-        else => {},
+        // Was `else => {}` → ESUCCESS for a directory or stdin. `fsync(dirfd)`
+        // after a rename is the standard durability idiom, and reporting success
+        // for a no-op tells the guest its data is durable when nothing happened.
+        else => return ret(results, errno.notsup),
     }
     return ret(results, errno.success);
 }
@@ -1120,9 +1133,19 @@ fn wFdFdstatSetFlags(ctx: *anyopaque, args: []const Value, results: []Value) boo
     switch (e.*) {
         .file => |*f| {
             if (f.rights_base & rights.fd_fdstat_set_flags == 0) return ret(results, errno.notcapable);
-            f.flags = @truncate(argU32(args, 1));
+            const want: u16 = @truncate(argU32(args, 1));
+            // Only APPEND is actually honoured (`f.flags` is read at the append
+            // write path and by the fdstat echo). Storing the rest verbatim meant
+            // `open(…, O_DSYNC)` returned success AND a following `fd_fdstat_get`
+            // CONFIRMED it, while writes were never synced — a guest relying on
+            // it for crash-consistency silently lost the guarantee. Refuse what
+            // we do not implement instead of pretending.
+            if (want & ~fdflags.append != 0) return ret(results, errno.notsup);
+            f.flags = want;
         },
-        else => {},
+        // Directories and stdio have no settable flags — say so rather than
+        // reporting success for a request that did nothing.
+        else => return ret(results, errno.notsup),
     }
     return ret(results, errno.success);
 }
@@ -1618,21 +1641,36 @@ fn writeStringVec(w: *Wasi, ptrs: u32, buf: u32, strings: []const []const u8, re
 /// `clock_time_get(id, precision, time)` — a nanosecond timestamp.
 fn wClockTimeGet(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const w: *Wasi = @ptrCast(@alignCast(ctx));
-    const clock: Io.Clock = if (argU32(args, 0) == 0) .real else .awake; // 0 = realtime
+    // Was `if (id == 0) .real else .awake`, so CPU-time ids (2/3) and undefined
+    // ids all silently returned since-boot wall time. See `clockOf`.
+    const clock = clockOf(argU32(args, 0)) orelse return ret(results, errno.notsup);
     const ns: i96 = Io.Timestamp.now(w.io, clock).nanoseconds;
     if (!w.writeU64(argU32(args, 2), @intCast(@max(ns, 0)))) return ret(results, errno.fault);
     return ret(results, errno.success);
 }
 
-/// The WASI clock id 0 is realtime; everything else maps to the monotonic clock.
-fn clockOf(id: u32) Io.Clock {
-    return if (id == 0) .real else .awake;
+/// WASI clock ids: 0 = REALTIME, 1 = MONOTONIC. Returns null for the CPU-time
+/// clocks (2 = PROCESS_CPUTIME_ID, 3 = THREAD_CPUTIME_ID), which we do not
+/// implement, and for any undefined id.
+///
+/// This used to be `if (id == 0) .real else .awake` — so `clock_time_get(2)`,
+/// which is what a guest's CPU-time profiling compiles to, returned since-boot
+/// **wall** time labelled as CPU time, and an out-of-range id was accepted
+/// instead of `EINVAL`. Silently answering the wrong question is worse than
+/// refusing: a profiler cannot tell it is being lied to.
+fn clockOf(id: u32) ?Io.Clock {
+    return switch (id) {
+        0 => .real,
+        1 => .awake,
+        else => null, // 2/3 = CPU-time (unimplemented), 4+ = undefined
+    };
 }
 
 /// `clock_res_get(id, resolution)` — the clock's tick resolution, in ns.
 fn wClockResGet(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     const w: *Wasi = @ptrCast(@alignCast(ctx));
-    const d = clockOf(argU32(args, 0)).resolution(w.io) catch return ret(results, errno.inval);
+    const clk = clockOf(argU32(args, 0)) orelse return ret(results, errno.inval);
+    const d = clk.resolution(w.io) catch return ret(results, errno.inval);
     // A zero resolution would be nonsense to a guest; report at least 1 ns.
     if (!w.writeU64(argU32(args, 1), @intCast(@max(d.nanoseconds, 1)))) return ret(results, errno.fault);
     return ret(results, errno.success);
@@ -1701,12 +1739,18 @@ fn wPollOneoff(ctx: *anyopaque, args: []const Value, results: []Value) bool {
             const timeout = w.readU64(s + 24) orelse return ret(results, errno.fault);
             const flags = w.readU16(s + 40) orelse return ret(results, errno.fault);
             var ns: i96 = @intCast(timeout);
-            if (flags & subclock_abstime != 0) ns -= Io.Timestamp.now(w.io, clockOf(id)).nanoseconds;
+            const clk = clockOf(id) orelse return ret(results, errno.inval);
+            if (flags & subclock_abstime != 0) ns -= Io.Timestamp.now(w.io, clk).nanoseconds;
             if (ns < 0) ns = 0;
             if (min_ns == null or ns < min_ns.?) min_ns = ns;
         }
         const ns = min_ns orelse return ret(results, errno.inval); // no clock subs either
-        w.io.sleep(.fromNanoseconds(ns), .awake) catch {};
+        // A swallowed cancellation meant the sleep did NOT happen while the loop
+        // below still reported the clock event as `success` — so a guest
+        // `sleep(60)` returned instantly claiming it had slept, and
+        // `while (!done) sleep(1)` became a 100%-CPU spin. `errno.canceled`
+        // already existed in the table and was unreachable.
+        w.io.sleep(.fromNanoseconds(ns), .awake) catch return ret(results, errno.canceled);
         i = 0;
         while (i < nsubs) : (i += 1) {
             const s = Wasi.arrayOffset(in, i, sub_size) orelse return ret(results, errno.fault);
