@@ -113,12 +113,49 @@ the value stack; segment-drop and grow state persisting across invocations is sp
 matched the native API across 813 modules with zero disagreements; and name resolution round-trips
 correctly across every index space over 666 real `.wat` files.
 
-**Still open (not fixed, recorded):** `(tag $t (export "e") (param …))` silently drops both the export and
-the parameters (15 of 666 corpus files lose an `__exn_tag` export and still validate); flat non-folded
-`br_table` cannot assemble (blocks `wasm2wat` output); `(export "mem" (memory $name))` unsupported (53 of
-666 files); data segments have no name table; the memory-index immediate is parsed and discarded, so
-`(memory.size $nope)` is accepted silently; assemble→decode does not preserve import order. Plus the two
-long-standing exclusions: **#8** (upstream Zig) and `skipConstExpr`'s GC-immediate gap.
+### Assembler gaps — the reported list is now CLOSED (2026-07-21)
+
+Measured against the real `.wat` corpus at `wasmtk/tests` (**493 files**): assembly went from ~468 to
+**488/493**. All committed with regression tests, and — the point of the pass — each was verified by
+*executing* the result, not just assembling it.
+
+- **`(tag $t (export "e") (param …))` silently dropped BOTH the export and the params** — the tag field
+  loop `break`s on any non-`type`/`param`/`result` field, so an inline `(export …)` terminated parsing
+  and left an empty `() → ()`, in a module that still validated. 15 corpus files lost an `__exn_tag`
+  export this way. Fixed; tags also gained an arm in the top-level `(export "e" (tag $t))` form (extern
+  kind 4).
+- **Module-level exports now resolve AFTER all fields**, so a forward reference works — binaryen emits
+  every export *before* the funcs they name, the single largest corpus blocker (`UnknownIdentifier` 9→1).
+- **`(export "mem" (memory $name))`** — memories have no name table (single memory), so a `$name` was a
+  hard `UnknownIdentifier` even though 0 is the only answer. The one declared name is recorded and
+  matched; an undeclared name still rejects, so "unresolved `$name` → 0" does not return.
+- **Flat non-folded `br_table`** — the label scan accepted any atom and swallowed the following
+  instructions as labels. `isIndexAtom` fixes it (wasm2wat's default shape).
+- **Data-segment names** — `memory.init $d`/`data.drop $d` were `BadImmediate` while the sibling
+  `elem.drop $e`/`table.init $e` resolved; data now has a name table.
+- **The memory-index immediate was emitted as 0 WITHOUT being read**, so `(memory.size 7)` and
+  `(memory.size $nope)` ran against memory 0 — the sole silent acceptor among index spaces. Now: unknown
+  name → `UnknownIdentifier`, non-zero index → `UnsupportedInstr`.
+- **`anyfunc`** (pre-standard spelling of `funcref`) accepted; assembles byte-identically.
+- **Legacy folded `try`/`catch` — assembler AND validator.** The interpreter has executed legacy
+  (older-LLVM) EH since Phase 6.3, but the assembler had no text form for it (`(try (do …) (catch $t …)
+  (catch_all …))` was `UnknownInstr`) and the VALIDATOR had no arms for `try_`/`catch_`/`catch_all`/
+  `rethrow` — so a legacy-EH module ran on the raw interp path yet was rejected by `validate` (and thus
+  the `.wast` runner and the summarize path). Both closed: `emitFoldedTry` emits the flat legacy encoding
+  the decoder already reads; the validator gained `try_legacy`/`catch_legacy` control frames and now
+  *rejects* an ill-typed legacy-EH module (new `MismatchedCatch`). A compiled WASI program using
+  try/catch (`15_recover.wat`) prints its recovery output through the normal CLI path. **`delegate` is
+  deliberately rejected at assembly** (`UnsupportedInstr`): `precomputeControlFlow` records its label but
+  `throwException` never routes through it, so emitting it would validate yet silently mis-run — the
+  "bytes don't match the source" failure the assembler refuses elsewhere. No corpus file uses it.
+
+**Still open** — a distinct long tail, not the reported gaps: 5 corpus files need out-of-scope proposals
+or are malformed (`memory64.wat` = i64 addresses; `memory-multiple.wat` = multi-memory *text*, correctly
+`UnsupportedInstr`; `gc-linked-list.wat` = a GC type-name edge; `SumSquared.wat`/`loop.wat` appear
+malformed — `BadModuleField`/`UnterminatedList`). Assemble→decode still does not preserve import order
+(indices stay consistent; only the linking-ABI order differs). Runtime `delegate` routing is unimplemented
+(field recorded, never consulted). Plus the two long-standing exclusions: **#8** (upstream Zig) and
+`skipConstExpr`'s GC-immediate gap.
 
 ## Code audit 2026-07-19 ("look for code issues") — 8 fixed, a few deferred
 

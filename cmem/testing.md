@@ -108,9 +108,13 @@ Two harness facts worth keeping:
 - **`ReleaseFast` for conformance runs.** Debug frames are large enough that deep-recursion tests used to
   segfault the runner; the depth cap is now safe in every mode, but Release is still much faster here.
 
-The remaining 752 failures are dominated by **assembler feature gaps**, not wrong answers — inline
-`(export …)` on a tag, flat `br_table`, `(export "mem" (memory $name))`, data-segment names, `(module
-quote …)`. Those are the highest-value next increments precisely because the oracle now measures them.
+The remaining failures are dominated by **assembler feature gaps**, not wrong answers. Most of the
+reported set was closed in the follow-up assembler batch (see known-issues, "Assembler gaps"): inline
+`(export …)` on a tag, forward-referenced exports, `(export "mem" (memory $name))`, flat `br_table`,
+data-segment names, the discarded memory-index immediate, `anyfunc`, and **legacy folded `try`/`catch`**
+(which also needed validator support). Real-world `.wat` corpus assembly went 468 → **488/493**. What's
+left is a genuine long tail — `(module quote …)`, memory64, multi-memory *text*, a GC type-name edge —
+each a distinct proposal rather than a shared gap.
 
 ## Spec-testsuite conformance snapshot (2026-07-02, `wast.zig` MVP) — SUPERSEDED by the run above
 
