@@ -4,7 +4,10 @@
       "Bash(sed -n '9915,9960p' \"C:/Users/jmarcum/scoop/apps/zig/0.16.0/lib/std/Io/Threaded.zig\")",
       "Read(//c/Users/jmarcum/scoop/apps/zig/0.16.0/lib/std/Io/**)",
       "WebFetch(domain:nix.dev)",
-      "Bash(zig build *)"
+      "Bash(zig build *)",
+      "Bash(export ZIG_LOCAL_CACHE_DIR=\"C:/Users/jmarcum/AppData/Local/Temp/claude/d--Programs--ProgramExamples-Example-Programs-wasmExamples-wazmrt/0a3433da-a4a4-467b-9658-d4c222ac75d8/scratchpad/zcache\")",
+      "Bash(./zig-out/bin/deep.exe)",
+      "Bash(echo \"exit=$?\")"
     ]
   }
 }

@@ -295,6 +295,10 @@ pub const DecodeError = error{
     MalformedFlag,
     /// A value-type byte was not one of the defined value types.
     BadValType,
+    /// A name (import module/field, export, custom-section id) was not valid
+    /// UTF-8. §5.2.4 defines a name as a UTF-8 byte vector, so this is a
+    /// malformed module, not merely an odd one.
+    InvalidUtf8,
     /// The data-count section disagreed with the number of data segments.
     DataCountMismatch,
     /// An instruction opcode wazmrt does not decode. The `0xFC` (saturating

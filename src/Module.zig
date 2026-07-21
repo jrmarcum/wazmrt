@@ -286,6 +286,10 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
             .custom => {
                 const nlen = try sub.readVarU32();
                 const cname = try sub.readBytes(nlen);
+                // A custom section's id is a *name* (§5.2.4), so it is UTF-8 too.
+                // It does not go through `readName` (nothing is copied out), so
+                // the check has to be repeated here.
+                if (!std.unicode.utf8ValidateSlice(cname)) return error.InvalidUtf8;
                 // Keep the "name" section's function-name subsection (§7.4.2) so
                 // traps can report a symbol instead of a bare index. We copy the
                 // bytes and scan them lazily — a module that never traps pays
@@ -606,9 +610,21 @@ fn readValTypes(a: std.mem.Allocator, r: *Reader, kinds: []const CompKind) Error
 }
 
 /// Copy a length-prefixed name (§5.2.4) into arena-owned memory.
+///
+/// A name is not an arbitrary byte string: §5.2.4 defines it as a vector of
+/// bytes that **must be valid UTF-8**, and a module whose names are not is
+/// malformed. We accepted any bytes, so every `utf8-*.wast` assertion in the
+/// spec suite (import module, import field, export, custom-section id — 528 of
+/// them) was an accept-invalid. Names reach `std.mem.eql` for import/export
+/// resolution and get handed to embedders as `char*` through the C ABI, so the
+/// encoding is part of the contract, not decoration.
+///
+/// Every name in the format flows through here, so this is the one place the
+/// check belongs.
 fn readName(a: std.mem.Allocator, r: *Reader) Error![]const u8 {
     const n = try r.readVarU32();
     const src = try r.readBytes(n);
+    if (!std.unicode.utf8ValidateSlice(src)) return error.InvalidUtf8;
     const dst = try a.alloc(u8, n);
     @memcpy(dst, src);
     return dst;
@@ -1071,6 +1087,36 @@ test "indexes a single custom section" {
     const s = m.section(.custom).?;
     try std.testing.expectEqual(@as(usize, 1), s.size);
     try std.testing.expectEqual(@as(usize, 10), s.offset);
+}
+
+test "names must be valid UTF-8 (§5.2.4)" {
+    const gpa = std.testing.allocator;
+
+    // A custom-section id of a lone continuation byte (0x80) — never valid UTF-8.
+    {
+        const bytes = types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+            [_]u8{ 0x00, 0x02, 0x01, 0x80 };
+        try std.testing.expectError(error.InvalidUtf8, Module.decode(gpa, &bytes));
+    }
+    // The same bytes with a valid 1-byte name still decode, so the test is
+    // discriminating on the ENCODING, not on the length or framing.
+    {
+        const bytes = types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+            [_]u8{ 0x00, 0x02, 0x01, 'x' };
+        var m = try Module.decode(gpa, &bytes);
+        defer m.deinit();
+        try std.testing.expectEqual(@as(usize, 1), m.sections.len);
+    }
+    // An EXPORT name goes through `readName` instead. Module: one empty func,
+    // exported under a truncated 2-byte sequence (0xC3 with no continuation).
+    {
+        const bytes = types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+            [_]u8{ 0x01, 0x04, 0x01, 0x60, 0x00, 0x00 } ++ // type: [] -> []
+            [_]u8{ 0x03, 0x02, 0x01, 0x00 } ++ // function: one func of type 0
+            [_]u8{ 0x07, 0x05, 0x01, 0x01, 0xC3, 0x00, 0x00 } ++ // export "\xC3" func 0
+            [_]u8{ 0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b }; // code: one empty body
+        try std.testing.expectError(error.InvalidUtf8, Module.decode(gpa, &bytes));
+    }
 }
 
 test "rejects a bad magic" {

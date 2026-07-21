@@ -933,6 +933,29 @@ test "exception handling: assert_return on a caught exn, assert_trap on an uncau
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
 
+test "unbounded recursion traps CallStackExhausted instead of overflowing the host stack" {
+    // A guest `call` recurses NATIVELY, so `max_call_depth` is the only thing
+    // between a runaway module and a segfault. It was calibrated against
+    // ReleaseFast frames and sat ABOVE what Debug's larger frames could take, so
+    // in Debug the process died at ~878 frames without the guard ever firing.
+    // Nothing in the suite recursed deeply enough to notice — the spec suite's
+    // own `call.wast` did, and crashed the runner.
+    //
+    // Both shapes matter: direct self-recursion and a mutual cycle (which a
+    // naive same-function-index guard would miss).
+    const src =
+        \\(module
+        \\  (func $runaway (export "runaway") (call $runaway))
+        \\  (func $m1 (export "mutual") (call $m2))
+        \\  (func $m2 (call $m1)))
+        \\(assert_exhaustion (invoke "runaway") "call stack exhausted")
+        \\(assert_exhaustion (invoke "mutual") "call stack exhausted")
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 2), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
 test "exception handling: an exception crossing a module boundary is catchable by the importer" {
     // `pending_exn` hangs off `Instance`, so an exception unwinding out of an
     // imported function used to be parked on the CALLEE's instance where the

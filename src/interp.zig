@@ -289,7 +289,27 @@ fn funcTypeEqual(x: Module.FuncType, y: Module.FuncType) bool {
     return std.mem.eql(V, x.params, y.params) and std.mem.eql(V, y.results, x.results);
 }
 
-const max_call_depth = 1024;
+/// Cap on guest call depth. A guest `call` recurses NATIVELY (one
+/// `callFunction`/`run` frame per guest frame), so the real resource is bytes of
+/// host stack and this frame count is only a proxy for it — which means the
+/// number has to be calibrated against the build whose frames are LARGEST, not
+/// the one we ship.
+///
+/// It was 1024, measured against ReleaseFast. In **Debug** the interpreter's
+/// frames are big enough that the native stack dies at ~878 guest frames, so the
+/// guard never fired and the process **segfaulted** instead of trapping
+/// `CallStackExhausted` — reachable from any module with unbounded recursion
+/// (the spec suite's own `call.wast` "runaway"/"mutual-runaway" cases do exactly
+/// this, which is how it was found). 512 leaves ~1.7x headroom in Debug and
+/// keeps every build mode behaving identically, which matters more than the
+/// absolute depth: a program must not trap in one build and run in another.
+///
+/// Caveat worth knowing: through the C ABI we run on whatever stack the embedder
+/// gives us. A host that calls in on a small thread stack can still run out
+/// before 512 frames; bounding that properly would mean either measuring
+/// remaining stack at run time or executing guests on a thread we size
+/// ourselves. Neither is in scope here.
+const max_call_depth = 512;
 
 const Label = struct {
     is_loop: bool,
