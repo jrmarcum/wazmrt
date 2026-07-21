@@ -679,14 +679,31 @@ const FuncValidator = struct {
             // Bulk memory. All three take `[dst, src|byte, n]` as i32 and need a
             // linear memory; `memory.init`/`data.drop` also need a valid data index.
             .memory_copy, .memory_fill => {
-                if (self.module.memories.len == 0) return error.MissingMemory;
+                // Bulk ops name a memory INDEX; testing only `len == 0` accepted
+                // `memory.fill (memory 7)` in a one-memory module. Sibling of the
+                // load/store hole `requireMemory` was added to close.
+                switch (instr.op) {
+                    .memory_fill => try self.requireMemory(instr.imm.mem_index),
+                    else => {
+                        try self.requireMemory(instr.imm.mem_copy.dst);
+                        try self.requireMemory(instr.imm.mem_copy.src);
+                    },
+                }
                 _ = try self.popExpect(.i32); // n
                 _ = try self.popExpect(.i32); // src / fill byte
                 _ = try self.popExpect(.i32); // dst
             },
             .memory_init => {
-                if (self.module.memories.len == 0) return error.MissingMemory;
-                if (instr.imm.data >= self.module.data.len) return error.UndefinedData;
+                // WRONG UNION FIELD: `memory.init` decodes to `.mem_init{data, mem}`,
+                // not `.data` — so this was `access of union field 'data' while
+                // field 'mem_init' is active`, i.e. a **panic while validating a
+                // VALID module** (LLVM emits `memory.init` for any passive data
+                // segment). In ReleaseFast the members alias at offset 0, so it
+                // silently read the right number — UB that happens to work, and
+                // differs by build mode. `data_drop` below is correct; its
+                // immediate really is `.data`.
+                try self.requireMemory(instr.imm.mem_init.mem);
+                if (instr.imm.mem_init.data >= self.module.data.len) return error.UndefinedData;
                 _ = try self.popExpect(.i32); // n
                 _ = try self.popExpect(.i32); // src (offset into the segment)
                 _ = try self.popExpect(.i32); // dst
@@ -726,13 +743,16 @@ const FuncValidator = struct {
             // func ref collapses to `funcref` in our model (see the decoder P1).
             .call_ref => {
                 const ft = self.module.funcSig(instr.imm.func) orelse return error.UndefinedType;
-                _ = try self.popExpect(.funcref); // the function reference (top)
+                // The immediate names the signature, so the operand must be a ref to
+                // THAT type — `popExpect(.funcref)` accepted any funcref, so
+                // `call_ref $a` on a `(ref $b)` delivered an i64 result as i32.
+                _ = try self.popExpect(V.concreteRef(true, .func, instr.imm.func));
                 try self.popVals(ft.params);
                 try self.pushVals(ft.results);
             },
             .return_call_ref => {
                 const ft = self.module.funcSig(instr.imm.func) orelse return error.UndefinedType;
-                _ = try self.popExpect(.funcref);
+                _ = try self.popExpect(V.concreteRef(true, .func, instr.imm.func));
                 try self.popVals(ft.params);
                 if (!valTypesEqual(ft.results, self.results)) return error.TypeMismatch;
                 self.setUnreachable();
@@ -778,7 +798,12 @@ const FuncValidator = struct {
                 if (gf.field >= fields.len) return error.UndefinedField;
                 const field = fields[gf.field];
                 try requirePacking(instr.op == .struct_get, field.storage);
-                _ = try self.popExpect(.structref); // (ref null $t)
+                // Pop the CONCRETE type, not the family head: popping `.structref`
+                // let ANY struct ref satisfy ANY `struct.*`, so `struct.get $b 0`
+                // on a `(ref $a)` reinterpreted an i64 field as a funcref and
+                // `call_ref` then CALLED it. `subtypeOf` already walks the
+                // declared supertype chain for concrete/concrete.
+                _ = try self.popExpect(V.concreteRef(true, .@"struct", gf.type_index));
                 try self.pushValT(field.storage.unpacked());
             },
             .struct_set => {
@@ -787,7 +812,7 @@ const FuncValidator = struct {
                 if (gf.field >= fields.len) return error.UndefinedField;
                 if (!fields[gf.field].mutable) return error.ImmutableField;
                 _ = try self.popExpect(fields[gf.field].storage.unpacked());
-                _ = try self.popExpect(.structref);
+                _ = try self.popExpect(V.concreteRef(true, .@"struct", gf.type_index));
             },
 
             // GC: array objects. `t'` is the (unpacked) element type.
@@ -821,7 +846,10 @@ const FuncValidator = struct {
                 const f = self.module.arrayField(instr.imm.gc_type) orelse return error.UndefinedType;
                 try requirePacking(instr.op == .array_get, f.storage);
                 _ = try self.popExpect(.i32); // index
-                _ = try self.popExpect(.arrayref); // (ref null $t)
+                // Concrete, not the family head — see `struct.get`. Popping
+                // `.arrayref` let any array ref satisfy any `array.*`, so
+                // `array.get $y` on a `(ref $x)` forged a funcref from an i64.
+                _ = try self.popExpect(V.concreteRef(true, .array, instr.imm.gc_type));
                 try self.pushValT(f.storage.unpacked());
             },
             .array_set => {
@@ -829,7 +857,7 @@ const FuncValidator = struct {
                 if (!f.mutable) return error.ImmutableField;
                 _ = try self.popExpect(f.storage.unpacked()); // value
                 _ = try self.popExpect(.i32); // index
-                _ = try self.popExpect(.arrayref);
+                _ = try self.popExpect(V.concreteRef(true, .array, instr.imm.gc_type));
             },
             .array_len => {
                 _ = try self.popExpect(.arrayref); // (ref null array)

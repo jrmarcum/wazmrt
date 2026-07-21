@@ -537,7 +537,15 @@ fn readValType(r: *Reader, kinds: []const CompKind) Error!types.ValType {
         0x6b => .structref,
         0x6a => .arrayref,
         0x71 => .nullref, // none
-        0x69, 0x74 => .externref, // exnref, nullexnref (EH — opaque, out of scope)
+        // EH is implemented, so `exnref` is its own type — mapping it to
+        // `externref` (a stale "out of scope" note) meant `opcode.readHeapType`
+        // and this reader DISAGREED: a valid `try_table` whose block type had an
+        // `exnref` result was rejected `TypeMismatch`, and an `exnref` in a
+        // param/local/global/table slot was silently type-confused with
+        // `externref` — which the C ABI would then hand out as a host pointer
+        // although it is an `exn_store` index.
+        0x69 => .exnref,
+        0x74 => .nullref, // nullexnref — bottom; closest modelled type
         0x68 => .funcref_nn, // our synthetic non-null tags (assembler round-trip)
         0x67 => .externref_nn,
         0x66 => .anyref_nn,
