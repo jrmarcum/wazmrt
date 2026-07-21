@@ -7,12 +7,15 @@
 //! per-call label stack plus a branch-target table precomputed once per function
 //! at instantiation (matching `end`/`else` for every `block`/`loop`/`if`).
 //!
-//! **Scope today:** the core-MVP instruction set plus reference types — i32/i64/
-//! f32/f64 numeric ops, locals, globals (init const-exprs evaluated, incl.
-//! extended-const and imported-global values), linear memory, `drop`/`select`,
-//! structured control flow, direct `call`, `call_indirect` over multiple tables,
-//! and `ref.null`/`ref.is_null`/`ref.func`. Imported *functions* still trap
-//! (`UnsupportedImportCall`) — host-function calls are the next execution slice.
+//! **Scope today (corrected 2026-07-21 — this header had gone stale):** the core
+//! instruction set, reference and typed-function references, **full GC**
+//! (struct/array/i31, `ref.test`/`ref.cast`, `br_on_cast*`), the **complete**
+//! SIMD set (`execSimd`), **exception handling in both encodings** (`try_table`
+//! + legacy `try`/`catch`, via `exn_store`), **multi-memory**, and **host
+//! function imports** — WASI and the C ABI both ride on `HostFunc.native_env`,
+//! dispatched in `callFunction`. The old claim that imported functions "still
+//! trap — host-function calls are the next execution slice" has been false since
+//! WASI shipped.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -60,14 +63,14 @@ const guest_mem_align: std.mem.Alignment = .fromByteUnits(16);
 /// declaration measured 1029 MB RSS and returned `0xAAAAAAAA` to the guest
 /// before this was fixed. `rawAlloc` skips the poison and hands back the OS
 /// mapping as-is, which the OS guarantees is zero-filled.
-fn allocGuestMemory(n: usize) error{OutOfMemory}![]u8 {
+pub fn allocGuestMemory(n: usize) error{OutOfMemory}![]u8 {
     if (n == 0) return &.{};
     const p = memory_allocator.rawAlloc(n, guest_mem_align, @returnAddress()) orelse
         return error.OutOfMemory;
     return p[0..n];
 }
 
-fn freeGuestMemory(buf: []u8) void {
+pub fn freeGuestMemory(buf: []u8) void {
     if (buf.len == 0) return;
     memory_allocator.rawFree(buf, guest_mem_align, @returnAddress());
 }
@@ -76,7 +79,7 @@ fn freeGuestMemory(buf: []u8) void {
 /// A remap extends the mapping with fresh (zero) pages; the fallback lands in a
 /// fresh mapping whose bytes past the copy are already zero. Either way no
 /// `@memset` — a 4 GiB grow must not touch 4 GiB.
-fn growGuestMemory(old: []u8, n: usize) error{OutOfMemory}![]u8 {
+pub fn growGuestMemory(old: []u8, n: usize) error{OutOfMemory}![]u8 {
     if (old.len == 0) return allocGuestMemory(n);
     if (memory_allocator.rawRemap(old, guest_mem_align, n, @returnAddress())) |p| return p[0..n];
     const new = try allocGuestMemory(n);
@@ -164,7 +167,10 @@ pub const Error = Module.Error || error{
     BadArgCount,
     /// Function index out of range (should not happen post-validation).
     UndefinedFunc,
-    /// Calling an imported (host) function — not yet supported.
+    /// An imported function index with no host backing supplied — i.e. the index
+    /// is past `Imports.funcs`. (NOT "host calls are unsupported": those work,
+    /// via `HostFunc.native_env`. Same family as `MissingImport` below, which is
+    /// its table/memory counterpart.)
     UnsupportedImportCall,
     /// An imported table/memory was declared but no host backing was supplied.
     MissingImport,
@@ -679,7 +685,13 @@ pub const Instance = struct {
         const imported_memories = module.importedMemoryCount();
         const memories = try gpa.alloc(*Memory, module.memories.len);
         errdefer gpa.free(memories);
-        var built: usize = 0;
+        // Starts at `imported_memories`, NOT 0: the errdefer slices
+        // `memories[imported_memories..built]`, so a failure in the *import*
+        // branch below (which returns before `built` is ever raised) formed
+        // `memories[1..0]` — start > end, i.e. illegal behaviour. A one-line
+        // `.wat` with an unbacked memory import panicked in Debug and was
+        // unchecked in ReleaseFast.
+        var built: usize = imported_memories;
         errdefer for (memories[imported_memories..built]) |m| { // free only owned ones built so far
             freeGuestMemory(m.bytes);
             gpa.destroy(m);
@@ -2355,8 +2367,25 @@ const Frame = struct {
             .sub => a - b,
             .mul => a * b,
             .div => a / b,
-            .min => @min(a, b),
-            .max => @max(a, b),
+            // `@min`/`@max` on floats are minNum/maxNum: "if one operand is NaN,
+            // return the other", and the ±0 case is unordered so the lowering
+            // returns either. wasm's `fNxM.min`/`max` are the lane-wise
+            // application of the SAME NaN-propagating fmin/fmax the scalar ops
+            // use, including min(+0,−0) = −0 and max(+0,−0) = +0.
+            //
+            // The scalar path was always right (it calls `fmin`/`fmax` below);
+            // only the SIMD path used the builtins, so identical source compiled
+            // with and without autovectorisation gave different answers —
+            // `f32x4.min(nan, 1.0)` returned 1.0. Per-lane escape hatch, the same
+            // shape `simdFloatUn(.nearest)` already uses.
+            .min, .max => blk: {
+                const N = 16 / @sizeOf(Lane);
+                const av: [N]Lane = a;
+                const bv: [N]Lane = b;
+                var out: [N]Lane = undefined;
+                for (0..N) |i| out[i] = if (op == .min) fmin(Lane, av[i], bv[i]) else fmax(Lane, av[i], bv[i]);
+                break :blk @as(Vec, out);
+            },
             .pmin => @select(Lane, b < a, b, a), // pseudo-min: b if b<a else a
             .pmax => @select(Lane, a < b, b, a),
         };
@@ -4345,4 +4374,70 @@ test "hardening: a bare else with no matching if is rejected at load time" {
         .{ .id = 10, .body = try ehCode(a, &.{&fbody}) },
     });
     try std.testing.expectError(error.UnbalancedControl, instantiate(bytes));
+}
+
+test "SIMD: fNxM.min/max propagate NaN and match the scalar ops on signed zero" {
+    // wasm's `fNxM.min`/`max` are the LANE-WISE application of the same
+    // NaN-propagating fmin/fmax the scalar ops use. `@min`/`@max` on floats are
+    // minNum/maxNum instead ("if one operand is NaN, return the other"), and
+    // leave ±0 unordered — so the SIMD path silently disagreed with the scalar
+    // path and `f32x4.min(nan, 1.0)` returned 1.0.
+    //
+    // Identical source compiled with and without autovectorisation therefore
+    // produced different answers. `pmin`/`pmax` deliberately keep the `@select`
+    // form: asymmetric NaN handling IS their spec.
+    //
+    // Why eleven audit passes missed it: no `simd_*.wast` has ever been run
+    // (see cmem/testing.md's snapshot list), and every SIMD unit test used
+    // ordinary finite operands — exactly the region where `@min` and `fmin` agree.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // f32x4.splat(nan) ; f32x4.splat(1.0) ; f32x4.min ; extract_lane 0 ; reinterpret
+    const nan_bits = [_]u8{ 0x00, 0x00, 0xc0, 0x7f }; // 0x7fc00000
+    const one_bits = [_]u8{ 0x00, 0x00, 0x80, 0x3f }; // 1.0
+    const zero_bits = [_]u8{ 0x00, 0x00, 0x00, 0x00 }; // +0.0
+    const negz_bits = [_]u8{ 0x00, 0x00, 0x00, 0x80 }; // -0.0
+
+    const Case = struct { lhs: [4]u8, rhs: [4]u8, op: u8, want: u32 };
+    const cases = [_]Case{
+        .{ .lhs = nan_bits, .rhs = one_bits, .op = 0xe8, .want = 0x7fc00000 }, // min(nan,1) -> NaN
+        .{ .lhs = one_bits, .rhs = nan_bits, .op = 0xe8, .want = 0x7fc00000 }, // min(1,nan) -> NaN
+        .{ .lhs = nan_bits, .rhs = one_bits, .op = 0xe9, .want = 0x7fc00000 }, // max(nan,1) -> NaN
+        .{ .lhs = zero_bits, .rhs = negz_bits, .op = 0xe8, .want = 0x80000000 }, // min(+0,-0) -> -0
+        .{ .lhs = negz_bits, .rhs = zero_bits, .op = 0xe9, .want = 0x00000000 }, // max(-0,+0) -> +0
+    };
+
+    for (cases) |c| {
+        // f32.const lhs ; f32x4.splat ; f32.const rhs ; f32x4.splat ; <op> ;
+        // f32x4.extract_lane 0 ; i32.reinterpret_f32 ; end
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(a);
+        try body.append(a, 0x00); // no locals
+        try body.append(a, 0x43); // f32.const
+        try body.appendSlice(a, &c.lhs);
+        try body.appendSlice(a, &.{ 0xfd, 0x13 }); // f32x4.splat
+        try body.append(a, 0x43);
+        try body.appendSlice(a, &c.rhs);
+        try body.appendSlice(a, &.{ 0xfd, 0x13 });
+        // The SIMD sub-opcode is a LEB128 u32, so 0xe8/0xe9 need a continuation
+        // byte — a bare 0xe8 would be read as the start of a multi-byte value.
+        try body.appendSlice(a, &.{ 0xfd, c.op, 0x01 });
+        try body.appendSlice(a, &.{ 0xfd, 0x1f, 0x00 }); // f32x4.extract_lane 0
+        try body.append(a, 0xbc); // i32.reinterpret_f32
+        try body.append(a, 0x0b); // end
+
+        const bytes = try ehModule(a, &.{
+            .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x01, 0x7f } },
+            .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+            .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
+            .{ .id = 10, .body = try ehCode(a, &.{body.items}) },
+        });
+        var inst = try instantiate(bytes);
+        defer destroy(&inst);
+        const r = try inst.invoke("f", &.{});
+        defer std.testing.allocator.free(r);
+        try std.testing.expectEqual(c.want, @as(u32, @bitCast(asI32(r[0]))));
+    }
 }

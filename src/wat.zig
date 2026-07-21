@@ -14,8 +14,16 @@
 //! `.grow`/`.fill`), globals (`(global (mut? t) init)`, incl. imported globals +
 //! extended-const inits, `global.get`/`.set`), and reference types
 //! (`ref.null`/`ref.is_null`/`ref.func`, `(ref null? func|extern)`) — in both
-//! folded `(i32.add (local.get 0) (local.get 1))` and flat forms. Deferred:
-//! `start`, imported functions/tables/memories, `table.init`/`.copy`.
+//! folded `(i32.add (local.get 0) (local.get 1))` and flat forms.
+//!
+//! Also assembled (missing from this header until 2026-07-21): `(start …)`,
+//! **imported functions/tables/memories**, the bulk table ops (`table.init`/
+//! `.copy`, `elem.drop`), the **complete SIMD set**, **GC**, and **exception
+//! handling** (`emitTryTable`). The old header listed the first three as
+//! "Deferred" long after they shipped.
+//!
+//! Genuinely deferred: multi-memory in the text syntax, and legacy
+//! `try`/`catch` (decode + execute only — no assembler support).
 
 const std = @import("std");
 const sexpr = @import("sexpr.zig");
@@ -1821,7 +1829,7 @@ fn emitMemArg(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
     try uleb(ctx.a, ctx.out, offset);
 }
 
-/// Natural alignment (log2 of the access size) for a load/store opcode.
+/// The first immediate of an instruction, or `BadImmediate` if it has none.
 fn imm0(immediates: []const Sexpr) Error!Sexpr {
     if (immediates.len == 0) return error.BadImmediate;
     return immediates[0];
@@ -1911,8 +1919,6 @@ fn lookupSimd(name: []const u8) ?SimdOp {
     return null;
 }
 
-/// Emit a SIMD op: parse its immediate from `items[start..]`, emit operand
-/// sub-exprs (folded form only), then `0xFD sub imm`. Returns the next index.
 /// The natural (maximum-allowed) alignment, as a log2, for a SIMD memory op —
 /// used as the `align=` default. Wrong here means the validator rejects an
 /// omitted-align load8_splat/load_lane as over-aligned.
@@ -1926,6 +1932,8 @@ fn simdNaturalAlign(sub: u32) u32 {
     };
 }
 
+/// Emit a SIMD op: parse its immediate from `items[start..]`, emit operand
+/// sub-exprs (folded form only), then `0xFD sub imm`. Returns the next index.
 fn emitSimd(ctx: *Ctx, sd: SimdOp, items: []const Sexpr, start: usize, is_folded: bool) Error!usize {
     var j = start;
     var lane: u8 = 0;

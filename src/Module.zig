@@ -180,8 +180,12 @@ sections: []const Section,
 /// The type index space (§5.3): func / struct / array composite types, in
 /// declaration order (rec groups flattened into consecutive indices).
 comp_types: []const CompType,
-/// Declared supertype of each type index (GC sub types), or null. Kept for
-/// future `ref.cast`/subtyping; unused by the current slice.
+/// Declared supertype of each type index (GC sub types), or null.
+///
+/// **LIVE — do not remove.** Read by `isSubtype`'s supertype-chain walk, which
+/// `ref.cast`/`br_on_cast`/operand matching all depend on. (This said "kept for
+/// future `ref.cast`; unused by the current slice" until 2026-07-21, long after
+/// GC P3 shipped — dead-code bait that could have cost a live field.)
 supertypes: []const ?u32,
 /// Type index of each *defined* function (function section), in order.
 functions: []const u32,

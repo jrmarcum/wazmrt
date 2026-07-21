@@ -828,7 +828,12 @@ fn valToSlot(v: Val) interp.Value {
         1 => interp.i64Value(v.of.i64), // WASM_I64
         2 => interp.f32Value(v.of.f32), // WASM_F32
         3 => interp.f64Value(v.of.f64), // WASM_F64
-        else => @intFromPtr(v.of.ref), // ref: pass the host pointer through
+        // Ref: NULL is the guest's `ref.null`, which the interpreter represents as
+        // the `null_ref` SENTINEL (maxInt(u64)), not as 0. Punning the pointer
+        // straight through inverted null in both directions: a host NULL became
+        // slot 0 — i.e. **funcref #0**, so `ref.is_null` answered false and
+        // `call_ref` called function 0 instead of trapping.
+        else => if (v.of.ref == null) interp.null_ref else @intFromPtr(v.of.ref),
     };
 }
 
@@ -839,7 +844,15 @@ fn slotToVal(t: types.ValType, x: interp.Value) Val {
         .i64 => .{ .kind = 1, .of = .{ .i64 = interp.asI64(x) } },
         .f32 => .{ .kind = 2, .of = .{ .f32 = interp.asF32(x) } },
         .f64 => .{ .kind = 3, .of = .{ .f64 = interp.asF64(x) } },
-        else => .{ .kind = valkindOf(t), .of = .{ .ref = @ptrFromInt(x) } },
+        // See `valToSlot`: the `null_ref` sentinel must surface as a C NULL, or
+        // the embedder's `val.of.ref == NULL` test reads a `ref.null` as a live
+        // reference (and then segfaults on any `wasm_ref_*` call).
+        //
+        // Residual, unchanged: a NON-null funcref slot holds a function *index*,
+        // which this still puns as a pointer. Representing it properly needs the
+        // `wasm_ref_t` object model the table path uses (`refFromTableValue`);
+        // until then, do not call `wasm_ref_delete` on a ref from a `wasm_val_t`.
+        else => .{ .kind = valkindOf(t), .of = .{ .ref = if (x == interp.null_ref) null else @ptrFromInt(x) } },
     };
 }
 
@@ -851,7 +864,7 @@ fn slotToValKind(kind: Valkind, x: interp.Value) Val {
         1 => .{ .kind = 1, .of = .{ .i64 = interp.asI64(x) } },
         2 => .{ .kind = 2, .of = .{ .f32 = interp.asF32(x) } },
         3 => .{ .kind = 3, .of = .{ .f64 = interp.asF64(x) } },
-        else => .{ .kind = kind, .of = .{ .ref = @ptrFromInt(x) } },
+        else => .{ .kind = kind, .of = .{ .ref = if (x == interp.null_ref) null else @ptrFromInt(x) } },
     };
 }
 
@@ -1446,15 +1459,20 @@ fn memObj(r: *const Ref) ?*interp.Instance.Memory {
 export fn wasm_memory_new(store: ?*Store, mt: ?*const MemoryType) ?*Ref {
     _ = store;
     const t = mt orelse return null;
-    const bytes = alloc.alloc(u8, @as(usize, t.limits.min) * wasm_page_size) catch return null;
-    @memset(bytes, 0);
+    // Guest linear memory ALWAYS comes from the interpreter's page-allocator
+    // helpers, never from `alloc`. `memObj` can hand back either a host memory
+    // created here or an *instance* memory that `interp` allocated, and the two
+    // must be freed/grown by the same allocator — mixing them (this used
+    // `alloc.alloc`/`alloc.realloc` while `interp` moved to demand-zero OS pages)
+    // is cross-allocator heap corruption. Also demand-zero, so no `@memset`.
+    const bytes = interp.allocGuestMemory(@as(usize, t.limits.min) * wasm_page_size) catch return null;
     const mem = alloc.create(interp.Instance.Memory) catch {
-        alloc.free(bytes);
+        interp.freeGuestMemory(bytes);
         return null;
     };
     mem.* = .{ .bytes = bytes, .max = if (t.limits.max == 0xffff_ffff) null else t.limits.max };
     const r = alloc.create(Ref) catch {
-        alloc.free(bytes);
+        interp.freeGuestMemory(bytes);
         alloc.destroy(mem);
         return null;
     };
@@ -1480,13 +1498,16 @@ export fn wasm_memory_size(m: ?*const Ref) u32 {
 export fn wasm_memory_grow(m: ?*Ref, delta: u32) bool {
     const r = m orelse return false;
     const mem = memObj(r) orelse return false;
-    const old_len = mem.bytes.len;
-    const old_pages: u32 = @intCast(old_len / wasm_page_size);
+    const old_pages: u32 = @intCast(mem.bytes.len / wasm_page_size);
     const new_pages = @as(u64, old_pages) + delta;
     const max = mem.max orelse 0x1_0000; // wasm32: at most 65536 pages
     if (new_pages > max) return false;
-    const grown = alloc.realloc(mem.bytes, @as(usize, @intCast(new_pages)) * wasm_page_size) catch return false;
-    @memset(grown[old_len..], 0);
+    // Same allocator as whoever created these bytes — see `wasm_memory_new`.
+    // `memObj` may return an *instance* memory owned by `interp`'s page
+    // allocator, so `alloc.realloc` here was a cross-allocator realloc.
+    const grown = interp.growGuestMemory(mem.bytes, @as(usize, @intCast(new_pages)) * wasm_page_size) catch return false;
+    // The grown tail is demand-zero, so no @memset is needed (nor wanted — it
+    // would touch every new page and defeat the lazy commit).
     mem.bytes = grown;
     return true;
 }
@@ -2234,7 +2255,7 @@ fn destroyRef(r: *Ref) void {
     if (r.functype) |ft| freeExternType(@ptrCast(ft));
     if (r.host_global) |hg| alloc.destroy(hg);
     if (r.host_memory) |mem| {
-        alloc.free(mem.bytes);
+        interp.freeGuestMemory(mem.bytes); // page-allocator owned — see wasm_memory_new
         alloc.destroy(mem);
     }
     if (r.host_table) |tbl| {
@@ -3103,4 +3124,34 @@ test "a trap keeps its instance alive after the embedder deletes it" {
     try std.testing.expectEqual(@as(usize, 1), again.size);
 
     wasm_trap_delete(t); // releases the frames' handle on the instance
+}
+
+test "ref null round-trips as C NULL in both directions" {
+    // `interp` represents `ref.null` as the sentinel maxInt(u64), NOT 0. Punning
+    // the slot straight to a pointer inverted null BOTH ways: a guest `ref.null`
+    // arrived as 0xFFFF…FF (non-NULL, so the embedder's null check failed), and a
+    // host NULL became slot 0 — funcref #0 — so `ref.is_null` answered false and
+    // `call_ref` would call function 0 instead of trapping.
+    const null_val = Val{ .kind = valkindOf(.funcref), .of = .{ .ref = null } };
+    try std.testing.expectEqual(interp.null_ref, valToSlot(null_val));
+
+    const from_guest = slotToVal(.funcref, interp.null_ref);
+    try std.testing.expect(from_guest.of.ref == null);
+
+    // A non-null funcref round-trips by value.
+    const one_index = slotToVal(.funcref, 1);
+    try std.testing.expect(one_index.of.ref != null);
+    try std.testing.expectEqual(@as(interp.Value, 1), valToSlot(one_index));
+
+    // The valkind-driven path agrees with the valtype-driven one.
+    try std.testing.expect(slotToValKind(valkindOf(.funcref), interp.null_ref).of.ref == null);
+    try std.testing.expect(slotToValKind(valkindOf(.funcref), 1).of.ref != null);
+
+    // KNOWN RESIDUAL, asserted so it is visible rather than forgotten: a funcref
+    // slot holds a function *index*, punned as a pointer — so index 0 is
+    // indistinguishable from NULL and is still reported as a null reference.
+    // Fixing it properly means routing `wasm_val_t` refs through the same
+    // `wasm_ref_t` object model the table path uses (`refFromTableValue`), which
+    // is an ownership decision, not a local patch. See cmem/known-issues.md.
+    try std.testing.expect(slotToVal(.funcref, 0).of.ref == null); // <- the residual
 }

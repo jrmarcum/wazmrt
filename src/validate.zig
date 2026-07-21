@@ -952,7 +952,7 @@ const FuncValidator = struct {
     }
 };
 
-/// Natural alignment (log2 of the access size in bytes) for a load/store opcode.
+/// True if two value-type lists are element-wise equal.
 fn valTypesEqual(a: []const V, b: []const V) bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| if (x != y) return false;

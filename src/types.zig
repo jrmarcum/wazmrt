@@ -278,10 +278,13 @@ pub const DecodeError = error{
     BadValType,
     /// The data-count section disagreed with the number of data segments.
     DataCountMismatch,
-    /// An instruction opcode wazmrt does not yet decode. The `0xFC` prefix is now
-    /// complete (saturating truncation `0x00–0x07`, bulk memory `0x08–0x0b`,
-    /// table ops `0x0c–0x11`) and the `0xFB` GC ops are implemented, so the
-    /// remaining gaps are **SIMD (`0xFD`)**, threads/atomics, and exception
-    /// handling — none of which LLVM emits by default.
+    /// An instruction opcode wazmrt does not decode. The `0xFC` (saturating
+    /// truncation, bulk memory, table ops), `0xFD` (the complete SIMD set) and
+    /// `0xFB` (GC) prefixes are all implemented, as is exception handling in both
+    /// encodings — **only threads/atomics remain** (corrected 2026-07-21; this
+    /// doc still listed SIMD and EH as gaps long after both shipped).
+    ///
+    /// Also returned for a **raw byte in `0xD7`–`0xFA`**: those are internal `Op`
+    /// tags for prefixed ops, never valid single-byte encodings (see `opcode.zig`).
     UnsupportedOpcode,
 };
