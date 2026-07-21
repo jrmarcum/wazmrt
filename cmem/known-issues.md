@@ -610,6 +610,37 @@ only an upstream fix can close it. This is the first batch.
 C-ABI) — +2 this batch: the internal-tag rejection test and the split-out text fuzz target. `c-smoke`
 319/319, `wasi-gate` + freestanding `wasm` green, and the conformance baseline flow re-checked end to end.
 
+### Validator correctness batch (items 1–3) — DONE 2026-07-21
+
+All three were **`validate.zig` not meaning what an embedder would assume it means**. None is a
+memory-safety issue — the interpreter self-defends on the run path — but `wasm_module_validate` is the
+gate a C-ABI embedder calls, so "the validator accepts it" has to be worth something.
+
+- **`br_on_non_null` was reject-VALID.** It hard-coded the label's last type to `funcref`/`externref`,
+  so every valid GC/typed-ref label (`i31ref`, `anyref`, `eqref`, `structref`, `arrayref`, a concrete
+  `(ref $t)`) was rejected. Spec is
+  `br_on_non_null l : [t* (ref null ht)] → [t*]` where `C.labels[l] = [t* (ref ht)]` — the last type must
+  be a **reference**, any reference. Now `isRef()` plus a `subtypeOf` check that the operand is the
+  nullable form of what the label expects (`.unknown` in unreachable code matches anything). Verified:
+  `funcref` still OK, `i31ref`/`anyref` now OK, a non-reference label still `TypeMismatch`.
+- **SIMD memory ops and `memory.size`/`memory.grow` had NO memory check.** The `.simd` arm never looked at
+  memories at all, and `memory.size`/`grow` fell through to `simpleSig` — so both validated in a module
+  with **no linear memory**. Added `requireMemory(index)`, which also fixes the multi-memory half the
+  scalar path was missing: it only tested `memories.len == 0`, so `(i32.load (memory 7))` in a one-memory
+  module passed. Which `0xFD` sub-opcodes touch memory now lives in `opcode.simdIsMemoryOp`, deliberately
+  beside `decodeSimd` (whose switch is the authority) so the two cannot drift — the `Simd` immediate
+  always carries a defaulted `mem` field, so its presence could not have distinguished them.
+- **`ValType.concreteRef` silently truncated the type index to 28 bits.** Worse than "wrong output" as
+  originally logged: an index just above the mask truncates to a small **valid** one, which is type
+  confusion rather than a wrong number. The binary decoder was already safe (`readHeapTypeRef` bounds `ti`
+  by the declared type count first); the **text** path had no bound, so `(ref 4294967295)` became
+  `(ref 0x0fffffff)`. Added `ValType.max_concrete_index` and a check at the assembler boundary →
+  `BadImmediate`.
+
+**Verification:** `test`/`test-safe` **415 printed (411 pass, 4 skip) = 213 distinct** (202 core + 11
+C-ABI) — +2 tests, each with both the newly-accepted and still-rejected cases so the fixes can't drift
+into over-acceptance. `c-smoke` 319/319, `wasi-gate` (real compiled guests) + freestanding `wasm` green.
+
 ## #23 — Zig 0.16 Windows `Io` filesystem gaps found in WASI 4.3 (2026-07-16)
 
 Two more std holes on Windows, same family as #18 (which is the first). Both hit during 4.3; recheck all

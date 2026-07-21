@@ -82,6 +82,14 @@ pub const ValType = enum(u32) {
     const kind_mask: u32 = 0x3 << kind_shift;
     const index_mask: u32 = 0x0fff_ffff; // 28 bits — up to ~268M types
 
+    /// Largest type index a concrete `(ref $t)` can carry. `concreteRef` masks
+    /// with `index_mask`, so anything above this **silently truncates** — and a
+    /// large index can truncate to a small *valid* one, which is type confusion
+    /// rather than merely a wrong number. Callers must reject above this before
+    /// constructing. The binary decoder already bounds `ti` by the declared type
+    /// count (`readHeapTypeRef`); the text assembler checks against this.
+    pub const max_concrete_index: u32 = index_mask;
+
     /// Build a concrete typed reference `(ref null? $ti)` for family `kind`
     /// (must be `.func`/`.@"struct"`/`.array`).
     pub fn concreteRef(is_nullable: bool, kind: RefHeap, ti: u32) ValType {

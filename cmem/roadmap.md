@@ -53,9 +53,12 @@ to upstream):** `opcode.zig` raw internal-tag bytes now rejected (the old guard 
 kind — so it was silently partial), duplicated align helpers consolidated, trap-backtrace offsets saturate
 instead of `@intCast`, `conformance` survives an unreadable directory, and the fuzz targets no longer share
 a coverage corpus. **211 distinct tests** (411 printed).
-**Still open:** `validate.zig` `br_on_non_null` reject-valid + the SIMD/`memory.size` presence checks +
-`ValType.concreteRef` 28-bit truncation (next), then the hardening trio (`gatherIovecs`/`fd_read`/
-`poll_oneoff` u32 offsets, the C-ABI trap-frame borrowed `*Instance`, `Wasi.init` swallowing OOM).
+**Validator-correctness batch (items 1–3) — DONE 2026-07-21:** `br_on_non_null` no longer rejects valid
+GC/typed-ref labels; SIMD memory ops and `memory.size`/`grow` now require an in-range memory (as does the
+scalar path, which never bounded the memarg's memory index); and `concreteRef`'s 28-bit mask no longer
+truncates a large type index into a small valid one. **213 distinct tests** (415 printed).
+**Still open:** the hardening trio (`gatherIovecs`/`fd_read`/`poll_oneoff` u32-before-widening offsets,
+the C-ABI trap-frame borrowed `*Instance`, `Wasi.init` swallowing OOM) — next.
 `skipConstExpr`'s GC-immediate gap stays latent until GC const-exprs land; **#8** waits on upstream Zig.
 *Standing lesson from this sequence: a run of clean passes means the current lens is exhausted, not that
 the code is clean — change the lens.*

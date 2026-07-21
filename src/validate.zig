@@ -353,6 +353,14 @@ const FuncValidator = struct {
         }
     }
     /// Pop a value that must be a reference type (or polymorphic `unknown`).
+    /// A linear memory must exist AND the instruction's memory index must be in
+    /// range. The second half matters for multi-memory: checking only
+    /// `memories.len == 0` accepted `(i32.load (memory 7))` in a one-memory
+    /// module.
+    fn requireMemory(self: *FuncValidator, index: u32) Error!void {
+        if (index >= self.module.memories.len) return error.MissingMemory;
+    }
+
     fn popRef(self: *FuncValidator) Error!StackType {
         const st = try self.popVal();
         switch (st) {
@@ -608,6 +616,14 @@ const FuncValidator = struct {
                 try self.pushValT(tys[0]);
             },
             .simd => {
+                // A memory-touching `0xFD` op needs a memory to exist, and its
+                // memarg's memory index must be in range (multi-memory). Neither
+                // was checked, so every SIMD load/store validated in a module
+                // with no memory at all — accept-invalid. Contained at run time
+                // by `Frame.memBytes` (`NoMemory`), but `validate` is the gate an
+                // embedder calling `wasm_module_validate` relies on.
+                if (opcode.simdIsMemoryOp(instr.imm.simd.sub))
+                    try self.requireMemory(instr.imm.simd.mem.memory);
                 const s = simdSig(instr.imm.simd.sub);
                 try self.popVals(s.pop);
                 try self.pushVals(s.push);
@@ -858,12 +874,26 @@ const FuncValidator = struct {
                 try self.pushVal(r);
             },
             .br_on_non_null => {
-                // The label expects [t* ref]; on fall-through the ref is consumed.
+                // Spec (function-references):
+                //   br_on_non_null l : [t* (ref null ht)] → [t*]
+                //   where C.labels[l] = [t* (ref ht)]
+                // so the label's last type must be a REFERENCE — any reference.
+                // This used to hard-code `funcref`/`externref`, which wrongly
+                // rejected every valid GC/typed label (`i31ref`, `anyref`,
+                // `eqref`, `structref`, `arrayref`, a concrete `(ref $t)`) —
+                // reject-valid, not a safety issue.
                 const lt = try self.labelTypesAt(instr.imm.label);
-                if (lt.len == 0 or (lt[lt.len - 1] != .funcref and lt[lt.len - 1] != .externref)) return error.TypeMismatch;
+                if (lt.len == 0 or !lt[lt.len - 1].isRef()) return error.TypeMismatch;
                 try self.popVals(lt);
                 try self.pushVals(lt);
-                _ = try self.popRef();
+                // The operand is the nullable form of what the label expects; in
+                // unreachable code it is `.unknown` and matches anything.
+                const r = try self.popRef();
+                switch (r) {
+                    .val => |v| if (!subtypeOf(self.module, v, lt[lt.len - 1].nullable()))
+                        return error.TypeMismatch,
+                    .unknown => {},
+                }
             },
 
             .local_get => {
@@ -893,10 +923,17 @@ const FuncValidator = struct {
 
             else => {
                 // Load/store: the alignment (log2) must not exceed the access's
-                // natural alignment, and a linear memory must exist.
-                if (opcode.immediateKind(instr.op) == .mem) {
-                    if (self.module.memories.len == 0) return error.MissingMemory;
-                    if (instr.imm.mem.alignment > opcode.naturalAlignLog2(instr.op)) return error.InvalidAlignment;
+                // natural alignment, and the addressed memory must exist.
+                switch (opcode.immediateKind(instr.op)) {
+                    .mem => {
+                        try self.requireMemory(instr.imm.mem.memory);
+                        if (instr.imm.mem.alignment > opcode.naturalAlignLog2(instr.op)) return error.InvalidAlignment;
+                    },
+                    // `memory.size`/`memory.grow` reached `simpleSig` with no
+                    // memory check at all — they were valid in a module with no
+                    // memory, and their memory index was never bounded.
+                    .mem_index => try self.requireMemory(instr.imm.mem_index),
+                    else => {},
                 }
                 const s = simpleSig(instr.op) orelse return error.UnsupportedOpcode;
                 try self.popVals(s.pop);
@@ -1206,5 +1243,67 @@ test "resource caps: a huge locals run and deep nesting are refused, not expande
         var m = try Module.decode(gpa, bytes.items);
         defer m.deinit();
         try std.testing.expectError(error.NestingTooDeep, validate(gpa, &m));
+    }
+}
+
+test "validator: memory-touching ops require an in-range memory" {
+    // SIMD load/store and memory.size/grow reached the operand-typing path with
+    // no memory check at all, so they validated in a module with **no memory**.
+    // Contained at run time by `Frame.memBytes`, but `validate` is the gate an
+    // embedder calling `wasm_module_validate` relies on.
+    const gpa = std.testing.allocator;
+    const wat = @import("wat.zig");
+
+    const cases = [_]struct { src: []const u8, ok: bool }{
+        // v128.load with no memory → invalid; with one → valid.
+        .{ .src = "(module (func (export \"f\") (result v128) (v128.load (i32.const 0))))", .ok = false },
+        .{ .src = "(module (memory 1) (func (export \"f\") (result v128) (v128.load (i32.const 0))))", .ok = true },
+        // memory.size / memory.grow with no memory → invalid.
+        .{ .src = "(module (func (export \"f\") (result i32) memory.size))", .ok = false },
+        .{ .src = "(module (memory 1) (func (export \"f\") (result i32) memory.size))", .ok = true },
+        // A scalar load still behaves.
+        .{ .src = "(module (func (export \"f\") (result i32) (i32.load (i32.const 0))))", .ok = false },
+        .{ .src = "(module (memory 1) (func (export \"f\") (result i32) (i32.load (i32.const 0))))", .ok = true },
+    };
+    for (cases) |c| {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const bin = try wat.assemble(arena.allocator(), c.src);
+        var m = try Module.decode(gpa, bin);
+        defer m.deinit();
+        if (c.ok) {
+            try validate(gpa, &m);
+        } else {
+            try std.testing.expectError(error.MissingMemory, validate(gpa, &m));
+        }
+    }
+}
+
+test "validator: br_on_non_null accepts any reference label type" {
+    // The label's last type must be a REFERENCE (spec: C.labels[l] = [t* (ref ht)]).
+    // This used to hard-code funcref/externref, wrongly rejecting every valid
+    // GC/typed-ref label — reject-valid, not a safety issue.
+    const gpa = std.testing.allocator;
+    const wat = @import("wat.zig");
+
+    const cases = [_]struct { src: []const u8, ok: bool }{
+        .{ .src = "(module (func $g) (func (export \"f\") (result funcref) (block (result funcref) (br_on_non_null 0 (ref.func $g)) (ref.null func))))", .ok = true },
+        // i31ref: a valid GC label that the old check rejected.
+        .{ .src = "(module (func (export \"f\") (param i31ref) (result i31ref) (block (result i31ref) (br_on_non_null 0 (local.get 0)) (ref.null i31))))", .ok = true },
+        .{ .src = "(module (func (export \"f\") (param anyref) (result anyref) (block (result anyref) (br_on_non_null 0 (local.get 0)) (ref.null any))))", .ok = true },
+        // A non-reference label type is still invalid.
+        .{ .src = "(module (func (export \"f\") (result i32) (block (result i32) (br_on_non_null 0 (ref.null func)) (i32.const 1))))", .ok = false },
+    };
+    for (cases) |c| {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const bin = try wat.assemble(arena.allocator(), c.src);
+        var m = try Module.decode(gpa, bin);
+        defer m.deinit();
+        if (c.ok) {
+            try validate(gpa, &m);
+        } else {
+            try std.testing.expectError(error.TypeMismatch, validate(gpa, &m));
+        }
     }
 }

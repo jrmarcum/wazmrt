@@ -1098,8 +1098,16 @@ fn parseValType(s: Sexpr, type_names: []const ?[]const u8) Error!V {
 fn heapTypeToValType(s: Sexpr, nullable: bool, type_names: []const ?[]const u8) Error!V {
     const atom = s.asAtom() orelse return error.BadValType;
     // A `$name` or a bare numeric index is a concrete type reference.
-    if ((atom.len != 0 and atom[0] == '$') or (atom.len != 0 and std.ascii.isDigit(atom[0])))
-        return V.concreteRef(nullable, .@"struct", try resolveType(type_names, s));
+    if ((atom.len != 0 and atom[0] == '$') or (atom.len != 0 and std.ascii.isDigit(atom[0]))) {
+        // `concreteRef` masks the index to 28 bits, so `(ref 4294967295)` used to
+        // become `(ref 0x0fffffff)` silently — and an index just above the mask
+        // truncates to a small *valid* one, i.e. type confusion rather than a
+        // merely wrong number. The binary decoder bounds this by the declared
+        // type count; the text side has no such bound, so check the width here.
+        const ti = try resolveType(type_names, s);
+        if (ti > V.max_concrete_index) return error.BadImmediate;
+        return V.concreteRef(nullable, .@"struct", ti);
+    }
     const pair: ?[2]V = if (std.mem.eql(u8, atom, "func") or std.mem.eql(u8, atom, "funcref") or std.mem.eql(u8, atom, "nofunc"))
         .{ .funcref, .funcref_nn }
     else if (std.mem.eql(u8, atom, "extern") or std.mem.eql(u8, atom, "externref") or std.mem.eql(u8, atom, "noextern"))

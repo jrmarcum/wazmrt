@@ -682,6 +682,18 @@ fn simdLaneCount(sub: u32) u8 {
     };
 }
 
+/// Does this `0xFD` sub-opcode carry a memarg (i.e. touch linear memory)?
+/// The `Simd` immediate always has a `mem` field (defaulted), so its presence
+/// cannot distinguish these — kept beside `decodeSimd`, whose switch is the
+/// authority, so the two can't drift.
+pub fn simdIsMemoryOp(sub: u32) bool {
+    return switch (sub) {
+        0x00...0x0b, 0x5c, 0x5d => true, // v128.load* / store / load{32,64}_zero
+        0x54...0x5b => true, // v128.load/store lane
+        else => false,
+    };
+}
+
 fn decodeSimd(r: *Reader, sub: u32) DecodeError!Instr {
     var s: Simd = .{ .sub = sub };
     switch (sub) {

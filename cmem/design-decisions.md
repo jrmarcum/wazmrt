@@ -197,6 +197,23 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   **C ABI takes arbitrary embedder bytes**. They now clamp: these values only name a line in a trap
   backtrace, so a wrong number is cosmetic where the cast was undefined. **Rule: a `usize → u32` narrowing
   on module-derived data is either checked or saturating — never a bare `@intCast`.**
+- **`validate` is a promise to embedders, not just a dev convenience (2026-07-21).** The CLI run path
+  deliberately skips validation and the interpreter self-defends — but `wasm_module_validate` is a C-ABI
+  entry point, so "the validator accepted it" has to mean something. Three gaps closed on that basis:
+  `br_on_non_null` was reject-**valid** (hard-coded `funcref`/`externref`, rejecting every GC/typed-ref
+  label); SIMD memory ops and `memory.size`/`grow` had **no memory check at all**; and the scalar path
+  checked only `memories.len == 0`, never the memarg's memory index (multi-memory). All now go through
+  `requireMemory(index)`. **Rule: a memory-touching op validates the memory it names, not merely that some
+  memory exists.**
+- **Which `0xFD` sub-opcodes touch memory lives next to `decodeSimd` (2026-07-21).** The `Simd` immediate
+  always carries a defaulted `mem` field, so its presence cannot distinguish a load from a splat.
+  `opcode.simdIsMemoryOp` is deliberately adjacent to the decode switch that *is* the authority, so the
+  two ranges cannot drift apart silently.
+- **A masked index must be range-checked before masking (2026-07-21).** `ValType.concreteRef` packs the
+  type index into 28 bits, so an index above `max_concrete_index` **truncates to a small, possibly valid
+  index** — type confusion, not merely a wrong number. The binary decoder was already safe (it bounds `ti`
+  by the declared type count first); the text assembler was not. **Rule: every path that builds a concrete
+  ref checks the width first** — the mask is a storage detail, never an input filter.
 - **`zig build test-safe` is the memory-safety gate (2026-07-20).** The suite under **ReleaseSafe** —
   optimizer on, safety checks kept — so out-of-range `@intCast`, OOB, and null-unwrap panic loudly instead
   of being silent UB in the shipped ReleaseFast/ReleaseSmall builds. **Run it alongside `zig build test`
