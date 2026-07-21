@@ -81,7 +81,38 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
   validation**, which is strong evidence the type-checker is correct across real, deeply-nested
   control flow (not just the simple `wasm_mod` set).
 
-## Spec-testsuite conformance snapshot (2026-07-02, `wast.zig` MVP)
+## Spec-testsuite conformance — first REAL measurement (2026-07-21, 13th pass)
+
+**Score: 57 827 passed / 752 failed / 4 507 skipped, over 258 files** (upstream `WebAssembly/spec`,
+`test/core` incl. `simd/`). Reproduce with:
+
+```
+git clone --depth 1 --filter=blob:none --sparse https://github.com/WebAssembly/spec.git
+cd spec && git sparse-checkout set test/core
+zig build conformance -Doptimize=ReleaseFast -Dtestsuite=<spec>/test/core
+# gate on regressions instead of zero failures:
+zig build conformance -Dtestsuite=<dir> -Dbaseline=<file> -Dwrite-baseline=true
+```
+
+**Run it. That is the whole lesson of the 13th pass.** Twelve audit passes had reviewed this code without
+ever executing the upstream oracle; doing so surfaced a guest-controlled **stack overflow**, missing
+**UTF-8 name validation**, and **hex-float literals truncated instead of rounded in the assembler** —
+within minutes, all in files the suite has always contained. See known-issues, 13th pass.
+
+Two harness facts worth keeping:
+
+- **SIMD had never actually run.** A v128 is *two* result slots, so every SIMD assertion failed as
+  `arity 2 != expected 1` until the runner learned `v128.const` (all six shapes, arguments and
+  expectations, lane-wise float matching for per-lane `nan:canonical`/`nan:arithmetic`). That one gap hid
+  ~24 k assertions — and is the recorded reason the `f32x4.min`/`max` NaN bug survived eleven passes.
+- **`ReleaseFast` for conformance runs.** Debug frames are large enough that deep-recursion tests used to
+  segfault the runner; the depth cap is now safe in every mode, but Release is still much faster here.
+
+The remaining 752 failures are dominated by **assembler feature gaps**, not wrong answers — inline
+`(export …)` on a tag, flat `br_table`, `(export "mem" (memory $name))`, data-segment names, `(module
+quote …)`. Those are the highest-value next increments precisely because the oracle now measures them.
+
+## Spec-testsuite conformance snapshot (2026-07-02, `wast.zig` MVP) — SUPERSEDED by the run above
 
 > ⚠ **These pass counts are UPPER BOUNDS, not measurements.** Every snapshot below was taken while
 > `assertRejected` counted **any** error as a pass — so any `assert_invalid`/`assert_malformed` module

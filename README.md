@@ -127,7 +127,14 @@ it, so declaring a large memory is cheap until it is used.
 Guests using the GC proposal have a second ceiling: wazmrt allocates GC objects
 without collecting them (they live until the instance is dropped), so a module
 is limited to **16 Mi live objects** and one that allocates past that traps with
-`GcHeapExhausted` rather than consuming the host's memory.
+`GcHeapExhausted` rather than consuming the host's memory. Exceptions boxed by
+`catch_ref` are bounded the same way, per call.
+
+Guest recursion is limited to **512 nested calls**, after which the call traps
+with `CallStackExhausted`. wazmrt interprets a guest `call` by recursing on the
+host stack, so this bound is what keeps a runaway or deeply recursive module from
+overflowing it; the limit is deliberately the same in every build so a program
+cannot run in one and trap in another.
 
 > **Scope of the sandbox.** Containment is enforced two ways: **lexically** (a
 > guest cannot name a path outside its preopens) and **through the filesystem**

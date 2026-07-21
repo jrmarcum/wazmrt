@@ -11,6 +11,115 @@ This file tracks only what's left.
 
 Line numbers are hints (they drift) — the function/construct name is the durable anchor.
 
+## 13th audit pass (2026-07-21) — the pass where we finally RAN the official spec testsuite
+
+**The lens that mattered: stop reasoning about the code and run the oracle.** Twelve passes had reviewed
+this code; none had executed the upstream `WebAssembly/spec` testsuite. Doing so found a crash and two
+wrong-value classes within minutes, all in files the suite has always contained. *Standing lesson, now
+demonstrated twice: an unexecuted oracle is not coverage. The recorded reason the SIMD `min`/`max` bug
+survived eleven passes was "no `simd_*.wast` has ever been run" — and that was still true.*
+
+Run it with `zig build conformance -Dtestsuite=<spec>/test/core` (shallow sparse clone of `test/core` is
+enough). **Score: 57 827 passed / 752 failed / 4 507 skipped over 258 files.**
+
+### Found by the testsuite
+
+- **Guest-controlled STACK OVERFLOW.** A guest `call` recurses natively, so `max_call_depth` is all that
+  stands between a runaway module and a dead process. It was 1024, calibrated against ReleaseFast frames
+  — but **Debug's larger frames exhaust the native stack at ~878 guest frames**, so the guard never fired
+  and the process segfaulted. `call.wast`'s `runaway`/`mutual-runaway` cases exist precisely to test this.
+  Lowered to **512** (~1.7× headroom in the most expensive build) so every build mode behaves the same: a
+  program must not trap in one build and run in another. The frame count is only a proxy for the real
+  resource (host stack bytes) — a C-ABI embedder calling in on a small thread stack can still run out.
+- **Names were never validated as UTF-8** (§5.2.4) — 528 accept-invalid assertions across
+  `utf8-import-module`/`utf8-import-field`/`utf8-custom-section-id`. The check belongs in `readName` (the
+  one place every name flows through) plus the custom-section id, which reads its name inline.
+- **Hex float literals were parsed by `std.fmt.parseFloat`, which TRUNCATES** a hex mantissa longer than
+  ~17 digits instead of rounding. The **assembler** therefore emitted a constant one ULP low: the same
+  number written in decimal and in hex compiled to *different modules*. `wat.parseFloatLit` now parses hex
+  itself (u128 significand + sticky bit, round-to-nearest-ties-even) and `wast.zig` shares it, so an
+  `assert_return` expectation and the module it checks can never disagree about what a literal means.
+  **Third upstream Zig issue** this project works around — unlike the other two, cheaply.
+- **`v128.const` was rejected in constant expressions**, so every `(global v128 (v128.const …))` — the
+  form LLVM emits for any SIMD global — failed to validate. It hid behind the CLI's invoke path, which
+  does not validate.
+
+### The `.wast` runner had no v128 support at all
+
+A v128 is **two** result slots, so every SIMD assertion failed as `arity 2 != expected 1` and **none had
+ever run**. Added v128 literal parsing for all six shapes (arguments *and* expectations), lane-wise float
+matching so per-lane `nan:canonical`/`nan:arithmetic` work, and slot-aware arity.
+**SIMD went from 848 passed / 23 985 failed to 24 951 passed / 2 failed**; the two remaining are assembler
+feature gaps, not wrong answers.
+
+*Method note, twice-earned:* the first round-trip check was **vacuous** — argument and expectation go
+through the same parser, so a consistent mis-parse still agrees. Re-checked against an independent oracle
+(node), which cleared the parser and redirected the search to `parseFloat`. Then the conformance oracle
+caught a hazard introduced *by that fix*: `@intCast(k-1)` to `u7` is out of range when `k > 128`, silently
+wrong in ReleaseFast. Having the oracle paid for itself immediately.
+
+### Found by parallel audit agents (four fresh lenses)
+
+- **A REJECTED module could install entries in another module's table.** The active-element loop
+  bounds-checked *per entry*, so an over-long segment wrote a partial prefix and only then failed
+  instantiation; the active-**data** path 60 lines above already hoisted the check. For an *imported*
+  table that storage belongs to the exporter and outlives the rejected instantiation — so a module that
+  **failed to instantiate** made another module dispatch through slots it never populated (importer picks
+  the indices, owner reinterprets them). `call_indirect`'s type check still applies, so wrong-function
+  dispatch rather than memory unsafety. Verified by reverting the fix: the victim returns `1337` instead
+  of trapping.
+- **v128 slot-vs-index conflation in BOTH out-of-module consumers.** `slotWidth` was private, so each had
+  independently written `for (results, ft.results)`. `wasm_func_call` returned **3 instead of 22** for the
+  third result of `(result i32 v128 i32)` and handed the v128 back as `WASM_ANYREF` whose `.of.ref` was
+  the low half punned as a pointer (a wild free). The CLI's multi-object `for` over unequal lengths is
+  *illegal behaviour*: it panicked in Debug/ReleaseSafe and in the **shipped ReleaseFast build** printed
+  raw slots and **exited 0**, silently dropping the other results. `slotWidth` is now `pub` and documented
+  as the shared authority; `wasm.h` has no v128 valkind, so such signatures are refused explicitly.
+- **`dropSelectWidths` swallowed `OutOfMemory`** along with validation errors. The "everything after the
+  error is unreachable" argument holds for a bad instruction but **not** for OOM: the widths stay at their
+  default, a v128 `drop`/`select` pops one slot instead of two, and the operand stack desyncs for the rest
+  of the function — a **silently wrong answer** from an `Instance.init` that still reports success.
+  Reachable by any memory-capped embedder, because a *budgeted* allocator fails transiently. **Sticky
+  `FailingAllocator` sweeps structurally cannot see this class**, which is why prior sweeps missed it.
+- **`nearest` returned a SIGNALING NaN** unchanged; the spec requires a quiet one. It is the only rounding
+  op we hand-wrote rather than getting from hardware, so scalar *and* SIMD were wrong together. Found by a
+  differential oracle against **V8 over ~121 k assertions**, which cleared every other numeric op — the
+  earlier `min`/`max` fix included, plus `pmin`/`pmax`'s deliberately non-NaN-propagating semantics.
+- **`makeTrap` returned null on OOM, and null means "no trap"** — so a host allocation failure was
+  reported to the embedder as a **successful call**, which then read its own uninitialised results buffer.
+  Now falls back to a preallocated static trap every delete path skips. Same shape as the old `Wasi.init`
+  bug, one layer out.
+- **`exn_store` was unbounded and never released** (`gc_heap` and linear memory both have caps).
+  `shrinkRetainingCapacity` pinned the historical peak — ~124 MiB after a catch-heavy loop on an instance
+  holding nothing. Capped at `max_exn_boxes`; buffer returned once empty and large.
+- **A module-linked callee's trap trace was never reset** — only `invoke` resets, and a cross-module call
+  never goes through it. The callee's trace grew monotonically until it pinned at 16 frames from
+  *unrelated* traps, leaving `trapTruncated()` permanently true; the caller's backtrace was meanwhile
+  missing the frame that actually faulted. Reset on entry; callee frames adopted as the caller's innermost.
+- **`sign --key` / `keygen --out` were silently ignored**, making `sign` unreachable from the CLI in any
+  argument order. `flagValue` searches only `flagRegion`, which stops at the first non-run-mode flag —
+  deliberately, so a guest's argv cannot smuggle in `--no-verify`. Subcommand flags now use a separate
+  reader that scans the whole list (safe: these subcommands take no guest argv).
+- **Undocumented allocator invariants** on the public `Instance.Memory`/`Table`: `bytes` must come from
+  `allocGuestMemory` and `entries` from the importing instance's `gpa`, because the grow paths free and
+  realloc through those. Cross-allocator guest memory has been a bug here three separate times; the
+  invariant now lives on the type.
+
+**Verified clean by the agents** (empirically, not by reading): all six bulk ops (`memory.fill`/`copy`/
+`init`, `table.fill`/`copy`/`init`) are bounds-check-**before**-write, including zero-length-at-boundary
+and `u32`-overflow cases; a trap leaves no partial state, leaks no `reentry_depth`, and does not corrupt
+the value stack; segment-drop and grow state persisting across invocations is spec-correct, not a bug;
+`Module.decode`/`wat.assemble`/`Instance.init` are leak- and double-free-clean under OOM sweeps; the C ABI
+matched the native API across 813 modules with zero disagreements; and name resolution round-trips
+correctly across every index space over 666 real `.wat` files.
+
+**Still open (not fixed, recorded):** `(tag $t (export "e") (param …))` silently drops both the export and
+the parameters (15 of 666 corpus files lose an `__exn_tag` export and still validate); flat non-folded
+`br_table` cannot assemble (blocks `wasm2wat` output); `(export "mem" (memory $name))` unsupported (53 of
+666 files); data segments have no name table; the memory-index immediate is parsed and discarded, so
+`(memory.size $nope)` is accepted silently; assemble→decode does not preserve import order. Plus the two
+long-standing exclusions: **#8** (upstream Zig) and `skipConstExpr`'s GC-immediate gap.
+
 ## Code audit 2026-07-19 ("look for code issues") — 8 fixed, a few deferred
 
 **FIXED in git (`d0dddc5`)** — 3 parallel auditors (security / SIMD / sweep): **decodeSimd lane-bounds guard**
