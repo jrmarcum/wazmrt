@@ -227,6 +227,21 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   regression test compared `wasm_frame_instance(...)` to the original pointer, which **passes against
   freed memory** — a lifetime test must *dereference*, not compare. Verified by removing the retain and
   watching the test crash.
+- **Float `min`/`max` use the hand-written `fmin`/`fmax`, NEVER `@min`/`@max` (2026-07-21).** Zig's
+  builtins are **minNum/maxNum** — "if one operand is NaN, return the other" — and leave ±0 unordered.
+  wasm requires NaN propagation and `min(+0,−0) = −0` / `max(+0,−0) = +0`. The scalar path always used the
+  correct helpers; the **SIMD** path used the builtins, so `f32x4.min(nan, 1.0)` returned `1.0` and the
+  same source compiled with and without autovectorisation gave different answers. **Rule: any new
+  float min/max — scalar, SIMD, or relaxed — routes through `fmin`/`fmax` unless the op's spec explicitly
+  wants the asymmetric form (`pmin`/`pmax`, and the relaxed `0x10d–0x110` arms, which correctly keep
+  `@select`).**
+- **Guest linear memory has exactly ONE owner: the `interp` page-allocator helpers (2026-07-21).**
+  `allocGuestMemory`/`growGuestMemory`/`freeGuestMemory` are `pub` for this reason. `memObj()` in the C ABI
+  can hand back either a host memory or an **instance** memory, so any site that frees or grows
+  `Memory.bytes` with a different allocator is cross-allocator corruption — which is exactly what the
+  lazy-pages change left behind in `wasm_memory_new`/`grow`/`destroyRef` until it was caught.
+  **Rule: `Memory.bytes` is never touched by `alloc`.** *Meta-lesson: changing who owns an allocation is
+  not local — sweep every file that frees or grows it, not just the one you edited.*
 - **`zig build test-safe` is the memory-safety gate (2026-07-20).** The suite under **ReleaseSafe** —
   optimizer on, safety checks kept — so out-of-range `@intCast`, OOB, and null-unwrap panic loudly instead
   of being silent UB in the shipped ReleaseFast/ReleaseSmall builds. **Run it alongside `zig build test`

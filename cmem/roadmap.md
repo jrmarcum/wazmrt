@@ -62,6 +62,17 @@ u32-before-widening guest-array offsets now go through `Wasi.arrayOffset` (u64 a
 fit), C-ABI trap frames **retain** their instance instead of borrowing it, and `Wasi.init` propagates OOM
 instead of returning a `Wasi` with no stdio. **214 distinct tests** (416 printed).
 
+**11th pass — 2026-07-21 — new lenses, first wrong-ANSWER bug.** With the memory-safety list closed, this
+pass used lenses never applied before (stale comments, dead code, fall-throughs, and **silently-wrong
+execution**). It found that **`fNxM.min`/`max` returned the wrong number** — Zig's `@min`/`@max` are
+minNum/maxNum, not the NaN-propagating `fmin`/`fmax` the scalar path uses, so `f32x4.min(nan,1.0)` gave
+`1.0` and autovectorised code disagreed with scalar code. Also: a **cross-allocator realloc of guest
+memory** (collateral from the lazy-pages change), an `errdefer` slice with start > end, and **null
+inverted both ways** in the C-ABI val path. **216 distinct tests** (419 printed).
+**Highest-value testing gap now open: no `simd_*.wast` has ever been run** — that absence is what hid the
+min/max bug for eleven passes. ~40 further findings from this pass are logged in `known-issues.md` as
+**unverified claims** (one checked did not reproduce), to be confirmed individually before any fix.
+
 **The 10th pass's remaining-issues list is closed.** Only two items survive, neither closable here:
 **#8** (upstream Zig `Io` bug — also what holds #17's final-component `path_open` TOCTOU open; recheck on
 every Zig upgrade) and `skipConstExpr`'s GC-immediate gap, latent until GC const-exprs are implemented.

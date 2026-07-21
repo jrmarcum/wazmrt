@@ -483,11 +483,11 @@ are ±10% noisy.)
 
 ## Reading the test count (updated 2026-07-20, post 10th audit pass)
 
-`zig build test --summary all` prints **416 total (412 pass, 4 skip)**, but there are **214 distinct
-tests**: 202 in the core module (200 pass + 2 skip) + 12 C-ABI. The `cabi_tests` target's root is
+`zig build test --summary all` prints **419 total (415 pass, 4 skip)**, but there are **216 distinct
+tests**: 203 in the core module (201 pass + 2 skip) + 13 C-ABI. The `cabi_tests` target's root is
 `wasm_c_api.zig`, which imports `root.zig`, so it compiles and **re-runs the core module's tests too**
-(202 core + 12 C-ABI = 214), on top of the standalone `mod_tests` run (202) → 416 printed. Harmless —
-about a second — but **don't quote the printed number as a test count**; quote **200**, or the per-target
+(203 core + 13 C-ABI = 216), on top of the standalone `mod_tests` run (203) → 419 printed. Harmless —
+about a second — but **don't quote the printed number as a test count**; quote **201**, or the per-target
 numbers from `--summary all`.
 
 *(Was 389 printed / 200 distinct before `src/fuzz.zig` added 2 blocks and the 10th-pass memory/underflow/CSPRNG
@@ -515,6 +515,16 @@ the split-out `fuzz` text target.
 comparing a stored pointer never dereferences it. It was made real by calling `wasm_instance_exports`
 *through* the frame's instance, then verified by deleting the retain and confirming a crash (exit 3).
 A lifetime test must dereference, not compare.
+
+**SIMD HAS NEVER BEEN RUN AGAINST UPSTREAM CONFORMANCE (recorded 2026-07-21).** The spec-testsuite
+snapshot in this file lists i32, call_indirect, func, table_init/copy, elem, data, imports, linking,
+start, the function-references files, global and f32/f64 — but **no `simd_*.wast`**. That gap hid a real
+wrong-answer bug for eleven audit passes: `f32x4.min(nan, 1.0)` returned `1.0` because the SIMD path used
+Zig's `@min` (minNum) instead of the NaN-propagating `fmin` the scalar path uses. Every SIMD unit test
+used **finite operands**, which is exactly the region where the two agree — so a large, growing suite had
+a precisely-shaped hole. **Running `simd_*.wast` through `zig build conformance` is the single highest-value
+testing gap open.** *General lesson: unit tests written alongside an implementation tend to exercise the
+cases the implementer was thinking about; the spec suite exists to test the ones they weren't.*
 
 The 5th-audit malformed-input tests: `wast.zig` `runner rejects malformed commands …` (12
 shapes) and a C-ABI import-memory-lifetime test (delete an imported memory after instantiation, then

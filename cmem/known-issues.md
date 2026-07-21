@@ -673,6 +673,77 @@ here: **#8** (upstream Zig `Io` bug — only an upstream fix helps; it is also w
 final-component `path_open` TOCTOU open) and `Module.zig skipConstExpr`'s GC-immediate gap, which stays
 latent until GC const-exprs are implemented.
 
+### 11th pass — 2026-07-21 — NEW LENSES, and the first wrong-ANSWER bug
+
+The memory-safety lens was exhausted (the 10th pass's list had just been closed), so this pass used four
+lenses the prior eleven had never applied: stale comments, dead code, fall-throughs/swallowed errors, and
+**silently-wrong execution**. That last one is the point: *every* prior pass hunted crashes; none had ever
+asked whether the interpreter returns the **right value**.
+
+**THE FIND — `interp.zig simdFloatBin`: `fNxM.min`/`max` returned the wrong number. HIGH.**
+They used Zig's `@min`/`@max`, which are **minNum/maxNum** ("if one operand is NaN, return the other") and
+leave the ±0 case unordered. wasm requires the lane-wise application of the same NaN-propagating
+`fmin`/`fmax` the **scalar** ops use. Measured before → after:
+`f32x4.min(nan,1.0)` **1.0 → NaN**; `f32x4.max(nan,1.0)` **1.0 → NaN**; `f32x4.min(+0,−0)` **+0 → −0**;
+`f32x4.max(−0,+0)` **−0 → +0**. The scalar path was correct throughout, so **identical source compiled
+with and without autovectorisation produced different results**. Fixed with a per-lane escape hatch
+through the existing `fmin`/`fmax` (the shape `simdFloatUn(.nearest)` already used). `pmin`/`pmax` keep
+`@select` — asymmetric NaN handling *is* their spec.
+**Why eleven passes missed it: no `simd_*.wast` has ever been run** (see this file's snapshot list — i32,
+func, f32/f64, … but no SIMD), **and every SIMD unit test used finite operands — exactly the region where
+`@min` and `fmin` agree.** A test suite can be large and still have a shaped hole.
+
+**A regression I introduced, caught by this pass.** The lazy-pages change moved guest linear memory to the
+page allocator, but `wasm_memory_new`/`wasm_memory_grow`/`destroyRef` still used `alloc` (smp_allocator) —
+and `memObj()` returns **instance** memories, so `wasm_memory_grow` did a **cross-allocator realloc** on
+interp-owned pages. Fixed by exporting `allocGuestMemory`/`growGuestMemory`/`freeGuestMemory` and using
+them for every `Memory.bytes`. *Lesson: changing who owns an allocation must sweep every other file that
+frees or grows it — the C ABI was not in scope when the allocator changed, and nothing linked the two.*
+
+**`interp.zig initWithImports` — `errdefer memories[imported_memories..built]` with `built = 0`** formed
+`memories[1..0]` (start > end) when the *import* branch failed. A one-line `.wat` with an unbacked memory
+import panicked in Debug, unchecked in ReleaseFast. `built` now starts at `imported_memories`.
+
+**C-ABI `valToSlot`/`slotToVal`/`slotToValKind` — null inverted BOTH ways.** `ref.null` is the sentinel
+`maxInt(u64)`, not 0, so punning the slot to a pointer meant a guest `ref.null` arrived **non-NULL** (the
+embedder's null check failed) and a host **NULL became slot 0 = funcref #0** (so `ref.is_null` answered
+false and `call_ref` would call function 0 instead of trapping). The *table* path always did this
+correctly (`refFromTableValue`); only the `wasm_val_t` path punned. **Residual, deliberately asserted in
+the test rather than hidden:** a non-null funcref slot is a function *index* punned as a pointer, so
+**index 0 still collides with NULL**. Fixing that means routing `wasm_val_t` refs through the same
+`wasm_ref_t` object model — an ownership decision, not a local patch.
+
+**Comments that actively mislead (category 1) — a rich seam.** `interp.zig`'s header claimed imported
+functions "still trap — host-function calls are the next execution slice" (false since WASI shipped);
+`types.zig` listed SIMD and EH as remaining decode gaps; `wat.zig` listed `start`/imports/`table.init` as
+"Deferred"; and **`Module.supertypes` was documented "unused by the current slice" while `isSubtype`'s
+chain walk depends on it** — dead-code bait discovered *while a dead-code audit was running against the
+same file*. Also re-homed three doc comments the earlier `naturalAlign` consolidation stranded on the
+wrong functions (`valTypesEqual`, `imm0`, `simdNaturalAlign`) — the sibling pattern again, one per file.
+
+**Verification:** `test`/`test-safe` **419 printed (415 pass, 4 skip) = 216 distinct**; `c-smoke` 319/319,
+`wasi-gate` + freestanding `wasm` green.
+
+**Process note (cost real time):** an auditor's cleanup ran `git checkout` on the working tree mid-pass and
+**reverted uncommitted fixes**. Nothing committed was lost. **When fanning out agents that may build or
+test, commit before and between batches** — do not leave verified work uncommitted while agents run.
+
+**BACKLOG — reported by this pass, NOT yet verified or fixed.** The fall-through and dead-code sweeps
+returned ~40 further findings. One that was checked **did not reproduce** (a claimed unclosed-block
+infinite loop: the repro exited cleanly, `validation: FAILED — ControlUnderflow`), which is why the rest
+are recorded as *claims* pending individual verification rather than as defects. Highest-value to check
+first: `wast.zig assertRejected` counting **any** error as a pass for `assert_invalid`/`assert_malformed`
+(if true it inflates the conformance numbers recorded in `testing.md`); a missing imported **global**
+silently reading 0 while memories/tables correctly `MissingImport`; several `wat.zig` silent drops
+(unknown module field, unknown `(type (func …))` part, unrecognised memarg atom, `(export … (memory $x))`
+always index 0, multi-memory collapsing onto memory 0) — the assembler emitting **wrong bytes** is the
+canonical failure the protocol names; `readHeapTypeRef` decoding an undefined heap type as `externref`;
+an undefined `0xFD` sub-opcode decoding *and validating*; `i8x16.shuffle` lane indices ≥ 32 accepted;
+`refMatches` folding `exn`/`nofunc`/`noextern` into the wrong hierarchy (`ref.test (ref nofunc)` on a
+funcref answering 1 where the spec says 0); WASI `clock_time_get` treating every clockid as monotonic;
+`errnoFor` mapping `NotLink` to EIO instead of EINVAL; and the CLI exiting **0** on every failure path
+including a verify-gate refusal.
+
 ## #23 — Zig 0.16 Windows `Io` filesystem gaps found in WASI 4.3 (2026-07-16)
 
 Two more std holes on Windows, same family as #18 (which is the first). Both hit during 4.3; recheck all
