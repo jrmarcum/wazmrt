@@ -49,6 +49,12 @@ int main(void) {
         0x02, 0x0b, 0x01, 0x03, 'e', 'n', 'v', 0x03, 'a', 'd', 'd', 0x00, 0x00,
         0x03, 0x02, 0x01, 0x00,
         0x07, 0x07, 0x01, 0x03, 'r', 'u', 'n', 0x00, 0x01,
+        /* code: one body for the one declared function — `local.get 0; end`.
+           This fixture previously had NO code section, so function/code counts
+           disagreed and the module was invalid. It passed only because
+           wasm_module_validate used to just decode; now that it really
+           validates, the fixture has to be a valid module. */
+        0x0a, 0x06, 0x01, 0x04, 0x00, 0x20, 0x00, 0x0b,
     };
     wasm_byte_vec_t binary;
     wasm_byte_vec_new_uninitialized(&binary, sizeof(mod));

@@ -236,7 +236,14 @@ export fn wasm_module_validate(store: ?*Store, binary: ?*const ByteVec) bool {
     _ = store;
     const bin = binary orelse return false;
     var m = root.decode(alloc, vecSlice(bin)) catch return false;
-    m.deinit();
+    defer m.deinit();
+    // It only DECODED. A function named `validate` returned true for a
+    // type-invalid module — so a host gating untrusted wasm on
+    // `wasm_module_validate` before `wasm_instance_new` got a green light, and
+    // every validator fix (`br_on_non_null`, `requireMemory`, the `concreteRef`
+    // truncation) was unreachable through the C ABI: the exact audience those
+    // fixes were justified by.
+    root.validate(alloc, &m) catch return false;
     return true;
 }
 
@@ -1031,6 +1038,12 @@ export fn wasm_extern_vec_delete(vec: *ExternVec) void {
                 // rather than aliasing them, so nothing else can hold this
                 // pointer. Free it outright — via destroyRef, so its handle on
                 // the instance is dropped too.
+                //
+                // But run the header's `host_info` finalizer first: it normally
+                // fires inside `release()`, which this branch bypasses, so
+                // `set_host_info_with_finalizer` on an export handle never had
+                // its finalizer called and the embedder's allocation leaked.
+                if (r.hdr.host_info_finalizer) |f| f(r.hdr.host_info);
                 destroyRef(r);
             } else {
                 // A standalone object the vec took ownership of (e.g. a host
@@ -1486,7 +1499,16 @@ export fn wasm_global_delete(g: ?*Ref) void {
 // ---- Memories -------------------------------------------------------------
 
 fn memObj(r: *const Ref) ?*interp.Instance.Memory {
-    if (r.instance) |wi| return wi.inst.memory0(); // MVP: single memory (index 0)
+    // Honour the export's index. This used to return `memory0()` for ANY
+    // instance-backed memory ref ("MVP: single memory"), but multi-memory
+    // shipped in Phase 7 — so on a two-memory module `wasm_memory_data(exports[1])`
+    // handed back memory **0**'s pages and `wasm_memory_grow` on the second
+    // export grew the first. `tableObj` and `globalStorage` both index correctly;
+    // this was the odd one out.
+    if (r.instance) |wi| {
+        if (r.index >= wi.inst.memories.len) return null;
+        return wi.inst.memories[r.index];
+    }
     return r.host_memory;
 }
 
@@ -2270,6 +2292,14 @@ export fn wasm_extern_delete(e: ?*Ref) void {
 fn dupExportHandle(src: *const Ref) ?*Ref {
     const r = alloc.create(Ref) catch return null;
     r.* = .{ .kind = src.kind, .instance = refRetainInstance(src.instance), .index = src.index };
+    // Carry `host_info` across. `wasm_X_same(copy, x)` is true for a dup, so two
+    // objects the API declares identical must not disagree about their host data
+    // — `get_host_info` on the copy used to return NULL.
+    //
+    // The FINALIZER is deliberately NOT copied: it is a delete-time callback and
+    // duplicating it would run the embedder's free twice for "the same object".
+    // The original handle keeps ownership of that call.
+    r.hdr.host_info = src.hdr.host_info;
     return r;
 }
 
@@ -2344,6 +2374,14 @@ export fn wasm_trap_trace(trap: ?*const Trap, out: *FrameVec) void {
 fn copyFrame(src: *const Frame) ?*Frame {
     const f = alloc.create(Frame) catch return null;
     f.* = src.*;
+    // A handed-out `wasm_frame_t` is `own` in the header and is NOT documented as
+    // tied to its trap's lifetime, so it must hold its own handle on the
+    // instance. The earlier fix retained once for the frame ARRAY stored in the
+    // Trap and released that in `wasm_trap_delete` — this copy was the surviving
+    // half: `wasm_trap_origin(t)` then `wasm_trap_delete(t)` then
+    // `wasm_instance_delete(inst)` left `origin` dangling. Released in
+    // `wasm_frame_delete` / `wasm_frame_vec_delete`.
+    if (f.instance) |wi| retain(&wi.hdr);
     return f;
 }
 
@@ -2354,6 +2392,7 @@ export fn wasm_frame_copy(frame: ?*const Frame) ?*Frame {
 
 export fn wasm_frame_delete(frame: ?*Frame) void {
     const f = frame orelse return;
+    if (f.instance) |wi| wasm_instance_delete(wi); // balance `copyFrame`'s retain
     alloc.destroy(f);
 }
 
@@ -2412,8 +2451,10 @@ export fn wasm_frame_vec_copy(out: *FrameVec, src: *const FrameVec) void {
 
 export fn wasm_frame_vec_delete(vec: *FrameVec) void {
     if (vec.data != null and vec.size != 0) {
+        // Each element came from `copyFrame`, which retains the instance — go
+        // through `wasm_frame_delete` so the release is not skipped.
         for (vec.data[0..vec.size]) |slot| {
-            if (slot) |f| alloc.destroy(f);
+            if (slot) |f| wasm_frame_delete(f);
         }
         alloc.free(vec.data[0..vec.size]);
     }
