@@ -938,11 +938,30 @@ fn copyFuncType(src: ?*const FuncType) ?*FuncType {
 }
 
 /// Allocate a trap carrying a NUL-terminated copy of `msg` and no frames.
-fn makeTrap(msg: []const u8) ?*Trap {
-    const t = alloc.create(Trap) catch return null;
+/// The trap handed back when we cannot allocate a real one.
+///
+/// `wasm_func_call` signals "no trap" by returning NULL, so a `makeTrap` that
+/// returned null on OOM reported a **guest trap as a successful call** — and the
+/// embedder then read its own uninitialised results buffer as the answer. There
+/// is no other channel in `wasm.h`, so the honest fallback is a preallocated
+/// singleton: it is never freed, never refcounted, and every delete path skips
+/// it (`isStaticTrap`). Losing the specific message is a far smaller lie than
+/// losing the trap.
+var oom_trap_message = [_]u8{ 'o', 'u', 't', ' ', 'o', 'f', ' ', 'm', 'e', 'm', 'o', 'r', 'y', 0 };
+var oom_trap: Trap = .{
+    .message = .{ .size = oom_trap_message.len, .data = &oom_trap_message },
+};
+
+/// True for the static OOM trap, which must never be freed or refcounted.
+fn isStaticTrap(t: *const Trap) bool {
+    return t == &oom_trap;
+}
+
+fn makeTrap(msg: []const u8) *Trap {
+    const t = alloc.create(Trap) catch return &oom_trap;
     const buf = alloc.alloc(u8, msg.len + 1) catch {
         alloc.destroy(t);
-        return null;
+        return &oom_trap;
     };
     @memcpy(buf[0..msg.len], msg);
     buf[msg.len] = 0;
@@ -957,8 +976,9 @@ fn makeTrap(msg: []const u8) ?*Trap {
 /// pointing at the live trace would hand the embedder a dangling read. Failing
 /// to allocate frames degrades to a message-only trap rather than losing the
 /// trap itself.
-fn makeTrapFrom(msg: []const u8, wi: *Instance) ?*Trap {
-    const t = makeTrap(msg) orelse return null;
+fn makeTrapFrom(msg: []const u8, wi: *Instance) *Trap {
+    const t = makeTrap(msg);
+    if (isStaticTrap(t)) return t; // no room for a real trap, let alone frames
     const src = wi.inst.trapFrames();
     if (src.len == 0) return t;
 
@@ -1739,6 +1759,7 @@ export fn wasm_trap_message(trap: ?*const Trap, out: *ByteVec) void {
 
 export fn wasm_trap_delete(trap: ?*Trap) void {
     const t = trap orelse return;
+    if (isStaticTrap(t)) return; // preallocated OOM trap — not ours to free
     if (!release(&t.hdr)) return; // a `wasm_trap_copy` handle still holds it
     wasm_byte_vec_delete(&t.message);
     if (t.frames.len != 0) {
@@ -2639,7 +2660,7 @@ test "a trap's frames stay valid after the call, and free once" {
     const h = testInstance();
     defer testTeardown(h);
     // Build a trap the way a failed call does, then read it back.
-    const t = makeTrap("boom").?;
+    const t = makeTrap("boom");
     var msg: ByteVec = undefined;
     wasm_trap_message(t, &msg);
     try std.testing.expectEqualStrings("boom", msg.data[0..4]);

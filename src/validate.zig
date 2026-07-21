@@ -251,6 +251,17 @@ fn validateConstExpr(module: *const Module, expr: []const u8, expected: V, self_
                 _ = try r.readBytes(8);
                 try push(&stack, &sp, .f64);
             },
+            0xfd => { // SIMD prefix — `v128.const` (sub 0x0c) is a constant expression
+                // §3.3.7 lists `v128.const` among the constant instructions, but
+                // this arm did not exist, so EVERY `(global v128 (v128.const …))`
+                // was rejected `ConstantExpressionRequired` — a reject-VALID on a
+                // form LLVM emits for any module with a SIMD global. It hid
+                // behind the CLI's invoke path, which does not validate.
+                const sub = try r.readVarU32();
+                if (sub != 0x0c) return error.ConstantExpressionRequired;
+                _ = try r.readBytes(16); // the 16 immediate lane bytes
+                try push(&stack, &sp, .v128);
+            },
             0x23 => { // global.get x — only a prior, immutable global
                 const gi = try r.readVarU32();
                 if (gi >= self_index) return error.UndefinedGlobal;
@@ -332,6 +343,20 @@ fn validateFunction(a: std.mem.Allocator, module: *const Module, ft: Module.Func
 /// returns the widths captured **before** the error — an error can only be at or
 /// after an unsupported/invalid instruction, which the interpreter traps on
 /// before reaching any later drop/select, so those later widths are never used.
+///
+/// **`OutOfMemory` is the exception to that tolerance and must propagate.** It
+/// can arise at *any* point in `validateFunction`, not just at a bad
+/// instruction, so the "everything after the error is unreachable" argument does
+/// not hold for it: the widths simply stay at their `1` default, a v128
+/// `drop`/`select` then pops one slot instead of two, and the operand stack is
+/// desynchronised for the rest of the function. The module returns a **silently
+/// wrong answer** with no trap and no diagnostic — one transient allocation
+/// failure inside `Instance.init`, which still reports success.
+///
+/// Reachable by any memory-capped embedder: a *budgeted* allocator (like the one
+/// in `fuzz.zig`) refuses while over its limit and succeeds again after frees, so
+/// a single failure here is transient rather than terminal. Sticky
+/// `FailingAllocator` sweeps cannot see this, which is why it went unnoticed.
 pub fn dropSelectWidths(a: std.mem.Allocator, module: *const Module, ft: Module.FuncType, code: Module.Code) std.mem.Allocator.Error![]const u8 {
     // The caller (interp) already decoded this body successfully, so re-decoding
     // here fails only on OOM; a (hypothetical) decode error → empty = all width 1.
@@ -344,7 +369,9 @@ pub fn dropSelectWidths(a: std.mem.Allocator, module: *const Module, ft: Module.
     // `refs` is null: this is a LOWERING pass, not a verdict — the caller has
     // already validated (or will), and a C.refs rejection here would only
     // truncate the width table it is trying to fill in.
-    validateFunction(a, module, ft, code, widths, null) catch {};
+    validateFunction(a, module, ft, code, widths, null) catch |e| {
+        if (e == error.OutOfMemory) return error.OutOfMemory;
+    };
     return widths;
 }
 

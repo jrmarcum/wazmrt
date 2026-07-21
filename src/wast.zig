@@ -303,8 +303,23 @@ const Runner = struct {
         const name = try asStr(try nth(list, i));
         i += 1;
         if (std.mem.eql(u8, kw, "invoke")) {
-            const args = try self.a.alloc(Value, list.len - i);
-            for (list[i..], args) |arg, *dst| dst.* = try self.parseConst(arg);
+            // A `v128` argument occupies TWO slots (low then high), so the slot
+            // count is not the form count.
+            var nslots: usize = 0;
+            for (list[i..]) |arg| nslots += if (isV128Form(arg)) 2 else 1;
+            const args = try self.a.alloc(Value, nslots);
+            var ai: usize = 0;
+            for (list[i..]) |arg| {
+                if (isV128Form(arg)) {
+                    const v = try parseV128(arg.asList().?);
+                    args[ai] = @truncate(v);
+                    args[ai + 1] = @truncate(v >> 64);
+                    ai += 2;
+                } else {
+                    args[ai] = try self.parseConst(arg);
+                    ai += 1;
+                }
+            }
             return inst.invoke(name, args);
         }
         if (std.mem.eql(u8, kw, "get")) return self.getGlobal(inst, name);
@@ -345,15 +360,35 @@ const Runner = struct {
             return;
         };
         const expected = form[2..];
-        if (results.len != expected.len) {
-            self.fail("assert_return: arity {d} != expected {d}", .{ results.len, expected.len });
+        // Results are counted in SLOTS, and a v128 is two of them (`pushV128`
+        // pushes low then high). Comparing form count to slot count directly
+        // reported "arity 2 != expected 1" for every SIMD assertion in the
+        // testsuite, which is why none of them had ever actually run.
+        var want_slots: usize = 0;
+        for (expected) |exp_form| want_slots += if (isV128Form(exp_form)) 2 else 1;
+        if (results.len != want_slots) {
+            self.fail("assert_return: arity {d} != expected {d}", .{ results.len, want_slots });
             return;
         }
         const action_name: []const u8 = actionName(form[1]);
-        for (results, expected) |got, exp_form| {
-            if (!try self.matches(got, exp_form)) {
-                self.fail("assert_return \"{s}\": result mismatch (got 0x{x})", .{ action_name, got });
-                return;
+        var ri: usize = 0;
+        for (expected) |exp_form| {
+            if (isV128Form(exp_form)) {
+                const lo = results[ri];
+                const hi = results[ri + 1];
+                ri += 2;
+                const got: u128 = (@as(u128, hi) << 64) | lo;
+                if (!try v128Matches(got, exp_form.asList().?)) {
+                    self.fail("assert_return \"{s}\": v128 mismatch (got 0x{x})", .{ action_name, got });
+                    return;
+                }
+            } else {
+                const got = results[ri];
+                ri += 1;
+                if (!try self.matches(got, exp_form)) {
+                    self.fail("assert_return \"{s}\": result mismatch (got 0x{x})", .{ action_name, got });
+                    return;
+                }
             }
         }
         self.summary.passed += 1;
@@ -633,6 +668,65 @@ fn spectestGlobal(module: []const u8, name: []const u8) ?Value {
     return null;
 }
 
+/// Lane count for a `v128.const` shape keyword, or null if it is not one.
+fn v128Shape(kw: []const u8) ?struct { lanes: usize, width: usize, float: bool } {
+    if (std.mem.eql(u8, kw, "i8x16")) return .{ .lanes = 16, .width = 1, .float = false };
+    if (std.mem.eql(u8, kw, "i16x8")) return .{ .lanes = 8, .width = 2, .float = false };
+    if (std.mem.eql(u8, kw, "i32x4")) return .{ .lanes = 4, .width = 4, .float = false };
+    if (std.mem.eql(u8, kw, "i64x2")) return .{ .lanes = 2, .width = 8, .float = false };
+    if (std.mem.eql(u8, kw, "f32x4")) return .{ .lanes = 4, .width = 4, .float = true };
+    if (std.mem.eql(u8, kw, "f64x2")) return .{ .lanes = 2, .width = 8, .float = true };
+    return null;
+}
+
+/// True if `form` is a `(v128.const <shape> <lane>…)` literal — which occupies
+/// **two** result slots, unlike every other value form.
+fn isV128Form(form: Sexpr) bool {
+    const list = form.asList() orelse return false;
+    if (list.len < 2) return false;
+    const kw = list[0].asAtom() orelse return false;
+    return std.mem.eql(u8, kw, "v128.const");
+}
+
+/// Parse `(v128.const <shape> <lane>…)` into its 128-bit value. Lanes are
+/// little-endian: lane 0 occupies the low bits, matching `pushV128`, which
+/// pushes the low half first.
+fn parseV128(list: []const Sexpr) Error!u128 {
+    if (list.len < 2) return error.BadValue;
+    const shape = v128Shape(list[1].asAtom() orelse return error.BadValue) orelse return error.BadValue;
+    if (list.len != 2 + shape.lanes) return error.BadValue;
+    var out: u128 = 0;
+    for (0..shape.lanes) |i| {
+        const lit = list[2 + i].asAtom() orelse return error.BadValue;
+        const bits: u64 = switch (shape.width) {
+            1 => @as(u8, @truncate(@as(u64, @bitCast(try parseInt(lit))))),
+            2 => @as(u16, @truncate(@as(u64, @bitCast(try parseInt(lit))))),
+            4 => if (shape.float) @as(u64, try parseFloatBits(f32, lit)) else @as(u32, @truncate(@as(u64, @bitCast(try parseInt(lit))))),
+            8 => if (shape.float) try parseFloatBits(f64, lit) else @as(u64, @bitCast(try parseInt(lit))),
+            else => unreachable,
+        };
+        out |= @as(u128, bits) << @intCast(i * shape.width * 8);
+    }
+    return out;
+}
+
+/// Compare a 128-bit result against a `(v128.const …)` expectation. Float shapes
+/// are matched **lane by lane** so the per-lane `nan:canonical`/`nan:arithmetic`
+/// matchers work — a whole-vector bit compare would reject a legitimate NaN.
+fn v128Matches(got: u128, list: []const Sexpr) Error!bool {
+    if (list.len < 2) return error.BadValue;
+    const shape = v128Shape(list[1].asAtom() orelse return error.BadValue) orelse return error.BadValue;
+    if (list.len != 2 + shape.lanes) return error.BadValue;
+    if (!shape.float) return got == try parseV128(list);
+    for (0..shape.lanes) |i| {
+        const lit = list[2 + i].asAtom() orelse return error.BadValue;
+        const lane: u64 = @truncate(got >> @intCast(i * shape.width * 8));
+        const ok = if (shape.width == 4) try floatMatches(f32, lane, lit) else try floatMatches(f64, lane, lit);
+        if (!ok) return false;
+    }
+    return true;
+}
+
 fn floatMatches(comptime F: type, got: Value, lit: []const u8) Error!bool {
     if (std.mem.eql(u8, lit, "nan:canonical")) return isCanonicalNan(F, got);
     if (std.mem.eql(u8, lit, "nan:arithmetic")) return isArithmeticNan(F, got);
@@ -662,7 +756,11 @@ fn parseFloatBits(comptime F: type, lit: []const u8) Error!UInt(F) {
         }
         return bits;
     }
-    const f = std.fmt.parseFloat(F, lit) catch return error.BadValue;
+    // `wat.parseFloatLit`, not `std.fmt.parseFloat`: one authority for float
+    // literals across the assembler and this runner, so an `assert_return`
+    // expectation and the module it checks can never disagree about what a
+    // literal means. (std truncates long hex mantissas — see that function.)
+    const f = wat.parseFloatLit(F, lit) orelse return error.BadValue;
     return @bitCast(f);
 }
 

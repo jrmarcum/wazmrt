@@ -2163,8 +2163,203 @@ fn floatLitBits(comptime U: type, comptime F: type, lit: []const u8) ?U {
         if (lit.len != 0 and lit[0] == '-') bits |= sign_bit;
         return bits;
     }
-    const f = std.fmt.parseFloat(F, lit) catch return null;
+    const f = parseFloatLit(F, lit) orelse return null;
     return @bitCast(f);
+}
+
+/// Parse a WAT numeric float literal to `F`, **correctly rounded**.
+///
+/// Decimal literals go to `std.fmt.parseFloat`, but hexadecimal ones
+/// (`0x1.abcp+3`, and the exponent-less `0xABC` form the text format also
+/// allows) are parsed here, because `std.fmt.parseFloat` **truncates** a hex
+/// mantissa longer than ~17 hex digits instead of rounding it:
+///
+///     0x0123456789ABCDEFa       -> 0x43b23456789abcdf   (correct)
+///     0x0123456789ABCDEFabcdef  -> 0x44f23456789abcde   (should be ...cdf)
+///
+/// That is a *wrong value*, not a rejected one: the assembler silently emitted a
+/// constant one ULP low, so the same number written in decimal and in hex
+/// compiled to different modules. Found via the spec suite's
+/// `simd_f64x2_rounding.wast`, whose literals are long enough to cross the
+/// threshold. (Third upstream Zig issue this project works around; unlike the
+/// other two it is cheap to route around, so we do.)
+///
+/// `wast.zig` shares this — one authority for float literals across the
+/// assembler and the `.wast` runner, so an expectation and the module it checks
+/// can never disagree about what a literal means.
+///
+/// Returns null on a malformed literal. `inf`/`nan` are not hex and fall through
+/// to std; the wasm-specific `nan:…` spellings are the caller's job.
+pub fn parseFloatLit(comptime F: type, lit: []const u8) ?F {
+    var s = lit;
+    var neg = false;
+    if (s.len != 0 and (s[0] == '+' or s[0] == '-')) {
+        neg = s[0] == '-';
+        s = s[1..];
+    }
+    if (!(s.len > 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X')))
+        return std.fmt.parseFloat(F, lit) catch null;
+    s = s[2..];
+
+    // Accumulate the hex significand into a u128. Digits beyond its capacity
+    // cannot change the rounded result except through the sticky bit, so they
+    // are folded into `sticky` rather than dropped silently.
+    var mant: u128 = 0;
+    var sticky = false;
+    var exp: i32 = 0; // binary exponent contributed by digit placement
+    var seen_digit = false;
+    var seen_dot = false;
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (c == '.') {
+            if (seen_dot) return null;
+            seen_dot = true;
+            continue;
+        }
+        if (c == 'p' or c == 'P') break;
+        if (c == '_') continue; // the text format permits digit separators
+        const d: u128 = switch (c) {
+            '0'...'9' => c - '0',
+            'a'...'f' => c - 'a' + 10,
+            'A'...'F' => c - 'A' + 10,
+            else => return null,
+        };
+        seen_digit = true;
+        if (mant >> 124 != 0) {
+            if (d != 0) sticky = true;
+            if (!seen_dot) exp += 4; // a dropped integer digit still scales the value
+        } else {
+            mant = (mant << 4) | d;
+            if (seen_dot) exp -= 4;
+        }
+    }
+    if (!seen_digit) return null;
+    if (i < s.len) { // `p` exponent
+        i += 1;
+        var pneg = false;
+        if (i < s.len and (s[i] == '+' or s[i] == '-')) {
+            pneg = s[i] == '-';
+            i += 1;
+        }
+        if (i >= s.len) return null;
+        var pexp: i64 = 0;
+        while (i < s.len) : (i += 1) {
+            if (s[i] == '_') continue;
+            if (s[i] < '0' or s[i] > '9') return null;
+            pexp = pexp * 10 + (s[i] - '0');
+            if (pexp > 1 << 30) pexp = 1 << 30; // saturate — it overflows/underflows either way
+        }
+        exp += @intCast(if (pneg) -pexp else pexp);
+    }
+    if (mant == 0) return if (neg) -@as(F, 0.0) else @as(F, 0.0);
+
+    // value = mant × 2^exp. Round it, in ONE step, to a multiple of the target's
+    // ULP — then `ldexp` only scales an exact integer and never rounds again.
+    //
+    // The ULP exponent is the coarser of the normalised one (`e - prec + 1`) and
+    // the smallest subnormal's (`min_e - prec + 1`). Taking the max is what makes
+    // normal, subnormal, and below-the-smallest-subnormal a single path. Rounding
+    // in two stages instead — clamping the kept-bit count and letting `ldexp`
+    // finish — throws away the sticky bit, so a value just ABOVE half the
+    // smallest subnormal flushed to zero instead of rounding up to it.
+    const prec: i32 = std.math.floatMantissaBits(F) + 1;
+    const msb: i32 = 128 - @as(i32, @clz(mant));
+    const e: i32 = exp + msb - 1;
+    const ulp_exp: i32 = @max(std.math.floatExponentMin(F) - prec + 1, e - prec + 1);
+
+    var q: u128 = undefined;
+    const k: i32 = ulp_exp - exp;
+    if (k > 0) {
+        // Round to nearest, ties to even. `q` may carry into the next binade
+        // (becoming 2^prec); that is exactly representable, so `ldexp` is still
+        // exact and the result lands on the right side of the boundary.
+        // `k` can exceed the width of `mant` for a value far below the smallest
+        // subnormal. A u128 shift is only defined for 0..127, and `@intCast` to
+        // the shift type would be out of range — silently wrong in ReleaseFast —
+        // so the whole-mantissa-shifted-out case is handled separately.
+        if (k > 128) {
+            if (mant != 0) sticky = true; // guard bit is past the top: no round-up
+            q = 0;
+        } else {
+            const sh: u7 = @intCast(k - 1); // k-1 is 0..127 here
+            const guard = (mant >> sh) & 1;
+            if (mant & ((@as(u128, 1) << sh) - 1) != 0) sticky = true;
+            q = if (k == 128) 0 else mant >> @intCast(k);
+            if (guard != 0 and (sticky or (q & 1) != 0)) q += 1;
+        }
+    } else {
+        q = mant << @intCast(-k);
+    }
+
+    const scaled = std.math.ldexp(@as(F, @floatFromInt(q)), ulp_exp);
+    return if (neg) -scaled else scaled;
+}
+
+test "hex float literals are correctly ROUNDED, not truncated" {
+    // The exact case from `simd_f64x2_rounding.wast`: std truncates to ...cde.
+    try std.testing.expectEqual(
+        @as(u64, 0x44f23456789abcdf),
+        @as(u64, @bitCast(parseFloatLit(f64, "0x0123456789ABCDEFabcdef").?)),
+    );
+    // Short mantissas (where std was already right) must not regress.
+    try std.testing.expectEqual(
+        @as(u64, 0x43b23456789abcdf),
+        @as(u64, @bitCast(parseFloatLit(f64, "0x0123456789ABCDEFa").?)),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 0x44a23456789abcdf),
+        @as(u64, @bitCast(parseFloatLit(f64, "0x0123456789ABCDEFp019").?)),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 0x45023456789abcde),
+        @as(u64, @bitCast(parseFloatLit(f64, "0x1.23456789abcdep+81").?)),
+    );
+    // The SAME value in hex and in decimal must compile identically — the
+    // property the truncation broke.
+    try std.testing.expectEqual(
+        @as(u64, @bitCast(parseFloatLit(f64, "1.3754889325393114e+24").?)),
+        @as(u64, @bitCast(parseFloatLit(f64, "0x0123456789ABCDEFabcdef").?)),
+    );
+    try std.testing.expectEqual(@as(f64, 1.0), parseFloatLit(f64, "0x1p+0").?);
+    try std.testing.expectEqual(@as(f64, 0.5), parseFloatLit(f64, "0x1p-1").?);
+    try std.testing.expectEqual(@as(f64, -2.0), parseFloatLit(f64, "-0x1p+1").?);
+    // Boundaries: smallest subnormal, smallest normal, largest finite, overflow.
+    try std.testing.expectEqual(@as(u64, 1), @as(u64, @bitCast(parseFloatLit(f64, "0x1p-1074").?)));
+    try std.testing.expectEqual(@as(u64, 0x0010000000000000), @as(u64, @bitCast(parseFloatLit(f64, "0x1p-1022").?)));
+    try std.testing.expectEqual(@as(u64, 0x7fefffffffffffff), @as(u64, @bitCast(parseFloatLit(f64, "0x1.fffffffffffffp+1023").?)));
+    try std.testing.expect(std.math.isInf(parseFloatLit(f64, "0x1p+1024").?));
+    try std.testing.expectEqual(@as(f64, 0.0), parseFloatLit(f64, "0x0p+0").?);
+    try std.testing.expect(std.math.signbit(parseFloatLit(f64, "-0x0p+0").?));
+    // f32 rounds in its own precision.
+    try std.testing.expectEqual(@as(u32, 0x3f800000), @as(u32, @bitCast(parseFloatLit(f32, "0x1p+0").?)));
+    try std.testing.expectEqual(@as(u32, 0x00000001), @as(u32, @bitCast(parseFloatLit(f32, "0x1p-149").?)));
+    // Below the smallest subnormal, rounding must still consider the STICKY bits:
+    // just over half a ULP rounds UP, exactly half ties to even (= zero), and
+    // just under stays zero. Two-stage rounding got the first of these wrong.
+    try std.testing.expectEqual( // spec suite simd_const.wast:825
+        @as(u64, 1),
+        @as(u64, @bitCast(parseFloatLit(f64, "0x0.000000000000080000000001p-1022").?)),
+    );
+    try std.testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(parseFloatLit(f64, "0x1p-1075").?))); // exactly half -> even
+    try std.testing.expectEqual(@as(u64, 1), @as(u64, @bitCast(parseFloatLit(f64, "0x1.8p-1075").?))); // 3/4 ULP -> up
+    try std.testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(parseFloatLit(f64, "0x1p-1200").?))); // far below -> 0
+    // 0x0.00000500000000001p-126 = just over 2.5 ULP -> 3 ULP (spec expects
+    // 0x0.000006p-126, i.e. 6 x 2^-150 = 3 x 2^-149 = bit pattern 3).
+    try std.testing.expectEqual(@as(u32, 3), @as(u32, @bitCast(parseFloatLit(f32, "0x0.00000500000000001p-126").?)));
+    // Ties-to-even at the smallest subnormal, and the carry-into-next-binade case.
+    try std.testing.expectEqual(@as(u64, 2), @as(u64, @bitCast(parseFloatLit(f64, "0x1.8p-1074").?))); // 1.5 ULP -> even = 2
+    try std.testing.expectEqual(
+        @as(u64, @bitCast(@as(f64, 2.0))),
+        @as(u64, @bitCast(parseFloatLit(f64, "0x1.ffffffffffffffp+0").?)), // rounds up to 2.0
+    );
+    // Decimal literals still go through std, unchanged.
+    try std.testing.expectEqual(@as(f64, 1.5), parseFloatLit(f64, "1.5").?);
+    // Malformed input is rejected, not silently accepted.
+    try std.testing.expect(parseFloatLit(f64, "0x") == null);
+    try std.testing.expect(parseFloatLit(f64, "0x1p") == null);
+    try std.testing.expect(parseFloatLit(f64, "0x1.2.3p+0") == null);
+    try std.testing.expect(parseFloatLit(f64, "0xzz") == null);
 }
 
 // --- Section / LEB helpers -------------------------------------------------

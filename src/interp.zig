@@ -464,6 +464,16 @@ pub const Instance = struct {
     /// Shared linear memory. A single object is referenced by the defining
     /// instance and every importer, so `memory.grow` (which updates `bytes`) is
     /// visible across the module boundary.
+    ///
+    /// **`bytes` MUST come from `allocGuestMemory`.** This is a hard invariant of
+    /// the public `initWithImports` API, not a convention: a guest `memory.grow`
+    /// on an imported memory goes through `growGuestMemory`, which `rawRemap`s
+    /// and — when the remap cannot extend in place — allocates, copies, and
+    /// calls `freeGuestMemory` on the OLD block. Handing in storage from any
+    /// other allocator therefore ends in the page allocator releasing memory it
+    /// never owned: a panic in a safety build, silent corruption in ReleaseFast.
+    /// (Cross-allocator guest memory has been a bug here three separate times;
+    /// every in-repo caller is correct, but the invariant lives on the type now.)
     pub const Memory = struct { bytes: []u8, max: ?u32 };
 
     /// Memory index 0, or null if the module has no memory. The WASI host and the
@@ -475,6 +485,11 @@ pub const Instance = struct {
     /// Shared reference table (funcref/externref `Value` slots; `null_ref` =
     /// uninitialized). Referenced by the definer and importers; `table.grow`
     /// updates `entries` in place so all sharers observe it.
+    ///
+    /// **`entries` MUST come from the importing `Instance`'s `gpa`**, for the same
+    /// reason `Memory.bytes` must come from `allocGuestMemory`: `table.grow`
+    /// does `self.inst.gpa.realloc(entries, …)`. Two instances built with
+    /// different allocators cannot share a `Table`.
     pub const Table = struct { entries: []Value, max: ?u32 };
 
     /// A callable backing an imported function: another instance's exported
@@ -3324,6 +3339,21 @@ fn fmax(comptime F: type, a: F, b: F) F {
 
 /// Round to nearest, ties to even (wasm `nearest`), preserving the sign of zero.
 fn rintEven(comptime F: type, x: F) F {
+    // A NaN operand must come back QUIET. The spec says `fnearest(z)` for a NaN
+    // `z` yields a value from `nans_N{z}`, every member of which has the quiet
+    // bit set — so returning a *signaling* NaN unchanged is not a legal answer.
+    // `ceil`/`floor`/`trunc`/`sqrt`/`add` all quiet it in hardware; this helper
+    // is hand-written and was the one path that didn't, which is why it affected
+    // scalar AND SIMD alike (`f32.nearest`, `f64.nearest`, `f32x4.nearest`,
+    // `f64x2.nearest` all route through here).
+    //
+    // Note `abs`/`neg`/`copysign` are deliberately NOT in this class: the spec
+    // defines them as sign-bit operations that preserve the payload.
+    if (std.math.isNan(x)) {
+        const U = if (F == f32) u32 else u64;
+        const quiet_bit: U = @as(U, 1) << (std.math.floatMantissaBits(F) - 1);
+        return @bitCast(@as(U, @bitCast(x)) | quiet_bit);
+    }
     if (!std.math.isFinite(x)) return x;
     const f = @floor(x);
     const diff = x - f;
