@@ -757,7 +757,12 @@ pub const Instance = struct {
             } else {
                 const entries = try gpa.alloc(Value, tt.limits.min);
                 @memset(entries, null_ref);
-                const tab = try gpa.create(Table);
+                // Mirror the memory branch above: `n_tables_init` hasn't been
+                // advanced yet, so the errdefer doesn't cover `entries` either.
+                const tab = gpa.create(Table) catch |e| {
+                    gpa.free(entries);
+                    return e;
+                };
                 tab.* = .{ .entries = entries, .max = tt.limits.max };
                 t.* = tab;
             }
@@ -1305,7 +1310,17 @@ const Frame = struct {
     /// unwinding). Never returns null — it either yields a pc or re-raises.
     fn onCallError(self: *Frame, e: Error) Error!usize {
         if (e != error.UncaughtException) return e;
-        const exn = self.inst.pending_exn.?;
+        // `pending_exn` lives on the instance that THREW. A cross-module call
+        // (`HostFunc.wasm`, i.e. `(register …)` linking) runs the callee on its
+        // own `Instance`, so when `UncaughtException` unwinds into this frame
+        // `self.inst` is the CALLER and its `pending_exn` is null. The `.?` was
+        // a panic in Debug/ReleaseSafe and — worse — UB in ReleaseFast, where a
+        // garbage `Exception` reached `throwException`, whose
+        // `for (exn.values) |v| pushU64(v)` then iterated a wild slice onto the
+        // operand stack: an arbitrary-read primitive.
+        //
+        // Nothing here can catch an exception it never received, so re-raise.
+        const exn = self.inst.pending_exn orelse return e;
         const target = (try self.throwException(exn)) orelse return e;
         // Caught here: drop the in-flight exception and the unwind trace it left.
         self.inst.pending_exn = null;

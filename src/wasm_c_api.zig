@@ -518,7 +518,16 @@ export fn wasm_valtype_vec_delete(vec: *ValTypeVec) void {
 
 /// Construct a functype, taking ownership of the two valtype vecs (moved in).
 export fn wasm_functype_new(params: ?*ValTypeVec, results: ?*ValTypeVec) ?*FuncType {
-    const ft = alloc.create(FuncType) catch return null;
+    const ft = alloc.create(FuncType) catch {
+        // `wasm.h` says this takes ownership of both vecs unconditionally, so
+        // returning null without freeing them strands the caller's allocations
+        // with no handle to recover them. Every sibling constructor in this file
+        // (globaltype/tabletype/tagtype/importtype/exporttype) gets this right;
+        // this was the one that didn't.
+        if (params) |p| freeValTypeVec(p);
+        if (results) |r| freeValTypeVec(r);
+        return null;
+    };
     ft.ekind = EXTERN_FUNC;
     ft.params = if (params) |p| p.* else .{ .size = 0, .data = null };
     ft.results = if (results) |r| r.* else .{ .size = 0, .data = null };

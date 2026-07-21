@@ -226,12 +226,21 @@ const Runner = struct {
         return error.UnresolvedImport;
     }
 
-    /// The shared `spectest` memory / table, allocated on first use (from the
-    /// runner arena, so they outlive every instance that borrows them).
+    /// The shared `spectest` memory / table, allocated on first use (the `Memory`
+    /// *object* from the runner arena, so it outlives every instance that borrows
+    /// it — but its `bytes` from the page allocator, see below).
     fn spectestMemory(self: *Runner) !*interp.Instance.Memory {
         if (self.spectest_memory) |m| return m;
-        const buf = try self.a.alloc(u8, interp.page_size); // 1 page
-        @memset(buf, 0);
+        // `Memory.bytes` is ALWAYS page-allocator owned — `memory.grow` hands it
+        // to `growGuestMemory`/`rawRemap`, which `@alignCast`s to page alignment.
+        // Arena bytes are a 16-byte-aligned interior pointer, so a guest
+        // `memory.grow` on an imported `spectest.memory` panicked with
+        // "incorrect alignment" in Debug and did an mremap/munmap on host-heap
+        // memory in ReleaseFast. (This is the sibling the `wasm_memory_new`
+        // cross-allocator fix missed: that swept `wasm_c_api.zig` but not
+        // `wast.zig`, the other producer of `Memory` objects — reachable from
+        // the official testsuite's `imports.wast`.)
+        const buf = try interp.allocGuestMemory(interp.page_size); // 1 page, demand-zero
         const m = try self.a.create(interp.Instance.Memory);
         m.* = .{ .bytes = buf, .max = 2 };
         self.spectest_memory = m;

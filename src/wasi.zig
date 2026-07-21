@@ -434,6 +434,23 @@ pub const Wasi = struct {
     }
 
     /// Install `e` at the lowest free guest fd.
+    /// Release an fd slot and its host handle — the undo for `put`, used when a
+    /// syscall installs an fd but then cannot deliver its number to the guest
+    /// (which would strand the handle forever, since only the guest can close
+    /// it). Mirrors `fd_close`'s per-kind release.
+    fn closeFd(self: *Wasi, fd: u32) void {
+        const e = self.get(fd) orelse return;
+        switch (e.*) {
+            .file => |f| f.handle.close(self.io),
+            .dir => |d| {
+                if (d.owned) d.handle.close(self.io);
+                if (d.preopen_name) |n| self.gpa.free(n);
+            },
+            else => return, // stdio is never installed by `put`
+        }
+        self.fds.items[fd] = null;
+    }
+
     fn put(self: *Wasi, e: FdEntry) !u32 {
         for (self.fds.items, 0..) |slot, i| {
             if (slot == null) {
@@ -1322,7 +1339,14 @@ fn wPathOpen(ctx: *anyopaque, args: []const Value, results: []Value) bool {
             dir.close(w.io);
             return ret(results, errno.nomem);
         };
-        if (!w.writeU32(opened_fd_ptr, fd)) return ret(results, errno.fault);
+        // The fd is already installed and owns a real host handle. If we cannot
+        // deliver its number, the guest can never `fd_close` it — so a guest
+        // pointing `opened_fd` at the last 4 bytes of memory could leak one host
+        // handle per call and exhaust the process handle table. Undo the install.
+        if (!w.writeU32(opened_fd_ptr, fd)) {
+            w.closeFd(fd);
+            return ret(results, errno.fault);
+        }
         return ret(results, errno.success);
     }
 
@@ -1363,7 +1387,12 @@ fn wPathOpen(ctx: *anyopaque, args: []const Value, results: []Value) bool {
         file.close(w.io);
         return ret(results, errno.nomem);
     };
-    if (!w.writeU32(opened_fd_ptr, fd)) return ret(results, errno.fault);
+    // Same as the directory branch above: don't strand a host handle the guest
+    // can never close.
+    if (!w.writeU32(opened_fd_ptr, fd)) {
+        w.closeFd(fd);
+        return ret(results, errno.fault);
+    }
     return ret(results, errno.success);
 }
 
