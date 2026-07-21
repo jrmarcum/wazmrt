@@ -256,6 +256,21 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   unimplemented, return `UnsupportedInstr` — never assemble something plausible.** Note the recurring
   shape: the *flat* instruction path was safe by construction while the *folded* path was not, so the
   asymmetry between two paths for the same syntax was itself the bug.
+- **A type-checking op validates against its IMMEDIATE's type, never the family head (2026-07-21).**
+  `struct.*`/`array.*` popping `.structref`/`.arrayref`, and `call_ref` popping `.funcref`, let any member
+  of the family satisfy any op — a **reference-forgery primitive that passed validation and executed**
+  (`struct.get $b 0` on a `(ref $a)` read an i64 field as a funcref and `call_ref` called it). **Rule: pop
+  `V.concreteRef(true, kind, imm.type_index)`;** `subtypeOf` already walks the declared supertype chain.
+- **Per-invocation state is SAVED AND RESTORED, not cleared (2026-07-21).** A host callback may re-enter
+  the same instance (`wasm_func_call` from inside a host function — a documented wasm-c-api pattern), so
+  zeroing `pending_exn`/`exn_store` on entry destroyed what the *suspended* outer invocation still owned.
+  The call-depth budget is likewise shared via `Instance.reentry_depth`, or each re-entry restarts at 0 and
+  the **native** stack overflows while `max_call_depth` never fires. **The trap trace is the deliberate
+  exception** — it must outlive the invocation for `trapFrames()`, and a test pins that.
+- **`wasm_module_validate` must actually validate (2026-07-21).** It decoded and returned true, so the
+  validator's guarantees never reached the C ABI at all. **Rule: when a function's name states a
+  guarantee, verify the call graph delivers it** — and note that turning it on found an invalid fixture in
+  our own test suite that had passed since it was written.
 - **`zig build test-safe` is the memory-safety gate (2026-07-20).** The suite under **ReleaseSafe** —
   optimizer on, safety checks kept — so out-of-range `@intCast`, OOB, and null-unwrap panic loudly instead
   of being silent UB in the shipped ReleaseFast/ReleaseSmall builds. **Run it alongside `zig build test`

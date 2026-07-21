@@ -817,6 +817,74 @@ funcref answering 1 where the spec says 0); WASI `clock_time_get` treating every
 `errnoFor` mapping `NotLink` to EIO instead of EINVAL; and the CLI exiting **0** on every failure path
 including a verify-gate refusal.
 
+### 12th pass — 2026-07-21 — four new lenses, and the most productive pass yet
+
+Lenses (all previously unused): **error-path resource management**, **instance state across invocations**,
+**systematic validator conformance**, and **the comptime-GENERATED C-ABI surface**. Four agents, every
+finding reproduced before fixing.
+
+**The headline — `wasm_module_validate` NEVER VALIDATED.** It called `decode`, discarded the result and
+returned `true`. So a host gating untrusted wasm on it got a green light for any decodable module, and —
+the sharp part — **every fix in the 11th pass's validator batch was unreachable through the C ABI**, the
+exact audience that batch was justified by. *Lesson: verify the call graph, not the function's name.*
+Switching it on immediately exposed that `tests/c_smoke.c`'s own fixture was invalid (function section, no
+code section) and had always passed. Fixture fixed.
+
+**Unsound typing — a reference-forgery primitive that passed validation AND executed.** GC field accessors
+popped the **family head** (`.structref`/`.arrayref`) instead of the immediate's concrete type, so any
+struct ref satisfied any `struct.*`: `struct.get $b 0` on a `(ref $a)` reinterpreted an **i64 field as a
+funcref** and `call_ref` then **called it** — verified printing `777` before, `TypeMismatch` after. Same
+via arrays. `call_ref`/`return_call_ref` had the same shape (popped `.funcref`, ignoring the type index),
+delivering an i64 result as i32. Contained memory-safety-wise (`gcObject` + the field bound), but it voids
+what validation promises.
+
+**A validator PANIC on valid input.** `memory_init` read `instr.imm.data` when the decoder gives it
+`.mem_init{data, mem}` — "access of union field 'data' while field 'mem_init' is active". LLVM emits
+`memory.init` for any passive data segment, so this crashed on ordinary compiler output. In ReleaseFast the
+members alias at offset 0 and it silently read the right number: **UB that happens to work, differing by
+build mode**. Found independently by two agents.
+
+**Three siblings of MY OWN earlier fixes** — the recurring lesson of this project:
+- `wast.zig spectestMemory` allocated guest memory from the runner arena. The 11th pass's cross-allocator
+  fix swept `wasm_c_api.zig` but never `wast.zig`, **the other producer of `Memory` objects**. Reproduced:
+  "incorrect alignment" panic on `memory.grow` of an imported `spectest.memory`, reachable from the
+  official `imports.wast`.
+- `copyFrame` handed out frames with **no retain**; the trap-frame fix covered the array held by the
+  `Trap`, not the frames given to the embedder.
+- `onCallError` did `pending_exn.?` where the exception lives on the **throwing** instance; a cross-module
+  call left it null — UB in ReleaseFast, pushing a wild slice onto the operand stack.
+
+**Reentrancy (both reproduced).** A host callback re-entering the same instance wiped the *suspended*
+invocation's exception state — live exnrefs silently re-bound to the inner invocation's exceptions (`11`
+became `22`, no trap) or vanished (`NullReference`). And each nested `invokeIndex` restarted the
+call-depth budget at 0, so `max_call_depth` never fired while the **native** stack grew: host stack
+overflow at ~600 re-entries. Both fixed by save/restore + a shared `reentry_depth`. **The trap trace is
+deliberately excluded from the restore** — it must outlive the invocation for `trapFrames()`; restoring it
+too broke a test immediately, which is exactly what that test is for.
+
+**Also fixed:** `wasm_instance_new` never ran the **start function** (§4.5.5 — module init silently
+skipped for every C-ABI embedder, and a trapping start reported success); `memObj` ignored the export's
+index so `wasm_memory_grow(exports[1])` grew memory **0**; the `host_info` finalizer never ran for export
+handles and was dropped by `copy`; `exnref` decoded as `externref` (two readers disagreeing, so valid EH
+modules were rejected); `wat.zig internSig` interned a **struct's index as a function signature** (it
+scans a list index-aligned with the type section) — the assembler-emits-wrong-bytes class again; bulk
+memory ops ignored the memory index; and five reject-valid validator faults (`ref.as_non_null` and
+`br_on_null` not removing nullability — the canonical null-check idiom was rejected; `call_indirect`
+demanding exact `funcref`; `table.init`/`table.copy` using `!=` instead of subtyping) plus four
+accept-invalid ones (tag types never validated, duplicate export names, §3.2.5 limits, SIMD memarg
+alignment left open).
+
+**Verification:** 421 printed / 417 pass, Debug **and** ReleaseSafe, `c-smoke` 319/319, `wasi-gate`,
+freestanding `wasm`. Every fix has a before/after reproduction.
+
+**Still open from this pass:** cross-module exceptions cannot be *caught* by the importer (the
+`orelse return e` fix made it safe, not correct — the in-flight exception needs to be a property of the
+invocation, not of `Instance`); `ref.test`/`ref.cast` don't check the operand's hierarchy; SIMD memarg
+alignment unchecked; `C.refs` not tracked for `ref.func`; `br_on_cast` fall-through over-approximated; the
+GC heap grows per-invocation forever (fine for a program, an unbounded per-call leak for a long-lived
+C-ABI host); `.wast` module memories leak (page-allocator bytes outside the runner arena); `frameOffset`
+leaks `br_table`/`select_types` side allocations under a non-arena allocator.
+
 ## #23 — Zig 0.16 Windows `Io` filesystem gaps found in WASI 4.3 (2026-07-16)
 
 Two more std holes on Windows, same family as #18 (which is the first). Both hit during 4.3; recheck all
