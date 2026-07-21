@@ -151,6 +151,28 @@ Two ways the authenticity gate did **not** hold as documented. One fixed, one op
   *Lesson: the gate was placed on the "module" path rather than on **every path that executes**. When
   adding a new input form to `main.zig`, the question is not "is this a module?" but "does this execute?"*
 
+### Sandbox + CLI hardening, 2026-07-20 (closing the 10th pass's deferred list)
+
+- **`path_symlink` refuses a lexically escaping *relative* target at creation** (`../../x`), not only an
+  absolute one. wazmrt itself was never fooled — `walkFull` contains the escape at follow time — but this
+  document's **orchestrator-invariant** section requires refusing at *creation*: the guest can otherwise
+  plant a landmine for the **next privileged reader** (a host `tar`, `cp -L`, the next pipeline stage),
+  which the runtime cannot enforce afterwards. `escapesRelative` tracks depth, so an in-sandbox `a/../b`
+  is still allowed. Does **not** affect `examples/wasi_symlink_traversal.zig`, which plants its links
+  externally via `ln -s` and tests *following*, not creation.
+- **`--verify <garbage>` now fails closed.** It can only ever *raise* strictness, so silently ignoring an
+  unparseable value dropped the user's intended extra strictness without a word — the opposite posture to
+  the 5th-pass `pin.modeFromDb` fix. Same principle, now applied on both sides of the policy input.
+- **`wazmrt keygen` writes the Ed25519 private seed `0600`** on POSIX. It was created with default
+  permissions — 0644 after umask, i.e. **world-readable**, for the one file in this project that must not
+  be. Windows has no mode bit here (`Permissions` is an attribute set), so the file inherits the directory
+  ACL; the honest mitigation there remains the documented one — keep the key off shared paths, or hold it
+  in an HSM.
+- **Resource caps** (`max_ctrl_depth`, `max_locals`, the `array_new_fixed` and `(table N …)` bounds) are
+  availability, not confidentiality/integrity — but they close the "a few bytes cost gigabytes" shape on
+  both the inspect and run paths. See `design-decisions.md`; note the two validator caps bound a
+  **product**.
+
 ### `random_get` is now cryptographic — FIXED 2026-07-20
 
 **Was:** `Wasi.rng` was `std.Random.DefaultPrng` (Xoshiro256++, non-cryptographic) seeded from

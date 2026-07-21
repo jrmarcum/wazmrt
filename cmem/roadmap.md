@@ -1,6 +1,9 @@
 # Roadmap
 
-## Status (2026-07-19) — feature-complete core; hardening + CLI ergonomics pass
+## Status (2026-07-20) — feature-complete core; ten hardening passes done
+
+*(Sections below are dated as written; the 2026-07-20 update at the end of this one supersedes the
+2026-07-19 test counts and open-item list.)*
 
 Everything through the **authenticity path** is built (see the dated sections below): decode → validate →
 execute, full text toolchain, reference types / GC / function-references, WASI preview 1 + sandbox,
@@ -36,7 +39,7 @@ and steady-state back at ~263 Mops/s. Then the last two audit items: **`.wast` n
 enforce), and **the fuzz targets were rebuilt to mutation-not-generation** — they had been reaching
 essentially nothing (0 decodes in 20 000 inputs), now 519 decoded / 387 instantiated / 142 assembled per
 sweep, with the sweep **asserting its own coverage** so it cannot silently degrade again; 800 k deep-run
-iterations across Debug and ReleaseSafe found no crashes. **207 distinct tests** (403 printed).
+iterations across Debug and ReleaseSafe found no crashes — 207 distinct tests at that checkpoint.
 Finally the whole still-open list was closed the same day: `validate.zig` resource caps (nesting + locals,
 whose **product** is the real bound) applied on the run path too, `array_new_fixed` bounded by instruction
 count, the `(table N …)` copy cap, `path_symlink` refusing escaping targets at creation, `writeStringVec`

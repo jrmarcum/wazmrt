@@ -135,7 +135,10 @@ it, so declaring a large memory is cheap until it is used.
 > One documented residual: a narrow TOCTOU on the final component of `path_open`,
 > tied to a Zig std bug on Windows (`cmem/known-issues.md` #17/#18). Creating a
 > symlink (`path_symlink`) needs OS privilege on Windows, so it is POSIX-only on
-> the write side; *following* host-placed symlinks works everywhere.
+> the write side; *following* host-placed symlinks works everywhere. A guest also
+> cannot **create** a link whose target obviously escapes (absolute, or climbing
+> above its own directory) — `ENOTCAPABLE`. wazmrt would contain it anyway; the
+> point is not to leave a trap for whatever reads that directory next.
 
 ### Verifying modules (pin database + signatures)
 
@@ -205,7 +208,9 @@ zig build -Droot-key=<64-hex-char public key>
 
 The default build embeds **no** key, so verification is **inert** (wazmrt runs
 any module) until you build with `-Droot-key`; an empty value keeps it inert and
-a malformed one is a build error. A local `.key` file is fine for testing; a real
+a malformed one is a build error. `keygen` writes the `.key` file `0600` on
+POSIX; Windows has no equivalent mode bit, so it inherits the directory's ACL —
+keep it off shared paths there. A local `.key` file is fine for testing; a real
 publisher keeps the private key in an HSM/YubiKey/KMS. Design + rationale:
 [`cmem/security-model.md`](cmem/security-model.md).
 

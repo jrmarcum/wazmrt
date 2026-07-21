@@ -150,6 +150,39 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   call/branch/epilogue already trap via `stackBase`/`peek`). **Rule: never add an unhinted branch to
   `Frame.run`'s loop, and re-run `zig build bench` when you touch `pop`/`push`/dispatch.** Same lesson as
   `noinline recordTrap` (#19).
+- **The validator's two resource caps are a PRODUCT, not two independent limits (2026-07-20).** Every
+  `pushCtrl` `dupe`s the whole local-init vector, so peak cost is `max_ctrl_depth × max_locals`. Raising
+  either one alone silently reinstates the amplification this fixed (a 512 KB module took **767 MB**);
+  2²⁰ locals × 1024 frames would still be ~1 GB. Current values — **1024 × 50 000 ≈ 51 MB** — were chosen
+  together, and `max_ctrl_depth = 1024` also matches `sexpr.zig`'s parser cap so nothing reachable from
+  `.wat`/`.wast` text can exceed it. **Rule: change one only by re-checking the product.** The same
+  `max_locals` is enforced on the **run path** (`interp` exports it from `validate`), where the old
+  `usize` accumulation would have *wrapped* on the wasm32 build.
+- **Bound a loop by something that cannot reject valid input (2026-07-20).** `array_new_fixed`'s `n` is an
+  unvalidated `u32`, and in *unreachable* code `popExpect` returns `.unknown` rather than underflowing, so
+  the loop could spin ~4×10⁹ times. It is bounded by the **body's instruction count** rather than a chosen
+  constant, because every operand must have been produced by at least one instruction — so the bound is
+  provably ≥ any valid `n`. **Prefer a derived bound over a magic number whenever one exists**; a constant
+  here would have been a guess that could reject a legitimate module.
+- **`ValType.nullable()` returns a TYPE, not a bool — do not "fix" the element/table check (2026-07-20).**
+  `validate.zig`'s active-element check is `elem.elem_type.nullable() != tet.nullable()`, which compares
+  heap types with nullability normalized away — correct. A 10th-pass audit reported it as accept-invalid
+  on the assumption that `nullable()` was a predicate; **verified false** (an `externref` segment against a
+  `funcref` table is rejected `TypeMismatch`). A comment sits at the site. *General rule this earned: an
+  audit finding is a hypothesis. Confirm the mechanism before changing security-relevant code — this one
+  came with a plausible write-up and died on a two-minute check.*
+- **A gate that cannot pass is not a gate (2026-07-20).** `zig build conformance` originally failed unless
+  the upstream testsuite produced **zero** failures, which it never has here (see `testing.md`'s snapshot),
+  so it would have been permanently red and therefore ignored. It now takes `-Dbaseline=<file>` (expected
+  failures per file, `-Dwrite-baseline=true` to generate) and fails only on **regressions**, reporting
+  improvements so the baseline gets re-generated. **Rule: when adding a CI step over a corpus we do not
+  fully pass, gate on the delta, and make the no-baseline path explain itself rather than silently fail.**
+- **The fuzz targets must not swallow the failure they exist to find (2026-07-20).** They `catch`
+  `error.OutOfMemory` — a malformed input legitimately producing one is not a bug — which made
+  allocation-amplification, the very class `Reader.readVecLen`/the memory budget/the table cap exist to
+  prevent, **invisible by construction**. The sweep runs under a 64 MB `Budget` allocator and asserts it
+  was never exceeded *and* that live bytes return to 0. **Rule: if a target catches an error class, add an
+  independent oracle for it**, or that class is untested no matter how many inputs run.
 - **`zig build test-safe` is the memory-safety gate (2026-07-20).** The suite under **ReleaseSafe** —
   optimizer on, safety checks kept — so out-of-range `@intCast`, OOB, and null-unwrap panic loudly instead
   of being silent UB in the shipped ReleaseFast/ReleaseSmall builds. **Run it alongside `zig build test`
