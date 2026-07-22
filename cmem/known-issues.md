@@ -149,13 +149,36 @@ Measured against the real `.wat` corpus at `wasmtk/tests` (**493 files**): assem
   `throwException` never routes through it, so emitting it would validate yet silently mis-run — the
   "bytes don't match the source" failure the assembler refuses elsewhere. No corpus file uses it.
 
-**Still open** — a distinct long tail, not the reported gaps: 5 corpus files need out-of-scope proposals
-or are malformed (`memory64.wat` = i64 addresses; `memory-multiple.wat` = multi-memory *text*, correctly
-`UnsupportedInstr`; `gc-linked-list.wat` = a GC type-name edge; `SumSquared.wat`/`loop.wat` appear
-malformed — `BadModuleField`/`UnterminatedList`). Assemble→decode still does not preserve import order
-(indices stay consistent; only the linking-ABI order differs). Runtime `delegate` routing is unimplemented
-(field recorded, never consulted). Plus the two long-standing exclusions: **#8** (upstream Zig) and
-`skipConstExpr`'s GC-immediate gap.
+**`gc-linked-list.wat` CLOSED (2026-07-21):** `struct.get`/`struct.set` resolved the field operand against
+an *empty* name table, so only the numeric form worked — `struct.get $Node $val` was `UnknownIdentifier`.
+Field names were parsed then discarded; now they are kept per-type (index-aligned with each struct's
+fields), threaded through `encodeBody` into the emit `Ctx`, and consulted by `.gc_field` (numeric form
+passes through, unknown name rejected). Verified the names map to the RIGHT indices — a `{val:11,next:22}`
+struct read back as `val + 100*next = 2211` — and the named form assembles byte-identically to the numeric.
+
+**Still open** — the *remaining* corpus long tail is 4 files, each a genuine feature/proposal boundary or
+malformed source, NOT a bug: `memory64.wat` (i64 addresses — a whole proposal); `memory-multiple.wat`
+(multi-memory *text* — the runtime supports multi-memory since Phase 7, only the assembler defers it, and
+it fails loud with `UnsupportedInstr`); `SumSquared.wat`/`loop.wat` (the top-level copies are genuinely
+malformed — stray line-number digits injected into the source, e.g. `(export 1"SumSquared")`, `(6local.get`
+— the Chapter2 copies of the same files assemble fine). Assemble→decode still does not preserve import
+order (indices stay consistent; only the linking-ABI order differs).
+
+**Deliberately not fixed (judgement calls, recorded):**
+- **Runtime `delegate` routing** — `precomputeControlFlow` records the label but `throwException` never
+  consults it. The assembler *rejects* `delegate` loudly rather than emit something that validates yet
+  mis-runs. NOT implemented because there is **no external oracle**: no corpus file uses it, and the spec
+  testsuite exercises the modern `try_table`, not legacy `delegate` — so its subtle label arithmetic would
+  be validated only by my own possibly-wrong tests (the vacuous-test trap). Loud rejection is the honest
+  state.
+- **`skipConstExpr`'s GC/SIMD-immediate gap** — the const-expr byte-scanner treats a `0xFB`/`0xFD`-prefixed
+  instruction as zero-operand, so a GC/SIMD const-expr (`struct.new`, `array.new_fixed`, `v128.const` in a
+  global init) can be mis-scanned. Reads are bounds-checked (**not** a safety issue), and the validator
+  already rejects GC/SIMD const-exprs (`ConstantExpressionRequired`), so on the validated path there is no
+  observable effect. A robust boundary-scan alone would change nothing (evaluation fails later regardless);
+  the real fix is full GC-const-expr support end-to-end (decoder + validator + evaluator), a feature, not a
+  bugfix. Left as the standing exclusion it has been.
+- **#8** (upstream Zig 0.16 Windows `Io`) — cannot fix here.
 
 ## Code audit 2026-07-19 ("look for code issues") — 8 fixed, a few deferred
 
