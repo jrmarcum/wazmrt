@@ -194,6 +194,12 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // GC composite kinds, index-aligned with the leading named `(type …)` defs
     // in `sigs`; struct/array carry their fields (func types use `sigs`).
     var gc_types: List(GcTypeDef) = .empty;
+    // Field names of each named type, index-aligned with `gc_types` (empty for
+    // func/array; a struct's entry is index-aligned with its fields, `null` for
+    // an anonymous field). Lets `struct.get $T $field` resolve a field by name,
+    // not just by number — the form binaryen/wat-tools and hand-written GC .wat
+    // actually emit.
+    var gc_field_names: List([]const ?[]const u8) = .empty;
     // Declared supertype (`(sub $super …)`) of each named type, or null; resolved
     // against `type_names` at type-section emission.
     var gc_supers: List(?Sexpr) = .empty;
@@ -237,7 +243,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     }
     // Pre-pass B: parse the bodies now that all type names resolve.
     for (type_forms.items) |form|
-        try parseTypeBody(a, form, type_names.items, &sigs, &gc_types, &gc_supers);
+        try parseTypeBody(a, form, type_names.items, &sigs, &gc_types, &gc_field_names, &gc_supers);
 
     // Pass 1: collect the remaining definitions. Imports (top-level or inline)
     // must precede every func/table/memory/global definition (§6.6.13), so an
@@ -536,7 +542,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     }
 
     var bodies: List([]const u8) = .empty;
-    for (funcs.items) |f| try bodies.append(a, try encodeBody(a, f, func_names.items, &sigs, type_names.items, global_names.items, table_names.items, elem_names.items, tag_names.items, data_names.items, mem_name));
+    for (funcs.items) |f| try bodies.append(a, try encodeBody(a, f, func_names.items, &sigs, type_names.items, global_names.items, table_names.items, elem_names.items, tag_names.items, data_names.items, mem_name, gc_field_names.items));
 
     // Pre-encode every const-expr-bearing section (global inits, element and data
     // exprs/offsets) BEFORE the type section, mirroring the function-body path, so
@@ -799,7 +805,7 @@ fn typeDefName(items: []const Sexpr) ?[]const u8 {
 /// `sigs`) or the struct/array fields (to `gc_types`) plus the declared supertype
 /// (to `gc_supers`, resolved at emit) at the next type index — all index-aligned
 /// with `type_names` (already fully populated, so concrete `(ref $t)` resolves).
-fn parseTypeBody(a: std.mem.Allocator, items: []const Sexpr, type_names: []const ?[]const u8, sigs: *List(Sig), gc_types: *List(GcTypeDef), gc_supers: *List(?Sexpr)) Error!void {
+fn parseTypeBody(a: std.mem.Allocator, items: []const Sexpr, type_names: []const ?[]const u8, sigs: *List(Sig), gc_types: *List(GcTypeDef), gc_field_names: *List([]const ?[]const u8), gc_supers: *List(?Sexpr)) Error!void {
     var i: usize = 1;
     if (i < items.len and isId(items[i])) i += 1; // skip $name (already collected)
     var body = try wantList(try nth(items, i));
@@ -835,17 +841,20 @@ fn parseTypeBody(a: std.mem.Allocator, items: []const Sexpr, type_names: []const
         }
         try sigs.append(a, .{ .params = params.items, .results = results.items });
         try gc_types.append(a, .func);
+        try gc_field_names.append(a, &.{}); // func types have no named fields
     } else if (std.mem.eql(u8, kw, "struct")) {
         var fields: List(GcField) = .empty;
+        var names: List(?[]const u8) = .empty;
         for (body[1..]) |part| {
             // Same rule as the `func` arm above: a mistyped part must not be
             // silently dropped, or the struct is assembled with missing fields.
             if (!std.mem.eql(u8, part.keyword() orelse return error.BadModuleField, "field"))
                 return error.BadModuleField;
-            try parseFieldGroup(a, (try wantList(part)), &fields, type_names);
+            try parseFieldGroup(a, (try wantList(part)), &fields, &names, type_names);
         }
         try sigs.append(a, .{ .params = &.{}, .results = &.{}, .gc_placeholder = true });
         try gc_types.append(a, .{ .@"struct" = fields.items });
+        try gc_field_names.append(a, names.items); // index-aligned with `fields`
     } else if (std.mem.eql(u8, kw, "array")) {
         if (body.len < 2) return error.BadModuleField;
         // `(array <fieldtype>)` — exactly one element field. The element may be a
@@ -853,21 +862,32 @@ fn parseTypeBody(a: std.mem.Allocator, items: []const Sexpr, type_names: []const
         const is_field_form = std.mem.eql(u8, body[1].keyword() orelse "", "field");
         const elem: GcField = if (is_field_form) blk: {
             var fields: List(GcField) = .empty;
-            try parseFieldGroup(a, (try wantList(body[1])), &fields, type_names);
+            var names: List(?[]const u8) = .empty;
+            try parseFieldGroup(a, (try wantList(body[1])), &fields, &names, type_names);
             if (fields.items.len != 1) return error.BadModuleField;
             break :blk fields.items[0];
         } else try parseFieldElem(body[1], type_names);
         try sigs.append(a, .{ .params = &.{}, .results = &.{}, .gc_placeholder = true });
         try gc_types.append(a, .{ .array = elem });
+        try gc_field_names.append(a, &.{}); // array elements are accessed by index, not name
     } else return error.BadModuleField;
 }
 
 /// Parse a `(field …)` group: an optional `$id` then one-or-more field types
 /// (`(field $x i32)` / `(field i32 (mut i64))`), appending each to `out`.
-fn parseFieldGroup(a: std.mem.Allocator, list: []const Sexpr, out: *List(GcField), type_names: []const ?[]const u8) Error!void {
+fn parseFieldGroup(a: std.mem.Allocator, list: []const Sexpr, out: *List(GcField), names_out: *List(?[]const u8), type_names: []const ?[]const u8) Error!void {
     var i: usize = 1;
-    if (i < list.len and isId(list[i])) i += 1; // a named field is a single field
-    while (i < list.len) : (i += 1) try out.append(a, try parseFieldElem(list[i], type_names));
+    // `(field $id ft)` names exactly one field; `(field ft1 ft2 …)` is a group of
+    // anonymous fields. Keep `names_out` index-aligned with `out`.
+    var name: ?[]const u8 = null;
+    if (i < list.len and isId(list[i])) {
+        name = list[i].asAtom();
+        i += 1;
+    }
+    while (i < list.len) : (i += 1) {
+        try out.append(a, try parseFieldElem(list[i], type_names));
+        try names_out.append(a, name); // only the (single) named field carries a name
+    }
 }
 
 /// Parse one field type: `(mut <storage>)` or a bare `<storage>`, where storage
@@ -1302,12 +1322,15 @@ const Ctx = struct {
     /// The single memory's `$name`, if declared — the memory index space has no
     /// name table because there is only ever one entry in it.
     mem_name: ?[]const u8 = null,
+    /// Per-type struct field names (indexed by type index; each entry aligned
+    /// with that struct's fields), for resolving `struct.get $T $field` by name.
+    field_names: []const []const ?[]const u8 = &.{},
     /// Control-flow label stack (innermost last), for resolving `br $name` to a
     /// relative depth.
     labels: List(?[]const u8) = .empty,
 };
 
-fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, table_names: []const ?[]const u8, elem_names: []const ?[]const u8, tag_names: []const ?[]const u8, data_names: []const ?[]const u8, mem_name: ?[]const u8) Error![]const u8 {
+fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, table_names: []const ?[]const u8, elem_names: []const ?[]const u8, tag_names: []const ?[]const u8, data_names: []const ?[]const u8, mem_name: ?[]const u8, field_names: []const []const ?[]const u8) Error![]const u8 {
     var body: List(u8) = .empty;
     // Locals vector: one (count=1, type) group per declared local.
     try uleb(a, &body, f.locals.items.len);
@@ -1315,7 +1338,7 @@ fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, si
         try uleb(a, &body, 1);
         try emitValType(a, &body, t);
     }
-    var ctx: Ctx = .{ .a = a, .out = &body, .local_names = f.local_names.items, .func_names = func_names, .sigs = sigs, .type_names = type_names, .global_names = global_names, .table_names = table_names, .elem_names = elem_names, .tag_names = tag_names, .data_names = data_names, .mem_name = mem_name };
+    var ctx: Ctx = .{ .a = a, .out = &body, .local_names = f.local_names.items, .func_names = func_names, .sigs = sigs, .type_names = type_names, .global_names = global_names, .table_names = table_names, .elem_names = elem_names, .tag_names = tag_names, .data_names = data_names, .mem_name = mem_name, .field_names = field_names };
     try emitSeq(&ctx, f.body);
     try body.append(a, @intFromEnum(Op.end)); // implicit function end
     return body.items;
@@ -1995,8 +2018,13 @@ fn emitInstr(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
         .gc_type => try uleb(ctx.a, ctx.out, try resolveType(ctx.type_names, try imm0(immediates))),
         .gc_field => {
             if (immediates.len < 2) return error.BadImmediate;
-            try uleb(ctx.a, ctx.out, try resolveType(ctx.type_names, immediates[0]));
-            try uleb(ctx.a, ctx.out, try resolveByName(&.{}, immediates[1])); // field index (numeric)
+            const ti = try resolveType(ctx.type_names, immediates[0]);
+            try uleb(ctx.a, ctx.out, ti);
+            // A field is named (`struct.get $T $field`) or numeric. Resolve a
+            // `$name` against that type's field names; the numeric form is
+            // untouched (`resolveByName` passes a plain index through).
+            const type_fields: []const ?[]const u8 = if (ti < ctx.field_names.len) ctx.field_names[ti] else &.{};
+            try uleb(ctx.a, ctx.out, try resolveByName(type_fields, immediates[1]));
         },
         .gc_type_n => {
             if (immediates.len < 2) return error.BadImmediate;
@@ -3422,6 +3450,46 @@ test "GC i31: (ref i31) flows into an anyref local and an eqref result (subtypin
     try validate(a, &m); // must type-check: (ref i31) <: anyref and <: eqref
 }
 
+
+test "struct.get/set resolve a field by NAME, not just by number" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Named fields must map to the SAME indices the numeric form uses: $val is
+    // field 0, $next is field 1. `mk` builds {11, 22} and returns
+    // val + 100*next = 11 + 2200 = 2211 — which is wrong if the names swap or
+    // both resolve to 0.
+    const src =
+        \\(module
+        \\  (type $N (struct (field $val i32) (field $next i32)))
+        \\  (func $getval (param $x (ref $N)) (result i32) (struct.get $N $val (local.get $x)))
+        \\  (func $getnext (param $x (ref $N)) (result i32) (struct.get $N $next (local.get $x)))
+        \\  (func (export "mk") (result i32)
+        \\    (local $r (ref $N))
+        \\    (local.set $r (struct.new $N (i32.const 11) (i32.const 22)))
+        \\    (i32.add (call $getval (local.get $r))
+        \\             (i32.mul (i32.const 100) (call $getnext (local.get $r))))))
+    ;
+    try std.testing.expectEqual(@as(i32, 2211), interp.asI32(try assembleAndRun(src, "mk", &.{})));
+
+    // The named form assembles byte-identically to the numeric one.
+    const named = try assemble(a,
+        \\(module (type $N (struct (field $val i32) (field $next i32)))
+        \\  (func (export "f") (param $x (ref $N)) (result i32) (struct.get $N $next (local.get $x))))
+    );
+    const numeric = try assemble(a,
+        \\(module (type $N (struct (field $val i32) (field $next i32)))
+        \\  (func (export "f") (param $x (ref $N)) (result i32) (struct.get $N 1 (local.get $x))))
+    );
+    try std.testing.expectEqualSlices(u8, numeric, named);
+
+    // An unknown field name is rejected, not silently mapped to 0.
+    try std.testing.expectError(error.UnknownIdentifier, assemble(a,
+        \\(module (type $N (struct (field $val i32)))
+        \\  (func (export "f") (param $x (ref $N)) (result i32) (struct.get $N $nope (local.get $x))))
+    ));
+}
 test "GC i31: validator rejects i31.get on a non-i31 reference" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
