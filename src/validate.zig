@@ -647,14 +647,18 @@ const FuncValidator = struct {
                 try self.pushCtrl(.catch_legacy, start, frame.end);
             },
             .delegate => {
-                // `delegate l` forwards to an enclosing handler and terminates the
-                // try in place of `end`, so the body must have produced the try's
-                // results and `l` must name a real enclosing construct.
-                const frame = try self.popCtrl();
-                if (frame.kind != .try_legacy) return error.MismatchedCatch;
-                _ = try self.labelTypesAt(instr.imm.label); // range-check the target
-                @memcpy(self.local_init, frame.init_snapshot);
-                try self.pushVals(frame.end);
+                // `delegate l` re-raises an exception "at label l", which can SKIP
+                // the handlers of trys between this one and the target. The
+                // interpreter records the label but `throwException` never routes
+                // through it, and there is no reference implementation left to
+                // validate the (subtle, historically-inconsistent) label
+                // arithmetic against — wasmtime and V8 dropped the legacy EH
+                // encoding for `try_table`. Rather than accept a construct we
+                // cannot correctly execute (the "validates yet mis-runs" trap the
+                // assembler already refuses by rejecting `delegate`), reject it
+                // here too, so text and binary paths agree. `try`/`catch`/
+                // `catch_all`/`rethrow` remain fully supported.
+                return error.UnsupportedOpcode;
             },
             .rethrow => {
                 // Re-raise the exception caught `l` levels out. `l` must resolve,
@@ -1502,6 +1506,28 @@ test "validator: memory-touching ops require an in-range memory" {
             try std.testing.expectError(error.MissingMemory, validate(gpa, &m));
         }
     }
+}
+
+test "validator rejects legacy try/delegate (deprecated, no reference impl to verify routing)" {
+    // `delegate` re-raises "at label l", which can skip intermediate handlers.
+    // The interpreter records the label but never routes through it, and there is
+    // no reference implementation left to validate the label arithmetic against
+    // (wasmtime and V8 dropped the legacy EH encoding). We reject it rather than
+    // accept a construct we cannot correctly execute. The assembler already
+    // refuses `delegate`, so this binary is hand-built:
+    //   (func (try (do) (delegate 0)))  →  try_ 0x40  delegate 0  end
+    const gpa = std.testing.allocator;
+    const bin = types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++ [_]u8{
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type: () -> ()
+        0x03, 0x02, 0x01, 0x00, //             function: one func, type 0
+        0x0a, 0x08, 0x01, 0x06, 0x00, //       code: one body, size 6, 0 locals
+        0x06, 0x40, //                         try (empty block type)
+        0x18, 0x00, //                         delegate 0
+        0x0b, //                               end (function)
+    };
+    var m = try Module.decode(gpa, &bin);
+    defer m.deinit();
+    try std.testing.expectError(error.UnsupportedOpcode, validate(gpa, &m));
 }
 
 test "validator: ref.func in a body requires the function to be declared (C.refs)" {

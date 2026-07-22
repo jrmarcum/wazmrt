@@ -1473,6 +1473,14 @@ const Frame = struct {
             // Legacy `try`: a matching inline handler runs INSIDE the try (the try
             // label stays on the stack for `rethrow`/`br`).
             if (label.legacy) |lt| {
+                // `delegate` re-raises the exception "at label l", which can skip
+                // handlers this normal outward unwind would otherwise run. We do
+                // not implement that routing (no reference impl remains to verify
+                // its label arithmetic — see `validate`), and the validator now
+                // rejects `delegate`. This is the defense for the UNVALIDATED run
+                // path: a hand-crafted binary that reaches a delegating try while
+                // unwinding traps loudly rather than silently mis-routing.
+                if (lt.delegate != null) return error.UnsupportedInstruction;
                 for (lt.handlers) |h| {
                     if (h.tag != null and h.tag.? != exn.tag) continue;
                     if (label.stack_base > self.vstack.items.len) return error.StackUnderflow;
@@ -4035,6 +4043,35 @@ test "legacy EH: catch_all catches any tag" {
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
     try std.testing.expectEqual(@as(i32, 5), asI32(r[0]));
+}
+
+test "legacy EH: a delegate reached while unwinding TRAPS instead of mis-routing" {
+    // `delegate` re-raises "at label l", which can skip intermediate handlers.
+    // We do not implement that routing (no reference impl remains to verify the
+    // label arithmetic), the validator rejects it, and the assembler cannot emit
+    // it. This is the defense for the UNVALIDATED run path: when an exception
+    // actually unwinds into a delegating try, trap loudly rather than silently
+    // propagate as if the delegate weren't there (which can leak past a handler
+    // the delegate meant to skip). `(func (try (do (throw 0)) (delegate 0)))`.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x00 } }, // one type: () -> ()
+        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } }, //       one tag, type 0
+        .{ .id = 3, .body = &.{ 0x01, 0x00 } }, //              one func, type 0
+        .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } }, // export "f" func 0
+        .{ .id = 10, .body = try ehCode(a, &.{&.{
+            0x00, //          0 locals
+            0x06, 0x40, //    try (void)
+            0x08, 0x00, //    throw 0
+            0x18, 0x00, //    delegate 0 (terminates the try)
+            0x0b, //          end func
+        }}) },
+    });
+    var inst = try instantiate(bytes);
+    defer destroy(&inst);
+    try std.testing.expectError(error.UnsupportedInstruction, inst.invoke("f", &.{}));
 }
 
 test "legacy EH: rethrow from an inner catch propagates to an outer catch" {
