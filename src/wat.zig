@@ -207,6 +207,15 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     var global_imports: List(ImportedGlobal) = .empty;
     var table_imports: List(ImportedTable) = .empty;
     var mem_imports: List(ImportedMemory) = .empty;
+    // Imports are collected into per-kind lists (which drive the per-kind index
+    // spaces), but the import SECTION must list them in source order — that order
+    // is the linking ABI a positional embedder (`wasm_instance_new`) builds its
+    // extern vector against. Recording the kind of each import as it is parsed
+    // lets the section be emitted in declaration order while the per-kind lists
+    // still assign indices. Each import-bearing field adds exactly one import, so
+    // one tag per grown list per field.
+    const ImportTag = enum { func, table, mem, global };
+    var import_order: List(ImportTag) = .empty;
     var global_names: List(?[]const u8) = .empty;
     var func_imports: List(ImportedFunc) = .empty;
     var mem_min: ?u32 = null;
@@ -257,6 +266,9 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         } else if (isDefKind(kw)) {
             seen_definition = true;
         }
+        // Snapshot the per-kind import counts; whichever grew after this field is
+        // processed is recorded in `import_order` (see its declaration).
+        const imp_before = [4]usize{ func_imports.items.len, table_imports.items.len, mem_imports.items.len, global_imports.items.len };
         if (std.mem.eql(u8, kw, "func")) {
             const f = try parseFunc(a, items, type_names.items);
             const idx: u32 = @intCast(func_names.items.len); // func-space index (imports first)
@@ -471,6 +483,11 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             // (`type`/`rec` are handled by the pre-pass above.)
             return error.BadModuleField;
         }
+        // Record which import kind (if any) this field added, in source order.
+        if (func_imports.items.len > imp_before[0]) try import_order.append(a, .func);
+        if (table_imports.items.len > imp_before[1]) try import_order.append(a, .table);
+        if (mem_imports.items.len > imp_before[2]) try import_order.append(a, .mem);
+        if (global_imports.items.len > imp_before[3]) try import_order.append(a, .global);
     }
 
     // Module-level exports, resolved now that every index space is complete.
@@ -595,32 +612,46 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     if (n_imports != 0) {
         var s: List(u8) = .empty;
         try uleb(a, &s, n_imports);
-        for (func_imports.items, func_import_type.items) |fi, ti| {
-            try nameBytes(a, &s, fi.module);
-            try nameBytes(a, &s, fi.name);
-            try s.append(a, 0x00); // func import
-            try uleb(a, &s, ti); // type index
-        }
-        for (table_imports.items) |t| {
-            try nameBytes(a, &s, t.module);
-            try nameBytes(a, &s, t.name);
-            try s.append(a, 0x01); // table import
-            try emitValType(a, &s, t.elem); // element reftype
-            try emitLimits(a, &s, t.min, t.max);
-        }
-        for (mem_imports.items) |m| {
-            try nameBytes(a, &s, m.module);
-            try nameBytes(a, &s, m.name);
-            try s.append(a, 0x02); // memory import
-            try emitLimits(a, &s, m.min, m.max);
-        }
-        for (global_imports.items) |g| {
-            try nameBytes(a, &s, g.module);
-            try nameBytes(a, &s, g.name);
-            try s.append(a, 0x03); // global import
-            try emitValType(a, &s, g.valtype);
-            try s.append(a, if (g.mutable) 0x01 else 0x00);
-        }
+        // Emit in SOURCE order (from `import_order`), not grouped by kind. Each
+        // kind advances its own cursor, so the per-kind lists — which already
+        // hold entries in source order and drive the index spaces — line up.
+        var ci = [4]usize{ 0, 0, 0, 0 };
+        for (import_order.items) |tag| switch (tag) {
+            .func => {
+                const fi = func_imports.items[ci[0]];
+                try nameBytes(a, &s, fi.module);
+                try nameBytes(a, &s, fi.name);
+                try s.append(a, 0x00); // func import
+                try uleb(a, &s, func_import_type.items[ci[0]]); // type index
+                ci[0] += 1;
+            },
+            .table => {
+                const t = table_imports.items[ci[1]];
+                try nameBytes(a, &s, t.module);
+                try nameBytes(a, &s, t.name);
+                try s.append(a, 0x01); // table import
+                try emitValType(a, &s, t.elem); // element reftype
+                try emitLimits(a, &s, t.min, t.max);
+                ci[1] += 1;
+            },
+            .mem => {
+                const m = mem_imports.items[ci[2]];
+                try nameBytes(a, &s, m.module);
+                try nameBytes(a, &s, m.name);
+                try s.append(a, 0x02); // memory import
+                try emitLimits(a, &s, m.min, m.max);
+                ci[2] += 1;
+            },
+            .global => {
+                const g = global_imports.items[ci[3]];
+                try nameBytes(a, &s, g.module);
+                try nameBytes(a, &s, g.name);
+                try s.append(a, 0x03); // global import
+                try emitValType(a, &s, g.valtype);
+                try s.append(a, if (g.mutable) 0x01 else 0x00);
+                ci[3] += 1;
+            },
+        };
         try emitSection(a, &out, 2, s.items);
     }
     // Function section (3)
@@ -3359,6 +3390,46 @@ test "rejects an import after a definition (#10)" {
     _ = try assemble(a,
         \\(module (import "m" "n" (func)) (func))
     );
+}
+
+test "the import section preserves source declaration order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Imports were collected into per-kind lists and emitted grouped (funcs,
+    // tables, mems, globals), so a source order interleaving kinds was lost —
+    // and that order is the positional linking ABI a C-ABI embedder builds its
+    // extern vector against. The section must now list them as declared.
+    const bin = try assemble(a,
+        \\(module
+        \\  (import "m" "f1"   (func $f1))
+        \\  (import "m" "g1"   (global $g1 i32))
+        \\  (import "m" "t1"   (table $t1 1 funcref))
+        \\  (import "m" "mem1" (memory $mem1 1))
+        \\  (import "m" "f2"   (func $f2)))
+    );
+    const m = try Module.decode(a, bin);
+    const want_name = [_][]const u8{ "f1", "g1", "t1", "mem1", "f2" };
+    const want_kind = [_]types.ExternKind{ .func, .global, .table, .memory, .func };
+    try std.testing.expectEqual(want_name.len, m.imports.len);
+    for (m.imports, want_name, want_kind) |imp, nm, k| {
+        try std.testing.expectEqualStrings(nm, imp.name);
+        try std.testing.expectEqual(k, imp.type.kind());
+    }
+
+    // Per-kind index spaces must still be correct despite the interleaving:
+    // $f1 is func 0, $f2 is func 1. Wire both to a host adder and check the sum.
+    const bin2 = try assemble(a,
+        \\(module
+        \\  (import "m" "f1" (func $f1 (result i32)))
+        \\  (import "m" "g1" (global $g1 i32))
+        \\  (import "m" "f2" (func $f2 (result i32)))
+        \\  (func (export "sum") (result i32)
+        \\    (i32.add (i32.add (call $f1) (call $f2)) (global.get $g1))))
+    );
+    var m2 = try Module.decode(a, bin2);
+    try validate(a, &m2); // indices resolve under validation
 }
 
 test "assembles multi-value function results" {
