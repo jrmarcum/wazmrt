@@ -687,7 +687,23 @@ fn skipConstExpr(r: *Reader) Error!void {
             0x43 => _ = try r.readBytes(4), // f32.const
             0x44 => _ = try r.readBytes(8), // f64.const
             0xd0 => _ = try r.readVarI64(), // ref.null (heaptype s33)
-            else => {}, // other zero-operand ops
+            0xfd => { // SIMD prefix — only `v128.const` is a constant instruction
+                if (try r.readVarU32() == 0x0c) _ = try r.readBytes(16);
+            },
+            0xfb => { // GC prefix — the constant GC instructions carry immediates
+                // that must be skipped, or a following immediate byte could be
+                // misread as `end` (0x0b) and truncate the captured expression.
+                const sub = try r.readVarU32();
+                switch (sub) {
+                    0x00, 0x01, 0x06, 0x07 => _ = try r.readVarU32(), // struct.new*/array.new* : type index
+                    0x08 => { // array.new_fixed : type index + element count
+                        _ = try r.readVarU32();
+                        _ = try r.readVarU32();
+                    },
+                    else => {}, // ref.i31 / *.convert_* : no immediate
+                }
+            },
+            else => {}, // other zero-operand ops (extended-const arithmetic, etc.)
         }
     }
 }

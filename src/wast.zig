@@ -447,6 +447,17 @@ const Runner = struct {
             if (list.len < 2) return got != null_ref;
             return got == @as(Value, @bitCast(try parseInt(list[1].asAtom() orelse return error.BadValue)));
         }
+        // Abstract GC reference matchers (`(ref.struct)`, `(ref.array)`,
+        // `(ref.i31)`, `(ref.eq)`, `(ref.any)`, `(ref.host)`, `(ref.data)`): the
+        // GC testsuite uses these to assert the result is a non-null reference of
+        // the given kind. We check non-null, matching the bare `(ref.func)` /
+        // `(ref.extern)` convention — before this, an unhandled matcher returned
+        // `error.BadValue` and ABORTED the whole `.wast` file, so as soon as a GC
+        // module built far enough to reach one, every later assertion was lost.
+        if (std.mem.eql(u8, kw, "ref.struct") or std.mem.eql(u8, kw, "ref.array") or
+            std.mem.eql(u8, kw, "ref.i31") or std.mem.eql(u8, kw, "ref.eq") or
+            std.mem.eql(u8, kw, "ref.any") or std.mem.eql(u8, kw, "ref.host") or
+            std.mem.eql(u8, kw, "ref.data")) return got != null_ref;
         if (list.len < 2) return error.BadValue;
         const lit = list[1].asAtom() orelse return error.BadValue;
         if (std.mem.eql(u8, kw, "f32.const")) return floatMatches(f32, got, lit);
@@ -1010,6 +1021,29 @@ test "runs a (module binary …) command" {
     ;
     const s = try runScript(std.testing.allocator, src);
     try std.testing.expectEqual(@as(usize, 1), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "wast runner: abstract GC ref matchers ((ref.struct)/(ref.i31)) don't abort the file" {
+    // A GC module returning a struct/array/i31 reference is checked with
+    // `(assert_return (invoke …) (ref.struct))` etc. The runner had no arm for
+    // these, so `matches` returned error.BadValue and aborted the ENTIRE .wast
+    // file the moment one was reached — losing every later assertion. They now
+    // match "non-null reference", like the bare `(ref.func)` convention. The
+    // trailing i32 assert would be lost (BadValue abort) if the ref matcher
+    // aborted, so its passing proves the file kept running.
+    const src =
+        \\(module
+        \\  (type $s (struct (field i32)))
+        \\  (func (export "mk") (result (ref $s)) (struct.new $s (i32.const 1)))
+        \\  (func (export "mki31") (result (ref i31)) (ref.i31 (i32.const 5)))
+        \\  (func (export "n") (result i32) (i32.const 42)))
+        \\(assert_return (invoke "mk") (ref.struct))
+        \\(assert_return (invoke "mki31") (ref.i31))
+        \\(assert_return (invoke "n") (i32.const 42))
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 3), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
 

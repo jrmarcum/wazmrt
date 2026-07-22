@@ -3346,6 +3346,67 @@ test "anyfunc is accepted as the pre-standard spelling of funcref" {
     try validate(a, &m);
 }
 
+
+test "GC constant instructions in global inits (struct.new / array.new* / ref.i31)" {
+    // struct.new / array.new_fixed / ref.i31 in a global init allocate at
+    // instantiation, before any Instance exists. Expected values cross-checked
+    // against wasmtime (the GC oracle): sv=22, av=9, iv=42.
+    const src =
+        \\(module
+        \\  (type $s (struct (field i32) (field i32)))
+        \\  (type $a (array i32))
+        \\  (global $g1 (ref $s) (struct.new $s (i32.const 11) (i32.const 22)))
+        \\  (global $g2 (ref $a) (array.new_fixed $a 3 (i32.const 7) (i32.const 8) (i32.const 9)))
+        \\  (global $g3 (ref i31) (ref.i31 (i32.const 42)))
+        \\  (func (export "sv") (result i32) (struct.get $s 1 (global.get $g1)))
+        \\  (func (export "av") (result i32) (array.get $a (global.get $g2) (i32.const 2)))
+        \\  (func (export "iv") (result i32) (i31.get_s (global.get $g3))))
+    ;
+    try std.testing.expectEqual(@as(i32, 22), interp.asI32(try assembleAndRun(src, "sv", &.{})));
+    try std.testing.expectEqual(@as(i32, 9), interp.asI32(try assembleAndRun(src, "av", &.{})));
+    try std.testing.expectEqual(@as(i32, 42), interp.asI32(try assembleAndRun(src, "iv", &.{})));
+
+    // struct.new_default (i64 field defaults to 0), array.new (init 5, size 4),
+    // array.new_default (len 3) — also cross-checked against wasmtime.
+    const src2 =
+        \\(module
+        \\  (type $s (struct (field i32) (field i64)))
+        \\  (type $a (array (mut i32)))
+        \\  (global $d (ref $s) (struct.new_default $s))
+        \\  (global $an (ref $a) (array.new $a (i32.const 5) (i32.const 4)))
+        \\  (global $ad (ref $a) (array.new_default $a (i32.const 3)))
+        \\  (func (export "anv") (result i32) (array.get $a (global.get $an) (i32.const 0)))
+        \\  (func (export "adlen") (result i32) (array.len (global.get $ad))))
+    ;
+    try std.testing.expectEqual(@as(i32, 5), interp.asI32(try assembleAndRun(src2, "anv", &.{})));
+    try std.testing.expectEqual(@as(i32, 3), interp.asI32(try assembleAndRun(src2, "adlen", &.{})));
+}
+
+test "GC constant instructions: validator rejects ill-typed const-exprs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // An i64 operand for an i32 struct field is a type error, not accepted.
+    {
+        const bin = try assemble(a,
+            \\(module (type $s (struct (field i32)))
+            \\  (global (ref $s) (struct.new $s (i64.const 1))))
+        );
+        var m = try Module.decode(a, bin);
+        try std.testing.expectError(error.TypeMismatch, validate(a, &m));
+    }
+    // struct.new_default on a struct with a non-defaultable (non-null ref) field
+    // must be rejected.
+    {
+        const bin = try assemble(a,
+            \\(module (type $s (struct (field (ref func))))
+            \\  (global (ref $s) (struct.new_default $s)))
+        );
+        var m = try Module.decode(a, bin);
+        try std.testing.expectError(error.TypeMismatch, validate(a, &m));
+    }
+}
 test "assembles reference types (ref.null / ref.func / ref.is_null)" {
     const src =
         \\(module

@@ -295,6 +295,70 @@ fn validateConstExpr(module: *const Module, expr: []const u8, expected: V, self_
                 if (sp < 2 or stack[sp - 1] != .i64 or stack[sp - 2] != .i64) return error.TypeMismatch;
                 sp -= 1;
             },
+            0xfb => { // GC constant instructions (§3.3.7 + GC proposal)
+                const sub = try r.readVarU32();
+                switch (sub) {
+                    0x1c => { // ref.i31
+                        if (sp < 1 or stack[sp - 1] != .i32) return error.TypeMismatch;
+                        stack[sp - 1] = .i31ref_nn;
+                    },
+                    0x00 => { // struct.new $t — pop each field (reverse), push (ref $t)
+                        const ti = try r.readVarU32();
+                        const fields = module.structFields(ti) orelse return error.UndefinedType;
+                        if (sp < fields.len) return error.TypeMismatch;
+                        var i = fields.len;
+                        while (i > 0) {
+                            i -= 1;
+                            sp -= 1;
+                            if (!subtypeOf(module, stack[sp], fields[i].storage.unpacked())) return error.TypeMismatch;
+                        }
+                        try push(&stack, &sp, V.concreteRef(false, .@"struct", ti));
+                    },
+                    0x01 => { // struct.new_default $t — every field must be defaultable
+                        const ti = try r.readVarU32();
+                        const fields = module.structFields(ti) orelse return error.UndefinedType;
+                        for (fields) |f| if (f.storage.unpacked().isNonNullRef()) return error.TypeMismatch;
+                        try push(&stack, &sp, V.concreteRef(false, .@"struct", ti));
+                    },
+                    0x06 => { // array.new $t — operands (elem, size); size on top
+                        const ti = try r.readVarU32();
+                        const f = module.arrayField(ti) orelse return error.UndefinedType;
+                        if (sp < 2 or stack[sp - 1] != .i32) return error.TypeMismatch;
+                        sp -= 1;
+                        if (!subtypeOf(module, stack[sp - 1], f.storage.unpacked())) return error.TypeMismatch;
+                        stack[sp - 1] = V.concreteRef(false, .array, ti);
+                    },
+                    0x07 => { // array.new_default $t — element must be defaultable
+                        const ti = try r.readVarU32();
+                        const f = module.arrayField(ti) orelse return error.UndefinedType;
+                        if (f.storage.unpacked().isNonNullRef()) return error.TypeMismatch;
+                        if (sp < 1 or stack[sp - 1] != .i32) return error.TypeMismatch;
+                        stack[sp - 1] = V.concreteRef(false, .array, ti);
+                    },
+                    0x08 => { // array.new_fixed $t N — pop N elements (reverse)
+                        const ti = try r.readVarU32();
+                        const n = try r.readVarU32();
+                        const f = module.arrayField(ti) orelse return error.UndefinedType;
+                        if (sp < n) return error.TypeMismatch;
+                        var k = n;
+                        while (k > 0) {
+                            k -= 1;
+                            sp -= 1;
+                            if (!subtypeOf(module, stack[sp], f.storage.unpacked())) return error.TypeMismatch;
+                        }
+                        try push(&stack, &sp, V.concreteRef(false, .array, ti));
+                    },
+                    0x1a => { // extern.convert_any : (ref null? any) → (ref null? extern)
+                        if (sp < 1 or !stack[sp - 1].isRef()) return error.TypeMismatch;
+                        stack[sp - 1] = if (stack[sp - 1].isNonNullRef()) .externref_nn else .externref;
+                    },
+                    0x1b => { // any.convert_extern : (ref null? extern) → (ref null? any)
+                        if (sp < 1 or !stack[sp - 1].isRef()) return error.TypeMismatch;
+                        stack[sp - 1] = if (stack[sp - 1].isNonNullRef()) .anyref_nn else .anyref;
+                    },
+                    else => return error.ConstantExpressionRequired,
+                }
+            },
             else => return error.ConstantExpressionRequired,
         }
     }

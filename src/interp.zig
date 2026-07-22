@@ -734,6 +734,14 @@ pub const Instance = struct {
             };
         }
 
+        // The GC heap: usually filled during execution, but a `struct.new` /
+        // `array.new*` in a global init or element const-expr allocates into it
+        // at instantiation, before any `Instance` exists. Built here and moved
+        // into the returned instance; `errdefer` frees it if init fails after an
+        // object was created (field slices are arena-backed, freed with `arena`).
+        var gc_heap: std.ArrayList(HeapObject) = .empty;
+        errdefer gc_heap.deinit(gpa);
+
         const globals = try a.alloc(Value, module.globals.len);
         @memset(globals, 0);
         // A v128 global needs 128 bits: `globals[i]` holds the low 64 and this
@@ -766,7 +774,13 @@ pub const Instance = struct {
                 globals[gidx] = @truncate(v);
                 global_hi[gidx] = @truncate(v >> 64);
             } else {
-                globals[gidx] = try evalConstExpr(globals[0..gidx], init_expr);
+                globals[gidx] = try evalConstExpr(.{
+                    .globals = globals[0..gidx],
+                    .module = module,
+                    .arena = a,
+                    .gc_heap = &gc_heap,
+                    .gpa = gpa,
+                }, init_expr);
             }
         }
 
@@ -872,7 +886,13 @@ pub const Instance = struct {
             ev.* = vals;
             n_elem_alloc += 1;
             for (elem.funcs, 0..) |f, k| vals[k] = @as(Value, f);
-            for (elem.exprs, 0..) |ex, k| vals[k] = try evalConstExpr(globals, ex);
+            for (elem.exprs, 0..) |ex, k| vals[k] = try evalConstExpr(.{
+                .globals = globals,
+                .module = module,
+                .arena = a,
+                .gc_heap = &gc_heap,
+                .gpa = gpa,
+            }, ex);
             dropped.* = elem.mode != .passive;
             if (elem.mode == .active) {
                 if (elem.table_index >= tables.len) return error.NoTable;
@@ -914,6 +934,7 @@ pub const Instance = struct {
             .elem_values = elem_values,
             .elem_dropped = elem_dropped,
             .data_dropped = data_dropped,
+            .gc_heap = gc_heap, // may already hold objects from const-expr inits
         };
     }
 
@@ -3281,14 +3302,32 @@ fn evalConstV128(expr: []const u8, lo: []const Value, hi: []const Value) Error!u
 /// i32 address.
 fn evalConstOffset(module: *const Module, globals: []const Value, expr: []const u8) Error!u32 {
     _ = module;
-    return @bitCast(asI32(try evalConstExpr(globals, expr)));
+    // Offset const-exprs are i32 and never allocate, so no GC context is needed.
+    return @bitCast(asI32(try evalConstExpr(.{ .globals = globals }, expr)));
 }
 
+/// Context for `evalConstExpr`. `globals` is always present; the GC fields are
+/// non-null only where a struct/array const-expr may allocate (global inits and
+/// element expressions during `Instance.init`) — an offset-only context leaves
+/// them null and a GC op there fails loud.
+const ConstCtx = struct {
+    globals: []const Value,
+    module: ?*const Module = null,
+    /// Arena for a new object's field/element slice (matches the run path).
+    arena: ?std.mem.Allocator = null,
+    /// The instance's GC heap under construction, plus its owning allocator, so
+    /// `struct.new`/`array.new` append here and the reference value is the index.
+    gc_heap: ?*std.ArrayList(Instance.HeapObject) = null,
+    gpa: ?std.mem.Allocator = null,
+};
+
 /// Evaluate a constant expression (§3.3.7, incl. the extended-const `i32`/`i64`
-/// `add`/`sub`/`mul`): a short stack machine over `*.const`, `global.get` (of a
-/// preceding global), `ref.null`/`ref.func`, terminated by `end`. Returns the
-/// single resulting slot.
-fn evalConstExpr(globals: []const Value, expr: []const u8) Error!Value {
+/// `add`/`sub`/`mul` and the GC constant instructions `ref.i31`/`struct.new*`/
+/// `array.new*`/`*.convert_*`): a short stack machine over `*.const`,
+/// `global.get` (of a preceding global), `ref.null`/`ref.func`, terminated by
+/// `end`. Returns the single resulting slot.
+fn evalConstExpr(ctx: ConstCtx, expr: []const u8) Error!Value {
+    const globals = ctx.globals;
     var r = Reader.init(expr);
     var stack: [16]Value = undefined;
     var sp: usize = 0;
@@ -3339,11 +3378,98 @@ fn evalConstExpr(globals: []const Value, expr: []const u8) Error!Value {
                     else => a *% b,
                 });
             },
+            0xfb => try evalConstGc(ctx, &r, &stack, &sp), // GC constant instructions
             else => return error.UnsupportedInstruction,
         }
     }
     if (sp == 0) return error.UnsupportedInstruction;
     return stack[sp - 1];
+}
+
+/// The `0xFB` (GC) constant instructions inside a const-expr. Mirrors the run
+/// path's `struct.new`/`array.new*`/`ref.i31` exactly (same `packField`, same
+/// arena-backed object, same heap index as the reference value), but allocates
+/// into the instance's *under-construction* heap (`ctx.gc_heap`) since no
+/// `Instance` exists yet. `ctx.arena`/`gc_heap`/`gpa`/`module` must be present —
+/// an offset-only context reaches here only on a malformed module and fails.
+fn evalConstGc(ctx: ConstCtx, r: *Reader, stack: *[16]Value, sp: *usize) Error!void {
+    const module = ctx.module orelse return error.UnsupportedInstruction;
+    const arena = ctx.arena orelse return error.UnsupportedInstruction;
+    const heap = ctx.gc_heap orelse return error.UnsupportedInstruction;
+    const gpa = ctx.gpa orelse return error.UnsupportedInstruction;
+
+    // Allocate a heap object with `fields`; the reference value is its index,
+    // exactly as `Instance.allocObject` assigns it.
+    const alloc = struct {
+        fn f(h: *std.ArrayList(Instance.HeapObject), g: std.mem.Allocator, ti: u32, fields: []Value) Error!Value {
+            const idx = h.items.len;
+            if (idx >= max_gc_objects) return error.GcHeapExhausted;
+            try h.append(g, .{ .type_index = ti, .fields = fields });
+            return @intCast(idx);
+        }
+    }.f;
+
+    const sub = try r.readVarU32();
+    switch (sub) {
+        0x00, 0x01 => { // struct.new / struct.new_default
+            const ti = try r.readVarU32();
+            const fs = module.structFields(ti) orelse return error.UndefinedType;
+            for (fs) |f| if (fieldIsV128(f.storage)) return error.UnsupportedInstruction;
+            const obj = try arena.alloc(Value, fs.len);
+            if (sub == 0x00) {
+                const base = std.math.sub(usize, sp.*, fs.len) catch return error.StackUnderflow;
+                for (fs, 0..) |f, k| obj[k] = packField(f.storage, stack[base + k]);
+                sp.* = base;
+            } else for (fs, 0..) |f, k| obj[k] = if (f.storage.unpacked().isRef()) null_ref else 0;
+            try pushConst(stack, sp, try alloc(heap, gpa, ti, obj));
+        },
+        0x06, 0x07 => { // array.new / array.new_default
+            const ti = try r.readVarU32();
+            const f = module.arrayField(ti) orelse return error.UndefinedType;
+            if (fieldIsV128(f.storage)) return error.UnsupportedInstruction;
+            if (sub == 0x06) {
+                if (sp.* < 2) return error.StackUnderflow;
+                const len = @as(u32, @bitCast(asI32(stack[sp.* - 1]))); // size on top
+                const init_v = packField(f.storage, stack[sp.* - 2]);
+                sp.* -= 2;
+                const obj = try arena.alloc(Value, len);
+                @memset(obj, init_v);
+                try pushConst(stack, sp, try alloc(heap, gpa, ti, obj));
+            } else {
+                if (sp.* < 1) return error.StackUnderflow;
+                const len = @as(u32, @bitCast(asI32(stack[sp.* - 1])));
+                sp.* -= 1;
+                const obj = try arena.alloc(Value, len);
+                @memset(obj, if (f.storage.unpacked().isRef()) null_ref else 0);
+                try pushConst(stack, sp, try alloc(heap, gpa, ti, obj));
+            }
+        },
+        0x08 => { // array.new_fixed <type> <n>
+            const ti = try r.readVarU32();
+            const n = try r.readVarU32();
+            const f = module.arrayField(ti) orelse return error.UndefinedType;
+            if (fieldIsV128(f.storage)) return error.UnsupportedInstruction;
+            const obj = try arena.alloc(Value, n);
+            const base = std.math.sub(usize, sp.*, n) catch return error.StackUnderflow;
+            for (0..n) |k| obj[k] = packField(f.storage, stack[base + k]);
+            sp.* = base;
+            try pushConst(stack, sp, try alloc(heap, gpa, ti, obj));
+        },
+        0x1c => { // ref.i31 — tag the low 31 bits, non-null (no allocation)
+            if (sp.* < 1) return error.StackUnderflow;
+            const x = @as(u32, @bitCast(asI32(stack[sp.* - 1])));
+            stack[sp.* - 1] = i31_tag | (x & 0x7fff_ffff);
+        },
+        0x1a, 0x1b => {}, // extern.convert_any / any.convert_extern — identity here
+        else => return error.UnsupportedInstruction,
+    }
+}
+
+/// Push onto the fixed const-expr stack (bounds-checked).
+fn pushConst(stack: *[16]Value, sp: *usize, v: Value) Error!void {
+    if (sp.* >= stack.len) return error.UnsupportedInstruction;
+    stack[sp.*] = v;
+    sp.* += 1;
 }
 
 /// Shared integer binary-op semantics for i32 (S=i32,U=u32) and i64.
