@@ -1,15 +1,33 @@
 # Roadmap
 
-## Status (2026-07-20) — feature-complete core; ten hardening passes done
+## Status (2026-07-21) — feature-complete core; runs the official spec testsuite; 13 audit passes done
 
-*(Sections below are dated as written; the 2026-07-20 update at the end of this one supersedes the
-2026-07-19 test counts and open-item list.)*
+*(Sections below are dated as written. The **2026-07-21** state supersedes all earlier test counts and
+open-item lists; the fine-grained audit ledger lives in `known-issues.md`.)*
+
+**Latest (2026-07-21).** Three more audit passes (11th–13th) plus an assembler-gap batch. The **13th pass
+finally RAN the official `WebAssembly/spec` testsuite** for the first time — twelve passes had *reviewed*
+the code without ever *executing* the upstream oracle — and within minutes it surfaced a guest-controlled
+stack overflow, missing UTF-8 name validation, and hex-float literals truncated (not rounded) by the
+assembler. **Score: 57.8k assertions passing across 258 spec files;** SIMD alone went from 848 pass /
+23,985 fail to 24,951 / 2 once the `.wast` runner learned v128 (a v128 is two result slots, so every SIMD
+assertion had been failing as an arity mismatch and *none had ever run*). Parallel audit agents then found
+an element-segment confinement break (a rejected module installing entries in another module's imported
+table), v128 slot-vs-index conflation in both the C ABI and the CLI, an OOM swallowed into a silently
+wrong answer, `nearest` returning a signaling NaN, and more. An **assembler-gap batch** followed: inline
+`(export …)` on a tag, forward-referenced exports, `(export "mem" (memory $name))`, data-segment names,
+flat `br_table`, `anyfunc`, the discarded memory-index immediate, **named struct fields**
+(`struct.get $T $field`), and **legacy folded `try`/`catch`** reaching both the assembler and the
+validator — real-world `.wat` corpus assembly 468→489/493. **What remains is a small, honest set:** #8
+(upstream Zig), `skipConstExpr`'s GC/SIMD-immediate gap (behind a validator that rejects GC/SIMD
+const-exprs anyway), runtime `delegate` routing (no oracle exists — kept loudly rejected), multi-memory
+*text* (runtime supports it; assembler defers it), and memory64 (a whole proposal).
 
 Everything through the **authenticity path** is built (see the dated sections below): decode → validate →
 execute, full text toolchain, reference types / GC / function-references, WASI preview 1 + sandbox,
 exception handling (both encodings), multi-memory, **complete SIMD**, and **Ed25519 signatures + pin
-verification** (`keygen`/`sign`/`-Droot-key`, deny-unsigned-when-armed). Since then, three **memory-safety
-hardening passes** (2026-07-19, from repeated "look for code issues" audits — full ledger in
+verification** (`keygen`/`sign`/`-Droot-key`, deny-unsigned-when-armed). Earlier (2026-07-19), three
+**memory-safety hardening passes** (from repeated "look for code issues" audits — full ledger in
 `known-issues.md`): (1) the CLI **run path doesn't validate before executing**, so the interpreter now
 self-defends — `checkStaticIndices` at load + cold-site bounds checks (`gcObject`/`throw_ref`/`branch`);
 (2) the **stack-HEIGHT wild-base class** — call opcodes were an unbounded `@memcpy` **write** into locals

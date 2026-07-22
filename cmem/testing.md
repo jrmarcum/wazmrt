@@ -111,10 +111,12 @@ Two harness facts worth keeping:
 The remaining failures are dominated by **assembler feature gaps**, not wrong answers. Most of the
 reported set was closed in the follow-up assembler batch (see known-issues, "Assembler gaps"): inline
 `(export …)` on a tag, forward-referenced exports, `(export "mem" (memory $name))`, flat `br_table`,
-data-segment names, the discarded memory-index immediate, `anyfunc`, and **legacy folded `try`/`catch`**
-(which also needed validator support). Real-world `.wat` corpus assembly went 468 → **488/493**. What's
-left is a genuine long tail — `(module quote …)`, memory64, multi-memory *text*, a GC type-name edge —
-each a distinct proposal rather than a shared gap.
+data-segment names, the discarded memory-index immediate, `anyfunc`, **named struct fields**
+(`struct.get $T $field`), and **legacy folded `try`/`catch`** (which also needed validator support).
+Real-world `.wat` corpus assembly went 468 → **489/493**. The 4 that remain are not shared gaps:
+`memory64` (a whole proposal), multi-memory *text* (runtime supports it, assembler defers it), and two
+top-level `ArtOfWebAssembly` files that are genuinely malformed (stray line-number digits injected into
+the source; the Chapter2 copies of the same files assemble fine).
 
 ## Spec-testsuite conformance snapshot (2026-07-02, `wast.zig` MVP) — SUPERSEDED by the run above
 

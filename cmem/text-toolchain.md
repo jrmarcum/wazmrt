@@ -47,8 +47,19 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
   `(memory idx)`-prefixed + const-expr-offset `(data …)`). **Imported tables/memories DONE 2026-07-13**
   (`(import … (table|memory …))` → import section kinds 0x01/0x02; imports take the low indices).
   **Start section (`(start $f|N)`), `(memory (data …))`, and inline `(memory|table (import …))` DONE
-  2026-07-13.** **Deferred in wat.zig:** inline `(table (export …) …)` on a *defined* table (#11), tag
-  imports, multi-memory.
+  2026-07-13.** **Index-space + GC + legacy-EH batch DONE 2026-07-21** (corpus 468→489/493, each verified
+  by *executing* the result): inline `(export …)` on a tag no longer drops the export AND its params;
+  **module-level exports resolve after all fields** so a forward reference works (binaryen emits exports
+  before the funcs — the largest corpus blocker); `(export "mem" (memory $name))`, data-segment names
+  (`memory.init $d`/`data.drop $d`), flat non-folded `br_table`, and `anyfunc`↔`funcref` all handled; the
+  memory-index immediate is now *read* (`(memory.size $nope)`/`(memory.size 7)` were silently accepted
+  against memory 0); **named struct fields** (`struct.get $T $field`, not just numeric — field names were
+  parsed then discarded, now kept per-type and consulted); and **legacy folded `try`/`catch`**
+  (`(try (do …) (catch $t …) (catch_all …))` + `rethrow`) reaching both the assembler and the validator
+  (the interp executed it since Phase 6.3 but neither the assembler nor `validate` did — see
+  `known-issues.md`). `delegate` is *rejected at assembly* (runtime never routes it). **Still deferred in
+  wat.zig:** tag imports, multi-memory *text* (the runtime supports multi-memory since Phase 7; the text
+  form fails loud with `UnsupportedInstr`).
 - **`src/wast.zig`** (DONE 2026-07-02, extended 2026-07-09) — WAST script runner: `(module …)` text +
   `(module binary …)`, `assert_return`, **`assert_trap` (genuine runtime traps only — `isRuntimeTrap`),
   `assert_exhaustion`, `assert_invalid`/`assert_malformed` (the inner module must be rejected)**,

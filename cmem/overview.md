@@ -86,9 +86,13 @@ The pipeline, in order: **decode → validate → execute**, with a text front-e
   rejects malformed binaries** (spec-correct LEB128 bounds, custom-section names, data-count
   consistency, reserved flag/valtype bytes). Imported tables/memories, bulk table/memory ops, the
   **function-references** proposal, **full WasmGC** (i31/struct/array, casts, subtyping, concrete
-  refs), and **exception handling** (exnref: `throw`/`throw_ref`/`try_table`, Phase 6) are all done.
-  **Phases 1–6 complete (WASI, CLI ergonomics + conformance, pin verification, exception handling);
-  next frontier is SIMD / multi-memory / the signature-verification path** — see `roadmap.md`.
+  refs), and **exception handling** (both the exnref `throw`/`throw_ref`/`try_table` form and the legacy
+  `try`/`catch`/`catch_all`/`rethrow` form) are all done. **Phases 1–8 complete** — WASI, CLI ergonomics
+  + conformance, pin verification, exception handling, **multi-memory (Phase 7)**, **complete SIMD/v128
+  (Phase 8)**, and the **Ed25519 signature** path (`keygen`/`sign`/`--root-key`, deny-unsigned-when-armed).
+  **The runtime now runs the official spec testsuite** (57.8k assertions passing) and assembles 489/493 of
+  a real-world `.wat` corpus; what remains is a small, honest set of feature boundaries and one upstream
+  Zig limitation — see `known-issues.md` and `roadmap.md`.
 - **Text toolchain (working).** `sexpr.zig` + `wat.zig` (WAT→wasm binary) + `wast.zig` (WAST script
   runner) — `wazmrt <file.wast>` **runs the official spec testsuite** (thousands of assertions pass; see
   `testing.md`). The runner executes `assert_return`/`assert_trap`/`assert_exhaustion` *and*
