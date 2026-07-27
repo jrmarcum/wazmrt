@@ -405,6 +405,12 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
 
 - **Proposal scope (owner, 2026-07-13; GC-priority note 2026-07-13).** Track the core spec + the
   proposals that are (or are becoming) browser-standard; defer the rest until they are, mirroring wasmtk.
+  - **STATUS 2026-07-27 — every in-scope proposal is now BUILT.** The dated slices below trace the
+    build-out and are kept as-written, but the "IN PROGRESS" labels are historical: full GC, multi-memory
+    (decode+execute+text), exception handling (both encodings), complete SIMD/v128, threads/atomics
+    (`0xFE`), and **memory64** (i64 addresses, the last one, 2026-07-27) are all done, alongside the core
+    spec, function-references, and WASI preview 1. Only WASI preview 2/3 stays deferred until it is
+    browser-standard.
   - **In scope / done:** MVP, reference types, multi-table, bulk table ops, extended-const, and the
     **function-references proposal** (typed refs, `call_ref`, non-null refs + local-init — DONE
     2026-07-13).

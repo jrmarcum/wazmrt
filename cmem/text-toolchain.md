@@ -62,8 +62,10 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
   memarg form (`i32.load $m …`), `memory.size/grow/fill $m`, `memory.copy $dst $src`,
   `memory.init $mem $data`, `(data (memory $m) …)`; `struct.new`/`array.new*`/`ref.i31` in constant
   expressions; and the **whole `0xFE` atomics family** (a 66-entry mnemonic table + `emitAtomic`, the
-  `shared` memory keyword). **Still deferred in wat.zig:** tag imports; memory64 (the last unimplemented
-  proposal).
+  `shared` memory keyword). **memory64 text DONE 2026-07-27** (Item 3): `(memory i64 …)` declarations +
+  imports, u64 limits, the 64-bit section flag, and i64 offsets for the inline `(memory i64 (data …))`
+  form — every wasm proposal wazmrt targets now has text-assembly support. **Still deferred in wat.zig:**
+  tag imports (the last remaining assembler gap).
 - **`src/wast.zig`** (DONE 2026-07-02, extended 2026-07-09) — WAST script runner: `(module …)` text +
   `(module binary …)`, `assert_return`, **`assert_trap` (genuine runtime traps only — `isRuntimeTrap`),
   `assert_exhaustion`, `assert_invalid`/`assert_malformed` (the inner module must be rejected)**,
