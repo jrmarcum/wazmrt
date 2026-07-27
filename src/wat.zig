@@ -156,6 +156,7 @@ const GlobalDef = struct { valtype: V, mutable: bool, init: []const Sexpr };
 const ImportedGlobal = struct { module: []const u8, name: []const u8, valtype: V, mutable: bool };
 const ImportedTable = struct { module: []const u8, name: []const u8, min: u32, max: ?u32, elem: V };
 const ImportedMemory = struct { module: []const u8, name: []const u8, min: u64, max: ?u64, shared: bool = false, is64: bool = false };
+const ImportedTag = struct { module: []const u8, name: []const u8, sig: u32 };
 
 /// Assemble the first `(module …)` form found in `src`.
 pub fn assemble(a: std.mem.Allocator, src: []const u8) Error![]const u8 {
@@ -188,8 +189,12 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     var sigs: List(Sig) = .empty;
     var type_names: List(?[]const u8) = .empty;
     // Exception tags (EH proposal): each names a type index (its params are the
-    // exception's value types); `tag_names` is index-aligned for `$e` resolution.
+    // exception's value types). `tag_types` holds the DEFINED tags (the tag
+    // section); imported tags live in `tag_imports`. `tag_names` spans BOTH —
+    // imports first, definitions after — so `$e` resolution yields the right
+    // global tag index (imports take the low indices, mirroring memories).
     var tag_types: List(u32) = .empty;
+    var tag_imports: List(ImportedTag) = .empty;
     var tag_names: List(?[]const u8) = .empty;
     // GC composite kinds, index-aligned with the leading named `(type …)` defs
     // in `sigs`; struct/array carry their fields (func types use `sigs`).
@@ -214,7 +219,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // lets the section be emitted in declaration order while the per-kind lists
     // still assign indices. Each import-bearing field adds exactly one import, so
     // one tag per grown list per field.
-    const ImportTag = enum { func, table, mem, global };
+    const ImportTag = enum { func, table, mem, global, tag };
     var import_order: List(ImportTag) = .empty;
     var global_names: List(?[]const u8) = .empty;
     var func_imports: List(ImportedFunc) = .empty;
@@ -268,7 +273,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         }
         // Snapshot the per-kind import counts; whichever grew after this field is
         // processed is recorded in `import_order` (see its declaration).
-        const imp_before = [4]usize{ func_imports.items.len, table_imports.items.len, mem_imports.items.len, global_imports.items.len };
+        const imp_before = [5]usize{ func_imports.items.len, table_imports.items.len, mem_imports.items.len, global_imports.items.len, tag_imports.items.len };
         if (std.mem.eql(u8, kw, "func")) {
             const f = try parseFunc(a, items, type_names.items);
             const idx: u32 = @intCast(func_names.items.len); // func-space index (imports first)
@@ -312,6 +317,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             // The tag's index is its position in the tag index space, which the
             // `tag_names` length gives (imported tags are appended there too).
             var tag_exports: List([]const u8) = .empty;
+            var import_mn: ?struct { m: []const u8, n: []const u8 } = null;
             while (j < items.len) : (j += 1) {
                 const tkw = items[j].keyword() orelse break;
                 if (std.mem.eql(u8, tkw, "type")) {
@@ -322,12 +328,24 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                     try parseDecls(a, (try wantList(items[j])), &results, null, type_names.items);
                 } else if (std.mem.eql(u8, tkw, "export")) {
                     try tag_exports.append(a, try fieldStr(items[j], 1));
+                } else if (std.mem.eql(u8, tkw, "import")) {
+                    // (tag $id? (export …)* (import "m" "n") (param …)*) — an imported
+                    // tag. Its params/type still follow and are parsed as usual.
+                    const imp = try wantList(items[j]);
+                    import_mn = .{ .m = try strAt(imp, 1), .n = try strAt(imp, 2) };
                 } else break;
             }
             const tag_index: u32 = @intCast(tag_names.items.len);
             for (tag_exports.items) |en|
                 try exports.append(a, .{ .name = en, .kind = 4, .index = tag_index });
-            try tag_types.append(a, type_ref orelse try internSig(a, &sigs, params.items, results.items));
+            const tag_sig = type_ref orelse try internSig(a, &sigs, params.items, results.items);
+            // An imported tag goes to the import section (low indices); a defined
+            // one to the tag section. `tag_names` spans both for `$e` resolution.
+            if (import_mn) |im| {
+                try tag_imports.append(a, .{ .module = im.m, .name = im.n, .sig = tag_sig });
+            } else {
+                try tag_types.append(a, tag_sig);
+            }
             try tag_names.append(a, nm);
         } else if (std.mem.eql(u8, kw, "memory")) {
             var mi: usize = 1;
@@ -481,6 +499,18 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 const lim = try parseMemLimits(desc, &mi2, false);
                 try mem_imports.append(a, .{ .module = (try strAt(items, 1)), .name = (try strAt(items, 2)), .min = lim.min, .max = lim.max, .shared = lim.shared, .is64 = lim.is64 });
                 try mem_names.append(a, mname);
+            } else if (std.mem.eql(u8, dkw, "tag")) {
+                // (import "m" "n" (tag $id? (type $t) | (param …)*)) — imported tags
+                // take the low tag indices (before any defined tag).
+                var gi: usize = 1;
+                var gname: ?[]const u8 = null;
+                if (gi < desc.len and isId(desc[gi])) {
+                    gname = desc[gi].atom;
+                    gi += 1;
+                }
+                const sig = try parseTagType(a, desc, gi, &sigs, type_names.items);
+                try tag_imports.append(a, .{ .module = (try strAt(items, 1)), .name = (try strAt(items, 2)), .sig = sig });
+                try tag_names.append(a, gname);
             } else {
                 try parseImport(a, items, &global_imports, &global_names, type_names.items); // global
             }
@@ -502,6 +532,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         if (table_imports.items.len > imp_before[1]) try import_order.append(a, .table);
         if (mem_imports.items.len > imp_before[2]) try import_order.append(a, .mem);
         if (global_imports.items.len > imp_before[3]) try import_order.append(a, .global);
+        if (tag_imports.items.len > imp_before[4]) try import_order.append(a, .tag);
     }
 
     // Module-level exports, resolved now that every index space is complete.
@@ -602,14 +633,14 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         try emitSection(a, &out, 1, s.items);
     }
     // Import section (2) — imported functions, tables, memories, globals.
-    const n_imports = func_imports.items.len + table_imports.items.len + mem_imports.items.len + global_imports.items.len;
+    const n_imports = func_imports.items.len + table_imports.items.len + mem_imports.items.len + global_imports.items.len + tag_imports.items.len;
     if (n_imports != 0) {
         var s: List(u8) = .empty;
         try uleb(a, &s, n_imports);
         // Emit in SOURCE order (from `import_order`), not grouped by kind. Each
         // kind advances its own cursor, so the per-kind lists — which already
         // hold entries in source order and drive the index spaces — line up.
-        var ci = [4]usize{ 0, 0, 0, 0 };
+        var ci = [5]usize{ 0, 0, 0, 0, 0 };
         for (import_order.items) |tag| switch (tag) {
             .func => {
                 const fi = func_imports.items[ci[0]];
@@ -644,6 +675,15 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 try emitValType(a, &s, g.valtype);
                 try s.append(a, if (g.mutable) 0x01 else 0x00);
                 ci[3] += 1;
+            },
+            .tag => {
+                const t = tag_imports.items[ci[4]];
+                try nameBytes(a, &s, t.module);
+                try nameBytes(a, &s, t.name);
+                try s.append(a, 0x04); // tag import
+                try s.append(a, 0x00); // attribute: exception
+                try uleb(a, &s, t.sig); // type (signature) index
+                ci[4] += 1;
             },
         };
         try emitSection(a, &out, 2, s.items);
@@ -2775,6 +2815,29 @@ test "hex float literals are correctly ROUNDED, not truncated" {
 
 // --- Section / LEB helpers -------------------------------------------------
 
+/// Parse an exception tag's type descriptor from `items[start..]` — a `(type $t)`
+/// reference or `(param …)* (result …)?` — and resolve it to a signature index.
+/// Shared by imported tags (top-level `(import … (tag …))` and inline
+/// `(tag (import …) …)`); the defined-tag field inlines the same shape because it
+/// also collects inline exports.
+fn parseTagType(a: std.mem.Allocator, items: []const Sexpr, start: usize, sigs: *List(Sig), type_names: []const ?[]const u8) Error!u32 {
+    var j = start;
+    var type_ref: ?u32 = null;
+    var params: List(V) = .empty;
+    var results: List(V) = .empty;
+    while (j < items.len) : (j += 1) {
+        const tkw = items[j].keyword() orelse break;
+        if (std.mem.eql(u8, tkw, "type")) {
+            type_ref = try resolveType(type_names, try nth(try wantList(items[j]), 1));
+        } else if (std.mem.eql(u8, tkw, "param")) {
+            try parseDecls(a, (try wantList(items[j])), &params, null, type_names);
+        } else if (std.mem.eql(u8, tkw, "result")) {
+            try parseDecls(a, (try wantList(items[j])), &results, null, type_names);
+        } else break;
+    }
+    return type_ref orelse try internSig(a, sigs, params.items, results.items);
+}
+
 fn internSig(a: std.mem.Allocator, sigs: *List(Sig), params: []const V, results: []const V) Error!u32 {
     for (sigs.items, 0..) |sig, i| {
         if (sig.gc_placeholder) continue; // a struct/array slot is not a func type
@@ -4505,6 +4568,31 @@ test "EH wat: throw caught by a matching catch carries the payload" {
         \\      throw $e)))
     ;
     try std.testing.expectEqual(@as(i32, 42), interp.asI32(try assembleAndRun(src, "f", &.{})));
+}
+
+test "EH wat: an imported tag (both forms) leads the tag space and is thrown + caught" {
+    // A tag import takes the low tag indices, so `$e` here is index 0. Throw/catch
+    // by that identity within the module. Cross-checked against wasmtime `wast`
+    // (a cross-module import of the tag, then invoke → 42).
+    const top =
+        \\(module
+        \\  (import "env" "e" (tag $e (param i32)))
+        \\  (func (export "f") (result i32)
+        \\    (try_table (result i32) (catch $e 0) i32.const 42 throw $e)))
+    ;
+    const inline_form =
+        \\(module
+        \\  (tag $e (import "env" "e") (param i32))
+        \\  (func (export "f") (result i32)
+        \\    (try_table (result i32) (catch $e 0) i32.const 42 throw $e)))
+    ;
+    try std.testing.expectEqual(@as(i32, 42), interp.asI32(try assembleAndRun(top, "f", &.{})));
+    try std.testing.expectEqual(@as(i32, 42), interp.asI32(try assembleAndRun(inline_form, "f", &.{})));
+    // The two abbreviations denote the same module, so they assemble identically.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expect(std.mem.eql(u8, try assemble(a, top), try assemble(a, inline_form)));
 }
 
 test "EH wat: catch_all catches and control resumes after the try_table" {
