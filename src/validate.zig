@@ -101,6 +101,10 @@ pub const Error = Module.Error || error{
     ConstantExpressionRequired,
     InvalidAlignment,
     MissingMemory,
+    /// A memarg static offset >= 2^32 on a 32-bit memory. The decoder reads the
+    /// offset as `u64` (memory64), so this ceiling — which only a 64-bit memory
+    /// may exceed — is a validation rule.
+    InvalidMemArgOffset,
 };
 
 /// Validate an entire module. Returns on the first error.
@@ -545,6 +549,13 @@ const FuncValidator = struct {
         return if (self.module.memories[index].limits.is64) .i64 else .i32;
     }
 
+    /// A memarg offset is decoded as `u64` (memory64), but on a 32-bit memory it
+    /// must fit in `u32`. Callers `requireMemory` first, so the index is valid.
+    fn checkMemOffset(self: *FuncValidator, index: u32, offset: u64) Error!void {
+        if (!self.module.memories[index].limits.is64 and offset > std.math.maxInt(u32))
+            return error.InvalidMemArgOffset;
+    }
+
     fn popRef(self: *FuncValidator) Error!StackType {
         const st = try self.popVal();
         switch (st) {
@@ -858,17 +869,29 @@ const FuncValidator = struct {
                 // with no memory at all — accept-invalid. Contained at run time
                 // by `Frame.memBytes` (`NoMemory`), but `validate` is the gate an
                 // embedder calling `wasm_module_validate` relies on.
-                if (opcode.simdIsMemoryOp(instr.imm.simd.sub))
-                    try self.requireMemory(instr.imm.simd.mem.memory);
-                // …and the memarg alignment rule (§6.5.8, `align <= N/8`), which the
-                // scalar path enforces but this arm skipped entirely, so
-                // `v128.store align=64` validated.
-                if (opcode.simdIsMemoryOp(instr.imm.simd.sub) and
-                    instr.imm.simd.mem.alignment > opcode.simdNaturalAlignLog2(instr.imm.simd.sub))
-                    return error.InvalidAlignment;
-                const s = simdSig(instr.imm.simd.sub);
-                try self.popVals(s.pop);
-                try self.pushVals(s.push);
+                const sub = instr.imm.simd.sub;
+                const s = simdSig(sub);
+                if (opcode.simdIsMemoryOp(sub)) {
+                    const mi = instr.imm.simd.mem.memory;
+                    try self.requireMemory(mi);
+                    // …and the memarg alignment rule (§6.5.8, `align <= N/8`), which
+                    // the scalar path enforces but this arm skipped entirely, so
+                    // `v128.store align=64` validated.
+                    if (instr.imm.simd.mem.alignment > opcode.simdNaturalAlignLog2(sub))
+                        return error.InvalidAlignment;
+                    try self.checkMemOffset(mi, instr.imm.simd.mem.offset);
+                    // memory64: the address operand is the memory's index type, not
+                    // the `i32` baked into `simdSig`. `s.pop[0]` is always the
+                    // address; pop the trailing v128 value(s) top-first, then it.
+                    const at = self.memAddrTy(mi);
+                    var k = s.pop.len;
+                    while (k > 1) : (k -= 1) _ = try self.popExpect(s.pop[k - 1]);
+                    _ = try self.popExpect(at);
+                    try self.pushVals(s.push);
+                } else {
+                    try self.popVals(s.pop);
+                    try self.pushVals(s.push);
+                }
             },
 
             .atomic => {
@@ -881,6 +904,7 @@ const FuncValidator = struct {
                 try self.requireMemory(instr.imm.atomic.mem.memory);
                 if (instr.imm.atomic.mem.alignment != opcode.atomicNaturalAlignLog2(sub))
                     return error.InvalidAlignment;
+                try self.checkMemOffset(instr.imm.atomic.mem.memory, instr.imm.atomic.mem.offset);
                 // memory64: the ADDRESS operand (the deepest one) is i64.
                 const adt = self.memAddrTy(instr.imm.atomic.mem.memory);
                 switch (sub) {
@@ -1298,6 +1322,7 @@ const FuncValidator = struct {
                 .mem => {
                     try self.requireMemory(instr.imm.mem.memory);
                     if (instr.imm.mem.alignment > opcode.naturalAlignLog2(instr.op)) return error.InvalidAlignment;
+                    try self.checkMemOffset(instr.imm.mem.memory, instr.imm.mem.offset);
                     const s = simpleSig(instr.op) orelse return error.UnsupportedOpcode;
                     const at = self.memAddrTy(instr.imm.mem.memory);
                     // `pop` is `[addr]` (load) or `[addr, value]` (store). Pop the

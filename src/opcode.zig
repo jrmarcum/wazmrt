@@ -415,7 +415,10 @@ pub const BlockType = union(enum) {
 
 /// A load/store memory-immediate. `memory` is the target memory index
 /// (multi-memory): the alignment's bit 6 flags an explicit index that follows.
-pub const MemArg = struct { alignment: u32, offset: u32, memory: u32 = 0 };
+/// `offset` is `u64`: the memory64 proposal widens the static offset to a full
+/// 64-bit value for a 64-bit memory (a 32-bit memory still requires it to fit in
+/// `u32`, enforced by the validator).
+pub const MemArg = struct { alignment: u32, offset: u64, memory: u32 = 0 };
 pub const BrTable = struct { labels: []const u32, default: u32 };
 pub const CallIndirect = struct { type_index: u32, table: u32 };
 
@@ -684,7 +687,10 @@ fn readMemArg(r: *Reader) DecodeError!MemArg {
         al &= ~@as(u32, 0x40);
         mem_i = try r.readVarU32();
     }
-    const of = try r.readVarU32();
+    // memory64: the offset is a full u64 (`readVarU32` would reject a valid
+    // >=2^32 offset on a 64-bit memory). The 32-bit-memory ceiling is a
+    // validation rule, not a decode one.
+    const of = try r.readVarU64();
     return .{ .alignment = al, .offset = of, .memory = mem_i };
 }
 
@@ -810,7 +816,7 @@ fn decodeAtomic(r: *Reader, sub: u32) DecodeError!Instr {
     switch (sub) {
         0x03 => _ = try r.readByte(), // atomic.fence: a reserved 0x00
         0x00, 0x01, 0x02, // notify / wait32 / wait64
-        0x10...0x4e, // loads / stores / rmw / cmpxchg
+        0x10...max_atomic_sub, // loads / stores / rmw / cmpxchg
         => at.mem = try readMemArg(r),
         else => return error.UnsupportedOpcode,
     }
@@ -1112,7 +1118,7 @@ test "decodes immediates: block, const, and a memory load" {
     try std.testing.expectEqual(BlockType{ .value = .i32 }, instrs[0].imm.block_type);
     try std.testing.expectEqual(@as(i32, -3), instrs[1].imm.i32);
     try std.testing.expectEqual(@as(u32, 2), instrs[2].imm.mem.alignment);
-    try std.testing.expectEqual(@as(u32, 8), instrs[2].imm.mem.offset);
+    try std.testing.expectEqual(@as(u64, 8), instrs[2].imm.mem.offset);
     try std.testing.expectEqual(Op.end, instrs[3].op);
 }
 

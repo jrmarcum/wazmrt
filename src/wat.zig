@@ -3605,6 +3605,49 @@ test "memory64: the validator requires an i64 address on a 64-bit memory" {
     var m2 = try Module.decode(a, ok);
     try validate(a, &m2);
 }
+
+test "memory64: SIMD v128 load/store use the memory's i64 address (values vs wasmtime)" {
+    // v128 memory ops were memory64-blind (i32 address hard-coded in both the
+    // validator and the interpreter). On an i64 memory the address is i64.
+    // Store an i64x2 and read lane 1 back — wasmtime (`-W memory64=y`) gives 6789.
+    const src =
+        \\(module
+        \\  (memory i64 1)
+        \\  (func (export "f") (result i64)
+        \\    (v128.store (i64.const 16) (v128.const i64x2 12345 6789))
+        \\    (i64x2.extract_lane 1 (v128.load offset=0 (i64.const 16)))))
+    ;
+    try std.testing.expectEqual(@as(i64, 6789), interp.asI64(try assembleAndRun(src, "f", &.{})));
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The validator now demands an i64 address for a v128 load on a 64-bit memory…
+    const bad = try assemble(a, "(module (memory i64 1) (func (result v128) (v128.load (i32.const 0))))");
+    var mb = try Module.decode(a, bad);
+    try std.testing.expectError(error.TypeMismatch, validate(a, &mb));
+    // …and still an i32 address on a 32-bit memory (the v128.load on an i64 addr fails).
+    const bad32 = try assemble(a, "(module (memory 1) (func (result v128) (v128.load (i64.const 0))))");
+    var mb32 = try Module.decode(a, bad32);
+    try std.testing.expectError(error.TypeMismatch, validate(a, &mb32));
+}
+
+test "memory64: a >2^32 static memarg offset decodes+validates on i64, rejected on i32" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The offset is decoded as u64; on a 64-bit memory a >=2^32 offset is legal
+    // (the access itself may still trap out of bounds — that's a runtime concern).
+    // Previously the decoder rejected it outright (`readVarU32` -> LebOverflow).
+    const ok = try assemble(a, "(module (memory i64 1) (func (result i64) (i64.load offset=0x100000000 (i64.const 0))))");
+    var m = try Module.decode(a, ok);
+    try validate(a, &m);
+    // On a 32-bit memory that offset must NOT be accepted — it exceeds u32.
+    const bad = try assemble(a, "(module (memory 1) (func (result i64) (i64.load offset=0x100000000 (i32.const 0))))");
+    var mb = try Module.decode(a, bad);
+    try std.testing.expectError(error.InvalidMemArgOffset, validate(a, &mb));
+}
+
 test "multi-memory: loads/stores/fill/copy/init/size/grow target the right memory" {
     // A self-contained two-memory module. Each op names its memory by identifier;
     // the assembler emits the bit-6 memarg form and the per-op memory indices.

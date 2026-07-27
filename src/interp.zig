@@ -2793,13 +2793,14 @@ const Frame = struct {
     }
 
     /// Pop an address and compute the effective address for a SIMD memory op,
-    /// bounds-checking `n` bytes. `offset` is a `u32` and the base a `u32`, so
-    /// `base + offset + n` cannot overflow `u64` — the check is exact.
+    /// bounds-checking `n` bytes. memory64: the address is i64 for a 64-bit
+    /// memory (via `popAddr`), so `base + offset + n` is checked overflow-safe.
     fn simdMemEA(self: *Frame, ma: opcode.MemArg, n: u64) Error!struct { mem: []u8, ea: usize } {
-        const base: u32 = @bitCast(self.popI32());
+        const base = try self.popAddr(ma.memory);
         const mem = try self.memBytes(ma.memory);
-        const ea = @as(u64, base) + ma.offset;
-        if (ea + n > mem.len) return error.MemoryOutOfBounds;
+        const ea = std.math.add(u64, base, ma.offset) catch return error.MemoryOutOfBounds;
+        const end = std.math.add(u64, ea, n) catch return error.MemoryOutOfBounds;
+        if (end > mem.len) return error.MemoryOutOfBounds;
         return .{ .mem = mem, .ea = @intCast(ea) };
     }
     /// `v128.loadMxN_s/u`: load 8 bytes as `Src` lanes, widen each to `Dst`.
@@ -3011,19 +3012,13 @@ const Frame = struct {
         switch (s.sub) {
             0x0c => try self.pushV128(s.bytes), // v128.const
             0x00 => { // v128.load
-                const base: u32 = @bitCast(self.popI32());
-                const mem = try self.memBytes(s.mem.memory);
-                const ea = @as(u64, base) + s.mem.offset;
-                if (ea + 16 > mem.len) return error.MemoryOutOfBounds;
-                try self.pushV128(std.mem.readInt(u128, mem[@intCast(ea)..][0..16], .little));
+                const r = try self.simdMemEA(s.mem, 16);
+                try self.pushV128(std.mem.readInt(u128, r.mem[r.ea..][0..16], .little));
             },
-            0x0b => { // v128.store
+            0x0b => { // v128.store — pop the value, then the address (via simdMemEA)
                 const v = self.popV128();
-                const base: u32 = @bitCast(self.popI32());
-                const mem = try self.memBytes(s.mem.memory);
-                const ea = @as(u64, base) + s.mem.offset;
-                if (ea + 16 > mem.len) return error.MemoryOutOfBounds;
-                std.mem.writeInt(u128, mem[@intCast(ea)..][0..16], v, .little);
+                const r = try self.simdMemEA(s.mem, 16);
+                std.mem.writeInt(u128, r.mem[r.ea..][0..16], v, .little);
             },
             0x0d => { // i8x16.shuffle — 16 immediate byte indices into a++b (32 bytes)
                 const b: [16]u8 = @bitCast(self.popV128());

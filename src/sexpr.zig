@@ -201,7 +201,11 @@ const Parser = struct {
         self.pos += 1;
         var cp: u32 = 0;
         while (self.pos < self.src.len and self.src[self.pos] != '}') {
-            cp = cp *% 16 + (hexVal(self.src[self.pos]) orelse return error.BadEscape);
+            const d = hexVal(self.src[self.pos]) orelse return error.BadEscape;
+            // Overflow-checked, not wrapping: `\u{100000041}` must be rejected, not
+            // silently truncated mod 2^32 to a valid scalar (here `'A'`).
+            cp = std.math.mul(u32, cp, 16) catch return error.BadEscape;
+            cp = std.math.add(u32, cp, d) catch return error.BadEscape;
             self.pos += 1;
         }
         if (self.pos >= self.src.len) return error.BadEscape;
