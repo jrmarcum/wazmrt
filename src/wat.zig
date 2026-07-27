@@ -352,15 +352,8 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 // (memory (export …)* (import "m" "n") min max? shared?)
                 const imp = (try wantList(items[mi]));
                 mi += 1;
-                const mmin = try parseU64(try nth(items, mi));
-                mi += 1;
-                var mmax: ?u64 = null;
-                if (mi < items.len and items[mi].asAtom() != null and !eqAtom(items[mi], "shared")) {
-                    mmax = try parseU64(items[mi]);
-                    mi += 1;
-                }
-                const shared = mi < items.len and eqAtom(items[mi], "shared");
-                try mem_imports.append(a, .{ .module = (try strAt(imp, 1)), .name = (try strAt(imp, 2)), .min = mmin, .max = mmax, .shared = shared, .is64 = this_is64 });
+                const lim = try parseMemLimits(items, &mi, this_is64);
+                try mem_imports.append(a, .{ .module = (try strAt(imp, 1)), .name = (try strAt(imp, 2)), .min = lim.min, .max = lim.max, .shared = lim.shared, .is64 = lim.is64 });
             } else if (mi < items.len and eqKw(items[mi], "data")) {
                 // (memory (data "…")) — size the memory to the bytes and append an
                 // active data segment at offset 0 targeting THIS memory.
@@ -380,17 +373,11 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 try data_names.append(a, null);
                 try datas.append(a, .{ .mem_index = midx, .offset_form = .{ .list = off }, .bytes = bytes.items });
             } else {
-                // (memory $m? i64? min max? shared?) — `shared` (threads) follows
-                // the limits and requires a max.
-                const mmin = try parseU64(try nth(items, mi));
-                mi += 1;
-                var mmax: ?u64 = null;
-                if (mi < items.len and items[mi].asAtom() != null and !eqAtom(items[mi], "shared")) {
-                    mmax = try parseU64(items[mi]);
-                    mi += 1;
-                }
-                const shared = mi < items.len and eqAtom(items[mi], "shared");
-                try memories.append(a, .{ .min = mmin, .max = mmax, .shared = shared, .is64 = this_is64 });
+                // (memory $m? i64? (export …)* i64? min max? shared?) — the index
+                // type may sit here (canonical) or right after the name; `shared`
+                // (threads) follows the limits and requires a max.
+                const lim = try parseMemLimits(items, &mi, this_is64);
+                try memories.append(a, .{ .min = lim.min, .max = lim.max, .shared = lim.shared, .is64 = lim.is64 });
             }
             try mem_names.append(a, this_name);
         } else if (std.mem.eql(u8, kw, "data")) {
@@ -491,20 +478,8 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                     mname = desc[mi2].atom;
                     mi2 += 1;
                 }
-                var imp_is64 = false;
-                if (mi2 < desc.len and eqAtom(desc[mi2], "i64")) {
-                    imp_is64 = true;
-                    mi2 += 1;
-                } else if (mi2 < desc.len and eqAtom(desc[mi2], "i32")) mi2 += 1;
-                const mmin = try parseU64(try nth(desc, mi2));
-                mi2 += 1;
-                var mmax: ?u64 = null;
-                if (mi2 < desc.len and desc[mi2].asAtom() != null and !eqAtom(desc[mi2], "shared")) {
-                    mmax = try parseU64(desc[mi2]);
-                    mi2 += 1;
-                }
-                const imp_shared = mi2 < desc.len and eqAtom(desc[mi2], "shared");
-                try mem_imports.append(a, .{ .module = (try strAt(items, 1)), .name = (try strAt(items, 2)), .min = mmin, .max = mmax, .shared = imp_shared, .is64 = imp_is64 });
+                const lim = try parseMemLimits(desc, &mi2, false);
+                try mem_imports.append(a, .{ .module = (try strAt(items, 1)), .name = (try strAt(items, 2)), .min = lim.min, .max = lim.max, .shared = lim.shared, .is64 = lim.is64 });
                 try mem_names.append(a, mname);
             } else {
                 try parseImport(a, items, &global_imports, &global_names, type_names.items); // global
@@ -2143,8 +2118,14 @@ fn emitMemArg(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
             return error.BadImmediate;
         }
     }
-    // Multi-memory: bit 6 of the alignment flags an explicit memory index that
-    // follows (before the offset). Natural alignment is ≤ 4, so bit 6 is free.
+    try emitMemArgBytes(ctx, align_log2, mem_idx, offset);
+}
+
+/// Emit an encoded memarg: `align` (with bit 6 set + an explicit memory index
+/// when `mem_idx != 0` — multi-memory) followed by the u64 offset. Shared by the
+/// scalar (`emitMemArg`) and SIMD (`emitSimd`) paths so the encoding can't drift.
+fn emitMemArgBytes(ctx: *Ctx, align_log2: u32, mem_idx: u32, offset: u64) Error!void {
+    // Natural alignment is ≤ 4, so bit 6 is free to flag the explicit index.
     if (mem_idx != 0) {
         try uleb(ctx.a, ctx.out, align_log2 | 0x40);
         try uleb(ctx.a, ctx.out, mem_idx);
@@ -2263,11 +2244,12 @@ fn emitSimd(ctx: *Ctx, sd: SimdOp, items: []const Sexpr, start: usize, is_folded
     var cbytes: [16]u8 = @splat(0);
     var align_log2: u32 = opcode.simdNaturalAlignLog2(sd.sub);
     var offset: u64 = 0;
+    var mem_idx: u32 = 0;
     switch (sd.imm) {
         .none => {},
         .lane => {
             if (j >= items.len) return error.BadImmediate;
-            lane = std.math.cast(u8, @as(u32, @bitCast(@as(i32, @truncate(try parseWatI32(items[j])))))) orelse return error.BadImmediate;
+            lane = try simdLaneByte(items[j]);
             j += 1;
         },
         .shuffle => for (0..16) |k| {
@@ -2277,21 +2259,35 @@ fn emitSimd(ctx: *Ctx, sd: SimdOp, items: []const Sexpr, start: usize, is_folded
         },
         .const_ => j = try parseV128Const(items, j, &cbytes),
         .mem, .mem_lane => {
-            while (j < items.len) {
-                const atom = items[j].asAtom() orelse break;
+            // The leading atoms are `memidx? offset=? align=?` and — for
+            // load/store_lane — a trailing `laneidx`. memidx and laneidx are both
+            // bare numbers, so collect the whole atom run first: the last atom is
+            // the lane (mem_lane), and a plain non-`offset=`/`align=` atom is the
+            // explicit memory index (multi-memory), which must precede the memarg.
+            var atoms: [8]Sexpr = undefined;
+            var na: usize = 0;
+            while (j < items.len and items[j].asAtom() != null) : (j += 1) {
+                if (na >= atoms.len) return error.BadImmediate;
+                atoms[na] = items[j];
+                na += 1;
+            }
+            var end = na;
+            if (sd.imm == .mem_lane) { // the last atom is the lane index
+                if (na == 0) return error.BadImmediate;
+                end -= 1;
+                lane = try simdLaneByte(atoms[end]);
+            }
+            for (atoms[0..end], 0..) |atom_s, k| {
+                const atom = atom_s.asAtom().?;
                 if (std.mem.startsWith(u8, atom, "offset=")) {
                     offset = std.fmt.parseInt(u64, atom[7..], 0) catch return error.BadImmediate;
                 } else if (std.mem.startsWith(u8, atom, "align=")) {
                     const by = std.fmt.parseInt(u32, atom[6..], 0) catch return error.BadImmediate;
                     if (by == 0 or (by & (by - 1)) != 0) return error.BadImmediate;
                     align_log2 = @ctz(by);
-                } else break;
-                j += 1;
-            }
-            if (sd.imm == .mem_lane) { // a lane index follows the memarg
-                if (j >= items.len) return error.BadImmediate;
-                lane = std.math.cast(u8, @as(u32, @bitCast(@as(i32, @truncate(try parseWatI32(items[j])))))) orelse return error.BadImmediate;
-                j += 1;
+                } else if (k == 0) { // memidx precedes offset/align in the grammar
+                    mem_idx = try resolveByName(ctx.mem_names, atom_s);
+                } else return error.BadImmediate;
             }
         },
     }
@@ -2304,17 +2300,20 @@ fn emitSimd(ctx: *Ctx, sd: SimdOp, items: []const Sexpr, start: usize, is_folded
         .none => {},
         .lane => try ctx.out.append(ctx.a, lane),
         .shuffle, .const_ => try ctx.out.appendSlice(ctx.a, &cbytes),
-        .mem => {
-            try uleb(ctx.a, ctx.out, align_log2);
-            try uleb(ctx.a, ctx.out, offset);
-        },
+        .mem => try emitMemArgBytes(ctx, align_log2, mem_idx, offset),
         .mem_lane => {
-            try uleb(ctx.a, ctx.out, align_log2);
-            try uleb(ctx.a, ctx.out, offset);
+            try emitMemArgBytes(ctx, align_log2, mem_idx, offset);
             try ctx.out.append(ctx.a, lane);
         },
     }
     return j;
+}
+
+/// Parse a SIMD lane / shuffle index atom into a byte (the decoder range-checks
+/// it against the op's lane count). `(i32x4.extract_lane 999)` -> `BadImmediate`
+/// rather than an `@intCast(u32->u8)` overflow (UB in ReleaseFast).
+fn simdLaneByte(s: Sexpr) Error!u8 {
+    return std.math.cast(u8, @as(u32, @bitCast(@as(i32, @truncate(try parseWatI32(s)))))) orelse error.BadImmediate;
 }
 
 /// Map an atomic (`0xFE`) mnemonic to its sub-opcode, or null. The rmw/cmpxchg
@@ -2504,6 +2503,35 @@ fn parseIndex(s: Sexpr) Error!u32 {
 fn parseU64(s: Sexpr) Error!u64 {
     const atom = s.asAtom() orelse return error.BadImmediate;
     return std.fmt.parseInt(u64, atom, 0) catch error.BadImmediate;
+}
+
+const MemLimits = struct { min: u64, max: ?u64 = null, shared: bool = false, is64: bool = false };
+
+/// Parse a memory `memtype` tail from `items[mi.*..]`: an optional index type
+/// (`i64`/`i32`) — which canonically sits HERE, after any inline export/import
+/// clauses — then `min max? shared?`. `is64_seen` carries an index type already
+/// consumed right after the name (the common non-canonical position wabt/binaryen
+/// emit); either position is accepted, neither required. Advances `mi`. One home
+/// for the parse the three memory sites (inline defined / inline import /
+/// top-level `(import … (memory …))`) used to each copy.
+fn parseMemLimits(items: []const Sexpr, mi: *usize, is64_seen: bool) Error!MemLimits {
+    var is64 = is64_seen;
+    if (mi.* < items.len and eqAtom(items[mi.*], "i64")) {
+        is64 = true;
+        mi.* += 1;
+    } else if (mi.* < items.len and eqAtom(items[mi.*], "i32")) {
+        mi.* += 1;
+    }
+    const min = try parseU64(try nth(items, mi.*));
+    mi.* += 1;
+    var max: ?u64 = null;
+    if (mi.* < items.len and items[mi.*].asAtom() != null and !eqAtom(items[mi.*], "shared")) {
+        max = try parseU64(items[mi.*]);
+        mi.* += 1;
+    }
+    const shared = mi.* < items.len and eqAtom(items[mi.*], "shared");
+    if (shared) mi.* += 1;
+    return .{ .min = min, .max = max, .shared = shared, .is64 = is64 };
 }
 
 fn parseWatI32(s: Sexpr) Error!i64 {
@@ -2795,8 +2823,8 @@ fn emitLimits(a: std.mem.Allocator, out: *List(u8), min: u64, max: ?u64, shared:
         (if (shared) @as(u8, 0x02) else 0) |
         (if (is64) @as(u8, 0x04) else 0);
     try out.append(a, flag);
-    try uleb(a, out, @intCast(min));
-    if (max) |mx| try uleb(a, out, @intCast(mx));
+    try uleb(a, out, min);
+    if (max) |mx| try uleb(a, out, mx);
 }
 
 fn emitSection(a: std.mem.Allocator, out: *List(u8), id: u8, payload: []const u8) Error!void {
@@ -2805,7 +2833,7 @@ fn emitSection(a: std.mem.Allocator, out: *List(u8), id: u8, payload: []const u8
     try out.appendSlice(a, payload);
 }
 
-fn uleb(a: std.mem.Allocator, out: *List(u8), value: usize) Error!void {
+fn uleb(a: std.mem.Allocator, out: *List(u8), value: u64) Error!void {
     var v: u64 = value;
     while (true) {
         var byte: u8 = @intCast(v & 0x7f);
@@ -3646,6 +3674,40 @@ test "memory64: a >2^32 static memarg offset decodes+validates on i64, rejected 
     const bad = try assemble(a, "(module (memory 1) (func (result i64) (i64.load offset=0x100000000 (i32.const 0))))");
     var mb = try Module.decode(a, bad);
     try std.testing.expectError(error.InvalidMemArgOffset, validate(a, &mb));
+}
+
+test "multi-memory SIMD text: v128 ops take an explicit memory index (values vs wasmtime)" {
+    // The SIMD load/store (+lane) text form now accepts a leading memory index,
+    // emitting the bit-6 memarg form. Cross-checked vs wasmtime (-W multi-memory=y).
+    const src =
+        \\(module
+        \\  (memory $a 1)
+        \\  (memory $b 1)
+        \\  (func (export "f") (result i32)
+        \\    (v128.store32_lane $b 3 (i32.const 0) (v128.const i32x4 10 20 30 40))
+        \\    (i32.load $b (i32.const 0)))
+        \\  (func (export "g") (result i32)
+        \\    (v128.store $b (i32.const 16) (v128.const i32x4 100 200 300 400))
+        \\    (i32x4.extract_lane 2 (v128.load $b offset=0 (i32.const 16)))))
+    ;
+    try std.testing.expectEqual(@as(i32, 40), interp.asI32(try assembleAndRun(src, "f", &.{})));
+    try std.testing.expectEqual(@as(i32, 300), interp.asI32(try assembleAndRun(src, "g", &.{})));
+}
+
+test "wat: a memory's index type is accepted in its canonical post-clause position" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The index type canonically sits after inline (export …) — previously only the
+    // right-after-the-name position assembled. Both forms must now decode to is64.
+    for ([_][]const u8{
+        "(module (memory (export \"m\") i64 1))", // canonical: after the export clause
+        "(module (memory i64 (export \"m\") 1))", // the non-canonical form we already took
+    }) |m| {
+        var d = try Module.decode(a, try assemble(a, m));
+        try validate(a, &d);
+        try std.testing.expect(d.memories[0].limits.is64);
+    }
 }
 
 test "multi-memory: loads/stores/fill/copy/init/size/grow target the right memory" {
