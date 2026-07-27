@@ -339,6 +339,23 @@ changes, each verified by executing the result:
 +3 regression tests; **491 local tests green (Debug + ReleaseSafe); c-smoke 319/319; full main testsuite
 60,670 / memory64 601/1 (no regression).**
 
+### Follow-up audit of the noted-LOW fixes (2026-07-27, `937739c`) — the fixes verified clean, 1 consistency item
+
+Three parallel investigators over the four noted-LOW fixes. **The riskiest change — `Reader.readVarS33`,
+on the hottest decode path (every block/heap type) — was verified CORRECT bit by bit** (mask `0x1f`, sign
+bit `0x10`, `~0 << 33` sign-extension, and the over-long/out-of-range rejection all traced against concrete
+encodings; **no silent value-change vs the old `readVarI64` for any valid input** — only accept→reject on
+malformed s33). The **table-entry budget** (overflow-safe sum, alloc-after-check ordering, errdefer
+interaction, Instance-field wiring, CLI plumbing) and the **C-ABI saturating casts + `resolveTagSig`** were
+all confirmed correct; sign/pin/`wasm_c_api` refcounts/wasi narrowing-casts came back clean and (sign/pin)
+fail-closed. **One actionable item:** the s33 strictness added in `bc39e89` had not been applied to the
+OTHER three genuine s33 reads in the decoder — `Module.readHeapTypeRef` (type-section `(ref null? ht)`),
+`skipConstExpr` (`ref.null`), and `skipValType` (`(ref ht)`) — which still accepted over-long/out-of-range
+s33 via `readVarI64`. Now all three use `readVarS33`, so s33 rejection is uniform across every decode
+surface. No change for any valid input (full main testsuite 60,670 unchanged; 491 local tests green Debug +
+ReleaseSafe; c-smoke 319/319). *Lesson (again): when a strictness fix lands on one reader, sweep for its
+siblings — the same class of read on a different section.*
+
 ## Code audit 2026-07-19 ("look for code issues") — 8 fixed, a few deferred
 
 **FIXED in git (`d0dddc5`)** — 3 parallel auditors (security / SIMD / sweep): **decodeSimd lane-bounds guard**
