@@ -225,6 +225,34 @@ Debug AND ReleaseSafe; c-smoke 319/319.
 - Out-of-scope `.wast` harness command forms (`module definition`/`module instance` module-linking) — not a
   bug, not in scope.
 
+### Remaining LOW items (current, verified in code 2026-07-27)
+
+After the memory64 audit, the assembler audit, the four noted-LOW fixes, and the s33 sweep, there are **no
+open LOW *defects*** — what remains is by-design limitations, one advisory-only behavior, and the
+upstream-Zig class. (The older "deferred LOW" lists further down are dated records; almost all were closed
+by the 2026-07-21 batches — annotated as since-fixed at each site.)
+
+*By-design (intentional mirrors / documented representability caps):*
+- **`table.grow` budgets per-table, not summed** (`interp.zig`) — N defined tables can each grow to
+  `max_table_elems`, so total up to N×budget. Deliberately mirrors `memory.grow`'s per-memory check against
+  the whole `max_memory_bytes`; each allocation is still capped and each new table costs module bytes.
+- **C-ABI represents a memory64 memory as 32-bit** (`wasm_c_api.zig`) — wasm.h has u32 pages and no `is64`
+  field, so a bounded memory64 with max >4G pages reports its max saturated to `0xffffffff` (read as "no
+  max"). The cast is memory-safe (saturating); the representability cap is inherent to the standard ABI.
+- **`wat.parseTagType` with only `(type $t)`** doesn't verify the referenced type is a func type — deferred
+  to a downstream `BadType`, same as every other typeuse site.
+
+*Cosmetic / advisory:*
+- **Trailing-value-missing on any two-arg CLI flag** (`--max-memory`, `--max-table-elems`, `--dir`, …) →
+  the flag is consumed as the module path rather than a targeted "expected a value" error. Pre-existing
+  pattern shared by all two-arg flags — the only item here worth a small, safe fix if desired.
+- **`fd_advise` returns success without validating the fd** (`wasi.zig`) — deliberate; `fd_advise` is
+  advisory-only, so success is honest.
+
+*Upstream-Zig-blocked (tracked with #8, not fixable here):*
+- **#18** — Windows `Io.openFile(.follow_symlinks=false)` returns a broken async handle; worked around in
+  `wPathOpen`, leaving #17's final-component TOCTOU residual. Rechecked on every Zig upgrade.
+
 ## Post-memory64 audit (2026-07-27 "look for code issues") — 4 fixed (`f478f79`)
 
 Four parallel investigators over the fresh memory64 code found two real gaps the feature commit's own
@@ -470,10 +498,13 @@ Debug/ReleaseFast + freestanding wasm32) build; 372→380 printed tests.
   valtype/local/funcvec/exprvec/GC-field vectors (`Module.zig`), and `try_table`/`br_table`/`select_types`
   (`opcode.zig`). Byte-vec/name readers were already safe (`readBytes` precedes their alloc). A tiny module
   can no longer force a huge alloc *attempt*.
-- **STILL DEFERRED (strictness / impractical, not memory-safety):** `opcode.zig` other raw internal-tag
+- ~~**STILL DEFERRED (strictness / impractical, not memory-safety):** `opcode.zig` other raw internal-tag
   leniency (`0xE3–0xE5`, `0xED`, `0xF0–0xF2`, etc.) — accepted as non-standard single-byte encodings, but
   they land on the *correct* union, so over-acceptance only. **`Module.zig:1023`/`opcode.zig:766`**
-  `@intCast` of a byte offset truncates for a >4 GiB module (impractical; only a wrong trap-backtrace offset).
+  `@intCast` of a byte offset truncates for a >4 GiB module (impractical; only a wrong trap-backtrace
+  offset).~~ **BOTH FIXED 2026-07-21 (cleanup batch, verified in code 2026-07-27):** the raw internal-tag
+  bytes `0xd7..0xfa` (which include `0xe3–0xe5`/`0xed`/`0xf0–0xf2`) are now rejected, and the offset lists in
+  `Module`/`opcode` saturate instead of `@intCast`.
 
 ### Run-path hardening, 3rd pass — verifying the 2nd pass's own refactor — DONE 2026-07-20 (4th "check for code issues")
 
@@ -548,7 +579,12 @@ this session**: `wast.zig`, `wasm_c_api.zig`, and `wasi.zig`/`validate.zig`/`sig
 authenticate), `wasi.zig` sandbox core (`resolve`/`walkFull` escape-resistant, rights only narrow, no
 fd-pointer-across-realloc), `validate.zig` (no accept-invalid / OOB), `pin.zig` apart from `modeFromDb`.
 
-**DEFERRED LOWs from the 5th pass** (not memory-safety / not run-path):
+**DEFERRED LOWs from the 5th pass** (not memory-safety / not run-path) — **⚠ ALL FOUR SINCE FIXED
+(verified in code 2026-07-27):** the `array_new_fixed`/locals inspect DoS is now bounded (instruction-count
+cap + `max_locals`); `br_on_non_null` accepts any reference label (validator-correctness batch, items 1–3);
+the `wasi` u32-offset formation goes through `Wasi.arrayOffset` (u64 arithmetic, whole-element fit); and the
+C-ABI trap frames retain their instance (`copyFrame` retain, balanced in `wasm_trap_delete`). The original
+entries are kept below as the dated record of when each was open:
 - **`validate.zig array_new_fixed` (`:744`) + locals expansion (`:191`) — inspect-path CPU/OOM DoS.** A huge
   `array.new_fixed n` (up to 2³²) in **unreachable** code makes the validator's `popExpect` loop spin ~4e9
   times (`popVal` returns `.unknown`, never underflows); likewise a huge `local` run-length drives a

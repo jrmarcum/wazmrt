@@ -36,6 +36,21 @@ verified by executing both forms (→ 42) and cross-checked vs wasmtime `wast`. 
 NO remaining known gaps** — every construct across every proposal wazmrt targets has text-assembly support.
 485 local tests green (Debug + ReleaseSafe); c-smoke 319/319; full main testsuite 60,670 passed.
 
+**Then (2026-07-27, continued) — an assembler audit, the four noted-LOW fixes, and an s33 sweep.** A
+"look for code issues" pass over the fresh assembler code found a **flat-form SIMD memory-op regression**
+(the multi-memory memidx change greedily ate the next flat instruction — HIGH, false-rejection), a
+**defined-tag-before-imported-tag mis-index** (`isDefKind` omitted `tag` — MEDIUM), and a doubled index
+type (LOW), all fixed (`436196e`). Then the four items that pass had *noted but deferred* were all closed
+(`bc39e89`): a **table-entry budget** (`max_table_elems`/`--max-table-elems`/`TableLimitExceeded`,
+mirroring the linear-memory budget — a `(table 0xffffffff funcref)` no longer demands ~32 GiB), **C-ABI
+saturating** u64→u32 memory casts, a strict **`Reader.readVarS33`** for block/heap types (≤5 bytes, in
+range), and a **tag typeuse consistency check** (`resolveTagSig`). A follow-up audit then verified those
+four correct (readVarS33 traced bit-by-bit, no miscompile) and swept the strict s33 reader into the **three
+remaining decoder s33 sites** (`937739c`). **After all this: every wasm proposal implemented, the WAT
+assembler has no gaps, and there are no open LOW *defects* — only by-design limits + the upstream-Zig class
+(see `known-issues.md` "Remaining LOW items").** **491 local tests green under Debug AND ReleaseSafe;
+c-smoke 319/319; full main testsuite 60,670 / memory64 601/1 / SIMD 24,956/0.**
+
 **Latest (2026-07-22) — the "open items 1–7" batch.** After the 13th pass the remaining list was walked
 end to end (see `known-issues.md` for the per-item detail). Six real fixes, each verified by executing the
 result and, where a live reference implementation exists, cross-checked against **wasmtime**:
