@@ -304,8 +304,9 @@ pub const DecodeError = error{
     /// An instruction opcode wazmrt does not decode. The `0xFC` (saturating
     /// truncation, bulk memory, table ops), `0xFD` (the complete SIMD set),
     /// `0xFB` (GC) and `0xFE` (threads/atomics) prefixes are all implemented, as
-    /// is exception handling in both encodings — **only the memory64 proposal
-    /// remains** (corrected 2026-07-22; atomics shipped that day).
+    /// is exception handling in both encodings and memory64 (i64 addresses) —
+    /// **every wasm proposal wazmrt targets is now implemented** (memory64
+    /// shipped 2026-07-27, the last one).
     ///
     /// Also returned for a **raw byte in `0xD7`–`0xFA`**: those are internal `Op`
     /// tags for prefixed ops, never valid single-byte encodings (see `opcode.zig`).

@@ -112,14 +112,18 @@ The reported assembler-feature gaps were then closed across two batches (see kno
 gaps" and "Open items 1–7"): inline `(export …)` on a tag, forward-referenced exports,
 `(export "mem" (memory $name))`, flat `br_table`, data-segment names, the discarded memory-index
 immediate, `anyfunc`, named struct fields, legacy folded `try`/`catch`, **GC const-exprs**,
-**multi-memory text**, and **the whole atomics family**. **Score after the open-items-1–7 batch
-(2026-07-22): 58,639 passed** over the 258 core files, plus the **threads `atomic.wast` suite at 302/0**
-and the **multi-memory dir at 764/4** (the 4 are pre-existing table/import-limits edges). Real-world
-`.wat` corpus assembly 468 → ~490/493; the ~3 that remain are `memory64` (the one unimplemented proposal)
-and two genuinely-malformed top-level `ArtOfWebAssembly` files (stray line-number digits — the Chapter2
-copies assemble fine). **Oracle note:** proposals with a live reference implementation (GC, multi-memory,
-atomics) are cross-checked against **wasmtime** (`-W gc=y` / `-W multi-memory=y` / `-W threads=y`); the
-threads and multi-memory `.wast` suites are cloned separately (`WebAssembly/threads`), not vendored.
+**multi-memory text**, and **the whole atomics family**. **Score after the memory64 batch (Item 3,
+2026-07-27): 59,705 passed / 394 failed** over the 258 core files (up from 58,639 — the overflow-safe
+memory64 bounds lifted base-suite edge cases), plus the **threads `atomic.wast` suite at 302/0**, the
+**multi-memory dir at 764/4** (the 4 are pre-existing table/import-limits edges), and the **memory64 dir**:
+address64/align64/memory_trap64/memory_grow64/memory_redundancy64 at 100%, memory64.wast 59/1 (the 1 is a
+`module definition` module-linking harness command, out of scope). Real-world `.wat` corpus assembly
+468 → ~490/493; the ~2 that remain are two genuinely-malformed top-level `ArtOfWebAssembly` files (stray
+line-number digits — the Chapter2 copies assemble fine). **With memory64, every wasm proposal wazmrt
+targets is implemented.** **Oracle note:** proposals with a live reference implementation (GC,
+multi-memory, atomics, memory64) are cross-checked against **wasmtime** (`-W gc=y` / `-W multi-memory=y` /
+`-W threads=y` / `-W memory64=y`); the threads, multi-memory, and memory64 `.wast` suites are cloned
+separately (`WebAssembly/threads`, `WebAssembly/memory64`), not vendored.
 
 ## Spec-testsuite conformance snapshot (2026-07-02, `wast.zig` MVP) — SUPERSEDED by the run above
 

@@ -1,9 +1,24 @@
 # Roadmap
 
-## Status (2026-07-22) — feature-complete core + threads/atomics + multi-memory text; only memory64 left
+## Status (2026-07-27) — every targeted wasm proposal implemented (memory64 was the last)
 
-*(Sections below are dated as written. The **2026-07-22** state supersedes all earlier test counts and
+*(Sections below are dated as written. The **2026-07-27** state supersedes all earlier test counts and
 open-item lists; the fine-grained audit ledger lives in `known-issues.md`.)*
+
+**Latest (2026-07-27) — memory64 (Item 3), the last unimplemented proposal, is COMPLETE.** A memory
+declared `i64` now uses 64-bit addresses, and its `memory.size`/`grow` operate in i64 — implemented end
+to end and cross-checked value-by-value against **wasmtime** (`-W memory64=y`). The address *type* is
+per-memory: every memory instruction consults the target memory's index type (a new `memAddrTy` helper in
+`validate.zig`). `Module.zig` parses the 64-bit limits flag (bit 2) and widens page counts to u64 (up to
+2^48 pages); `interp.zig` pops i64 addresses (`popAddr`/`popMemU64`) and uses overflow-safe u64 bounds
+(`memRange`) for load/store/bulk-ops/atomics plus i64 size/grow; `wat.zig` assembles `(memory i64 …)`
+(declarations + imports), u64 limits, the 64-bit section flag, and i64 offsets for the inline
+`(memory i64 (data …))` form; `Reader.zig` gained `readVarU64`. The overflow-safe bounds also fixed
+base-suite edge cases: **core spec suite 58.6k → 59,705 passing / 394 failed.** memory64 spec files
+(address64/align64/memory_trap64/memory_grow64/memory_redundancy64) pass 100%; memory64.wast is 59/1 (the
+1 is a `module definition` module-linking harness command, out of scope). **475 local tests green under
+Debug AND ReleaseSafe; c-smoke 319/319. With this, every wasm proposal wazmrt targets is implemented** —
+only #8 (upstream Zig) and out-of-scope harness command forms remain.
 
 **Latest (2026-07-22) — the "open items 1–7" batch.** After the 13th pass the remaining list was walked
 end to end (see `known-issues.md` for the per-item detail). Six real fixes, each verified by executing the
@@ -16,8 +31,9 @@ bit-6 memarg form, per-op memory indices, `shared`, and `(data (memory $m) …)`
 memory-import-linking fix); and **threads/ATOMICS** — the whole `0xFE` family (~66 ops) from scratch
 across decoder/validator/interp/assembler, single-threaded semantics, **the entire threads `atomic.wast`
 suite passing 302/0**. (Item 7's two "failing" corpus files were confirmed malformed source, not a bug.)
-**Core spec suite 57.9k → 58.6k passing; 469 local tests green under Debug AND ReleaseSafe. Only the
-memory64 proposal remains unimplemented** (Item 3, in progress).
+**Core spec suite 57.9k → 58.6k passing; 469 local tests green under Debug AND ReleaseSafe.** memory64
+(Item 3) was the last item; it was completed 2026-07-27 (see the Latest section above) — **every targeted
+proposal is now implemented**.
 
 **Prior (2026-07-21).** Three audit passes (11th–13th) plus an assembler-gap batch. The **13th pass
 finally RAN the official `WebAssembly/spec` testsuite** for the first time — twelve passes had *reviewed*
@@ -35,7 +51,8 @@ flat `br_table`, `anyfunc`, the discarded memory-index immediate, **named struct
 validator — real-world `.wat` corpus assembly 468→489/493. **What remains is a small, honest set:** #8
 (upstream Zig), `skipConstExpr`'s GC/SIMD-immediate gap (behind a validator that rejects GC/SIMD
 const-exprs anyway), runtime `delegate` routing (no oracle exists — kept loudly rejected), multi-memory
-*text* (runtime supports it; assembler defers it), and memory64 (a whole proposal).
+*text* (runtime supports it; assembler defers it), and memory64 (a whole proposal). **All of these except
+#8 have since been closed — multi-memory text (2026-07-22) and memory64 (2026-07-27) were the last two.**
 
 Everything through the **authenticity path** is built (see the dated sections below): decode → validate →
 execute, full text toolchain, reference types / GC / function-references, WASI preview 1 + sandbox,

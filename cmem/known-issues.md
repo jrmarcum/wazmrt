@@ -195,14 +195,35 @@ live reference implementation, cross-checked against **wasmtime**.
   wait returns 1 on mismatch / 2 (timed-out) on a match. **The entire threads `atomic.wast` suite passes:
   302/0**; values cross-checked against wasmtime (`-W threads=y`).
 
-**Net:** full core spec suite 57,909 → **58,639 passed** across the session; the whole run holds steady
-after atomics (no regression from the limits/`shared` change). Local tests grew to **469**, green under
-Debug AND ReleaseSafe.
+- **Item 3 — memory64 (i64 memory addresses)** (`1991daa`, 2026-07-27). The last unimplemented proposal,
+  now end to end. A memory declared `i64` uses 64-bit addresses; its `memory.size`/`grow` operate in i64.
+  The address *type* is per-memory, so every memory instruction consults the target memory's index type.
+  - **`Module.zig`**: `readLimits` parses the 64-bit flag (bit 2); `Limits`/`Memory` carry `is64` and page
+    counts widen to **u64** (a 64-bit memory may declare up to 2^48 pages). Tables reject the shared/64-bit
+    flags. `Reader.readVarU64` added for the 64-bit LEB page counts.
+  - **`validate.zig`**: a `memAddrTy(index)` helper drives the address/size/grow/fill/copy/init operand and
+    result types off the memory's index type; the 2^48 page ceiling; active-data offsets take the memory's
+    type; the atomics arm's address follows suit.
+  - **`interp.zig`**: `popAddr`/`popMemU64` pop i64 addresses for 64-bit memories; load/store/bulk-ops/
+    atomics use **overflow-safe u64 bounds** (`memRange` + `std.math.add`); memory.size/grow push/pop i64
+    and cap at 2^48 pages. This overflow-safe arithmetic also fixed edge cases in the BASE memory tests.
+  - **`wat.zig`**: the `(memory i64 …)` index type (declarations + imports), u64 limits (`parseU64`), the
+    64-bit section flag (`emitLimits`), and i64 offsets for the inline `(memory i64 (data …))` form.
+  - **`wasm_c_api.zig`**: saturating u64→u32 casts at the C-ABI limits boundary (wasm.h is u32).
+  Every value cross-checked against **wasmtime** (`-W memory64=y`): i64 store/load, memory.size, grow
+  success/failure, large offsets, an OOB trap at 2^32. memory64 spec files (address64/align64/
+  memory_trap64/memory_grow64/memory_redundancy64) pass 100%; memory64.wast is 59/1 (the 1 is a
+  `module definition` module-linking harness command, out of scope). +3 regression tests in `wat.zig`.
 
-**Still open — a genuinely short list now:**
-- **memory64** — the one remaining unimplemented wasm proposal (i64 memory addresses). Item 3, in progress.
+**Net:** full core spec suite 57,909 → **59,705 passed / 394 failed** across the session (the overflow-safe
+memory64 bounds lifted base-suite edge cases: 58,639 → 59,705). Local tests grew to **475**, green under
+Debug AND ReleaseSafe; c-smoke 319/319.
+
+**Still open — every targeted proposal is now implemented; only two non-feature items remain:**
 - **#8** (upstream Zig 0.16 Windows `Io`) — cannot fix here; only an upstream fix helps.
-- **Runtime `delegate` routing** stays deliberately unimplemented (refused everywhere, per above).
+- **Runtime `delegate` routing** stays deliberately unimplemented (refused everywhere, per above — no oracle).
+- Out-of-scope `.wast` harness command forms (`module definition`/`module instance` module-linking) — not a
+  bug, not in scope.
 
 ## Code audit 2026-07-19 ("look for code issues") — 8 fixed, a few deferred
 
