@@ -384,6 +384,24 @@ surface. No change for any valid input (full main testsuite 60,670 unchanged; 49
 ReleaseSafe; c-smoke 319/319). *Lesson (again): when a strictness fix lands on one reader, sweep for its
 siblings — the same class of read on a different section.*
 
+### Legacy `try`/`catch` infinite loop — FIXED 2026-07-27 (`d51c004`, found by the wasmtk WASI corpus)
+
+Running the full wasmtk WASI corpus (397 runnable files across `wasm_wasi` + `wasm_wasi_bundle`; `dync` is
+out of scope — wasmtk's dynamic-runtime host, which wasmtime also refuses) surfaced **one real bug**:
+`15_LexicalShadowing_Stress.wasm` **infinite-looped** (1.86 billion identical "Inner Catch:" lines in
+ReleaseFast). The legacy re-throw idiom `try { … } catch (e) { …; throw e; }` compiles to a raw `throw`
+inside a legacy `catch` handler. wazmrt correctly keeps the try label on the stack while its handler runs
+(for `br`/`rethrow`), but `throwException` then **re-matched that same handler** on the re-throw — the inner
+catch caught its own re-throw endlessly instead of propagating to the outer try. Per legacy-EH semantics a
+throw from within a catch handler is OUTSIDE the try's protected region and must reach the *enclosing*
+handler. Fix: `throwException` skips a legacy try whose `caught` is already set (its handler is executing) —
+consistent with `rethrow`, which had avoided this by popping the try before re-raising (a raw `throw`
+doesn't pop, so it needed the guard). Only the legacy path is touched; `try_table`/exnref is unaffected
+(`.legacy` is null there). +1 regression test (a raw re-throw in an inner catch reaches the outer catch →
+7); the fixture now prints the correct Inner/Outer/Shadow sequence. **Legacy EH is the one EH sub-feature
+with no independent conformance suite and no validator-then (Phase 6.3 was execute-only), so exactly the
+corner that hid this — real-corpus execution was the oracle.** 493 local tests green (Debug + ReleaseSafe).
+
 ## Code audit 2026-07-19 ("look for code issues") — 8 fixed, a few deferred
 
 **FIXED in git (`d0dddc5`)** — 3 parallel auditors (security / SIMD / sweep): **decodeSimd lane-bounds guard**

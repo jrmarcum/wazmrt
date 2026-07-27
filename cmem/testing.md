@@ -537,7 +537,7 @@ are ±10% noisy.)
 
 ## Reading the test count (updated 2026-07-27)
 
-`zig build test --summary all` prints **491 total (487 pass, 4 skip)** as of 2026-07-27. The count grew
+`zig build test --summary all` prints **493 total (489 pass, 4 skip)** as of 2026-07-27. The count grew
 across the session's work: memory64 (Item 3), the post-memory64 audit, the deferred-item cleanup
 (multi-memory SIMD text, canonical index-type ordering), tag imports (the last assembler gap), the
 assembler audit (flat-form SIMD regression, tag ordering, doubled index type), and the four noted-LOW fixes
@@ -755,17 +755,31 @@ non-v128 global), and imported globals now fill both halves. 1 test: an imported
 **SIMD is now fully complete** — every 0xFD op decodes, validates, and either executes or traps cleanly;
 nothing silently corrupts, and there are no known v128 gaps.
 
-## wasmtk WASI corpus — real-world conformance snapshot (2026-07-17)
+## wasmtk WASI corpus — real-world conformance snapshot (re-measured 2026-07-27)
 
-Not in the repo (sibling `../wasmtk/tests/wasi/wasm_wasi`, 336 compiled `wasm32-wasi` programs from a
-mix of source languages), so it's a *manual* check, not a CI gate. Ran each through the release CLI
-(stdin=/dev/null). **Result after Phase 6.1/6.2/6.3: 331 run fully, 2 are `_start`-less library
-modules, 3 correctly trap** (they `throw` with no handler — an uncaught exception, which traps with a
-backtrace). **Zero decode errors, zero runtime crashes, zero traps outside the 3 deliberate
-uncaught-throws.** History: the initial run had 21 `UnknownExternKind` (tag imports → fixed 6.2) and 10
-legacy-EH `UnsupportedOpcode` (`try`/`catch`/`rethrow` → fixed 6.3). Reproduce with a shell loop over
-the corpus; `error:`/`trap:` are printed but the CLI still exits 0, so classify on *output text*, not
-exit code (a whole-corpus run takes a few minutes — background it).
+Not in the repo (sibling `../wasmtk/tests/wasi`, compiled `wasm32-wasi` programs from a mix of source
+languages), so it's a *manual* check, not a CI gate. Ran each through the release CLI (stdin=/dev/null).
+
+**Re-measured 2026-07-27 (the "run the full spectrum" pass):**
+- **`wasm_wasi` (336 files): 333 run cleanly + 3 correctly trap on an uncaught exception + 0 hangs.** The
+  3 traps (`13_SecureMatrixManagerIntegration`, `15_Trap-On-Error`, `15_panic`) were cross-checked against
+  **wasmtime**, which traps identically at the same function indices ("thrown Wasm exception"). Zero decode
+  errors, zero host crashes, zero disagreements with wasmtime.
+- **`wasm_wasi_bundle` (61 files across 19 dirs): 61/61 clean.**
+- **`wasm_wasi_dync` (3 files): OUT OF SCOPE** — they import wasmtk's custom dynamic-runtime host
+  (`env.__host_call`/`__host_print`), not WASI; **wasmtime also refuses to instantiate them**. wazmrt binds
+  a trapping stub for the unknown import and HostTraps when the guest calls it. Not a wazmrt bug.
+
+**This pass found and fixed one REAL bug** (`d51c004`): `15_LexicalShadowing_Stress.wasm` **infinite-looped**
+(1.86 billion identical "Inner Catch:" lines) — a legacy `try`/`catch` control-flow bug where a raw `throw`
+inside a catch handler re-matched the SAME handler instead of propagating to the enclosing try (the
+re-throw idiom `catch (e) { … throw e; }`). See `known-issues.md`. *Method note: guest programs legitimately
+print "error"/"invalid"/"trap" strings, so the first classification pass had 6 false positives — always
+separate wazmrt's engine output (exit code + `trap:`/decode errors) from guest stdout/stderr, and confirm
+the trap/hang cases against wasmtime.*
+
+*(Prior 2026-07-17 snapshot after Phase 6.1/6.2/6.3: 331 run, 2 `_start`-less library modules, 3 traps —
+superseded; the corpus has since grown and the one legacy-EH hang above was a later addition, now fixed.)*
 
 ## Pin verification tests — `src/pin.zig` (2026-07-17, Phase 5)
 

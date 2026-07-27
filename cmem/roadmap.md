@@ -51,6 +51,14 @@ assembler has no gaps, and there are no open LOW *defects* — only by-design li
 (see `known-issues.md` "Remaining LOW items").** **491 local tests green under Debug AND ReleaseSafe;
 c-smoke 319/319; full main testsuite 60,670 / memory64 601/1 / SIMD 24,956/0.**
 
+**Then (2026-07-27, continued) — ran the full wasmtk WASI corpus and fixed a legacy-EH bug.** Ran all
+397 runnable files (`wasm_wasi` 336 + `wasm_wasi_bundle` 61; `dync` out of scope — wasmtk's dynamic-runtime
+host, which wasmtime also refuses). One real bug (`d51c004`): `15_LexicalShadowing_Stress.wasm`
+**infinite-looped** — a raw `throw` inside a legacy `catch` handler re-matched the same handler instead of
+propagating to the enclosing try (`throwException` now skips a legacy try whose handler is executing).
+**Result: `wasm_wasi` 333 clean + 3 correct uncaught-exception traps (identical to wasmtime) + 0 hangs;
+`wasm_wasi_bundle` 61/61 clean.** +1 regression test; **493 local tests green (Debug + ReleaseSafe).**
+
 **Latest (2026-07-22) — the "open items 1–7" batch.** After the 13th pass the remaining list was walked
 end to end (see `known-issues.md` for the per-item detail). Six real fixes, each verified by executing the
 result and, where a live reference implementation exists, cross-checked against **wasmtime**:
