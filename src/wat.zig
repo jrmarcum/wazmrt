@@ -155,7 +155,7 @@ const GlobalDef = struct { valtype: V, mutable: bool, init: []const Sexpr };
 /// An imported global (`(global (import "m" "n") type)`).
 const ImportedGlobal = struct { module: []const u8, name: []const u8, valtype: V, mutable: bool };
 const ImportedTable = struct { module: []const u8, name: []const u8, min: u32, max: ?u32, elem: V };
-const ImportedMemory = struct { module: []const u8, name: []const u8, min: u32, max: ?u32, shared: bool = false };
+const ImportedMemory = struct { module: []const u8, name: []const u8, min: u64, max: ?u64, shared: bool = false, is64: bool = false };
 
 /// Assemble the first `(module …)` form found in `src`.
 pub fn assemble(a: std.mem.Allocator, src: []const u8) Error![]const u8 {
@@ -221,7 +221,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // Defined memories (multi-memory). Each `(memory …)` appends here; the memory
     // section emits them in order. Imported memories take the low indices, so
     // `mem_names` (below) spans BOTH — imports first, definitions after.
-    var memories: List(struct { min: u32, max: ?u32, shared: bool = false }) = .empty;
+    var memories: List(struct { min: u64, max: ?u64, shared: bool = false, is64: bool = false }) = .empty;
     // Memory names, index-aligned with the memory INDEX space (imported memories
     // first, then defined). Lets a `$name` resolve everywhere it can appear:
     // `(export "m" (memory $x))`, `(i32.load $x …)`, `memory.size $x`,
@@ -336,6 +336,14 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 this_name = items[mi].asAtom();
                 mi += 1;
             }
+            // Optional index type `i64` (memory64) / `i32`, right after the name.
+            var this_is64 = false;
+            if (mi < items.len and eqAtom(items[mi], "i64")) {
+                this_is64 = true;
+                mi += 1;
+            } else if (mi < items.len and eqAtom(items[mi], "i32")) {
+                mi += 1;
+            }
             // This memory's index in the index space (imports precede defs).
             const midx: u32 = @intCast(mem_names.items.len);
             while (mi < items.len and eqKw(items[mi], "export")) : (mi += 1)
@@ -344,15 +352,15 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 // (memory (export …)* (import "m" "n") min max? shared?)
                 const imp = (try wantList(items[mi]));
                 mi += 1;
-                const mmin = try parseIndex(try nth(items, mi));
+                const mmin = try parseU64(try nth(items, mi));
                 mi += 1;
-                var mmax: ?u32 = null;
+                var mmax: ?u64 = null;
                 if (mi < items.len and items[mi].asAtom() != null and !eqAtom(items[mi], "shared")) {
-                    mmax = try parseIndex(items[mi]);
+                    mmax = try parseU64(items[mi]);
                     mi += 1;
                 }
                 const shared = mi < items.len and eqAtom(items[mi], "shared");
-                try mem_imports.append(a, .{ .module = (try strAt(imp, 1)), .name = (try strAt(imp, 2)), .min = mmin, .max = mmax, .shared = shared });
+                try mem_imports.append(a, .{ .module = (try strAt(imp, 1)), .name = (try strAt(imp, 2)), .min = mmin, .max = mmax, .shared = shared, .is64 = this_is64 });
             } else if (mi < items.len and eqKw(items[mi], "data")) {
                 // (memory (data "…")) — size the memory to the bytes and append an
                 // active data segment at offset 0 targeting THIS memory.
@@ -361,27 +369,28 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                     .string => |sbytes| try bytes.appendSlice(a, sbytes),
                     else => {},
                 };
-                const pages: u32 = @intCast((bytes.items.len + 65535) / 65536);
-                try memories.append(a, .{ .min = pages, .max = pages });
+                const pages: u64 = @intCast((bytes.items.len + 65535) / 65536);
+                try memories.append(a, .{ .min = pages, .max = pages, .is64 = this_is64 });
                 const off = try a.alloc(Sexpr, 2);
-                off[0] = .{ .atom = "i32.const" };
+                // The active-data offset takes the memory's index type.
+                off[0] = .{ .atom = if (this_is64) "i64.const" else "i32.const" };
                 off[1] = .{ .atom = "0" };
                 // Keep `data_names` index-aligned with `datas`: this inline
                 // `(memory (data …))` form has no `$id` of its own.
                 try data_names.append(a, null);
                 try datas.append(a, .{ .mem_index = midx, .offset_form = .{ .list = off }, .bytes = bytes.items });
             } else {
-                // (memory $m? min max? shared?) — `shared` (threads) follows the
-                // limits and requires a max.
-                const mmin = try parseIndex(try nth(items, mi));
+                // (memory $m? i64? min max? shared?) — `shared` (threads) follows
+                // the limits and requires a max.
+                const mmin = try parseU64(try nth(items, mi));
                 mi += 1;
-                var mmax: ?u32 = null;
+                var mmax: ?u64 = null;
                 if (mi < items.len and items[mi].asAtom() != null and !eqAtom(items[mi], "shared")) {
-                    mmax = try parseIndex(items[mi]);
+                    mmax = try parseU64(items[mi]);
                     mi += 1;
                 }
                 const shared = mi < items.len and eqAtom(items[mi], "shared");
-                try memories.append(a, .{ .min = mmin, .max = mmax, .shared = shared });
+                try memories.append(a, .{ .min = mmin, .max = mmax, .shared = shared, .is64 = this_is64 });
             }
             try mem_names.append(a, this_name);
         } else if (std.mem.eql(u8, kw, "data")) {
@@ -475,17 +484,27 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 try table_imports.append(a, .{ .module = (try strAt(items, 1)), .name = (try strAt(items, 2)), .min = tmin, .max = tmax, .elem = try parseValType(try nth(desc, ti), type_names.items) });
                 try table_names.append(a, tname);
             } else if (std.mem.eql(u8, dkw, "memory")) {
-                // (import "m" "n" (memory $id? min max?)) — takes a memory index.
+                // (import "m" "n" (memory $id? i64? min max? shared?))
                 var mi2: usize = 1;
                 var mname: ?[]const u8 = null;
                 if (mi2 < desc.len and isId(desc[mi2])) {
                     mname = desc[mi2].atom;
                     mi2 += 1;
                 }
-                const mmin = try parseIndex(try nth(desc, mi2));
+                var imp_is64 = false;
+                if (mi2 < desc.len and eqAtom(desc[mi2], "i64")) {
+                    imp_is64 = true;
+                    mi2 += 1;
+                } else if (mi2 < desc.len and eqAtom(desc[mi2], "i32")) mi2 += 1;
+                const mmin = try parseU64(try nth(desc, mi2));
                 mi2 += 1;
-                const mmax: ?u32 = if (mi2 < desc.len) try parseIndex(desc[mi2]) else null;
-                try mem_imports.append(a, .{ .module = (try strAt(items, 1)), .name = (try strAt(items, 2)), .min = mmin, .max = mmax });
+                var mmax: ?u64 = null;
+                if (mi2 < desc.len and desc[mi2].asAtom() != null and !eqAtom(desc[mi2], "shared")) {
+                    mmax = try parseU64(desc[mi2]);
+                    mi2 += 1;
+                }
+                const imp_shared = mi2 < desc.len and eqAtom(desc[mi2], "shared");
+                try mem_imports.append(a, .{ .module = (try strAt(items, 1)), .name = (try strAt(items, 2)), .min = mmin, .max = mmax, .shared = imp_shared, .is64 = imp_is64 });
                 try mem_names.append(a, mname);
             } else {
                 try parseImport(a, items, &global_imports, &global_names, type_names.items); // global
@@ -631,7 +650,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 try nameBytes(a, &s, t.name);
                 try s.append(a, 0x01); // table import
                 try emitValType(a, &s, t.elem); // element reftype
-                try emitLimits(a, &s, t.min, t.max, false);
+                try emitLimits(a, &s, t.min, if (t.max) |mx| @as(u64, mx) else null, false, false);
                 ci[1] += 1;
             },
             .mem => {
@@ -639,7 +658,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 try nameBytes(a, &s, m.module);
                 try nameBytes(a, &s, m.name);
                 try s.append(a, 0x02); // memory import
-                try emitLimits(a, &s, m.min, m.max, m.shared);
+                try emitLimits(a, &s, m.min, m.max, m.shared, m.is64);
                 ci[2] += 1;
             },
             .global => {
@@ -667,7 +686,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         try uleb(a, &s, tables.items.len);
         for (tables.items) |t| {
             try emitValType(a, &s, t.elem); // element reftype (funcref / externref)
-            try emitLimits(a, &s, t.min, t.max, false);
+            try emitLimits(a, &s, t.min, if (t.max) |mx| @as(u64, mx) else null, false, false);
         }
         try emitSection(a, &out, 4, s.items);
     }
@@ -676,7 +695,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     if (memories.items.len != 0) {
         var s: List(u8) = .empty;
         try uleb(a, &s, memories.items.len);
-        for (memories.items) |m| try emitLimits(a, &s, m.min, m.max, m.shared);
+        for (memories.items) |m| try emitLimits(a, &s, m.min, m.max, m.shared, m.is64);
         try emitSection(a, &out, 5, s.items);
     }
     // Tag section (13) — exception tags. Ordered after memory (5) and before
@@ -2480,6 +2499,13 @@ fn parseIndex(s: Sexpr) Error!u32 {
     return std.fmt.parseInt(u32, atom, 0) catch error.BadImmediate;
 }
 
+/// Parse an unsigned integer that may exceed u32 — a memory64 page limit
+/// (`_` digit separators allowed, e.g. `0x1_0000_0000_0000`).
+fn parseU64(s: Sexpr) Error!u64 {
+    const atom = s.asAtom() orelse return error.BadImmediate;
+    return std.fmt.parseInt(u64, atom, 0) catch error.BadImmediate;
+}
+
 fn parseWatI32(s: Sexpr) Error!i64 {
     const atom = s.asAtom() orelse return error.BadImmediate;
     const v = std.fmt.parseInt(i64, atom, 0) catch (std.fmt.parseInt(u32, atom, 0) catch return error.BadImmediate);
@@ -2763,12 +2789,14 @@ fn nameBytes(a: std.mem.Allocator, out: *List(u8), name: []const u8) Error!void 
 }
 
 /// Emit a `limits` (§5.3.7): flag byte (0x01 if a max is present) then min[, max].
-fn emitLimits(a: std.mem.Allocator, out: *List(u8), min: u32, max: ?u32, shared: bool) Error!void {
-    // Flag bits: 0 = has max, 1 = shared (threads; memories only).
-    const flag: u8 = (if (max != null) @as(u8, 0x01) else 0) | (if (shared) @as(u8, 0x02) else 0);
+fn emitLimits(a: std.mem.Allocator, out: *List(u8), min: u64, max: ?u64, shared: bool, is64: bool) Error!void {
+    // Flag bits: 0 = has max, 1 = shared (threads), 2 = i64 index (memory64).
+    const flag: u8 = (if (max != null) @as(u8, 0x01) else 0) |
+        (if (shared) @as(u8, 0x02) else 0) |
+        (if (is64) @as(u8, 0x04) else 0);
     try out.append(a, flag);
-    try uleb(a, out, min);
-    if (max) |mx| try uleb(a, out, mx);
+    try uleb(a, out, @intCast(min));
+    if (max) |mx| try uleb(a, out, @intCast(mx));
 }
 
 fn emitSection(a: std.mem.Allocator, out: *List(u8), id: u8, payload: []const u8) Error!void {
@@ -3518,6 +3546,62 @@ test "atomics: the validator requires the natural alignment" {
     try std.testing.expectError(error.InvalidAlignment, validate(a, &m));
     // The natural alignment assembles and validates.
     const ok = try assemble(a, "(module (memory 1) (func (result i32) (i32.atomic.load align=4 (i32.const 0))))");
+    var m2 = try Module.decode(a, ok);
+    try validate(a, &m2);
+}
+test "memory64: i64 addresses, i64 size/grow, values vs wasmtime" {
+    // A 64-bit memory: store/load use i64 addresses; memory.size returns i64.
+    const basic =
+        \\(module
+        \\  (memory i64 1)
+        \\  (func (export "t") (result i64)
+        \\    (i64.store (i64.const 8) (i64.const 12345))
+        \\    (i64.load (i64.const 8)))
+        \\  (func (export "sz") (result i64) (memory.size)))
+    ;
+    try std.testing.expectEqual(@as(i64, 12345), interp.asI64(try assembleAndRun(basic, "t", &.{})));
+    try std.testing.expectEqual(@as(i64, 1), interp.asI64(try assembleAndRun(basic, "sz", &.{})));
+
+    // memory.grow takes and returns i64: success gives the old page count, a
+    // grow past the max gives -1.
+    const grow =
+        \\(module
+        \\  (memory i64 1 4)
+        \\  (func (export "ok") (result i64) (memory.grow (i64.const 2)))
+        \\  (func (export "fail") (result i64) (memory.grow (i64.const 100))))
+    ;
+    try std.testing.expectEqual(@as(i64, 1), interp.asI64(try assembleAndRun(grow, "ok", &.{})));
+    try std.testing.expectEqual(@as(i64, -1), interp.asI64(try assembleAndRun(grow, "fail", &.{})));
+}
+
+test "memory64: assembles byte-identically to a hand-declared i64 memory; i32 form differs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The i64 index type sets flag bit 2 in the memory section, so a 64-bit and
+    // 32-bit memory of the same limits assemble to DIFFERENT bytes.
+    const m64 = try assemble(a, "(module (memory i64 1 2))");
+    const m32 = try assemble(a, "(module (memory 1 2))");
+    try std.testing.expect(!std.mem.eql(u8, m64, m32));
+    // Both decode + validate.
+    var d64 = try Module.decode(a, m64);
+    try validate(a, &d64);
+    try std.testing.expect(d64.memories[0].limits.is64);
+    var d32 = try Module.decode(a, m32);
+    try validate(a, &d32);
+    try std.testing.expect(!d32.memories[0].limits.is64);
+}
+
+test "memory64: the validator requires an i64 address on a 64-bit memory" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // An i32 address on a 64-bit memory is a type error.
+    const bad = try assemble(a, "(module (memory i64 1) (func (result i32) (i32.load (i32.const 0))))");
+    var m = try Module.decode(a, bad);
+    try std.testing.expectError(error.TypeMismatch, validate(a, &m));
+    // The i64 address validates.
+    const ok = try assemble(a, "(module (memory i64 1) (func (result i32) (i32.load (i64.const 0))))");
     var m2 = try Module.decode(a, ok);
     try validate(a, &m2);
 }

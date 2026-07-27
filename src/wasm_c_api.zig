@@ -372,7 +372,12 @@ fn valkindOf(v: types.ValType) Valkind {
 }
 
 fn limitsOf(l: root.Module.Limits) Limits {
-    return .{ .min = l.min, .max = l.max orelse 0xffff_ffff };
+    // `wasm.h`'s limits are u32; page counts are u64 (memory64), so saturate — a
+    // 64-bit memory's large limits simply aren't representable through this ABI.
+    return .{
+        .min = std.math.cast(u32, l.min) orelse 0xffff_ffff,
+        .max = if (l.max) |m| (std.math.cast(u32, m) orelse 0xffff_ffff) else 0xffff_ffff,
+    };
 }
 
 fn makeValType(v: types.ValType) ?*ValType {
@@ -1701,11 +1706,11 @@ export fn wasm_table_type(t: ?*const Ref) ?*TableType {
     if (r.instance) |wi| {
         if (r.index < wi.inst.module.tables.len) {
             elem = wi.inst.module.tables[r.index].element;
-            maxv = wi.inst.module.tables[r.index].limits.max;
+            maxv = if (wi.inst.module.tables[r.index].limits.max) |m| @as(u32, @intCast(m)) else null;
         }
     } else if (r.host_table) |tbl| maxv = tbl.max;
     const min: u32 = @intCast((tableObj(r) orelse return null).entries.len);
-    const ext = makeExternType(.{ .table = .{ .element = elem, .limits = .{ .min = min, .max = maxv } } }) orelse return null;
+    const ext = makeExternType(.{ .table = .{ .element = elem, .limits = .{ .min = min, .max = if (maxv) |m| @as(u64, m) else null } } }) orelse return null;
     return @ptrCast(@alignCast(ext));
 }
 

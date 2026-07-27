@@ -79,9 +79,13 @@ pub const CompType = union(enum) {
 };
 
 /// Resizable-range limits shared by tables and memories (§5.3.7). `shared`
-/// (threads proposal) applies only to memories — a shared memory backs atomic
-/// `wait`/`notify`; it is always false for tables.
-pub const Limits = struct { min: u32, max: ?u32, shared: bool = false };
+/// (threads proposal) and `is64` (memory64 proposal) apply only to memories —
+/// `shared` backs atomic `wait`/`notify`; `is64` makes the memory's addresses
+/// (and `memory.size`/`grow`) i64. Both are always false for tables.
+///
+/// `min`/`max` are PAGE counts. A 64-bit memory may declare up to 2^48 pages, so
+/// the counts are kept as u64 (a 32-bit memory still fits ≤ 2^16).
+pub const Limits = struct { min: u64, max: ?u64, shared: bool = false, is64: bool = false };
 
 pub const TableType = struct { element: types.ValType, limits: Limits };
 pub const MemoryType = struct { limits: Limits };
@@ -634,18 +638,19 @@ fn readName(a: std.mem.Allocator, r: *Reader) Error![]const u8 {
 
 fn readLimits(r: *Reader) Error!Limits {
     const flag = try r.readByte();
-    // bit 0 = has max, bit 1 = shared (threads proposal). 0x00/0x01 unshared,
-    // 0x02/0x03 shared; anything else is malformed.
-    if (flag > 0x03) return error.MalformedFlag;
-    const min = try r.readVarU32();
-    const max: ?u32 = if (flag & 0x01 != 0) try r.readVarU32() else null;
-    return .{ .min = min, .max = max, .shared = flag & 0x02 != 0 };
+    // bit 0 = has max, bit 1 = shared (threads), bit 2 = i64 index (memory64).
+    if (flag > 0x07) return error.MalformedFlag;
+    const is64 = flag & 0x04 != 0;
+    // A 32-bit memory's min/max are u32; a 64-bit memory's are u64.
+    const min: u64 = if (is64) try r.readVarU64() else try r.readVarU32();
+    const max: ?u64 = if (flag & 0x01 != 0) (if (is64) try r.readVarU64() else try r.readVarU32()) else null;
+    return .{ .min = min, .max = max, .shared = flag & 0x02 != 0, .is64 = is64 };
 }
 
 fn readTableType(r: *Reader, kinds: []const CompKind) Error!TableType {
     const element = try readValType(r, kinds);
     const limits = try readLimits(r);
-    if (limits.shared) return error.MalformedFlag; // tables are never shared here
+    if (limits.shared or limits.is64) return error.MalformedFlag; // tables are 32-bit, unshared
     return .{ .element = element, .limits = limits };
 }
 
@@ -1295,7 +1300,7 @@ test "resolves a memory export with limits" {
     try std.testing.expectEqual(@as(usize, 1), m.exports.len);
     try std.testing.expectEqual(types.ExternKind.memory, m.exports[0].type.kind());
     try std.testing.expectEqual(@as(u32, 1), m.exports[0].type.memory.limits.min);
-    try std.testing.expectEqual(@as(?u32, 2), m.exports[0].type.memory.limits.max);
+    try std.testing.expectEqual(@as(?u64, 2), m.exports[0].type.memory.limits.max);
 }
 
 test "reads function names from the name section" {

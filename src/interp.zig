@@ -504,7 +504,7 @@ pub const Instance = struct {
     /// never owned: a panic in a safety build, silent corruption in ReleaseFast.
     /// (Cross-allocator guest memory has been a bug here three separate times;
     /// every in-repo caller is correct, but the invariant lives on the type now.)
-    pub const Memory = struct { bytes: []u8, max: ?u32, shared: bool = false };
+    pub const Memory = struct { bytes: []u8, max: ?u64, shared: bool = false, is64: bool = false };
 
     /// Memory index 0, or null if the module has no memory. The WASI host and the
     /// C ABI speak the conventional single memory through this.
@@ -816,7 +816,8 @@ pub const Instance = struct {
                 // `min` is an unvalidated varU32; on a 32-bit `usize` (the wasm32
                 // build) `min * page_size` would overflow, so multiply with an
                 // overflow check → clean OOM (harmless on 64-bit: 2^32 × 2^16 fits).
-                const nbytes = std.math.mul(usize, @as(usize, mt.limits.min), page_size) catch return error.OutOfMemory;
+                const min_pages = std.math.cast(usize, mt.limits.min) orelse return error.MemoryLimitExceeded;
+                const nbytes = std.math.mul(usize, min_pages, page_size) catch return error.OutOfMemory;
                 // Budget across ALL defined memories, not per memory — otherwise
                 // multi-memory trivially multiplies past the ceiling.
                 total_memory_bytes = std.math.add(usize, total_memory_bytes, nbytes) catch return error.MemoryLimitExceeded;
@@ -827,7 +828,7 @@ pub const Instance = struct {
                     freeGuestMemory(buf);
                     return e;
                 };
-                mem_obj.* = .{ .bytes = buf, .max = mt.limits.max, .shared = mt.limits.shared };
+                mem_obj.* = .{ .bytes = buf, .max = mt.limits.max, .shared = mt.limits.shared, .is64 = mt.limits.is64 };
                 memories[i] = mem_obj;
                 built = i + 1;
             }
@@ -835,10 +836,12 @@ pub const Instance = struct {
         for (module.data) |seg| {
             if (!seg.active) continue;
             if (seg.mem_index >= memories.len) return error.NoMemory;
-            const bytes = memories[seg.mem_index].bytes;
-            const offset = try evalConstOffset(module, globals, seg.offset_expr);
-            if (@as(u64, offset) + seg.bytes.len > bytes.len) return error.MemoryOutOfBounds;
-            @memcpy(bytes[offset..][0..seg.bytes.len], seg.bytes);
+            const mem = memories[seg.mem_index];
+            const offset = try evalConstOffset(globals, seg.offset_expr, mem.is64);
+            const start = std.math.cast(usize, offset) orelse return error.MemoryOutOfBounds;
+            const end = std.math.add(usize, start, seg.bytes.len) catch return error.MemoryOutOfBounds;
+            if (end > mem.bytes.len) return error.MemoryOutOfBounds;
+            @memcpy(mem.bytes[start..][0..seg.bytes.len], seg.bytes);
         }
 
         // Tables: imported tables (the low indices) borrow host-supplied shared
@@ -867,7 +870,7 @@ pub const Instance = struct {
                     gpa.free(entries);
                     return e;
                 };
-                tab.* = .{ .entries = entries, .max = tt.limits.max };
+                tab.* = .{ .entries = entries, .max = if (tt.limits.max) |mx| @as(u32, @intCast(mx)) else null };
                 t.* = tab;
             }
             n_tables_init += 1;
@@ -903,7 +906,7 @@ pub const Instance = struct {
             if (elem.mode == .active) {
                 if (elem.table_index >= tables.len) return error.NoTable;
                 const tbl = tables[elem.table_index].entries;
-                const offset = try evalConstOffset(module, globals, elem.offset_expr);
+                const offset = try evalConstOffset(globals, elem.offset_expr, false); // tables are always 32-bit
                 // Bound the WHOLE range before writing anything, exactly as the
                 // active-data branch above does. The check used to sit inside the
                 // loop, so an over-long segment wrote a partial prefix and *then*
@@ -2009,40 +2012,48 @@ const Frame = struct {
                 },
                 // --- Bulk memory (multi-memory: each carries its memory index) ---
                 .memory_copy => {
-                    const dmem = try self.memBytes(instr.imm.mem_copy.dst);
-                    const smem = try self.memBytes(instr.imm.mem_copy.src);
-                    const n = @as(u32, @bitCast(self.popI32()));
-                    const src = @as(u32, @bitCast(self.popI32()));
-                    const dst = @as(u32, @bitCast(self.popI32()));
-                    if (@as(u64, src) + n > smem.len or @as(u64, dst) + n > dmem.len) return error.MemoryOutOfBounds;
+                    if (instr.imm.mem_copy.dst >= self.inst.memories.len or instr.imm.mem_copy.src >= self.inst.memories.len) return error.NoMemory;
+                    const dm = self.inst.memories[instr.imm.mem_copy.dst];
+                    const sm = self.inst.memories[instr.imm.mem_copy.src];
+                    // memory64: dst/src take their memory's index type; n the smaller.
+                    const n = self.popMemU64(dm.is64 and sm.is64);
+                    const src = self.popMemU64(sm.is64);
+                    const dst = self.popMemU64(dm.is64);
+                    const dsti = memRange(dst, n, dm.bytes.len) orelse return error.MemoryOutOfBounds;
+                    const srci = memRange(src, n, sm.bytes.len) orelse return error.MemoryOutOfBounds;
+                    const ni: usize = @intCast(n);
                     if (instr.imm.mem_copy.dst != instr.imm.mem_copy.src) {
-                        @memcpy(dmem[dst..][0..n], smem[src..][0..n]); // distinct buffers: no overlap
-                    } else if (dst <= src) {
-                        std.mem.copyForwards(u8, dmem[dst..][0..n], smem[src..][0..n]);
+                        @memcpy(dm.bytes[dsti..][0..ni], sm.bytes[srci..][0..ni]); // distinct buffers: no overlap
+                    } else if (dsti <= srci) {
+                        std.mem.copyForwards(u8, dm.bytes[dsti..][0..ni], sm.bytes[srci..][0..ni]);
                     } else {
-                        std.mem.copyBackwards(u8, dmem[dst..][0..n], smem[src..][0..n]);
+                        std.mem.copyBackwards(u8, dm.bytes[dsti..][0..ni], sm.bytes[srci..][0..ni]);
                     }
                     pc += 1;
                 },
                 .memory_fill => {
-                    const mem = try self.memBytes(instr.imm.mem_index);
-                    const n = @as(u32, @bitCast(self.popI32()));
+                    if (instr.imm.mem_index >= self.inst.memories.len) return error.NoMemory;
+                    const m = self.inst.memories[instr.imm.mem_index];
+                    const n = self.popMemU64(m.is64);
                     const byte: u8 = @truncate(@as(u32, @bitCast(self.popI32())));
-                    const dst = @as(u32, @bitCast(self.popI32()));
-                    if (@as(u64, dst) + n > mem.len) return error.MemoryOutOfBounds;
-                    @memset(mem[dst..][0..n], byte);
+                    const dst = self.popMemU64(m.is64);
+                    const dsti = memRange(dst, n, m.bytes.len) orelse return error.MemoryOutOfBounds;
+                    @memset(m.bytes[dsti..][0..@intCast(n)], byte);
                     pc += 1;
                 },
                 .memory_init => {
-                    const mem = try self.memBytes(instr.imm.mem_init.mem);
+                    if (instr.imm.mem_init.mem >= self.inst.memories.len) return error.NoMemory;
+                    const m = self.inst.memories[instr.imm.mem_init.mem];
                     const di = instr.imm.mem_init.data;
                     // A dropped (or active, already-applied) segment reads as empty.
                     const seg: []const u8 = if (self.inst.data_dropped[di]) &.{} else self.inst.module.data[di].bytes;
-                    const n = @as(u32, @bitCast(self.popI32()));
-                    const src = @as(u32, @bitCast(self.popI32()));
-                    const dst = @as(u32, @bitCast(self.popI32()));
-                    if (@as(u64, src) + n > seg.len or @as(u64, dst) + n > mem.len) return error.MemoryOutOfBounds;
-                    @memcpy(mem[dst..][0..n], seg[src..][0..n]);
+                    // n/src index the data segment (always i32); dst is a memory address.
+                    const n = @as(u64, @as(u32, @bitCast(self.popI32())));
+                    const src = @as(u64, @as(u32, @bitCast(self.popI32())));
+                    const dst = self.popMemU64(m.is64);
+                    const srci = memRange(src, n, seg.len) orelse return error.MemoryOutOfBounds;
+                    const dsti = memRange(dst, n, m.bytes.len) orelse return error.MemoryOutOfBounds;
+                    @memcpy(m.bytes[dsti..][0..@intCast(n)], seg[srci..][0..@intCast(n)]);
                     pc += 1;
                 },
                 .data_drop => {
@@ -2423,14 +2434,39 @@ const Frame = struct {
         return self.inst.memories[idx].bytes;
     }
 
+    /// Pop a memory ADDRESS for `mem_idx` — i64 for a memory64 memory, else i32
+    /// (zero-extended to u64). All bounds arithmetic is then u64.
+    fn popAddr(self: *Frame, mem_idx: u32) Error!u64 {
+        if (mem_idx >= self.inst.memories.len) return error.NoMemory;
+        return if (self.inst.memories[mem_idx].is64)
+            @bitCast(self.popI64())
+        else
+            @as(u64, @as(u32, @bitCast(self.popI32())));
+    }
+
+    /// Pop an address/count value that is i64 when `is64`, else i32 (zero-ext).
+    fn popMemU64(self: *Frame, is64: bool) u64 {
+        return if (is64) @bitCast(self.popI64()) else @as(u64, @as(u32, @bitCast(self.popI32())));
+    }
+
+    /// Overflow-safe range check: `base + n <= len`? Returns `base` as a `usize`
+    /// (safe: it is then `< len`, which fits) or null for out-of-bounds.
+    fn memRange(base: u64, n: u64, len: usize) ?usize {
+        const end = std.math.add(u64, base, n) catch return null;
+        if (end > len) return null;
+        return @intCast(base);
+    }
+
     /// Load `T` from linear memory `ma.memory` at (popped address + memarg
     /// offset), little-endian. Signed `T` sign-extends, unsigned zero-extends.
     fn load(self: *Frame, comptime T: type, ma: opcode.MemArg) Error!T {
         const n = @sizeOf(T);
-        const base: u32 = @bitCast(self.popI32());
-        const mem = try self.memBytes(ma.memory);
-        const ea = @as(u64, base) + ma.offset;
-        if (ea + n > mem.len) return error.MemoryOutOfBounds;
+        const base = try self.popAddr(ma.memory);
+        const mem = self.inst.memories[ma.memory].bytes;
+        // Overflow-safe for 64-bit addresses: base + offset (+ n) can exceed u64.
+        const ea = std.math.add(u64, base, ma.offset) catch return error.MemoryOutOfBounds;
+        const end = std.math.add(u64, ea, n) catch return error.MemoryOutOfBounds;
+        if (end > mem.len) return error.MemoryOutOfBounds;
         return std.mem.readInt(T, mem[@intCast(ea)..][0..n], .little);
     }
 
@@ -2438,46 +2474,57 @@ const Frame = struct {
     /// offset). The caller has already popped the value; this pops the address.
     fn store(self: *Frame, comptime T: type, ma: opcode.MemArg, value: T) Error!void {
         const n = @sizeOf(T);
-        const base: u32 = @bitCast(self.popI32());
-        const mem = try self.memBytes(ma.memory);
-        const ea = @as(u64, base) + ma.offset;
-        if (ea + n > mem.len) return error.MemoryOutOfBounds;
+        const base = try self.popAddr(ma.memory);
+        const mem = self.inst.memories[ma.memory].bytes;
+        const ea = std.math.add(u64, base, ma.offset) catch return error.MemoryOutOfBounds;
+        const end = std.math.add(u64, ea, n) catch return error.MemoryOutOfBounds;
+        if (end > mem.len) return error.MemoryOutOfBounds;
         std.mem.writeInt(T, mem[@intCast(ea)..][0..n], value, .little);
     }
 
     fn memoryGrow(self: *Frame, mem_idx: u32) Error!void {
-        const delta: u64 = @as(u32, @bitCast(self.popI32()));
         if (mem_idx >= self.inst.memories.len) return error.NoMemory;
         const m = self.inst.memories[mem_idx];
+        // memory64: the delta and the result page count are i64.
+        const delta: u64 = if (m.is64) @bitCast(self.popI64()) else @as(u32, @bitCast(self.popI32()));
         const old = m.bytes;
         const old_pages: u64 = old.len / page_size;
-        // Clamp to the architectural cap (spec: ≤ 2^16 pages) so an unvalidated
-        // `m.max` can't authorize an oversized grow; `old_pages + delta ≤ limit`
-        // then fits `usize` on every target. Multiply with an overflow check so
-        // 65536×page_size (= 2^32, one past u32) fails cleanly on the wasm32 build.
-        const limit: u64 = @min(m.max orelse 65536, 65536);
-        if (old_pages + delta > limit) return self.pushI32(-1);
-        const nbytes = std.math.mul(usize, @intCast(old_pages + delta), page_size) catch return self.pushI32(-1);
-        // Same budget instantiation enforced: otherwise a module declaring a
-        // small minimum could just grow past the ceiling. `memory.grow` reports
-        // failure as -1 (spec), so this is a clean refusal, not a trap.
-        if (nbytes > self.inst.max_memory_bytes) return self.pushI32(-1);
+        // Architectural cap: 2^16 pages for a 32-bit memory, 2^48 for a 64-bit
+        // one — so an unvalidated `m.max` can't authorize an oversized grow.
+        // `memory.grow` reports failure as -1 (of the memory's index type), a
+        // clean refusal rather than a trap.
+        const cap: u64 = if (m.is64) 0x1_0000_0000_0000 else 65536;
+        const limit: u64 = @min(m.max orelse cap, cap);
+        const new_pages = std.math.add(u64, old_pages, delta) catch return self.growFail(m.is64);
+        if (new_pages > limit) return self.growFail(m.is64);
+        const np = std.math.cast(usize, new_pages) orelse return self.growFail(m.is64);
+        const nbytes = std.math.mul(usize, np, page_size) catch return self.growFail(m.is64);
+        // Same budget instantiation enforces: else a module with a small minimum
+        // could just grow past the ceiling.
+        if (nbytes > self.inst.max_memory_bytes) return self.growFail(m.is64);
         // Page-allocator owned, and the grown tail is demand-zero either way:
         // a resize-in-place commits fresh (zero) pages, and a move lands in a
         // fresh mapping whose bytes past the copy are already zero. So no
         // @memset — which is the point, a 4 GiB grow must not touch 4 GiB.
-        const new_buf = growGuestMemory(old, nbytes) catch
-            return self.pushI32(-1);
+        const new_buf = growGuestMemory(old, nbytes) catch return self.growFail(m.is64);
         m.bytes = new_buf; // shared object → visible to importers
-        try self.pushI32(@intCast(old_pages));
+        if (m.is64) try self.pushI64(@intCast(old_pages)) else try self.pushI32(@intCast(old_pages));
+    }
+
+    /// `memory.grow` failure: push -1 of the memory's index type.
+    fn growFail(self: *Frame, is64: bool) Error!void {
+        return if (is64) self.pushI64(-1) else self.pushI32(-1);
     }
 
     fn execMemory(self: *Frame, instr: opcode.Instr) Error!void {
         // memory.size / memory.grow carry a memory index, not a memarg.
         switch (instr.op) {
             .memory_size => {
-                const mem = try self.memBytes(instr.imm.mem_index);
-                return self.pushI32(@intCast(mem.len / page_size));
+                if (instr.imm.mem_index >= self.inst.memories.len) return error.NoMemory;
+                const m = self.inst.memories[instr.imm.mem_index];
+                const pages = m.bytes.len / page_size;
+                // memory64: the page count is i64, not i32.
+                return if (m.is64) self.pushI64(@intCast(pages)) else self.pushI32(@intCast(pages));
             },
             .memory_grow => return self.memoryGrow(instr.imm.mem_index),
             else => {},
@@ -2949,12 +2996,13 @@ const Frame = struct {
     /// alignment-check it. `need_shared` additionally requires the memory to be
     /// shared (`wait*`). Returns the memory slice and the effective offset.
     fn atomicEa(self: *Frame, at: opcode.Atomic, width: u64, need_shared: bool) Error!struct { mem: []u8, ea: usize } {
-        const base: u32 = @bitCast(self.popI32());
         if (at.mem.memory >= self.inst.memories.len) return error.NoMemory;
         const m = self.inst.memories[at.mem.memory];
+        const base = self.popMemU64(m.is64); // memory64: i64 address
         if (need_shared and !m.shared) return error.ExpectedSharedMemory;
-        const ea = @as(u64, base) + at.mem.offset;
-        if (ea + width > m.bytes.len) return error.MemoryOutOfBounds;
+        const ea = std.math.add(u64, base, at.mem.offset) catch return error.MemoryOutOfBounds;
+        const end = std.math.add(u64, ea, width) catch return error.MemoryOutOfBounds;
+        if (end > m.bytes.len) return error.MemoryOutOfBounds;
         if (ea % width != 0) return error.UnalignedAtomic;
         return .{ .mem = m.bytes, .ea = @intCast(ea) };
     }
@@ -3389,10 +3437,11 @@ fn evalConstV128(expr: []const u8, lo: []const Value, hi: []const Value) Error!u
 
 /// Evaluate a constant offset expression (data / element segment offset) to an
 /// i32 address.
-fn evalConstOffset(module: *const Module, globals: []const Value, expr: []const u8) Error!u32 {
-    _ = module;
-    // Offset const-exprs are i32 and never allocate, so no GC context is needed.
-    return @bitCast(asI32(try evalConstExpr(.{ .globals = globals }, expr)));
+fn evalConstOffset(globals: []const Value, expr: []const u8, is64: bool) Error!u64 {
+    // Offset const-exprs never allocate, so no GC context is needed. A 64-bit
+    // memory's active-data offset is i64 (memory64); a 32-bit one is i32.
+    const v = try evalConstExpr(.{ .globals = globals }, expr);
+    return if (is64) @bitCast(asI64(v)) else @as(u64, @as(u32, @bitCast(asI32(v))));
 }
 
 /// Context for `evalConstExpr`. `globals` is always present; the GC fields are

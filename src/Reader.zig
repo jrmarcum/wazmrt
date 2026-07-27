@@ -76,6 +76,24 @@ pub fn readVarU32(self: *Reader) types.DecodeError!u32 {
     }
 }
 
+/// Read an unsigned LEB128 integer into a u64 (§5.2.2) — for memory64 page
+/// counts and 64-bit indices. Rejects over-long encodings / >64-bit values.
+pub fn readVarU64(self: *Reader) types.DecodeError!u64 {
+    var result: u64 = 0;
+    var shift: u7 = 0;
+    while (true) {
+        const byte = try self.readByte();
+        if (shift == 63) {
+            // 10th byte: only 1 value bit fits, and there must be no 11th byte.
+            if (byte >> 1 != 0) return error.LebOverflow;
+            return result | (@as(u64, byte & 0x01) << 63);
+        }
+        result |= @as(u64, byte & 0x7f) << @intCast(shift);
+        if (byte & 0x80 == 0) return result;
+        shift += 7;
+    }
+}
+
 /// Read a signed LEB128 integer into an i32 (§5.2.2). Rejects over-long
 /// encodings and values that don't sign-fit in 32 bits.
 pub fn readVarI32(self: *Reader) types.DecodeError!i32 {

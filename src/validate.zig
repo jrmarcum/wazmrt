@@ -166,7 +166,9 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
     for (module.data) |seg| {
         if (!seg.active) continue;
         if (seg.mem_index >= module.memories.len) return error.MissingMemory;
-        try validateConstExpr(module, seg.offset_expr, .i32, all_globals, null);
+        // The active-data offset has the target memory's index type (memory64).
+        const off_ty: V = if (module.memories[seg.mem_index].limits.is64) .i64 else .i32;
+        try validateConstExpr(module, seg.offset_expr, off_ty, all_globals, null);
     }
 
     // Limits (§3.2.5): `min <= max`, and each is bounded by the type's ceiling —
@@ -175,10 +177,13 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
     // at run time (instantiation clamps and the `--max-memory` budget refuses),
     // but the validator is a C-ABI entry point and should say so itself.
     for (module.memories) |mt| {
-        if (mt.limits.min > 0x1_0000) return error.InvalidLimits;
+        // Page-count ceiling: 2^16 for a 32-bit memory, 2^48 for a 64-bit one
+        // (memory64). A shared memory must declare a max (§ threads).
+        const ceiling: u64 = if (mt.limits.is64) 0x1_0000_0000_0000 else 0x1_0000;
+        if (mt.limits.min > ceiling) return error.InvalidLimits;
         if (mt.limits.max) |mx| {
-            if (mx > 0x1_0000 or mt.limits.min > mx) return error.InvalidLimits;
-        }
+            if (mx > ceiling or mt.limits.min > mx) return error.InvalidLimits;
+        } else if (mt.limits.shared) return error.InvalidLimits;
     }
     for (module.tables) |tt| {
         if (tt.limits.max) |mx| {
@@ -534,6 +539,12 @@ const FuncValidator = struct {
         if (index >= self.module.memories.len) return error.MissingMemory;
     }
 
+    /// The address/count value type of memory `index` — `i64` for a memory64
+    /// memory, else `i32`. Callers `requireMemory` first, so the index is valid.
+    fn memAddrTy(self: *FuncValidator, index: u32) V {
+        return if (self.module.memories[index].limits.is64) .i64 else .i32;
+    }
+
     fn popRef(self: *FuncValidator) Error!StackType {
         const st = try self.popVal();
         switch (st) {
@@ -870,43 +881,45 @@ const FuncValidator = struct {
                 try self.requireMemory(instr.imm.atomic.mem.memory);
                 if (instr.imm.atomic.mem.alignment != opcode.atomicNaturalAlignLog2(sub))
                     return error.InvalidAlignment;
+                // memory64: the ADDRESS operand (the deepest one) is i64.
+                const adt = self.memAddrTy(instr.imm.atomic.mem.memory);
                 switch (sub) {
                     0x00 => { // notify: [addr count] -> [i32]
                         _ = try self.popExpect(.i32);
-                        _ = try self.popExpect(.i32);
+                        _ = try self.popExpect(adt);
                         try self.pushValT(.i32);
                     },
                     0x01 => { // wait32: [addr i32 i64] -> [i32]
                         _ = try self.popExpect(.i64);
                         _ = try self.popExpect(.i32);
-                        _ = try self.popExpect(.i32);
+                        _ = try self.popExpect(adt);
                         try self.pushValT(.i32);
                     },
                     0x02 => { // wait64: [addr i64 i64] -> [i32]
                         _ = try self.popExpect(.i64);
                         _ = try self.popExpect(.i64);
-                        _ = try self.popExpect(.i32);
+                        _ = try self.popExpect(adt);
                         try self.pushValT(.i32);
                     },
                     0x10...0x16 => { // atomic load: [addr] -> [T]
-                        _ = try self.popExpect(.i32);
+                        _ = try self.popExpect(adt);
                         try self.pushValT(atomicValType(sub));
                     },
                     0x17...0x1d => { // atomic store: [addr T] -> []
                         _ = try self.popExpect(atomicValType(sub));
-                        _ = try self.popExpect(.i32);
+                        _ = try self.popExpect(adt);
                     },
                     0x1e...0x47 => { // rmw: [addr T] -> [T]
                         const t = atomicValType(sub);
                         _ = try self.popExpect(t);
-                        _ = try self.popExpect(.i32);
+                        _ = try self.popExpect(adt);
                         try self.pushValT(t);
                     },
                     0x48...0x4e => { // cmpxchg: [addr expected replacement] -> [T]
                         const t = atomicValType(sub);
                         _ = try self.popExpect(t);
                         _ = try self.popExpect(t);
-                        _ = try self.popExpect(.i32);
+                        _ = try self.popExpect(adt);
                         try self.pushValT(t);
                     },
                     else => return error.UnsupportedOpcode,
@@ -960,16 +973,27 @@ const FuncValidator = struct {
                 // Bulk ops name a memory INDEX; testing only `len == 0` accepted
                 // `memory.fill (memory 7)` in a one-memory module. Sibling of the
                 // load/store hole `requireMemory` was added to close.
+                // memory64: address/count operands take the memory's index type.
                 switch (instr.op) {
-                    .memory_fill => try self.requireMemory(instr.imm.mem_index),
-                    else => {
+                    .memory_fill => {
+                        try self.requireMemory(instr.imm.mem_index);
+                        const at = self.memAddrTy(instr.imm.mem_index);
+                        _ = try self.popExpect(at); // n
+                        _ = try self.popExpect(.i32); // fill byte (always i32)
+                        _ = try self.popExpect(at); // dst
+                    },
+                    else => { // memory.copy
                         try self.requireMemory(instr.imm.mem_copy.dst);
                         try self.requireMemory(instr.imm.mem_copy.src);
+                        const dt = self.memAddrTy(instr.imm.mem_copy.dst);
+                        const st = self.memAddrTy(instr.imm.mem_copy.src);
+                        // n is the smaller index type (i32 unless both are i64).
+                        const nt: V = if (dt == .i64 and st == .i64) .i64 else .i32;
+                        _ = try self.popExpect(nt); // n
+                        _ = try self.popExpect(st); // src
+                        _ = try self.popExpect(dt); // dst
                     },
                 }
-                _ = try self.popExpect(.i32); // n
-                _ = try self.popExpect(.i32); // src / fill byte
-                _ = try self.popExpect(.i32); // dst
             },
             .memory_init => {
                 // WRONG UNION FIELD: `memory.init` decodes to `.mem_init{data, mem}`,
@@ -982,9 +1006,9 @@ const FuncValidator = struct {
                 // immediate really is `.data`.
                 try self.requireMemory(instr.imm.mem_init.mem);
                 if (instr.imm.mem_init.data >= self.module.data.len) return error.UndefinedData;
-                _ = try self.popExpect(.i32); // n
-                _ = try self.popExpect(.i32); // src (offset into the segment)
-                _ = try self.popExpect(.i32); // dst
+                _ = try self.popExpect(.i32); // n (count into the data segment — i32)
+                _ = try self.popExpect(.i32); // src (offset into the segment — i32)
+                _ = try self.popExpect(self.memAddrTy(instr.imm.mem_init.mem)); // dst address (memory64: i64)
             },
             .data_drop => {
                 if (instr.imm.data >= self.module.data.len) return error.UndefinedData;
@@ -1267,23 +1291,35 @@ const FuncValidator = struct {
                 _ = try self.popExpect(g.content);
             },
 
-            else => {
+            else => switch (opcode.immediateKind(instr.op)) {
                 // Load/store: the alignment (log2) must not exceed the access's
-                // natural alignment, and the addressed memory must exist.
-                switch (opcode.immediateKind(instr.op)) {
-                    .mem => {
-                        try self.requireMemory(instr.imm.mem.memory);
-                        if (instr.imm.mem.alignment > opcode.naturalAlignLog2(instr.op)) return error.InvalidAlignment;
-                    },
-                    // `memory.size`/`memory.grow` reached `simpleSig` with no
-                    // memory check at all — they were valid in a module with no
-                    // memory, and their memory index was never bounded.
-                    .mem_index => try self.requireMemory(instr.imm.mem_index),
-                    else => {},
-                }
-                const s = simpleSig(instr.op) orelse return error.UnsupportedOpcode;
-                try self.popVals(s.pop);
-                try self.pushVals(s.push);
+                // natural alignment, the addressed memory must exist, and — for a
+                // memory64 memory — the ADDRESS operand is i64, not i32.
+                .mem => {
+                    try self.requireMemory(instr.imm.mem.memory);
+                    if (instr.imm.mem.alignment > opcode.naturalAlignLog2(instr.op)) return error.InvalidAlignment;
+                    const s = simpleSig(instr.op) orelse return error.UnsupportedOpcode;
+                    const at = self.memAddrTy(instr.imm.mem.memory);
+                    // `pop` is `[addr]` (load) or `[addr, value]` (store). Pop the
+                    // trailing value(s) top-first, then the address as `at`.
+                    var k = s.pop.len;
+                    while (k > 1) : (k -= 1) _ = try self.popExpect(s.pop[k - 1]);
+                    _ = try self.popExpect(at);
+                    try self.pushVals(s.push);
+                },
+                // `memory.size`/`memory.grow` reached `simpleSig` with no memory
+                // check at all. For a memory64 memory the operand/result is i64.
+                .mem_index => {
+                    try self.requireMemory(instr.imm.mem_index);
+                    const at = self.memAddrTy(instr.imm.mem_index);
+                    if (instr.op == .memory_grow) _ = try self.popExpect(at); // delta
+                    try self.pushValT(at); // size / new-or-old page count
+                },
+                else => {
+                    const s = simpleSig(instr.op) orelse return error.UnsupportedOpcode;
+                    try self.popVals(s.pop);
+                    try self.pushVals(s.push);
+                },
             },
         }
     }
