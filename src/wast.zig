@@ -218,7 +218,12 @@ const Runner = struct {
             for (inst.module.exports) |e| {
                 if (e.type == .memory and std.mem.eql(u8, e.name, name)) {
                     if (!limitsFit(e.type.memory.limits, want.limits)) return error.IncompatibleImportType;
-                    return inst.memory0() orelse error.UnresolvedImport;
+                    // The EXPORT names a specific memory index (multi-memory), not
+                    // necessarily 0 — `memory0()` here linked every imported memory
+                    // to the exporter's first one, so `memory.size $mem2` read the
+                    // wrong memory.
+                    if (e.index >= inst.memories.len) return error.UnresolvedImport;
+                    return inst.memories[e.index];
                 }
             }
         }

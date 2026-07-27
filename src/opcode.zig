@@ -571,7 +571,9 @@ pub fn immediateKind(op: Op) ImmKind {
         0xd7 => .data_init, // memory.init: data index + reserved mem byte
         0xd8 => .data, // data.drop: data index
         0xd9 => .mem_copy, // memory.copy: two reserved mem bytes
-        0xda => .mem_reserved, // memory.fill: one reserved mem byte
+        0xda => .mem_reserved, // memory.fill: a memory index (multi-memory). Kept
+        // a distinct kind (not `.mem_index`) so the raw synthetic-tag byte 0xDA is
+        // still rejected by the decoder; the assembler emits the index for it.
         0x28...0x3e => .mem,
         0x3f, 0x40 => .mem_index, // memory.size / memory.grow — a memory index
         0x41 => .i32c,

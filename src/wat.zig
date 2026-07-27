@@ -218,16 +218,16 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     var import_order: List(ImportTag) = .empty;
     var global_names: List(?[]const u8) = .empty;
     var func_imports: List(ImportedFunc) = .empty;
-    var mem_min: ?u32 = null;
-    var mem_max: ?u32 = null;
-    // The memory's `$name`, if it declared one. Memories are the only index
-    // space with no name table (the assembler models a single memory), which
-    // made `(export "mem" (memory $m))` a hard `UnknownIdentifier` — even though
-    // index 0 is the only answer it could possibly have. Since `(memory $m 1)`
-    // is *accepted* at declaration, the pair looked supported and then failed,
-    // and binaryen emits exactly that pair. Recording the one name is enough to
-    // resolve it while still rejecting a name that was never declared.
-    var mem_name: ?[]const u8 = null;
+    // Defined memories (multi-memory). Each `(memory …)` appends here; the memory
+    // section emits them in order. Imported memories take the low indices, so
+    // `mem_names` (below) spans BOTH — imports first, definitions after.
+    var memories: List(struct { min: u32, max: ?u32 }) = .empty;
+    // Memory names, index-aligned with the memory INDEX space (imported memories
+    // first, then defined). Lets a `$name` resolve everywhere it can appear:
+    // `(export "m" (memory $x))`, `(i32.load $x …)`, `memory.size $x`,
+    // `(data (memory $x) …)`. Before multi-memory this was a single optional name
+    // and any index but 0 was refused.
+    var mem_names: List(?[]const u8) = .empty;
     var start_ref: ?Sexpr = null;
 
     const start: usize = if (module.len > 1 and isId(module[1])) 2 else 1; // skip optional module $name
@@ -331,12 +331,15 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             try tag_names.append(a, nm);
         } else if (std.mem.eql(u8, kw, "memory")) {
             var mi: usize = 1;
+            var this_name: ?[]const u8 = null;
             if (mi < items.len and isId(items[mi])) {
-                mem_name = items[mi].asAtom(); // so `(export … (memory $m))` resolves
+                this_name = items[mi].asAtom();
                 mi += 1;
             }
+            // This memory's index in the index space (imports precede defs).
+            const midx: u32 = @intCast(mem_names.items.len);
             while (mi < items.len and eqKw(items[mi], "export")) : (mi += 1)
-                try exports.append(a, .{ .name = try fieldStr(items[mi], 1), .kind = 2, .index = 0 });
+                try exports.append(a, .{ .name = try fieldStr(items[mi], 1), .kind = 2, .index = midx });
             if (mi < items.len and eqKw(items[mi], "import")) {
                 // (memory (export …)* (import "m" "n") min max?)
                 const imp = (try wantList(items[mi]));
@@ -346,37 +349,31 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 try mem_imports.append(a, .{ .module = (try strAt(imp, 1)), .name = (try strAt(imp, 2)), .min = mmin, .max = mmax });
             } else if (mi < items.len and eqKw(items[mi], "data")) {
                 // (memory (data "…")) — size the memory to the bytes and append an
-                // active data segment at offset 0.
+                // active data segment at offset 0 targeting THIS memory.
                 var bytes: List(u8) = .empty;
                 for ((try wantList(items[mi]))[1..]) |it| switch (it) {
                     .string => |sbytes| try bytes.appendSlice(a, sbytes),
                     else => {},
                 };
                 const pages: u32 = @intCast((bytes.items.len + 65535) / 65536);
-                mem_min = pages;
-                mem_max = pages;
+                try memories.append(a, .{ .min = pages, .max = pages });
                 const off = try a.alloc(Sexpr, 2);
                 off[0] = .{ .atom = "i32.const" };
                 off[1] = .{ .atom = "0" };
                 // Keep `data_names` index-aligned with `datas`: this inline
                 // `(memory (data …))` form has no `$id` of its own.
                 try data_names.append(a, null);
-                try datas.append(a, .{ .mem_index = 0, .offset_form = .{ .list = off }, .bytes = bytes.items });
+                try datas.append(a, .{ .mem_index = midx, .offset_form = .{ .list = off }, .bytes = bytes.items });
             } else {
-                // `mem_min`/`mem_max` are a SINGLE memory, so a second
-                // `(memory …)` used to overwrite the first — `(memory 1)(memory 3)`
-                // silently assembled as one 3-page memory and every `memory.*`
-                // and data segment collapsed onto index 0. Multi-memory decodes
-                // and executes (Phase 7); only the text syntax is unimplemented,
-                // and "deferred" must not mean "emits wrong bytes".
-                if (mem_min != null) return error.UnsupportedInstr;
-                mem_min = try parseIndex(try nth(items, mi));
-                if (mi + 1 < items.len) mem_max = try parseIndex(items[mi + 1]);
+                const mmin = try parseIndex(try nth(items, mi));
+                const mmax: ?u32 = if (mi + 1 < items.len) try parseIndex(items[mi + 1]) else null;
+                try memories.append(a, .{ .min = mmin, .max = mmax });
             }
+            try mem_names.append(a, this_name);
         } else if (std.mem.eql(u8, kw, "data")) {
             // (data $id? (memory idx)? offset-expr? "bytes"…) — active when an
-            // offset is present, else passive. Only memory 0 is supported, so a
-            // `(memory …)` prefix is parsed but folds to index 0.
+            // offset is present, else passive. A `(memory idx)` prefix targets a
+            // specific memory (multi-memory).
             var di: usize = 1;
             var dname: ?[]const u8 = null;
             if (di < items.len and isId(items[di])) {
@@ -384,8 +381,12 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 di += 1; // $id
             }
             try data_names.append(a, dname);
+            var seg_mem: u32 = 0;
             if (di < items.len) if (items[di].asList()) |l| {
-                if (l.len >= 1 and eqAtom(l[0], "memory")) di += 1; // (memory idx) — single memory
+                if (l.len >= 2 and eqAtom(l[0], "memory")) {
+                    seg_mem = try resolveByName(mem_names.items, l[1]);
+                    di += 1;
+                }
             };
             // The offset is any leading list (`(offset …)` or a folded const-expr
             // like `(i32.const N)` / `(global.get $g)` — even a malformed one, so
@@ -401,7 +402,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 .string => |sbytes| try bytes.appendSlice(a, sbytes),
                 else => {},
             };
-            try datas.append(a, .{ .mem_index = 0, .offset_form = offset_form, .bytes = bytes.items });
+            try datas.append(a, .{ .mem_index = seg_mem, .offset_form = offset_form, .bytes = bytes.items });
         } else if (std.mem.eql(u8, kw, "table")) {
             // Inline import `(table $id? (export …)* (import "m" "n") min max? reftype)`
             // is handled here; a defined table goes to `parseTable`.
@@ -460,13 +461,18 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 try table_imports.append(a, .{ .module = (try strAt(items, 1)), .name = (try strAt(items, 2)), .min = tmin, .max = tmax, .elem = try parseValType(try nth(desc, ti), type_names.items) });
                 try table_names.append(a, tname);
             } else if (std.mem.eql(u8, dkw, "memory")) {
-                // (import "m" "n" (memory $id? min max?)) — the single memory 0.
+                // (import "m" "n" (memory $id? min max?)) — takes a memory index.
                 var mi2: usize = 1;
-                if (mi2 < desc.len and isId(desc[mi2])) mi2 += 1;
+                var mname: ?[]const u8 = null;
+                if (mi2 < desc.len and isId(desc[mi2])) {
+                    mname = desc[mi2].atom;
+                    mi2 += 1;
+                }
                 const mmin = try parseIndex(try nth(desc, mi2));
                 mi2 += 1;
                 const mmax: ?u32 = if (mi2 < desc.len) try parseIndex(desc[mi2]) else null;
                 try mem_imports.append(a, .{ .module = (try strAt(items, 1)), .name = (try strAt(items, 2)), .min = mmin, .max = mmax });
+                try mem_names.append(a, mname);
             } else {
                 try parseImport(a, items, &global_imports, &global_names, type_names.items); // global
             }
@@ -502,27 +508,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         const idx: u32 = switch (kind) {
             0 => try resolveByName(func_names.items, try nth(target, 1)),
             1 => try resolveByName(table_names.items, try nth(target, 1)),
-            // The assembler models a SINGLE memory, so 0 is the only valid index
-            // — but this used to return 0 without looking at the target at all,
-            // so `(export "m" (memory $doesnotexist))` and `(memory 7)` both
-            // silently exported memory 0. That is the canonical "unresolved
-            // `$name` became index 0" bug; every other kind goes through
-            // `resolveByName`, which reports `UnknownIdentifier`.
-            2 => blk: {
-                const t = try nth(target, 1);
-                const at = try wantAtom(t);
-                if (at.len != 0 and at[0] == '$') {
-                    // Single memory, so the only resolvable name is the one the
-                    // `(memory $m …)` declared — but it must MATCH, or an
-                    // undeclared name would silently become index 0, which is the
-                    // bug this arm exists to prevent.
-                    const declared = mem_name orelse return error.UnknownIdentifier;
-                    if (!std.mem.eql(u8, declared, at)) return error.UnknownIdentifier;
-                    break :blk 0;
-                }
-                if (try parseIndex(t) != 0) return error.UnsupportedInstr; // multi-memory: not assembled
-                break :blk 0;
-            },
+            2 => try resolveByName(mem_names.items, try nth(target, 1)),
             3 => try resolveByName(global_names.items, try nth(target, 1)),
             4 => try resolveByName(tag_names.items, try nth(target, 1)),
             else => unreachable,
@@ -559,7 +545,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     }
 
     var bodies: List([]const u8) = .empty;
-    for (funcs.items) |f| try bodies.append(a, try encodeBody(a, f, func_names.items, &sigs, type_names.items, global_names.items, table_names.items, elem_names.items, tag_names.items, data_names.items, mem_name, gc_field_names.items));
+    for (funcs.items) |f| try bodies.append(a, try encodeBody(a, f, func_names.items, &sigs, type_names.items, global_names.items, table_names.items, elem_names.items, tag_names.items, data_names.items, mem_names.items, gc_field_names.items));
 
     // Pre-encode every const-expr-bearing section (global inits, element and data
     // exprs/offsets) BEFORE the type section, mirroring the function-body path, so
@@ -671,12 +657,12 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         }
         try emitSection(a, &out, 4, s.items);
     }
-    // Memory section (5) — a *defined* memory only (an imported one lives in the
-    // import section).
-    if (mem_min) |mn| {
+    // Memory section (5) — the *defined* memories only (imported ones live in
+    // the import section). Multi-memory: a vector of limits.
+    if (memories.items.len != 0) {
         var s: List(u8) = .empty;
-        try uleb(a, &s, 1);
-        try emitLimits(a, &s, mn, mem_max);
+        try uleb(a, &s, memories.items.len);
+        for (memories.items) |m| try emitLimits(a, &s, m.min, m.max);
         try emitSection(a, &out, 5, s.items);
     }
     // Tag section (13) — exception tags. Ordered after memory (5) and before
@@ -789,8 +775,13 @@ fn encodeDataSection(a: std.mem.Allocator, datas: []const DataSeg, sigs: *List(S
     for (datas) |seg| {
         if (seg.offset_form == null) {
             try s.append(a, 0x01); // passive
-        } else {
+        } else if (seg.mem_index == 0) {
             try s.append(a, 0x00); // active, memory 0
+            try emitOffsetExpr(a, &s, sigs, type_names, global_names, func_names, seg.offset_form);
+        } else {
+            // active, explicit memory index (multi-memory)
+            try s.append(a, 0x02);
+            try uleb(a, &s, seg.mem_index);
             try emitOffsetExpr(a, &s, sigs, type_names, global_names, func_names, seg.offset_form);
         }
         try uleb(a, &s, seg.bytes.len);
@@ -1350,9 +1341,9 @@ const Ctx = struct {
     /// Data-segment names (index-aligned with the data index space), for
     /// resolving `$d` in `memory.init` / `data.drop`.
     data_names: []const ?[]const u8 = &.{},
-    /// The single memory's `$name`, if declared — the memory index space has no
-    /// name table because there is only ever one entry in it.
-    mem_name: ?[]const u8 = null,
+    /// Memory names (index-aligned with the memory index space, imports first),
+    /// for resolving `$m` in a memarg (`i32.load $m …`) and `memory.*` ops.
+    mem_names: []const ?[]const u8 = &.{},
     /// Per-type struct field names (indexed by type index; each entry aligned
     /// with that struct's fields), for resolving `struct.get $T $field` by name.
     field_names: []const []const ?[]const u8 = &.{},
@@ -1361,7 +1352,7 @@ const Ctx = struct {
     labels: List(?[]const u8) = .empty,
 };
 
-fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, table_names: []const ?[]const u8, elem_names: []const ?[]const u8, tag_names: []const ?[]const u8, data_names: []const ?[]const u8, mem_name: ?[]const u8, field_names: []const []const ?[]const u8) Error![]const u8 {
+fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, table_names: []const ?[]const u8, elem_names: []const ?[]const u8, tag_names: []const ?[]const u8, data_names: []const ?[]const u8, mem_names: []const ?[]const u8, field_names: []const []const ?[]const u8) Error![]const u8 {
     var body: List(u8) = .empty;
     // Locals vector: one (count=1, type) group per declared local.
     try uleb(a, &body, f.locals.items.len);
@@ -1369,7 +1360,7 @@ fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, si
         try uleb(a, &body, 1);
         try emitValType(a, &body, t);
     }
-    var ctx: Ctx = .{ .a = a, .out = &body, .local_names = f.local_names.items, .func_names = func_names, .sigs = sigs, .type_names = type_names, .global_names = global_names, .table_names = table_names, .elem_names = elem_names, .tag_names = tag_names, .data_names = data_names, .mem_name = mem_name, .field_names = field_names };
+    var ctx: Ctx = .{ .a = a, .out = &body, .local_names = f.local_names.items, .func_names = func_names, .sigs = sigs, .type_names = type_names, .global_names = global_names, .table_names = table_names, .elem_names = elem_names, .tag_names = tag_names, .data_names = data_names, .mem_names = mem_names, .field_names = field_names };
     try emitSeq(&ctx, f.body);
     try body.append(a, @intFromEnum(Op.end)); // implicit function end
     return body.items;
@@ -1777,10 +1768,23 @@ fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Erro
             var buf: [4]Sexpr = undefined;
             var n: usize = 0;
             var j = i + 1;
-            if (opcode.immediateKind(op) == .mem) {
+            const kind = opcode.immediateKind(op);
+            if (kind == .mem) {
+                // memarg: an optional leading memory index (multi-memory), then
+                // `offset=`/`align=` atoms in any order.
                 while (j < items.len and n < buf.len) : (j += 1) {
                     const atom = items[j].asAtom() orelse break;
-                    if (!std.mem.startsWith(u8, atom, "offset=") and !std.mem.startsWith(u8, atom, "align=")) break;
+                    const is_memarg = std.mem.startsWith(u8, atom, "offset=") or std.mem.startsWith(u8, atom, "align=");
+                    const is_memidx = n == 0 and isIndexAtom(items[j]);
+                    if (!is_memarg and !is_memidx) break;
+                    buf[n] = items[j];
+                    n += 1;
+                }
+            } else if (kind == .mem_index or kind == .mem_reserved or kind == .data_init or kind == .mem_copy) {
+                // Optional memory index(es) — `memory.size/grow/fill $m`,
+                // `memory.copy $dst $src`, `memory.init $mem $data`. Collect every
+                // leading index atom; `emitInstr` interprets them by count.
+                while (j < items.len and n < buf.len and isIndexAtom(items[j])) : (j += 1) {
                     buf[n] = items[j];
                     n += 1;
                 }
@@ -2000,38 +2004,33 @@ fn emitInstr(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
         .f32c => try floatBits(ctx, u32, try imm0(immediates)),
         .f64c => try floatBits(ctx, u64, try imm0(immediates)),
         .mem => try emitMemArg(ctx, op, immediates),
-        .mem_reserved => try ctx.out.append(ctx.a, 0x00),
-        // `memory.size`/`memory.grow`: a single memory index, 0 in single-memory.
-        // The operand used to be emitted as 0 WITHOUT BEING LOOKED AT, so
-        // `(memory.size 7)`, `(memory.fill 7 …)` and even `(memory.size $nope)`
-        // all assembled, validated and ran against memory 0. Every other index
-        // space reports `UnknownIdentifier` for an unknown `$name`; this was the
-        // sole silent acceptor, and a live trap for the multi-memory text support
-        // the header defers. Check it now, and fail loudly when it isn't 0.
-        .mem_index => {
-            if (immediates.len != 0) {
-                const t = immediates[0];
-                if (t.asAtom()) |at| {
-                    if (at.len != 0 and at[0] == '$') {
-                        const declared = ctx.mem_name orelse return error.UnknownIdentifier;
-                        if (!std.mem.eql(u8, declared, at)) return error.UnknownIdentifier;
-                    } else if (try parseIndex(t) != 0) {
-                        return error.UnsupportedInstr; // multi-memory: not assembled
-                    }
-                }
-            }
-            try ctx.out.append(ctx.a, 0x00);
-        },
-        // Bulk memory: a data index (+ reserved memory index bytes, always 0).
-        // `resolveByName`, not `parseIndex`: data was the only index space whose
-        // operand was numeric-only, so `data.drop $d` / `memory.init $d` failed
-        // with `BadImmediate` while `elem.drop $e` / `table.init $e` resolved.
+        // memory.fill: an optional memory index (multi-memory), default 0.
+        .mem_reserved => try uleb(ctx.a, ctx.out, try memOperand(ctx, immediates, 0)),
+        // `memory.size`/`memory.grow`/`memory.fill`: an optional memory index
+        // (multi-memory), default 0. Resolved via `mem_names`, so a `$name` or a
+        // real index works and an unknown one is `UnknownIdentifier`.
+        .mem_index => try uleb(ctx.a, ctx.out, try memOperand(ctx, immediates, 0)),
+        // Bulk memory: a data index (+ a memory index). `resolveByName`, not
+        // `parseIndex`: data was the only index space whose operand was
+        // numeric-only, so `data.drop $d` / `memory.init $d` failed with
+        // `BadImmediate` while `elem.drop $e` / `table.init $e` resolved.
         .data => try uleb(ctx.a, ctx.out, try resolveByName(ctx.data_names, try imm0(immediates))),
+        // `memory.init <memidx>? <dataidx>`: two immediates = [mem, data]; one =
+        // [data], mem 0. The binary is data index then memory index.
         .data_init => {
-            try uleb(ctx.a, ctx.out, try resolveByName(ctx.data_names, try imm0(immediates)));
-            try ctx.out.append(ctx.a, 0x00); // reserved memory index
+            if (immediates.len >= 2) {
+                try uleb(ctx.a, ctx.out, try resolveByName(ctx.data_names, immediates[1]));
+                try uleb(ctx.a, ctx.out, try resolveByName(ctx.mem_names, immediates[0]));
+            } else {
+                try uleb(ctx.a, ctx.out, try resolveByName(ctx.data_names, try imm0(immediates)));
+                try ctx.out.append(ctx.a, 0x00); // memory 0
+            }
         },
-        .mem_copy => try ctx.out.appendSlice(ctx.a, &.{ 0x00, 0x00 }), // reserved dst, src
+        // `memory.copy <dstmem>? <srcmem>?`: dst then src, each default 0.
+        .mem_copy => {
+            try uleb(ctx.a, ctx.out, try memOperand(ctx, immediates, 0));
+            try uleb(ctx.a, ctx.out, try memOperand(ctx, immediates, 1));
+        },
         // ref.null takes a heap type as an `s33`: an abstract head code, or a
         // concrete `$t` / index (so `ref.null $t` is typed `(ref null $t)`).
         .ref_type => {
@@ -2084,29 +2083,45 @@ fn resolveLabel(ctx: *Ctx, s: Sexpr) Error!u32 {
 fn emitMemArg(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
     var offset: u64 = 0;
     var align_log2: u32 = opcode.naturalAlignLog2(op);
+    var mem_idx: u32 = 0;
     for (immediates) |imm| {
         // A non-atom here is an operand sub-expression in the folded form, not a
-        // memarg — skip those. But an ATOM that is neither `offset=` nor `align=`
-        // is a typo, and ignoring it silently loaded the wrong address:
-        // `(i32.load offest=4 (i32.const 0))` read offset 0. The flat path is
-        // safe by construction (it stops at the first non-memarg atom and
-        // `lookupOp` then fails); the folded path harvests every leading atom as
-        // an immediate, so it needs the check here — the asymmetry WAS the bug.
+        // memarg — skip those. An ATOM is either `offset=`/`align=`, or (once) a
+        // leading memory index (multi-memory). A typo must not be ignored: it
+        // silently loaded the wrong address — `(i32.load offest=4 (i32.const 0))`
+        // read offset 0 — so anything else is `BadImmediate`.
         const atom = imm.asAtom() orelse continue;
         if (std.mem.startsWith(u8, atom, "offset=")) {
             offset = std.fmt.parseInt(u64, atom[7..], 0) catch return error.BadImmediate;
-        } else if (!std.mem.startsWith(u8, atom, "align=")) {
-            return error.BadImmediate;
         } else if (std.mem.startsWith(u8, atom, "align=")) {
             const bytes = std.fmt.parseInt(u32, atom[6..], 0) catch return error.BadImmediate;
             // Alignment must be a non-zero power of two (§6.5.8); otherwise
             // `@ctz` would silently encode a bogus log2 (e.g. align=3 → 0).
             if (bytes == 0 or (bytes & (bytes - 1)) != 0) return error.BadImmediate;
             align_log2 = @ctz(bytes);
+        } else if (isIndexAtom(imm)) {
+            mem_idx = try resolveByName(ctx.mem_names, imm); // explicit memory index
+        } else {
+            return error.BadImmediate;
         }
     }
-    try uleb(ctx.a, ctx.out, align_log2);
+    // Multi-memory: bit 6 of the alignment flags an explicit memory index that
+    // follows (before the offset). Natural alignment is ≤ 4, so bit 6 is free.
+    if (mem_idx != 0) {
+        try uleb(ctx.a, ctx.out, align_log2 | 0x40);
+        try uleb(ctx.a, ctx.out, mem_idx);
+    } else {
+        try uleb(ctx.a, ctx.out, align_log2);
+    }
     try uleb(ctx.a, ctx.out, offset);
+}
+
+/// Resolve the memory index at `immediates[idx]` (a `$name` or numeric index)
+/// against the memory name table, or 0 if that operand is absent — the
+/// multi-memory default for `memory.size`/`grow`/`fill`/`copy`.
+fn memOperand(ctx: *Ctx, immediates: []const Sexpr, idx: usize) Error!u32 {
+    if (idx >= immediates.len) return 0;
+    return resolveByName(ctx.mem_names, immediates[idx]);
 }
 
 /// The first immediate of an instruction, or `BadImmediate` if it has none.
@@ -3333,6 +3348,95 @@ test "dispatches call_indirect through distinct named tables" {
     try std.testing.expectEqual(@as(i32, 2), interp.asI32(try assembleAndRun(src, "via1", &.{})));
 }
 
+test "multi-memory: loads/stores/fill/copy/init/size/grow target the right memory" {
+    // A self-contained two-memory module. Each op names its memory by identifier;
+    // the assembler emits the bit-6 memarg form and the per-op memory indices.
+    // Values cross-checked against wasmtime (`-W multi-memory=y`).
+
+    // Distinct store/load per memory: 11 into $a, 22 into $b, summed = 33.
+    const store_load =
+        \\(module
+        \\  (memory $a 1) (memory $b 1)
+        \\  (func (export "t") (result i32)
+        \\    (i32.store $a (i32.const 0) (i32.const 11))
+        \\    (i32.store $b (i32.const 0) (i32.const 22))
+        \\    (i32.add (i32.load $a (i32.const 0)) (i32.load $b (i32.const 0)))))
+    ;
+    try std.testing.expectEqual(@as(i32, 33), interp.asI32(try assembleAndRun(store_load, "t", &.{})));
+
+    // memory.fill on $b (index 1) must not touch $a: fill two 0x02 bytes at
+    // offset 1 in $b, read them back (0x0202 = 514); $a stays 0.
+    const fill =
+        \\(module
+        \\  (memory $a 1) (memory $b 1)
+        \\  (func (export "fb") (result i32)
+        \\    (memory.fill $b (i32.const 1) (i32.const 0x02) (i32.const 2))
+        \\    (i32.load16_u $b (i32.const 1)))
+        \\  (func (export "ca") (result i32) (i32.load16_u $a (i32.const 1))))
+    ;
+    try std.testing.expectEqual(@as(i32, 514), interp.asI32(try assembleAndRun(fill, "fb", &.{})));
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(fill, "ca", &.{})));
+
+    // memory.copy from $a to $b: write 0xAB55 into $a, copy 2 bytes $a->$b, read $b.
+    const copy =
+        \\(module
+        \\  (memory $a 1) (memory $b 1)
+        \\  (func (export "c") (result i32)
+        \\    (i32.store16 $a (i32.const 4) (i32.const 0xAB55))
+        \\    (memory.copy $b $a (i32.const 8) (i32.const 4) (i32.const 2))
+        \\    (i32.load16_u $b (i32.const 8))))
+    ;
+    try std.testing.expectEqual(@as(i32, 0xAB55), interp.asI32(try assembleAndRun(copy, "c", &.{})));
+
+    // memory.init $mem $data into $b from a passive segment; read it back.
+    const init =
+        \\(module
+        \\  (memory $a 1) (memory $b 1)
+        \\  (data $d "\09\08\07\06")
+        \\  (func (export "i") (result i32)
+        \\    (memory.init $b $d (i32.const 0) (i32.const 0) (i32.const 4))
+        \\    (i32.load8_u $b (i32.const 2))))
+    ;
+    try std.testing.expectEqual(@as(i32, 7), interp.asI32(try assembleAndRun(init, "i", &.{})));
+
+    // memory.size / memory.grow per memory: $b starts at 3 pages; grow $b by 2.
+    const size =
+        \\(module
+        \\  (memory $a 1) (memory $b 3)
+        \\  (func (export "sa") (result i32) (memory.size $a))
+        \\  (func (export "grow_and_size") (result i32)
+        \\    (drop (memory.grow $b (i32.const 2)))
+        \\    (memory.size $b)))
+    ;
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(size, "sa", &.{})));
+    try std.testing.expectEqual(@as(i32, 5), interp.asI32(try assembleAndRun(size, "grow_and_size", &.{})));
+}
+
+test "multi-memory: active data segments target their declared memory" {
+    // Two active data segments: one into $a, one into $b at offset 0. Each
+    // memory reads back only its own bytes.
+    const src =
+        \\(module
+        \\  (memory $a 1) (memory $b 1)
+        \\  (data (memory $a) (i32.const 0) "\aa")
+        \\  (data (memory $b) (i32.const 0) "\bb")
+        \\  (func (export "ra") (result i32) (i32.load8_u $a (i32.const 0)))
+        \\  (func (export "rb") (result i32) (i32.load8_u $b (i32.const 0))))
+    ;
+    try std.testing.expectEqual(@as(i32, 0xaa), interp.asI32(try assembleAndRun(src, "ra", &.{})));
+    try std.testing.expectEqual(@as(i32, 0xbb), interp.asI32(try assembleAndRun(src, "rb", &.{})));
+}
+
+test "multi-memory: assembles byte-identically to the single-memory form for memory 0" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // A load naming memory 0 explicitly must emit the same bytes as the implicit
+    // form — bit 6 is only set for a non-zero memory index.
+    const explicit = try assemble(a, "(module (memory 1) (func (result i32) (i32.load 0 (i32.const 0))))");
+    const implicit = try assemble(a, "(module (memory 1) (func (result i32) (i32.load (i32.const 0))))");
+    try std.testing.expectEqualSlices(u8, implicit, explicit);
+}
 test "anyfunc is accepted as the pre-standard spelling of funcref" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4176,11 +4280,19 @@ test "assembler index-space gaps closed (13th pass)" {
     }
 
     // (6) The memory-index immediate was emitted as 0 WITHOUT being read, so
-    // `(memory.size 7)` and even `(memory.size $nope)` assembled and ran against
-    // memory 0 — the sole silent acceptor among the index spaces.
+    // `(memory.size $nope)` assembled and ran against memory 0. It now resolves
+    // via the memory name table (multi-memory), so a `$name` or real index works
+    // and an unknown name is `UnknownIdentifier`.
     _ = try assemble(a, "(module (memory $m 1) (func (result i32) (memory.size $m)))");
     try std.testing.expectError(error.UnknownIdentifier, assemble(a, "(module (memory $m 1) (func (result i32) (memory.size $nope)))"));
-    try std.testing.expectError(error.UnsupportedInstr, assemble(a, "(module (memory $m 1) (func (result i32) (memory.size 7)))"));
+    // `(memory.size 7)` is now a well-formed memory index (multi-memory is
+    // supported), so it assembles; a module with only one memory then fails
+    // VALIDATION on the out-of-range index rather than at assembly.
+    {
+        const bin = try assemble(a, "(module (memory $m 1) (func (result i32) (memory.size 7)))");
+        var m = try Module.decode(a, bin);
+        try std.testing.expectError(error.MissingMemory, validate(a, &m));
+    }
 }
 
 test "legacy folded try assembles, validates, and runs (catch + catch_all + rethrow)" {
