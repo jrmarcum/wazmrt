@@ -278,9 +278,19 @@ executing the result (values cross-checked vs wasmtime where a live oracle exist
 
 Net of closing the deferred list: full main testsuite 60,310 → **60,668 passed / 608 → 569 failed** (the
 delta is these changes; no regression), memory64 dir unchanged at 601/1. +4 regression tests; **483 local
-tests green under Debug AND ReleaseSafe; c-smoke 319/319. Every wasm proposal wazmrt targets now has
-complete text-assembly support** — `tag` imports remain the one known assembler gap (a separate feature,
-not memory64-related).
+tests green under Debug AND ReleaseSafe; c-smoke 319/319.**
+
+**Then the last assembler gap — `tag` imports — was closed (`49e5284`).** The WAT assembler now emits
+imported exception tags in both abbreviations: `(import "m" "n" (tag $id? (param …)*|(type $t)))` and the
+inline `(tag $id? (import "m" "n") (param …)*)`. Tag imports already worked at the binary/runtime level
+since Phase 6.2; only the text form was missing. `ImportedTag`/`tag_imports` mirror the memory-import
+pattern (imported tags take the low tag indices, `tag_names` spans both, `tag_types` stays defined-only);
+the import section emits kind 0x04 + attr 0x00 + type index in source order (`import_order` now 5-wide);
+`parseTagType` is the shared descriptor parser. Verified by executing both forms (throw the imported tag,
+catch by its index-0 identity → 42; the two forms are byte-identical) and cross-checked against wasmtime
+`wast` (cross-module tag import → 42). +2 tests; **485 local tests green (Debug + ReleaseSafe); c-smoke
+319/319; full main testsuite 60,668 → 60,670 passed.** **The WAT assembler now has NO remaining known
+gaps** — every construct across every proposal wazmrt targets has text-assembly support.
 
 ## Code audit 2026-07-19 ("look for code issues") — 8 fixed, a few deferred
 

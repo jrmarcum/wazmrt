@@ -29,10 +29,12 @@ were memory64-blind** (i32 address hard-coded in validator + interp), a dead `ma
 wrapping `\u{…}` escape. Then all four audit-**deferred** items were closed (`e276d09`), all `wat.zig`:
 **multi-memory SIMD text** (`v128.load8_lane $m …` → SIMD suite 24,956/0), the **canonical index-type
 ordering** (`(memory (export "m") i64 1)`), a **de-duplicated limits parser** (`parseMemLimits`), and
-**`uleb` widened to u64**. **Every wasm proposal now has complete text-assembly support**; the one
-remaining assembler gap is **`tag` imports** (the text form — tag imports already work at the
-binary/runtime level since Phase 6.2). Full main testsuite 60,310 → **60,668 passed**; **483 local tests
-green (Debug + ReleaseSafe)**.
+**`uleb` widened to u64**. Full main testsuite 60,310 → **60,668 passed**; 483 local tests green. **Then the
+last assembler gap — `tag` imports (the text form; they already worked at the binary/runtime level since
+Phase 6.2) — was closed (`49e5284`):** both `(import … (tag …))` and inline `(tag (import …) …)` emit,
+verified by executing both forms (→ 42) and cross-checked vs wasmtime `wast`. **The WAT assembler now has
+NO remaining known gaps** — every construct across every proposal wazmrt targets has text-assembly support.
+485 local tests green (Debug + ReleaseSafe); c-smoke 319/319; full main testsuite 60,670 passed.
 
 **Latest (2026-07-22) — the "open items 1–7" batch.** After the 13th pass the remaining list was walked
 end to end (see `known-issues.md` for the per-item detail). Six real fixes, each verified by executing the

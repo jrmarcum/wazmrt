@@ -69,9 +69,13 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
   form; SIMD suite 24,956/0), and a memory's `i64`/`i32` index type is accepted in its canonical position
   after the inline export/import clauses (not only right after the name). One `parseMemLimits` helper now
   backs all three memory-declaration sites; `emitMemArgBytes`/`simdLaneByte` are the single homes for the
-  memarg encoding and the SIMD lane byte. **Every wasm proposal wazmrt targets now has text-assembly
-  support. Still deferred in wat.zig:** `tag` imports — the last remaining assembler gap (a separate
-  feature, not proposal-related).
+  memarg encoding and the SIMD lane byte. **Tag imports DONE 2026-07-27** (the last assembler gap):
+  `(import "m" "n" (tag $id? (param …)*|(type $t)))` and the inline `(tag $id? (import "m" "n") (param …)*)`
+  both emit — `ImportedTag`/`tag_imports` mirror the memory-import pattern (imported tags take the low tag
+  indices; `tag_names` spans both; `tag_types` stays defined-only), kind 0x04 + attribute 0x00 + type index,
+  in source order via `import_order`; `parseTagType` is the shared descriptor parser. Cross-checked vs
+  wasmtime `wast` (cross-module tag import → 42). **The WAT assembler now has NO remaining known gaps** —
+  every construct across every proposal wazmrt targets has text-assembly support.
 - **`src/wast.zig`** (DONE 2026-07-02, extended 2026-07-09) — WAST script runner: `(module …)` text +
   `(module binary …)`, `assert_return`, **`assert_trap` (genuine runtime traps only — `isRuntimeTrap`),
   `assert_exhaustion`, `assert_invalid`/`assert_malformed` (the inner module must be rejected)**,
