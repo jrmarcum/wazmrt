@@ -623,7 +623,7 @@ pub fn immediateKind(op: Op) ImmKind {
 /// Decode a block type (§5.3.6): an s33 — negative values encode empty/valtype,
 /// non-negative values are a type index.
 fn readBlockType(r: *Reader) DecodeError!BlockType {
-    const v = try r.readVarI64();
+    const v = try r.readVarS33();
     if (v >= 0) {
         if (v > std.math.maxInt(u32)) return error.UnsupportedOpcode; // guard the @intCast
         return .{ .type_index = @intCast(v) };
@@ -889,7 +889,7 @@ fn readTryTable(r: *Reader, a: std.mem.Allocator) (DecodeError || std.mem.Alloca
 /// Read a heap type (§ GC binary format): a non-negative `s33` is a concrete
 /// type index; negative values are the abstract heap-type codes.
 pub fn readHeapType(r: *Reader) DecodeError!HeapType {
-    const v = try r.readVarI64(); // s33
+    const v = try r.readVarS33(); // s33
     if (v >= 0) {
         if (v > std.math.maxInt(u32)) return error.UnsupportedOpcode; // guard the @intCast
         return .{ .concrete = @intCast(v) };
@@ -1134,11 +1134,15 @@ test "decodes a br_table" {
     try std.testing.expectEqual(@as(u32, 2), instrs[0].imm.br_table.default);
 }
 
-test "rejects a block type index that overflows u32 (s33 @intCast guard)" {
-    // `block` (0x02) with a type-index s33 encoding 2^32 (> u32 max) — must be
-    // rejected before the @intCast, not panic.
+test "rejects a block type index outside the s33 range" {
+    // `block` (0x02) with an s33 whose bit 32 (0x10 in the 5th byte) is set but the
+    // higher bits don't sign-extend it — 2^32 is out of the s33 range [-2^32,2^32-1]
+    // (bit 32 is the sign). `readVarS33` rejects it as malformed, not a huge index.
     const body = [_]u8{ 0x02, 0x80, 0x80, 0x80, 0x80, 0x10 };
-    try std.testing.expectError(error.UnsupportedOpcode, decodeBody(std.testing.allocator, &body));
+    try std.testing.expectError(error.LebOverflow, decodeBody(std.testing.allocator, &body));
+    // An over-long (>5-byte) s33 encoding of a small index is also rejected.
+    const overlong = [_]u8{ 0x02, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00 };
+    try std.testing.expectError(error.LebOverflow, decodeBody(std.testing.allocator, &overlong));
 }
 
 test "#6: select_t rejects an invalid value-type byte at decode" {

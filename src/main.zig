@@ -252,6 +252,7 @@ fn printHelp(out: *Io.Writer, prog: []const u8) !void {
         \\  --env KEY=VALUE             set one environment variable for the guest
         \\  --max-memory <size>         linear-memory ceiling for a WASI command (default 1G; e.g. 512M, 2G)
         \\                              the default ceiling applies to every run mode
+        \\  --max-table-elems <count>   table-entry ceiling (default 128M; e.g. 1M, 100000)
         \\  --                          end wazmrt flags; the rest is the guest's argv
         \\
         \\VERIFICATION FLAGS (authenticity — see the pin DB / signatures)
@@ -517,7 +518,7 @@ fn defaultPinsPath() []const u8 {
 /// verification. This mirrors exactly the run `runWasi` consumes, so the two
 /// agree on where our flags stop and the guest's argv begins.
 fn flagRegion(rest: []const []const u8) []const []const u8 {
-    const two = [_][]const u8{ "--dir", "--ro-dir", "--env", "--verify", "--pins", "--max-memory" };
+    const two = [_][]const u8{ "--dir", "--ro-dir", "--env", "--verify", "--pins", "--max-memory", "--max-table-elems" };
     const one = [_][]const u8{ "--no-verify", "--yes" };
     var i: usize = 0;
     outer: while (i < rest.len) {
@@ -803,12 +804,21 @@ fn runWasi(
     //   --                          end of wazmrt flags; the rest is guest argv
     var environ: std.ArrayList([]const u8) = .empty;
     var max_memory: usize = interp.default_max_memory_bytes;
+    var max_table_elems: usize = interp.default_max_table_elems;
     var rest = wasi_args;
     flags: while (rest.len >= 1) {
         const flag = rest[0];
         if (std.mem.eql(u8, flag, "--max-memory") and rest.len >= 2) {
             max_memory = parseSize(rest[1]) orelse {
                 try out.print("error: --max-memory '{s}': expected a size like 512M or 2G\n", .{rest[1]});
+                return 1;
+            };
+            rest = rest[2..];
+            continue :flags;
+        }
+        if (std.mem.eql(u8, flag, "--max-table-elems") and rest.len >= 2) {
+            max_table_elems = parseSize(rest[1]) orelse {
+                try out.print("error: --max-table-elems '{s}': expected a count like 1M or 100000\n", .{rest[1]});
                 return 1;
             };
             rest = rest[2..];
@@ -870,7 +880,7 @@ fn runWasi(
             try funcs.append(arena, .{ .native_env = .{ .ctx = &wasi, .call = unresolvedImport } });
     }
 
-    var inst = try interp.Instance.initWithImports(arena, module, .{ .funcs = funcs.items, .max_memory_bytes = max_memory });
+    var inst = try interp.Instance.initWithImports(arena, module, .{ .funcs = funcs.items, .max_memory_bytes = max_memory, .max_table_elems = max_table_elems });
     defer inst.deinit();
     wasi.memory = inst.memory0(); // module memory now exists
 

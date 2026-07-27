@@ -1627,15 +1627,19 @@ export fn wasm_memory_data_size(m: ?*const Ref) usize {
 
 export fn wasm_memory_size(m: ?*const Ref) u32 {
     const r = m orelse return 0;
-    return @intCast((memObj(r) orelse return 0).bytes.len / wasm_page_size);
+    // Saturating: a memory64 memory can exceed a u32 page count this ABI can't
+    // express. Unreachable today (needs >256 TiB), but a `@intCast` would be UB.
+    return std.math.cast(u32, (memObj(r) orelse return 0).bytes.len / wasm_page_size) orelse std.math.maxInt(u32);
 }
 
 export fn wasm_memory_grow(m: ?*Ref, delta: u32) bool {
     const r = m orelse return false;
     const mem = memObj(r) orelse return false;
-    const old_pages: u32 = @intCast(mem.bytes.len / wasm_page_size);
+    const old_pages = std.math.cast(u32, mem.bytes.len / wasm_page_size) orelse return false;
     const new_pages = @as(u64, old_pages) + delta;
-    const max = mem.max orelse 0x1_0000; // wasm32: at most 65536 pages
+    // A memory64 memory with no declared max may exceed the 32-bit page count,
+    // so cap it at what a u32 page count allows rather than the 32-bit 65536.
+    const max = mem.max orelse (if (mem.is64) @as(u64, std.math.maxInt(u32)) else 0x1_0000);
     if (new_pages > max) return false;
     // Same allocator as whoever created these bytes — see `wasm_memory_new`.
     // `memObj` may return an *instance* memory owned by `interp`'s page
@@ -1650,8 +1654,8 @@ export fn wasm_memory_grow(m: ?*Ref, delta: u32) bool {
 export fn wasm_memory_type(m: ?*const Ref) ?*MemoryType {
     const r = m orelse return null;
     const mem = memObj(r) orelse return null;
-    const min: u32 = @intCast(mem.bytes.len / wasm_page_size);
-    const ext = makeExternType(.{ .memory = .{ .limits = .{ .min = min, .max = mem.max } } }) orelse return null;
+    const min = mem.bytes.len / wasm_page_size; // u64; limitsOf saturates for the C ABI
+    const ext = makeExternType(.{ .memory = .{ .limits = .{ .min = min, .max = mem.max, .is64 = mem.is64 } } }) orelse return null;
     return @ptrCast(@alignCast(ext));
 }
 

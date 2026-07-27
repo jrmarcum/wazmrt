@@ -140,6 +140,36 @@ pub fn readVarI64(self: *Reader) types.DecodeError!i64 {
     }
 }
 
+/// Read a signed LEB128 constrained to `s33` — the encoding of block types
+/// (§5.3.6) and heap types (GC). At most 5 bytes; value in [-2^32, 2^32-1].
+/// Unlike `readVarI64`, this rejects both over-long (>5-byte) encodings AND
+/// values outside the s33 range (`LebOverflow`) — bit 32 is the sign, so e.g.
+/// `0x80 0x80 0x80 0x80 0x10` (2^32) is out of range, not a positive index.
+pub fn readVarS33(self: *Reader) types.DecodeError!i64 {
+    var result: u64 = 0;
+    var shift: u6 = 0;
+    while (true) {
+        const byte = try self.readByte();
+        if (shift == 28) {
+            // 5th byte: payload bit 4 (0x10) is value bit 32 = the sign; the higher
+            // payload bits (0x60) must sign-extend it, and there is no 6th byte.
+            if (byte & 0x80 != 0) return error.LebOverflow;
+            const sign = byte & 0x10;
+            const hi = byte & 0x60;
+            if ((sign == 0 and hi != 0) or (sign != 0 and hi != 0x60)) return error.LebOverflow;
+            var r = result | (@as(u64, byte & 0x1f) << 28);
+            if (sign != 0) r |= ~@as(u64, 0) << 33; // sign-extend bit 32
+            return @bitCast(r);
+        }
+        result |= @as(u64, byte & 0x7f) << shift;
+        if (byte & 0x80 == 0) {
+            if ((byte & 0x40) != 0) result |= ~@as(u64, 0) << (shift + 7); // sign-extend
+            return @bitCast(result);
+        }
+        shift += 7;
+    }
+}
+
 /// Skip a LEB128-encoded integer, consuming bytes until the continuation bit
 /// clears. `max_bytes` bounds the encoding length (5 for a 32-bit LEB, 10 for a
 /// 64-bit LEB) so an over-long encoding is rejected as malformed, not spun on.

@@ -340,7 +340,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             const tag_index: u32 = @intCast(tag_names.items.len);
             for (tag_exports.items) |en|
                 try exports.append(a, .{ .name = en, .kind = 4, .index = tag_index });
-            const tag_sig = type_ref orelse try internSig(a, &sigs, params.items, results.items);
+            const tag_sig = try resolveTagSig(a, &sigs, type_ref, params.items, results.items);
             // An imported tag goes to the import section (low indices); a defined
             // one to the tag section. `tag_names` spans both for `$e` resolution.
             if (import_mn) |im| {
@@ -2856,7 +2856,25 @@ fn parseTagType(a: std.mem.Allocator, items: []const Sexpr, start: usize, sigs: 
             try parseDecls(a, (try wantList(items[j])), &results, null, type_names);
         } else break;
     }
-    return type_ref orelse try internSig(a, sigs, params.items, results.items);
+    return resolveTagSig(a, sigs, type_ref, params.items, results.items);
+}
+
+/// Resolve a tag's signature from an optional `(type $t)` reference and inline
+/// params/results. When BOTH a type index and inline params/results are given,
+/// they must agree (§ typeuse — the inline form is a check); otherwise intern the
+/// inline signature. Shared by imported (`parseTagType`) and defined tags.
+fn resolveTagSig(a: std.mem.Allocator, sigs: *List(Sig), type_ref: ?u32, params: []const V, results: []const V) Error!u32 {
+    if (type_ref) |tr| {
+        // Guard the index — a malformed numeric type index is caught downstream at
+        // decode/validate; here we only cross-check when both forms are present.
+        if ((params.len != 0 or results.len != 0) and tr < sigs.items.len) {
+            const sig = sigs.items[tr];
+            if (!std.mem.eql(V, sig.params, params) or !std.mem.eql(V, sig.results, results))
+                return error.BadModuleField;
+        }
+        return tr;
+    }
+    return try internSig(a, sigs, params, results);
 }
 
 fn internSig(a: std.mem.Allocator, sigs: *List(Sig), params: []const V, results: []const V) Error!u32 {
@@ -4650,6 +4668,34 @@ test "EH wat: an imported tag (both forms) leads the tag space and is thrown + c
     defer arena.deinit();
     const a = arena.allocator();
     try std.testing.expect(std.mem.eql(u8, try assemble(a, top), try assemble(a, inline_form)));
+}
+
+test "a tag typeuse with inline params that disagree with (type $t) is rejected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // `(type $t)` and inline `(param …)` on the same tag must match (§ typeuse).
+    try std.testing.expectError(error.BadModuleField, assemble(a,
+        \\(module (type $t (func (param i32))) (tag $e (type $t) (param i64)))
+    ));
+    // Agreeing params are fine, and so is `(type $t)` alone.
+    _ = try assemble(a, "(module (type $t (func (param i32))) (tag $e (type $t) (param i32)))");
+    _ = try assemble(a, "(module (type $t (func (param i32))) (tag $e (type $t)))");
+}
+
+test "a defined table larger than the entry budget is refused at instantiation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // `(table 0xffffffff funcref)` would eagerly allocate ~32 GiB of Value slots;
+    // the per-instance entry budget refuses it cleanly instead. (Assembles and
+    // decodes fine — the ceiling is an instantiation-time resource limit.)
+    var m = try Module.decode(a, try assemble(a, "(module (table 0xffffffff funcref))"));
+    try std.testing.expectError(error.TableLimitExceeded, interp.Instance.init(a, &m));
+    // A modest table instantiates.
+    var ok = try Module.decode(a, try assemble(a, "(module (table 10 funcref))"));
+    var inst = try interp.Instance.init(a, &ok);
+    inst.deinit();
 }
 
 test "EH wat: catch_all catches and control resumes after the try_table" {

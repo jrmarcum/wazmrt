@@ -96,6 +96,15 @@ pub fn growGuestMemory(old: []u8, n: usize) error{OutOfMemory}![]u8 {
 /// `Imports.max_memory_bytes` (CLI: `--max-memory`).
 pub const default_max_memory_bytes: usize = 1 << 30;
 
+/// Cap on total defined-table entries per instance, applied at instantiation
+/// *and* `table.grow`. A table entry is a `Value` (8 bytes) allocated eagerly, so
+/// an unvalidated `min` — up to 2^32-1 — lets a ~7-byte module `(table 0xffffffff
+/// funcref)` demand ~32 GiB. Unlike linear memory, table storage is not lazy, so
+/// this bounds the eager allocation. 2^27 entries (~1 GiB of slots) is far above
+/// any realistic guest and matches the linear-memory budget in spirit. Summed
+/// across all DEFINED tables (imported tables are host-supplied, already sized).
+pub const default_max_table_elems: usize = 1 << 27;
+
 /// Cap on live GC objects per instance. There is no collector (a documented
 /// proposal-scope decision), so `struct.new`/`array.new` in a loop grows the
 /// heap for the whole instance lifetime — an unbounded host allocation driven
@@ -274,6 +283,10 @@ pub const Error = Module.Error || error{
     /// module can declare gigabytes, so the ceiling is what keeps a hostile
     /// input from exhausting address space. Raise it with `--max-memory`.
     MemoryLimitExceeded,
+    /// A defined table's entry count (at instantiation, or after a `table.grow`)
+    /// exceeds this instance's `max_table_elems` budget. Each entry is an eagerly
+    /// allocated `Value`, so a tiny module could otherwise demand tens of GiB.
+    TableLimitExceeded,
     /// The function section and the code section declared different counts. The
     /// validator also rejects this (`validate.CountMismatch`), but the CLI *run*
     /// path never validates, so instantiation must reject it itself — the two
@@ -440,6 +453,9 @@ pub const Instance = struct {
     /// Ceiling on total linear memory for this instance, carried so `memory.grow`
     /// enforces the same budget instantiation did.
     max_memory_bytes: usize,
+    /// Ceiling on total defined-table entries, carried so `table.grow` enforces the
+    /// same budget instantiation did.
+    max_table_elems: usize,
     /// Reference tables, one shared `*Table` per module table (imports first, so
     /// an imported table reflects the exporter's growth). The outer slice is
     /// `gpa`-owned; `tables[0..imported_tables]` are borrowed objects.
@@ -551,6 +567,9 @@ pub const Instance = struct {
         /// its memories and enforced again by `memory.grow`. See
         /// `default_max_memory_bytes`.
         max_memory_bytes: usize = default_max_memory_bytes,
+        /// Ceiling on total defined-table entries, summed over all defined tables
+        /// and enforced again by `table.grow`. See `default_max_table_elems`.
+        max_table_elems: usize = default_max_table_elems,
     };
 
     pub fn init(gpa: std.mem.Allocator, module: *const Module) Error!Instance {
@@ -857,11 +876,17 @@ pub const Instance = struct {
             gpa.free(t.entries);
             gpa.destroy(t);
         };
+        var total_table_elems: usize = 0;
         for (tables, module.tables, 0..) |*t, tt, k| {
             if (k < n_imported_tables) {
                 if (k >= imports.tables.len) return error.MissingImport;
                 t.* = imports.tables[k];
             } else {
+                // Budget the eager entry allocation across all defined tables — an
+                // unvalidated `min` up to 2^32-1 would otherwise demand tens of GiB.
+                const min_elems = std.math.cast(usize, tt.limits.min) orelse return error.TableLimitExceeded;
+                total_table_elems = std.math.add(usize, total_table_elems, min_elems) catch return error.TableLimitExceeded;
+                if (total_table_elems > imports.max_table_elems) return error.TableLimitExceeded;
                 const entries = try gpa.alloc(Value, tt.limits.min);
                 @memset(entries, null_ref);
                 // Mirror the memory branch above: `n_tables_init` hasn't been
@@ -938,6 +963,7 @@ pub const Instance = struct {
             .memories = memories,
             .imported_memories = imported_memories,
             .max_memory_bytes = imports.max_memory_bytes,
+            .max_table_elems = imports.max_table_elems,
             .tables = tables,
             .imported_tables = n_imported_tables,
             .elem_values = elem_values,
@@ -1986,7 +2012,10 @@ const Frame = struct {
                     const init_val = self.pop();
                     const old = tab.entries;
                     const new_len = @as(u64, old.len) + delta;
-                    const max = tab.max orelse std.math.maxInt(u32);
+                    // Refuse past the table's declared max AND the instance's entry
+                    // budget — a guest `table.grow` by ~2^32 would else realloc tens
+                    // of GiB (the runtime twin of the instantiation-time cap).
+                    const max = @min(@as(u64, tab.max orelse std.math.maxInt(u32)), self.inst.max_table_elems);
                     if (new_len > max) {
                         try self.pushI32(-1); // growth refused
                     } else {
