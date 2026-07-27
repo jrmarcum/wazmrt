@@ -51,8 +51,9 @@ bytes ──► DECODE ──► VALIDATE ──► INSTANTIATE ──► EXECUT
   const-expr forms), **imported functions** (`HostFunc`: a cross-module `wasm` call runs in the
   exporting instance, or a `native` host fn), and traps (`unreachable`, div-by-zero, overflow,
   call-depth, invalid-float→int, out-of-bounds memory/table, uninitialized/mismatched indirect call).
-  **Deferred (trap / unbuilt):** imported *tables/memories*, bulk table ops (`table.init`/`.copy`/
-  `elem.drop`), passive element segments. **Verified on real modules:** `Instance.invoke` runs the whole `wasm_mod` corpus
+  **(All since built — this bullet describes the 2026-07 MVP core; imported tables/memories, bulk
+  table/memory ops, passive elements/data, GC, multi-memory, memory64, threads/atomics, SIMD, and exception
+  handling are ALL done — see `roadmap.md`/`overview.md` for the current proposal set.)** **Verified on real modules:** `Instance.invoke` runs the whole `wasm_mod` corpus
   to its `.test.json` expected values (`fib(20)=6765`, `fac(7)=5040`, `sieve(30)=10` via memory) — the
   CLI gained a run mode `wazmrt <file.wasm> <export> [args…]`.
 

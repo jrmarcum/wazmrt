@@ -145,6 +145,13 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   **1 GiB**, CLI `--max-memory`) is summed over **all** of an instance's memories and re-checked by
   `memory.grow` — otherwise a small declared minimum simply grows past the ceiling. Grow reports refusal as
   `-1` (spec-correct), instantiation as `error.MemoryLimitExceeded`.
+- **A table-entry budget, same shape as the memory one (2026-07-27).** Table storage is NOT lazy — a defined
+  table's entries (`Value`, 8 bytes each) are allocated eagerly at instantiation — so an unvalidated `min`
+  up to 2^32-1 lets a ~7-byte `(table 0xffffffff funcref)` demand ~32 GiB. `Imports.max_table_elems`
+  (default `default_max_table_elems` = **2^27 ≈ 1 GiB of slots**, CLI `--max-table-elems`) is summed over
+  all DEFINED tables at instantiation and re-checked in `table.grow` (the runtime twin — a guest could else
+  `table.grow` by ~2^32). Grow reports refusal as `-1`; instantiation as `error.TableLimitExceeded`. Found
+  by the 2026-07-27 audit; imported tables are host-supplied (already sized) and excluded.
 - **Hot-loop guards are `@branchHint(.cold)` + benchmarked (2026-07-20).** Making `Frame.pop` safe cost
   **−12%** (250 → 220 Mops/s) until the underflow arm was marked `@branchHint(.cold)`, which restored
   parity (244–250) — `.?` is fast precisely because it lets the optimizer delete the check, so any real

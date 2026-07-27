@@ -535,17 +535,25 @@ V8. **Decision:** build the shipped `.lib`/`.dll` (and the freestanding wasm —
 `design-decisions.md`. (Caveat: single machine; sizes + steady-state are solid, the µs/ms cold numbers
 are ±10% noisy.)
 
-## Reading the test count (updated 2026-07-20, post 10th audit pass)
+## Reading the test count (updated 2026-07-27)
 
-`zig build test --summary all` prints **419 total (415 pass, 4 skip)**, but there are **216 distinct
-tests**: 203 in the core module (201 pass + 2 skip) + 13 C-ABI. The `cabi_tests` target's root is
-`wasm_c_api.zig`, which imports `root.zig`, so it compiles and **re-runs the core module's tests too**
-(204 core + 13 C-ABI = 217), on top of the standalone `mod_tests` run (204) → 421 printed. Harmless —
-about a second — but **don't quote the printed number as a test count**; quote **202**, or the per-target
-numbers from `--summary all`.
+`zig build test --summary all` prints **491 total (487 pass, 4 skip)** as of 2026-07-27. The count grew
+across the session's work: memory64 (Item 3), the post-memory64 audit, the deferred-item cleanup
+(multi-memory SIMD text, canonical index-type ordering), tag imports (the last assembler gap), the
+assembler audit (flat-form SIMD regression, tag ordering, doubled index type), and the four noted-LOW fixes
+(table budget, C-ABI saturating casts, s33 reader, tag typeuse check). The `cabi_tests` target's root is
+`wasm_c_api.zig`, which imports `root.zig`, so it compiles and **re-runs the core module's tests too**, on
+top of the standalone `mod_tests` run — so the printed total roughly doubles each new core test. **Don't
+quote the printed number as a distinct-test count; quote the per-target numbers from `--summary all`.**
+Green under **Debug AND ReleaseSafe**; `zig build c-smoke` 319/319.
 
-*(Was 389 printed / 200 distinct before `src/fuzz.zig` added 2 blocks and the 10th-pass memory/underflow/CSPRNG
-fixes added 4 more; because both targets run them, each new test moves the printed total by 2.)*
+**Session conformance snapshot (2026-07-27):** full main testsuite (`WebAssembly/testsuite`, 288 files)
+**60,670 passed / 568 failed**; memory64 dir **601/1** (the 1 = the out-of-scope `module definition`
+module-linking command); SIMD suite **24,956/0**. Every wasm proposal wazmrt targets is implemented and the
+WAT assembler has no remaining gaps (`tag` imports closed).
+
+*(Historical: was 419 printed / 216 distinct after the 10th audit pass on 2026-07-20; each subsequent
+feature/fix added regression tests, and because both targets run them, each moves the printed total by 2.)*
 
 The four 10th-pass additions are worth knowing individually — each pins a property that is invisible in a
 normal run: **`guest linear memory is zero-initialized, in every build mode`** (catches a regression to
