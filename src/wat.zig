@@ -4909,3 +4909,28 @@ test "legacy folded try assembles, validates, and runs (catch + catch_all + reth
     try std.testing.expectError(error.UnsupportedInstr, assemble(a,
         "(module (tag $t) (func (try (do (nop)) (delegate 0))))"));
 }
+
+test "legacy EH: a raw throw inside a catch handler propagates to the OUTER try, not a loop" {
+    // The legacy re-throw idiom `catch (e) { … throw e; }`: a throw from WITHIN a
+    // catch handler is outside that try's protected region, so it must reach the
+    // ENCLOSING catch — not re-match the same handler (which looped forever, the
+    // `15_LexicalShadowing_Stress` corpus hang). Distinct from `rethrow`, which
+    // already popped the try first. Inner catch throws a fresh 7 → outer catch
+    // returns it. Cross-checked against wasmtime's legacy-EH semantics (the .ts
+    // source: inner catch runs once, then the re-throw is caught by the outer).
+    const src =
+        \\(module (tag $t (param i32))
+        \\  (func (export "f") (result i32)
+        \\    (try (result i32)
+        \\      (do (try (result i32)
+        \\            (do (throw $t (i32.const 5)))
+        \\            (catch $t (drop) (throw $t (i32.const 7)))))
+        \\      (catch $t))))
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = try Module.decode(a, try assemble(a, src));
+    try validate(a, &m);
+    try std.testing.expectEqual(@as(i32, 7), interp.asI32(try assembleAndRun(src, "f", &.{})));
+}

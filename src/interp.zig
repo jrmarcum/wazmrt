@@ -1537,7 +1537,13 @@ const Frame = struct {
                 // path: a hand-crafted binary that reaches a delegating try while
                 // unwinding traps loudly rather than silently mis-routing.
                 if (lt.delegate != null) return error.UnsupportedInstruction;
-                for (lt.handlers) |h| {
+                // A throw from WITHIN this try's own catch handler must propagate
+                // OUTWARD, not re-match the same handler: once a handler is entered
+                // (`caught` set) we are past the `catch` clause, outside the try's
+                // protected region. Re-matching loops forever on the legacy re-throw
+                // idiom `catch (e) { … throw e; }`. `rethrow` avoids this by popping
+                // the try before re-raising; a raw `throw` needs this guard.
+                if (label.caught == null) for (lt.handlers) |h| {
                     if (h.tag != null and h.tag.? != exn.tag) continue;
                     if (label.stack_base > self.vstack.items.len) return error.StackUnderflow;
                     self.vstack.shrinkRetainingCapacity(label.stack_base);
@@ -1547,7 +1553,7 @@ const Frame = struct {
                     self.labels.shrinkRetainingCapacity(idx + 1);
                     self.labels.items[idx].caught = exn;
                     return h.handler_pc;
-                }
+                };
             }
         }
         return null;
