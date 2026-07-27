@@ -225,6 +225,55 @@ Debug AND ReleaseSafe; c-smoke 319/319.
 - Out-of-scope `.wast` harness command forms (`module definition`/`module instance` module-linking) — not a
   bug, not in scope.
 
+## Post-memory64 audit (2026-07-27 "look for code issues") — 4 fixed (`f478f79`)
+
+Four parallel investigators over the fresh memory64 code found two real gaps the feature commit's own
+tests didn't reach — both the memory64×{u64-offset, SIMD} intersections, i.e. exactly the combinations no
+single-feature test exercises — plus two minor finds. Each fix was verified by EXECUTING it and
+cross-checking values against wasmtime (`-W memory64=y`).
+
+- **HIGH — memarg offset decoded as u32.** `readMemArg` used `readVarU32`, but memory64 widens the static
+  offset to u64 for a 64-bit memory. A valid `i64.load offset=0x1_0000_0000` was *rejected at decode*
+  (`LebOverflow`) — and the assembler already emitted u64 offsets, so it was a self-inflicted round-trip
+  break. `opcode.MemArg.offset` is now u64, read via `readVarU64` (one fix covers scalar + atomic + SIMD,
+  which all share `readMemArg`). Widening the *decode* would have opened an accept-invalid hole on 32-bit
+  memories (offset ≥ 2^32), so a new validation rule closes it: `validate.checkMemOffset` →
+  `InvalidMemArgOffset`, wired into the `.mem`, `.atomic`, and `.simd` arms. *Lesson: a field's width is
+  part of a proposal's ABI — widening `Limits` for memory64 but leaving `MemArg.offset` at u32 was the
+  sibling-missed-again pattern, one field short.*
+- **MEDIUM — SIMD (v128) memory ops were memory64-blind.** `simdSig` hard-coded an i32 address and the
+  `.simd` validate arm never consulted `memAddrTy`; `simdMemEA` popped i32. Validator and interpreter
+  *agreed* (so memory-safe, no crash), but a valid `v128.load (i64.const 0)` on a 64-bit memory was
+  rejected, the i32 form wrongly accepted, and SIMD could never address past 4 GiB. The `.simd` arm now
+  types the address off the memory's index type (mirroring the scalar `.mem` arm's pop-trailing-then-addr
+  idiom); `simdMemEA` pops via `popAddr` with overflow-safe u64 bounds; the two inline v128.load/store
+  cases (which had their own non-overflow-safe `base + offset` math) now route through `simdMemEA` too.
+  *Found independently by two of the four agents. Survived because no `simd_*.wast` uses a 64-bit memory
+  and no memory64 test uses SIMD — the intersection had zero coverage.*
+- **LOW — `opcode.max_atomic_sub` was dead** (decodeAtomic hard-coded the `0x4e` bound). Wired the constant
+  into the range pattern so the exported bound and the decoder can't drift.
+- **LOW — `sexpr` `\u{…}` wrapping multiply.** `\u{100000041}` truncated mod 2^32 to a valid scalar
+  (`'A'`) instead of erroring; now overflow-checked → `BadEscape`. Text-path only, not memory-unsafe.
+
+Verified: memory64 SIMD store/load returns 6789 and a >2^32 offset decodes+validates on i64 / is rejected
+on i32 (both cross-checked vs wasmtime); +3 regression tests in `wat.zig`. **479 local tests green under
+Debug AND ReleaseSafe; c-smoke 319/319. SIMD spec suite 24,956/1; memory64 spec 601/1** — the two "1"s are
+pre-existing/out-of-scope, not regressions.
+
+**Noted, deferred (not bugs, or separate features — recorded so they're not re-discovered as "new"):**
+- **Multi-memory SIMD *text*** — `v128.load8_lane $m 1 …` (an explicit memory index on a SIMD lane op) is
+  not assembled → `UnknownInstr`; this is the one `simd_memory-multi.wast` failure. The runtime/decoder
+  handle the bit-6 memory index; only the *assembler's* SIMD-lane text form lacks it. Sibling of the
+  multi-memory text batch, which wired `memOperand` into scalar load/store and `memory.*` but not the
+  `0xFD` lane ops.
+- **WAT index-type ordering asymmetry** — the assembler parses `i64`/`i32` right after the name, so it
+  accepts `(memory i64 (export "m") 1)` but *rejects* the canonical `(memory (export "m") i64 1)` (index
+  type belongs after the inline export/import clauses). Errors cleanly (`BadImmediate`), never mis-emits.
+- **Triple-duplicated memory-limits parser** in `wat.zig` (inline import / inline defined / `(import …
+  (memory …))`) — consistent today, no shared helper, so a future fix could drift.
+- **`emitLimits` `@intCast(u64→usize)`** truncates a ≥2^32 page count on the *wasm32 self-host* build only
+  (native x64 `usize`=u64 is fine); such a memory no wasm32 host could instantiate anyway.
+
 ## Code audit 2026-07-19 ("look for code issues") — 8 fixed, a few deferred
 
 **FIXED in git (`d0dddc5`)** — 3 parallel auditors (security / SIMD / sweep): **decodeSimd lane-bounds guard**
