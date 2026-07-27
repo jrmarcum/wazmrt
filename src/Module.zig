@@ -576,9 +576,11 @@ fn readValType(r: *Reader, kinds: []const CompKind) Error!types.ValType {
 /// `arrayref`) using the pre-scanned `kinds`. Negative encodings are the
 /// abstract heap types. `nullable` picks the nullable vs non-null variant.
 fn readHeapTypeRef(r: *Reader, nullable: bool, kinds: []const CompKind) Error!types.ValType {
-    const ht = try r.readVarI64(); // s33
+    const ht = try r.readVarS33(); // s33 (≤5 bytes, [-2^32, 2^32-1])
     if (ht >= 0) {
-        if (ht > std.math.maxInt(u32)) return error.IndexOutOfRange; // guard the @intCast (s33 can hold up to 2^63)
+        // A non-negative s33 is always ≤ 2^32-1, so the cast is safe; the guard is
+        // a belt-and-suspenders backstop kept in case `readVarS33` ever changes.
+        if (ht > std.math.maxInt(u32)) return error.IndexOutOfRange;
         const ti: u32 = @intCast(ht);
         if (ti >= kinds.len) return error.IndexOutOfRange;
         const head: types.ValType.RefHeap = switch (kinds[ti]) {
@@ -697,7 +699,7 @@ fn skipConstExpr(r: *Reader) Error!void {
             0x42 => try r.skipLeb(10), // i64.const (64-bit LEB)
             0x43 => _ = try r.readBytes(4), // f32.const
             0x44 => _ = try r.readBytes(8), // f64.const
-            0xd0 => _ = try r.readVarI64(), // ref.null (heaptype s33)
+            0xd0 => _ = try r.readVarS33(), // ref.null (heaptype s33)
             0xfd => { // SIMD prefix — only `v128.const` is a constant instruction
                 if (try r.readVarU32() == 0x0c) _ = try r.readBytes(16);
             },
@@ -844,7 +846,7 @@ fn skipValTypeVec(r: *Reader) Error!void {
 /// Advance past one value type without resolving it (bytes only).
 fn skipValType(r: *Reader) Error!void {
     const b = try r.readByte();
-    if (b == 0x63 or b == 0x64) _ = try r.readVarI64(); // (ref null? ht): + heaptype s33
+    if (b == 0x63 or b == 0x64) _ = try r.readVarS33(); // (ref null? ht): + heaptype s33
 }
 
 fn skipFieldType(r: *Reader) Error!void {
