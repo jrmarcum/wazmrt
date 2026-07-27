@@ -126,6 +126,12 @@ for more is refused with `MemoryLimitExceeded`. Memory within the cap costs
 address space rather than RAM — it is committed by the OS as the guest touches
 it, so declaring a large memory is cheap until it is used.
 
+Table storage is not lazy, so a table's entries are allocated up front. A defined
+table is capped at **128 Mi entries** by default (raise or lower with
+`--max-table-elems <count>`, e.g. `1M` or `100000`); a module declaring or growing
+past the cap is refused with `TableLimitExceeded` rather than allocating tens of
+gigabytes from a few bytes of source.
+
 Guests using the GC proposal have a second ceiling: wazmrt allocates GC objects
 without collecting them (they live until the instance is dropped), so a module
 is limited to **16 Mi live objects** and one that allocates past that traps with

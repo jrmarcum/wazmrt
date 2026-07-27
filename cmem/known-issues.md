@@ -319,21 +319,25 @@ changes, each verified by executing the result:
 +2 regression tests; **487 local tests green (Debug + ReleaseSafe); c-smoke 319/319; SIMD spec suite
 24,956/0; full main testsuite 60,670 (no regression).**
 
-**Noted LOW, not fixed (non-exploitable / documented / owner-decision territory):**
-- **Table-entry OOM amplification at instantiation** — `interp.zig` `gpa.alloc(Value, tt.limits.min)` has
-  no per-table budget, so `(table 0xffffffff funcref)` requests ~32 GiB. Reachable only when an embedder
-  instantiates an untrusted module; fails **gracefully** as `OutOfMemory` (not UB). Memories have
-  `--max-memory`; tables have no equivalent (the fuzz `Budget` allocator bounds it in tests). Same class of
-  owner-decision the memory budget once was.
-- **C ABI represents a memory64 memory as 32-bit** (`wasm_memory_grow`/`size`/`type` use u32, ignore
-  `is64`) — a wasm.h representability limitation, not memory-unsafety (`delta` is u32, no oversized request
-  possible).
-- **s33 blocktype/heaptype over-long LEB leniency** — `readBlockType`/`readHeapType` accept up to a 10-byte
-  LEB where the s33 is ≤5; out-of-range → `UnsupportedOpcode`, so malformed-acceptance only, no safety
-  impact.
-- **`parseTagType` accepts both `(type $t)` and inline `(param …)` without a consistency check** — the
-  explicit type wins (authoritative), inline params ignored; a reference assembler would reject the
-  inconsistency. Not a miscompile.
+**All four noted-LOW items CLOSED same day (`bc39e89`):**
+- **Table-entry OOM amplification** — a defined table's `min` (up to 2^32-1) was allocated eagerly with no
+  budget, so `(table 0xffffffff funcref)` demanded ~32 GiB. Added a per-instance `max_table_elems` ceiling
+  (default 2^27 ≈ 1 GiB of `Value` slots), summed across defined tables at instantiation and enforced again
+  in `table.grow` (the runtime twin) — mirroring the linear-memory budget. New `--max-table-elems` CLI flag
+  + `TableLimitExceeded`; verified end to end (refuse → exit 1; raise → runs).
+- **C-ABI memory64-as-32-bit** — `wasm_memory_size`/`grow`/`type` now use **saturating** u64→u32 casts (the
+  `@intCast` was latent UB past 256 TiB) and `grow` caps a no-max memory64 memory at the u32 page max, not
+  65536; `wasm_memory_type` carries `is64`.
+- **s33 over-long leniency** — block types (§5.3.6) and heap types (GC) are s33 but were read via
+  `readVarI64` (up to 10 bytes, s64 sign semantics). New `Reader.readVarS33`: at most 5 bytes, bit 32 is the
+  sign, value in [-2^32, 2^32-1] — rejects over-long encodings and out-of-range values as malformed. **No
+  change for any valid input** (full spec suite 60,670 unchanged, incl. all control flow + GC heap types).
+- **`parseTagType` typeuse check** — a tag giving BOTH `(type $t)` and inline `(param …)` now rejects a
+  mismatch via a shared `resolveTagSig` (covers imported AND defined tags — the first attempt missed the
+  defined-tag path, which inlines its own parsing).
+
++3 regression tests; **491 local tests green (Debug + ReleaseSafe); c-smoke 319/319; full main testsuite
+60,670 / memory64 601/1 (no regression).**
 
 ## Code audit 2026-07-19 ("look for code issues") — 8 fixed, a few deferred
 
