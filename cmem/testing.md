@@ -108,15 +108,18 @@ Two harness facts worth keeping:
 - **`ReleaseFast` for conformance runs.** Debug frames are large enough that deep-recursion tests used to
   segfault the runner; the depth cap is now safe in every mode, but Release is still much faster here.
 
-The remaining failures are dominated by **assembler feature gaps**, not wrong answers. Most of the
-reported set was closed in the follow-up assembler batch (see known-issues, "Assembler gaps"): inline
-`(export …)` on a tag, forward-referenced exports, `(export "mem" (memory $name))`, flat `br_table`,
-data-segment names, the discarded memory-index immediate, `anyfunc`, **named struct fields**
-(`struct.get $T $field`), and **legacy folded `try`/`catch`** (which also needed validator support).
-Real-world `.wat` corpus assembly went 468 → **489/493**. The 4 that remain are not shared gaps:
-`memory64` (a whole proposal), multi-memory *text* (runtime supports it, assembler defers it), and two
-top-level `ArtOfWebAssembly` files that are genuinely malformed (stray line-number digits injected into
-the source; the Chapter2 copies of the same files assemble fine).
+The reported assembler-feature gaps were then closed across two batches (see known-issues, "Assembler
+gaps" and "Open items 1–7"): inline `(export …)` on a tag, forward-referenced exports,
+`(export "mem" (memory $name))`, flat `br_table`, data-segment names, the discarded memory-index
+immediate, `anyfunc`, named struct fields, legacy folded `try`/`catch`, **GC const-exprs**,
+**multi-memory text**, and **the whole atomics family**. **Score after the open-items-1–7 batch
+(2026-07-22): 58,639 passed** over the 258 core files, plus the **threads `atomic.wast` suite at 302/0**
+and the **multi-memory dir at 764/4** (the 4 are pre-existing table/import-limits edges). Real-world
+`.wat` corpus assembly 468 → ~490/493; the ~3 that remain are `memory64` (the one unimplemented proposal)
+and two genuinely-malformed top-level `ArtOfWebAssembly` files (stray line-number digits — the Chapter2
+copies assemble fine). **Oracle note:** proposals with a live reference implementation (GC, multi-memory,
+atomics) are cross-checked against **wasmtime** (`-W gc=y` / `-W multi-memory=y` / `-W threads=y`); the
+threads and multi-memory `.wast` suites are cloned separately (`WebAssembly/threads`), not vendored.
 
 ## Spec-testsuite conformance snapshot (2026-07-02, `wast.zig` MVP) — SUPERSEDED by the run above
 

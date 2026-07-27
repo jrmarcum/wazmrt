@@ -1,11 +1,25 @@
 # Roadmap
 
-## Status (2026-07-21) — feature-complete core; runs the official spec testsuite; 13 audit passes done
+## Status (2026-07-22) — feature-complete core + threads/atomics + multi-memory text; only memory64 left
 
-*(Sections below are dated as written. The **2026-07-21** state supersedes all earlier test counts and
+*(Sections below are dated as written. The **2026-07-22** state supersedes all earlier test counts and
 open-item lists; the fine-grained audit ledger lives in `known-issues.md`.)*
 
-**Latest (2026-07-21).** Three more audit passes (11th–13th) plus an assembler-gap batch. The **13th pass
+**Latest (2026-07-22) — the "open items 1–7" batch.** After the 13th pass the remaining list was walked
+end to end (see `known-issues.md` for the per-item detail). Six real fixes, each verified by executing the
+result and, where a live reference implementation exists, cross-checked against **wasmtime**:
+**import-order preservation**; **`delegate` uniformly refused** (validator + runtime, closing the
+"validates yet mis-runs" gap); **GC constant expressions** (`struct.new`/`array.new*`/`ref.i31` in const
+exprs — which also closed the old `skipConstExpr` gap — plus abstract GC ref matchers in the `.wast`
+runner); **multi-memory TEXT assembly** (the runtime had it since Phase 7; the assembler now emits the
+bit-6 memarg form, per-op memory indices, `shared`, and `(data (memory $m) …)`, plus a `.wast`-runner
+memory-import-linking fix); and **threads/ATOMICS** — the whole `0xFE` family (~66 ops) from scratch
+across decoder/validator/interp/assembler, single-threaded semantics, **the entire threads `atomic.wast`
+suite passing 302/0**. (Item 7's two "failing" corpus files were confirmed malformed source, not a bug.)
+**Core spec suite 57.9k → 58.6k passing; 469 local tests green under Debug AND ReleaseSafe. Only the
+memory64 proposal remains unimplemented** (Item 3, in progress).
+
+**Prior (2026-07-21).** Three audit passes (11th–13th) plus an assembler-gap batch. The **13th pass
 finally RAN the official `WebAssembly/spec` testsuite** for the first time — twelve passes had *reviewed*
 the code without ever *executing* the upstream oracle — and within minutes it surfaced a guest-controlled
 stack overflow, missing UTF-8 name validation, and hex-float literals truncated (not rounded) by the

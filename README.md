@@ -44,8 +44,9 @@ compliance process, and for the ledger of any reused code.
 > hashes, or verify an **Ed25519 signature** against an embedded root key (both
 > opt-in; see *Verifying modules* below). It also implements **exception
 > handling** (both the `exnref` proposal and the legacy `try`/`catch` encoding),
-> **multiple memories**, and the **complete SIMD (v128)** instruction set —
-> every fixed-width op plus the relaxed-SIMD extensions. Requires Zig 0.16.
+> **multiple memories**, **threads/atomics** (the whole `0xFE` family plus
+> `shared` memories), and the **complete SIMD (v128)** instruction set — every
+> fixed-width op plus the relaxed-SIMD extensions. Requires Zig 0.16.
 
 ## Build
 

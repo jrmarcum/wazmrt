@@ -57,9 +57,13 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
   parsed then discarded, now kept per-type and consulted); and **legacy folded `try`/`catch`**
   (`(try (do …) (catch $t …) (catch_all …))` + `rethrow`) reaching both the assembler and the validator
   (the interp executed it since Phase 6.3 but neither the assembler nor `validate` did — see
-  `known-issues.md`). `delegate` is *rejected at assembly* (runtime never routes it). **Still deferred in
-  wat.zig:** tag imports, multi-memory *text* (the runtime supports multi-memory since Phase 7; the text
-  form fails loud with `UnsupportedInstr`).
+  `known-issues.md`). `delegate` is *rejected at assembly* (runtime never routes it). **Multi-memory text +
+  GC const-exprs + atomics DONE 2026-07-22** (open-items-1–7 batch): multiple `(memory …)`, the bit-6
+  memarg form (`i32.load $m …`), `memory.size/grow/fill $m`, `memory.copy $dst $src`,
+  `memory.init $mem $data`, `(data (memory $m) …)`; `struct.new`/`array.new*`/`ref.i31` in constant
+  expressions; and the **whole `0xFE` atomics family** (a 66-entry mnemonic table + `emitAtomic`, the
+  `shared` memory keyword). **Still deferred in wat.zig:** tag imports; memory64 (the last unimplemented
+  proposal).
 - **`src/wast.zig`** (DONE 2026-07-02, extended 2026-07-09) — WAST script runner: `(module …)` text +
   `(module binary …)`, `assert_return`, **`assert_trap` (genuine runtime traps only — `isRuntimeTrap`),
   `assert_exhaustion`, `assert_invalid`/`assert_malformed` (the inner module must be rejected)**,

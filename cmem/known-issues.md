@@ -156,29 +156,53 @@ fields), threaded through `encodeBody` into the emit `Ctx`, and consulted by `.g
 passes through, unknown name rejected). Verified the names map to the RIGHT indices — a `{val:11,next:22}`
 struct read back as `val + 100*next = 2211` — and the named form assembles byte-identically to the numeric.
 
-**Still open** — the *remaining* corpus long tail is 4 files, each a genuine feature/proposal boundary or
-malformed source, NOT a bug: `memory64.wat` (i64 addresses — a whole proposal); `memory-multiple.wat`
-(multi-memory *text* — the runtime supports multi-memory since Phase 7, only the assembler defers it, and
-it fails loud with `UnsupportedInstr`); `SumSquared.wat`/`loop.wat` (the top-level copies are genuinely
-malformed — stray line-number digits injected into the source, e.g. `(export 1"SumSquared")`, `(6local.get`
-— the Chapter2 copies of the same files assemble fine). Assemble→decode still does not preserve import
-order (indices stay consistent; only the linking-ABI order differs).
+## "Open items 1–7" batch — CLOSED 2026-07-22 (owner walked the remaining list)
 
-**Deliberately not fixed (judgement calls, recorded):**
-- **Runtime `delegate` routing** — `precomputeControlFlow` records the label but `throwException` never
-  consults it. The assembler *rejects* `delegate` loudly rather than emit something that validates yet
-  mis-runs. NOT implemented because there is **no external oracle**: no corpus file uses it, and the spec
-  testsuite exercises the modern `try_table`, not legacy `delegate` — so its subtle label arithmetic would
-  be validated only by my own possibly-wrong tests (the vacuous-test trap). Loud rejection is the honest
-  state.
-- **`skipConstExpr`'s GC/SIMD-immediate gap** — the const-expr byte-scanner treats a `0xFB`/`0xFD`-prefixed
-  instruction as zero-operand, so a GC/SIMD const-expr (`struct.new`, `array.new_fixed`, `v128.const` in a
-  global init) can be mis-scanned. Reads are bounds-checked (**not** a safety issue), and the validator
-  already rejects GC/SIMD const-exprs (`ConstantExpressionRequired`), so on the validated path there is no
-  observable effect. A robust boundary-scan alone would change nothing (evaluation fails later regardless);
-  the real fix is full GC-const-expr support end-to-end (decoder + validator + evaluator), a feature, not a
-  bugfix. Left as the standing exclusion it has been.
-- **#8** (upstream Zig 0.16 Windows `Io`) — cannot fix here.
+The seven-item list that had been "still open" after the assembler batch was worked through end to end.
+Six were fixed (one was a non-bug); each verified by *executing* the result and, where a proposal has a
+live reference implementation, cross-checked against **wasmtime**.
+
+- **Item 7 — the 2 malformed corpus files: NOT a bug.** The top-level `SumSquared.wat`/`loop.wat` have
+  stray line-number digits injected into the source (`(export 1"SumSquared")`, `(6local.get`); any
+  conformant parser rejects them. Correct rejection, nothing to fix.
+- **Item 6 — import order preserved** (`6273069`). The assembler collected imports into four per-kind
+  lists and emitted them grouped; a source order interleaving kinds was lost, and that order is the
+  positional linking ABI a C-ABI embedder builds its extern vector against. A source-order tag list now
+  drives the section emit; per-kind indices are unchanged.
+- **Item 5 — `delegate` uniformly REFUSED** (`8647784`). Still not *routed* (no oracle — wasmtime and V8
+  dropped legacy EH; its parser rejects `(try …)` outright), but the earlier inconsistency is closed: the
+  validator rejects `delegate` and the runtime traps if one is reached while unwinding, matching the
+  assembler's rejection. No "validates yet mis-runs" gap remains.
+- **Item 4 — GC constant expressions** (`363e764`). `struct.new`/`struct.new_default`/`array.new`/
+  `array.new_default`/`array.new_fixed`/`ref.i31` in const-exprs, end to end (decoder `skipConstExpr` now
+  skips their immediates; the validator type-checks them; the evaluator allocates into the instance's
+  under-construction GC heap at instantiation). **This closes the old `skipConstExpr` GC/SIMD-immediate
+  gap** — it is no longer a latent scan gap, it is a supported feature. Also fixed a `.wast`-runner gap it
+  exposed: the abstract GC ref matchers (`(ref.struct)`/`(ref.array)`/`(ref.i31)`/…) were unhandled and
+  *aborted the whole file*; they now match "non-null reference". Values cross-checked against wasmtime;
+  gc/ spec dir 149→204 passed.
+- **Item 2 — multi-memory TEXT assembly** (`baefac2`). The runtime supported multi-memory since Phase 7;
+  only the assembler deferred it. Now: multiple `(memory …)`, the bit-6 memarg form (`i32.load $m …`),
+  `memory.size/grow/fill $m`, `memory.copy $dst $src`, `memory.init $mem $data`, `(data (memory $m) …)`,
+  and `(export … (memory $m))`. Also fixed a `.wast`-runner linking bug it exposed —
+  `resolveMemoryImport` returned `memory0()`, linking every imported memory to the exporter's FIRST one.
+  Multi-memory spec dir: full rejection → 764/4 (the 4 are pre-existing table/import-limits edges).
+- **Item 1 — threads/ATOMICS (`0xFE`)** (`3554e38`). The whole ~66-op family, from scratch across all four
+  layers (mirrors SIMD's `Op.simd` + sub-opcode): notify/wait32/wait64, `atomic.fence`, atomic
+  loads/stores (all widths), rmw/cmpxchg (add/sub/and/or/xor/xchg/cmpxchg), plus the `shared` memory
+  flag. Single-threaded semantics: every rmw is trivially atomic, fence is a no-op, a misaligned access
+  traps (`UnalignedAtomic`), `wait` on non-shared memory traps (`ExpectedSharedMemory`), notify wakes 0,
+  wait returns 1 on mismatch / 2 (timed-out) on a match. **The entire threads `atomic.wast` suite passes:
+  302/0**; values cross-checked against wasmtime (`-W threads=y`).
+
+**Net:** full core spec suite 57,909 → **58,639 passed** across the session; the whole run holds steady
+after atomics (no regression from the limits/`shared` change). Local tests grew to **469**, green under
+Debug AND ReleaseSafe.
+
+**Still open — a genuinely short list now:**
+- **memory64** — the one remaining unimplemented wasm proposal (i64 memory addresses). Item 3, in progress.
+- **#8** (upstream Zig 0.16 Windows `Io`) — cannot fix here; only an upstream fix helps.
+- **Runtime `delegate` routing** stays deliberately unimplemented (refused everywhere, per above).
 
 ## Code audit 2026-07-19 ("look for code issues") — 8 fixed, a few deferred
 
