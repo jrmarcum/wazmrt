@@ -292,6 +292,49 @@ catch by its index-0 identity → 42; the two forms are byte-identical) and cros
 319/319; full main testsuite 60,668 → 60,670 passed.** **The WAT assembler now has NO remaining known
 gaps** — every construct across every proposal wazmrt targets has text-assembly support.
 
+## Assembler audit 2026-07-27 ("look for code issues") — 3 fixed (`436196e`)
+
+Four parallel investigators over the fresh assembler code. **interp/validate came back clean** (13+ prior
+passes have saturated the numeric/control/GC/typing classes — verdict re-confirmed by an end-to-end trace).
+**The memory64 u64 ripple through the decoder + C ABI came back clean** (`readVarU64` bounded, offset never
+re-narrowed, `limitsOf` saturates not corrupts). Three real bugs, all in THIS session's own `wat.zig`
+changes, each verified by executing the result:
+- **HIGH (a regression from `e276d09`)** — a **flat-form** SIMD memory op swallowed the FOLLOWING
+  instruction. The multi-memory memidx change made the atom-run collection greedy (`while
+  items[j].asAtom() != null`), but in flat/stack form `items` is the whole sibling sequence, so `v128.load
+  drop …` ate `drop` as a memidx → `BadImmediate` (false-**rejection** of valid WAT, not wrong bytes).
+  *Folded form and the folded-heavy SIMD suite hid it — 0 failures there.* Now the loop stops at the first
+  non-`offset=`/`align=`, non-index-like atom, mirroring the scalar `.mem` flat loop. *Lesson: when
+  borrowing a parse shape, borrow its STOP condition too — the scalar loop had `is_memarg or is_memidx`
+  with `break`; the SIMD copy dropped the break.*
+- **MEDIUM** — a defined tag before an imported tag was silently **mis-indexed** rather than rejected.
+  `isDefKind` omitted `tag`, so the imports-before-defs guard (`ImportAfterDefinition`) never fired for tags
+  and the inline `(tag (import …))` form wasn't recognized as an import — unlike the memory path this was
+  modeled on. Since a tag import takes a low tag index but `tag_names` is source-order, `throw $d` could
+  encode the wrong tag. Fixed by adding `tag` to `isDefKind`. *Sibling-missed-again: the tag-import feature
+  copied the memory-import data model but not memory's `isDefKind` membership.*
+- **LOW** — `parseMemLimits` accepted a doubled index type (`(memory i64 i64 1)`); a `type_seen` flag now
+  blocks the canonical-position consume when one was already taken after the name → `BadImmediate`.
+
++2 regression tests; **487 local tests green (Debug + ReleaseSafe); c-smoke 319/319; SIMD spec suite
+24,956/0; full main testsuite 60,670 (no regression).**
+
+**Noted LOW, not fixed (non-exploitable / documented / owner-decision territory):**
+- **Table-entry OOM amplification at instantiation** — `interp.zig` `gpa.alloc(Value, tt.limits.min)` has
+  no per-table budget, so `(table 0xffffffff funcref)` requests ~32 GiB. Reachable only when an embedder
+  instantiates an untrusted module; fails **gracefully** as `OutOfMemory` (not UB). Memories have
+  `--max-memory`; tables have no equivalent (the fuzz `Budget` allocator bounds it in tests). Same class of
+  owner-decision the memory budget once was.
+- **C ABI represents a memory64 memory as 32-bit** (`wasm_memory_grow`/`size`/`type` use u32, ignore
+  `is64`) — a wasm.h representability limitation, not memory-unsafety (`delta` is u32, no oversized request
+  possible).
+- **s33 blocktype/heaptype over-long LEB leniency** — `readBlockType`/`readHeapType` accept up to a 10-byte
+  LEB where the s33 is ≤5; out-of-range → `UnsupportedOpcode`, so malformed-acceptance only, no safety
+  impact.
+- **`parseTagType` accepts both `(type $t)` and inline `(param …)` without a consistency check** — the
+  explicit type wins (authoritative), inline params ignored; a reference assembler would reject the
+  inconsistency. Not a miscompile.
+
 ## Code audit 2026-07-19 ("look for code issues") — 8 fixed, a few deferred
 
 **FIXED in git (`d0dddc5`)** — 3 parallel auditors (security / SIMD / sweep): **decodeSimd lane-bounds guard**
