@@ -279,6 +279,10 @@ pub const Op = enum(u8) {
     /// specific operation is `imm.simd.sub` (the 0xFD sub-opcode). Using one tag
     /// keeps the ~236-op family out of the u8 `Op` space.
     simd = 0xdb,
+    /// All `0xFE`-prefixed atomic (threads proposal) ops share this tag; the
+    /// specific operation is `imm.atomic.sub` (the 0xFE sub-opcode). One tag keeps
+    /// the ~66-op family out of the u8 `Op` space (mirrors `simd`).
+    atomic = 0xdc,
     memory_init = 0xd7, // 0xFC 0x08: [dst src n] -> [] (from a data segment)
     data_drop = 0xd8, // 0xFC 0x09: mark a data segment consumed
     memory_copy = 0xd9, // 0xFC 0x0a: [dst src n] -> []
@@ -477,6 +481,9 @@ pub const Imm = union(enum) {
     try_table: TryTable,
     /// A `0xFD` SIMD op: the sub-opcode plus whatever immediate it carries.
     simd: Simd,
+    /// A `0xFE` atomic op: the sub-opcode plus its memarg (all atomic ops carry
+    /// one except `atomic.fence`, whose immediate is a reserved `0x00`).
+    atomic: Atomic,
 };
 
 /// A decoded `0xFD` (v128 SIMD) instruction. `sub` is the 0xFD sub-opcode;
@@ -487,6 +494,14 @@ pub const Simd = struct {
     mem: MemArg = .{ .alignment = 0, .offset = 0 },
     lane: u8 = 0,
     bytes: u128 = 0,
+};
+
+/// A decoded `0xFE` atomic instruction. `sub` is the 0xFE sub-opcode; `mem` is
+/// the memarg every atomic memory op carries (`atomic.fence` has none, so `mem`
+/// stays default and is ignored).
+pub const Atomic = struct {
+    sub: u32,
+    mem: MemArg = .{ .alignment = 0, .offset = 0 },
 };
 
 pub const Instr = struct { op: Op, imm: Imm };
@@ -743,6 +758,65 @@ pub fn simdIsMemoryOp(sub: u32) bool {
     };
 }
 
+/// Highest `0xFE` atomic sub-opcode wazmrt knows (`i64.atomic.rmw32.cmpxchg_u`).
+pub const max_atomic_sub: u32 = 0x4e;
+
+/// The REQUIRED alignment (log2 bytes) of a `0xFE` atomic op — atomics must be
+/// naturally aligned, so this is both the assembler default and the exact value
+/// the validator enforces (an atomic access with any other alignment traps/is
+/// invalid). Access width is encoded in the sub-opcode: `8`→1 byte, `16`→2,
+/// `32`→4, else the full type width (i32=4, i64=8). notify/wait32 are 4, wait64
+/// is 8. `atomic.fence` (0x03) has no memarg; returns 0.
+pub fn atomicNaturalAlignLog2(sub: u32) u32 {
+    return switch (sub) {
+        0x00, 0x01 => 2, // notify, wait32
+        0x02 => 3, //       wait64
+        0x03 => 0, //       fence (no memarg)
+        // i32 full / i64 full loads+stores
+        0x10, 0x17 => 2, // i32.atomic.load / store
+        0x11, 0x18 => 3, // i64.atomic.load / store
+        // sub-width loads (0x12–0x16) and stores (0x19–0x1d): width in the name
+        0x12, 0x19 => 0, // i32 …8
+        0x13, 0x1a => 1, // i32 …16
+        0x14, 0x1b => 0, // i64 …8
+        0x15, 0x1c => 1, // i64 …16
+        0x16, 0x1d => 2, // i64 …32
+        // rmw/cmpxchg: 7 ops per group, laid out
+        // [i32.full, i64.full, i32.8, i32.16, i64.8, i64.16, i64.32] from 0x1e.
+        else => atomicRmwAlign(sub),
+    };
+}
+
+fn atomicRmwAlign(sub: u32) u32 {
+    if (sub < 0x1e or sub > 0x4e) return 0;
+    return switch ((sub - 0x1e) % 7) {
+        0 => 2, // i32 full  (4 bytes)
+        1 => 3, // i64 full  (8 bytes)
+        2 => 0, // i32.8     (1)
+        3 => 1, // i32.16    (2)
+        4 => 0, // i64.8     (1)
+        5 => 1, // i64.16    (2)
+        6 => 2, // i64.32    (4)
+        else => unreachable,
+    };
+}
+
+/// Decode a `0xFE` atomic op. `atomic.fence` (0x03) carries a reserved byte;
+/// every other op (notify/wait, and all load/store/rmw/cmpxchg) carries a
+/// memarg. Sub-opcodes outside the defined set are rejected at decode (the run
+/// path does not re-validate).
+fn decodeAtomic(r: *Reader, sub: u32) DecodeError!Instr {
+    var at: Atomic = .{ .sub = sub };
+    switch (sub) {
+        0x03 => _ = try r.readByte(), // atomic.fence: a reserved 0x00
+        0x00, 0x01, 0x02, // notify / wait32 / wait64
+        0x10...0x4e, // loads / stores / rmw / cmpxchg
+        => at.mem = try readMemArg(r),
+        else => return error.UnsupportedOpcode,
+    }
+    return .{ .op = .atomic, .imm = .{ .atomic = at } };
+}
+
 fn decodeSimd(r: *Reader, sub: u32) DecodeError!Instr {
     var s: Simd = .{ .sub = sub };
     switch (sub) {
@@ -934,6 +1008,12 @@ pub fn decodeBodyTracked(
         if (b0 == 0xfd) {
             // 0xFD-prefixed fixed-width SIMD (v128): a LEB sub-opcode + immediate.
             try list.append(a, try decodeSimd(&r, try r.readVarU32()));
+            continue;
+        }
+        if (b0 == 0xfe) {
+            // 0xFE-prefixed atomics (threads proposal): a LEB sub-opcode + memarg
+            // (or a reserved byte for `atomic.fence`).
+            try list.append(a, try decodeAtomic(&r, try r.readVarU32()));
             continue;
         }
         // `0xd7..0xfa` are wazmrt's INTERNAL tags for ops whose real wire form is

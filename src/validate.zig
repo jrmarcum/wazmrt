@@ -860,6 +860,59 @@ const FuncValidator = struct {
                 try self.pushVals(s.push);
             },
 
+            .atomic => {
+                const sub = instr.imm.atomic.sub;
+                if (sub == 0x03) { // atomic.fence: no memory, no operands
+                    return;
+                }
+                // Every other atomic op touches memory and MUST be naturally
+                // aligned (§ threads: the alignment is fixed, not a max).
+                try self.requireMemory(instr.imm.atomic.mem.memory);
+                if (instr.imm.atomic.mem.alignment != opcode.atomicNaturalAlignLog2(sub))
+                    return error.InvalidAlignment;
+                switch (sub) {
+                    0x00 => { // notify: [addr count] -> [i32]
+                        _ = try self.popExpect(.i32);
+                        _ = try self.popExpect(.i32);
+                        try self.pushValT(.i32);
+                    },
+                    0x01 => { // wait32: [addr i32 i64] -> [i32]
+                        _ = try self.popExpect(.i64);
+                        _ = try self.popExpect(.i32);
+                        _ = try self.popExpect(.i32);
+                        try self.pushValT(.i32);
+                    },
+                    0x02 => { // wait64: [addr i64 i64] -> [i32]
+                        _ = try self.popExpect(.i64);
+                        _ = try self.popExpect(.i64);
+                        _ = try self.popExpect(.i32);
+                        try self.pushValT(.i32);
+                    },
+                    0x10...0x16 => { // atomic load: [addr] -> [T]
+                        _ = try self.popExpect(.i32);
+                        try self.pushValT(atomicValType(sub));
+                    },
+                    0x17...0x1d => { // atomic store: [addr T] -> []
+                        _ = try self.popExpect(atomicValType(sub));
+                        _ = try self.popExpect(.i32);
+                    },
+                    0x1e...0x47 => { // rmw: [addr T] -> [T]
+                        const t = atomicValType(sub);
+                        _ = try self.popExpect(t);
+                        _ = try self.popExpect(.i32);
+                        try self.pushValT(t);
+                    },
+                    0x48...0x4e => { // cmpxchg: [addr expected replacement] -> [T]
+                        const t = atomicValType(sub);
+                        _ = try self.popExpect(t);
+                        _ = try self.popExpect(t);
+                        _ = try self.popExpect(.i32);
+                        try self.pushValT(t);
+                    },
+                    else => return error.UnsupportedOpcode,
+                }
+            },
+
             .table_get => {
                 const et = try self.tableElemType(instr.imm.table);
                 _ = try self.popExpect(.i32);
@@ -1319,6 +1372,21 @@ fn sig(pop: []const V, push: []const V) FuncValidator.Sig {
 /// unclassified op defaults to the common binary shape `v128,v128 -> v128`;
 /// that only affects functions using unimplemented ops, which trap at execution
 /// before the annotation is used (see `interp` drop/select width handling).
+/// The value type (`i32`/`i64`) an atomic load/store/rmw/cmpxchg operates on.
+/// Determined by the sub-opcode: the `i32.*`/`i64.*` prefix in the mnemonic.
+fn atomicValType(sub: u32) V {
+    return switch (sub) {
+        0x10, 0x12, 0x13, 0x17, 0x19, 0x1a => .i32, // i32 loads/stores (full/8/16)
+        0x11, 0x14, 0x15, 0x16, 0x18, 0x1b, 0x1c, 0x1d => .i64, // i64 loads/stores
+        // rmw/cmpxchg groups of 7: [i32.full, i64.full, i32.8, i32.16, i64.8,
+        // i64.16, i64.32] — positions 0,2,3 are i32; 1,4,5,6 are i64.
+        else => switch ((sub - 0x1e) % 7) {
+            0, 2, 3 => .i32,
+            else => .i64,
+        },
+    };
+}
+
 fn simdSig(sub: u32) FuncValidator.Sig {
     return switch (sub) {
         0x00...0x0a, 0x5c, 0x5d => sig(i32_1, v128_1), // loads: addr -> v128

@@ -78,8 +78,10 @@ pub const CompType = union(enum) {
     }
 };
 
-/// Resizable-range limits shared by tables and memories (§5.3.7).
-pub const Limits = struct { min: u32, max: ?u32 };
+/// Resizable-range limits shared by tables and memories (§5.3.7). `shared`
+/// (threads proposal) applies only to memories — a shared memory backs atomic
+/// `wait`/`notify`; it is always false for tables.
+pub const Limits = struct { min: u32, max: ?u32, shared: bool = false };
 
 pub const TableType = struct { element: types.ValType, limits: Limits };
 pub const MemoryType = struct { limits: Limits };
@@ -632,15 +634,19 @@ fn readName(a: std.mem.Allocator, r: *Reader) Error![]const u8 {
 
 fn readLimits(r: *Reader) Error!Limits {
     const flag = try r.readByte();
-    if (flag > 0x01) return error.MalformedFlag; // only 0x00 (min) / 0x01 (min,max)
+    // bit 0 = has max, bit 1 = shared (threads proposal). 0x00/0x01 unshared,
+    // 0x02/0x03 shared; anything else is malformed.
+    if (flag > 0x03) return error.MalformedFlag;
     const min = try r.readVarU32();
     const max: ?u32 = if (flag & 0x01 != 0) try r.readVarU32() else null;
-    return .{ .min = min, .max = max };
+    return .{ .min = min, .max = max, .shared = flag & 0x02 != 0 };
 }
 
 fn readTableType(r: *Reader, kinds: []const CompKind) Error!TableType {
     const element = try readValType(r, kinds);
-    return .{ .element = element, .limits = try readLimits(r) };
+    const limits = try readLimits(r);
+    if (limits.shared) return error.MalformedFlag; // tables are never shared here
+    return .{ .element = element, .limits = limits };
 }
 
 fn readGlobalType(r: *Reader, kinds: []const CompKind) Error!GlobalType {

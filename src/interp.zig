@@ -208,6 +208,12 @@ pub const Error = Module.Error || error{
     InvalidConversionToInt,
     /// A memory access (or data-segment init) outside the memory bounds.
     MemoryOutOfBounds,
+    /// An atomic access whose effective address is not naturally aligned to its
+    /// width (threads proposal — atomics trap on a misaligned address, unlike
+    /// ordinary loads/stores which permit any alignment). Traps.
+    UnalignedAtomic,
+    /// `memory.atomic.wait*` on a non-shared memory (threads proposal). Traps.
+    ExpectedSharedMemory,
     /// A memory instruction in a module with no linear memory.
     NoMemory,
     /// A global index out of range (e.g. in a data-segment offset expression).
@@ -498,7 +504,7 @@ pub const Instance = struct {
     /// never owned: a panic in a safety build, silent corruption in ReleaseFast.
     /// (Cross-allocator guest memory has been a bug here three separate times;
     /// every in-repo caller is correct, but the invariant lives on the type now.)
-    pub const Memory = struct { bytes: []u8, max: ?u32 };
+    pub const Memory = struct { bytes: []u8, max: ?u32, shared: bool = false };
 
     /// Memory index 0, or null if the module has no memory. The WASI host and the
     /// C ABI speak the conventional single memory through this.
@@ -821,7 +827,7 @@ pub const Instance = struct {
                     freeGuestMemory(buf);
                     return e;
                 };
-                mem_obj.* = .{ .bytes = buf, .max = mt.limits.max };
+                mem_obj.* = .{ .bytes = buf, .max = mt.limits.max, .shared = mt.limits.shared };
                 memories[i] = mem_obj;
                 built = i + 1;
             }
@@ -2137,6 +2143,10 @@ const Frame = struct {
                     try self.execSimd(instr.imm.simd);
                     pc += 1;
                 },
+                .atomic => {
+                    try self.execAtomic(instr.imm.atomic);
+                    pc += 1;
+                },
 
                 else => {
                     try self.execNumeric(instr.op);
@@ -2870,6 +2880,85 @@ const Frame = struct {
     /// extadd_pairwise, conversions, any/all_true, bitmask, and the relaxed ops
     /// (`0x100`–`0x113`) — via Zig `@Vector`. A v128 in a GC field is the only
     /// v128 case left unhandled; it traps in the struct/array ops, not here.
+    /// Execute a `0xFE` atomic op. Single-threaded, so every read-modify-write is
+    /// trivially atomic and `atomic.fence` is a no-op. All accesses trap on a
+    /// misaligned effective address (unlike ordinary loads/stores), and
+    /// `wait*` requires a shared memory.
+    fn execAtomic(self: *Frame, at: opcode.Atomic) Error!void {
+        const sub = at.sub;
+        if (sub == 0x03) return; // atomic.fence — nothing to order single-threaded
+
+        const w: u64 = @as(u64, 1) << @intCast(opcode.atomicNaturalAlignLog2(sub)); // access width in bytes
+        switch (sub) {
+            0x00 => { // memory.atomic.notify [addr count] -> [woken]
+                _ = self.popI32(); // count (ignored — no waiters single-threaded)
+                _ = try self.atomicEa(at, w, false);
+                try self.pushI32(0); // 0 threads woken
+            },
+            0x01, 0x02 => { // memory.atomic.wait32 / wait64 [addr expected timeout] -> [i32]
+                _ = self.popI64(); // timeout (ignored — we never block)
+                const expected: u64 = if (sub == 0x01) @as(u32, @bitCast(self.popI32())) else @bitCast(self.popI64());
+                const acc = try self.atomicEa(at, w, true); // wait requires shared memory
+                const cur = atomicRead(acc.mem, acc.ea, w);
+                // A mismatch returns 1 ("not equal") immediately. On a match a real
+                // multi-threaded engine blocks; single-threaded there is no thread
+                // to notify, so it "times out" (2).
+                try self.pushI32(if (cur != expected) 1 else 2);
+            },
+            0x10...0x16 => { // atomic load [addr] -> [T]
+                const acc = try self.atomicEa(at, w, false);
+                const v = atomicRead(acc.mem, acc.ea, w);
+                if (atomicIs64(sub)) try self.pushI64(@bitCast(v)) else try self.pushI32(@bitCast(@as(u32, @truncate(v))));
+            },
+            0x17...0x1d => { // atomic store [addr T] -> []
+                const val: u64 = if (atomicIs64(sub)) @bitCast(self.popI64()) else @as(u32, @bitCast(self.popI32()));
+                const acc = try self.atomicEa(at, w, false);
+                atomicWrite(acc.mem, acc.ea, w, val);
+            },
+            0x1e...0x4e => { // rmw (0x1e..0x47) / cmpxchg (0x48..0x4e)
+                const is64 = atomicIs64(sub);
+                const group = (sub - 0x1e) / 7; // 0 add,1 sub,2 and,3 or,4 xor,5 xchg,6 cmpxchg
+                if (group == 6) { // cmpxchg [addr expected replacement] -> [old]
+                    const repl: u64 = if (is64) @bitCast(self.popI64()) else @as(u32, @bitCast(self.popI32()));
+                    const expected: u64 = if (is64) @bitCast(self.popI64()) else @as(u32, @bitCast(self.popI32()));
+                    const acc = try self.atomicEa(at, w, false);
+                    const old = atomicRead(acc.mem, acc.ea, w);
+                    if (old == maskWidth(expected, w)) atomicWrite(acc.mem, acc.ea, w, repl);
+                    if (is64) try self.pushI64(@bitCast(old)) else try self.pushI32(@bitCast(@as(u32, @truncate(old))));
+                } else { // add/sub/and/or/xor/xchg [addr val] -> [old]
+                    const val: u64 = if (is64) @bitCast(self.popI64()) else @as(u32, @bitCast(self.popI32()));
+                    const acc = try self.atomicEa(at, w, false);
+                    const old = atomicRead(acc.mem, acc.ea, w);
+                    const new = switch (group) {
+                        0 => old +% val,
+                        1 => old -% val,
+                        2 => old & val,
+                        3 => old | val,
+                        4 => old ^ val,
+                        else => val, // xchg
+                    };
+                    atomicWrite(acc.mem, acc.ea, w, new);
+                    if (is64) try self.pushI64(@bitCast(old)) else try self.pushI32(@bitCast(@as(u32, @truncate(old))));
+                }
+            },
+            else => return error.UnsupportedInstruction,
+        }
+    }
+
+    /// Pop the address of an atomic access, add the memarg offset, and bounds- +
+    /// alignment-check it. `need_shared` additionally requires the memory to be
+    /// shared (`wait*`). Returns the memory slice and the effective offset.
+    fn atomicEa(self: *Frame, at: opcode.Atomic, width: u64, need_shared: bool) Error!struct { mem: []u8, ea: usize } {
+        const base: u32 = @bitCast(self.popI32());
+        if (at.mem.memory >= self.inst.memories.len) return error.NoMemory;
+        const m = self.inst.memories[at.mem.memory];
+        if (need_shared and !m.shared) return error.ExpectedSharedMemory;
+        const ea = @as(u64, base) + at.mem.offset;
+        if (ea + width > m.bytes.len) return error.MemoryOutOfBounds;
+        if (ea % width != 0) return error.UnalignedAtomic;
+        return .{ .mem = m.bytes, .ea = @intCast(ea) };
+    }
+
     fn execSimd(self: *Frame, s: opcode.Simd) Error!void {
         switch (s.sub) {
             0x0c => try self.pushV128(s.bytes), // v128.const
@@ -3473,6 +3562,45 @@ fn pushConst(stack: *[16]Value, sp: *usize, v: Value) Error!void {
 }
 
 /// Shared integer binary-op semantics for i32 (S=i32,U=u32) and i64.
+/// True if an atomic sub-opcode operates on i64 (else i32). Loads/stores name
+/// the type; rmw/cmpxchg groups of 7 put i64 at positions 1,4,5,6.
+fn atomicIs64(sub: u32) bool {
+    return switch (sub) {
+        0x11, 0x14, 0x15, 0x16, 0x18, 0x1b, 0x1c, 0x1d => true,
+        0x10, 0x12, 0x13, 0x17, 0x19, 0x1a => false,
+        else => switch ((sub - 0x1e) % 7) {
+            1, 4, 5, 6 => true,
+            else => false,
+        },
+    };
+}
+
+/// Keep only the low `width` bytes of `v` (the access width of a sub-width
+/// atomic op).
+fn maskWidth(v: u64, width: u64) u64 {
+    return if (width >= 8) v else v & ((@as(u64, 1) << @intCast(width * 8)) - 1);
+}
+
+/// Read `width` (1/2/4/8) little-endian bytes at `mem[ea..]`, zero-extended.
+fn atomicRead(mem: []const u8, ea: usize, width: u64) u64 {
+    return switch (width) {
+        1 => mem[ea],
+        2 => std.mem.readInt(u16, mem[ea..][0..2], .little),
+        4 => std.mem.readInt(u32, mem[ea..][0..4], .little),
+        else => std.mem.readInt(u64, mem[ea..][0..8], .little),
+    };
+}
+
+/// Write the low `width` bytes of `v` little-endian at `mem[ea..]`.
+fn atomicWrite(mem: []u8, ea: usize, width: u64, v: u64) void {
+    switch (width) {
+        1 => mem[ea] = @truncate(v),
+        2 => std.mem.writeInt(u16, mem[ea..][0..2], @truncate(v), .little),
+        4 => std.mem.writeInt(u32, mem[ea..][0..4], @truncate(v), .little),
+        else => std.mem.writeInt(u64, mem[ea..][0..8], v, .little),
+    }
+}
+
 fn applyInt(comptime S: type, comptime U: type, comptime o: Frame.BinOp, a: S, b: S) Error!S {
     const bits = @typeInfo(S).int.bits;
     const Shift = std.math.Log2Int(U);

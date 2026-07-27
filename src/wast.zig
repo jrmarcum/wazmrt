@@ -602,6 +602,8 @@ fn isRuntimeTrap(e: anyerror) bool {
         error.IntOverflow,
         error.InvalidConversionToInt,
         error.MemoryOutOfBounds,
+        error.UnalignedAtomic, // atomic op on a misaligned address (threads)
+        error.ExpectedSharedMemory, // atomic.wait on a non-shared memory (threads)
         error.TableOutOfBounds,
         error.UninitializedElement,
         error.IndirectTypeMismatch,
@@ -1069,6 +1071,48 @@ test "exception handling: assert_return on a caught exn, assert_trap on an uncau
     const s = try runScript(std.testing.allocator, src);
     try std.testing.expectEqual(@as(usize, 2), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "atomics: a misaligned access traps; a naturally aligned one does not" {
+    const src =
+        \\(module (memory 1)
+        \\  (func (export "aligned") (result i32) (i32.atomic.load (i32.const 4)))
+        \\  (func (export "misaligned") (result i32) (i32.atomic.load (i32.const 3))))
+        \\(assert_return (invoke "aligned") (i32.const 0))
+        \\(assert_trap (invoke "misaligned") "unaligned atomic")
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 2), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "atomics: wait/notify semantics; wait requires shared memory" {
+    // On a shared memory: notify wakes 0 (single-threaded), and wait returns 1
+    // ("not equal") when the value differs from `expected`. init writes 0xff… so
+    // the compared value is non-zero and `expected` 0 mismatches.
+    const shared =
+        \\(module
+        \\  (memory 1 1 shared)
+        \\  (func (export "init") (i64.store (i32.const 0) (i64.const 0xffffffffffff)))
+        \\  (func (export "notify") (result i32) (memory.atomic.notify (i32.const 0) (i32.const 0)))
+        \\  (func (export "wait32") (result i32) (memory.atomic.wait32 (i32.const 0) (i32.const 0) (i64.const 0))))
+        \\(invoke "init")
+        \\(assert_return (invoke "notify") (i32.const 0))
+        \\(assert_return (invoke "wait32") (i32.const 1))
+    ;
+    const s = try runScript(std.testing.allocator, shared);
+    try std.testing.expectEqual(@as(usize, 2), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+
+    // wait on a NON-shared memory traps.
+    const nonshared =
+        \\(module (memory 1)
+        \\  (func (export "w") (result i32) (memory.atomic.wait32 (i32.const 0) (i32.const 0) (i64.const 0))))
+        \\(assert_trap (invoke "w") "expected shared memory")
+    ;
+    const s2 = try runScript(std.testing.allocator, nonshared);
+    try std.testing.expectEqual(@as(usize, 1), s2.passed);
+    try std.testing.expectEqual(@as(usize, 0), s2.failed);
 }
 
 test "unbounded recursion traps CallStackExhausted instead of overflowing the host stack" {

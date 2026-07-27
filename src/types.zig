@@ -302,10 +302,10 @@ pub const DecodeError = error{
     /// The data-count section disagreed with the number of data segments.
     DataCountMismatch,
     /// An instruction opcode wazmrt does not decode. The `0xFC` (saturating
-    /// truncation, bulk memory, table ops), `0xFD` (the complete SIMD set) and
-    /// `0xFB` (GC) prefixes are all implemented, as is exception handling in both
-    /// encodings — **only threads/atomics remain** (corrected 2026-07-21; this
-    /// doc still listed SIMD and EH as gaps long after both shipped).
+    /// truncation, bulk memory, table ops), `0xFD` (the complete SIMD set),
+    /// `0xFB` (GC) and `0xFE` (threads/atomics) prefixes are all implemented, as
+    /// is exception handling in both encodings — **only the memory64 proposal
+    /// remains** (corrected 2026-07-22; atomics shipped that day).
     ///
     /// Also returned for a **raw byte in `0xD7`–`0xFA`**: those are internal `Op`
     /// tags for prefixed ops, never valid single-byte encodings (see `opcode.zig`).

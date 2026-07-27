@@ -155,7 +155,7 @@ const GlobalDef = struct { valtype: V, mutable: bool, init: []const Sexpr };
 /// An imported global (`(global (import "m" "n") type)`).
 const ImportedGlobal = struct { module: []const u8, name: []const u8, valtype: V, mutable: bool };
 const ImportedTable = struct { module: []const u8, name: []const u8, min: u32, max: ?u32, elem: V };
-const ImportedMemory = struct { module: []const u8, name: []const u8, min: u32, max: ?u32 };
+const ImportedMemory = struct { module: []const u8, name: []const u8, min: u32, max: ?u32, shared: bool = false };
 
 /// Assemble the first `(module …)` form found in `src`.
 pub fn assemble(a: std.mem.Allocator, src: []const u8) Error![]const u8 {
@@ -221,7 +221,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // Defined memories (multi-memory). Each `(memory …)` appends here; the memory
     // section emits them in order. Imported memories take the low indices, so
     // `mem_names` (below) spans BOTH — imports first, definitions after.
-    var memories: List(struct { min: u32, max: ?u32 }) = .empty;
+    var memories: List(struct { min: u32, max: ?u32, shared: bool = false }) = .empty;
     // Memory names, index-aligned with the memory INDEX space (imported memories
     // first, then defined). Lets a `$name` resolve everywhere it can appear:
     // `(export "m" (memory $x))`, `(i32.load $x …)`, `memory.size $x`,
@@ -341,12 +341,18 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             while (mi < items.len and eqKw(items[mi], "export")) : (mi += 1)
                 try exports.append(a, .{ .name = try fieldStr(items[mi], 1), .kind = 2, .index = midx });
             if (mi < items.len and eqKw(items[mi], "import")) {
-                // (memory (export …)* (import "m" "n") min max?)
+                // (memory (export …)* (import "m" "n") min max? shared?)
                 const imp = (try wantList(items[mi]));
                 mi += 1;
                 const mmin = try parseIndex(try nth(items, mi));
-                const mmax: ?u32 = if (mi + 1 < items.len) try parseIndex(items[mi + 1]) else null;
-                try mem_imports.append(a, .{ .module = (try strAt(imp, 1)), .name = (try strAt(imp, 2)), .min = mmin, .max = mmax });
+                mi += 1;
+                var mmax: ?u32 = null;
+                if (mi < items.len and items[mi].asAtom() != null and !eqAtom(items[mi], "shared")) {
+                    mmax = try parseIndex(items[mi]);
+                    mi += 1;
+                }
+                const shared = mi < items.len and eqAtom(items[mi], "shared");
+                try mem_imports.append(a, .{ .module = (try strAt(imp, 1)), .name = (try strAt(imp, 2)), .min = mmin, .max = mmax, .shared = shared });
             } else if (mi < items.len and eqKw(items[mi], "data")) {
                 // (memory (data "…")) — size the memory to the bytes and append an
                 // active data segment at offset 0 targeting THIS memory.
@@ -365,9 +371,17 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 try data_names.append(a, null);
                 try datas.append(a, .{ .mem_index = midx, .offset_form = .{ .list = off }, .bytes = bytes.items });
             } else {
+                // (memory $m? min max? shared?) — `shared` (threads) follows the
+                // limits and requires a max.
                 const mmin = try parseIndex(try nth(items, mi));
-                const mmax: ?u32 = if (mi + 1 < items.len) try parseIndex(items[mi + 1]) else null;
-                try memories.append(a, .{ .min = mmin, .max = mmax });
+                mi += 1;
+                var mmax: ?u32 = null;
+                if (mi < items.len and items[mi].asAtom() != null and !eqAtom(items[mi], "shared")) {
+                    mmax = try parseIndex(items[mi]);
+                    mi += 1;
+                }
+                const shared = mi < items.len and eqAtom(items[mi], "shared");
+                try memories.append(a, .{ .min = mmin, .max = mmax, .shared = shared });
             }
             try mem_names.append(a, this_name);
         } else if (std.mem.eql(u8, kw, "data")) {
@@ -617,7 +631,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 try nameBytes(a, &s, t.name);
                 try s.append(a, 0x01); // table import
                 try emitValType(a, &s, t.elem); // element reftype
-                try emitLimits(a, &s, t.min, t.max);
+                try emitLimits(a, &s, t.min, t.max, false);
                 ci[1] += 1;
             },
             .mem => {
@@ -625,7 +639,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 try nameBytes(a, &s, m.module);
                 try nameBytes(a, &s, m.name);
                 try s.append(a, 0x02); // memory import
-                try emitLimits(a, &s, m.min, m.max);
+                try emitLimits(a, &s, m.min, m.max, m.shared);
                 ci[2] += 1;
             },
             .global => {
@@ -653,7 +667,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         try uleb(a, &s, tables.items.len);
         for (tables.items) |t| {
             try emitValType(a, &s, t.elem); // element reftype (funcref / externref)
-            try emitLimits(a, &s, t.min, t.max);
+            try emitLimits(a, &s, t.min, t.max, false);
         }
         try emitSection(a, &out, 4, s.items);
     }
@@ -662,7 +676,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     if (memories.items.len != 0) {
         var s: List(u8) = .empty;
         try uleb(a, &s, memories.items.len);
-        for (memories.items) |m| try emitLimits(a, &s, m.min, m.max);
+        for (memories.items) |m| try emitLimits(a, &s, m.min, m.max, m.shared);
         try emitSection(a, &out, 5, s.items);
     }
     // Tag section (13) — exception tags. Ordered after memory (5) and before
@@ -1401,6 +1415,10 @@ fn emitFoldedOne(ctx: *Ctx, l: []const Sexpr, i: usize) Error!usize {
         _ = try emitSimd(ctx, sd, l, 1, true);
         return i + 1;
     }
+    if (lookupAtomic(kw)) |sub| {
+        _ = try emitAtomic(ctx, sub, l, 1, true);
+        return i + 1;
+    }
     const op = lookupOp(kw) orelse return error.UnknownInstr;
     switch (op) {
         .block, .loop => try emitFoldedBlock(ctx, op, l),
@@ -1661,6 +1679,7 @@ fn emitFoldedIf(ctx: *Ctx, l: []const Sexpr) Error!void {
 /// A flat instruction at `items[i]` (`name` is its atom); return the next index.
 fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Error!usize {
     if (lookupSimd(name)) |sd| return emitSimd(ctx, sd, items, i + 1, false);
+    if (lookupAtomic(name)) |sub| return emitAtomic(ctx, sub, items, i + 1, false);
     const op = lookupOp(name) orelse return error.UnknownInstr;
     switch (op) {
         .block, .loop, .@"if" => {
@@ -2279,6 +2298,103 @@ fn emitSimd(ctx: *Ctx, sd: SimdOp, items: []const Sexpr, start: usize, is_folded
     return j;
 }
 
+/// Map an atomic (`0xFE`) mnemonic to its sub-opcode, or null. The rmw/cmpxchg
+/// families are laid out in groups of 7 from 0x1e (add), then sub/and/or/xor/
+/// xchg/cmpxchg, each `[i32.full, i64.full, i32.8, i32.16, i64.8, i64.16,
+/// i64.32]`.
+fn lookupAtomic(name: []const u8) ?u32 {
+    const E = struct { n: []const u8, s: u32 };
+    const tbl = [_]E{
+        .{ .n = "memory.atomic.notify", .s = 0x00 }, .{ .n = "memory.atomic.wait32", .s = 0x01 },
+        .{ .n = "memory.atomic.wait64", .s = 0x02 }, .{ .n = "atomic.fence", .s = 0x03 },
+        // loads
+        .{ .n = "i32.atomic.load", .s = 0x10 },      .{ .n = "i64.atomic.load", .s = 0x11 },
+        .{ .n = "i32.atomic.load8_u", .s = 0x12 },   .{ .n = "i32.atomic.load16_u", .s = 0x13 },
+        .{ .n = "i64.atomic.load8_u", .s = 0x14 },   .{ .n = "i64.atomic.load16_u", .s = 0x15 },
+        .{ .n = "i64.atomic.load32_u", .s = 0x16 },
+        // stores
+        .{ .n = "i32.atomic.store", .s = 0x17 },     .{ .n = "i64.atomic.store", .s = 0x18 },
+        .{ .n = "i32.atomic.store8", .s = 0x19 },    .{ .n = "i32.atomic.store16", .s = 0x1a },
+        .{ .n = "i64.atomic.store8", .s = 0x1b },    .{ .n = "i64.atomic.store16", .s = 0x1c },
+        .{ .n = "i64.atomic.store32", .s = 0x1d },
+        // rmw add (0x1e), sub (0x25), and (0x2c), or (0x33), xor (0x3a), xchg (0x41)
+        .{ .n = "i32.atomic.rmw.add", .s = 0x1e },      .{ .n = "i64.atomic.rmw.add", .s = 0x1f },
+        .{ .n = "i32.atomic.rmw8.add_u", .s = 0x20 },   .{ .n = "i32.atomic.rmw16.add_u", .s = 0x21 },
+        .{ .n = "i64.atomic.rmw8.add_u", .s = 0x22 },   .{ .n = "i64.atomic.rmw16.add_u", .s = 0x23 },
+        .{ .n = "i64.atomic.rmw32.add_u", .s = 0x24 },
+        .{ .n = "i32.atomic.rmw.sub", .s = 0x25 },      .{ .n = "i64.atomic.rmw.sub", .s = 0x26 },
+        .{ .n = "i32.atomic.rmw8.sub_u", .s = 0x27 },   .{ .n = "i32.atomic.rmw16.sub_u", .s = 0x28 },
+        .{ .n = "i64.atomic.rmw8.sub_u", .s = 0x29 },   .{ .n = "i64.atomic.rmw16.sub_u", .s = 0x2a },
+        .{ .n = "i64.atomic.rmw32.sub_u", .s = 0x2b },
+        .{ .n = "i32.atomic.rmw.and", .s = 0x2c },      .{ .n = "i64.atomic.rmw.and", .s = 0x2d },
+        .{ .n = "i32.atomic.rmw8.and_u", .s = 0x2e },   .{ .n = "i32.atomic.rmw16.and_u", .s = 0x2f },
+        .{ .n = "i64.atomic.rmw8.and_u", .s = 0x30 },   .{ .n = "i64.atomic.rmw16.and_u", .s = 0x31 },
+        .{ .n = "i64.atomic.rmw32.and_u", .s = 0x32 },
+        .{ .n = "i32.atomic.rmw.or", .s = 0x33 },       .{ .n = "i64.atomic.rmw.or", .s = 0x34 },
+        .{ .n = "i32.atomic.rmw8.or_u", .s = 0x35 },    .{ .n = "i32.atomic.rmw16.or_u", .s = 0x36 },
+        .{ .n = "i64.atomic.rmw8.or_u", .s = 0x37 },    .{ .n = "i64.atomic.rmw16.or_u", .s = 0x38 },
+        .{ .n = "i64.atomic.rmw32.or_u", .s = 0x39 },
+        .{ .n = "i32.atomic.rmw.xor", .s = 0x3a },      .{ .n = "i64.atomic.rmw.xor", .s = 0x3b },
+        .{ .n = "i32.atomic.rmw8.xor_u", .s = 0x3c },   .{ .n = "i32.atomic.rmw16.xor_u", .s = 0x3d },
+        .{ .n = "i64.atomic.rmw8.xor_u", .s = 0x3e },   .{ .n = "i64.atomic.rmw16.xor_u", .s = 0x3f },
+        .{ .n = "i64.atomic.rmw32.xor_u", .s = 0x40 },
+        .{ .n = "i32.atomic.rmw.xchg", .s = 0x41 },     .{ .n = "i64.atomic.rmw.xchg", .s = 0x42 },
+        .{ .n = "i32.atomic.rmw8.xchg_u", .s = 0x43 },  .{ .n = "i32.atomic.rmw16.xchg_u", .s = 0x44 },
+        .{ .n = "i64.atomic.rmw8.xchg_u", .s = 0x45 },  .{ .n = "i64.atomic.rmw16.xchg_u", .s = 0x46 },
+        .{ .n = "i64.atomic.rmw32.xchg_u", .s = 0x47 },
+        // cmpxchg (0x48)
+        .{ .n = "i32.atomic.rmw.cmpxchg", .s = 0x48 },     .{ .n = "i64.atomic.rmw.cmpxchg", .s = 0x49 },
+        .{ .n = "i32.atomic.rmw8.cmpxchg_u", .s = 0x4a },  .{ .n = "i32.atomic.rmw16.cmpxchg_u", .s = 0x4b },
+        .{ .n = "i64.atomic.rmw8.cmpxchg_u", .s = 0x4c },  .{ .n = "i64.atomic.rmw16.cmpxchg_u", .s = 0x4d },
+        .{ .n = "i64.atomic.rmw32.cmpxchg_u", .s = 0x4e },
+    };
+    inline for (tbl) |e| if (std.mem.eql(u8, name, e.n)) return e.s;
+    return null;
+}
+
+/// Emit a `0xFE` atomic op. `atomic.fence` (0x03) takes a reserved `0x00`;
+/// every other op takes a memarg (optional leading memory index, `offset=`,
+/// `align=`; the default alignment is the required natural one). `is_folded`
+/// emits the operand sub-expressions first.
+fn emitAtomic(ctx: *Ctx, sub: u32, items: []const Sexpr, start: usize, is_folded: bool) Error!usize {
+    var j = start;
+    if (sub == 0x03) { // atomic.fence: reserved byte, no operands
+        try ctx.out.append(ctx.a, 0xfe);
+        try uleb(ctx.a, ctx.out, sub);
+        try ctx.out.append(ctx.a, 0x00);
+        return j;
+    }
+    var align_log2: u32 = opcode.atomicNaturalAlignLog2(sub);
+    var offset: u64 = 0;
+    var mem_idx: u32 = 0;
+    while (j < items.len) {
+        const atom = items[j].asAtom() orelse break;
+        if (std.mem.startsWith(u8, atom, "offset=")) {
+            offset = std.fmt.parseInt(u64, atom[7..], 0) catch return error.BadImmediate;
+        } else if (std.mem.startsWith(u8, atom, "align=")) {
+            const by = std.fmt.parseInt(u32, atom[6..], 0) catch return error.BadImmediate;
+            if (by == 0 or (by & (by - 1)) != 0) return error.BadImmediate;
+            align_log2 = @ctz(by);
+        } else if (isIndexAtom(items[j])) {
+            mem_idx = try resolveByName(ctx.mem_names, items[j]);
+        } else break;
+        j += 1;
+    }
+    if (is_folded) while (j < items.len) {
+        j = try emitOne(ctx, items, j);
+    };
+    try ctx.out.append(ctx.a, 0xfe);
+    try uleb(ctx.a, ctx.out, sub);
+    if (mem_idx != 0) { // multi-memory: bit 6 flags an explicit index
+        try uleb(ctx.a, ctx.out, align_log2 | 0x40);
+        try uleb(ctx.a, ctx.out, mem_idx);
+    } else {
+        try uleb(ctx.a, ctx.out, align_log2);
+    }
+    try uleb(ctx.a, ctx.out, offset);
+    return j;
+}
+
 /// Parse a `v128.const <shape> <values…>` immediate into 16 little-endian bytes.
 fn parseV128Const(items: []const Sexpr, start: usize, out: *[16]u8) Error!usize {
     var j = start;
@@ -2647,15 +2763,12 @@ fn nameBytes(a: std.mem.Allocator, out: *List(u8), name: []const u8) Error!void 
 }
 
 /// Emit a `limits` (§5.3.7): flag byte (0x01 if a max is present) then min[, max].
-fn emitLimits(a: std.mem.Allocator, out: *List(u8), min: u32, max: ?u32) Error!void {
-    if (max) |mx| {
-        try out.append(a, 0x01);
-        try uleb(a, out, min);
-        try uleb(a, out, mx);
-    } else {
-        try out.append(a, 0x00);
-        try uleb(a, out, min);
-    }
+fn emitLimits(a: std.mem.Allocator, out: *List(u8), min: u32, max: ?u32, shared: bool) Error!void {
+    // Flag bits: 0 = has max, 1 = shared (threads; memories only).
+    const flag: u8 = (if (max != null) @as(u8, 0x01) else 0) | (if (shared) @as(u8, 0x02) else 0);
+    try out.append(a, flag);
+    try uleb(a, out, min);
+    if (max) |mx| try uleb(a, out, mx);
 }
 
 fn emitSection(a: std.mem.Allocator, out: *List(u8), id: u8, payload: []const u8) Error!void {
@@ -3348,6 +3461,66 @@ test "dispatches call_indirect through distinct named tables" {
     try std.testing.expectEqual(@as(i32, 2), interp.asI32(try assembleAndRun(src, "via1", &.{})));
 }
 
+test "atomics: load/store/rmw/cmpxchg execute correctly (values vs wasmtime)" {
+    // rmw.add returns the OLD value and writes old+val.
+    const add =
+        \\(module (memory 1)
+        \\  (func (export "f") (result i32)
+        \\    (i32.atomic.store (i32.const 0) (i32.const 10))
+        \\    (drop (i32.atomic.rmw.add (i32.const 0) (i32.const 5)))
+        \\    (i32.atomic.load (i32.const 0))))
+    ;
+    try std.testing.expectEqual(@as(i32, 15), interp.asI32(try assembleAndRun(add, "f", &.{})));
+
+    // cmpxchg replaces on a match, leaves memory on a mismatch.
+    const cx =
+        \\(module (memory 1)
+        \\  (func (export "hit") (result i32)
+        \\    (i32.atomic.store (i32.const 0) (i32.const 100))
+        \\    (drop (i32.atomic.rmw.cmpxchg (i32.const 0) (i32.const 100) (i32.const 999)))
+        \\    (i32.atomic.load (i32.const 0)))
+        \\  (func (export "miss") (result i32)
+        \\    (i32.atomic.store (i32.const 4) (i32.const 100))
+        \\    (drop (i32.atomic.rmw.cmpxchg (i32.const 4) (i32.const 7) (i32.const 999)))
+        \\    (i32.atomic.load (i32.const 4))))
+    ;
+    try std.testing.expectEqual(@as(i32, 999), interp.asI32(try assembleAndRun(cx, "hit", &.{})));
+    try std.testing.expectEqual(@as(i32, 100), interp.asI32(try assembleAndRun(cx, "miss", &.{})));
+
+    // Sub-width rmw wraps at the access width: 0x1FF as a byte is 0xFF, +1 = 0x00.
+    const rmw8 =
+        \\(module (memory 1)
+        \\  (func (export "f") (result i32)
+        \\    (i32.atomic.store (i32.const 8) (i32.const 0x1FF))
+        \\    (drop (i32.atomic.rmw8.add_u (i32.const 8) (i32.const 1)))
+        \\    (i32.atomic.load8_u (i32.const 8))))
+    ;
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(rmw8, "f", &.{})));
+
+    // i64.atomic.rmw.add returns the old 64-bit value.
+    const i64x =
+        \\(module (memory 1)
+        \\  (func (export "f") (result i64)
+        \\    (i64.atomic.store (i32.const 16) (i64.const 0x100000000))
+        \\    (i64.atomic.rmw.add (i32.const 16) (i64.const 5))))
+    ;
+    try std.testing.expectEqual(@as(i64, 0x100000000), interp.asI64(try assembleAndRun(i64x, "f", &.{})));
+}
+
+test "atomics: the validator requires the natural alignment" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // i32.atomic.load must be align=4; align=1 is invalid (atomics are exact,
+    // not "at most natural" like ordinary loads).
+    const bad = try assemble(a, "(module (memory 1) (func (result i32) (i32.atomic.load align=1 (i32.const 0))))");
+    var m = try Module.decode(a, bad);
+    try std.testing.expectError(error.InvalidAlignment, validate(a, &m));
+    // The natural alignment assembles and validates.
+    const ok = try assemble(a, "(module (memory 1) (func (result i32) (i32.atomic.load align=4 (i32.const 0))))");
+    var m2 = try Module.decode(a, ok);
+    try validate(a, &m2);
+}
 test "multi-memory: loads/stores/fill/copy/init/size/grow target the right memory" {
     // A self-contained two-memory module. Each op names its memory by identifier;
     // the assembler emits the bit-6 memarg form and the per-op memory indices.
