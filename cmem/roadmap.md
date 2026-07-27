@@ -20,6 +20,20 @@ base-suite edge cases: **core spec suite 58.6k → 59,705 passing / 394 failed.*
 Debug AND ReleaseSafe; c-smoke 319/319. With this, every wasm proposal wazmrt targets is implemented** —
 only #8 (upstream Zig) and out-of-scope harness command forms remain.
 
+**Then (2026-07-27, same day) — a "look for code issues" audit + the deferred-item cleanup.** Four
+parallel investigators over the fresh memory64 code found two real gaps at the memory64×{u64-offset, SIMD}
+intersections (which no single-feature test exercises) + two minor finds, all fixed (`f478f79`): the
+memarg **offset was decoded as u32** (memory64 widens it to u64 — a valid `offset=0x1_0000_0000` was
+rejected at decode, and the assembler already emitted u64, a round-trip break), **SIMD v128 memory ops
+were memory64-blind** (i32 address hard-coded in validator + interp), a dead `max_atomic_sub` const, and a
+wrapping `\u{…}` escape. Then all four audit-**deferred** items were closed (`e276d09`), all `wat.zig`:
+**multi-memory SIMD text** (`v128.load8_lane $m …` → SIMD suite 24,956/0), the **canonical index-type
+ordering** (`(memory (export "m") i64 1)`), a **de-duplicated limits parser** (`parseMemLimits`), and
+**`uleb` widened to u64**. **Every wasm proposal now has complete text-assembly support**; the one
+remaining assembler gap is **`tag` imports** (the text form — tag imports already work at the
+binary/runtime level since Phase 6.2). Full main testsuite 60,310 → **60,668 passed**; **483 local tests
+green (Debug + ReleaseSafe)**.
+
 **Latest (2026-07-22) — the "open items 1–7" batch.** After the 13th pass the remaining list was walked
 end to end (see `known-issues.md` for the per-item detail). Six real fixes, each verified by executing the
 result and, where a live reference implementation exists, cross-checked against **wasmtime**:
