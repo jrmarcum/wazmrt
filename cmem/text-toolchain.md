@@ -64,8 +64,14 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
   expressions; and the **whole `0xFE` atomics family** (a 66-entry mnemonic table + `emitAtomic`, the
   `shared` memory keyword). **memory64 text DONE 2026-07-27** (Item 3): `(memory i64 …)` declarations +
   imports, u64 limits, the 64-bit section flag, and i64 offsets for the inline `(memory i64 (data …))`
-  form — every wasm proposal wazmrt targets now has text-assembly support. **Still deferred in wat.zig:**
-  tag imports (the last remaining assembler gap).
+  form. **Multi-memory SIMD text + index-type ordering DONE 2026-07-27** (audit deferred-item cleanup):
+  v128 load/store(+lane) ops take a leading explicit memory index (`v128.load8_lane $m 1 …` → bit-6 memarg
+  form; SIMD suite 24,956/0), and a memory's `i64`/`i32` index type is accepted in its canonical position
+  after the inline export/import clauses (not only right after the name). One `parseMemLimits` helper now
+  backs all three memory-declaration sites; `emitMemArgBytes`/`simdLaneByte` are the single homes for the
+  memarg encoding and the SIMD lane byte. **Every wasm proposal wazmrt targets now has text-assembly
+  support. Still deferred in wat.zig:** `tag` imports — the last remaining assembler gap (a separate
+  feature, not proposal-related).
 - **`src/wast.zig`** (DONE 2026-07-02, extended 2026-07-09) — WAST script runner: `(module …)` text +
   `(module binary …)`, `assert_return`, **`assert_trap` (genuine runtime traps only — `isRuntimeTrap`),
   `assert_exhaustion`, `assert_invalid`/`assert_malformed` (the inner module must be rejected)**,

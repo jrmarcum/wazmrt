@@ -260,19 +260,27 @@ on i32 (both cross-checked vs wasmtime); +3 regression tests in `wat.zig`. **479
 Debug AND ReleaseSafe; c-smoke 319/319. SIMD spec suite 24,956/1; memory64 spec 601/1** — the two "1"s are
 pre-existing/out-of-scope, not regressions.
 
-**Noted, deferred (not bugs, or separate features — recorded so they're not re-discovered as "new"):**
-- **Multi-memory SIMD *text*** — `v128.load8_lane $m 1 …` (an explicit memory index on a SIMD lane op) is
-  not assembled → `UnknownInstr`; this is the one `simd_memory-multi.wast` failure. The runtime/decoder
-  handle the bit-6 memory index; only the *assembler's* SIMD-lane text form lacks it. Sibling of the
-  multi-memory text batch, which wired `memOperand` into scalar load/store and `memory.*` but not the
-  `0xFD` lane ops.
-- **WAT index-type ordering asymmetry** — the assembler parses `i64`/`i32` right after the name, so it
-  accepts `(memory i64 (export "m") 1)` but *rejects* the canonical `(memory (export "m") i64 1)` (index
-  type belongs after the inline export/import clauses). Errors cleanly (`BadImmediate`), never mis-emits.
-- **Triple-duplicated memory-limits parser** in `wat.zig` (inline import / inline defined / `(import …
-  (memory …))`) — consistent today, no shared helper, so a future fix could drift.
-- **`emitLimits` `@intCast(u64→usize)`** truncates a ≥2^32 page count on the *wasm32 self-host* build only
-  (native x64 `usize`=u64 is fine); such a memory no wasm32 host could instantiate anyway.
+**All four deferred items CLOSED same day (`e276d09`)** — all `wat.zig` assembler surface, each verified by
+executing the result (values cross-checked vs wasmtime where a live oracle exists):
+- **Multi-memory SIMD text** — `v128.load8_lane $m 1 …` / `v128.store $b …` now assemble (the leading
+  explicit memory index emits the bit-6 memarg form). memidx and laneidx are both bare numbers, so the
+  parse collects the whole leading atom run: the last atom is the lane, a plain non-`offset=`/`align=` atom
+  is the memory index. Fixed the one `simd_memory-multi.wast` failure → **SIMD spec suite 24,956/0** (was
+  /1). Values: store32_lane→40, extract of a v128.load→300 (both match wasmtime `-W multi-memory=y`).
+- **WAT index-type ordering** — the index type is now accepted in its canonical position (after the inline
+  `(export …)`/`(import …)` clauses), not only right after the name; `(memory (export "m") i64 1)` no
+  longer rejected.
+- **De-duplicated the memory-limits parser** into one `parseMemLimits` helper (was three copy-pasted
+  sites), which is also where the canonical index-type position is handled. Same one-home treatment for the
+  memarg encoding (`emitMemArgBytes`, shared scalar+SIMD) and the SIMD lane byte (`simdLaneByte`).
+- **`uleb` widened to u64** so `emitLimits` no longer `@intCast`s a memory64 page count to u32 on the
+  wasm32 self-host build.
+
+Net of closing the deferred list: full main testsuite 60,310 → **60,668 passed / 608 → 569 failed** (the
+delta is these changes; no regression), memory64 dir unchanged at 601/1. +4 regression tests; **483 local
+tests green under Debug AND ReleaseSafe; c-smoke 319/319. Every wasm proposal wazmrt targets now has
+complete text-assembly support** — `tag` imports remain the one known assembler gap (a separate feature,
+not memory64-related).
 
 ## Code audit 2026-07-19 ("look for code issues") — 8 fixed, a few deferred
 
