@@ -260,8 +260,10 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         try parseTypeBody(a, form, type_names.items, &sigs, &gc_types, &gc_field_names, &gc_supers);
 
     // Pass 1: collect the remaining definitions. Imports (top-level or inline)
-    // must precede every func/table/memory/global definition (§6.6.13), so an
-    // import after a definition is rejected rather than silently mis-indexed.
+    // must precede every func/table/memory/global/tag definition (§6.6.13), so an
+    // import after a definition is rejected rather than silently mis-indexed. Tags
+    // are in `isDefKind` for this reason: an imported tag takes a low tag index, so
+    // a defined tag before it would otherwise mis-align the source-order tag space.
     var seen_definition = false;
     for (module[start..]) |field| {
         const kw = field.keyword() orelse return error.BadModuleField;
@@ -355,11 +357,16 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 mi += 1;
             }
             // Optional index type `i64` (memory64) / `i32`, right after the name.
+            // `this_type_seen` blocks a SECOND index type in the canonical position
+            // (`parseMemLimits`), so `(memory i64 i64 1)` is rejected, not doubled.
             var this_is64 = false;
+            var this_type_seen = false;
             if (mi < items.len and eqAtom(items[mi], "i64")) {
                 this_is64 = true;
+                this_type_seen = true;
                 mi += 1;
             } else if (mi < items.len and eqAtom(items[mi], "i32")) {
+                this_type_seen = true;
                 mi += 1;
             }
             // This memory's index in the index space (imports precede defs).
@@ -370,7 +377,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 // (memory (export …)* (import "m" "n") min max? shared?)
                 const imp = (try wantList(items[mi]));
                 mi += 1;
-                const lim = try parseMemLimits(items, &mi, this_is64);
+                const lim = try parseMemLimits(items, &mi, this_is64, this_type_seen);
                 try mem_imports.append(a, .{ .module = (try strAt(imp, 1)), .name = (try strAt(imp, 2)), .min = lim.min, .max = lim.max, .shared = lim.shared, .is64 = lim.is64 });
             } else if (mi < items.len and eqKw(items[mi], "data")) {
                 // (memory (data "…")) — size the memory to the bytes and append an
@@ -394,7 +401,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 // (memory $m? i64? (export …)* i64? min max? shared?) — the index
                 // type may sit here (canonical) or right after the name; `shared`
                 // (threads) follows the limits and requires a max.
-                const lim = try parseMemLimits(items, &mi, this_is64);
+                const lim = try parseMemLimits(items, &mi, this_is64, this_type_seen);
                 try memories.append(a, .{ .min = lim.min, .max = lim.max, .shared = lim.shared, .is64 = lim.is64 });
             }
             try mem_names.append(a, this_name);
@@ -496,7 +503,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                     mname = desc[mi2].atom;
                     mi2 += 1;
                 }
-                const lim = try parseMemLimits(desc, &mi2, false);
+                const lim = try parseMemLimits(desc, &mi2, false, false);
                 try mem_imports.append(a, .{ .module = (try strAt(items, 1)), .name = (try strAt(items, 2)), .min = lim.min, .max = lim.max, .shared = lim.shared, .is64 = lim.is64 });
                 try mem_names.append(a, mname);
             } else if (std.mem.eql(u8, dkw, "tag")) {
@@ -843,7 +850,8 @@ fn encodeDataSection(a: std.mem.Allocator, datas: []const DataSeg, sigs: *List(S
 /// A module field that defines an index-space entry (func/table/memory/global).
 fn isDefKind(kw: []const u8) bool {
     return std.mem.eql(u8, kw, "func") or std.mem.eql(u8, kw, "table") or
-        std.mem.eql(u8, kw, "memory") or std.mem.eql(u8, kw, "global");
+        std.mem.eql(u8, kw, "memory") or std.mem.eql(u8, kw, "global") or
+        std.mem.eql(u8, kw, "tag");
 }
 
 /// True if `field` is an import: a top-level `(import …)` or a def-kind field with
@@ -2306,7 +2314,15 @@ fn emitSimd(ctx: *Ctx, sd: SimdOp, items: []const Sexpr, start: usize, is_folded
             // explicit memory index (multi-memory), which must precede the memarg.
             var atoms: [8]Sexpr = undefined;
             var na: usize = 0;
-            while (j < items.len and items[j].asAtom() != null) : (j += 1) {
+            // Collect ONLY memarg atoms (`offset=`/`align=`) and index-like atoms
+            // (the memidx and, for lane ops, the laneidx). Stop at anything else:
+            // in FLAT form `items` is the whole sibling instruction sequence, so a
+            // following mnemonic (`drop`, `i32.const`) is not index-like and must
+            // NOT be swallowed as a memidx/lane. Mirrors the scalar `.mem` flat loop.
+            while (j < items.len) : (j += 1) {
+                const atom = items[j].asAtom() orelse break;
+                const is_memarg = std.mem.startsWith(u8, atom, "offset=") or std.mem.startsWith(u8, atom, "align=");
+                if (!is_memarg and !isIndexAtom(items[j])) break;
                 if (na >= atoms.len) return error.BadImmediate;
                 atoms[na] = items[j];
                 na += 1;
@@ -2554,13 +2570,18 @@ const MemLimits = struct { min: u64, max: ?u64 = null, shared: bool = false, is6
 /// emit); either position is accepted, neither required. Advances `mi`. One home
 /// for the parse the three memory sites (inline defined / inline import /
 /// top-level `(import … (memory …))`) used to each copy.
-fn parseMemLimits(items: []const Sexpr, mi: *usize, is64_seen: bool) Error!MemLimits {
+fn parseMemLimits(items: []const Sexpr, mi: *usize, is64_seen: bool, type_seen: bool) Error!MemLimits {
     var is64 = is64_seen;
-    if (mi.* < items.len and eqAtom(items[mi.*], "i64")) {
-        is64 = true;
-        mi.* += 1;
-    } else if (mi.* < items.len and eqAtom(items[mi.*], "i32")) {
-        mi.* += 1;
+    // Consume the index type here only if one wasn't already taken after the name
+    // — otherwise a doubled `(memory i64 i64 1)` would be silently accepted (the
+    // leftover `i64` then fails `parseU64` as a non-number, which is the rejection).
+    if (!type_seen) {
+        if (mi.* < items.len and eqAtom(items[mi.*], "i64")) {
+            is64 = true;
+            mi.* += 1;
+        } else if (mi.* < items.len and eqAtom(items[mi.*], "i32")) {
+            mi.* += 1;
+        }
     }
     const min = try parseU64(try nth(items, mi.*));
     mi.* += 1;
@@ -3771,6 +3792,29 @@ test "wat: a memory's index type is accepted in its canonical post-clause positi
         try validate(a, &d);
         try std.testing.expect(d.memories[0].limits.is64);
     }
+    // A SECOND index type is rejected (a stray/typo'd token, not doubled silently).
+    try std.testing.expectError(error.BadImmediate, assemble(a, "(module (memory i64 i64 1))"));
+    try std.testing.expectError(error.BadImmediate, assemble(a, "(module (memory i32 i64 1))"));
+}
+
+test "wat: a flat-form SIMD memory op does not swallow the following instruction" {
+    // In FLAT (stack) form the SIMD memarg parse must stop at the next mnemonic,
+    // not consume it as a memidx/lane. `v128.load drop …` and `v128.load8_lane 3
+    // drop …` must assemble and run (regression: the memidx atom-run was greedy).
+    const load =
+        \\(module (memory 1)
+        \\  (func (export "f") (result i32)
+        \\    i32.const 0 v128.load drop
+        \\    i32.const 42))
+    ;
+    try std.testing.expectEqual(@as(i32, 42), interp.asI32(try assembleAndRun(load, "f", &.{})));
+    const lane =
+        \\(module (memory 1)
+        \\  (func (export "g") (result i32)
+        \\    i32.const 0  v128.const i32x4 1 2 3 4  v128.load8_lane 3  drop
+        \\    i32.const 7))
+    ;
+    try std.testing.expectEqual(@as(i32, 7), interp.asI32(try assembleAndRun(lane, "g", &.{})));
 }
 
 test "multi-memory: loads/stores/fill/copy/init/size/grow target the right memory" {
@@ -3979,6 +4023,19 @@ test "rejects an import after a definition (#10)" {
     // Valid imports-first assembles fine.
     _ = try assemble(a,
         \\(module (import "m" "n" (func)) (func))
+    );
+    // Tags participate too (an imported tag takes a low tag index): a defined tag
+    // before a tag import must be rejected, not silently mis-indexed — both the
+    // top-level and the inline import form.
+    try std.testing.expectError(error.ImportAfterDefinition, assemble(a,
+        \\(module (tag $d (param i32)) (import "m" "n" (tag $i (param i32))))
+    ));
+    try std.testing.expectError(error.ImportAfterDefinition, assemble(a,
+        \\(module (tag $d (param i32)) (tag $i (import "m" "n") (param i32)))
+    ));
+    // Imported tag before the defined one is fine.
+    _ = try assemble(a,
+        \\(module (import "m" "n" (tag $i (param i32))) (tag $d (param i32)))
     );
 }
 
