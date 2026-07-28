@@ -386,8 +386,10 @@ siblings — the same class of read on a different section.*
 
 ### Legacy `try`/`catch` infinite loop — FIXED 2026-07-27 (`d51c004`, found by the wasmtk WASI corpus)
 
-Running the full wasmtk WASI corpus (397 runnable files across `wasm_wasi` + `wasm_wasi_bundle`; `dync` is
-out of scope — wasmtk's dynamic-runtime host, which wasmtime also refuses) surfaced **one real bug**:
+Running the full wasmtk WASI corpus (then 397 runnable files across `wasm_wasi` + `wasm_wasi_bundle`;
+`wasm_wasi_dync`'s 3 were out of scope at the time — wasmtk's dynamic-runtime host, which wasmtime also
+refused — but the owner regenerated them self-contained the same day, so all **400** now run, see
+testing.md) surfaced **one real bug**:
 `15_LexicalShadowing_Stress.wasm` **infinite-looped** (1.86 billion identical "Inner Catch:" lines in
 ReleaseFast). The legacy re-throw idiom `try { … } catch (e) { …; throw e; }` compiles to a raw `throw`
 inside a legacy `catch` handler. wazmrt correctly keeps the try label on the stack while its handler runs

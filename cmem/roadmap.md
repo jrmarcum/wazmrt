@@ -52,8 +52,9 @@ assembler has no gaps, and there are no open LOW *defects* — only by-design li
 c-smoke 319/319; full main testsuite 60,670 / memory64 601/1 / SIMD 24,956/0.**
 
 **Then (2026-07-27, continued) — ran the full wasmtk WASI corpus and fixed a legacy-EH bug.** Ran all
-397 runnable files (`wasm_wasi` 336 + `wasm_wasi_bundle` 61; `dync` out of scope — wasmtk's dynamic-runtime
-host, which wasmtime also refuses). One real bug (`d51c004`): `15_LexicalShadowing_Stress.wasm`
+400 runnable files (`wasm_wasi` 336 + `wasm_wasi_bundle` 61 + `wasm_wasi_dync` 3 — the dync trio initially
+imported wasmtk's custom dynamic-runtime host and was out of scope, then the owner regenerated them
+self-contained and they run identically to wasmtime). One real bug (`d51c004`): `15_LexicalShadowing_Stress.wasm`
 **infinite-looped** — a raw `throw` inside a legacy `catch` handler re-matched the same handler instead of
 propagating to the enclosing try (`throwException` now skips a legacy try whose handler is executing).
 **Result: `wasm_wasi` 333 clean + 3 correct uncaught-exception traps (identical to wasmtime) + 0 hangs;
