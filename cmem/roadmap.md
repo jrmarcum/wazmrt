@@ -57,7 +57,10 @@ host, which wasmtime also refuses). One real bug (`d51c004`): `15_LexicalShadowi
 **infinite-looped** — a raw `throw` inside a legacy `catch` handler re-matched the same handler instead of
 propagating to the enclosing try (`throwException` now skips a legacy try whose handler is executing).
 **Result: `wasm_wasi` 333 clean + 3 correct uncaught-exception traps (identical to wasmtime) + 0 hangs;
-`wasm_wasi_bundle` 61/61 clean.** +1 regression test; **493 local tests green (Debug + ReleaseSafe).**
+`wasm_wasi_bundle` 61/61 clean; `wasm_wasi_dync` 3/3 clean (output byte-identical to wasmtime, after the
+owner regenerated them self-contained on 2026-07-27).** **Every one of the 400 runnable WASI files now
+behaves correctly — wazmrt runs the whole wasmtk WASI suite.** +1 regression test; **493 local tests green
+(Debug + ReleaseSafe).**
 
 **Latest (2026-07-22) — the "open items 1–7" batch.** After the 13th pass the remaining list was walked
 end to end (see `known-issues.md` for the per-item detail). Six real fixes, each verified by executing the

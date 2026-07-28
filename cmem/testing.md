@@ -766,9 +766,13 @@ languages), so it's a *manual* check, not a CI gate. Ran each through the releas
   **wasmtime**, which traps identically at the same function indices ("thrown Wasm exception"). Zero decode
   errors, zero host crashes, zero disagreements with wasmtime.
 - **`wasm_wasi_bundle` (61 files across 19 dirs): 61/61 clean.**
-- **`wasm_wasi_dync` (3 files): OUT OF SCOPE** — they import wasmtk's custom dynamic-runtime host
-  (`env.__host_call`/`__host_print`), not WASI; **wasmtime also refuses to instantiate them**. wazmrt binds
-  a trapping stub for the unknown import and HostTraps when the guest calls it. Not a wazmrt bug.
+- **`wasm_wasi_dync` (3 files): 3/3 clean — output byte-identical to wasmtime.** *(Earlier these imported
+  wasmtk's custom dynamic-runtime host `env.__host_call`/`__host_print` and were out of scope — wasmtime
+  refused them too; the owner regenerated them 2026-07-27 as self-contained WASI modules and all three now
+  run correctly under both engines.)*
+
+**Net: every one of the 400 runnable files behaves correctly — 397 run cleanly + 3 correctly trap on a
+deliberate uncaught exception (identical to wasmtime). wazmrt runs the whole wasmtk WASI suite.**
 
 **This pass found and fixed one REAL bug** (`d51c004`): `15_LexicalShadowing_Stress.wasm` **infinite-looped**
 (1.86 billion identical "Inner Catch:" lines) — a legacy `try`/`catch` control-flow bug where a raw `throw`
