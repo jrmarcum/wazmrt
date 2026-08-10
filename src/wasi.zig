@@ -159,6 +159,12 @@ const rights = struct {
     const fd_filestat_get: u64 = 1 << 21;
     const fd_filestat_set_size: u64 = 1 << 22;
     const fd_filestat_set_times: u64 = 1 << 23;
+    /// ⚠️ **Was missing entirely** — the list jumped 23 → 25. Because there was no constant,
+    /// `wPathSymlink` demanded `path_open` (a READ right) and `write_mask` could not strip it, so a
+    /// guest could **plant symlinks inside a `--ro-dir` read-only preopen**. Found 2026-08-10 by the
+    /// owner asking whether the runtime should be creating symlinks at all; the Rust port had it
+    /// right. See `cmem/known-issues.md`.
+    const path_symlink: u64 = 1 << 24;
     const path_remove_directory: u64 = 1 << 25;
     const path_unlink_file: u64 = 1 << 26;
     const poll_fd_readwrite: u64 = 1 << 27;
@@ -173,6 +179,7 @@ const rights = struct {
         path_create_directory | path_create_file |
         path_link_source | path_link_target |
         path_rename_source | path_rename_target |
+        path_symlink |
         path_filestat_set_times | fd_filestat_set_size | fd_filestat_set_times |
         path_remove_directory | path_unlink_file;
 
@@ -1472,7 +1479,9 @@ fn wPathSymlink(ctx: *anyopaque, args: []const Value, results: []Value) bool {
     // Don't plant an escape: absolute, or lexically climbing above its own dir.
     if (isAbsoluteTarget(target) or escapesRelative(target)) return ret(results, errno.notcapable);
     if (std.mem.indexOfScalar(u8, target, 0) != null) return ret(results, errno.inval);
-    var rp = resolveArg(w, argU32(args, 2), argU32(args, 3), argU32(args, 4), rights.path_open, false, results) orelse
+    // The right for CREATING a link is `path_symlink`, not `path_open` — asking for the read right
+    // meant a read-only preopen still permitted planting links.
+    var rp = resolveArg(w, argU32(args, 2), argU32(args, 3), argU32(args, 4), rights.path_symlink, false, results) orelse
         return true;
     defer rp.close(w);
     // Copy the target — `slice` borrows linear memory that `symLink` may outlive.
@@ -2294,6 +2303,12 @@ test "read-only preopen rights can never yield a writable child fd (--ro-dir)" {
         rights.fd_write,          rights.path_create_file, rights.path_create_directory,
         rights.path_unlink_file,  rights.path_remove_directory, rights.path_link_source,
         rights.path_rename_source, rights.fd_filestat_set_size, rights.fd_allocate,
+        // ⚠️ `path_symlink` is listed EXPLICITLY because its absence is exactly how this test stayed
+        // green through the bug. `ro & write_mask == 0` above is trivially true for a right that is
+        // not IN write_mask — and there was no `path_symlink` constant at all (the bit list jumped
+        // 23 → 25). A guest could plant symlinks inside a `--ro-dir` preopen while every assertion
+        // here passed. **A mask test only covers the bits someone remembered to define.**
+        rights.path_symlink,
     }) |bit| {
         try std.testing.expectEqual(@as(u64, 0), ro & bit);
     }

@@ -11,6 +11,38 @@ This file tracks only what's left.
 
 Line numbers are hints (they drift) — the function/construct name is the durable anchor.
 
+## 🔴 ✅ Fixed 2026-08-10 — `--ro-dir` DID NOT PREVENT SYMLINK CREATION (real security hole)
+
+**A guest could plant symlinks inside a read-only preopen.** Found by the owner asking a design
+question — *"we do not want the wasm runner creating symlinks at runtime"* — not by any test.
+
+Three failures, each sufficient on its own:
+
+1. **There was no `rights.path_symlink` constant at all.** The bit list jumped `1 << 23` to `1 << 25`;
+   bit 24 simply did not exist.
+2. **So `write_mask` could not contain it**, and `--ro-dir` (`all & ~write_mask`) therefore never
+   stripped it.
+3. **`wPathSymlink` demanded `rights.path_open`** — a READ right, which survives `--ro-dir` by design.
+
+⚠️ **The existing read-only test passed throughout.** It asserts `ro & write_mask == 0`, which is
+**trivially true for a right that is not in write_mask**. A mask test only covers the bits someone
+remembered to define — so the guard and the gap had the same blind spot. The regression list now names
+`path_symlink` explicitly; mutation-verified (removing it from the mask fails with *expected 0, found
+16777216*).
+
+**Fixed:** the constant exists, it is in `write_mask`, and the handler demands it. `493/493` and
+`test-security` 3/3 after.
+
+⚠️ **The Rust port had this right all along** — `PATH_SYMLINK = 1 << 24`, in `WRITE_MASK`, and
+`path_symlink` demands it. Another instance of the same shape as the validation gap: **the property
+held in one implementation and not the other, and nothing compared them.** A cross-runtime diff of the
+rights masks would have found it in a minute; that is now a T12 item in the port.
+
+**What was NOT affected:** an escaping target (absolute, or lexically climbing) was already refused at
+creation in both runtimes, and the resolver refuses to follow one out at open time. So this was
+"a guest may plant an in-sandbox link in a directory declared read-only" — a rights/authority breach
+and a landmine for a later privileged reader, not a direct sandbox escape.
+
 ## ✅ Fixed 2026-08-10 — invalid-module diagnostics now match wasmtime
 
 An invalid module reported a bare `TypeMismatch`: no offset, no function, no expected/found. Now:
