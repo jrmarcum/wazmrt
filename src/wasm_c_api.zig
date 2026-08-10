@@ -214,7 +214,17 @@ export fn wasm_module_new(store: ?*Store, binary: ?*const ByteVec) ?*Module {
     return moduleFromBytes(vecSlice(bin));
 }
 
-/// Decode `src` into a `wasm_module_t`, keeping an owned copy of the binary.
+/// Decode **and validate** `src` into a `wasm_module_t`, keeping an owned copy of the binary.
+///
+/// Validation is not optional here. `wasm_module_new` is specified to return NULL for a module that
+/// is not valid, and this used to only *decode* — so `wasm_module_new` → `wasm_instance_new` → call
+/// was a route that **executed an unvalidated module**, on the embedding surface, where it matters
+/// most. A host that never called the opt-in `wasm_module_validate` got no type-checking at all.
+///
+/// Same defect the CLI had on the other surface (see `main.zig`, `will_execute`): the paths that
+/// *run* code were the ones not checking it. And `wasm_module_validate` just below still carries its
+/// comment about having once merely decoded — this surface has been wrong in this exact way before,
+/// which is the argument for closing it at the constructor rather than trusting callers to opt in.
 fn moduleFromBytes(src: []const u8) ?*Module {
     const m = alloc.create(Module) catch return null;
     const kept = alloc.dupe(u8, src) catch {
@@ -228,6 +238,12 @@ fn moduleFromBytes(src: []const u8) ?*Module {
             return null;
         },
         .bytes = kept,
+    };
+    root.validate(alloc, &m.inner) catch {
+        m.inner.deinit();
+        alloc.free(kept);
+        alloc.destroy(m);
+        return null;
     };
     return m;
 }

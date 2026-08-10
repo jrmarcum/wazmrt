@@ -134,6 +134,26 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
         findExport(&module, "_start") != null;
     if (will_execute and !(try verifyGate(arena, io, out, bytes, path, args[2..]))) return exit_failure;
 
+    // §4.5.1 defines instantiation only for a VALID module, so nothing executes before validation.
+    // Both execute paths — `<module> <export>` and the WASI `_start` command — used to skip this
+    // entirely, while the summarize path below validated and reported a verdict. That asymmetry
+    // was the bug: the two paths that actually RUN code were the two that did not check it.
+    //
+    // It was not theoretical. `runFunction` still carries the comment recording what it cost: an
+    // export index the decoder never cross-checks against the function space reached a `.?` and
+    // was an undefined-data null unwrap in ReleaseFast — a segfault from a 31-byte module. That
+    // was patched defensively at the one site it happened to be noticed; this fixes the cause,
+    // and every other site that assumes validation has run is covered by the same guard.
+    //
+    // Placed AFTER the pin gate deliberately: authorization first, so an unauthorized module is
+    // refused as unauthorized rather than having its contents inspected and reported on.
+    if (will_execute) {
+        wazmrt.validate(arena, &module) catch |e| {
+            try out.print("error: '{s}' is not a valid module: {s}\n", .{ path, @errorName(e) });
+            return exit_failure;
+        };
+    }
+
     // Run mode: `wazmrt <module.wasm> <export> [args...]` — invoke and print.
     // A trailing arg only selects an export if it actually names one; otherwise
     // it belongs to the WASI command below (`--dir …`, guest argv, …).

@@ -11,6 +11,55 @@ This file tracks only what's left.
 
 Line numbers are hints (they drift) — the function/construct name is the durable anchor.
 
+## ✅ Fixed 2026-08-08 — **the two paths that EXECUTE were the two that never validated**
+
+Found from the wasmrt side, while resolving a port punch-list item carried since T7 as "wazmrt runs
+this module and wasmrt refuses it, so the *port's* type-checker is wrong". It was not. The module is
+ill-typed and **wazmrt's own validator says so** — it simply never ran on that path.
+
+| CLI path | validated before? | now |
+| --- | --- | --- |
+| `wazmrt <module>` (summarize) | ✅ | ✅ |
+| `wazmrt <script.wast>` | ✅ | ✅ |
+| `wazmrt <module> <export>` | ❌ **executed unvalidated** | ✅ |
+| `wazmrt <module>` → WASI `_start` | ❌ **executed unvalidated** | ✅ |
+
+⚠️ **The asymmetry was the bug: the paths that actually run code were the ones that did not check it.**
+The help text has always advertised "decode, validate, execute".
+
+**It was not theoretical, and half of it was already known.** `runFunction` still carries the comment
+recording the cost: an export index the decoder never cross-checks against the function space reached
+a `.?` and was *undefined data in ReleaseFast — a segfault from a 31-byte module*. That was patched
+**defensively at the one site where it was noticed**, and the root cause left in place; every other
+site that assumes validation has run had the same exposure.
+
+**The fix** is one guard in `run()`, on the **`will_execute`** predicate that already existed to gate
+pin verification — so a third execute path added later inherits it rather than having to remember.
+Placed **after** the pin gate deliberately: authorization first, so an unauthorized module is refused
+as unauthorized rather than having its contents inspected and reported on.
+
+**Measured, and it refuses nothing legitimate:**
+- `zig build test` — **489/493, 4 skipped, 5/5 steps**: identical to the frozen baseline.
+- wasmtk WASI corpus — **376/376 modules unaffected**, zero refused.
+- `.wat` corpus — **534 files, exactly 2 refused**: the byte-identical `39_JstyperMixed` round-trip
+  artifacts, genuinely ill-typed (`if (result f64)` with both arms pushing `i32`). wasmrt refuses the
+  same two, so the runtimes now agree exactly — **532 valid, 2 invalid**.
+- The `.wast` runner is untouched (`if.wast` 216/0, `start.wast` 10/0).
+
+🔒 **This is deliberate oracle drift.** wazmrt was frozen at `dadc727` as the reference oracle for the
+Rust port; the owner authorized the change in both repos concurrently, and wasmrt's
+`scripts/wazmrt-baseline.txt` was re-baselined in the same breath rather than left for
+`check-wazmrt.sh` to report later as an accident.
+
+⚠️ **Lesson for anyone citing this runtime as an oracle: name the subcommand.** "wazmrt runs it" was
+never evidence of validity while the run path skipped validation, and a runtime that *executes* an
+invalid module is over-permissive, not authoritative. That mistake cost the port two releases of
+carrying a phantom defect.
+
+*(Build note for this machine: `zig build` on the `D:` drive fails with `error: Unexpected` — a Zig
+cache/filesystem interaction, not a code problem. Build with
+`--cache-dir C:\…\zigcache --global-cache-dir C:\…\zigcache\g`.)*
+
 ## 13th audit pass (2026-07-21) — the pass where we finally RAN the official spec testsuite
 
 **The lens that mattered: stop reasoning about the code and run the oracle.** Twelve passes had reviewed
