@@ -229,8 +229,11 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(cabi_tests).step);
 
     // ---- Security gate (`zig build test-security`) -------------------------
-    // The sandbox-escape tests SKIP when the host will not let the harness create a symlink
-    // (Windows, without Developer Mode or elevation). Inside `zig build test` that skip disappears
+    // The sandbox-escape tests SKIP when the harness cannot create a symlink. ⚠️ On the dev machine
+    // that is NOT a privilege problem — Developer Mode is on. `std.testing.tmpDir` puts its scratch
+    // under `.zig-cache/tmp` **relative to the CWD**, and the D: drive is **exFAT**, which has no
+    // reparse points, so FSCTL_SET_REPARSE_POINT returns INVALID_DEVICE_REQUEST. Run from an NTFS cwd
+    // and the whole suite is **493/493 with ZERO skips**. Inside `zig build test` that skip disappears
     // into "489/493, 4 skipped" — and an UNVERIFIED sandbox then looks exactly like a verified one.
     // Removing that ambiguity is the entire point of this step.
     //
@@ -252,7 +255,7 @@ pub fn build(b: *std.Build) void {
         const run_sec = b.addRunArtifact(sec_tests);
         run_sec.setEnvironmentVariable("WAZMRT_SECURITY_STRICT", "1");
         run_sec.has_side_effects = true; // always re-run: a cached pass proves nothing about today
-        const sec_step = b.step("test-security", "Sandbox-escape tests, where a SKIP is a FAILURE (needs symlink privilege)");
+        const sec_step = b.step("test-security", "Sandbox-escape tests, where a SKIP is a FAILURE (run from an NTFS cwd)");
         sec_step.dependOn(&run_sec.step);
     }
 

@@ -553,7 +553,7 @@ Green under **Debug AND ReleaseSafe**; `zig build c-smoke` 319/319.
   the first two, so the other two were *unverified* rather than failing — a gap in the **record**, now
   closed. Re-run all four whenever this number is quoted: ReleaseFast/ReleaseSmall remove the safety
   checks, so they are exactly where a latent index or cast bug would surface.
-- ⚠️⚠️ **The 4 skips are the SANDBOX-ESCAPE tests, and they do not run on a normal Windows box.** Both
+- ⚠️⚠️ **CORRECTED 2026-08-10: the 4 skips are an exFAT artifact, NOT a privilege problem — and NOT a code property.** From an **NTFS** working directory the suite is **493/493 with ZERO skips** and `zig build test-security` is **3/3 green**, so the sandbox-escape properties ARE verified. The earlier diagnosis here ("needs Developer Mode or elevation") was wrong: Developer Mode is already enabled on this machine. The real cause is that `std.testing.tmpDir` creates its scratch under `.zig-cache/tmp` **relative to the CWD**, and the **D: drive is exFAT**, which has no reparse points — so `FSCTL_SET_REPARSE_POINT` returns `INVALID_DEVICE_REQUEST`, not access-denied. **Run the suite from an NTFS cwd and the "489/493, 4 skipped" figure — carried in the freeze record since 2026-07-27 — becomes 493/493.** Same root cause as the `zig build` "error: Unexpected" on D: and cargo's hard-link warnings: exFAT lacks hard links and reparse points. Detail on what the skip does NOT mean:** Both
   live in `src/wasi.zig` — `symlink traversal: in-sandbox links follow, escaping links refused
   (#17/4.3)` and `symlink resolver fuzz: no adversarial topology reaches outside the preopen` — once per
   test binary, hence four. Each bails with `error.SkipZigTest` when the host refuses to create a

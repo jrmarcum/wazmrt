@@ -2012,8 +2012,11 @@ test "resolve contains guest paths inside the preopen" {
 /// Is this run a **security gate** (`zig build test-security`) rather than an ordinary `zig build
 /// test`?
 ///
-/// ⚠️ **Why this exists.** The sandbox-escape tests below skip when the host will not let the harness
-/// create a symlink — Windows refuses without Developer Mode or elevation. That skip is honest (with
+/// ⚠️ **Why this exists.** The sandbox-escape tests below skip when the harness cannot create a
+/// symlink. On the dev machine that is NOT a privilege problem (Developer Mode is on): `testing.tmpDir`
+/// puts its scratch under `.zig-cache/tmp` relative to the CWD, and the D: drive is **exFAT** — no
+/// reparse points, so the call returns INVALID_DEVICE_REQUEST. From an NTFS cwd the suite is 493/493
+/// with zero skips. That skip is honest (with
 /// no link there is nothing to traverse) but it is **not** a pass: it fires during *fixture setup*,
 /// before a single assertion runs, so nothing was refused by wazmrt — the OS refused the test. Folded
 /// into a "489/493, 4 skipped" summary, an unverified sandbox is indistinguishable from a verified one.
