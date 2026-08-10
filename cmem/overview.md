@@ -68,6 +68,38 @@ The pipeline, in order: **decode → validate → execute**, with a text front-e
 - `zig build wasm` → builds the runtime itself as a freestanding `wasm32` module
 - `zig build run -- <file.wasm> [export args…]` → summarize a module, or invoke an export and print results
 
+## 📦 Distribution manifest — exactly which files a user needs (2026-08-10)
+
+**Measured on a clean `PATH`**, not read off `build.zig`: the binary was copied to an empty directory
+and run with `PATH=C:\Windows\system32;C:\Windows`. That is the only way to tell a real dependency from
+one the dev box happens to satisfy.
+
+| you are shipping | files a user needs | do NOT ship |
+| --- | --- | --- |
+| **the CLI** | `zig-out/bin/wazmrt.exe` — **one file** | `wazmrt.pdb` |
+| **the C ABI, dynamic** | `zig-out/bin/wazmrt.dll` + `include/wasm.h` + `include/wazmrt.h` | `wazmrt.pdb` |
+| **the C ABI, static** | `zig-out/lib/wazmrt.lib` + both headers | — |
+| **the wasm build** | `zig-out/bin/wazmrt.wasm` | — |
+
+✅ **wazmrt is standalone by construction.** `wazmrt.exe` and `wazmrt.dll` import **only `ntdll` and
+`KERNEL32`** — no libc, no toolchain runtime, nothing from the Zig install. That falls out of the
+libc-free design, and it is worth re-checking rather than assuming after any build-system change.
+
+⚠️ **`wazmrt.pdb` is 3.6 MB of debug symbols and the largest file in `zig-out/bin`** — easy to sweep up
+with a wildcard copy, and it carries source paths and symbol names.
+
+**How to re-verify** (before any release, per binary):
+
+```
+objdump -p zig-out/bin/wazmrt.exe | grep "DLL Name"
+```
+
+Anything that is not `ntdll`, `KERNEL32`, `api-ms-win-*` or `bcrypt*` is a file you are also shipping,
+whether you meant to or not. Then copy the binary somewhere empty and run it with `PATH` cut back to
+the system directories. **"It runs here" is not evidence that it ships** — the Rust port silently
+needed a *toolchain* DLL (`libunwind.dll`) while every dev-box test passed, and died with a bare
+**exit 127** on a clean machine.
+
 ## Mental model
 
 - **Zero-copy decode.** `Reader` borrows slices of the input; `Module` stores only section `{id,
