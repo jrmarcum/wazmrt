@@ -11,6 +11,39 @@ This file tracks only what's left.
 
 Line numbers are hints (they drift) — the function/construct name is the durable anchor.
 
+## ✅ Fixed 2026-08-10 — invalid-module diagnostics now match wasmtime
+
+An invalid module reported a bare `TypeMismatch`: no offset, no function, no expected/found. Now:
+
+```
+error: 'x.wasm' is not a valid module at offset 33 (function 0): type mismatch: expected i32, found i64
+```
+
+🔒 **Matched against the real tool, not from its docs.** wasmtime 47.0.2 on the same module says
+`Invalid input WebAssembly code at offset 33: type mismatch: expected i32, found i64`. **The offset is
+byte-identical** because both count from the start of the module, so the two tools' numbers are directly
+comparable on one file — verified on two modules (offsets **33** and **61**). The function index is ours
+to add; wasmtime omits it, and it is what makes a twenty-body module tractable.
+
+**A side channel, because a Zig error set carries no payload** — `error.TypeMismatch` is a bare tag, so
+there is nowhere on the error to put the two types. `validate.FailureSite` is `threadlocal`, cleared on
+ENTRY so a module-level failure reports no location rather than inheriting the previous module's.
+
+**The offset costs nothing on the happy path.** `popExpect` already knew both types and the driver loop
+already tracked `pc`; the byte offset is derived **only on failure** by re-decoding that one body with
+`opcode.decodeBodyTracked` and adding `code.body_offset` — the same cold-path trick
+`Instance.frameOffset` uses for trap frames. So nothing is stored per instruction. (The Rust port keeps
+a `u32` on `Instr` instead, which is free in its existing padding — different trade, same result.)
+
+Both CLI paths share one formatter, so they cannot drift into describing the same module differently.
+A non-type failure keeps the offset and honestly reports no types.
+
+⚠️ `ValType` is a **non-exhaustive** enum, so `` would be undefined on a value outside its
+fields; `std.enums.tagName` returns null and the report falls back to the bare error name.
+
+**Measured:** `zig build test` **489/493 in all four modes**; wasmtk WASI corpus **376/376 unaffected**;
+`.wast` runner untouched (`if.wast` 216/0, `start.wast` 10/0).
+
 ## ✅ Fixed 2026-08-08 — **the two paths that EXECUTE were the two that never validated**
 
 Found from the wasmrt side, while resolving a port punch-list item carried since T7 as "wazmrt runs

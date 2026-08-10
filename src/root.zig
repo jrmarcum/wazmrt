@@ -11,6 +11,10 @@ pub const Reader = @import("Reader.zig");
 pub const Module = @import("Module.zig");
 pub const opcode = @import("opcode.zig");
 pub const validate = @import("validate.zig").validate;
+/// Where the last `validate` failure was and what it was about — see `FailureSite`. A side channel
+/// because a Zig error set carries no payload, so `error.TypeMismatch` alone cannot say which types.
+pub const lastFailureSite = @import("validate.zig").lastFailureSite;
+pub const FailureSite = @import("validate.zig").FailureSite;
 pub const interp = @import("interp.zig");
 pub const Instance = interp.Instance;
 pub const sexpr = @import("sexpr.zig");

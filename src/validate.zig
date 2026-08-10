@@ -107,8 +107,48 @@ pub const Error = Module.Error || error{
     InvalidMemArgOffset,
 };
 
+/// Where the last validation failure was, and what it was about.
+///
+/// **A side channel because a Zig error set cannot carry a payload** — `error.TypeMismatch` is a bare
+/// tag, so "expected i32, found i64" has nowhere to live on the error itself. (The Rust port reached
+/// the same design for a different reason: its `ValidateError` *could* carry data, but it is `Copy`,
+/// exhaustively matched, and crosses a C ABI.)
+///
+/// **Shaped to match wasmtime**, which is the standard for diagnostics as well as behaviour.
+/// wasmtime 47 on `(func (result i32) i64.const 1)`:
+///
+/// ```text
+/// Invalid input WebAssembly code at offset 33: type mismatch: expected i32, found i64
+/// ```
+///
+/// `threadlocal` so two threads validating at once cannot scramble each other's report. A stale value
+/// can only mislabel a *later* failure, never make a success look like one, because `validate` clears
+/// this on entry.
+pub const FailureSite = struct {
+    /// Index in the function index space (imports included), if the failure was inside a body.
+    func_index: ?u32 = null,
+    /// Byte offset from the start of the module of the instruction that failed — the same number,
+    /// and the same origin, that wasmtime prints.
+    offset: ?u32 = null,
+    /// For a type mismatch: what the instruction required, and what was on the stack.
+    expected: ?V = null,
+    found: ?V = null,
+};
+
+threadlocal var site: FailureSite = .{};
+
+/// Everything known about the most recent [`validate`] failure. Valid until the next `validate` call
+/// on this thread; all-null after a success.
+pub fn lastFailureSite() FailureSite {
+    return site;
+}
+
 /// Validate an entire module. Returns on the first error.
 pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
+    // Cleared on ENTRY, not on success: a module-level failure below must report "no location"
+    // rather than inherit the previous module's.
+    site = .{};
+
     if (module.functions.len != module.code.len) return error.CountMismatch;
 
     // C.refs (§3.4.10, "undeclared function reference"): `ref.func x` inside a
@@ -221,11 +261,36 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
-    for (module.functions, module.code) |type_index, code| {
+    const imported = module.importedFuncCount();
+    for (module.functions, module.code, 0..) |type_index, code, n| {
         const ft = module.funcSig(type_index) orelse return error.UndefinedType;
-        try validateFunction(arena.allocator(), module, ft, code, null, &refs);
+        validateFunction(arena.allocator(), module, ft, code, null, &refs) catch |e| {
+            // Locate the failure for the diagnostic. `validateFunction` leaves `site.pc_hint` at the
+            // instruction it stopped on; mapping that to a byte offset costs a re-decode of this one
+            // body, which is fine because it happens **only on failure** — the same cold-path trick
+            // `Instance.frameOffset` uses for trap frames, and the reason no offset is stored per
+            // instruction. (The Rust port instead keeps a `u32` on `Instr`, free in its padding.)
+            site.func_index = imported + @as(u32, @intCast(n));
+            site.offset = offsetOfPc(arena.allocator(), code, pc_hint);
+            return e;
+        };
         _ = arena.reset(.retain_capacity);
     }
+}
+
+/// Instruction index within the body that validation stopped on. Set by the per-instruction loop and
+/// read only when that loop fails, so it costs one store per instruction and nothing else.
+threadlocal var pc_hint: usize = 0;
+
+/// Map an instruction index in `code` to its absolute module offset, or null if the body will not
+/// re-decode. Cold path only.
+fn offsetOfPc(a: std.mem.Allocator, code: Module.Code, pc: usize) ?u32 {
+    var offsets: std.ArrayList(u32) = .empty;
+    defer offsets.deinit(a);
+    const ir = opcode.decodeBodyTracked(a, code.body, &offsets) catch return null;
+    opcode.freeBody(a, ir); // we want the offsets, not the IR
+    if (pc >= offsets.items.len) return null;
+    return code.body_offset + offsets.items[pc];
 }
 
 /// Type-check a constant expression (§3.3.7 + extended-const `i32`/`i64`
@@ -404,6 +469,9 @@ fn validateFunction(a: std.mem.Allocator, module: *const Module, ft: Module.Func
     try v.pushCtrl(.block, empty, ft.results);
     for (instrs, 0..) |instr, i| {
         v.pc = i;
+        // Mirrored into the thread-local so the CALLER can locate the failure: `v` dies with this
+        // frame, and the offset lookup needs `code`, which only the caller has.
+        pc_hint = i;
         try v.step(instr);
     }
     if (v.ctrls.items.len != 0) return error.ControlUnderflow; // missing `end`
@@ -523,7 +591,13 @@ const FuncValidator = struct {
         const actual = try self.popVal();
         switch (actual) {
             .unknown => {},
-            .val => |t| if (!subtypeOf(self.module, t, expect)) return error.TypeMismatch,
+            .val => |t| if (!subtypeOf(self.module, t, expect)) {
+                // The one place that knows BOTH types, which is what makes wasmtime's
+                // "expected i32, found i64" possible at all — the error tag carries nothing.
+                site.expected = expect;
+                site.found = t;
+                return error.TypeMismatch;
+            },
         }
         return actual;
     }

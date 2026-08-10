@@ -149,7 +149,8 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
     // refused as unauthorized rather than having its contents inspected and reported on.
     if (will_execute) {
         wazmrt.validate(arena, &module) catch |e| {
-            try out.print("error: '{s}' is not a valid module: {s}\n", .{ path, @errorName(e) });
+            try out.print("error: '{s}' is not a valid module", .{path});
+            try printInvalidity(out, e);
             return exit_failure;
         };
     }
@@ -207,7 +208,10 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
     }
 
     wazmrt.validate(arena, &module) catch |e| {
-        try out.print("  validation: FAILED — {s}\n", .{@errorName(e)});
+        // Same report as the execute paths above, so the two never drift into saying different
+        // things about the same module.
+        try out.print("  validation: FAILED", .{});
+        try printInvalidity(out, e);
         return exit_failure; // the inspect path reports invalidity in its status
     };
     try out.print("  validation: OK\n", .{});
@@ -734,6 +738,42 @@ fn verifyGate(
             return false;
         },
     }
+}
+
+/// Report an invalid module, **shaped to match wasmtime**.
+///
+/// wasmtime 47 on `(func (result i32) i64.const 1)`:
+///
+/// ```text
+/// Invalid input WebAssembly code at offset 33: type mismatch: expected i32, found i64
+/// ```
+///
+/// So: the byte offset **in decimal**, counted from the start of the module — the same origin
+/// wasmtime uses, so the two tools' numbers are directly comparable on the same file — then the two
+/// types. The function index is ours to add; wasmtime does not print it, and it is what makes a
+/// twenty-body module tractable. Anything the validator did not record is omitted, never guessed.
+///
+/// Without this, an invalid module was just `TypeMismatch` — the same gap for validation that
+/// `printTrap` below closes for traps, and the reason a port punch-list item sat misdiagnosed for two
+/// releases (`cmem/known-issues.md`).
+/// Prints only the DETAIL — " at offset N (function M): type mismatch: …" — so each caller supplies
+/// the lead-in that reads correctly in its own context ("… is not a valid module" vs
+/// "validation: FAILED"). One formatter, so the two can never say different things about one module.
+fn printInvalidity(out: *Io.Writer, e: anyerror) !void {
+    const site = wazmrt.lastFailureSite();
+    if (site.offset) |off| try out.print(" at offset {d}", .{off});
+    if (site.func_index) |fi| try out.print(" (function {d})", .{fi});
+    if (site.expected != null and site.found != null) {
+        // `ValType` is a NON-EXHAUSTIVE enum, so `@tagName` would be undefined on a value outside its
+        // fields — `tagName` returns null instead, and an unnamed type falls back to the bare error.
+        const exp = std.enums.tagName(wazmrt.types.ValType, site.expected.?);
+        const got = std.enums.tagName(wazmrt.types.ValType, site.found.?);
+        if (exp != null and got != null) {
+            try out.print(": type mismatch: expected {s}, found {s}\n", .{ exp.?, got.? });
+            return;
+        }
+    }
+    try out.print(": {s}\n", .{@errorName(e)});
 }
 
 /// Report a trap with the location it actually happened at, innermost frame
