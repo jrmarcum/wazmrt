@@ -57,6 +57,25 @@ pub fn build(b: *std.Build) void {
     cabi.installHeader(b.path("include/wazmrt.h"), "wazmrt.h");
     b.installArtifact(cabi);
 
+    // ---- Attribution travels WITH the artifact -----------------------------
+    // `wasm.h` above is vendored verbatim from https://github.com/WebAssembly/wasm-c-api and is
+    // **Apache-2.0**, so §4(a) obliges us to give recipients a copy of the License *when we
+    // distribute it*. The repo satisfied that (third_party/wasm-c-api/LICENSE + NOTICE + the ledger)
+    // while `zig-out/` — the thing anyone actually copies — shipped the header alone.
+    //
+    // ⚠️ **A compliant repository is not a compliant distribution.** Whoever takes `zig-out/include`
+    // never sees the repo, so the licence has to be in the output tree, not merely in the source tree.
+    // Named for the header it covers, so it cannot be mistaken for wazmrt's own licence (this project
+    // is MIT OR Apache-2.0; the vendored header is Apache-2.0 only).
+    b.getInstallStep().dependOn(&b.addInstallFile(
+        b.path("third_party/wasm-c-api/LICENSE"),
+        "include/LICENSE.wasm-c-api",
+    ).step);
+    b.getInstallStep().dependOn(&b.addInstallFile(
+        b.path("NOTICE"),
+        "include/NOTICE",
+    ).step);
+
     // ---- C ABI *shared* library (`zig build dll`) --------------------------
     // The same wasm-c-api implementation as a dynamic library, so host languages
     // can load it over FFI (Deno.dlopen, Python ctypes, …) — the vision's

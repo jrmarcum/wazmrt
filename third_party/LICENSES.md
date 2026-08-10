@@ -81,6 +81,12 @@ Newest first. Copy the template for each adopted component.
   not in the vendored header.
 - **Obligations satisfied:** [x] license copied  [x] NOTICE propagated
   [x] verbatim — no change-notes required  [x] provenance commit pinned
+  [x] **license SHIPS WITH THE ARTIFACT** — `build.zig` installs `LICENSE.wasm-c-api` and `NOTICE`
+      into `zig-out/include/` beside the header (added 2026-08-10). ⚠️ Until then the repo was
+      compliant and the **output tree was not**: `zig-out/include` carried `wasm.h` alone, and whoever
+      copies that directory never sees `third_party/`. **A compliant repository is not a compliant
+      distribution** — Apache-2.0 §4(a) binds on distribution, so the licence has to be where the
+      artifact goes.
 - **Benefit / drawback note:** Benefit — instant, standard interop; loaders bind
   once to a familiar ABI. Drawback — large surface (~740 lines); we implement it
   incrementally, backing only what the runtime can do today.

@@ -77,8 +77,8 @@ one the dev box happens to satisfy.
 | you are shipping | files a user needs | do NOT ship |
 | --- | --- | --- |
 | **the CLI** | `zig-out/bin/wazmrt.exe` — **one file** | `wazmrt.pdb` |
-| **the C ABI, dynamic** | `zig-out/bin/wazmrt.dll` + `include/wasm.h` + `include/wazmrt.h` | `wazmrt.pdb` |
-| **the C ABI, static** | `zig-out/lib/wazmrt.lib` + both headers | — |
+| **the C ABI, dynamic** | `zig-out/bin/wazmrt.dll` + **the whole of `zig-out/include/`** | `wazmrt.pdb` |
+| **the C ABI, static** | `zig-out/lib/wazmrt.lib` + **the whole of `zig-out/include/`** | — |
 | **the wasm build** | `zig-out/bin/wazmrt.wasm` | — |
 
 ✅ **wazmrt is standalone by construction.** `wazmrt.exe` and `wazmrt.dll` import **only `ntdll` and
@@ -87,6 +87,17 @@ libc-free design, and it is worth re-checking rather than assuming after any bui
 
 ⚠️ **`wazmrt.pdb` is 3.6 MB of debug symbols and the largest file in `zig-out/bin`** — easy to sweep up
 with a wildcard copy, and it carries source paths and symbol names.
+
+🔒 **Ship `zig-out/include/` whole — all four files, not just the headers.** `wasm.h` is vendored
+verbatim from https://github.com/WebAssembly/wasm-c-api and is **Apache-2.0**, so §4(a) obliges us to
+hand recipients a copy of the licence *when we distribute it*. `build.zig` therefore installs
+`LICENSE.wasm-c-api` and `NOTICE` beside the headers (added 2026-08-10 — before that the repo was
+compliant and the **output tree was not**).
+
+⚠️ **A compliant repository is not a compliant distribution.** Whoever copies `zig-out/include` never
+sees `third_party/`, so the licence has to be in the output. The file is named for the header it
+covers: wazmrt's own code is `MIT OR Apache-2.0`, the vendored header is **Apache-2.0 only**, and
+conflating the two is how attribution quietly goes missing.
 
 **How to re-verify** (before any release, per binary):
 
