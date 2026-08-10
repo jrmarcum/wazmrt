@@ -569,6 +569,22 @@ Green under **Debug AND ReleaseSafe**; `zig build c-smoke` 319/319.
   then *fails*, that is a real finding the skip was hiding. **"489/493, 4 skipped" should never be
   quoted unqualified** — the port's `scripts/wazmrt-baseline.txt` now carries the same caveat.
 
+  ⚠️ **Do NOT read the skip as "the escape was refused, so it passed."** That reading is natural — these
+  *are* negative tests, and inside them `refused(openErrno(…))` genuinely means "failing to open is the
+  success condition". But the skip fires **during fixture setup**, at
+  `pre.symLink(…) catch { return error.SkipZigTest; }`, **before a single assertion runs**. Nothing was
+  refused by wazmrt; the *host* refused the test harness a symlink, and the resolver was never invoked.
+
+  Two facts settle it:
+  - The very first assertion expects **`errno.success`** — an in-sandbox link must be *followed*. So
+    "refusal = pass" is not even true of the whole test; a skip would also be claiming that
+    in-sandbox traversal works, which was equally untested.
+  - `SkipZigTest` is returned before `Wasi.init`, so no wasi call is made at all.
+
+  **A skip here means zero of the three properties were checked** — not that they held. Same lesson as
+  the port's `assert_unlinkable`, which was skipped for an obsolete reason and turned out to be
+  insuring a real defect for two stages.
+
 **Build note (this machine, 2026-08-10):** `zig build` from the `D:` drive fails with `error:
 Unexpected` — a Zig cache/filesystem interaction, not a code problem. Build with
 `--cache-dir C:\…\zigcache --global-cache-dir C:\…\zigcache\g`. The port's `check-wazmrt.sh` already
