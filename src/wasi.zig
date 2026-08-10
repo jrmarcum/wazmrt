@@ -194,6 +194,17 @@ const rights = struct {
 pub const allRights: u64 = rights.all;
 pub const readOnlyRights: u64 = rights.read_only;
 
+/// **The default for a read-write preopen (`--dir`): everything except planting symlinks.**
+///
+/// 🔒 Owner policy, 2026-08-10. A guest that is *running a workload* has no business creating
+/// symlinks — composing modules over shared linear memory is the runtime's job, not the
+/// filesystem's. Denying creation removes a guest-controlled primitive that a **second process**
+/// could later repoint, which matters because the mid-run swap is a residual neither runtime closes.
+/// Installer-shaped workloads legitimately need it, so it is **opt-in** (`--allow-symlink`).
+///
+/// Governs CREATION only: following a pre-existing link is unaffected.
+pub const readWriteRights: u64 = rights.all & ~rights.path_symlink;
+
 /// `oflags` for `path_open`.
 const oflags = struct {
     const creat: u16 = 1 << 0;
@@ -2323,6 +2334,18 @@ test "read-only preopen rights can never yield a writable child fd (--ro-dir)" {
     try std.testing.expectEqual(@as(u64, 0), child_inheriting & rights.write_mask);
     // A read-write preopen, by contrast, does pass write rights through.
     try std.testing.expect((rights.all & allRights) & rights.fd_write != 0);
+
+    // 🔒 Owner policy 2026-08-10: the DEFAULT read-write preopen (`--dir`) may not plant symlinks.
+    // A workload run has no need to create links — composing modules over shared memory is the
+    // runtime's job — and denying it removes a guest-controlled primitive a second process could
+    // later repoint. `--allow-symlink` restores it for installer-shaped work.
+    try std.testing.expectEqual(@as(u64, 0), readWriteRights & rights.path_symlink);
+    // ...and it is a one-bit narrowing of `all`, not a different capability set, so nothing else a
+    // read-write preopen could do has quietly gone away.
+    try std.testing.expectEqual(rights.path_symlink, rights.all & ~readWriteRights);
+    try std.testing.expect(allRights & rights.path_symlink != 0); // the opt-in still grants it
+    // ⚠️ CREATION only: following a pre-existing link needs `path_open`, which both grants keep.
+    try std.testing.expect(readWriteRights & rights.path_open != 0);
 }
 
 test "fd_prestat_get/dir_name enumerate preopens and stop at the first non-preopen" {

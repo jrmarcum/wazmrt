@@ -866,8 +866,15 @@ fn runWasi(
     var max_memory: usize = interp.default_max_memory_bytes;
     var max_table_elems: usize = interp.default_max_table_elems;
     var rest = wasi_args;
+    // 🔒 Symlink CREATION is off unless asked for — see `wasi.readWriteRights`.
+    var allow_symlink = false;
     flags: while (rest.len >= 1) {
         const flag = rest[0];
+        if (std.mem.eql(u8, flag, "--allow-symlink")) {
+            allow_symlink = true;
+            rest = rest[1..];
+            continue :flags;
+        }
         if (std.mem.eql(u8, flag, "--max-memory") and rest.len >= 2) {
             max_memory = parseSize(rest[1]) orelse {
                 try out.print("error: --max-memory '{s}': expected a size like 512M or 2G\n", .{rest[1]});
@@ -892,7 +899,10 @@ fn runWasi(
                 if (i > 1) .{ spec[0..i], spec[i + 1 ..] } else .{ spec, spec }
             else
                 .{ spec, spec };
-            const rmask = if (ro) wazmrt.wasi.readOnlyRights else wazmrt.wasi.allRights;
+            // 🔒 Read-write does NOT include planting symlinks unless `--allow-symlink` asked for it.
+            const rmask = if (ro)
+                wazmrt.wasi.readOnlyRights
+            else if (allow_symlink) wazmrt.wasi.allRights else wazmrt.wasi.readWriteRights;
             _ = wasi.addPreopen(host, guest, rmask) catch |e| {
                 try out.print("error: {s} '{s}': {s}\n", .{ flag, host, @errorName(e) });
                 return 1;
