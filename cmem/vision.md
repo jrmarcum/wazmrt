@@ -92,8 +92,37 @@ Benefits:
   "universal" loader).
 - **No heavy dependency** — wasmtime is megabytes + a Rust toolchain; wazmrt is a few hundred KB,
   dependency-free, and self-owned.
-- **Low-friction swap** — wasmtime also implements wasm-c-api, so ports already on its C API are close
-  to drop-in against wazmrt's C ABI (a payoff of the wasm-c-api decision).
+- ~~**Low-friction swap** — wasmtime also implements wasm-c-api, so ports already on its C API are
+  close to drop-in against wazmrt's C ABI (a payoff of the wasm-c-api decision).~~
+  ⚠️⚠️ **FALSIFIED 2026-08-10 (owner: "somehow that intent slipped"). This payoff never existed, and it
+  is where the wasm-c-api decision drifted from the actual goal.**
+
+  The claim assumed the loaders were "already on wasmtime's C API", meaning wasm-c-api. They are not.
+  wasmtime ships **two** C surfaces: the standard `wasm.h`, and its own richer `wasmtime.h`. A survey of
+  the real loader source (`universalWasmLoader-c/universal_wasm_loader.h`, recorded in wasmrt's
+  `cmem/loaders.md`) found it uses wasmtime's **`wasmtime_*` store/context/linker/typed-val model — NOT
+  the wasm-c-api instance/func model.** "Close to drop-in" was a hypothesis about someone else's code
+  that nobody had read.
+
+  Worse than unhelpful: **wasm-c-api structurally cannot serve the loaders' core need.** Its host-func
+  callback receives **no handle to the caller's memory**, and essentially every loader host import must
+  read guest memory inside a callback. wasmrt's `loaders.md` calls this "the load-bearing gap over
+  wazmrt's shape"; the port closed it at T8 by adopting wasmtime's **caller-based** callback model
+  (`wasmrt_caller_*`).
+
+  **What it cost:** `src/wasm_c_api.zig` — 319 declared functions, 174 exports, this project's largest
+  file and, by its own design-decisions entry, "the one file that hands raw ownership across a C
+  boundary — memory-safety-critical". Audit findings **#20** (180 undefined symbols), **#21** (double
+  free, use-after-free, uninitialised refcount, leak) and **#22** (two more, from the lifecycle fuzz)
+  were *all* in it. The Rust port replaced the whole surface with ~74 functions and value handles.
+
+  **In fairness, what the decision DID deliver:** a genuinely standard ABI, third-party interop with any
+  wasm-c-api consumer, and the proven Deno-FFI path below. Those are real. The error was narrower and
+  specific — claiming a payoff *for the intended consumer* without reading that consumer's code.
+
+  🎓 **The lesson (now in `wasmrt/cmem/best-practices.md`): a stated benefit is a hypothesis about
+  someone ELSE's code — go read theirs.** The universal loaders were always meant to be the layer that
+  standardises imports across languages; the runtime beneath them only ever had to serve **them**.
 - **Licensing freedom** — a structural win, not a preference. wazmrt is **`MIT OR Apache-2.0`** and
   100% team-owned; wasmtime is `Apache-2.0 WITH LLVM-exception`. Dropping the wasmtime dependency means
   a loader carries **no external-runtime license/NOTICE to propagate** and can license itself freely
