@@ -228,6 +228,34 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(cabi_tests).step);
 
+    // ---- Security gate (`zig build test-security`) -------------------------
+    // The sandbox-escape tests SKIP when the host will not let the harness create a symlink
+    // (Windows, without Developer Mode or elevation). Inside `zig build test` that skip disappears
+    // into "489/493, 4 skipped" — and an UNVERIFIED sandbox then looks exactly like a verified one.
+    // Removing that ambiguity is the entire point of this step.
+    //
+    // `WAZMRT_SECURITY_STRICT=1` makes those same tests FAIL instead of skipping, so this step goes
+    // red on a box that cannot verify the sandbox. Deliberately separate: the default `test` stays
+    // dev-friendly on an unprivileged box, while the security properties get a gate that CAN fail.
+    //
+    // A skip here was never a pass — it fires during fixture setup, before any assertion, so nothing
+    // was refused by wazmrt; the OS refused the test harness. Run this before any security review, and
+    // if it goes red for lack of privilege, grant the privilege and run it again rather than waving
+    // it through.
+    {
+        const sec_tests = b.addTest(.{
+            .root_module = mod,
+            // Only the tests whose subject IS the sandbox boundary. Keep this list in step with any
+            // new escape/traversal test, or the gate silently stops covering it.
+            .filters = &.{ "symlink traversal", "symlink resolver fuzz" },
+        });
+        const run_sec = b.addRunArtifact(sec_tests);
+        run_sec.setEnvironmentVariable("WAZMRT_SECURITY_STRICT", "1");
+        run_sec.has_side_effects = true; // always re-run: a cached pass proves nothing about today
+        const sec_step = b.step("test-security", "Sandbox-escape tests, where a SKIP is a FAILURE (needs symlink privilege)");
+        sec_step.dependOn(&run_sec.step);
+    }
+
     // ---- ReleaseSafe test run (`zig build test-safe`) ----------------------
     // The same suite compiled with the optimizer ON but safety checks KEPT
     // (bounds, integer overflow, out-of-range @intCast, .? on null, reaching

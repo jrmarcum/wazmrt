@@ -565,6 +565,14 @@ Green under **Debug AND ReleaseSafe**; `zig build c-smoke` 319/319.
   review rather than before it. Partial cover exists: the absolute-target canary case is exercised on
   Windows by `examples/wasi_symlink_traversal.zig`.
 
+  ✅ **`zig build test-security` (added 2026-08-10) removes the ambiguity.** It runs ONLY the
+  sandbox-boundary tests with `WAZMRT_SECURITY_STRICT=1`, under which they **FAIL instead of skipping**
+  — so an unverified sandbox is red, not green. On this box it reports **`1 pass, 2 fail`**; grant
+  symlink privilege and it should go green. The default `zig build test` is deliberately unchanged
+  (489/493 in all four modes), so ordinary development on an unprivileged box stays friendly while the
+  security property gets a gate that CAN fail. ⚠️ The step's `.filters` list must be kept in step with
+  any new escape/traversal test, or the gate silently stops covering it.
+
   **Before any security review: enable Developer Mode, re-run, confirm all four become passes.** If one
   then *fails*, that is a real finding the skip was hiding. **"489/493, 4 skipped" should never be
   quoted unqualified** — the port's `scripts/wazmrt-baseline.txt` now carries the same caveat.

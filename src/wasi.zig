@@ -2009,6 +2009,29 @@ test "resolve contains guest paths inside the preopen" {
     }
 }
 
+/// Is this run a **security gate** (`zig build test-security`) rather than an ordinary `zig build
+/// test`?
+///
+/// ⚠️ **Why this exists.** The sandbox-escape tests below skip when the host will not let the harness
+/// create a symlink — Windows refuses without Developer Mode or elevation. That skip is honest (with
+/// no link there is nothing to traverse) but it is **not** a pass: it fires during *fixture setup*,
+/// before a single assertion runs, so nothing was refused by wazmrt — the OS refused the test. Folded
+/// into a "489/493, 4 skipped" summary, an unverified sandbox is indistinguishable from a verified one.
+///
+/// So the security step sets `WAZMRT_SECURITY_STRICT=1` and the same tests then **fail** instead of
+/// skipping. A gate that cannot fail is decoration; a security gate that silently skips is worse,
+/// because it reports green.
+fn securityStrict() bool {
+    // Zig 0.16 moved env access to `std.process.Environ`; `containsUnempty` treats an empty value as
+    // absent, so `WAZMRT_SECURITY_STRICT=` does not accidentally arm the gate.
+    const environ: std.process.Environ = .{ .block = .global };
+    return environ.containsUnempty(std.testing.allocator, "WAZMRT_SECURITY_STRICT") catch false;
+}
+
+/// Returned instead of `SkipZigTest` under the security gate: the sandbox could not be *verified*,
+/// which for a security gate is a failure, not an absence.
+const CannotVerifySandbox = error.SymlinkUnavailable_CannotVerifySandbox;
+
 test "symlink traversal: in-sandbox links follow, escaping links refused (#17/4.3)" {
     // The real-filesystem resolver test. Full traversal (4.3): an in-sandbox
     // symlink is FOLLOWED; a symlink whose target leaves the preopen is REFUSED
@@ -2040,14 +2063,17 @@ test "symlink traversal: in-sandbox links follow, escaping links refused (#17/4.
     // Plant the links. If we can't make one, there's nothing to test — skip.
     pre.symLink(tio, "sub", "inlink", .{ .is_directory = true }) catch { // in-sandbox
         pre.close(tio);
+        if (securityStrict()) return CannotVerifySandbox;
         return error.SkipZigTest;
     };
     pre.symLink(tio, "../outside", "dlink", .{ .is_directory = true }) catch { // escapes
         pre.close(tio);
+        if (securityStrict()) return CannotVerifySandbox;
         return error.SkipZigTest;
     };
     pre.symLink(tio, "../outside/secret.txt", "flink", .{}) catch { // escapes
         pre.close(tio);
+        if (securityStrict()) return CannotVerifySandbox;
         return error.SkipZigTest;
     };
 
@@ -2119,6 +2145,7 @@ test "symlink resolver fuzz: no adversarial topology reaches outside the preopen
     {
         const f = pre.createFile(tio, "real.txt", .{}) catch {
             pre.close(tio);
+            if (securityStrict()) return CannotVerifySandbox;
             return error.SkipZigTest;
         };
         f.close(tio);
@@ -2140,6 +2167,7 @@ test "symlink resolver fuzz: no adversarial topology reaches outside the preopen
         const nm = std.fmt.bufPrint(&name, "l{d}", .{i}) catch unreachable;
         pre.symLink(tio, t, nm, .{}) catch {
             pre.close(tio);
+            if (securityStrict()) return CannotVerifySandbox;
             return error.SkipZigTest; // no symlink support here
         };
     }
@@ -2148,6 +2176,7 @@ test "symlink resolver fuzz: no adversarial topology reaches outside the preopen
     // examples/wasi_symlink_traversal.zig on Windows).
     pre.symLink(tio, "/outside/canary.txt", "labs", .{}) catch {
         pre.close(tio);
+        if (securityStrict()) return CannotVerifySandbox;
         return error.SkipZigTest;
     };
 
