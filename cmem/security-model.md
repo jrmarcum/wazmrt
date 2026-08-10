@@ -131,6 +131,36 @@ Both are fixed (`CountMismatch`, an `orelse` on `funcType`, and a comptime arity
 `zig build test-safe` (ReleaseSafe) now exists specifically so this class panics loudly in CI instead of
 being silent UB in the shipped build.
 
+## 🔒 Symlink CREATION is denied by default (owner, 2026-08-10)
+
+**The policy, in the owner's words:** *"Symlink creation during runtime for the purpose of running
+processes shall be illegal. Creating symlinks at runtime for, say, a program install situation should
+be a legal operation."*
+
+| grant | may the guest CREATE a symlink? |
+| --- | --- |
+| `--dir` (default) | ❌ `readWriteRights = all & ~path_symlink` |
+| `--dir --allow-symlink` | ✅ the installer case — explicit opt-in |
+| `--ro-dir` | ❌ already, twice over (`path_symlink` is in `write_mask`) |
+
+**Why it is sound to deny.** Composing wasm modules over shared linear memory is the **runtime's** job,
+not the filesystem's — modules share memory through imports, so nothing in a normal workload run needs
+new links to appear on disk. Denying creation removes a **guest-controlled primitive that a second
+process could later repoint**, which matters precisely because the mid-run swap (TOCTOU, below) is the
+residual this project has *accepted* rather than closed. Shrinking what the guest can plant shrinks
+what an external racer has to work with.
+
+**Deny-by-default with an explicit escape hatch**, rather than grant-by-default with a warning nobody
+reads. The installer case is real, so it stays expressible — it just has to be asked for.
+
+⚠️ **This governs CREATION, not traversal.** Following a **pre-existing** in-sandbox link needs
+`path_open`, which every grant keeps. Conflating the two would silently turn "deny symlink creation"
+into "break every guest that reads through a link the operator placed" — a far larger change, and one
+nobody requested. The read-only rights test asserts both halves.
+
+*(The same policy and the same flag ship in the Rust port; the two masks are meant to stay identical —
+see `known-issues.md` on why they had drifted.)*
+
 ## What holds today (shipped, verified)
 
 - **A guest cannot execute anything.** Verified against the full WASI preview-1 surface (45 functions):

@@ -4,6 +4,15 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
 
 ## Invariants
 
+- 🔒 **SYMLINK CREATION IS DENIED BY DEFAULT (owner, 2026-08-10).** `--dir` grants
+  `readWriteRights = all & ~path_symlink`; `--allow-symlink` opts back in for installer-shaped work;
+  `--ro-dir` denied it already. Composing modules over shared linear memory is the **runtime's** job,
+  so a workload run never needs new links on disk — and denying creation removes a guest-controlled
+  primitive an external process could later repoint, which is what makes the accepted TOCTOU residual
+  survivable. ⚠️ **Governs CREATION, not traversal:** following a pre-existing link needs `path_open`,
+  which every grant keeps, and both halves are asserted in the read-only rights test. Do not "simplify"
+  this back to a single `all` grant.
+
 - 🔒 **EVERY PATH THAT EXECUTES MUST VALIDATE FIRST (2026-08-10 — reverses the 2026-07-19 decision).**
   §4.5.1 defines instantiation only for a *valid* module. `runFunction`, `runWasi` and the C ABI's
   `wasm_module_new` now all validate; the summarize and `.wast` paths always did. The guard hangs off
