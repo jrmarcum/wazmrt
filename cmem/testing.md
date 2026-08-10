@@ -547,6 +547,33 @@ top of the standalone `mod_tests` run — so the printed total roughly doubles e
 quote the printed number as a distinct-test count; quote the per-target numbers from `--summary all`.**
 Green under **Debug AND ReleaseSafe**; `zig build c-smoke` 319/319.
 
+**Update 2026-08-10 — green under all FOUR modes, and the 4 skips are not neutral.**
+
+- ✅ **489/493 in Debug, ReleaseSafe, ReleaseFast AND ReleaseSmall.** The line above only ever claimed
+  the first two, so the other two were *unverified* rather than failing — a gap in the **record**, now
+  closed. Re-run all four whenever this number is quoted: ReleaseFast/ReleaseSmall remove the safety
+  checks, so they are exactly where a latent index or cast bug would surface.
+- ⚠️⚠️ **The 4 skips are the SANDBOX-ESCAPE tests, and they do not run on a normal Windows box.** Both
+  live in `src/wasi.zig` — `symlink traversal: in-sandbox links follow, escaping links refused
+  (#17/4.3)` and `symlink resolver fuzz: no adversarial topology reaches outside the preopen` — once per
+  test binary, hence four. Each bails with `error.SkipZigTest` when the host refuses to create a
+  symlink, and Windows refuses without **Developer Mode or elevation** (`New-Item -ItemType
+  SymbolicLink` → *"Administrator privilege required"*).
+
+  The skip is honest — with no link there is nothing to traverse — but the effect is that **the escape
+  properties are unverified in that environment**, which is the wrong thing to find during a security
+  review rather than before it. Partial cover exists: the absolute-target canary case is exercised on
+  Windows by `examples/wasi_symlink_traversal.zig`.
+
+  **Before any security review: enable Developer Mode, re-run, confirm all four become passes.** If one
+  then *fails*, that is a real finding the skip was hiding. **"489/493, 4 skipped" should never be
+  quoted unqualified** — the port's `scripts/wazmrt-baseline.txt` now carries the same caveat.
+
+**Build note (this machine, 2026-08-10):** `zig build` from the `D:` drive fails with `error:
+Unexpected` — a Zig cache/filesystem interaction, not a code problem. Build with
+`--cache-dir C:\…\zigcache --global-cache-dir C:\…\zigcache\g`. The port's `check-wazmrt.sh` already
+retries with a throwaway cache and reports the oracle green.
+
 **Session conformance snapshot (2026-07-27):** full main testsuite (`WebAssembly/testsuite`, 288 files)
 **60,670 passed / 568 failed**; memory64 dir **601/1** (the 1 = the out-of-scope `module definition`
 module-linking command); SIMD suite **24,956/0**. Every wasm proposal wazmrt targets is implemented and the

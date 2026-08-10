@@ -4,6 +4,46 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
 
 ## Invariants
 
+- 🔒 **EVERY PATH THAT EXECUTES MUST VALIDATE FIRST (2026-08-10 — reverses the 2026-07-19 decision).**
+  §4.5.1 defines instantiation only for a *valid* module. `runFunction`, `runWasi` and the C ABI's
+  `wasm_module_new` now all validate; the summarize and `.wast` paths always did. The guard hangs off
+  the **`will_execute`** predicate that already existed to gate pin verification, so a *future* execute
+  path inherits it rather than having to remember — and it sits **after** the pin gate, so authorization
+  still precedes inspection.
+
+  ⚠️ **The old decision was reasoned, not sloppy**, which is why it lasted: the interpreter must be
+  memory-safe anyway, so hardening is the real floor. **That reasoning still stands and the hardening
+  stays.** What it missed is the other half — an unvalidated module that is *not* memory-unsafe simply
+  runs and prints a **plausible wrong answer**. Validation is now the first line; `checkStaticIndices`
+  and the cold-path bounds checks remain the floor. **Do not delete a defence because an upstream check
+  now catches the same input** — the C-ABI embedder path can still hand the interpreter anything.
+
+  **The cost of not having it:** a downstream consumer (the Rust port `wasmrt`) carried a **false defect
+  for two releases** — "wazmrt runs this module and wasmrt refuses it, so the *port's* type-checker is
+  wrong". It was not; the module was ill-typed and *this* validator says so, on the path nobody ran.
+  **A runtime that executes an invalid module is over-permissive, not authoritative** — and anything
+  citing it as an oracle inherits that. **The generalizable rule: the bug is rarely "nobody does X", it
+  is "three of the four do X" — enumerate every entry point in a table and check the property at each.**
+
+- 🔒 **AN INVALID MODULE IS REFUSED WITH A wasmtime-SHAPED DIAGNOSTIC (2026-08-10).** Not just
+  `TypeMismatch`, but the byte offset, the function index, and expected-vs-found:
+
+  ```
+  error: 'x.wasm' is not a valid module at offset 33 (function 0): type mismatch: expected i32, found i64
+  ```
+
+  Matched against **the real wasmtime 47.0.2**, not its documentation — `Invalid input WebAssembly code
+  at offset 33: type mismatch: expected i32, found i64`. **The offset is byte-identical because both
+  count from the start of the module**, so the two tools' numbers are directly comparable on one file;
+  verified side by side on two modules (offsets **33** and **61**), and `wasmrt` pins both as tests.
+  **Do not change the origin to body-relative** — that silently breaks the comparison this exists for.
+
+  Carried in a `threadlocal` `validate.FailureSite`, **because a Zig error set cannot hold a payload** —
+  `error.TypeMismatch` is a bare tag. The offset is derived **only on failure**, by re-decoding that one
+  body with `opcode.decodeBodyTracked` + `code.body_offset`, the same cold-path trick
+  `Instance.frameOffset` uses — so nothing is stored per instruction. ⚠️ `ValType` is **non-exhaustive**;
+  use `std.enums.tagName` (returns null), never `@tagName`, which is undefined on an unknown value.
+
 - **MEMORY SAFETY IS A PROJECT GOAL, AND `wasm_c_api.zig` IS WHERE IT IS AT RISK (owner, 2026-07-15:
   "we do not ever want to introduce exploitable holes").** It is the only file that hands raw ownership
   across a C boundary, so a mistake there is a *heap-corruption primitive*, not a wrong answer. Six

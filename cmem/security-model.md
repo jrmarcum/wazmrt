@@ -69,10 +69,38 @@ conditional on granted capabilities (zero for a bare function ⇒ no sandbox nee
 unconditional.** (Caveat: an **embedder** via the C-ABI/FFI chooses its own imports — if it grants file
 access it must sandbox that itself; the embedder run path is intentionally ungated for both properties.)
 
-### The run path is ungated for *authority/validation* but not *memory safety* (2026-07-19)
+### 🔄 REVERSED 2026-08-10 — the run path NOW VALIDATES. The hardening floor stays
 
-The CLI run path (`runFunction`/`runWasi`) does **not** type-validate the module before executing — only
-the inspect path does. "Not validated" must never mean "memory-unsafe": a malicious/malformed module runs
+**The decision below was deliberate and reasoned, and it has been overturned.** From 2026-07-19 the CLI
+run path deliberately skipped validation, arguing that the interpreter must be memory-safe *anyway* and
+that hardening is the real floor. **That argument is still correct** — which is why every word of the
+hardening rationale below stays. What it did not survive is the second question: *what does an
+unvalidated module do when it is **not** memory-unsafe?* It runs, and prints a plausible wrong answer.
+
+Both execute paths (`runFunction`, `runWasi`) **and** the C ABI's `wasm_module_new` now validate first.
+One guard in `run()` on the pre-existing `will_execute` predicate, placed **after** the pin gate so
+authorization still comes first. Measured: `zig build test` **489/493 in all four modes**, wasmtk WASI
+corpus **376/376 unaffected** — it refuses nothing legitimate.
+
+**Why the reversal, in one line:** the paths that *execute* were the only ones not checking, and that
+asymmetry let a downstream consumer — the Rust port — carry a **false defect for two releases**
+("wazmrt runs this module and wasmrt refuses it, so the *port's* type-checker is wrong"). It was not:
+the module was ill-typed and *this* validator says so. **A runtime that executes an invalid module is
+over-permissive, not authoritative**, and anything citing it as an oracle inherits that.
+
+⚠️ **What has NOT changed, and must not be read as weakened.** The hardening floor below is still the
+guarantee. Validation is now a *first* line, not the only one: it buys spec-conformance and a real
+diagnostic, while `checkStaticIndices` and the cold-path bounds checks remain what makes
+ReleaseFast/ReleaseSmall safe. **Do not delete a defence because a check upstream now catches the same
+input** — the two answer different questions, and the C-ABI *embedder* path can still hand the
+interpreter arbitrary values through its own imports.
+
+*(The original rationale follows, kept verbatim because it is still what justifies the hardening.)*
+
+### The run path is ungated for *authority/validation* but not *memory safety* (2026-07-19, superseded)
+
+The CLI run path (`runFunction`/`runWasi`) did **not** type-validate the module before executing — only
+the inspect path did. "Not validated" must never mean "memory-unsafe": a malicious/malformed module runs
 untrusted immediates and stack values, and the interpreter must **trap, never corrupt memory** (the project
 ships ReleaseFast/ReleaseSmall, so an unchecked OOB is real UB). So the interpreter self-defends:
 `checkStaticIndices` bounds-checks every static index immediate once at load time, and cold GC/EH/branch
