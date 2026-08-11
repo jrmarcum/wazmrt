@@ -156,11 +156,114 @@ export fn wazmrt_trap_frame(
 // Engine
 // ---------------------------------------------------------------------------------------
 
-/// Holds the configuration shared by the stores made from it, and must outlive them. The
-/// feature/ceiling fields arrive with the config surface in step 2e — deliberately absent
-/// rather than present-and-ignored, because the header promises a disabled proposal makes a
-/// module *invalid*, and a toggle that gates nothing while reading as a control is worse than
-/// no toggle at all.
+/// Mirrors `wazmrt_feature_t`.
+const Feature = enum(c_int) {
+    sign_extension = 0,
+    saturating_float_to_int = 1,
+    multi_value = 2,
+    reference_types = 3,
+    bulk_memory = 4,
+    extended_const = 5,
+    simd = 6,
+    relaxed_simd = 7,
+    threads = 8,
+    multi_memory = 9,
+    memory64 = 10,
+    function_references = 11,
+    gc = 12,
+    exceptions = 13,
+    _,
+
+    fn valid(self: Feature) bool {
+        return @intFromEnum(self) >= 0 and @intFromEnum(self) <= 13;
+    }
+};
+
+/// A template `wazmrt_engine_new_with_config` copies. The embedder keeps ownership.
+///
+/// ⚠️ **This build enforces the two memory/table ceilings and nothing else.** `max_gc_objects`,
+/// `max_exception_boxes` and `max_call_depth` are compile-time constants in `interp.zig`, and
+/// there is no per-proposal gating in the validator at all. Rather than accept those requests
+/// and ignore them — which would hand an embedder a *security control that controls nothing* —
+/// a request this build cannot honour is REFUSED: `set_feature` returns false, and a ceiling
+/// with no backing makes `wazmrt_engine_new_with_config` fail with a message naming it.
+///
+/// The `void` setters cannot report failure themselves, which is why the refusal is deferred to
+/// engine creation instead of being silent. Step 2e-b makes these real; until then the embedder
+/// finds out immediately rather than believing in a cap that does not exist.
+pub const Config = struct {
+    /// 0 means "leave at the default", per the header.
+    max_memory_bytes: u64 = 0,
+    max_table_elements: u64 = 0,
+    /// Requests recorded only so engine creation can refuse them by name.
+    asked_gc_objects: bool = false,
+    asked_exception_boxes: bool = false,
+    asked_call_depth: bool = false,
+    asked_disable_all: bool = false,
+};
+
+export fn wazmrt_config_new() ?*Config {
+    const c = alloc.create(Config) catch return null;
+    c.* = .{};
+    return c;
+}
+
+export fn wazmrt_config_delete(c: ?*Config) void {
+    const cfg = c orelse return;
+    alloc.destroy(cfg);
+}
+
+/// False for an unrecognised feature — or for a request this build cannot enforce. Every
+/// proposal is ON, so enabling one succeeds and disabling one is refused rather than pretended.
+export fn wazmrt_config_set_feature(c: ?*Config, f: Feature, enabled: bool) bool {
+    _ = c orelse return false;
+    if (!f.valid()) return false;
+    return enabled; // true: already on. false: cannot gate — see the Config doc comment.
+}
+
+export fn wazmrt_config_get_feature(c: ?*Config, f: Feature, out: ?*bool) bool {
+    _ = c orelse return false;
+    if (!f.valid()) return false;
+    if (out) |p| p.* = true; // everything is on and cannot currently be turned off
+    return true;
+}
+
+export fn wazmrt_config_all_features(c: ?*Config, enabled: bool) void {
+    const cfg = c orelse return;
+    if (!enabled) cfg.asked_disable_all = true; // refused at engine creation
+}
+
+export fn wazmrt_config_set_max_memory_bytes(c: ?*Config, n: u64) void {
+    if (c) |cfg| if (n != 0) {
+        cfg.max_memory_bytes = n;
+    };
+}
+
+export fn wazmrt_config_set_max_table_elements(c: ?*Config, n: u64) void {
+    if (c) |cfg| if (n != 0) {
+        cfg.max_table_elements = n;
+    };
+}
+
+export fn wazmrt_config_set_max_gc_objects(c: ?*Config, n: u64) void {
+    if (c) |cfg| if (n != 0) {
+        cfg.asked_gc_objects = true;
+    };
+}
+
+export fn wazmrt_config_set_max_exception_boxes(c: ?*Config, n: u64) void {
+    if (c) |cfg| if (n != 0) {
+        cfg.asked_exception_boxes = true;
+    };
+}
+
+export fn wazmrt_config_set_max_call_depth(c: ?*Config, n: u32) void {
+    if (c) |cfg| if (n != 0) {
+        cfg.asked_call_depth = true;
+    };
+}
+
+/// Holds the configuration shared by the stores made from it, and must outlive them.
 pub const Engine = struct {
     /// Distinguishes stores made from different engines in diagnostics; not a security
     /// boundary (the store id is what handles are checked against).
@@ -179,6 +282,12 @@ pub const Engine = struct {
     /// always heap-allocated, and it outlives its stores by contract.
     threaded: std.Io.Threaded,
 
+    /// Resource ceilings applied to every instance made through this engine. Enforced by the
+    /// interpreter itself (`memory.grow` and `table.grow` re-check them), not merely at
+    /// instantiation.
+    max_memory_bytes: usize = interp.default_max_memory_bytes,
+    max_table_elems: usize = interp.default_max_table_elems,
+
     fn io(self: *Engine) std.Io {
         return self.threaded.io();
     }
@@ -192,6 +301,43 @@ export fn wazmrt_engine_new() ?*Engine {
     // The single-threaded template ships a `.failing` allocator; WASI path work needs a real one.
     t.allocator = alloc;
     e.* = .{ .id = next_engine_id.fetchAdd(1, .monotonic), .threaded = t };
+    return e;
+}
+
+/// Returns NULL and sets *error for a config this build cannot honour.
+///
+/// Refusing beats repairing: silently enabling a dependency, or silently ignoring a ceiling,
+/// would accept guests the embedder meant to constrain. The embedder still owns `cfg`.
+export fn wazmrt_engine_new_with_config(c: ?*const Config, err_out: ?*?*Error) ?*Engine {
+    const cfg = c orelse {
+        if (err_out) |p| p.* = errorf("wazmrt_engine_new_with_config: config is NULL", .{});
+        return null;
+    };
+
+    const unsupported: ?[]const u8 =
+        if (cfg.asked_disable_all) "disabling proposals" else if (cfg.asked_gc_objects)
+            "max_gc_objects"
+        else if (cfg.asked_exception_boxes)
+            "max_exception_boxes"
+        else if (cfg.asked_call_depth)
+            "max_call_depth"
+        else
+            null;
+    if (unsupported) |what| {
+        if (err_out) |p| p.* = errorf(
+            "this build cannot enforce {s} — it is a compile-time constant in the interpreter. " ++
+                "Refusing rather than accepting a limit that would not apply.",
+            .{what},
+        );
+        return null;
+    }
+
+    const e = wazmrt_engine_new() orelse {
+        if (err_out) |p| p.* = errorf("out of memory", .{});
+        return null;
+    };
+    if (cfg.max_memory_bytes != 0) e.max_memory_bytes = std.math.cast(usize, cfg.max_memory_bytes) orelse std.math.maxInt(usize);
+    if (cfg.max_table_elements != 0) e.max_table_elems = std.math.cast(usize, cfg.max_table_elements) orelse std.math.maxInt(usize);
     return e;
 }
 
@@ -1357,7 +1503,15 @@ fn resolveImports(
         }
     }
 
-    out.* = .{ .funcs = funcs, .globals = globals, .globals_hi = globals_hi };
+    out.* = .{
+        .funcs = funcs,
+        .globals = globals,
+        .globals_hi = globals_hi,
+        // The engine's ceilings, carried per-instance so `memory.grow`/`table.grow` re-check
+        // them at run time rather than only at instantiation.
+        .max_memory_bytes = lk.engine.max_memory_bytes,
+        .max_table_elems = lk.engine.max_table_elems,
+    };
     return null;
 }
 
@@ -2301,6 +2455,96 @@ test "an instance outliving its linker does not write through a dangling pointer
     try testing.expect(wazmrt_instance_get_func(s, inst, "_start", &f));
     try testing.expect(wazmrt_func_call(s, f, null, 0, null, 0, &trap) == null);
     if (trap) |t| wazmrt_trap_delete(t);
+}
+
+test "config: the memory ceiling is enforced, not merely accepted" {
+    const cfg = wazmrt_config_new().?;
+    defer wazmrt_config_delete(cfg);
+    wazmrt_config_set_max_memory_bytes(cfg, 64 * 1024); // one page
+
+    var cerr: ?*Error = null;
+    const e = wazmrt_engine_new_with_config(cfg, &cerr).?;
+    defer wazmrt_engine_delete(e);
+    try testing.expect(cerr == null);
+
+    const s = wazmrt_store_new(e).?;
+    defer wazmrt_store_delete(s);
+    const l = wazmrt_linker_new(e).?;
+    defer wazmrt_linker_delete(l);
+
+    // `peek_module` declares one page, which exactly fits the ceiling.
+    const ft = i32Type(&.{.i32}, &.{.i32});
+    defer wazmrt_functype_delete(ft);
+    try testing.expect(wazmrt_linker_define_func(l, "env", "peek", ft, peekCb, null, null) == null);
+    var m: *CModule = undefined;
+    try testing.expect(wazmrt_module_new(e, &peek_module, peek_module.len, &m) == null);
+    defer wazmrt_module_delete(m);
+    var inst: InstanceHandle = .{ .id = 0 };
+    var trap: ?*Trap = null;
+    try testing.expect(wazmrt_linker_instantiate(l, s, m, &inst, &trap) == null);
+
+    // Below the ceiling the same module must be REFUSED — otherwise the number is decoration.
+    const tight = wazmrt_config_new().?;
+    defer wazmrt_config_delete(tight);
+    wazmrt_config_set_max_memory_bytes(tight, 4096);
+    const e2 = wazmrt_engine_new_with_config(tight, &cerr).?;
+    defer wazmrt_engine_delete(e2);
+    const s2 = wazmrt_store_new(e2).?;
+    defer wazmrt_store_delete(s2);
+    const l2 = wazmrt_linker_new(e2).?;
+    defer wazmrt_linker_delete(l2);
+    try testing.expect(wazmrt_linker_define_func(l2, "env", "peek", ft, peekCb, null, null) == null);
+    var m2: *CModule = undefined;
+    try testing.expect(wazmrt_module_new(e2, &peek_module, peek_module.len, &m2) == null);
+    defer wazmrt_module_delete(m2);
+    var inst2: InstanceHandle = .{ .id = 0 };
+    const err = wazmrt_linker_instantiate(l2, s2, m2, &inst2, &trap);
+    defer wazmrt_error_delete(err);
+    try testing.expect(err != null);
+}
+
+test "config: a limit this build cannot enforce is REFUSED, not ignored" {
+    // The whole point of 2e-a. An embedder that caps GC objects for safety must not be told
+    // "fine" and then run uncapped — that is a security control that controls nothing.
+    for ([_]u8{ 0, 1, 2, 3 }) |which| {
+        const cfg = wazmrt_config_new().?;
+        defer wazmrt_config_delete(cfg);
+        switch (which) {
+            0 => wazmrt_config_set_max_gc_objects(cfg, 1000),
+            1 => wazmrt_config_set_max_exception_boxes(cfg, 1000),
+            2 => wazmrt_config_set_max_call_depth(cfg, 64),
+            else => wazmrt_config_all_features(cfg, false),
+        }
+        var cerr: ?*Error = null;
+        try testing.expect(wazmrt_engine_new_with_config(cfg, &cerr) == null);
+        const err = cerr orelse return error.TestExpectedError;
+        defer wazmrt_error_delete(err);
+        // Names what it could not do, so the embedder can act rather than guess.
+        try testing.expect(std.mem.indexOf(u8, std.mem.span(wazmrt_error_message(err).?), "cannot enforce") != null);
+    }
+}
+
+test "config: features report honestly" {
+    const cfg = wazmrt_config_new().?;
+    defer wazmrt_config_delete(cfg);
+
+    // Enabling is a no-op that succeeds: everything is already on.
+    try testing.expect(wazmrt_config_set_feature(cfg, .simd, true));
+    // Disabling is REFUSED rather than pretended — there is no gating in the validator yet.
+    try testing.expect(!wazmrt_config_set_feature(cfg, .simd, false));
+    // An unrecognised feature is false either way.
+    try testing.expect(!wazmrt_config_set_feature(cfg, @enumFromInt(99), true));
+
+    var on: bool = false;
+    try testing.expect(wazmrt_config_get_feature(cfg, .gc, &on));
+    try testing.expect(on);
+    try testing.expect(!wazmrt_config_get_feature(cfg, @enumFromInt(99), &on));
+
+    // A config that asked for nothing impossible builds an engine fine.
+    var cerr: ?*Error = null;
+    const e = wazmrt_engine_new_with_config(cfg, &cerr).?;
+    defer wazmrt_engine_delete(e);
+    try testing.expect(cerr == null);
 }
 
 test "delete functions tolerate NULL" {

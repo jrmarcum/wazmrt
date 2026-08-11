@@ -184,10 +184,16 @@ typedef enum {
 /* The WebAssembly proposals that can be individually refused. ALL ARE ON BY DEFAULT —
  * wazmrt's stated scope is full browser-standard parity plus memory64.
  *
- * ⚠️ A TOGGLE HERE GATES FOR REAL. A disabled proposal makes a module INVALID: it is refused
- * by `wazmrt_module_new` / `wazmrt_module_validate`, wholly and before execution, never
- * part-way through. A flag that read as a control while gating nothing would be worse than
- * no flag at all, so if one cannot be enforced it is not listed.
+ * ⚠️⚠️ NOT YET ENFORCED IN THIS BUILD. There is no per-proposal gating in the validator, so
+ * `wazmrt_config_set_feature(cfg, f, false)` RETURNS FALSE and `wazmrt_config_all_features(cfg,
+ * false)` makes `wazmrt_engine_new_with_config` fail. Nothing here silently does nothing: a
+ * request that cannot be honoured is refused where you make it, because an embedder who thinks
+ * SIMD is off when it is on has a security control that controls nothing. Enabling a proposal
+ * succeeds (they are all already on), and reading one reports true.
+ *
+ * When gating lands, a disabled proposal will make a module INVALID — refused by
+ * `wazmrt_module_new` / `wazmrt_module_validate`, wholly and before execution, never part-way
+ * through. The enum is published now so that change adds no symbols.
  *
  * There is deliberately NO tail-call entry: `return_call` / `return_call_indirect` are not
  * in wazmrt's implemented set, so a toggle for them would gate nothing. `return_call_ref`
@@ -223,13 +229,24 @@ void wazmrt_config_all_features(wazmrt_config_t *, bool enabled);
 
 /* Resource ceilings. Each is a CEILING, not a reservation: raising one costs nothing until a
  * guest actually asks for it — wazmrt's linear memory is lazily paged. Passing 0 leaves the
- * current value unchanged. */
+ * current value unchanged.
+ *
+ * The first two are ENFORCED, and not only at instantiation: the interpreter re-checks them in
+ * `memory.grow` and `table.grow`, so a guest cannot climb past them at run time. */
 void wazmrt_config_set_max_memory_bytes(wazmrt_config_t *, uint64_t);
 void wazmrt_config_set_max_table_elements(wazmrt_config_t *, uint64_t);
+
+/* ⚠️ NOT ENFORCEABLE IN THIS BUILD — these are compile-time constants in the interpreter.
+ * Setting either to a non-zero value makes `wazmrt_engine_new_with_config` FAIL, naming the
+ * limit. These setters return void and so cannot report failure themselves, which is exactly
+ * why the refusal happens at engine creation rather than silently at the setter. */
 void wazmrt_config_set_max_gc_objects(wazmrt_config_t *, uint64_t);
 void wazmrt_config_set_max_exception_boxes(wazmrt_config_t *, uint64_t);
 
 /* Guest call depth before the engine reports "call stack exhausted". Default 512.
+ *
+ * ⚠️ NOT ENFORCEABLE IN THIS BUILD — see the two setters above; a non-zero value makes
+ * `wazmrt_engine_new_with_config` fail rather than accepting a depth that would not apply.
  *
  * WORTH SETTING IF YOU LINK A DEBUG BUILD. The interpreter recurses on the host stack, and an
  * un-inlined debug frame is large enough that the default can exhaust an 8 MiB thread stack
