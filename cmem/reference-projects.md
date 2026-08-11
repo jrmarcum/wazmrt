@@ -23,7 +23,18 @@ all compatible with our dual `MIT OR Apache-2.0` distribution. See `licensing.md
 
 ## Adoption status
 
-**First adoption 2026-07-02 — the C API standard.** The owner chose to **mirror the wasm-c-api standard
+⚡ **REVERSED 2026-08-11 — THE ONLY ADOPTION WAS UNDONE. NOTHING IS VENDORED; THE LEDGER IS EMPTY.**
+The vendored `wasm.h` was deleted along with `src/wasm_c_api.zig`, and the C ABI is now the native
+`include/wazmrt.h` (ABI 2). The nine runtimes below remain **Evaluating** — so wazmrt has adapted no
+third-party code from anything, and is `MIT OR Apache-2.0` end to end.
+
+🎓 **The adoption-checklist lesson this bought, which is the reason to keep reading the entry below:**
+the ledger's own "Benefit" line — *"loaders bind once to a familiar ABI"* — was a claim about someone
+else's code that nobody verified. It was false; the loaders use wasmtime's `wasmtime_*` API. **A
+Benefit line is a HYPOTHESIS until you open that project's source and grep for it.** Full account in
+`vision.md`; the replacement in `architecture.md`.
+
+**First adoption 2026-07-02 — the C API standard (SINCE UNDONE, see above).** The owner chose to **mirror the wasm-c-api standard
 `wasm.h`** as wazmrt's integration ABI (so `universalWasmLoader-*` and any wasm-c-api consumer bind
 identically to how they'd bind wasmtime/wasmer). The canonical header (`WebAssembly/wasm-c-api`,
 Apache-2.0) is vendored **verbatim** at `third_party/wasm-c-api/include/wasm.h`, pinned to commit
@@ -35,7 +46,7 @@ The nine runtimes above remain **Evaluating** — no interpreter/decoder code ad
 **Adopted**, add the ledger entry, copy the upstream `LICENSE`/`NOTICE` into `third_party/<component>/`,
 and add change-notes + SPDX headers to the adapting source (per the Adoption Checklist).
 
-## C ABI decision (2026-07-02): mirror the wasm-c-api standard
+## ~~C ABI decision (2026-07-02): mirror the wasm-c-api standard~~ — REVERSED 2026-08-11
 
 - **Integration ABI = the vendored standard `wasm.h`** (every loader binds to it).
 - **`include/wazmrt.h` = a small extension header** (version/ABI handshake + wazmrt-specifics), the

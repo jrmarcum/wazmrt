@@ -11,6 +11,46 @@ This file tracks only what's left.
 
 Line numbers are hints (they drift) — the function/construct name is the durable anchor.
 
+⚠️ **READ THE C-ABI ENTRIES AS HISTORY.** `#20`, `#21`, `#22` and every other `wasm_c_api.zig` item is
+about a file **deleted on 2026-08-11**. They are kept because they are the *evidence* for the
+replacement's design: value handles exist precisely so that class cannot recur. See
+`design-decisions.md`.
+
+## 🧾 ABI-2 build (2026-08-11) — bugs and near-misses found while replacing the C ABI
+
+None of these shipped; all were caught by a gate or a test. Recorded because each is a **shape** that
+will recur, and four of them compile perfectly.
+
+1. 🔴 **`ArenaAllocator` moved after `allocator()` was taken → dangling allocator.** Instance slots were
+   stored by value in an `ArrayList`; the list grew, the arena moved, and the interpreter kept
+   allocating through the old address. **Compiles cleanly, crashes on the second instantiation** (four
+   tests, allocator panic). `interp.Instance` embeds an arena and has the same constraint. Fix:
+   heap-allocate, store pointers. → invariant in `design-decisions.md`.
+2. 🟠 **`zig build-obj` on a library file proves almost nothing.** `features.zig` "compiled" standalone
+   while referencing `Module.types`, a field that does not exist — an unreferenced `pub fn` is never
+   analysed. Only building it into the test target found it. **Never treat a standalone object build as
+   a check that a library file is correct.**
+3. 🟠 **Near-miss: a gate wrong in the FALSE-POSITIVE direction.** The first feature-gating draft
+   flagged `comp_types.len > 0` as GC, but that slice holds function signatures too — it would have
+   refused **every** module under a disabled-GC config. Caught before commit. A gate that over-refuses
+   is how a feature gets turned off and stays off.
+4. 🟠 **A gate demonstration that tested the wrong mechanism.** Proving the symbol gate by renaming
+   `wazmrt_bytes_delete` failed at Zig *compile* time — `module_new_wat` calls it internally — so it
+   never reached the linker. Use a symbol nothing calls internally, or you have demonstrated the
+   compiler.
+5. 🟡 **`ffi-demo` passed its script as a RELATIVE path**, resolved against the process cwd. It worked
+   from the repo root and failed everywhere else — including `zig build --build-file` from another
+   drive, which is exactly how the sandbox tests must be run here. Fixed with `addFileArg`. The old
+   step had the same defect and nobody had run it from elsewhere.
+6. 🟡 **Hand-assembled wasm fixtures were wrong three separate times** — a reused type index that gave
+   a function a parameter it never read, and two custom/section size bytes miscounted. Each surfaced
+   only as "failed to decode module". Byte counts now sit in comments beside each section so the next
+   edit is checkable by reading.
+7. 🟠 **PowerShell `Set-Content` corrupted a `cmem/` file** — added a BOM and mojibake'd every em-dash
+   and emoji. ⚠️ **Invisible in a terminal**, which renders the damage back as the same glyphs; caught
+   only by reading raw bytes. Reverted with `git checkout` and redone with the editing tool. **On this
+   machine, never write these files through PowerShell redirection or `Set-Content`.**
+
 ## 🔴 ✅ Fixed 2026-08-10 — `--ro-dir` DID NOT PREVENT SYMLINK CREATION (real security hole)
 
 **A guest could plant symlinks inside a read-only preopen.** Found by the owner asking a design

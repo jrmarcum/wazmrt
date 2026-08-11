@@ -420,6 +420,81 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   wazmrt already cedes to a JIT. Reserve `ReleaseFast` for a specifically compute-bound embedder.
   Aligns with the "smallest binary" goal at ~no cost to the win.
 
+- 🔒 **PER-PROPOSAL GATING IS ONLY WORTH HAVING IF ITS COVERAGE IS ENFORCED BY THE COMPILER
+  (`src/features.zig`, 2026-08-11).** A gate that misses an opcode is **worse than no gate**: it reads
+  as a control while letting the thing through. `opFeature` maps 66 opcodes to a proposal and ends in
+  `else => null` for the 172 WebAssembly-1.0 core ops — so a NEWLY ADDED opcode would silently default
+  to "always allowed". **The comptime assertion pinning `@typeInfo(opcode.Op).@"enum".fields.len` is
+  the load-bearing part of that file**: adding an opcode fails the build until someone classifies it.
+  ⚠️ **Do not satisfy it by bumping the number.**
+  🎓 **It caught its own author.** Written against a hand-counted 214, it fired at 238 — and the gap was
+  four opcodes spelled **`@"unreachable"`, `@"if"`, `@"else"`, `@"return"`**, which are `@"…"`-quoted
+  because they collide with Zig keywords, so `grep '^    [a-z_]'` misses every one. All four are core,
+  so the classification held — **but a hand-audit would have "confirmed" coverage while blind to them.
+  Count enum members with `@typeInfo`, never with a text search.**
+  ⚠️ **Gate on TYPES as well as code:** a module can need a proposal without executing one of its
+  instructions (`(module (type (func (param v128))))` needs SIMD and contains no SIMD op). And beware
+  the false-positive direction — an early draft flagged `comp_types.len > 0` as GC, but `comp_types`
+  holds function signatures too, so it would have refused **every** module under a disabled-GC config.
+  A gate wrong that way is how a feature gets switched off and stays off.
+
+- 🔑 **VALUE HANDLES: the ABI-2 ownership model (2026-08-11). Do not "improve" this back into
+  pointers.** `wazmrt_instance_t`/`_func_t`/`_memory_t`/`_global_t` are `struct { uint64_t id; }`
+  encoding **`(store_id << 32) | (slot + 1)`**, and three properties fall out of that encoding rather
+  than out of discipline:
+  1. **Slot 0 is never used**, so an all-zero handle — one a caller forgot to fill in, or that `memset`
+     zeroed — is invalid *by construction* rather than naming slot 0 of whatever store it meets. That
+     is the likeliest host mistake and it costs nothing to catch.
+  2. **Store ids come from a monotonic counter and are never reused**, so a handle from a DELETED store
+     fails the comparison against any later store instead of aliasing it.
+  3. **Validity is decided by LOOKUP in the owning store**, never asserted by the handle.
+  ⚠️ **This is what removed the `#20`/`#21`/`#22` bug class — not vigilance.** With no refcount and no
+  ownership transfer, double-free / use-after-free / uninitialised-refcount cannot be *expressed*. Six
+  hand-enforced rules became zero. It is also why handles are pleasant over FFI: a single-`u64` struct
+  is passed in a register exactly like a `u64` on SysV-x64 and Win64, so Deno/ctypes/cgo declare it as
+  a plain integer with no struct modelling and no pointer to keep alive.
+  **Opaque pointers (engine/store/module/linker/trap/error) stay ordinary C: one owner, one `_delete`.**
+
+- ⚠️ **`ArenaAllocator` IS NOT MOVABLE once `allocator()` has been taken from it (2026-08-11).** The
+  returned `Allocator` captures `&arena`, so copying the arena — into an `ArrayList` element, or when
+  that list reallocs on growth — leaves everything allocating through a dangling pointer.
+  **`interp.Instance` embeds an arena and has the same constraint.** Storing either by value in a
+  growable container **compiles perfectly and crashes on the second instantiation**; it cost four
+  crashed tests before the cause was obvious. Rule: heap-allocate the owner and store POINTERS.
+
+- **Errors and traps are separate channels, and both must be checked (2026-08-11).** A C-ABI function
+  returning `wazmrt_error_t*` returns NULL on success; a GUEST trap arrives through a distinct
+  `wazmrt_trap_t**` out-param. A call can therefore return no error and still have trapped. ⚠️ A host
+  trap keeps ITS OWN message: the interpreter's error set can only say `HostTrap`, so a trap returned
+  by a callback is stashed on the instance and handed back rather than replaced by a generic one.
+  **`proc_exit` is a CLEAN FINISH, not a trap** — it unwinds internally as `HostTrap` with a code
+  recorded, and reporting that to the embedder would make every ordinary WASI command look like a crash.
+
+- **An import's declared signature is CHECKED at bind time, not trusted (2026-08-11).** Two
+  declarations exist — the module's and the linker's — so `wazmrt_linker_define_func` compares them and
+  a disagreement fails instantiation naming the import. Binding a mismatched callback has it read
+  arguments that were never passed, which is a segfault from a four-line `.wat` (the 10th pass found
+  exactly this in `wasi.callFor`). One comparison per import removes the class. Same rule applies to
+  `define_instance` guest-to-guest imports.
+
+- **Concurrency comes from MULTIPLE ENGINES, not from a thread-safe engine (owner, 2026-08-11).** Each
+  engine carries its own **single-threaded** `std.Io` (`Io.Threaded.init_single_threaded`, which spawns
+  nothing). A thread pool would contradict the published contract that a store is single-threaded, and
+  would cost bytes in a runtime whose pitch is footprint. An async/await or threaded host gives each
+  concurrent context its own engine; they share nothing. ⚠️ `io()` captures `&threaded`, so an `Engine`
+  must never be moved after creation.
+
+- 🔒 **A GATE MUST BE ABLE TO FAIL, AND THE PROOF MUST TEST THE RIGHT MECHANISM (2026-08-11).** Both
+  new gates were verified by breaking them on purpose, and one attempt proved the wrong thing:
+  - **`zig build size`** — ceilings in `tools/size-ceilings.txt` are EXACT, with no headroom, so growth
+    fails the build and must raise the number *in the same commit* with a reason. Headroom would let
+    drift accumulate under a green check, which is the failure it exists to prevent. It caught the
+    ABI-2 flip growing the DLL 227→845 KB. A SHRINK is reported too, so a win gets locked in.
+  - **`tests/wazmrt_abi_symbols.c`** — GENERATED from the header, because a hand-kept list drifts by
+    exactly the typo it exists to catch. ⚠️ **Demonstrating it requires a symbol nothing calls
+    internally.** The first attempt renamed `wazmrt_bytes_delete`, which `module_new_wat` calls, so it
+    failed at Zig *compile* time and never reached the linker — proving the compiler, not the gate.
+
 - ⚡ **REVERSED AND EXECUTED 2026-08-11 — the integration ABI is now the native `wazmrt.h` (ABI 2).**
   The entry below is the ORIGINAL decision, kept because its reasoning is why the replacement looks the
   way it does. `src/wasm_c_api.zig` and `third_party/wasm-c-api/` are deleted.

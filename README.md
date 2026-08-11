@@ -67,7 +67,8 @@ zig build conformance -Dtestsuite=<dir>   # run a WebAssembly spec-testsuite che
 zig build wasm                     # build the runtime itself as a wasm module
 zig build dll                      # C-ABI shared library (for FFI: Deno, ctypes, …)
 zig build capi-smoke               # build + run the C example (needs no external deps)
-zig build ffi-demo                 # build the DLL + run examples/deno_ffi.mjs (needs deno)
+zig build ffi-demo                 # build the DLL + run examples/deno_ffi_capi.mjs (needs deno)
+zig build size -Doptimize=ReleaseSmall   # fail if a shipped artifact grew past its ceiling
 zig build bench                    # interpreter microbenchmark (ReleaseFast)
 ```
 
