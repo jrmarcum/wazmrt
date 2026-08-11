@@ -116,7 +116,7 @@ pub const default_max_table_elems: usize = 1 << 27;
 /// 16 Mi objects is far past any real workload and still bounds the outer list
 /// at ~256 MiB. Note this counts OBJECTS, not their payload — the arena holding
 /// the field slices is bounded only indirectly. It is a backstop, not a budget.
-pub const max_gc_objects: usize = 1 << 24;
+pub const default_max_gc_objects: usize = 1 << 24;
 
 /// Cap on live boxed exceptions (`exn_store`) per invocation. `catch_ref` /
 /// `catch_all_ref` box an exception so it can become an `exnref` value, and
@@ -124,7 +124,7 @@ pub const max_gc_objects: usize = 1 << 24;
 /// without limit, the same guest-driven host allocation `max_gc_objects` exists
 /// to prevent. Entries are released at the end of the invocation, so this bounds
 /// a single call rather than the instance's lifetime.
-pub const max_exn_boxes: usize = 1 << 20;
+pub const default_max_exn_boxes: usize = 1 << 20;
 
 /// `exn_store` capacity retained between invocations. Reuse is worth keeping for
 /// ordinary sizes, but `shrinkRetainingCapacity` alone pinned the historical PEAK
@@ -352,7 +352,7 @@ fn funcTypeEqual(x: Module.FuncType, y: Module.FuncType) bool {
 /// before 512 frames; bounding that properly would mean either measuring
 /// remaining stack at run time or executing guests on a thread we size
 /// ourselves. Neither is in scope here.
-const max_call_depth = 512;
+pub const default_max_call_depth: usize = 512;
 
 const Label = struct {
     is_loop: bool,
@@ -453,6 +453,13 @@ pub const Instance = struct {
     /// Ceiling on total linear memory for this instance, carried so `memory.grow`
     /// enforces the same budget instantiation did.
     max_memory_bytes: usize,
+    /// Per-instance copies of the three backstops that used to be module-level
+    /// constants. They became per-instance so an embedder can actually set them
+    /// (the C ABI's `wazmrt_config_set_max_*`); the defaults are unchanged, so
+    /// nothing that did not ask for a different value behaves differently.
+    max_gc_objects: usize = default_max_gc_objects,
+    max_exn_boxes: usize = default_max_exn_boxes,
+    max_call_depth: usize = default_max_call_depth,
     /// Ceiling on total defined-table entries, carried so `table.grow` enforces the
     /// same budget instantiation did.
     max_table_elems: usize,
@@ -567,6 +574,11 @@ pub const Instance = struct {
         /// its memories and enforced again by `memory.grow`. See
         /// `default_max_memory_bytes`.
         max_memory_bytes: usize = default_max_memory_bytes,
+        /// See the same-named fields on `Instance`. Defaults preserve the previous
+        /// hard-coded behaviour exactly.
+        max_gc_objects: usize = default_max_gc_objects,
+        max_exn_boxes: usize = default_max_exn_boxes,
+        max_call_depth: usize = default_max_call_depth,
         /// Ceiling on total defined-table entries, summed over all defined tables
         /// and enforced again by `table.grow`. See `default_max_table_elems`.
         max_table_elems: usize = default_max_table_elems,
@@ -964,6 +976,9 @@ pub const Instance = struct {
             .imported_memories = imported_memories,
             .max_memory_bytes = imports.max_memory_bytes,
             .max_table_elems = imports.max_table_elems,
+            .max_gc_objects = imports.max_gc_objects,
+            .max_exn_boxes = imports.max_exn_boxes,
+            .max_call_depth = imports.max_call_depth,
             .tables = tables,
             .imported_tables = n_imported_tables,
             .elem_values = elem_values,
@@ -1060,7 +1075,7 @@ pub const Instance = struct {
         // once per invocation overflowed the host stack (observed at ~600
         // re-entries, exit code 5). Carry the depth in.
         self.reentry_depth = saved_depth + 1;
-        if (self.reentry_depth > max_call_depth) return error.CallStackExhausted;
+        if (self.reentry_depth > self.max_call_depth) return error.CallStackExhausted;
         const results = try self.callFunction(scratch.allocator(), func_index, args, self.reentry_depth);
 
         const owned = try self.gpa.alloc(Value, results.len);
@@ -1157,7 +1172,7 @@ pub const Instance = struct {
     /// with the `null_ref` sentinel or a tagged i31 (bit 63 set).
     fn allocObject(self: *Instance, type_index: u32, fields: []Value) Error!Value {
         const idx = self.gc_heap.items.len;
-        if (idx >= max_gc_objects) return error.GcHeapExhausted;
+        if (idx >= self.max_gc_objects) return error.GcHeapExhausted;
         try self.gc_heap.append(self.gpa, .{ .type_index = type_index, .fields = fields });
         return @intCast(idx);
     }
@@ -1237,7 +1252,7 @@ pub const Instance = struct {
     }
 
     fn callFunction(self: *Instance, a: std.mem.Allocator, func_index: u32, args: []const Value, depth: usize) Error![]Value {
-        if (depth > max_call_depth) return error.CallStackExhausted;
+        if (depth > self.max_call_depth) return error.CallStackExhausted;
         if (func_index < self.imported_funcs) {
             if (func_index >= self.import_funcs.len) return error.UnsupportedImportCall;
             switch (self.import_funcs[func_index]) {
@@ -1512,7 +1527,7 @@ const Frame = struct {
                 switch (c.kind) {
                     .catch_ref, .catch_all_ref => {
                         const eidx = self.inst.exn_store.items.len;
-                        if (eidx >= max_exn_boxes) return error.ExnStoreExhausted;
+                        if (eidx >= self.inst.max_exn_boxes) return error.ExnStoreExhausted;
                         try self.inst.exn_store.append(self.inst.gpa, exn);
                         try self.pushU64(@intCast(eidx));
                     },
@@ -3571,7 +3586,8 @@ fn evalConstGc(ctx: ConstCtx, r: *Reader, stack: *[16]Value, sp: *usize) Error!v
     const alloc = struct {
         fn f(h: *std.ArrayList(Instance.HeapObject), g: std.mem.Allocator, ti: u32, fields: []Value) Error!Value {
             const idx = h.items.len;
-            if (idx >= max_gc_objects) return error.GcHeapExhausted;
+            // A test helper with no Instance in hand, so it checks the default directly.
+            if (idx >= default_max_gc_objects) return error.GcHeapExhausted;
             try h.append(g, .{ .type_index = ti, .fields = fields });
             return @intCast(idx);
         }

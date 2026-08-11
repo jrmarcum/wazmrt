@@ -125,12 +125,25 @@ int main(void) {
         wazmrt_module_delete(mod);
     }
 
-    /* A limit this build cannot enforce must be refused, not accepted silently. */
+    /* Every ceiling is enforced now, so a config that sets them must SUCCEED. */
     wazmrt_config_t *cfg = wazmrt_config_new();
+    wazmrt_config_set_max_memory_bytes(cfg, 1u << 20);
     wazmrt_config_set_max_call_depth(cfg, 64);
+    wazmrt_config_set_max_gc_objects(cfg, 1000);
+    wazmrt_config_set_max_exception_boxes(cfg, 1000);
     wazmrt_error_t *cerr = NULL;
+    wazmrt_engine_t *capped = wazmrt_engine_new_with_config(cfg, &cerr);
+    check(capped != NULL && cerr == NULL, "all five resource ceilings are accepted");
+    if (cerr) wazmrt_error_delete(cerr);
+    if (capped) wazmrt_engine_delete(capped);
+    wazmrt_config_delete(cfg);
+
+    /* But a restriction this build cannot apply is still refused, not silently dropped. */
+    cfg = wazmrt_config_new();
+    wazmrt_config_all_features(cfg, false);
+    cerr = NULL;
     wazmrt_engine_t *bad = wazmrt_engine_new_with_config(cfg, &cerr);
-    check(bad == NULL && cerr != NULL, "an unenforceable limit is refused at engine creation");
+    check(bad == NULL && cerr != NULL, "disabling proposals is refused (no gating yet)");
     if (cerr) wazmrt_error_delete(cerr);
     wazmrt_config_delete(cfg);
 

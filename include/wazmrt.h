@@ -231,22 +231,16 @@ void wazmrt_config_all_features(wazmrt_config_t *, bool enabled);
  * guest actually asks for it — wazmrt's linear memory is lazily paged. Passing 0 leaves the
  * current value unchanged.
  *
- * The first two are ENFORCED, and not only at instantiation: the interpreter re-checks them in
- * `memory.grow` and `table.grow`, so a guest cannot climb past them at run time. */
+ * All five are ENFORCED, and not only at instantiation: the interpreter re-checks the memory and
+ * table budgets in `memory.grow` and `table.grow`, so a guest cannot climb past them at run
+ * time. A value larger than this machine can represent is treated as "no limit" rather than
+ * being truncated into a tighter cap than you asked for. */
 void wazmrt_config_set_max_memory_bytes(wazmrt_config_t *, uint64_t);
 void wazmrt_config_set_max_table_elements(wazmrt_config_t *, uint64_t);
-
-/* ⚠️ NOT ENFORCEABLE IN THIS BUILD — these are compile-time constants in the interpreter.
- * Setting either to a non-zero value makes `wazmrt_engine_new_with_config` FAIL, naming the
- * limit. These setters return void and so cannot report failure themselves, which is exactly
- * why the refusal happens at engine creation rather than silently at the setter. */
 void wazmrt_config_set_max_gc_objects(wazmrt_config_t *, uint64_t);
 void wazmrt_config_set_max_exception_boxes(wazmrt_config_t *, uint64_t);
 
 /* Guest call depth before the engine reports "call stack exhausted". Default 512.
- *
- * ⚠️ NOT ENFORCEABLE IN THIS BUILD — see the two setters above; a non-zero value makes
- * `wazmrt_engine_new_with_config` fail rather than accepting a depth that would not apply.
  *
  * WORTH SETTING IF YOU LINK A DEBUG BUILD. The interpreter recurses on the host stack, and an
  * un-inlined debug frame is large enough that the default can exhaust an 8 MiB thread stack
