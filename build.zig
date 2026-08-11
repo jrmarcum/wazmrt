@@ -42,50 +42,32 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     // ---- C ABI library for universalWasmLoader-* ---------------------------
-    // Implements the standard wasm-c-api (third_party/wasm-c-api/include/wasm.h).
+    // The native ABI-2 surface (`include/wazmrt.h`), which replaced the vendored wasm-c-api.
     // Own root module so the core stays libc-free; this artifact is libc-free too.
+    //
+    // `zig-out/include` is now ONE file. Nothing third-party ships, so there is no licence to
+    // propagate alongside it — see cmem/licensing.md.
     const cabi = b.addLibrary(.{
         .name = "wazmrt",
         .linkage = .static,
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/wasm_c_api.zig"),
+            .root_source_file = b.path("src/capi.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
-    cabi.installHeader(b.path("third_party/wasm-c-api/include/wasm.h"), "wasm.h");
     cabi.installHeader(b.path("include/wazmrt.h"), "wazmrt.h");
     b.installArtifact(cabi);
 
-    // ---- Attribution travels WITH the artifact -----------------------------
-    // `wasm.h` above is vendored verbatim from https://github.com/WebAssembly/wasm-c-api and is
-    // **Apache-2.0**, so §4(a) obliges us to give recipients a copy of the License *when we
-    // distribute it*. The repo satisfied that (third_party/wasm-c-api/LICENSE + NOTICE + the ledger)
-    // while `zig-out/` — the thing anyone actually copies — shipped the header alone.
-    //
-    // ⚠️ **A compliant repository is not a compliant distribution.** Whoever takes `zig-out/include`
-    // never sees the repo, so the licence has to be in the output tree, not merely in the source tree.
-    // Named for the header it covers, so it cannot be mistaken for wazmrt's own licence (this project
-    // is MIT OR Apache-2.0; the vendored header is Apache-2.0 only).
-    b.getInstallStep().dependOn(&b.addInstallFile(
-        b.path("third_party/wasm-c-api/LICENSE"),
-        "include/LICENSE.wasm-c-api",
-    ).step);
-    b.getInstallStep().dependOn(&b.addInstallFile(
-        b.path("NOTICE"),
-        "include/NOTICE",
-    ).step);
-
     // ---- C ABI *shared* library (`zig build dll`) --------------------------
-    // The same wasm-c-api implementation as a dynamic library, so host languages
-    // can load it over FFI (Deno.dlopen, Python ctypes, …) — the vision's
-    // "native FFI → the C-ABI shared library" path. Libc-free, like the static
-    // lib.
+    // The same implementation as a dynamic library, so host languages can load it over FFI
+    // (Deno.dlopen, Python ctypes, …) — the vision's "native FFI → the C-ABI shared library"
+    // path. Libc-free, like the static lib.
     const dll = b.addLibrary(.{
         .name = "wazmrt",
         .linkage = .dynamic,
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/wasm_c_api.zig"),
+            .root_source_file = b.path("src/capi.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -98,8 +80,8 @@ pub fn build(b: *std.Build) void {
     // Builds the DLL, then runs a Deno script that loads it over FFI and drives
     // the standard wasm-c-api (decode -> instantiate -> call) — proving the
     // native runtime binds from a host language. Requires `deno` on PATH.
-    const ffi = b.addSystemCommand(&.{ "deno", "run", "--allow-ffi", "--allow-env", "examples/deno_ffi.mjs" });
-    ffi.setEnvironmentVariable("WAZMRT_DLL", "zig-out/bin/wazmrt.dll");
+    const ffi = b.addSystemCommand(&.{ "deno", "run", "--allow-ffi", "--allow-env", "examples/deno_ffi_capi.mjs" });
+    ffi.setEnvironmentVariable("WAZMRT_CAPI_DLL", b.getInstallPath(.bin, "wazmrt.dll"));
     ffi.step.dependOn(&install_dll.step);
     const ffi_step = b.step("ffi-demo", "Build the DLL + run the Deno FFI demo (needs deno)");
     ffi_step.dependOn(&ffi.step);
@@ -150,33 +132,6 @@ pub fn build(b: *std.Build) void {
         const run_csmoke = b.addRunArtifact(csmoke);
         const csmoke_step = b.step("c-smoke", "Build + run the C smoke test (wasm-c-api from C)");
         csmoke_step.dependOn(&run_csmoke.step);
-    }
-
-    // ---- ABI-2 shared library + Deno FFI demo ------------------------------
-    // `zig build capi-dll` builds src/capi.zig as a DLL under a distinct name, so it can be
-    // exercised over FFI while the old wasm-c-api library is still what `zig build` installs.
-    // Both disappear into one artifact at step 5; until then nothing is broken by the overlap.
-    {
-        const capi_dll = b.addLibrary(.{
-            .name = "wazmrt_capi",
-            .linkage = .dynamic,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/capi.zig"),
-                .target = target,
-                .optimize = optimize,
-            }),
-        });
-        const install_capi_dll = b.addInstallArtifact(capi_dll, .{});
-        const capi_dll_step = b.step("capi-dll", "Build the ABI-2 C surface as a shared library (for FFI)");
-        capi_dll_step.dependOn(&install_capi_dll.step);
-
-        // The wasmtk-facing proof: a host language driving the runtime with no V8 in the path,
-        // running a `.wat` directly and reading guest memory from inside a JS callback.
-        const capi_ffi = b.addSystemCommand(&.{ "deno", "run", "--allow-ffi", "--allow-env", "examples/deno_ffi_capi.mjs" });
-        capi_ffi.setEnvironmentVariable("WAZMRT_CAPI_DLL", b.getInstallPath(.bin, "wazmrt_capi.dll"));
-        capi_ffi.step.dependOn(&install_capi_dll.step);
-        const capi_ffi_step = b.step("capi-ffi-demo", "Build the ABI-2 DLL + run the Deno FFI demo (needs deno)");
-        capi_ffi_step.dependOn(&capi_ffi.step);
     }
 
     // ---- ABI-2 C smoke test (`zig build capi-smoke`) -----------------------

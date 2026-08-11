@@ -17,6 +17,24 @@
 # NOTE: `wazmrt.lib` is the STATIC library only. `zig build dll` overwrites it with the DLL's much
 # smaller import library, so measure the static lib from a plain `zig build`, never after `dll`.
 
-wazmrt.exe  911360
-wazmrt.lib  279444
-wazmrt.dll  227328
+# RAISED 2026-08-11 by the ABI-2 flip (`zig build` now installs src/capi.zig, not
+# src/wasm_c_api.zig). What bought the bytes, and it is FEATURES, not waste:
+#
+#   dll  227,328 -> 845,312   (+618 KB, 3.7x)
+#   lib  279,444 -> 973,600   (+694 KB, 3.5x)
+#   exe  911,360 -> 911,872   (+512 B — features.zig, nothing structural)
+#
+# The old wasm-c-api surface could not assemble text, could not serve WASI, and needed no `Io`.
+# The new one does all three, so the embed artifact now contains `wat.zig` + `sexpr.zig` (for
+# wazmrt_module_new_wat / wazmrt_wat_to_wasm), `wasi.zig` (for wazmrt_linker_define_wasi) and
+# `std.Io.Threaded`. This is not an apples-to-apples comparison with the old number and must not
+# be quoted as a regression — but it IS a real cost against the smallest-binary goal.
+#
+# ⚠️ THIS IS THE MEASUREMENT THAT MAKES TRACK 2c (comptime feature gating) NECESSARY RATHER THAN
+# NICE. `.wat` is not being descoped — owner, 2026-08-11 — but an embedder who never assembles
+# text should not have to carry the assembler. `-Dwat=false` / `-Dwasi=false` build flags are the
+# recorded compromise; until they exist, every FFI consumer pays for both.
+
+wazmrt.exe  911872
+wazmrt.lib  973600
+wazmrt.dll  845312

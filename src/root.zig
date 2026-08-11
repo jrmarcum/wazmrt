@@ -31,7 +31,11 @@ pub const version: [:0]const u8 = "0.1.0";
 
 /// Stable C-ABI version for embedders (universalWasmLoader-*). Bump on any
 /// breaking change to the exported C symbols.
-pub const abi_version: u32 = 1;
+///
+/// **2 = the native `wazmrt.h` surface.** Version 1 was the vendored wasm-c-api (`wasm_*`
+/// symbols); nothing from it survives, so a v1 consumer fails to LINK rather than mislinking.
+/// The number exists for consumers that bind dynamically and only check it.
+pub const abi_version: u32 = 2;
 
 /// Decode a WebAssembly binary into a `Module`. Caller owns the result and
 /// must call `Module.deinit`.

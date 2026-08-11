@@ -1763,7 +1763,14 @@ fn trapFrom(inst: *interp.Instance, err: anyerror) ?*Trap {
         // it exists to be compared against `wasm-objdump` without rebasing. Null (a host frame,
         // or a pc one past the end) reports 0 rather than inventing a position.
         const off: u32 = if (inst.frameOffset(scratch.allocator(), f)) |o| o.module else 0;
-        dst.* = .{ .func_index = f.func_index, .offset = off, .name = null };
+        // The name section is optional, so null genuinely means "this guest was built stripped"
+        // — which is what the header promises. Copied because the trap outlives the call and may
+        // outlive the module the name is borrowed from.
+        const nm: ?[:0]u8 = if (inst.module.funcName(f.func_index)) |n|
+            alloc.dupeZ(u8, n) catch null
+        else
+            null;
+        dst.* = .{ .func_index = f.func_index, .offset = off, .name = nm };
     }
     t.* = .{ .msg = msg, .frames = frames };
     return t;
@@ -2836,6 +2843,78 @@ test "config: features round-trip, and an incoherent set is refused" {
     const err = cerr orelse return error.TestExpectedError;
     defer wazmrt_error_delete(err);
     try testing.expect(std.mem.indexOf(u8, std.mem.span(wazmrt_error_message(err).?), "incoherent") != null);
+}
+
+/// `(module (func (export "boom") unreachable))` plus a name section naming func 0 "boom_fn".
+/// Hand-assembled so the test does not depend on a toolchain emitting names.
+const named_trap_module = [_]u8{
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type: () -> ()
+    0x03, 0x02, 0x01, 0x00, // func 0 : type 0
+    0x07, 0x08, 0x01, 0x04, 'b', 'o', 'o', 'm', 0x00, 0x00, // export "boom"
+    0x0a, 0x05, 0x01, 0x03, 0x00, 0x00, 0x0b, // code: unreachable; end
+    // Custom section "name". Payload = 5 bytes of `"name"` + a 12-byte subsection = 17 (0x11);
+    // the subsection's own content is count(1) + index(1) + len(1) + 7 = 10 (0x0a).
+    0x00, 0x11, 0x04, 'n', 'a', 'm', 'e',
+    0x01, 0x0a, 0x01, 0x00, 0x07, 'b', 'o', 'o', 'm', '_', 'f', 'n',
+};
+
+test "trap frames carry the function name from the name section" {
+    const e = wazmrt_engine_new().?;
+    defer wazmrt_engine_delete(e);
+    const s = wazmrt_store_new(e).?;
+    defer wazmrt_store_delete(s);
+    const l = wazmrt_linker_new(e).?;
+    defer wazmrt_linker_delete(l);
+
+    var m: *CModule = undefined;
+    try testing.expect(wazmrt_module_new(e, &named_trap_module, named_trap_module.len, &m) == null);
+    defer wazmrt_module_delete(m);
+    var inst: InstanceHandle = .{ .id = 0 };
+    var trap: ?*Trap = null;
+    try testing.expect(wazmrt_linker_instantiate(l, s, m, &inst, &trap) == null);
+
+    var f: FuncHandle = .{ .id = 0 };
+    try testing.expect(wazmrt_instance_get_func(s, inst, "boom", &f));
+    try testing.expect(wazmrt_func_call(s, f, null, 0, null, 0, &trap) == null);
+    const t = trap orelse return error.TestExpectedTrap;
+    defer wazmrt_trap_delete(t);
+
+    try testing.expect(wazmrt_trap_frame_count(t) >= 1);
+    var fi: u32 = 0xffff_ffff;
+    var off: u32 = 0xffff_ffff;
+    var name: ?[*:0]const u8 = null;
+    try testing.expect(wazmrt_trap_frame(t, 0, &fi, &off, &name));
+    try testing.expectEqual(@as(u32, 0), fi);
+    // NULL here would mean "stripped guest" per the header — this guest is not stripped, so a
+    // null would be the header lying rather than a missing name.
+    const got = name orelse return error.TestExpectedName;
+    try testing.expectEqualStrings("boom_fn", std.mem.span(got));
+
+    // Out-of-range writes nothing and says so.
+    try testing.expect(!wazmrt_trap_frame(t, wazmrt_trap_frame_count(t), null, null, null));
+}
+
+test "a stripped guest reports no name, which is what NULL means" {
+    const e = wazmrt_engine_new().?;
+    defer wazmrt_engine_delete(e);
+    const s = wazmrt_store_new(e).?;
+    defer wazmrt_store_delete(s);
+    const l = wazmrt_linker_new(e).?;
+    defer wazmrt_linker_delete(l);
+
+    // `add_module` carries no name section.
+    var m: *CModule = undefined;
+    try testing.expect(wazmrt_module_new(e, &add_module, add_module.len, &m) == null);
+    defer wazmrt_module_delete(m);
+    var inst: InstanceHandle = .{ .id = 0 };
+    var trap: ?*Trap = null;
+    try testing.expect(wazmrt_linker_instantiate(l, s, m, &inst, &trap) == null);
+
+    const t = wazmrt_trap_new("synthetic").?;
+    defer wazmrt_trap_delete(t);
+    // A host-made trap has no guest stack at all, so there is nothing to name.
+    try testing.expectEqual(@as(usize, 0), wazmrt_trap_frame_count(t));
 }
 
 test "delete functions tolerate NULL" {
