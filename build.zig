@@ -247,6 +247,20 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(cabi_tests).step);
 
+    // The ABI-2 surface (`src/capi.zig`) gets its own test target from its FIRST commit, for
+    // exactly the reason `cabi_tests` exists: `root.zig` does not import it, so its tests are
+    // unreachable from `mod_tests` and the file would otherwise be untested for as long as the
+    // old one was — which is how #21's double free, use-after-free and uninitialised refcount
+    // all shipped. Wired before there is anything much to test, so it can never be "added later".
+    const capi_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/capi.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(capi_tests).step);
+
     // ---- Security gate (`zig build test-security`) -------------------------
     // The sandbox-escape tests SKIP when the harness cannot create a symlink. ⚠️ On the dev machine
     // that is NOT a privilege problem — Developer Mode is on. `std.testing.tmpDir` puts its scratch
@@ -296,9 +310,19 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = .ReleaseSafe,
         }) });
+        // The ABI-2 surface is in the memory-safety gate from its first commit too: a C boundary
+        // is exactly where an out-of-range cast or a bad index stops being a wrong answer and
+        // becomes a corrupted heap, and ReleaseSafe is what turns that from silent UB in the
+        // SHIPPED build into a loud panic here.
+        const capi_tests_safe = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("src/capi.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        }) });
         const test_safe_step = b.step("test-safe", "Run the test suite under ReleaseSafe (optimized + safety checks kept)");
         test_safe_step.dependOn(&b.addRunArtifact(mod_tests_safe).step);
         test_safe_step.dependOn(&b.addRunArtifact(cabi_tests_safe).step);
+        test_safe_step.dependOn(&b.addRunArtifact(capi_tests_safe).step);
     }
 
     // ---- Size gate (`zig build size -Doptimize=ReleaseSmall`) --------------
