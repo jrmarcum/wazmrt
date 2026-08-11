@@ -29,11 +29,23 @@ option. ⚠️ **This reverses the analysis of 2026-08-11 morning**, which had f
 configures `OptLevel::Speed`, the *slowest-starting* setting. A development environment runs **many
 short runs, not few long ones**, so a small fast-starting interpreter is the right shape by design.
 
-**🎯 The prioritisation this dictates — do not spend the size budget on throughput.** The critical path
-is **decode → validate → instantiate**, not steady-state Mops/s. Concretely: the **A → A.5 → B perf
-ladder is DEPRIORITISED** (it costs size and buys hot-loop throughput, the one regime this consumer does
-not live in), and startup/instantiate work is promoted. Re-open the ladder only when a measured
-compute-bound consumer appears.
+**🎯 The prioritisation this dictates — `decode → validate → instantiate` is now a FIRST-CLASS metric**,
+alongside steady-state Mops/s rather than instead of it.
+
+⚠️ **OWNER CORRECTION, 2026-08-11 — an earlier draft of this section deprioritised the A → A.5 → B perf
+ladder and that is OVERRULED. Do not descope it, and do not descope running `.wat` files either.**
+Both stay fully in scope. The reasoning that led to the deprioritisation (a dev-loop consumer pays
+startup far more often than hot-loop throughput) is *sound as far as it goes* and is why startup gets
+promoted — but it is not a reason to stop optimizing execution, and the earlier text overreached from
+"startup matters more than we treated it" to "throughput matters less than it does".
+
+**How the two goals are reconciled — the size gate is the referee.** Speed and `ReleaseSmall` genuinely
+pull against each other, so the rule is *not* to pick a winner in advance: **every optimization must pay
+its way in measured bytes** against the Track 2a size ceiling. A.5 (partial evaluation +
+superinstructions) is the first lever precisely because it is largely a *decode-time* transformation —
+it can buy throughput at modest, and measurable, size cost. Option B (register machine) is the bigger
+bet and gets measured the same way. **Reject an optimization on measured bytes-per-percent, never on a
+prior assumption about which regime matters.**
 
 ⚠️ **Fairness rule for any benchmark (binding): compare against wasmtime configured for FAST START**
 (`OptLevel::None`, or the Winch baseline compiler), **not only `OptLevel::Speed`.** Beating a runtime in
@@ -136,7 +148,11 @@ reading guest memory via `Deno.UnsafePointerView`. No amount of wazmrt-side ABI 
    (b) Delete the C ABI, measure the delta. (c) **Comptime proposal gating** (`-Dgc=false`, …) so an
    embedder compiles out what its guests never use — biggest lever, biggest work; ⚠️ a disabled proposal
    must be **rejected loudly**, never silently ignored (the canonical fall-through failure mode).
-   (d) Keep CLI-only surface (wat/wast/sign/pin) out of the library.
+   (d) Keep CLI-only surface out of the *embed* artifact. ⚠️ **This is NOT a descope of `.wat`** — owner,
+   2026-08-11: running `.wat` files stays fully in scope. The CLI keeps assembling `.wat`/`.wast`
+   unconditionally (it is a stated capability: *"a `<module>` is a `.wasm` binary **or a `.wat` text
+   file**"*); the only question is whether an *embedder* who never assembles text should have to carry
+   the assembler, which is an **opt-out build flag**, never a removal.
 3. **Bake-off harness.** wazmrt vs wasmrt vs wasmtime on wasmtk's + rsxtk's real corpora: DLL size,
    **decode+validate+instantiate**, cold-start wall-clock, steady-state, conformance score, security
    posture — with wasmtime in a **fast-start** configuration. Include a proposal-parity check against

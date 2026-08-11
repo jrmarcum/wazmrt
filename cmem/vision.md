@@ -68,10 +68,15 @@ the consumers settled which regime actually pays:
   compile on every run** — and rsxtk sets `OptLevel::Speed`, its slowest-starting configuration.
   *(An earlier read of rsxtk's AOT cache had concluded the opposite; that path is no longer the default,
   so the cold-start thesis holds for this consumer.)*
-- **Therefore the critical path is `decode → validate → instantiate`, NOT steady-state Mops/s.**
-  **The A → A.5 → B perf ladder is DEPRIORITISED**: it costs binary size — now a first-class goal — to
-  buy hot-loop throughput, the one regime these consumers do not live in. Re-open it when a measured
-  compute-bound consumer appears, not before.
+- **Therefore `decode → validate → instantiate` is promoted to a first-class metric** — measured and
+  optimized alongside steady-state Mops/s, not instead of it.
+  ⚠️ **OWNER CORRECTION 2026-08-11: an earlier draft deprioritised the A → A.5 → B perf ladder. That is
+  OVERRULED — neither execution optimization nor `.wat` support is descoped in wazmrt.** The dev-loop
+  observation justifies *promoting* startup; it does not justify demoting throughput, and the earlier
+  text overreached. **Reconciliation: the Track 2a size gate is the referee — every optimization pays
+  its way in measured bytes-per-percent, and none is rejected on a prior assumption about which regime
+  matters.** A.5 is the first lever because it is largely a decode-time transformation, so its size cost
+  is small and measurable.
 
 ⚠️ **Benchmark fairness rule (binding).** Any "faster than wasmtime" measurement must include wasmtime
 configured to **start fast** (`OptLevel::None`, or the Winch baseline compiler), not only
