@@ -226,6 +226,19 @@ const InstanceSlot = struct {
     arena: std.heap.ArenaAllocator,
     inst: interp.Instance,
     module: *CModule,
+    /// A trap raised by a HOST callback, stashed here because the interpreter's error set can
+    /// only say `HostTrap` — it cannot carry the host's message. Consumed by whoever reports the
+    /// failure, so the embedder gets its own trap back instead of a generic one.
+    pending_trap: ?*Trap = null,
+
+    /// Take the host trap if there is one, else make one from the interpreter's error.
+    fn takeTrap(self: *InstanceSlot, err: anyerror) ?*Trap {
+        if (self.pending_trap) |t| {
+            self.pending_trap = null;
+            return t;
+        }
+        return trapFrom(&self.inst, err);
+    }
 };
 
 /// A func/memory/global handle names (instance slot, index within that instance) — never a raw
@@ -645,10 +658,65 @@ export fn wazmrt_functype_result(ft: ?*const FuncType, i: usize, out: ?*ValKind)
 // Linker
 // ---------------------------------------------------------------------------------------
 
-/// Step 2b builds the skeleton: a linker that can instantiate an import-free module. Host
-/// function definitions, WASI and unknown-imports-as-traps arrive in 2c/2d.
+/// The C callback signature from the header.
+pub const Callback = *const fn (
+    env: ?*anyopaque,
+    caller: *Caller,
+    args: [*]const Val,
+    nargs: usize,
+    results: [*]Val,
+    nresults: usize,
+) callconv(.c) ?*Trap;
+
+const Definition = union(enum) {
+    func: struct {
+        params: []ValKind,
+        results: []ValKind,
+        cb: Callback,
+        env: ?*anyopaque,
+        finalizer: ?*const fn (env: ?*anyopaque) callconv(.c) void,
+    },
+    global: Val,
+};
+
+const Entry = struct {
+    module: []u8,
+    name: []u8,
+    def: Definition,
+
+    fn deinit(self: *Entry) void {
+        alloc.free(self.module);
+        alloc.free(self.name);
+        switch (self.def) {
+            .func => |f| {
+                if (f.finalizer) |fin| fin(f.env);
+                alloc.free(f.params);
+                alloc.free(f.results);
+            },
+            .global => {},
+        }
+    }
+};
+
 pub const Linker = struct {
     engine: *Engine,
+    entries: std.ArrayList(Entry) = .empty,
+    /// Back otherwise-unsatisfied FUNCTION imports with a trapping stub.
+    trap_unknown: bool = false,
+    /// Set when a guest called `proc_exit`; read by `wazmrt_wasi_exit_code` (2d).
+    exit_code: ?i32 = null,
+
+    fn find(self: *const Linker, module: []const u8, name: []const u8) ?*const Definition {
+        // Linear: import counts are small, and a map would cost more in code size than it saves.
+        // Later definitions win, so a redefinition replaces — hence the reverse walk.
+        var i = self.entries.items.len;
+        while (i > 0) {
+            i -= 1;
+            const e = &self.entries.items[i];
+            if (std.mem.eql(u8, e.module, module) and std.mem.eql(u8, e.name, name)) return &e.def;
+        }
+        return null;
+    }
 };
 
 export fn wazmrt_linker_new(e: ?*Engine) ?*Linker {
@@ -660,7 +728,306 @@ export fn wazmrt_linker_new(e: ?*Engine) ?*Linker {
 
 export fn wazmrt_linker_delete(l: ?*Linker) void {
     const lk = l orelse return;
+    for (lk.entries.items) |*e| e.deinit();
+    lk.entries.deinit(alloc);
     alloc.destroy(lk);
+}
+
+/// Define `module`.`name` as a host function. Name strings are copied; `env` is passed to every
+/// call and `env_finalizer` (may be NULL) runs when the linker is deleted or the name redefined.
+export fn wazmrt_linker_define_func(
+    l: ?*Linker,
+    module: ?[*:0]const u8,
+    name: ?[*:0]const u8,
+    ft: ?*const FuncType,
+    cb: ?Callback,
+    env: ?*anyopaque,
+    env_finalizer: ?*const fn (env: ?*anyopaque) callconv(.c) void,
+) ?*Error {
+    const lk = l orelse return errorf("wazmrt_linker_define_func: linker is NULL", .{});
+    const t = ft orelse return errorf("wazmrt_linker_define_func: type is NULL", .{});
+    const f = cb orelse return errorf("wazmrt_linker_define_func: callback is NULL", .{});
+    const m = spanOf(module);
+    const n = spanOf(name);
+
+    const mc = alloc.dupe(u8, m) catch return errorf("out of memory", .{});
+    const nc = alloc.dupe(u8, n) catch {
+        alloc.free(mc);
+        return errorf("out of memory", .{});
+    };
+    const p = alloc.dupe(ValKind, t.params) catch {
+        alloc.free(mc);
+        alloc.free(nc);
+        return errorf("out of memory", .{});
+    };
+    const r = alloc.dupe(ValKind, t.results) catch {
+        alloc.free(mc);
+        alloc.free(nc);
+        alloc.free(p);
+        return errorf("out of memory", .{});
+    };
+    lk.entries.append(alloc, .{
+        .module = mc,
+        .name = nc,
+        .def = .{ .func = .{ .params = p, .results = r, .cb = f, .env = env, .finalizer = env_finalizer } },
+    }) catch {
+        alloc.free(mc);
+        alloc.free(nc);
+        alloc.free(p);
+        alloc.free(r);
+        return errorf("out of memory", .{});
+    };
+    return null;
+}
+
+export fn wazmrt_linker_define_global(
+    l: ?*Linker,
+    module: ?[*:0]const u8,
+    name: ?[*:0]const u8,
+    value: Val,
+) ?*Error {
+    const lk = l orelse return errorf("wazmrt_linker_define_global: linker is NULL", .{});
+    const mc = alloc.dupe(u8, spanOf(module)) catch return errorf("out of memory", .{});
+    const nc = alloc.dupe(u8, spanOf(name)) catch {
+        alloc.free(mc);
+        return errorf("out of memory", .{});
+    };
+    lk.entries.append(alloc, .{ .module = mc, .name = nc, .def = .{ .global = value } }) catch {
+        alloc.free(mc);
+        alloc.free(nc);
+        return errorf("out of memory", .{});
+    };
+    return null;
+}
+
+/// ⚠️ Convenience with a real cost, documented in the header: with this set a typo'd import name
+/// stops being a link-time error and becomes a runtime surprise.
+export fn wazmrt_linker_define_unknown_imports_as_traps(l: ?*Linker) ?*Error {
+    const lk = l orelse return errorf("wazmrt_linker_define_unknown_imports_as_traps: linker is NULL", .{});
+    lk.trap_unknown = true;
+    return null;
+}
+
+// ---------------------------------------------------------------------------------------
+// Host callback plumbing
+// ---------------------------------------------------------------------------------------
+
+/// Per-import state for one host function, living in the instance's arena so it dies with the
+/// instance. `slot` is filled before the instance can run, and the instance is heap-stable.
+const Trampoline = struct {
+    slot: *InstanceSlot,
+    cb: ?Callback, // null ⇒ the trap-unknown stub
+    env: ?*anyopaque,
+    params: []const root.types.ValType,
+    results: []const root.types.ValType,
+};
+
+/// Valid ONLY for the duration of one callback — it lives on the trampoline's stack frame.
+pub const Caller = struct {
+    slot: *InstanceSlot,
+};
+
+/// Arities above this use the heap. Sized so every surveyed loader import fits on the stack;
+/// beyond it correctness matters more than the allocation.
+const stack_vals = 16;
+
+fn hostTrampoline(ctx: *anyopaque, args: []const interp.Value, results: []interp.Value) bool {
+    const t: *Trampoline = @ptrCast(@alignCast(ctx));
+    const cb = t.cb orelse {
+        // The trap-unknown stub: an import that was never defined.
+        t.slot.pending_trap = wazmrt_trap_new("unknown import called");
+        return false;
+    };
+
+    var in_buf: [stack_vals]Val = undefined;
+    var out_buf: [stack_vals]Val = undefined;
+    const nin = t.params.len;
+    const nout = t.results.len;
+
+    const in: []Val = if (nin <= stack_vals) in_buf[0..nin] else alloc.alloc(Val, nin) catch {
+        t.slot.pending_trap = wazmrt_trap_new("out of memory marshalling host call arguments");
+        return false;
+    };
+    defer if (nin > stack_vals) alloc.free(in);
+    const out: []Val = if (nout <= stack_vals) out_buf[0..nout] else alloc.alloc(Val, nout) catch {
+        t.slot.pending_trap = wazmrt_trap_new("out of memory marshalling host call results");
+        return false;
+    };
+    defer if (nout > stack_vals) alloc.free(out);
+
+    // Slots in, values out — by slot width, because a v128 is two slots.
+    var si: usize = 0;
+    for (t.params, 0..) |vt, i| {
+        const w = interp.slotWidth(vt);
+        if (si + w > args.len) {
+            t.slot.pending_trap = wazmrt_trap_new("host call: argument slots exhausted");
+            return false;
+        }
+        _ = slotsToVal(args[si..], vt, &in[i]) orelse {
+            t.slot.pending_trap = wazmrt_trap_new("host call: argument type cannot cross the ABI");
+            return false;
+        };
+        si += w;
+    }
+    // Zeroed so a callback that writes nothing yields a defined value rather than whatever was
+    // on the stack — the old ABI disclosed uninitialised heap to the guest exactly this way.
+    @memset(out, .{ .kind = .i32, .of = .{ .i64 = 0 } });
+
+    var caller: Caller = .{ .slot = t.slot };
+    if (cb(t.env, &caller, in.ptr, nin, out.ptr, nout)) |trap| {
+        t.slot.pending_trap = trap; // ownership transferred to the engine, per the header
+        return false;
+    }
+
+    var oi: usize = 0;
+    for (t.results, 0..) |vt, i| {
+        const w = interp.slotWidth(vt);
+        if (oi + w > results.len) {
+            t.slot.pending_trap = wazmrt_trap_new("host call: result slots exhausted");
+            return false;
+        }
+        _ = valToSlots(out[i], vt, results[oi..]) orelse {
+            t.slot.pending_trap = wazmrt_trap_new("host call: result has the wrong type");
+            return false;
+        };
+        oi += w;
+    }
+    return true;
+}
+
+export fn wazmrt_caller_get_memory(c: ?*Caller, name: ?[*:0]const u8, out: ?*MemoryHandle) bool {
+    _ = c;
+    _ = name;
+    _ = out;
+    // Deliberately always false, and the header says so: a durable memory handle must be tagged
+    // against a live store, and during a callback the store is mid-borrow. Use the read/write
+    // helpers below — which is what a loader actually needs. Kept so the wasmtime-shaped call
+    // sequence compiles.
+    return false;
+}
+
+export fn wazmrt_caller_memory_size(c: ?*Caller) usize {
+    const caller = c orelse return 0;
+    const mem = caller.slot.inst.memory0() orelse return 0;
+    return mem.bytes.len;
+}
+
+export fn wazmrt_caller_read(c: ?*Caller, offset: u64, dst: ?*anyopaque, n: usize) bool {
+    const caller = c orelse return false;
+    const mem = caller.slot.inst.memory0() orelse return false;
+    const end = std.math.add(u64, offset, n) catch return false;
+    if (end > mem.bytes.len) return false;
+    if (n == 0) return true;
+    const d = dst orelse return false;
+    @memcpy(@as([*]u8, @ptrCast(d))[0..n], mem.bytes[@intCast(offset)..][0..n]);
+    return true;
+}
+
+export fn wazmrt_caller_write(c: ?*Caller, offset: u64, src: ?*const anyopaque, n: usize) bool {
+    const caller = c orelse return false;
+    const mem = caller.slot.inst.memory0() orelse return false;
+    const end = std.math.add(u64, offset, n) catch return false;
+    if (end > mem.bytes.len) return false;
+    if (n == 0) return true;
+    const s = src orelse return false;
+    @memcpy(mem.bytes[@intCast(offset)..][0..n], @as([*]const u8, @ptrCast(s))[0..n]);
+    return true;
+}
+
+/// Bind every declared import to something the linker defines.
+///
+/// Returns null on success. `Imports.funcs`/`globals` align with the module's imports OF THAT
+/// KIND in declaration order, which is why this walks `module.imports` rather than the linker's
+/// table — the positional layout is the interpreter's contract, not ours to reorder.
+fn resolveImports(
+    lk: *Linker,
+    slot: *InstanceSlot,
+    cm: *CModule,
+    sa: std.mem.Allocator,
+    out: *interp.Instance.Imports,
+) ?*Error {
+    var nfunc: usize = 0;
+    var nglobal: usize = 0;
+    for (cm.inner.imports) |im| switch (im.type.kind()) {
+        .func => nfunc += 1,
+        .global => nglobal += 1,
+        else => {},
+    };
+
+    const funcs = sa.alloc(interp.Instance.HostFunc, nfunc) catch return errorf("out of memory", .{});
+    const globals = sa.alloc(interp.Value, nglobal) catch return errorf("out of memory", .{});
+    const globals_hi = sa.alloc(interp.Value, nglobal) catch return errorf("out of memory", .{});
+
+    var fi: usize = 0;
+    var gi: usize = 0;
+    for (cm.inner.imports) |im| {
+        switch (im.type) {
+            .func => |want| {
+                const def = lk.find(im.module, im.name) orelse {
+                    if (!lk.trap_unknown)
+                        return errorf("unresolved import '{s}'.'{s}'", .{ im.module, im.name });
+                    const t = sa.create(Trampoline) catch return errorf("out of memory", .{});
+                    t.* = .{ .slot = slot, .cb = null, .env = null, .params = want.params, .results = want.results };
+                    funcs[fi] = .{ .native_env = .{ .ctx = t, .call = hostTrampoline } };
+                    fi += 1;
+                    continue;
+                };
+                const hf = switch (def.*) {
+                    .func => |f| f,
+                    .global => return errorf("import '{s}'.'{s}' is declared as a function but defined as a global", .{ im.module, im.name }),
+                };
+
+                // ⚠️ CHECK THE DECLARED SIGNATURE AT BIND TIME. An import declaration is
+                // untrusted input: the guest picks the type it declares, and the host picks the
+                // type it defines. If they disagree and we bind anyway, the callback reads
+                // arguments that were never passed — which is a segfault from a four-line `.wat`
+                // (10th audit pass, `wasi.guardArity`). Refusing here costs one comparison per
+                // import and removes the whole class.
+                if (hf.params.len != want.params.len or hf.results.len != want.results.len)
+                    return errorf("import '{s}'.'{s}': the guest declares {d} param(s)/{d} result(s), the host defines {d}/{d}", .{ im.module, im.name, want.params.len, want.results.len, hf.params.len, hf.results.len });
+                for (want.params, hf.params, 0..) |vt, k, i| {
+                    const declared = valKindOf(vt) orelse
+                        return errorf("import '{s}'.'{s}': parameter {d} has a type this ABI cannot carry", .{ im.module, im.name, i });
+                    if (declared != k)
+                        return errorf("import '{s}'.'{s}': parameter {d} type mismatch", .{ im.module, im.name, i });
+                }
+                for (want.results, hf.results, 0..) |vt, k, i| {
+                    const declared = valKindOf(vt) orelse
+                        return errorf("import '{s}'.'{s}': result {d} has a type this ABI cannot carry", .{ im.module, im.name, i });
+                    if (declared != k)
+                        return errorf("import '{s}'.'{s}': result {d} type mismatch", .{ im.module, im.name, i });
+                }
+
+                const t = sa.create(Trampoline) catch return errorf("out of memory", .{});
+                t.* = .{ .slot = slot, .cb = hf.cb, .env = hf.env, .params = want.params, .results = want.results };
+                funcs[fi] = .{ .native_env = .{ .ctx = t, .call = hostTrampoline } };
+                fi += 1;
+            },
+            .global => |want| {
+                const def = lk.find(im.module, im.name) orelse
+                    return errorf("unresolved global import '{s}'.'{s}'", .{ im.module, im.name });
+                const v = switch (def.*) {
+                    .global => |g| g,
+                    .func => return errorf("import '{s}'.'{s}' is declared as a global but defined as a function", .{ im.module, im.name }),
+                };
+                var two: [2]interp.Value = .{ 0, 0 };
+                _ = valToSlots(v, want.content, &two) orelse
+                    return errorf("import '{s}'.'{s}': global value has the wrong type", .{ im.module, im.name });
+                globals[gi] = two[0];
+                globals_hi[gi] = two[1];
+                gi += 1;
+            },
+            // Refused LOUDLY rather than left unbound: an unbacked memory or table import would
+            // otherwise surface as a confusing trap deep inside execution. No surveyed consumer
+            // needs them, and adding them later is additive.
+            .memory => return errorf("import '{s}'.'{s}': imported memories are not supported by this ABI", .{ im.module, im.name }),
+            .table => return errorf("import '{s}'.'{s}': imported tables are not supported by this ABI", .{ im.module, im.name }),
+            .tag => return errorf("import '{s}'.'{s}': imported tags are not supported by this ABI", .{ im.module, im.name }),
+        }
+    }
+
+    out.* = .{ .funcs = funcs, .globals = globals, .globals_hi = globals_hi };
+    return null;
 }
 
 /// Instantiate into `store`, running the start function if there is one.
@@ -674,33 +1041,32 @@ export fn wazmrt_linker_instantiate(
     out: ?*InstanceHandle,
     trap_out: ?*?*Trap,
 ) ?*Error {
-    _ = l orelse return errorf("wazmrt_linker_instantiate: linker is NULL", .{});
+    const lk = l orelse return errorf("wazmrt_linker_instantiate: linker is NULL", .{});
     const store = s orelse return errorf("wazmrt_linker_instantiate: store is NULL", .{});
     const cm = m orelse return errorf("wazmrt_linker_instantiate: module is NULL", .{});
     const out_p = out orelse return errorf("wazmrt_linker_instantiate: out is NULL", .{});
-
-    if (cm.inner.imports.len != 0) {
-        // Until 2c there is nothing to satisfy an import WITH. Refusing by name beats
-        // instantiating something half-wired.
-        return errorf("unresolved import '{s}'.'{s}': host imports are not wired yet", .{
-            cm.inner.imports[0].module,
-            cm.inner.imports[0].name,
-        });
-    }
 
     // The slot is allocated FIRST so the arena has its final address before `allocator()` is
     // taken from it — see the warning on `InstanceSlot`.
     const slot = alloc.create(InstanceSlot) catch return errorf("out of memory", .{});
     slot.* = .{ .arena = std.heap.ArenaAllocator.init(alloc), .inst = undefined, .module = cm };
+    const sa = slot.arena.allocator();
 
-    slot.inst = interp.Instance.init(slot.arena.allocator(), &cm.inner) catch |err| {
+    var imports: interp.Instance.Imports = .{};
+    if (resolveImports(lk, slot, cm, sa, &imports)) |msg| {
+        slot.arena.deinit();
+        alloc.destroy(slot);
+        return msg;
+    }
+
+    slot.inst = interp.Instance.initWithImports(sa, &cm.inner, imports) catch |err| {
         slot.arena.deinit();
         alloc.destroy(slot);
         return errorf("instantiate: {s}", .{@errorName(err)});
     };
 
     slot.inst.runStart() catch |err| {
-        if (trap_out) |p| p.* = trapFrom(&slot.inst, err);
+        if (trap_out) |p| p.* = slot.takeTrap(err);
         slot.inst.deinit();
         slot.arena.deinit();
         alloc.destroy(slot);
@@ -820,7 +1186,7 @@ export fn wazmrt_instance_initialize(s: ?*Store, h: InstanceHandle, trap_out: ?*
     const slot = store.instances.items[islot];
     const fi = findExport(slot.module, "_initialize", .func) orelse return null;
     _ = slot.inst.invokeIndex(fi, &.{}) catch |err| {
-        if (trap_out) |p| p.* = trapFrom(&slot.inst, err);
+        if (trap_out) |p| p.* = slot.takeTrap(err);
         return null;
     };
     return null;
@@ -900,7 +1266,7 @@ export fn wazmrt_func_call(
     }
 
     const got = slot.inst.invokeIndex(r.index, slots) catch |err| {
-        if (trap_out) |p| p.* = trapFrom(&slot.inst, err);
+        if (trap_out) |p| p.* = slot.takeTrap(err);
         return null; // trapped, but no host error
     };
 
@@ -1308,6 +1674,179 @@ test "instantiate refuses a module with unresolved imports" {
     try testing.expect(err != null);
     // The message must name the import, or the embedder has to guess which one.
     try testing.expect(std.mem.indexOf(u8, std.mem.span(wazmrt_error_message(err).?), "log") != null);
+}
+
+/// ```wat
+/// (module
+///   (import "env" "peek" (func $peek (param i32) (result i32)))
+///   (memory (export "mem") 1)
+///   (func (export "run") (result i32) i32.const 4 call $peek))
+/// ```
+/// The shape every surveyed loader import has: the guest calls out, and the host must read the
+/// guest's memory from inside the callback to do its job.
+const peek_module = [_]u8{
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    // Two types: the import's (i32)->i32, and `run`'s ()->i32. They are NOT the same signature,
+    // and reusing type 0 for `run` would silently give it a parameter it never reads.
+    0x01, 0x0a, 0x02, 0x60, 0x01, 0x7f, 0x01, 0x7f, 0x60, 0x00, 0x01, 0x7f,
+    0x02, 0x0c, 0x01, 0x03, 'e', 'n', 'v', 0x04, 'p', 'e', 'e', 'k', 0x00, 0x00, // import env.peek
+    0x03, 0x02, 0x01, 0x01, // func 1 : type 1 = ()->i32
+    0x05, 0x03, 0x01, 0x00, 0x01, // memory 0: min 1 page
+    0x07, 0x0d, 0x02, 0x03, 'r', 'u', 'n', 0x00, 0x01, 0x03, 'm', 'e', 'm', 0x02, 0x00,
+    0x0a, 0x08, 0x01, 0x06, 0x00, 0x41, 0x04, 0x10, 0x00, 0x0b, // i32.const 4; call 0
+};
+
+/// Reads 4 bytes of GUEST memory at the offset it was handed, and returns them. This is the
+/// capability wasm-c-api structurally could not provide.
+fn peekCb(env: ?*anyopaque, caller: *Caller, args: [*]const Val, nargs: usize, results: [*]Val, nresults: usize) callconv(.c) ?*Trap {
+    _ = env;
+    if (nargs != 1 or nresults != 1) return wazmrt_trap_new("peek: bad arity");
+    var word: u32 = 0;
+    if (!wazmrt_caller_read(caller, @intCast(args[0].of.i32), &word, 4)) return wazmrt_trap_new("peek: out of bounds");
+    results[0] = .{ .kind = .i32, .of = .{ .i32 = @bitCast(word) } };
+    return null;
+}
+
+fn trappingCb(env: ?*anyopaque, caller: *Caller, args: [*]const Val, nargs: usize, results: [*]Val, nresults: usize) callconv(.c) ?*Trap {
+    _ = .{ env, caller, args, nargs, results, nresults };
+    return wazmrt_trap_new("host said no");
+}
+
+fn i32Type(params: []const ValKind, results: []const ValKind) *FuncType {
+    return wazmrt_functype_new(params.ptr, params.len, results.ptr, results.len).?;
+}
+
+test "host callback reads guest memory through the caller" {
+    const e = wazmrt_engine_new().?;
+    defer wazmrt_engine_delete(e);
+    const s = wazmrt_store_new(e).?;
+    defer wazmrt_store_delete(s);
+    const l = wazmrt_linker_new(e).?;
+    defer wazmrt_linker_delete(l);
+
+    const ft = i32Type(&.{.i32}, &.{.i32});
+    defer wazmrt_functype_delete(ft);
+    try testing.expect(wazmrt_linker_define_func(l, "env", "peek", ft, peekCb, null, null) == null);
+
+    var m: *CModule = undefined;
+    try testing.expect(wazmrt_module_new(e, &peek_module, peek_module.len, &m) == null);
+    defer wazmrt_module_delete(m);
+
+    var inst: InstanceHandle = .{ .id = 0 };
+    var trap: ?*Trap = null;
+    try testing.expect(wazmrt_linker_instantiate(l, s, m, &inst, &trap) == null);
+    try testing.expect(trap == null);
+
+    // Plant a value at offset 4, which is where the guest asks the host to look.
+    var mem: MemoryHandle = .{ .id = 0 };
+    try testing.expect(wazmrt_instance_get_memory(s, inst, "mem", &mem));
+    try testing.expectEqual(@as(u64, 1), wazmrt_memory_size_pages(s, mem));
+    const planted: u32 = 0xdeadbeef;
+    try testing.expect(wazmrt_memory_write(s, mem, 4, &planted, 4));
+
+    var f: FuncHandle = .{ .id = 0 };
+    try testing.expect(wazmrt_instance_get_func(s, inst, "run", &f));
+    var res = [_]Val{.{ .kind = .i32, .of = .{ .i32 = 0 } }};
+    try testing.expect(wazmrt_func_call(s, f, null, 0, &res, 1, &trap) == null);
+    try testing.expect(trap == null);
+    try testing.expectEqual(@as(u32, 0xdeadbeef), @as(u32, @bitCast(res[0].of.i32)));
+
+    // And the bounds check is real: one byte past the end must refuse, not read.
+    const size = wazmrt_memory_data_size(s, mem);
+    var scratch: u32 = 0;
+    try testing.expect(!wazmrt_memory_read(s, mem, size - 3, &scratch, 4));
+    // Wrapping arithmetic must not turn an out-of-range offset into an in-range one.
+    try testing.expect(!wazmrt_memory_read(s, mem, std.math.maxInt(u64) - 1, &scratch, 4));
+}
+
+test "a host trap reaches the embedder with its own message" {
+    const e = wazmrt_engine_new().?;
+    defer wazmrt_engine_delete(e);
+    const s = wazmrt_store_new(e).?;
+    defer wazmrt_store_delete(s);
+    const l = wazmrt_linker_new(e).?;
+    defer wazmrt_linker_delete(l);
+
+    const ft = i32Type(&.{.i32}, &.{.i32});
+    defer wazmrt_functype_delete(ft);
+    try testing.expect(wazmrt_linker_define_func(l, "env", "peek", ft, trappingCb, null, null) == null);
+
+    var m: *CModule = undefined;
+    try testing.expect(wazmrt_module_new(e, &peek_module, peek_module.len, &m) == null);
+    defer wazmrt_module_delete(m);
+    var inst: InstanceHandle = .{ .id = 0 };
+    var trap: ?*Trap = null;
+    try testing.expect(wazmrt_linker_instantiate(l, s, m, &inst, &trap) == null);
+    var f: FuncHandle = .{ .id = 0 };
+    try testing.expect(wazmrt_instance_get_func(s, inst, "run", &f));
+
+    var res = [_]Val{.{ .kind = .i32, .of = .{ .i32 = 0 } }};
+    // No host ERROR — the guest trapped — so both channels must be checked.
+    try testing.expect(wazmrt_func_call(s, f, null, 0, &res, 1, &trap) == null);
+    const t = trap orelse return error.TestExpectedTrap;
+    defer wazmrt_trap_delete(t);
+    // The host's own message, not a generic "HostTrap" the interpreter's error set would give.
+    try testing.expectEqualStrings("host said no", std.mem.span(wazmrt_trap_message(t).?));
+}
+
+test "a host/guest signature disagreement is refused at link time" {
+    // The guest declares (i32)->i32. Defining (i64)->i32 and binding anyway would have the
+    // callback read an argument that was never passed — a segfault from a four-line module.
+    const e = wazmrt_engine_new().?;
+    defer wazmrt_engine_delete(e);
+    const s = wazmrt_store_new(e).?;
+    defer wazmrt_store_delete(s);
+    const l = wazmrt_linker_new(e).?;
+    defer wazmrt_linker_delete(l);
+
+    const wrong = i32Type(&.{.i64}, &.{.i32});
+    defer wazmrt_functype_delete(wrong);
+    try testing.expect(wazmrt_linker_define_func(l, "env", "peek", wrong, peekCb, null, null) == null);
+
+    var m: *CModule = undefined;
+    try testing.expect(wazmrt_module_new(e, &peek_module, peek_module.len, &m) == null);
+    defer wazmrt_module_delete(m);
+    var inst: InstanceHandle = .{ .id = 0 };
+    var trap: ?*Trap = null;
+    const err = wazmrt_linker_instantiate(l, s, m, &inst, &trap);
+    defer wazmrt_error_delete(err);
+    try testing.expect(err != null);
+    try testing.expect(std.mem.indexOf(u8, std.mem.span(wazmrt_error_message(err).?), "peek") != null);
+
+    // Arity disagreement is caught the same way.
+    const short = i32Type(&.{}, &.{.i32});
+    defer wazmrt_functype_delete(short);
+    try testing.expect(wazmrt_linker_define_func(l, "env", "peek", short, peekCb, null, null) == null);
+    const err2 = wazmrt_linker_instantiate(l, s, m, &inst, &trap);
+    defer wazmrt_error_delete(err2);
+    try testing.expect(err2 != null);
+}
+
+test "unknown imports as traps: links, then traps when called" {
+    const e = wazmrt_engine_new().?;
+    defer wazmrt_engine_delete(e);
+    const s = wazmrt_store_new(e).?;
+    defer wazmrt_store_delete(s);
+    const l = wazmrt_linker_new(e).?;
+    defer wazmrt_linker_delete(l);
+    try testing.expect(wazmrt_linker_define_unknown_imports_as_traps(l) == null);
+
+    var m: *CModule = undefined;
+    try testing.expect(wazmrt_module_new(e, &peek_module, peek_module.len, &m) == null);
+    defer wazmrt_module_delete(m);
+    var inst: InstanceHandle = .{ .id = 0 };
+    var trap: ?*Trap = null;
+    // Links despite `env.peek` being undefined — that is the whole point of the flag, and the
+    // documented cost is that a typo becomes a runtime surprise instead of a link error.
+    try testing.expect(wazmrt_linker_instantiate(l, s, m, &inst, &trap) == null);
+
+    var f: FuncHandle = .{ .id = 0 };
+    try testing.expect(wazmrt_instance_get_func(s, inst, "run", &f));
+    var res = [_]Val{.{ .kind = .i32, .of = .{ .i32 = 0 } }};
+    try testing.expect(wazmrt_func_call(s, f, null, 0, &res, 1, &trap) == null);
+    const t = trap orelse return error.TestExpectedTrap;
+    defer wazmrt_trap_delete(t);
+    try testing.expectEqualStrings("unknown import called", std.mem.span(wazmrt_trap_message(t).?));
 }
 
 test "delete functions tolerate NULL" {

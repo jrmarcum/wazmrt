@@ -350,9 +350,10 @@ void wazmrt_linker_delete(wazmrt_linker_t *);
  * ownership of nothing else; `env` is passed to every call, and `env_finalizer` (may be NULL)
  * runs when the linker is deleted or the name redefined. Redefining replaces.
  *
- * ⚠️ The declared type is TRUSTED to match what the guest declares — a host callback carries
- * no signature the engine can cross-check. Get it wrong and the guest sees garbage arguments.
- * Guest-to-guest imports ARE type-checked at link time. */
+ * ✅ The type you declare here is CHECKED against the type the guest declares for that import,
+ * at link time, and a disagreement fails `wazmrt_linker_instantiate` naming the import. Binding
+ * a mismatched callback would have it read arguments that were never passed — reachable from a
+ * four-line module — so this is refused rather than trusted. */
 wazmrt_error_t *wazmrt_linker_define_func(wazmrt_linker_t *,
                                           const char *module, const char *name,
                                           const wazmrt_functype_t *,
