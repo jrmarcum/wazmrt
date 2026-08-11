@@ -1,0 +1,22 @@
+# Size ceilings for the SHIPPED artifacts — checked by `zig build size -Doptimize=ReleaseSmall`.
+#
+# Format: <artifact-name> <ceiling-bytes>    (blank lines and `#` comments ignored)
+#
+# ⚠️ A ceiling is EXACT, not a budget with headroom. Any growth fails the build, which forces raising
+# the number in the same commit that grows it — so every increase is a deliberate, reviewed act with a
+# reason in the log. Headroom would let drift accumulate silently, which is precisely the failure this
+# gate exists to prevent: between 2026-07-14 and 2026-08-11 the DLL grew +75% and the static lib +122%
+# while "smallest binary" was a stated goal, because nothing measured them.
+#
+# Raising a ceiling is legitimate — features cost bytes. State WHAT bought the bytes in the commit
+# message. Lowering one after a win is equally expected; re-run and commit the smaller number.
+#
+# Baseline measured 2026-08-11, Zig 0.16.0, x86_64-windows, ReleaseSmall:
+#   wazmrt.exe  911,360    wazmrt.lib  279,444    wazmrt.dll  227,328
+#
+# NOTE: `wazmrt.lib` is the STATIC library only. `zig build dll` overwrites it with the DLL's much
+# smaller import library, so measure the static lib from a plain `zig build`, never after `dll`.
+
+wazmrt.exe  911360
+wazmrt.lib  279444
+wazmrt.dll  227328

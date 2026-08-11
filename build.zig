@@ -301,6 +301,35 @@ pub fn build(b: *std.Build) void {
         test_safe_step.dependOn(&b.addRunArtifact(cabi_tests_safe).step);
     }
 
+    // ---- Size gate (`zig build size -Doptimize=ReleaseSmall`) --------------
+    // `ReleaseSmall` is a first-class goal, and a goal with no gate is a preference: between
+    // 2026-07-14 and 2026-08-11 the DLL grew +75% and the static lib +122% unnoticed, because the only
+    // size numbers on record were a month-old note in a memory file. Same shape as `test-security` —
+    // a step whose entire value is that it CAN go red.
+    //
+    // Ceilings in `tools/size-ceilings.txt` are EXACT, so growth must raise the number in the same
+    // commit and say what bought the bytes. Not wired into `zig build test`: it needs the artifacts
+    // built in the shipping mode, and silently passing in Debug would be worse than not running.
+    {
+        const size_gate = b.addExecutable(.{ .name = "size_gate", .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/size_gate.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }) });
+        const run_size = b.addRunArtifact(size_gate);
+        run_size.addFileArg(b.path("tools/size-ceilings.txt"));
+        // The mode is passed to the TOOL rather than checked here: a configure-time warning would
+        // print on every `zig build`, including the ones that never asked for this step.
+        run_size.addArg(@tagName(optimize));
+        run_size.addArg(b.getInstallPath(.bin, ""));
+        run_size.addArg(b.getInstallPath(.lib, ""));
+        run_size.has_side_effects = true; // measure what is on disk NOW, never a cached verdict
+        run_size.step.dependOn(b.getInstallStep());
+
+        const size_step = b.step("size", "Check shipped artifact sizes (needs -Doptimize=ReleaseSmall)");
+        size_step.dependOn(&run_size.step);
+    }
+
     // ---- Spec-conformance runner (`zig build conformance -Dtestsuite=<dir>`) -
     // Walks a WebAssembly spec-testsuite checkout (a directory of `.wast` files),
     // runs each through the in-process `.wast` runner, aggregates pass/fail, and
