@@ -547,6 +547,25 @@ top of the standalone `mod_tests` run — so the printed total roughly doubles e
 quote the printed number as a distinct-test count; quote the per-target numbers from `--summary all`.**
 Green under **Debug AND ReleaseSafe**; `zig build c-smoke` 319/319.
 
+**Update 2026-08-11 — ABI-2 work in progress; the counts below are superseded.**
+
+- **From an NTFS cwd: `zig build test` = 748/748, `test-safe` = 748/748, `test-security` = 3/3, all
+  ZERO skips.** From the D: (exFAT) repo the same runs report 742/748 with **6 skipped**.
+- **There are now THREE test binaries**, not two: `mod_tests`, `cabi_tests` and the new `capi_tests`
+  (`src/capi.zig`, the ABI-2 surface). Each imports `root.zig`, so each re-runs the core suite — the
+  printed total now **triples** the distinct-test count instead of doubling, and the skip count on
+  exFAT is 3 binaries × 2 symlink tests = 6. Both revert when step 6 deletes `cabi_tests`.
+  **Still: never quote the printed number as a distinct-test count.**
+- ⚙️ **HOW to run from NTFS when the repo lives on the exFAT drive** — `zig build` roots itself where
+  the repo is, so pointing it across the drive is the whole trick:
+  ```
+  cd C:\some\ntfs\dir
+  zig build --build-file D:\…\wazmrt\build.zig test-security --cache-dir C:\…\zigcache --global-cache-dir C:\…\zigcache\g
+  ```
+  ⚠️ **Quote NTFS numbers.** A "6 skipped" result is not evidence about the sandbox — it is evidence
+  about the filesystem the harness happened to run on. Owner, 2026-08-11: *"if skipped tests are
+  symlink related they have to be run on the hard drive not the thumb drive to be checked correctly."*
+
 **Update 2026-08-10 — green under all FOUR modes, and the 4 skips are not neutral.**
 
 - ✅ **489/493 in Debug, ReleaseSafe, ReleaseFast AND ReleaseSmall.** The line above only ever claimed
