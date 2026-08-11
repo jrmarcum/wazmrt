@@ -255,9 +255,15 @@ absent on unprivileged Windows (they return `ENOTSUP` there; both work on POSIX)
 ## Embedding (C ABI)
 
 wazmrt implements the **standard [WebAssembly C API](https://github.com/WebAssembly/wasm-c-api)**
-(`wasm.h`), so it embeds like wasmtime or wasmer — the `universalWasmLoader-*`
-ports bind to the same ABI. `zig build` installs both `wasm.h` and the small
-`wazmrt.h` extension header alongside the static library.
+(`wasm.h`), so it embeds like wasmtime or wasmer — any consumer already written
+against that header binds to wazmrt unchanged. `zig build` installs both
+`wasm.h` and the small `wazmrt.h` extension header alongside the static library.
+
+> **If you redistribute the C ABI, ship `zig-out/include/` whole.** `zig build`
+> also installs `LICENSE.wasm-c-api` and `NOTICE` there: `wasm.h` is vendored
+> verbatim from upstream and is **Apache-2.0 only** (wazmrt's own code is
+> `MIT OR Apache-2.0`), and §4(a) requires the license to reach whoever receives
+> the header. Copying the headers alone leaves that obligation unmet.
 
 > **Every function `wasm.h` declares is implemented** — all 319, checked at
 > link time on every build (`tests/c_abi_symbols.c` references them all, so a

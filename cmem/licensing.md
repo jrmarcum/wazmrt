@@ -26,11 +26,41 @@ and change-statement obligations must be preserved. So:
   wazmrt still complies with, e.g., Apache-2.0 for any incorporated Apache-2.0 files. This is normal
   and expected — the dual choice covers our contributions, not the vendored code.
 
+## The distribution rule (2026-08-10) — ⚠️ **a compliant repository is not a compliant distribution**
+
+Apache-2.0 §4(a) binds on **distribution**: recipients must get a copy of the license. The obligation
+attaches to *the thing you hand someone*, not to the source tree it was built from. wazmrt satisfied it
+in the repo (`third_party/wasm-c-api/LICENSE` + `NOTICE` + the ledger entry) while `zig-out/include/` —
+the directory an embedder actually copies — carried `wasm.h` **alone**, and whoever copies it never sees
+`third_party/`.
+
+`build.zig` now installs, beside the two headers:
+
+```
+zig-out/include/LICENSE.wasm-c-api   the Apache-2.0 text (11.1 KiB)
+zig-out/include/NOTICE               wazmrt's attribution notices (1.3 KiB)
+```
+
+- **Named for the header it covers, deliberately.** wazmrt's own code is `MIT OR Apache-2.0`; the
+  vendored header is **Apache-2.0 only**. A bare `LICENSE` in an include directory invites conflating
+  the two — which is how attribution quietly goes missing.
+- Upstream wasm-c-api ships no NOTICE of its own, so §4(d) has nothing extra to propagate *from it*;
+  wazmrt's own `NOTICE` carries the attribution and now travels with the headers.
+- **The rule to apply next time: when vendoring anything, ask where the artifact goes, not where the
+  file sits.** If a vendored file ends up in `zig-out/`, its license must too. Found only because the
+  owner asked whether `wasm.h` was reference-only — it is not: wazmrt vendors it, implements all 174
+  `wasm_*` exports against it, and ships it.
+
+See `cmem/overview.md` for the resulting distribution manifest (ship `zig-out/include/` **whole**), and
+`third_party/LICENSES.md` for the ledger checkbox that records it.
+
 ## Files
 
 - `LICENSE-MIT`, `LICENSE-APACHE` — the two license texts (Apache is the canonical verbatim text).
 - `NOTICE` — attribution + a statement that incorporated Apache-2.0 code retains its NOTICE and gets
-  change-notes (§4 obligations).
+  change-notes (§4 obligations). **Also installed to `zig-out/include/NOTICE`** by `build.zig`.
+- `zig-out/include/LICENSE.wasm-c-api` — build output, not a source file: the vendored header's
+  Apache-2.0 text, shipped so the distribution is compliant on its own (see the rule above).
 - `third_party/LICENSES.md` — **the operational source of truth**: the obligations-at-a-glance table,
   the Adoption Checklist (run before any reuse), the Component Ledger (one entry per adopted
   component), and the verified SPDX inventory. `reference-projects.md` mirrors the inventory with

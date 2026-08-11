@@ -87,9 +87,18 @@ Newest first. Copy the template for each adopted component.
       copies that directory never sees `third_party/`. **A compliant repository is not a compliant
       distribution** — Apache-2.0 §4(a) binds on distribution, so the licence has to be where the
       artifact goes.
-- **Benefit / drawback note:** Benefit — instant, standard interop; loaders bind
-  once to a familiar ABI. Drawback — large surface (~740 lines); we implement it
+- **Benefit / drawback note:** Benefit — instant, standard interop; ~~loaders bind
+  once to a familiar ABI~~. Drawback — large surface (~740 lines); we implement it
   incrementally, backing only what the runtime can do today.
+  ⚠️ **Benefit partly FALSIFIED 2026-08-10:** the standard-interop half is real, but
+  "loaders bind once to a familiar ABI" was never checked against the loaders. The
+  `universalWasmLoader-*` consumers use wasmtime's *other* C API (`wasmtime_*`
+  store/context/linker), and wasm-c-api's host-func callback cannot reach the
+  caller's memory — which is what nearly every loader host import needs. Full
+  account in `cmem/vision.md`; the caveat is on the decision in
+  `cmem/design-decisions.md`. **Checklist lesson: a "Benefit" line asserting what
+  another project does is a hypothesis — go read that project's source before
+  ticking it.**
 
 <!--
 ### <component-name>

@@ -415,6 +415,35 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   `wazmrt_abi_version()`. Windows consumers compile with `-DLIBWASM_STATIC` (static lib). The retired
   ad-hoc `wazmrt_module_decode/_section_count/_free` ABI was replaced by the standard `wasm_module_*`.
 
+  ⚠️⚠️ **One of this decision's stated payoffs was FALSIFIED 2026-08-10 — read `vision.md` before
+  re-arguing the ABI.** The claimed "low-friction swap" (*"the loaders are already on wasmtime's C API,
+  so they are close to drop-in"*) assumed the `universalWasmLoader-*` consumers used **wasm-c-api**.
+  They do not. wasmtime ships **two** C surfaces — the standard `wasm.h` and its own richer
+  `wasmtime.h` — and the real loader header (`universalWasmLoader-c/universal_wasm_loader.h`, surveyed
+  in wasmrt's `cmem/loaders.md`) uses the **`wasmtime_*` store/context/linker/typed-val model**.
+  Structurally worse than merely different: **wasm-c-api's host-func callback gets no handle to the
+  caller's memory**, and essentially every loader host import must read guest memory inside a callback;
+  the Rust port closed that at T8 with wasmtime's **caller-based** model (`wasmrt_caller_*`) and
+  replaced the whole surface with ~74 functions and value handles.
+  **What the decision DID deliver is still real** — a genuinely standard ABI, third-party interop with
+  any wasm-c-api consumer, and the proven Deno-FFI path. **Do not read this as "rip out the C ABI"**;
+  read it as *the intended consumer was never served by it*, and note the cost: `src/wasm_c_api.zig` is
+  319 declared functions / 174 exports, the largest file here and the one flagged above as
+  memory-safety-critical — audit findings **#20, #21 and #22 were all in it**.
+  🎓 **The generalized lesson: a stated BENEFIT is a hypothesis about someone else's code.** When a
+  decision rests on "consumer X already does Y", open X's source and grep for Y **before** deciding, not
+  after implementing. The loader header sat in a sibling repo the whole time. (Recorded as a reusable
+  practice in `wasmrt/cmem/best-practices.md` §2.2a.)
+
+- **Attribution travels WITH the artifact, not merely with the repo (2026-08-10).** `wasm.h` is vendored
+  verbatim and is **Apache-2.0 only** (wazmrt's own code is `MIT OR Apache-2.0`), so §4(a) obliges us to
+  put the license where the *distribution* goes. `build.zig` installs `third_party/wasm-c-api/LICENSE` →
+  `zig-out/include/LICENSE.wasm-c-api` and `NOTICE` → `zig-out/include/NOTICE`, hung off
+  `b.getInstallStep()` so they cannot be skipped by building only the library. ⚠️ **Do not "tidy" these
+  into a bare `include/LICENSE`** — the name states which of the two licenses it is, and collapsing it
+  invites conflating the vendored header's terms with wazmrt's. Rule for any future vendoring: **a
+  compliant repository is not a compliant distribution** — see `licensing.md`.
+
 - **Zero-copy decode (2026-07-02).** `Reader` borrows slices; `Module` stores only section
   `{id, offset, size}` extents — no eager payload copies. Consequence: a decoded `Module` must remain
   valid after the input buffer is freed (it does — it copies nothing out of the input except the extent

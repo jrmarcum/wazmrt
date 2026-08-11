@@ -85,7 +85,8 @@ The core (`root.zig`) is compiled into three artifacts by `build.zig`:
    entry + new `Io` API (`Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64<<20))`,
    `Io.File.Writer`). See `design-decisions.md` for the 0.16 API notes.
 2. **C-ABI static library** (`wasm_c_api.zig`) — implements the **standard wasm-c-api**. `zig build`
-   installs `wazmrt.lib`/`.a` + both headers (`wasm.h`, `wazmrt.h`). Opaque handles; `smp_allocator`
+   installs `wazmrt.lib`/`.a` + both headers (`wasm.h`, `wazmrt.h`) + the attribution files that must
+   ship with them (`LICENSE.wasm-c-api`, `NOTICE`). Opaque handles; `smp_allocator`
    (no libc). This is what the `universalWasmLoader-*` ports link. Verified from C by `tests/c_smoke.c`.
 3. **Freestanding wasm** (`wasm_entry.zig`) — `zig build wasm`, `ReleaseSmall`, `entry = .disabled`,
    `rdynamic = true`, `std.heap.wasm_allocator`. Proves the runtime compiles to wasm and gives web
@@ -96,7 +97,11 @@ The core (`root.zig`) is compiled into three artifacts by `build.zig`:
 - `mod` = `addModule("wazmrt", root.zig)` — imported by the CLI and reused as the test root.
 - `exe` = CLI, imports `mod`; installed by default; `run` step.
 - `cabi` = `addLibrary(.static, wasm_c_api.zig)` + `installHeader(wasm.h)` + `installHeader(wazmrt.h)`;
-  installed by default. **Does NOT link libc** (deliberate — see `design-decisions.md`).
+  installed by default. **Does NOT link libc** (deliberate — see `design-decisions.md`). Since
+  2026-08-10 the install step also copies **`LICENSE.wasm-c-api`** (the vendored header's Apache-2.0
+  text) and **`NOTICE`** into `zig-out/include/`, via `b.getInstallStep().dependOn(addInstallFile(…))`
+  so they ship even when only the library is built — `wasm.h` is Apache-2.0 only and §4(a) binds on
+  distribution, not on the repo. Ship `zig-out/include/` **whole**; see `licensing.md` + `overview.md`.
 - `wasm_exe` = `addExecutable(wasm_entry.zig)` for `wasm32-freestanding`, under the `wasm` step only.
 - `mod_tests` = `addTest(mod)` under the `test` step; `cabi_tests` = `addTest(wasm_c_api.zig)` (re-runs
   the core tests + the C-ABI tests under `std.testing.allocator`), also under `test`.
@@ -111,6 +116,13 @@ The integration ABI **is** the standard `wasm.h` (vendored, Apache-2.0, at
 `third_party/wasm-c-api/include/wasm.h`; ledger in `third_party/LICENSES.md`). `include/wazmrt.h` is a
 thin *extension* header (the wasmtime `wasm.h` + `wasmtime.h` pattern) that `#include`s `wasm.h` and
 adds only the wazmrt handshake.
+
+⚠️ **The intended consumer does not bind to this surface (falsified 2026-08-10).** The
+`universalWasmLoader-*` ports use wasmtime's *other* C API — the `wasmtime_*` store/context/linker
+model — not wasm-c-api, and wasm-c-api's host-func callback **cannot reach the caller's memory**, which
+is what almost every loader host import needs. The ABI is still a correct, complete, standard one (and
+the Deno-FFI path is real); it is simply not the drop-in the decision claimed. Full account in
+`vision.md`; the decision entry in `design-decisions.md` carries the caveat and the lesson.
 
 **Implemented today** (`src/wasm_c_api.zig`) — the subset the runtime can back:
 
