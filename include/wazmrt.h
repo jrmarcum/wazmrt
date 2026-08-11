@@ -45,8 +45,18 @@
  *      That is the property a refcount model exists to provide, obtained instead by
  *      construction: there is no count to get wrong and no ownership to transfer.
  *
- * THREADING. A store and everything reachable from it is single-threaded. Do not touch one
- * store from two threads, even under an external lock; separate stores are independent.
+ * THREADING — CONCURRENCY COMES FROM MULTIPLE ENGINES.
+ *
+ * An engine, its stores, and everything reachable from them are single-threaded. Do not touch
+ * one engine from two threads, even under an external lock. This is not a temporary limitation:
+ * the engine carries a single-threaded I/O implementation on purpose, because a thread pool
+ * would cost binary size in a runtime whose whole pitch is footprint.
+ *
+ * ⚠️ If your host uses async/await, goroutines, tasks or threads, give **each concurrent context
+ * its own `wazmrt_engine_t`**. Engines are cheap and fully independent — nothing is shared
+ * between them — so N engines is the supported way to run N things at once. Sharing one engine
+ * across an async runtime's worker threads is undefined behaviour, and it is the mistake this
+ * paragraph exists to prevent.
  *
  * ---------------------------------------------------------------------------------------
  * Error convention

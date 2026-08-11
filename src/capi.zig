@@ -165,13 +165,33 @@ pub const Engine = struct {
     /// Distinguishes stores made from different engines in diagnostics; not a security
     /// boundary (the store id is what handles are checked against).
     id: u64,
+
+    /// The `Io` the WASI host performs file and stdio operations through (owner, 2026-08-11:
+    /// **single-threaded, one per engine**).
+    ///
+    /// Single-threaded is not a shortcut, it is the coherent choice: `wazmrt.h` documents that a
+    /// store and everything reachable from it is single-threaded, so backing it with a thread
+    /// pool would contradict the published contract — and a pool sized from the CPU count is real
+    /// bytes in a library whose size is now gated. `init_single_threaded` spawns nothing
+    /// (`async_limit = .nothing`).
+    ///
+    /// ⚠️ `io()` captures `&threaded`, so an Engine must never be moved after creation. It is
+    /// always heap-allocated, and it outlives its stores by contract.
+    threaded: std.Io.Threaded,
+
+    fn io(self: *Engine) std.Io {
+        return self.threaded.io();
+    }
 };
 
 var next_engine_id: std.atomic.Value(u64) = .init(1);
 
 export fn wazmrt_engine_new() ?*Engine {
     const e = alloc.create(Engine) catch return null;
-    e.* = .{ .id = next_engine_id.fetchAdd(1, .monotonic) };
+    var t = std.Io.Threaded.init_single_threaded;
+    // The single-threaded template ships a `.failing` allocator; WASI path work needs a real one.
+    t.allocator = alloc;
+    e.* = .{ .id = next_engine_id.fetchAdd(1, .monotonic), .threaded = t };
     return e;
 }
 
@@ -226,6 +246,14 @@ const InstanceSlot = struct {
     arena: std.heap.ArenaAllocator,
     inst: interp.Instance,
     module: *CModule,
+    /// The WASI host, if this module imported `wasi_snapshot_preview1`. Owned by the arena
+    /// except for the directory handles, which `Wasi.deinit` closes.
+    wasi: ?*WasiState = null,
+    /// The linker that instantiated this, so a guest's `proc_exit` code can reach
+    /// `wazmrt_wasi_exit_code`. ⚠️ Cleared by `wazmrt_linker_delete`, and the slot removes itself
+    /// from the linker when IT dies — either object may legally outlive the other, so a raw
+    /// pointer in one direction only would be a use-after-free waiting for the right order.
+    linker: ?*Linker = null,
     /// A trap raised by a HOST callback, stashed here because the interpreter's error set can
     /// only say `HostTrap` — it cannot carry the host's message. Consumed by whoever reports the
     /// failure, so the embedder gets its own trap back instead of a generic one.
@@ -238,6 +266,24 @@ const InstanceSlot = struct {
             return t;
         }
         return trapFrom(&self.inst, err);
+    }
+
+    /// A guest `proc_exit` unwinds as `HostTrap` with the code recorded — it is a CLEAN EXIT, not
+    /// a failure, and reporting it as a trap would make every normal WASI command look like a
+    /// crash. Returns true when the error was really an exit, having recorded the code.
+    fn tookExit(self: *InstanceSlot, err: anyerror) bool {
+        if (err != error.HostTrap) return false;
+        const w = self.wasi orelse return false;
+        const code = w.wasi.exit_code orelse return false;
+        // WASI's `proc_exit` takes a u32; the ABI reports int32_t, so 0xFFFFFFFF reads as -1 —
+        // which is what a host shell would show. Bit-cast, never truncate.
+        if (self.linker) |lk| lk.noteExit(@bitCast(code));
+        // Consume any trap the unwind stashed, so it is not leaked or misreported.
+        if (self.pending_trap) |t| {
+            wazmrt_trap_delete(t);
+            self.pending_trap = null;
+        }
+        return true;
     }
 };
 
@@ -291,6 +337,18 @@ export fn wazmrt_store_delete(s: ?*Store) void {
         i -= 1;
         const slot = store.instances.items[i];
         slot.inst.deinit();
+        // Before the arena goes: `Wasi.deinit` closes the preopened directory handles it owns,
+        // which are OS resources the arena knows nothing about.
+        if (slot.wasi) |w| w.wasi.deinit();
+        // Symmetric to `wazmrt_linker_delete`: drop the linker's reference to us first.
+        if (slot.linker) |lk| {
+            for (lk.slots.items, 0..) |cand, k| {
+                if (cand == slot) {
+                    _ = lk.slots.swapRemove(k);
+                    break;
+                }
+            }
+        }
         slot.arena.deinit();
         releaseModule(slot.module);
         alloc.destroy(slot);
@@ -701,10 +759,19 @@ const Entry = struct {
 pub const Linker = struct {
     engine: *Engine,
     entries: std.ArrayList(Entry) = .empty,
+    /// A copy of the embedder's WASI template, or null if `define_wasi` was never called.
+    wasi: ?WasiConfig = null,
     /// Back otherwise-unsatisfied FUNCTION imports with a trapping stub.
     trap_unknown: bool = false,
-    /// Set when a guest called `proc_exit`; read by `wazmrt_wasi_exit_code` (2d).
+    /// Set when a guest called `proc_exit`; read by `wazmrt_wasi_exit_code`.
     exit_code: ?i32 = null,
+    /// Instances made by this linker, so their back-pointers can be cleared if it dies first.
+    slots: std.ArrayList(*InstanceSlot) = .empty,
+
+    /// Record a guest's exit code and detach the instance, which has finished with us.
+    fn noteExit(self: *Linker, code: i32) void {
+        self.exit_code = code;
+    }
 
     fn find(self: *const Linker, module: []const u8, name: []const u8) ?*const Definition {
         // Linear: import counts are small, and a map would cost more in code size than it saves.
@@ -730,6 +797,11 @@ export fn wazmrt_linker_delete(l: ?*Linker) void {
     const lk = l orelse return;
     for (lk.entries.items) |*e| e.deinit();
     lk.entries.deinit(alloc);
+    // Detach every instance still pointing back here, or their `proc_exit` reporting would write
+    // into freed memory.
+    for (lk.slots.items) |s| s.linker = null;
+    lk.slots.deinit(alloc);
+    if (lk.wasi) |*w| w.deinit();
     alloc.destroy(lk);
 }
 
@@ -806,6 +878,253 @@ export fn wazmrt_linker_define_unknown_imports_as_traps(l: ?*Linker) ?*Error {
     const lk = l orelse return errorf("wazmrt_linker_define_unknown_imports_as_traps: linker is NULL", .{});
     lk.trap_unknown = true;
     return null;
+}
+
+// ---------------------------------------------------------------------------------------
+// WASI preview 1
+// ---------------------------------------------------------------------------------------
+
+const Preopen = struct {
+    host: []u8,
+    guest: []u8,
+    read_only: bool,
+    allow_symlink: bool,
+};
+
+/// A template the linker copies. Everything is owned here and duplicated on copy, so an
+/// embedder can delete the config the moment `wazmrt_linker_define_wasi` returns.
+pub const WasiConfig = struct {
+    args: std.ArrayList([]u8) = .empty,
+    env_names: std.ArrayList([]u8) = .empty,
+    env_values: std.ArrayList([]u8) = .empty,
+    preopens: std.ArrayList(Preopen) = .empty,
+    inherit_stdout: bool = false,
+    inherit_stderr: bool = false,
+    inherit_stdin: bool = false,
+
+    fn deinit(self: *WasiConfig) void {
+        for (self.args.items) |a| alloc.free(a);
+        for (self.env_names.items) |a| alloc.free(a);
+        for (self.env_values.items) |a| alloc.free(a);
+        for (self.preopens.items) |p| {
+            alloc.free(p.host);
+            alloc.free(p.guest);
+        }
+        self.args.deinit(alloc);
+        self.env_names.deinit(alloc);
+        self.env_values.deinit(alloc);
+        self.preopens.deinit(alloc);
+    }
+
+    fn clone(self: *const WasiConfig) ?WasiConfig {
+        var out: WasiConfig = .{
+            .inherit_stdout = self.inherit_stdout,
+            .inherit_stderr = self.inherit_stderr,
+            .inherit_stdin = self.inherit_stdin,
+        };
+        for (self.args.items) |a| {
+            const c = alloc.dupe(u8, a) catch {
+                out.deinit();
+                return null;
+            };
+            out.args.append(alloc, c) catch {
+                alloc.free(c);
+                out.deinit();
+                return null;
+            };
+        }
+        for (self.env_names.items, self.env_values.items) |n, v| {
+            const cn = alloc.dupe(u8, n) catch {
+                out.deinit();
+                return null;
+            };
+            const cv = alloc.dupe(u8, v) catch {
+                alloc.free(cn);
+                out.deinit();
+                return null;
+            };
+            out.env_names.append(alloc, cn) catch {
+                out.deinit();
+                return null;
+            };
+            out.env_values.append(alloc, cv) catch {
+                out.deinit();
+                return null;
+            };
+        }
+        for (self.preopens.items) |p| {
+            const ch = alloc.dupe(u8, p.host) catch {
+                out.deinit();
+                return null;
+            };
+            const cg = alloc.dupe(u8, p.guest) catch {
+                alloc.free(ch);
+                out.deinit();
+                return null;
+            };
+            out.preopens.append(alloc, .{ .host = ch, .guest = cg, .read_only = p.read_only, .allow_symlink = p.allow_symlink }) catch {
+                out.deinit();
+                return null;
+            };
+        }
+        return out;
+    }
+};
+
+export fn wazmrt_wasi_config_new() ?*WasiConfig {
+    const c = alloc.create(WasiConfig) catch return null;
+    c.* = .{};
+    return c;
+}
+
+export fn wazmrt_wasi_config_delete(c: ?*WasiConfig) void {
+    const cfg = c orelse return;
+    cfg.deinit();
+    alloc.destroy(cfg);
+}
+
+export fn wazmrt_wasi_config_inherit_stdout(c: ?*WasiConfig) void {
+    if (c) |cfg| cfg.inherit_stdout = true;
+}
+export fn wazmrt_wasi_config_inherit_stderr(c: ?*WasiConfig) void {
+    if (c) |cfg| cfg.inherit_stderr = true;
+}
+export fn wazmrt_wasi_config_inherit_stdin(c: ?*WasiConfig) void {
+    if (c) |cfg| cfg.inherit_stdin = true;
+}
+
+/// Replaces any previous argv. Strings are copied.
+export fn wazmrt_wasi_config_set_args(c: ?*WasiConfig, argv: ?[*]const ?[*:0]const u8, n: usize) void {
+    const cfg = c orelse return;
+    for (cfg.args.items) |a| alloc.free(a);
+    cfg.args.clearRetainingCapacity();
+    const src = argv orelse return;
+    for (0..n) |i| {
+        const dup = alloc.dupe(u8, spanOf(src[i])) catch return;
+        cfg.args.append(alloc, dup) catch alloc.free(dup);
+    }
+}
+
+export fn wazmrt_wasi_config_set_env(
+    c: ?*WasiConfig,
+    names: ?[*]const ?[*:0]const u8,
+    values: ?[*]const ?[*:0]const u8,
+    n: usize,
+) void {
+    const cfg = c orelse return;
+    for (cfg.env_names.items) |a| alloc.free(a);
+    for (cfg.env_values.items) |a| alloc.free(a);
+    cfg.env_names.clearRetainingCapacity();
+    cfg.env_values.clearRetainingCapacity();
+    const ns = names orelse return;
+    const vs = values orelse return;
+    for (0..n) |i| {
+        const dn = alloc.dupe(u8, spanOf(ns[i])) catch return;
+        const dv = alloc.dupe(u8, spanOf(vs[i])) catch {
+            alloc.free(dn);
+            return;
+        };
+        cfg.env_names.append(alloc, dn) catch {
+            alloc.free(dn);
+            alloc.free(dv);
+            return;
+        };
+        cfg.env_values.append(alloc, dv) catch {
+            alloc.free(dv);
+            return;
+        };
+    }
+}
+
+/// 🔒 `read_only` narrows rights and propagates to the subtree; `allow_symlink` is what lets the
+/// guest CREATE links, and it is OFF unless asked for — denying creation shrinks what an external
+/// racer can repoint. Following a PRE-EXISTING link is unaffected.
+export fn wazmrt_wasi_config_preopen_dir(
+    c: ?*WasiConfig,
+    host_path: ?[*:0]const u8,
+    guest_path: ?[*:0]const u8,
+    read_only: bool,
+    allow_symlink: bool,
+) ?*Error {
+    const cfg = c orelse return errorf("wazmrt_wasi_config_preopen_dir: config is NULL", .{});
+    const h = alloc.dupe(u8, spanOf(host_path)) catch return errorf("out of memory", .{});
+    const g = alloc.dupe(u8, spanOf(guest_path)) catch {
+        alloc.free(h);
+        return errorf("out of memory", .{});
+    };
+    cfg.preopens.append(alloc, .{ .host = h, .guest = g, .read_only = read_only, .allow_symlink = allow_symlink }) catch {
+        alloc.free(h);
+        alloc.free(g);
+        return errorf("out of memory", .{});
+    };
+    return null;
+}
+
+export fn wazmrt_linker_define_wasi(l: ?*Linker, c: ?*const WasiConfig) ?*Error {
+    const lk = l orelse return errorf("wazmrt_linker_define_wasi: linker is NULL", .{});
+    const cfg = c orelse return errorf("wazmrt_linker_define_wasi: config is NULL", .{});
+    if (lk.wasi) |*old| old.deinit();
+    lk.wasi = cfg.clone() orelse return errorf("out of memory", .{});
+    return null;
+}
+
+export fn wazmrt_wasi_exit_code(l: ?*const Linker, out: ?*i32) bool {
+    const lk = l orelse return false;
+    const code = lk.exit_code orelse return false;
+    if (out) |p| p.* = code;
+    return true;
+}
+
+/// Everything one instance's WASI host needs, all living in that instance's arena.
+const WasiState = struct {
+    wasi: root.wasi.Wasi,
+    out_writer: std.Io.File.Writer,
+    err_writer: std.Io.File.Writer,
+    discard_out: std.Io.Writer.Discarding,
+    discard_err: std.Io.Writer.Discarding,
+};
+
+/// Build the WASI host for one instance. `sa` is the instance arena, so nothing here needs an
+/// explicit free beyond `Wasi.deinit` (which closes the preopened directories it owns).
+fn initWasi(eng: *Engine, cfg: *const WasiConfig, sa: std.mem.Allocator) !*WasiState {
+    const st = try sa.create(WasiState);
+    const io = eng.io();
+
+    const obuf = try sa.alloc(u8, 4096);
+    const ebuf = try sa.alloc(u8, 4096);
+    st.discard_out = std.Io.Writer.Discarding.init(obuf);
+    st.discard_err = std.Io.Writer.Discarding.init(ebuf);
+    st.out_writer = .init(.stdout(), io, obuf);
+    st.err_writer = .init(.stderr(), io, ebuf);
+
+    // Not inheriting means DISCARD, not "write to a broken handle": a guest that prints when the
+    // embedder asked for no stdout should be silent, not fail.
+    const out_iface = if (cfg.inherit_stdout) &st.out_writer.interface else &st.discard_out.writer;
+    const err_iface = if (cfg.inherit_stderr) &st.err_writer.interface else &st.discard_err.writer;
+
+    st.wasi = try root.wasi.Wasi.init(sa, io, out_iface, err_iface);
+    errdefer st.wasi.deinit();
+
+    for (cfg.preopens.items) |p| {
+        // 🔒 Read-write does NOT include planting symlinks unless explicitly granted.
+        const rights = if (p.read_only)
+            root.wasi.readOnlyRights
+        else if (p.allow_symlink) root.wasi.allRights else root.wasi.readWriteRights;
+        _ = try st.wasi.addPreopen(p.host, p.guest, rights);
+    }
+
+    const args = try sa.alloc([]const u8, cfg.args.items.len);
+    for (cfg.args.items, args) |src, *dst| dst.* = src;
+    st.wasi.args = args;
+
+    // `Wasi.environ` wants "KEY=VALUE" strings.
+    const env = try sa.alloc([]const u8, cfg.env_names.items.len);
+    for (cfg.env_names.items, cfg.env_values.items, env) |n, v, *dst| {
+        dst.* = try std.fmt.allocPrint(sa, "{s}={s}", .{ n, v });
+    }
+    st.wasi.environ = env;
+
+    return st;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -963,6 +1282,18 @@ fn resolveImports(
     for (cm.inner.imports) |im| {
         switch (im.type) {
             .func => |want| {
+                // WASI is backed by the runtime's own host, not by a linker entry. Checked
+                // first so an embedder cannot shadow a WASI syscall with a define_func of the
+                // same name and have the two silently disagree about which one runs.
+                if (lk.wasi != null and std.mem.eql(u8, im.module, "wasi_snapshot_preview1")) {
+                    if (slot.wasi == null) {
+                        slot.wasi = initWasi(lk.engine, &lk.wasi.?, sa) catch |err|
+                            return errorf("wasi: {s}", .{@errorName(err)});
+                    }
+                    funcs[fi] = slot.wasi.?.wasi.hostFunc(im.name);
+                    fi += 1;
+                    continue;
+                }
                 const def = lk.find(im.module, im.name) orelse {
                     if (!lk.trap_unknown)
                         return errorf("unresolved import '{s}'.'{s}'", .{ im.module, im.name });
@@ -1060,10 +1391,15 @@ export fn wazmrt_linker_instantiate(
     }
 
     slot.inst = interp.Instance.initWithImports(sa, &cm.inner, imports) catch |err| {
+        if (slot.wasi) |w| w.wasi.deinit();
         slot.arena.deinit();
         alloc.destroy(slot);
         return errorf("instantiate: {s}", .{@errorName(err)});
     };
+
+    // The guest's memory only exists once the instance does, and every WASI call that touches a
+    // buffer needs it — so this must happen after init and before anything can run.
+    if (slot.wasi) |w| w.wasi.memory = slot.inst.memory0();
 
     slot.inst.runStart() catch |err| {
         if (trap_out) |p| p.* = slot.takeTrap(err);
@@ -1073,6 +1409,14 @@ export fn wazmrt_linker_instantiate(
         return null; // a trap is not a host error
     };
 
+    slot.linker = lk;
+    lk.slots.append(alloc, slot) catch {
+        slot.inst.deinit();
+        if (slot.wasi) |w| w.wasi.deinit();
+        slot.arena.deinit();
+        alloc.destroy(slot);
+        return errorf("out of memory", .{});
+    };
     store.instances.append(alloc, slot) catch {
         slot.inst.deinit();
         slot.arena.deinit();
@@ -1266,6 +1610,7 @@ export fn wazmrt_func_call(
     }
 
     const got = slot.inst.invokeIndex(r.index, slots) catch |err| {
+        if (slot.tookExit(err)) return null; // proc_exit — a clean finish, not a trap
         if (trap_out) |p| p.* = slot.takeTrap(err);
         return null; // trapped, but no host error
     };
@@ -1847,6 +2192,115 @@ test "unknown imports as traps: links, then traps when called" {
     const t = trap orelse return error.TestExpectedTrap;
     defer wazmrt_trap_delete(t);
     try testing.expectEqualStrings("unknown import called", std.mem.span(wazmrt_trap_message(t).?));
+}
+
+/// ```wat
+/// (module
+///   (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+///   (memory (export "memory") 1)
+///   (func (export "_start") i32.const 7 call $exit))
+/// ```
+const wasi_exit_module = [_]u8{
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    // types: 1 + (i32)->() is 4 + ()->() is 3 = 8 bytes of content
+    0x01, 0x08, 0x02, 0x60, 0x01, 0x7f, 0x00, 0x60, 0x00, 0x00,
+    // import: 1 + (1+22) + (1+9) + 1 + 1 = 36 = 0x24 bytes of content
+    0x02, 0x24, 0x01, 0x16, 'w', 'a', 's', 'i', '_', 's', 'n', 'a', 'p', 's', 'h', 'o',
+    't', '_', 'p', 'r', 'e', 'v', 'i', 'e', 'w', '1', 0x09, 'p', 'r', 'o', 'c', '_',
+    'e', 'x', 'i', 't', 0x00, 0x00,
+    0x03, 0x02, 0x01, 0x01, // func 1 : type 1 = ()->()
+    0x05, 0x03, 0x01, 0x00, 0x01, // memory 0: min 1 page
+    // export: 1 + (1+6) + 1 + 1 = 10 = 0x0a bytes of content
+    0x07, 0x0a, 0x01, 0x06, '_', 's', 't', 'a', 'r', 't', 0x00, 0x01,
+    0x0a, 0x08, 0x01, 0x06, 0x00, 0x41, 0x07, 0x10, 0x00, 0x0b, // i32.const 7; call 0
+};
+
+test "wasi: proc_exit is a clean finish, not a trap" {
+    const e = wazmrt_engine_new().?;
+    defer wazmrt_engine_delete(e);
+    const s = wazmrt_store_new(e).?;
+    defer wazmrt_store_delete(s);
+    const l = wazmrt_linker_new(e).?;
+    defer wazmrt_linker_delete(l);
+
+    const cfg = wazmrt_wasi_config_new().?;
+    defer wazmrt_wasi_config_delete(cfg);
+    // Deliberately NOT inheriting stdout: a guest that prints should be silent, not fail.
+    const argv = [_]?[*:0]const u8{ "prog", "--flag" };
+    wazmrt_wasi_config_set_args(cfg, &argv, argv.len);
+    const en = [_]?[*:0]const u8{"KEY"};
+    const ev = [_]?[*:0]const u8{"VALUE"};
+    wazmrt_wasi_config_set_env(cfg, &en, &ev, 1);
+    try testing.expect(wazmrt_linker_define_wasi(l, cfg) == null);
+
+    // The config is the embedder's; deleting it now must not affect the linker's copy.
+    var m: *CModule = undefined;
+    try testing.expect(wazmrt_module_new(e, &wasi_exit_module, wasi_exit_module.len, &m) == null);
+    defer wazmrt_module_delete(m);
+
+    var inst: InstanceHandle = .{ .id = 0 };
+    var trap: ?*Trap = null;
+    try testing.expect(wazmrt_linker_instantiate(l, s, m, &inst, &trap) == null);
+    try testing.expect(trap == null);
+
+    var code: i32 = -1;
+    try testing.expect(!wazmrt_wasi_exit_code(l, &code)); // nothing has exited yet
+
+    var f: FuncHandle = .{ .id = 0 };
+    try testing.expect(wazmrt_instance_get_func(s, inst, "_start", &f));
+    // proc_exit unwinds as HostTrap internally. The embedder must see a normal return, or every
+    // ordinary WASI command would look like a crash.
+    try testing.expect(wazmrt_func_call(s, f, null, 0, null, 0, &trap) == null);
+    try testing.expect(trap == null);
+    try testing.expect(wazmrt_wasi_exit_code(l, &code));
+    try testing.expectEqual(@as(i32, 7), code);
+}
+
+test "wasi: a module importing wasi without define_wasi is refused by name" {
+    const e = wazmrt_engine_new().?;
+    defer wazmrt_engine_delete(e);
+    const s = wazmrt_store_new(e).?;
+    defer wazmrt_store_delete(s);
+    const l = wazmrt_linker_new(e).?;
+    defer wazmrt_linker_delete(l);
+
+    var m: *CModule = undefined;
+    try testing.expect(wazmrt_module_new(e, &wasi_exit_module, wasi_exit_module.len, &m) == null);
+    defer wazmrt_module_delete(m);
+    var inst: InstanceHandle = .{ .id = 0 };
+    var trap: ?*Trap = null;
+    const err = wazmrt_linker_instantiate(l, s, m, &inst, &trap);
+    defer wazmrt_error_delete(err);
+    try testing.expect(err != null);
+    try testing.expect(std.mem.indexOf(u8, std.mem.span(wazmrt_error_message(err).?), "proc_exit") != null);
+}
+
+test "an instance outliving its linker does not write through a dangling pointer" {
+    // Either object may legally be deleted first. The back-pointer is cleared on both paths, so
+    // a later proc_exit has nowhere to report rather than corrupting freed memory.
+    const e = wazmrt_engine_new().?;
+    defer wazmrt_engine_delete(e);
+    const s = wazmrt_store_new(e).?;
+    defer wazmrt_store_delete(s);
+
+    const l = wazmrt_linker_new(e).?;
+    const cfg = wazmrt_wasi_config_new().?;
+    defer wazmrt_wasi_config_delete(cfg);
+    try testing.expect(wazmrt_linker_define_wasi(l, cfg) == null);
+
+    var m: *CModule = undefined;
+    try testing.expect(wazmrt_module_new(e, &wasi_exit_module, wasi_exit_module.len, &m) == null);
+    defer wazmrt_module_delete(m);
+    var inst: InstanceHandle = .{ .id = 0 };
+    var trap: ?*Trap = null;
+    try testing.expect(wazmrt_linker_instantiate(l, s, m, &inst, &trap) == null);
+
+    wazmrt_linker_delete(l); // gone first; the instance is still live
+
+    var f: FuncHandle = .{ .id = 0 };
+    try testing.expect(wazmrt_instance_get_func(s, inst, "_start", &f));
+    try testing.expect(wazmrt_func_call(s, f, null, 0, null, 0, &trap) == null);
+    if (trap) |t| wazmrt_trap_delete(t);
 }
 
 test "delete functions tolerate NULL" {
