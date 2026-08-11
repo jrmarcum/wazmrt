@@ -152,6 +152,41 @@ pub fn build(b: *std.Build) void {
         csmoke_step.dependOn(&run_csmoke.step);
     }
 
+    // ---- ABI-2 C smoke test (`zig build capi-smoke`) -----------------------
+    // The same idea as `c-smoke`, pointed at the NEW surface: compile `tests/capi_smoke.c`
+    // against `src/capi.zig` exactly as an embedder would, and run it. Two things it proves that
+    // the Zig tests cannot — that the published HEADER is usable from a C compiler (types,
+    // const-ness, calling convention), and that every function it declares really links.
+    //
+    // `tests/wazmrt_abi_symbols.c` is the completeness gate: it takes the address of every
+    // declared function, so a symbol we promise but never define breaks THIS build rather than an
+    // embedder's. Audit #20 found 180 such symbols in the old ABI, invisible because our own tests
+    // only called what we had implemented.
+    //
+    // mingw target for the same reason `c-smoke` uses it: the C client needs a libc without MSVC.
+    // The wazmrt library itself stays libc-free.
+    {
+        const gnu = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu });
+        const capi_gnu = b.addLibrary(.{
+            .name = "wazmrt_capismoke",
+            .linkage = .static,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/capi.zig"),
+                .target = gnu,
+                .optimize = optimize,
+            }),
+        });
+        const smoke_mod = b.createModule(.{ .target = gnu, .optimize = optimize, .link_libc = true });
+        smoke_mod.addCSourceFile(.{ .file = b.path("tests/capi_smoke.c"), .flags = &.{ "-Wall", "-Wextra" } });
+        smoke_mod.addCSourceFile(.{ .file = b.path("tests/wazmrt_abi_symbols.c"), .flags = &.{ "-Wall", "-Wextra" } });
+        smoke_mod.addIncludePath(b.path("include"));
+        smoke_mod.linkLibrary(capi_gnu);
+        const smoke = b.addExecutable(.{ .name = "capi_smoke", .root_module = smoke_mod });
+        const run_smoke = b.addRunArtifact(smoke);
+        const step = b.step("capi-smoke", "Build + run the ABI-2 C smoke test (link-time symbol gate included)");
+        step.dependOn(&run_smoke.step);
+    }
+
     // ---- Interpreter microbenchmark (`zig build bench`) --------------------
     // In-process cold-path + steady-state timing, always ReleaseFast so the
     // numbers reflect the real interpreter, not a Debug build.

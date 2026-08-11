@@ -668,6 +668,61 @@ export fn wazmrt_module_delete(m: ?*CModule) void {
     if (cm.live_instances == 0) freeModule(cm);
 }
 
+// ---------------------------------------------------------------------------------------
+// WebAssembly text (`.wat`)
+// ---------------------------------------------------------------------------------------
+//
+// The differentiator: an embedder can run a `.wat` with no external toolchain — no `wat2wasm`
+// process, no temp file, no build step. ⚠️ The saving is a PIPELINE, not decode time. Parsing
+// text costs more per module than decoding a binary, so a module run repeatedly is still better
+// assembled once and cached — which is what `wazmrt_wat_to_wasm` is for.
+
+/// Assemble text to a binary the caller owns and frees with `wazmrt_bytes_delete`.
+export fn wazmrt_wat_to_wasm(
+    text: ?[*]const u8,
+    len: usize,
+    out: ?*[*]u8,
+    out_len: ?*usize,
+) ?*Error {
+    const src = (text orelse return errorf("wazmrt_wat_to_wasm: text is NULL", .{}))[0..len];
+    const out_p = out orelse return errorf("wazmrt_wat_to_wasm: out is NULL", .{});
+    const out_len_p = out_len orelse return errorf("wazmrt_wat_to_wasm: out_len is NULL", .{});
+
+    // The assembler allocates freely into an arena; the result is copied out so the caller owns
+    // one flat buffer it can free with one call, rather than a graph it cannot see.
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const wasm = root.wat.assemble(arena.allocator(), src) catch |err| {
+        return errorf("failed to assemble wat: {s}", .{@errorName(err)});
+    };
+    const owned = alloc.dupe(u8, wasm) catch return errorf("out of memory", .{});
+    out_p.* = owned.ptr;
+    out_len_p.* = owned.len;
+    return null;
+}
+
+/// Free a buffer this library produced. Only ever call it on such a buffer.
+export fn wazmrt_bytes_delete(bytes: ?[*]u8, len: usize) void {
+    const p = bytes orelse return;
+    alloc.free(p[0..len]);
+}
+
+/// `wazmrt_module_new` for text: assemble, then decode and validate the result.
+export fn wazmrt_module_new_wat(
+    e: ?*Engine,
+    text: ?[*]const u8,
+    len: usize,
+    out: ?**CModule,
+) ?*Error {
+    var bin: [*]u8 = undefined;
+    var bin_len: usize = 0;
+    if (wazmrt_wat_to_wasm(text, len, &bin, &bin_len)) |err| return err;
+    defer wazmrt_bytes_delete(bin, bin_len);
+    // Decoding the ASSEMBLED bytes, not trusting the assembler: a module wazmrt produced still
+    // goes through the same validation an untrusted one does.
+    return wazmrt_module_new(e, bin, bin_len, out);
+}
+
 export fn wazmrt_module_export_count(m: ?*const CModule) usize {
     const cm = m orelse return 0;
     return cm.inner.exports.len;
@@ -881,6 +936,8 @@ const Definition = union(enum) {
         finalizer: ?*const fn (env: ?*anyopaque) callconv(.c) void,
     },
     global: Val,
+    /// Every export of an already-instantiated module, published under one namespace.
+    instance: InstanceHandle,
 };
 
 const Entry = struct {
@@ -897,7 +954,7 @@ const Entry = struct {
                 alloc.free(f.params);
                 alloc.free(f.results);
             },
-            .global => {},
+            .global, .instance => {},
         }
     }
 };
@@ -917,6 +974,19 @@ pub const Linker = struct {
     /// Record a guest's exit code and detach the instance, which has finished with us.
     fn noteExit(self: *Linker, code: i32) void {
         self.exit_code = code;
+    }
+
+    /// A namespace published by `define_instance`, if any. Kept separate from `find` because an
+    /// instance entry matches on the MODULE alone — every name under it comes from that
+    /// instance's exports, not from our table.
+    fn findInstance(self: *const Linker, module: []const u8) ?InstanceHandle {
+        var i = self.entries.items.len;
+        while (i > 0) {
+            i -= 1;
+            const e = &self.entries.items[i];
+            if (e.def == .instance and std.mem.eql(u8, e.module, module)) return e.def.instance;
+        }
+        return null;
     }
 
     fn find(self: *const Linker, module: []const u8, name: []const u8) ?*const Definition {
@@ -1011,6 +1081,33 @@ export fn wazmrt_linker_define_global(
         return errorf("out of memory", .{});
     };
     lk.entries.append(alloc, .{ .module = mc, .name = nc, .def = .{ .global = value } }) catch {
+        alloc.free(mc);
+        alloc.free(nc);
+        return errorf("out of memory", .{});
+    };
+    return null;
+}
+
+/// Publish every export of an already-instantiated module under `module`, so later modules can
+/// import from it. The callee runs against ITS OWN instance, so it sees the exporter's memory
+/// and globals — that is what makes this real linking rather than a copy.
+export fn wazmrt_linker_define_instance(
+    l: ?*Linker,
+    module: ?[*:0]const u8,
+    instance: InstanceHandle,
+) ?*Error {
+    const lk = l orelse return errorf("wazmrt_linker_define_instance: linker is NULL", .{});
+    const mc = alloc.dupe(u8, spanOf(module)) catch return errorf("out of memory", .{});
+    // The handle is stored unresolved: it is only meaningful against the store you later
+    // instantiate into, and it is checked there. Storing a resolved pointer here would be a
+    // dangling one the moment that store died.
+    // A real zero-length allocation, not `&.{}`: `Entry.deinit` frees `name` unconditionally, and
+    // the two must not disagree about whether it was ever allocated.
+    const nc = alloc.dupe(u8, "") catch {
+        alloc.free(mc);
+        return errorf("out of memory", .{});
+    };
+    lk.entries.append(alloc, .{ .module = mc, .name = nc, .def = .{ .instance = instance } }) catch {
         alloc.free(mc);
         alloc.free(nc);
         return errorf("out of memory", .{});
@@ -1406,6 +1503,7 @@ export fn wazmrt_caller_write(c: ?*Caller, offset: u64, src: ?*const anyopaque, 
 /// table — the positional layout is the interpreter's contract, not ours to reorder.
 fn resolveImports(
     lk: *Linker,
+    store: *Store,
     slot: *InstanceSlot,
     cm: *CModule,
     sa: std.mem.Allocator,
@@ -1441,6 +1539,28 @@ fn resolveImports(
                     continue;
                 }
                 const def = lk.find(im.module, im.name) orelse {
+                    // A namespace published by `define_instance`. Explicit definitions win, so
+                    // this is only consulted after the table misses.
+                    if (lk.findInstance(im.module)) |h| {
+                        const oi = store.resolve(h.id, store.instances.items.len) orelse
+                            return errorf("import '{s}'.'{s}': the instance published as '{s}' does not belong to this store", .{ im.module, im.name, im.module });
+                        const oslot = store.instances.items[oi];
+                        const idx = findExport(oslot.module, im.name, .func) orelse
+                            return errorf("import '{s}'.'{s}': the published instance exports no such function", .{ im.module, im.name });
+                        const have = oslot.module.inner.funcType(idx) orelse
+                            return errorf("import '{s}'.'{s}': the published export has no type", .{ im.module, im.name });
+                        // Same rule as for host callbacks: two declarations exist, so compare
+                        // them rather than trusting that a shared name means a shared signature.
+                        if (have.params.len != want.params.len or have.results.len != want.results.len)
+                            return errorf("import '{s}'.'{s}': signature mismatch with the published instance", .{ im.module, im.name });
+                        for (want.params, have.params) |a, b| if (a != b)
+                            return errorf("import '{s}'.'{s}': parameter type mismatch with the published instance", .{ im.module, im.name });
+                        for (want.results, have.results) |a, b| if (a != b)
+                            return errorf("import '{s}'.'{s}': result type mismatch with the published instance", .{ im.module, im.name });
+                        funcs[fi] = .{ .wasm = .{ .instance = &oslot.inst, .func_index = idx } };
+                        fi += 1;
+                        continue;
+                    }
                     if (!lk.trap_unknown)
                         return errorf("unresolved import '{s}'.'{s}'", .{ im.module, im.name });
                     const t = sa.create(Trampoline) catch return errorf("out of memory", .{});
@@ -1452,6 +1572,7 @@ fn resolveImports(
                 const hf = switch (def.*) {
                     .func => |f| f,
                     .global => return errorf("import '{s}'.'{s}' is declared as a function but defined as a global", .{ im.module, im.name }),
+                    .instance => return errorf("import '{s}'.'{s}': namespace entry used as a function", .{ im.module, im.name }),
                 };
 
                 // ⚠️ CHECK THE DECLARED SIGNATURE AT BIND TIME. An import declaration is
@@ -1481,11 +1602,29 @@ fn resolveImports(
                 fi += 1;
             },
             .global => |want| {
+                // A published instance's exported global, read at link time — a snapshot, which
+                // is what the ABI can carry (it has no mutable-global sharing).
+                if (lk.find(im.module, im.name) == null) {
+                    if (lk.findInstance(im.module)) |h| {
+                        const oi = store.resolve(h.id, store.instances.items.len) orelse
+                            return errorf("import '{s}'.'{s}': the instance published as '{s}' does not belong to this store", .{ im.module, im.name, im.module });
+                        const oslot = store.instances.items[oi];
+                        const idx = findExport(oslot.module, im.name, .global) orelse
+                            return errorf("import '{s}'.'{s}': the published instance exports no such global", .{ im.module, im.name });
+                        if (idx >= oslot.inst.globals.len)
+                            return errorf("import '{s}'.'{s}': published global is out of range", .{ im.module, im.name });
+                        globals[gi] = oslot.inst.globals[idx];
+                        globals_hi[gi] = if (idx < oslot.inst.global_hi.len) oslot.inst.global_hi[idx] else 0;
+                        gi += 1;
+                        continue;
+                    }
+                }
                 const def = lk.find(im.module, im.name) orelse
                     return errorf("unresolved global import '{s}'.'{s}'", .{ im.module, im.name });
                 const v = switch (def.*) {
                     .global => |g| g,
                     .func => return errorf("import '{s}'.'{s}' is declared as a global but defined as a function", .{ im.module, im.name }),
+                    .instance => return errorf("import '{s}'.'{s}': namespace entry used as a value", .{ im.module, im.name }),
                 };
                 var two: [2]interp.Value = .{ 0, 0 };
                 _ = valToSlots(v, want.content, &two) orelse
@@ -1538,7 +1677,7 @@ export fn wazmrt_linker_instantiate(
     const sa = slot.arena.allocator();
 
     var imports: interp.Instance.Imports = .{};
-    if (resolveImports(lk, slot, cm, sa, &imports)) |msg| {
+    if (resolveImports(lk, store, slot, cm, sa, &imports)) |msg| {
         slot.arena.deinit();
         alloc.destroy(slot);
         return msg;
