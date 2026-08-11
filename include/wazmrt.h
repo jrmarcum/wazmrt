@@ -184,16 +184,19 @@ typedef enum {
 /* The WebAssembly proposals that can be individually refused. ALL ARE ON BY DEFAULT —
  * wazmrt's stated scope is full browser-standard parity plus memory64.
  *
- * ⚠️⚠️ NOT YET ENFORCED IN THIS BUILD. There is no per-proposal gating in the validator, so
- * `wazmrt_config_set_feature(cfg, f, false)` RETURNS FALSE and `wazmrt_config_all_features(cfg,
- * false)` makes `wazmrt_engine_new_with_config` fail. Nothing here silently does nothing: a
- * request that cannot be honoured is refused where you make it, because an embedder who thinks
- * SIMD is off when it is on has a security control that controls nothing. Enabling a proposal
- * succeeds (they are all already on), and reading one reports true.
+ * ⚠️ A TOGGLE HERE GATES FOR REAL. A disabled proposal makes a module INVALID: it is refused by
+ * `wazmrt_module_new` AND `wazmrt_module_validate` — wholly, before anything executes, never
+ * part-way through. The error names the proposal, so "you disabled gc" reaches you rather than a
+ * type error inside a feature you never wanted to allow.
  *
- * When gating lands, a disabled proposal will make a module INVALID — refused by
- * `wazmrt_module_new` / `wazmrt_module_validate`, wholly and before execution, never part-way
- * through. The enum is published now so that change adds no symbols.
+ * Gating looks at the module's TYPES as well as its code, because a module can need a proposal
+ * without ever executing one of its instructions — a `v128` parameter needs SIMD even if nothing
+ * in the body is a SIMD op.
+ *
+ * ⚠️ A PROPOSAL LAYERED ON ANOTHER MUST BE DISABLED WITH IT. Turning off `SIMD` while
+ * `RELAXED_SIMD` stays on is an incoherent config and `wazmrt_engine_new_with_config` reports it
+ * rather than quietly repairing it — silently enabling a dependency would accept modules you
+ * meant to refuse. The layering is noted per entry below.
  *
  * There is deliberately NO tail-call entry: `return_call` / `return_call_indirect` are not
  * in wazmrt's implemented set, so a toggle for them would gate nothing. `return_call_ref`
@@ -222,6 +225,7 @@ void wazmrt_config_delete(wazmrt_config_t *);
 /* One setter rather than fourteen: adding a proposal later must not add a symbol, and the
  * enum keeps the exported surface small (a stated goal). False for an unrecognised feature. */
 bool wazmrt_config_set_feature(wazmrt_config_t *, wazmrt_feature_t, bool enabled);
+/* Reads back what is actually set, so you can confirm a restriction took effect. */
 bool wazmrt_config_get_feature(const wazmrt_config_t *, wazmrt_feature_t, bool *out);
 
 /* Turn every proposal on (the default) or off (WebAssembly 1.0 only). */

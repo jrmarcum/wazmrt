@@ -194,8 +194,7 @@ pub const Config = struct {
     max_gc_objects: u64 = 0,
     max_exception_boxes: u64 = 0,
     max_call_depth: u32 = 0,
-    /// Recorded only so engine creation can refuse it by name.
-    asked_disable_all: bool = false,
+    features: root.features.Set = .{},
 };
 
 export fn wazmrt_config_new() ?*Config {
@@ -209,24 +208,25 @@ export fn wazmrt_config_delete(c: ?*Config) void {
     alloc.destroy(cfg);
 }
 
-/// False for an unrecognised feature — or for a request this build cannot enforce. Every
-/// proposal is ON, so enabling one succeeds and disabling one is refused rather than pretended.
+/// False only for an unrecognised feature. Disabling now genuinely gates: a module using a
+/// disabled proposal is refused by `wazmrt_module_new` / `wazmrt_module_validate`.
 export fn wazmrt_config_set_feature(c: ?*Config, f: Feature, enabled: bool) bool {
-    _ = c orelse return false;
+    const cfg = c orelse return false;
     if (!f.valid()) return false;
-    return enabled; // true: already on. false: cannot gate — see the Config doc comment.
+    cfg.features.set(@enumFromInt(@intFromEnum(f)), enabled);
+    return true;
 }
 
 export fn wazmrt_config_get_feature(c: ?*Config, f: Feature, out: ?*bool) bool {
-    _ = c orelse return false;
+    const cfg = c orelse return false;
     if (!f.valid()) return false;
-    if (out) |p| p.* = true; // everything is on and cannot currently be turned off
+    if (out) |p| p.* = cfg.features.has(@enumFromInt(@intFromEnum(f)));
     return true;
 }
 
 export fn wazmrt_config_all_features(c: ?*Config, enabled: bool) void {
     const cfg = c orelse return;
-    if (!enabled) cfg.asked_disable_all = true; // refused at engine creation
+    for (0..root.features.count) |i| cfg.features.set(@enumFromInt(@as(u8, @intCast(i))), enabled);
 }
 
 export fn wazmrt_config_set_max_memory_bytes(c: ?*Config, n: u64) void {
@@ -287,6 +287,10 @@ pub const Engine = struct {
     max_exn_boxes: usize = interp.default_max_exn_boxes,
     max_call_depth: usize = interp.default_max_call_depth,
 
+    /// Which proposals modules made through this engine may use. All-on by default, in which
+    /// case the check short-circuits entirely.
+    features: root.features.Set = .{},
+
     fn io(self: *Engine) std.Io {
         return self.threaded.io();
     }
@@ -313,11 +317,12 @@ export fn wazmrt_engine_new_with_config(c: ?*const Config, err_out: ?*?*Error) ?
         return null;
     };
 
-    if (cfg.asked_disable_all) {
+    // A proposal layered on another cannot be enabled alone. REPORTED, not repaired: silently
+    // enabling the dependency would accept modules the embedder meant to refuse.
+    if (cfg.features.incoherent()) |pair| {
         if (err_out) |p| p.* = errorf(
-            "this build cannot disable proposals — there is no per-proposal gating in the " ++
-                "validator yet. Refusing rather than accepting a restriction that would not apply.",
-            .{},
+            "incoherent config: {s} is enabled but {s}, which it is layered on, is not",
+            .{ pair[0].name(), pair[1].name() },
         );
         return null;
     }
@@ -338,6 +343,7 @@ export fn wazmrt_engine_new_with_config(c: ?*const Config, err_out: ?*?*Error) ?
     if (cfg.max_gc_objects != 0) e.max_gc_objects = cap(cfg.max_gc_objects);
     if (cfg.max_exception_boxes != 0) e.max_exn_boxes = cap(cfg.max_exception_boxes);
     if (cfg.max_call_depth != 0) e.max_call_depth = cfg.max_call_depth;
+    e.features = cfg.features;
     return e;
 }
 
@@ -594,7 +600,7 @@ export fn wazmrt_module_new(
     len: usize,
     out: ?**CModule,
 ) ?*Error {
-    _ = e orelse return errorf("wazmrt_module_new: engine is NULL", .{});
+    const eng = e orelse return errorf("wazmrt_module_new: engine is NULL", .{});
     const out_p = out orelse return errorf("wazmrt_module_new: out is NULL", .{});
     const src = (bytes orelse return errorf("wazmrt_module_new: bytes is NULL", .{}))[0..len];
 
@@ -602,6 +608,14 @@ export fn wazmrt_module_new(
         return errorf("failed to decode module: {s}", .{@errorName(err)});
     };
     errdefer m.deinit();
+
+    // A disabled proposal makes the module INVALID — refused wholly, before anything executes.
+    // Checked before type validation because "you disabled this" is a better answer than a type
+    // error deep inside a feature the embedder never wanted to allow.
+    if (root.features.firstViolation(alloc, &m, eng.features) catch null) |f| {
+        m.deinit();
+        return errorf("module uses the '{s}' proposal, which this engine has disabled", .{f.name()});
+    }
 
     root.validate(alloc, &m) catch |err| {
         // The wasmtime-shaped diagnostic: offset + function + expected/found, matched
@@ -652,10 +666,13 @@ fn diagnose(err: anyerror, site: root.FailureSite) ?*Error {
 
 /// Would `wazmrt_module_new` succeed? No allocation survives, no module is produced.
 export fn wazmrt_module_validate(e: ?*Engine, bytes: ?[*]const u8, len: usize) bool {
-    _ = e orelse return false;
+    const eng = e orelse return false;
     const src = (bytes orelse return false)[0..len];
     var m = Module.decode(alloc, src) catch return false;
     defer m.deinit();
+    // Must answer the same question `wazmrt_module_new` does, gating included — a `validate` that
+    // said yes to a module `new` would refuse is worse than not having it.
+    if ((root.features.firstViolation(alloc, &m, eng.features) catch null) != null) return false;
     root.validate(alloc, &m) catch return false;
     return true;
 }
@@ -2680,40 +2697,145 @@ test "config: the three former constants are now accepted and applied" {
     try testing.expectEqual(@as(usize, 64), slot.inst.max_call_depth);
 }
 
-test "config: disabling a proposal is still refused, and says why" {
-    // Feature gating is the half of 2e-b that is NOT built. It must keep failing loudly rather
-    // than becoming a silent no-op now that its neighbours work.
+/// `(module (type (func (param v128))))` — declares a SIMD type and nothing else. A module can
+/// need a proposal without ever executing one of its instructions, which is why gating looks at
+/// types and not only at code.
+const v128_type_module = [_]u8{
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x05, 0x01, 0x60, 0x01, 0x7b, 0x00, // type: (v128) -> ()
+};
+
+/// `(module (type (func (result i32 i32))))` — two results is the whole of multi-value.
+const multi_value_module = [_]u8{
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x06, 0x01, 0x60, 0x00, 0x02, 0x7f, 0x7f,
+};
+
+/// Turn `f` off, along with anything layered on it.
+///
+/// The dependents have to go too, and that is the EMBEDDER's job by design: turning off `simd`
+/// while `relaxed_simd` stays on is an incoherent config, and the engine reports it rather than
+/// quietly repairing it. Repairing would mean an embedder who disabled SIMD still had relaxed
+/// SIMD enabled — a config that does not mean what it says.
+fn engineWithout(f: Feature) *Engine {
+    const cfg = wazmrt_config_new().?;
+    defer wazmrt_config_delete(cfg);
+    _ = wazmrt_config_set_feature(cfg, f, false);
+    switch (f) {
+        .simd => _ = wazmrt_config_set_feature(cfg, .relaxed_simd, false),
+        .reference_types => {
+            _ = wazmrt_config_set_feature(cfg, .function_references, false);
+            _ = wazmrt_config_set_feature(cfg, .exceptions, false);
+            _ = wazmrt_config_set_feature(cfg, .gc, false);
+        },
+        .function_references => _ = wazmrt_config_set_feature(cfg, .gc, false),
+        else => {},
+    }
+    var cerr: ?*Error = null;
+    const e = wazmrt_engine_new_with_config(cfg, &cerr);
+    if (e == null) {
+        if (cerr) |bad| {
+            std.debug.print("engineWithout({s}): {s}\n", .{ @tagName(f), wazmrt_error_message(bad).? });
+            wazmrt_error_delete(bad);
+        }
+        unreachable; // a test helper handing back a null engine would fail confusingly later
+    }
+    return e.?;
+}
+
+test "gating: a disabled proposal makes a module invalid" {
+    const e = engineWithout(.simd);
+    defer wazmrt_engine_delete(e);
+
+    var m: *CModule = undefined;
+    const err = wazmrt_module_new(e, &v128_type_module, v128_type_module.len, &m);
+    defer wazmrt_error_delete(err);
+    try testing.expect(err != null);
+    // Names the proposal: "you disabled this" is actionable, "invalid module" is not.
+    try testing.expect(std.mem.indexOf(u8, std.mem.span(wazmrt_error_message(err).?), "simd") != null);
+    // `validate` must answer the SAME question as `new`, gating included.
+    try testing.expect(!wazmrt_module_validate(e, &v128_type_module, v128_type_module.len));
+
+    // With SIMD on, the very same bytes are fine — so the refusal is the gate, not the module.
+    const on = wazmrt_engine_new().?;
+    defer wazmrt_engine_delete(on);
+    var m2: *CModule = undefined;
+    try testing.expect(wazmrt_module_new(on, &v128_type_module, v128_type_module.len, &m2) == null);
+    wazmrt_module_delete(m2);
+}
+
+test "gating: multi-value is detected from the type section" {
+    const e = engineWithout(.multi_value);
+    defer wazmrt_engine_delete(e);
+    var m: *CModule = undefined;
+    const err = wazmrt_module_new(e, &multi_value_module, multi_value_module.len, &m);
+    defer wazmrt_error_delete(err);
+    try testing.expect(err != null);
+    try testing.expect(std.mem.indexOf(u8, std.mem.span(wazmrt_error_message(err).?), "multi_value") != null);
+}
+
+test "gating: NO false positives on a plain module" {
+    // The failure mode that would make gating unusable: refusing modules that do not actually
+    // use the proposal. `add_module` is pure WebAssembly 1.0, so it must load with EVERY
+    // proposal turned off.
     const cfg = wazmrt_config_new().?;
     defer wazmrt_config_delete(cfg);
     wazmrt_config_all_features(cfg, false);
     var cerr: ?*Error = null;
-    try testing.expect(wazmrt_engine_new_with_config(cfg, &cerr) == null);
-    const err = cerr orelse return error.TestExpectedError;
-    defer wazmrt_error_delete(err);
-    try testing.expect(std.mem.indexOf(u8, std.mem.span(wazmrt_error_message(err).?), "cannot disable") != null);
-}
-
-test "config: features report honestly" {
-    const cfg = wazmrt_config_new().?;
-    defer wazmrt_config_delete(cfg);
-
-    // Enabling is a no-op that succeeds: everything is already on.
-    try testing.expect(wazmrt_config_set_feature(cfg, .simd, true));
-    // Disabling is REFUSED rather than pretended — there is no gating in the validator yet.
-    try testing.expect(!wazmrt_config_set_feature(cfg, .simd, false));
-    // An unrecognised feature is false either way.
-    try testing.expect(!wazmrt_config_set_feature(cfg, @enumFromInt(99), true));
-
-    var on: bool = false;
-    try testing.expect(wazmrt_config_get_feature(cfg, .gc, &on));
-    try testing.expect(on);
-    try testing.expect(!wazmrt_config_get_feature(cfg, @enumFromInt(99), &on));
-
-    // A config that asked for nothing impossible builds an engine fine.
-    var cerr: ?*Error = null;
     const e = wazmrt_engine_new_with_config(cfg, &cerr).?;
     defer wazmrt_engine_delete(e);
     try testing.expect(cerr == null);
+
+    var m: *CModule = undefined;
+    const err = wazmrt_module_new(e, &add_module, add_module.len, &m);
+    if (err) |bad| {
+        defer wazmrt_error_delete(bad);
+        std.debug.print("unexpected refusal: {s}\n", .{wazmrt_error_message(bad).?});
+        return error.TestUnexpectedResult;
+    }
+    defer wazmrt_module_delete(m);
+
+    // And it still runs, so gating did not disturb execution.
+    const s = wazmrt_store_new(e).?;
+    defer wazmrt_store_delete(s);
+    const l = wazmrt_linker_new(e).?;
+    defer wazmrt_linker_delete(l);
+    var inst: InstanceHandle = .{ .id = 0 };
+    var trap: ?*Trap = null;
+    try testing.expect(wazmrt_linker_instantiate(l, s, m, &inst, &trap) == null);
+    var f: FuncHandle = .{ .id = 0 };
+    try testing.expect(wazmrt_instance_get_func(s, inst, "add", &f));
+    const args = [_]Val{
+        .{ .kind = .i32, .of = .{ .i32 = 2 } },
+        .{ .kind = .i32, .of = .{ .i32 = 3 } },
+    };
+    var res = [_]Val{.{ .kind = .i32, .of = .{ .i32 = 0 } }};
+    try testing.expect(wazmrt_func_call(s, f, &args, 2, &res, 1, &trap) == null);
+    try testing.expectEqual(@as(i32, 5), res[0].of.i32);
+}
+
+test "config: features round-trip, and an incoherent set is refused" {
+    const cfg = wazmrt_config_new().?;
+    defer wazmrt_config_delete(cfg);
+
+    try testing.expect(wazmrt_config_set_feature(cfg, .simd, false));
+    var on: bool = true;
+    try testing.expect(wazmrt_config_get_feature(cfg, .simd, &on));
+    try testing.expect(!on); // it really is off now
+    try testing.expect(wazmrt_config_set_feature(cfg, .simd, true));
+
+    // An unrecognised feature is false either way.
+    try testing.expect(!wazmrt_config_set_feature(cfg, @enumFromInt(99), true));
+    try testing.expect(!wazmrt_config_get_feature(cfg, @enumFromInt(99), &on));
+
+    // GC rests on function-references. Enabling one without the other is REPORTED, not quietly
+    // repaired — silently enabling the dependency would accept modules meant to be refused.
+    try testing.expect(wazmrt_config_set_feature(cfg, .function_references, false));
+    var cerr: ?*Error = null;
+    try testing.expect(wazmrt_engine_new_with_config(cfg, &cerr) == null);
+    const err = cerr orelse return error.TestExpectedError;
+    defer wazmrt_error_delete(err);
+    try testing.expect(std.mem.indexOf(u8, std.mem.span(wazmrt_error_message(err).?), "incoherent") != null);
 }
 
 test "delete functions tolerate NULL" {

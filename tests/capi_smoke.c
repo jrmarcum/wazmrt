@@ -138,19 +138,58 @@ int main(void) {
     if (capped) wazmrt_engine_delete(capped);
     wazmrt_config_delete(cfg);
 
-    /* But a restriction this build cannot apply is still refused, not silently dropped. */
+    /* A disabled proposal makes a module INVALID. `(module (type (func (param v128))))` needs
+     * SIMD to be legal, and needs nothing else — so it is the smallest honest probe. */
+    static const uint8_t kV128Type[] = {
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x05, 0x01, 0x60, 0x01, 0x7b, 0x00,
+    };
     cfg = wazmrt_config_new();
-    wazmrt_config_all_features(cfg, false);
+    check(wazmrt_config_set_feature(cfg, WAZMRT_FEATURE_SIMD, false), "set_feature(false) is honoured");
+    /* Relaxed SIMD rests on SIMD, so it has to go too — the engine reports an incoherent
+     * config rather than quietly repairing it. */
+    wazmrt_config_set_feature(cfg, WAZMRT_FEATURE_RELAXED_SIMD, false);
+    bool simd_on = true;
+    wazmrt_config_get_feature(cfg, WAZMRT_FEATURE_SIMD, &simd_on);
+    check(!simd_on, "get_feature reports it is really off");
+
     cerr = NULL;
-    wazmrt_engine_t *bad = wazmrt_engine_new_with_config(cfg, &cerr);
-    check(bad == NULL && cerr != NULL, "disabling proposals is refused (no gating yet)");
+    wazmrt_engine_t *nosimd = wazmrt_engine_new_with_config(cfg, &cerr);
+    check(nosimd != NULL && cerr == NULL, "a coherent restricted config builds an engine");
     if (cerr) wazmrt_error_delete(cerr);
     wazmrt_config_delete(cfg);
 
-    /* Disabling a proposal is refused rather than pretended. */
+    if (nosimd) {
+        wazmrt_module_t *m = NULL;
+        wazmrt_error_t *gerr = wazmrt_module_new(nosimd, kV128Type, sizeof kV128Type, &m);
+        check(gerr != NULL, "a module needing a disabled proposal is refused");
+        if (gerr) wazmrt_error_delete(gerr);
+        check(!wazmrt_module_validate(nosimd, kV128Type, sizeof kV128Type),
+              "module_validate agrees with module_new about gating");
+        /* No false positives: a plain 1.0 module still loads on the restricted engine.
+         * `(module (func (export "answer") (result i32) i32.const 42))` — nothing but core. */
+        static const uint8_t kPlain[] = {
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+            0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f,
+            0x03, 0x02, 0x01, 0x00,
+            0x07, 0x0a, 0x01, 0x06, 'a', 'n', 's', 'w', 'e', 'r', 0x00, 0x00,
+            0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x2a, 0x0b,
+        };
+        wazmrt_module_t *plain = NULL;
+        gerr = wazmrt_module_new(nosimd, kPlain, sizeof kPlain, &plain);
+        check(gerr == NULL && plain != NULL, "a plain module still loads with SIMD disabled");
+        if (gerr) wazmrt_error_delete(gerr);
+        if (plain) wazmrt_module_delete(plain);
+        wazmrt_engine_delete(nosimd);
+    }
+
+    /* An incoherent config is reported, not repaired. */
     cfg = wazmrt_config_new();
-    check(!wazmrt_config_set_feature(cfg, WAZMRT_FEATURE_SIMD, false), "set_feature(false) is refused");
-    check(wazmrt_config_set_feature(cfg, WAZMRT_FEATURE_SIMD, true), "set_feature(true) succeeds");
+    wazmrt_config_set_feature(cfg, WAZMRT_FEATURE_FUNCTION_REFERENCES, false);
+    cerr = NULL;
+    wazmrt_engine_t *bad = wazmrt_engine_new_with_config(cfg, &cerr);
+    check(bad == NULL && cerr != NULL, "gc without function-references is refused as incoherent");
+    if (cerr) wazmrt_error_delete(cerr);
     wazmrt_config_delete(cfg);
 
     /* Text -> binary, kept for caching. */

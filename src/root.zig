@@ -16,6 +16,8 @@ pub const validate = @import("validate.zig").validate;
 pub const lastFailureSite = @import("validate.zig").lastFailureSite;
 pub const FailureSite = @import("validate.zig").FailureSite;
 pub const interp = @import("interp.zig");
+/// Per-proposal gating: which WebAssembly proposals a module is allowed to use.
+pub const features = @import("features.zig");
 pub const Instance = interp.Instance;
 pub const sexpr = @import("sexpr.zig");
 pub const wat = @import("wat.zig");
