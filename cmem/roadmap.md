@@ -159,6 +159,54 @@ reading guest memory via `Deno.UnsafePointerView`. No amount of wazmrt-side ABI 
    wasmtime's supported list (verify tail-calls and relaxed-SIMD first; `return_call_ref` sits at 38/9
    in the last snapshot). Also unmeasured: rsxtk's own binary size and Cranelift's share of it.
 
+### 📋 AGREED CHANGE SERIES for Track 1 (owner-approved 2026-08-11) — build new, prove, then delete
+
+**Sequencing principle: the new surface is built ALONGSIDE the old, proven, and only then is the old
+deleted.** No step leaves a broken intermediate, and the two coexist long enough to *measure* what the
+deletion buys. ⚠️ `src/wasm_c_api.zig` is the root module of **five** build-graph sites (`cabi` static,
+`dll`, `cabi_gnu` for c-smoke, `cabi_tests`, `cabi_tests_safe`) — nothing flips until the replacement
+satisfies all five.
+
+| # | Change | Gate |
+| --- | --- | --- |
+| 0 | **Size gate FIRST** — `zig build size` + checked-in ceilings | green at today's bytes |
+| 1 | `include/wazmrt.h` v2 — the full surface, header only | `-fsyntax-only` |
+| 2a–2e | `src/capi.zig` — lifecycle → memory/globals → **linker + caller-based host funcs** → WASI config → caps | `test` + `test-safe` |
+| 3 | `tests/wazmrt_abi_symbols.c` + new `c_smoke` | link-time completeness gate |
+| 4 | port `examples/deno_ffi.mjs` | `ffi-demo` |
+| 5 | flip the default; **`abi_version` → 2** | all green + **measure delta** |
+| 6 | **delete** old surface + `third_party/wasm-c-api/` | `zig-out/include` = 1 file |
+| 7 | memory + README sync | — |
+
+**Owner decisions, 2026-08-11:**
+
+1. **`abi_version` → 2.** The surface changes wholesale; a consumer checking `wazmrt_abi_version()` must
+   not read the new library as compatible with the old.
+2. **`.wat` IS exposed through the C ABI** — `wazmrt_module_new_wat()` (run text directly) plus
+   `wazmrt_wat_to_wasm()` (assemble + cache). Owner's rationale: *"our built-in wat to wasm will allow
+   running the wat directly instead of running through the wasmtk normal processes, which will save time
+   at runtime."* ✅ Real and a genuine differentiator — **no other embeddable runtime offers it**, and it
+   removes a whole toolchain round-trip (no separate converter process, no temp file) from the consumer.
+   ⚠️ **Be precise about WHERE the saving is: it is pipeline elimination, not faster execution.** Parsing
+   text costs *more* per module than decoding a binary, so for a module run repeatedly, caching the
+   assembled `.wasm` still wins. The win is for the edit-run loop, which is exactly this consumer's
+   regime.
+3. **Ship the `wasmrt_*` compatibility alias header** (~30 lines of `#define`), so a consumer can A/B
+   wazmrt against wasmrt by rebuilding rather than rewriting.
+4. **KEEP CURRENT FUNCTIONALITY — v128 crosses the boundary, it is not refused.** Reverses the
+   scoping proposal to reject SIMD at the C ABI. ⚠️ **Fix the root cause rather than reproducing the
+   workaround:** the old surface's v128 damage (slot-vs-index conflation; half a vector punned as a
+   pointer, 13th pass) traces to `wasm.h` having **no v128 valkind**, forcing a two-slot hack. Our own
+   header has no such constraint — give `wazmrt_val_t` a **proper 16-byte v128 variant**.
+5. Interim artifact step name: **`zig build capi`** (owner: no preference). Both libraries cannot install
+   as `wazmrt.lib`, so the new one lives under its own step until step 5.
+
+⚠️ **Decisions 3 and 4 interact — record the trade.** With `.wat` and v128 added, wazmrt's surface is a
+**superset** of `wasmrt.h`, so the alias header can only cover the common core; the extras are
+wazmrt-only and a consumer using them is no longer trivially swappable. That is an accepted cost of
+keeping current functionality, **not** an oversight — do not later "simplify" the extras away to restore
+symmetry.
+
 **The defensible claim** — the one that survives someone checking: **"wasmtime-class module
 compatibility, at a fraction of the footprint, faster on anything not precompiled."** An unqualified
 "faster than wasmtime" dies to one hot-loop benchmark.
