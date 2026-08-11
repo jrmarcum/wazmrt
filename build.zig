@@ -152,6 +152,33 @@ pub fn build(b: *std.Build) void {
         csmoke_step.dependOn(&run_csmoke.step);
     }
 
+    // ---- ABI-2 shared library + Deno FFI demo ------------------------------
+    // `zig build capi-dll` builds src/capi.zig as a DLL under a distinct name, so it can be
+    // exercised over FFI while the old wasm-c-api library is still what `zig build` installs.
+    // Both disappear into one artifact at step 5; until then nothing is broken by the overlap.
+    {
+        const capi_dll = b.addLibrary(.{
+            .name = "wazmrt_capi",
+            .linkage = .dynamic,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/capi.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        const install_capi_dll = b.addInstallArtifact(capi_dll, .{});
+        const capi_dll_step = b.step("capi-dll", "Build the ABI-2 C surface as a shared library (for FFI)");
+        capi_dll_step.dependOn(&install_capi_dll.step);
+
+        // The wasmtk-facing proof: a host language driving the runtime with no V8 in the path,
+        // running a `.wat` directly and reading guest memory from inside a JS callback.
+        const capi_ffi = b.addSystemCommand(&.{ "deno", "run", "--allow-ffi", "--allow-env", "examples/deno_ffi_capi.mjs" });
+        capi_ffi.setEnvironmentVariable("WAZMRT_CAPI_DLL", b.getInstallPath(.bin, "wazmrt_capi.dll"));
+        capi_ffi.step.dependOn(&install_capi_dll.step);
+        const capi_ffi_step = b.step("capi-ffi-demo", "Build the ABI-2 DLL + run the Deno FFI demo (needs deno)");
+        capi_ffi_step.dependOn(&capi_ffi.step);
+    }
+
     // ---- ABI-2 C smoke test (`zig build capi-smoke`) -----------------------
     // The same idea as `c-smoke`, pointed at the NEW surface: compile `tests/capi_smoke.c`
     // against `src/capi.zig` exactly as an embedder would, and run it. Two things it proves that
