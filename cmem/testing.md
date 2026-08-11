@@ -547,6 +547,48 @@ top of the standalone `mod_tests` run — so the printed total roughly doubles e
 quote the printed number as a distinct-test count; quote the per-target numbers from `--summary all`.**
 Green under **Debug AND ReleaseSafe**; `zig build c-smoke` 319/319.
 
+**📊 FULL wasmtk CORPUS RUN, 2026-08-11 — 1,315 files, and it supersedes every corpus figure below.**
+
+Run against the `ReleaseSmall` CLI. Two corpora, two different questions.
+
+**A. WASI corpora + go_fixtures — 888 files (450 `.wasm` + 438 `.wat`)**
+
+| outcome | count |
+| --- | --- |
+| ran correctly | **852** |
+| library modules, no `_start` → summarized | 26 |
+| ran, no output (by design) | 4 |
+| traps | 6 |
+
+**Zero hangs, zero crashes, zero decode/validation errors.** The 6 traps are 3 programs × 2 formats
+(`13_SecureMatrixManagerIntegration`, `15_Trap-On-Error`, `15_panic`) and are CORRECT: **wasmtime
+produces identical output and the identical exit code** on all three. ✅ **`.wat` and `.wasm` agree on
+every single file**, which independently exercises the assembler against the binary decoder across 438
+text files.
+
+**B. `tests/module/` — 427 files.** 142 modules decode+validate clean (`wasm_mod` 21/21,
+`bindgen_fixtures` 14/14, ArtOfWebAssembly ch.1–11, wasm-wat-samples incl. GC/memory64/reference-types).
+The one "failure", `wasi-read-file/readfile.wat`, is correct sandbox behaviour — run without `--dir`, so
+`fd_prestat_get` fails. **284 `.wast` scripts: 60,568 assertions passed / 525 failed / 3,038 skipped;
+199 of 284 completely clean.** Triage of the 164 proposal-dir failures → **102 by design, 62 defects**;
+the fix list is at the top of `known-issues.md`.
+
+⚠️ **3,038 SKIPPED IS NOT 3,038 PASSED.** `wast.zig` increments `skipped` for unhandled command forms
+and cascades a skip to every assertion depending on a module that failed to build. `utf8-invalid-
+encoding.wast` is **0 passed / 0 failed / 176 skipped** — UTF-8 name validation is *entirely
+unverified* by this corpus, though the 13th pass records it as fixed. Quote the skip count whenever
+quoting the pass count.
+
+🛠️ **Method notes for whoever re-runs this — both cost a full re-run to discover:**
+- **`Start-Process -PassThru` does not retain the handle needed for `ExitCode`**, which reads back as
+  `$null`, so every process scores as a failure. The first run reported **888/888 FAIL** while the
+  captured output plainly showed `Hello, World!`. Use `System.Diagnostics.Process` directly, and read
+  both pipes with `ReadToEndAsync` or a guest that fills the pipe buffer deadlocks and looks like a hang.
+- **`exit 0` does NOT mean "ran".** wazmrt summarizes a module with no `_start` and exits 0, so an
+  exit-code-only harness scores non-runs as passes — 26 of them here. Classify on output, not status.
+- **A `.ps1` must be ASCII-only**: PowerShell 5.1 reads it as ANSI without a BOM, so a UTF-8 em-dash in
+  a comment corrupts the parse.
+
 **Update 2026-08-11 — ABI-2 COMPLETE; the counts below are superseded.**
 
 - **From an NTFS cwd: `zig build test` = 510/510, `test-safe` = 510/510, `test-security` = 3/3, all

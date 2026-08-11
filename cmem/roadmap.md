@@ -134,6 +134,23 @@ turning every host import into a `Deno.UnsafeCallback` (a JS↔native hop per ca
 re-introduces the boundary cost the vision claims to remove — measure it, do not assume it**), and
 reading guest memory via `Deno.UnsafePointerView`. No amount of wazmrt-side ABI work substitutes for it.
 
+### 🎯 Spec-conformance fix list (2026-08-11) — 62 defects, details in `known-issues.md`
+
+From the full `tests/module/` run. ⚠️ **Every HIGH item is wazmrt being TOO PERMISSIVE** — the
+opposite of the failure mode most of the audit passes hunted, and in a corner nobody had run before.
+
+| | defect | assertions |
+| --- | --- | --- |
+| **T1** 🔴 | **Accept-invalid** — 43 malformed modules ACCEPTED (`custom-descriptors/binary` 25, `custom-page-sizes-invalid` 18). Suspect an ignored reserved bit in the memory-limits flag + unknown type-section forms | 43 |
+| **T2** 🔴 | A custom-page-size module accepted **then mis-executed** — `memory.grow` → −1. Silent wrong answer; likely free once T1 lands | 12 |
+| **T3** 🟠 | **legacy `rethrow` traps where it must return** — a real bug in an IMPLEMENTED feature | 3 |
+| **T4** 🟠 | a legacy `try`/`catch` encoding not decoded (`UnknownInstr`) | 2 |
+| **T5** 🟡 | oversized limits refused at the wrong STAGE (decode, not link) | 2 |
+
+**Start with T1**: those files are almost entirely *negative* assertions, so this is not a failure to
+run something — it is building modules whose encodings are malformed. The decoder already rejects
+*some* reserved limits flags; **sweep for the sibling**, the lesson that has now paid off four times.
+
 ### What is left after Track 1 (2026-08-11)
 
 - **Track 2c — comptime feature gating (`-Dwat=false` / `-Dwasi=false`).** Promoted from optional to
