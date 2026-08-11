@@ -397,8 +397,22 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   one allocator strategy across targets. If a future feature genuinely needs libc, add it as an opt-in
   `-Dlibc` build flag — never the default. See "Windows gotchas" for why this also unbroke the build.
 
-- **Distributed artifacts ship as `ReleaseSmall` (measured 2026-07-14).** The C-ABI `.lib`/`.dll` (what
-  the `universalWasmLoader-*` ports link) and the freestanding wasm build should be built `ReleaseSmall`,
+- ⚠️ **RE-MEASURED 2026-08-11 — the numbers in the entry below are STALE, and the gap is the point.**
+  Same box, same `ReleaseSmall`: the **DLL is 227,328 B (222 KB, +75%)** and the **static lib 279,444 B
+  (273 KB, +122%)**; the CLI exe is 911,360 B. **The shipped artifacts roughly doubled in a month**
+  while "smallest binary" was a stated goal, because memory64, threads/atomics, full SIMD, GC
+  const-exprs and the hardening all landed after the measurement and nothing re-checked it.
+  **A goal with no gate is a preference** — hence the size gate in `roadmap.md` Track 2a.
+  **Security-vs-size, measured:** the same DLL under **`ReleaseSafe` is 1,238,016 B — 5.4×**. That
+  settles shipping `ReleaseSmall`, and it makes the consequence load-bearing rather than incidental:
+  **`ReleaseSmall` disables Zig's runtime safety checks**, so wazmrt's own hardening + `test-safe` +
+  the fuzz + `test-security` **are** the memory-safety floor, not a nice-to-have.
+  *(Method: `zig build [dll] -Doptimize=…` with `--cache-dir`/`--global-cache-dir` on `C:` — a `D:`
+  build fails with `error: Unexpected`; see the Windows gotchas below.)*
+
+- **Distributed artifacts ship as `ReleaseSmall` (measured 2026-07-14; sizes superseded above).** The
+  C-ABI `.lib`/`.dll` (what the `universalWasmLoader-*` ports link) and the freestanding wasm build
+  should be built `ReleaseSmall`,
   not `ReleaseFast`. Benchmark data (`testing.md`): `ReleaseSmall` shrinks the static lib **−88%**
   (1015→123 KB) and the DLL **−58%** (311→130 KB) for only ~5% steady-state throughput and +0.5 µs
   instantiate — and the metric wazmrt actually wins on, **cross-process cold-start, is unchanged** (it's
@@ -434,6 +448,20 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   decision rests on "consumer X already does Y", open X's source and grep for Y **before** deciding, not
   after implementing. The loader header sat in a sibling repo the whole time. (Recorded as a reusable
   practice in `wasmrt/cmem/best-practices.md` §2.2a.)
+
+- 🏁 **SUPERSEDED BY OWNER DECISION 2026-08-11: the wasm-c-api surface is DELETED, not deprecated.**
+  Full delete — not an opt-in compat build — replaced by a native **`wazmrt.h` matching `wasmrt.h`'s
+  74-function shape** (see `roadmap.md` → CURRENT PROGRAM). Rationale, in order of weight: the intended
+  consumer never used it (the falsification above); every C-ABI audit finding (**#20/#21/#22**) lived in
+  that one file, and wasmrt's **value-handle + `is_valid`** model *structurally* removes that whole bug
+  class; it is the **only** thing keeping `third_party/` non-empty, so deleting it makes wazmrt **100%
+  self-owned** — the second half of the vision's *"dependency-free, and self-owned"*; and it is
+  176 exports of size in a project where `ReleaseSmall` is now a first-class goal.
+  ⚠️ **The retained value is real and must be replaced, not dropped:** a stable versioned ABI, the
+  link-time completeness gate (re-pointed at *our* header — the honest version of it), and the proven
+  Deno-FFI path (`examples/deno_ffi.mjs` must keep working; it is the wasmtk integration route).
+  **Reusing `wasmrt`'s design and lessons is owner-sanctioned and raises no third-party question** — same
+  owner, same `MIT OR Apache-2.0`.
 
 - **Attribution travels WITH the artifact, not merely with the repo (2026-08-10).** `wasm.h` is vendored
   verbatim and is **Apache-2.0 only** (wazmrt's own code is `MIT OR Apache-2.0`), so §4(a) obliges us to

@@ -57,6 +57,36 @@ regime, so the win is exactly where the vision predicted: **short-lived / native
 compiler-test outputs), not sustained hot loops.** Option A stays; A→B waits for a real compute-bound
 workload. First datapoint on one dev box, not a tuned benchmark.
 
+### 🎯 The consumer's regime, established 2026-08-11 — and what it deprioritises
+
+**wazmrt and `wasmrt` are in competition for the runtime slot in wasmtk and rsxtk** (owner). Surveying
+the consumers settled which regime actually pays:
+
+- **rsxtk is a DEVELOPMENT environment — many short runs, not few long ones**, and the owner has
+  **dropped `.cwasm` as its primary path** (machine-specific, not a cross-platform standard) in favour
+  of plain **`.wasm`**, with `.cwasm` left as an end-user option. So wasmtime pays a **full Cranelift
+  compile on every run** — and rsxtk sets `OptLevel::Speed`, its slowest-starting configuration.
+  *(An earlier read of rsxtk's AOT cache had concluded the opposite; that path is no longer the default,
+  so the cold-start thesis holds for this consumer.)*
+- **Therefore the critical path is `decode → validate → instantiate`, NOT steady-state Mops/s.**
+  **The A → A.5 → B perf ladder is DEPRIORITISED**: it costs binary size — now a first-class goal — to
+  buy hot-loop throughput, the one regime these consumers do not live in. Re-open it when a measured
+  compute-bound consumer appears, not before.
+
+⚠️ **Benchmark fairness rule (binding).** Any "faster than wasmtime" measurement must include wasmtime
+configured to **start fast** (`OptLevel::None`, or the Winch baseline compiler), not only
+`OptLevel::Speed`. Beating a runtime in its slowest-starting configuration proves nothing, and shipping
+that number would repeat the falsified-payoff error one section below — a claim that dies the moment
+someone checks. **The defensible claim: *"wasmtime-class module compatibility, at a fraction of the
+footprint, faster on anything not precompiled."*** Unqualified "faster than wasmtime" dies to one
+hot-loop benchmark.
+
+**The structural asymmetry, named rather than wished away:** for **wasmtk** (Deno/TS) both runtimes sit
+behind FFI, so it is a fair fight and wazmrt's embed footprint wins it (**222 KB vs 554 KB**, measured
+2026-08-11). For **rsxtk** (Rust), `wasmrt` is a **native crate** — zero FFI, zero `unsafe`, no DLL to
+ship — an advantage wazmrt cannot erase from behind a C boundary. Sizes and the full program:
+`roadmap.md` → CURRENT PROGRAM.
+
 ## Integration goal — wazmrt as wasmtk's wasm execution backend (owner, 2026-07-02)
 
 The concrete productization target: **wasmtk runs its wasm through native wazmrt instead of Deno/V8**,
@@ -79,6 +109,37 @@ libc-free shared library (`wazmrt.dll`), and `examples/deno_ffi.mjs` (run by `zi
 function — with no wasmtime and no JS-loader in the path. This is exactly the "Deno FFI → the C-ABI
 shared library" routing above; the remaining work for the wasmtk speedup is WASI + the benchmark, not
 the binding mechanism.
+
+⚠️⚠️ **CORRECTED 2026-08-11 — "the remaining work is WASI + the benchmark" is FALSE, and the same class
+of error as the falsified payoff below: a claim about someone else's code, made without reading it.**
+A survey of wasmtk's actual source found:
+
+- **wasmtk executes ALL wasm through `WebAssembly.instantiate` — V8's built-in engine.** Hits in
+  `src/utils.ts` (×2), `src/wast.ts`, and — the load-bearing one — **`src/bindgen.ts`, which *generates*
+  `WebAssembly.instantiate` into every emitted `.bindings.ts`**.
+- **There is no native-runtime FFI path in wasmtk.** The single `Deno.dlopen` in the whole project is in
+  `main.ts` and calls **`kernel32.SetConsoleOutputCP`** to fix Windows console encoding. Nothing else.
+- **wazmrt appears nowhere in wasmtk's source or its `cmem/`.**
+
+**What IS true:** the *mechanism* is proven — `wazmrt.dll` + `Deno.dlopen` + a real call works, in
+wazmrt's own `examples/deno_ffi.mjs`. **What is NOT true:** that anything on the wasmtk side uses it.
+**So "which runtime gets into wasmtk" is a competition for a slot that does not exist yet** — neither
+wazmrt nor wasmrt is in wasmtk; V8 is.
+
+**The real blocker is wasmtk-side work, and it is bigger than a binding:** replacing
+`WebAssembly.instantiate` in `utils.ts`/`wast.ts` *and* in the bindgen **codegen**, turning every host
+import into a `Deno.UnsafeCallback` (a JS↔native hop per call — note that this partly re-introduces the
+very boundary cost this vision claims to eliminate, and must be measured, not assumed), and reading
+guest memory through `Deno.UnsafePointerView` instead of `instance.exports.memory.buffer`. The owner
+owns both projects, so this is a scheduling decision — but it is **wasmtk's** scope, not wazmrt's, and
+no amount of wazmrt-side ABI work substitutes for it.
+
+**Cheapest real foothold, do this first:** `wasmtk/tests/dync_cross_runtime_tests.ts` already runs
+wasmtk's output through external runtimes for portability — `RUNTIMES = ["wasmtime", "wasmer",
+"wazero"]`. **wazmrt is not in that list.** Adding it costs almost nothing and puts wazmrt in front of
+wasmtk's own corpus as a peer of the runtimes it means to replace. wazmrt already runs **all 400
+runnable files of the wasmtk WASI corpus** (`testing.md`), so the parity claim is evidence-backed
+*today* — it simply is not wired into wasmtk's gates.
 
 ## Candidate direction — wazmrt as the universalWasmLoader native backend (speculative, 2026-07-02)
 

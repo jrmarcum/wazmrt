@@ -1,5 +1,152 @@
 # Roadmap
 
+## 🏁 CURRENT PROGRAM (owner, 2026-08-11) — smallest + fastest-starting, and self-owned
+
+**The competitive frame, stated by the owner:** `wasmrt` (the Rust port) and `wazmrt` are **in
+competition** for which becomes the wasm runtime inside **wasmtk** and **rsxtk**. The target is *"the
+fastest smallest version we can distribute that performs as a general wasm runtime"* — **`ReleaseSmall`
+is a goal, as much as security is.** Compatibility means running the **same modules wasmtime runs**
+(spec + proposal parity). ⚠️ **The component model is explicitly OUT of scope — wazmrt is a RUNTIME, not
+a loader.** Canonical-ABI marshalling belongs to the `universalWasmLoader-*` layer (see wasmrt's
+`cmem/loaders.md`), and rsxtk uses none of it (its `component-model` Cargo feature is enabled but
+**never called** — dead weight in the consumer).
+
+### Decision 1 — DELETE the wasm-c-api surface outright (owner, 2026-08-11)
+
+Not an opt-in compat build, not a deprecation: **full delete**, replaced by a native `wazmrt.h`. See the
+decision entry in `design-decisions.md`. This is what makes `third_party/` **empty** and wazmrt **100%
+self-owned** — the vision's own words are *"dependency-free, **and self-owned**"*, and only the vendored
+header stood between us and the second half. Reusing `wasmrt`'s lessons is explicitly sanctioned by the
+owner and raises **no third-party question at all** — it is the same owner's `MIT OR Apache-2.0` code.
+
+### Decision 2 — the consumer regime is the DEV LOOP, on un-precompiled `.wasm` (owner, 2026-08-11)
+
+rsxtk has **dropped `.cwasm` as its primary path**: the format is machine-specific and *not a
+cross-platform standard*, so **`.wasm` is the chosen end product** and `.cwasm` becomes an end-user
+option. ⚠️ **This reverses the analysis of 2026-08-11 morning**, which had found rsxtk's AOT cache
+(`build_and_cache_script` → `Module::deserialize_file`) neutralising wazmrt's cold-start advantage. With
+`.wasm` as the default, **wasmtime pays a full Cranelift compile on every single run** — and rsxtk
+configures `OptLevel::Speed`, the *slowest-starting* setting. A development environment runs **many
+short runs, not few long ones**, so a small fast-starting interpreter is the right shape by design.
+
+**🎯 The prioritisation this dictates — do not spend the size budget on throughput.** The critical path
+is **decode → validate → instantiate**, not steady-state Mops/s. Concretely: the **A → A.5 → B perf
+ladder is DEPRIORITISED** (it costs size and buys hot-loop throughput, the one regime this consumer does
+not live in), and startup/instantiate work is promoted. Re-open the ladder only when a measured
+compute-bound consumer appears.
+
+⚠️ **Fairness rule for any benchmark (binding): compare against wasmtime configured for FAST START**
+(`OptLevel::None`, or the Winch baseline compiler), **not only `OptLevel::Speed`.** Beating a runtime in
+its slowest-starting configuration proves nothing, and publishing that number is the same error as the
+falsified wasm-c-api payoff — a claim that dies on first contact with someone who checks.
+
+### Measured baseline (2026-08-11, `ReleaseSmall`, dev box) — and a size regression nobody caught
+
+| Artifact | 2026-08-11 | recorded 2026-07-14 | drift |
+| --- | --- | --- | --- |
+| C-ABI **DLL** | **227,328 B** (222 KB) | 130 KB | **+75%** |
+| C-ABI **static lib** | **279,444 B** (273 KB) | 123 KB | **+122%** |
+| **CLI exe** | **911,360 B** (890 KB) | — | — |
+
+**The artifacts roughly DOUBLED in a month while "smallest binary" was a stated goal, because nothing
+re-measured them** after memory64, threads/atomics, full SIMD, GC const-exprs and the hardening landed.
+*Lesson, and it is the same one as the licence gap: a goal with no gate is a preference.*
+
+**Security-vs-size, measured not argued:** the same DLL built `ReleaseSafe` is **1,238,016 B — 5.4×**
+the `ReleaseSmall` build. A 990 KB tax is unpayable when size is first-class, so **ship `ReleaseSmall`**
+— and accept the consequence explicitly: `ReleaseSmall` **disables Zig's runtime safety checks**, so
+wazmrt's *own* hardening (13 audit passes, `test-safe`, the Budget-allocator fuzz, `test-security`)
+**is** the memory-safety floor. Those gates are product requirements now, not hygiene.
+
+**First head-to-head (same box, both size-tuned):** C-ABI shared library — **wazmrt 222 KB vs wasmrt
+554 KB (2.5× smaller)**; CLI — wazmrt 890 KB vs wasmrt 684 KB. Not feature-parity-verified; the Rust
+`.a` is not comparable (metadata + bitcode). **The embed footprint is wazmrt's strongest card**, and it
+is measured *before* deleting the 176-export wasm-c-api surface.
+
+### The structural asymmetry — name it, don't wish it away
+
+| Consumer | fair fight? | favoured | why |
+| --- | --- | --- | --- |
+| **wasmtk** (Deno/TS) | **yes** | **wazmrt** | both sit behind FFI; wazmrt's DLL is 2.5× smaller |
+| **rsxtk** (Rust) | **no** | **wasmrt** | native crate — zero FFI, zero `unsafe`, no DLL to ship |
+
+**rsxtk needs only ~15 runtime operations** (`Engine`/`Config`, `Linker` + WASI-p1, `Module::new`,
+`Store`, instantiate, func-by-name, untyped `Val` call, `_start` + `I32Exit`, imports/exports
+introspection, `preopened_dir`/args/env) — a smaller surface than the loaders' 38 or `wasmrt.h`'s 74, so
+either runtime can serve it technically. **Its WAT comes from the `wat` crate, not the runtime**, so
+wazmrt's WAT assembler is CLI weight, never embed weight. **And the pitch to rsxtk vs wasmtime is not
+raw speed — it is dropping Cranelift**: binary size, build time, no machine-keyed artifacts, no `unsafe
+deserialize_file`.
+
+### ⚠️ THE SLOT IS EMPTY — surveyed 2026-08-11, and it reframes the whole competition
+
+Every consumer was read, not assumed (the lesson from the falsified payoff). **Neither wazmrt nor
+wasmrt is in ANY of them yet. All are still on wasmtime or V8.**
+
+| Consumer | Runs wasm today via | Native-runtime hook |
+| --- | --- | --- |
+| **wasmtk** (Deno/TS) | **`WebAssembly.instantiate` — V8**, incl. inside the **bindgen codegen** | **none** — its only `Deno.dlopen` calls `kernel32.SetConsoleOutputCP` |
+| **rsxtk** (Rust) | wasmtime 40.0.1 + Cranelift | native crate (wasmrt's, by language) |
+| **universalWasmLoader-c/-v/-zig** | **wasmtime C API v45.0.2**, vendored per triplet | `universal_wasm_loader.h` |
+| **-go/-jvm/-py/-dotnet** | wazero / Chicory / wasmtime-py / Wasmtime-NuGet | FFI over the C header |
+| **-js/-dart** | host `WebAssembly` | wasm-in-wasm (heaviest, last) |
+
+**So the fight is not wazmrt vs wasmrt over an occupied seat — it is both of them vs *wasmtime*, over a
+seat nobody holds.** That is a better position than it sounds, and it changes what wins:
+
+1. **API shape is the port cost.** The C loader uses `wasmtime_store/context/module/instance/memory/
+   linker`, and `uwl__import_trampoline` reads guest memory via **`wasmtime_caller_export_get(caller,
+   "memory")` + `wasmtime_memory_data`** — the caller-in-callback pattern wasm-c-api structurally cannot
+   serve. **This is direct confirmation of the falsification** *and* of the fix: `wasmrt.h`'s shape is
+   derived from exactly these calls, so **matching it makes wazmrt a near-mechanical port for the
+   loaders AND A/B-swappable against wasmrt.** Do not invent a third shape.
+2. **Distribution is the real selling point, not speed.** The loaders today **fetch a prebuilt wasmtime
+   C API SDK per platform triplet from GitHub releases** (`scripts/fetch-wasmtime.sh`, sha512-pinned in
+   the vcpkg port, *no* upstream vcpkg port exists, static-linked at v45.0.2). Replacing megabytes of
+   per-triplet vendored SDK with a **222 KB self-owned library** removes an entire supply-chain and
+   build-system burden. **This is where wazmrt wins on merit today** — before any benchmark.
+3. **Licensing freedom becomes REAL here** (unlike the falsified drop-in claim): wasmtime is
+   `Apache-2.0 WITH LLVM-exception`; post-delete wazmrt is `MIT OR Apache-2.0`, 100% self-owned, with
+   **nothing to propagate** into a loader's distribution.
+
+**🥇 Cheapest real foothold — do this before any ABI work.** `wasmtk/tests/dync_cross_runtime_tests.ts`
+already runs wasmtk's output through `RUNTIMES = ["wasmtime", "wasmer", "wazero"]` for portability.
+**wazmrt is not in that list**, though it already runs **all 400 runnable files of the wasmtk WASI
+corpus** (`testing.md`). Adding it costs near-nothing and puts wazmrt in front of a consumer's own gates
+as a peer of the runtimes it means to replace. **Evidence in someone else's test suite beats a claim in
+ours.**
+
+⚠️ **And the honest counterweight for wasmtk:** getting in there is **wasmtk-side work bigger than a
+binding** — replacing `WebAssembly.instantiate` in `utils.ts`/`wast.ts` *and* in the **bindgen codegen**,
+turning every host import into a `Deno.UnsafeCallback` (a JS↔native hop per call, which **partly
+re-introduces the boundary cost the vision claims to remove — measure it, do not assume it**), and
+reading guest memory via `Deno.UnsafePointerView`. No amount of wazmrt-side ABI work substitutes for it.
+
+### The three tracks
+
+1. **ABI replacement.** Match `wasmrt.h`'s 74-function shape *exactly* (semantics + spelling modulo the
+   prefix) + a small alias header, so wasmtk can A/B the two engines by swapping a DLL — a bake-off
+   needs that. Adopt wasmrt's **value handles + `is_valid`**, which *structurally* delete the
+   `#20`/`#21`/`#22` bug class (no refcount, no raw ownership transfer to get wrong); caller-based
+   callbacks; name-based linker; per-module WASI. Do **not** re-derive the four designs wasmrt's
+   `loaders.md` records as not surviving contact with the code. Then delete `src/wasm_c_api.zig`,
+   `tests/c_abi_symbols.c`, `third_party/wasm-c-api/`, both install-file steps and the ledger entry.
+2. **Size program.** (a) **A size gate that FAILS the build** past a recorded ceiling — the
+   `test-security` pattern applied to bytes, and the only thing that stops another silent doubling.
+   (b) Delete the C ABI, measure the delta. (c) **Comptime proposal gating** (`-Dgc=false`, …) so an
+   embedder compiles out what its guests never use — biggest lever, biggest work; ⚠️ a disabled proposal
+   must be **rejected loudly**, never silently ignored (the canonical fall-through failure mode).
+   (d) Keep CLI-only surface (wat/wast/sign/pin) out of the library.
+3. **Bake-off harness.** wazmrt vs wasmrt vs wasmtime on wasmtk's + rsxtk's real corpora: DLL size,
+   **decode+validate+instantiate**, cold-start wall-clock, steady-state, conformance score, security
+   posture — with wasmtime in a **fast-start** configuration. Include a proposal-parity check against
+   wasmtime's supported list (verify tail-calls and relaxed-SIMD first; `return_call_ref` sits at 38/9
+   in the last snapshot). Also unmeasured: rsxtk's own binary size and Cranelift's share of it.
+
+**The defensible claim** — the one that survives someone checking: **"wasmtime-class module
+compatibility, at a fraction of the footprint, faster on anything not precompiled."** An unqualified
+"faster than wasmtime" dies to one hot-loop benchmark.
+
 ## Status (2026-07-27) — every targeted wasm proposal implemented (memory64 was the last)
 
 *(Sections below are dated as written. The **2026-07-27** state supersedes all earlier test counts and
