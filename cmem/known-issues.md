@@ -16,6 +16,81 @@ about a file **deleted on 2026-08-11**. They are kept because they are the *evid
 replacement's design: value handles exist precisely so that class cannot recur. See
 `design-decisions.md`.
 
+## 🎯 TASK-TO-FIX LIST — 62 real defects from the proposal-dir spec runs (2026-08-11)
+
+Ran wasmtk's `tests/module/` corpus: **427 files, 60,568 assertions passed / 525 failed / 3,038
+skipped**. 164 of those failures sit in `testsuite-main/proposals/` + `legacy/`. Classified every one
+by its first-failure text:
+
+- **102 are BY DESIGN** — the module cannot be built because it uses a proposal wazmrt does not
+  target. `custom-descriptors` (99: `BadValType`/`BadType`/`BadModuleField`/`BadImmediate` — exact
+  refs and descriptors), `wide-arithmetic` (2: `UnknownInstr`), `legacy/try_delegate` (1:
+  `UnsupportedInstr` — `delegate` is *deliberately* refused because nothing routes it). **Refusing to
+  build a module you do not implement is the correct behaviour; no action.**
+- **62 are DEFECTS.** They are listed below in priority order.
+
+⚠️ **The pattern that matters: every HIGH item is wazmrt being TOO PERMISSIVE, not too strict.** The
+project's own rule — *a runtime that executes an invalid module is over-permissive, not authoritative*
+— is being broken in a corner nobody had run before.
+
+### 🔴 T1 — ACCEPT-INVALID: 43 modules accepted that the spec requires be REJECTED
+
+- `proposals/custom-descriptors/binary.wast` — **25 failures**, first: `assert_invalid/malformed:
+  module was accepted (should be rejected)`.
+- `proposals/custom-page-sizes/custom-page-sizes-invalid.wast` — **18 failures**, same verdict.
+
+**Why it matters more than the count suggests:** these files are almost entirely *negative*
+assertions. wazmrt is not failing to run something — it is **building modules whose encodings are
+malformed**, which is the accept-invalid class the 12th/13th passes spent so much effort closing.
+**Likely cause:** an unknown/reserved bit in the memory-limits flag byte (custom-page-sizes adds a
+page-size field there) and unknown type-section forms (custom-descriptors) are being ignored rather
+than refused. The decoder already rejects *some* reserved limits flags (`MalformedFlag`) — this is the
+sibling case it misses. **Sweep for the sibling**, per the standing lesson.
+
+### 🔴 T2 — SILENT WRONG ANSWER on custom page sizes (12 failures)
+
+`proposals/custom-page-sizes/custom-page-sizes.wast` — first failure: `assert_return "grow": result
+mismatch (got 0xffffffff)`.
+
+wazmrt **accepted** a module declaring a custom page size, then executed it wrongly: `memory.grow`
+returned −1. This is worse than T1 and is the *worst* failure mode in this codebase's taxonomy — not a
+refusal, not a trap, but a plausible wrong value handed to the guest. Fixing T1 (reject the encoding)
+almost certainly fixes this too; if the proposal is ever implemented, the grow semantics need their own
+test.
+
+### 🟠 T3 — legacy `rethrow` traps where it must return (3 failures)
+
+`legacy/rethrow.wast` — first failure: `assert_return: unexpected trap UncaughtException`.
+
+⚠️ **This one is in a feature wazmrt DOES implement** (legacy EH, Phase 6.3), so it is a genuine
+runtime bug rather than a scope gap: a caught exception re-raised by `rethrow` is escaping the handler
+that should catch it. Same family as the 2026-07-27 fix where *"a throw inside a catch handler must go
+outward"* — this is the neighbouring case that fix did not cover.
+
+### 🟠 T4 — legacy `try`/`catch` encoding not decoded (2 failures)
+
+`legacy/try_catch.wast` — first failure: `module failed to build: UnknownInstr`.
+
+Legacy try/catch is implemented, so some *variant* in this file is not — likely a block-type or
+`catch_all` form the decoder does not accept. Find the exact opcode before assuming scope.
+
+### 🟡 T5 — wrong error STAGE for oversized memory limits (2 failures)
+
+`proposals/custom-page-sizes/memory_max.wast` and `memory_max_i64.wast` — first failure:
+`assert_unlinkable: non-link error InvalidLimits`.
+
+wazmrt raises `InvalidLimits` at decode/validate where the spec expects the failure at **link** time.
+The module is correctly rejected, so this is a classification defect, not a safety one — but
+`assert_unlinkable` deliberately refuses to green-wash a non-link error, and it is right to.
+
+### Not on this list, but do not lose it
+
+**3,038 skipped assertions** across the corpus are *not* failures and *not* passes — they are
+assertions that never ran (`wast.zig` skips unhandled command forms, and cascades a skip to everything
+depending on a module that failed to build). ⚠️ `utf8-invalid-encoding.wast` is **0 passed / 0 failed /
+176 skipped** — UTF-8 name validation is entirely unverified by this corpus despite the 13th pass
+recording it as fixed. Worth a separate look at whether the skip is the runner's gap or ours.
+
 ## 🧾 ABI-2 build (2026-08-11) — bugs and near-misses found while replacing the C ABI
 
 None of these shipped; all were caught by a gate or a test. Recorded because each is a **shape** that
