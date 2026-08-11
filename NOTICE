@@ -28,7 +28,12 @@ source file, as required by Section 4(b).
 
 Incorporated components (see third_party/LICENSES.md for the full ledger):
 
-  * WebAssembly C API — "wasm.h" from https://github.com/WebAssembly/wasm-c-api
-    Copyright the wasm-c-api project authors.
-    Licensed under Apache-2.0 (see third_party/wasm-c-api/LICENSE).
-    Vendored verbatim as third_party/wasm-c-api/include/wasm.h.
+  * NONE. As of 2026-08-11 wazmrt incorporates no third-party code. The one
+    component it ever vendored — "wasm.h" from the WebAssembly C API project —
+    was removed when the C ABI was replaced by the native wazmrt.h (ABI 2).
+
+    Nothing third-party therefore ships in zig-out/, and no third-party license
+    or NOTICE has to travel with the artifact. The paragraphs above remain
+    because they describe the obligations that WOULD apply if something were
+    incorporated again; the Adoption Checklist in third_party/LICENSES.md is the
+    gate for that.

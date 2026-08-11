@@ -80,7 +80,12 @@ pub fn build(b: *std.Build) void {
     // Builds the DLL, then runs a Deno script that loads it over FFI and drives
     // the standard wasm-c-api (decode -> instantiate -> call) — proving the
     // native runtime binds from a host language. Requires `deno` on PATH.
-    const ffi = b.addSystemCommand(&.{ "deno", "run", "--allow-ffi", "--allow-env", "examples/deno_ffi_capi.mjs" });
+    const ffi = b.addSystemCommand(&.{ "deno", "run", "--allow-ffi", "--allow-env" });
+    // `addFileArg`, not a relative string: a bare "examples/…" resolves against the PROCESS cwd,
+    // so the step worked from the repo root and failed from anywhere else — including
+    // `zig build --build-file` run from another drive, which is how the sandbox tests have to be
+    // run on this machine.
+    ffi.addFileArg(b.path("examples/deno_ffi_capi.mjs"));
     ffi.setEnvironmentVariable("WAZMRT_CAPI_DLL", b.getInstallPath(.bin, "wazmrt.dll"));
     ffi.step.dependOn(&install_dll.step);
     const ffi_step = b.step("ffi-demo", "Build the DLL + run the Deno FFI demo (needs deno)");
@@ -101,38 +106,6 @@ pub fn build(b: *std.Build) void {
     const install_wasm = b.addInstallArtifact(wasm_exe, .{});
     const wasm_step = b.step("wasm", "Build the runtime as a freestanding wasm module");
     wasm_step.dependOn(&install_wasm.step);
-
-    // ---- C smoke test (`zig build c-smoke`) --------------------------------
-    // Compiles tests/c_smoke.c against the C ABI exactly as an embedder would and
-    // runs it: engine/store, module decode + introspection, and instantiate +
-    // call. Uses the mingw (windows-gnu) target so the C client gets a libc
-    // without MSVC (the native target can't link libc on a MSVC-less box — see
-    // cmem/design-decisions.md); the wazmrt lib itself stays libc-free.
-    {
-        const gnu = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu });
-        const cabi_gnu = b.addLibrary(.{
-            .name = "wazmrt_csmoke",
-            .linkage = .static,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/wasm_c_api.zig"),
-                .target = gnu,
-                .optimize = optimize,
-            }),
-        });
-        const csmoke_mod = b.createModule(.{ .target = gnu, .optimize = optimize, .link_libc = true });
-        csmoke_mod.addCSourceFile(.{ .file = b.path("tests/c_smoke.c"), .flags = &.{"-DLIBWASM_STATIC"} });
-        // The completeness gate: references every function wasm.h declares, so a
-        // symbol we promise but don't define breaks THIS build rather than an
-        // embedder's link. See cmem/known-issues.md #20.
-        csmoke_mod.addCSourceFile(.{ .file = b.path("tests/c_abi_symbols.c"), .flags = &.{"-DLIBWASM_STATIC"} });
-        csmoke_mod.addIncludePath(b.path("include"));
-        csmoke_mod.addIncludePath(b.path("third_party/wasm-c-api/include"));
-        csmoke_mod.linkLibrary(cabi_gnu);
-        const csmoke = b.addExecutable(.{ .name = "c_smoke", .root_module = csmoke_mod });
-        const run_csmoke = b.addRunArtifact(csmoke);
-        const csmoke_step = b.step("c-smoke", "Build + run the C smoke test (wasm-c-api from C)");
-        csmoke_step.dependOn(&run_csmoke.step);
-    }
 
     // ---- ABI-2 C smoke test (`zig build capi-smoke`) -----------------------
     // The same idea as `c-smoke`, pointed at the NEW surface: compile `tests/capi_smoke.c`
@@ -248,27 +221,12 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
 
-    // The C ABI needs its own test target: `root.zig` doesn't import
-    // `wasm_c_api.zig` (the dependency runs the other way), so tests in it were
-    // unreachable from `mod_tests` — the file had none, and couldn't have had
-    // any. Its tests drive the C entry points under `std.testing.allocator`,
-    // which catches the double-frees and leaks that the C smoke test cannot see
-    // (on the real allocator a double free corrupts the freelist silently and
-    // the test still prints OK).
-    const cabi_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/wasm_c_api.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(cabi_tests).step);
-
-    // The ABI-2 surface (`src/capi.zig`) gets its own test target from its FIRST commit, for
-    // exactly the reason `cabi_tests` exists: `root.zig` does not import it, so its tests are
-    // unreachable from `mod_tests` and the file would otherwise be untested for as long as the
-    // old one was — which is how #21's double free, use-after-free and uninitialised refcount
-    // all shipped. Wired before there is anything much to test, so it can never be "added later".
+    // The C ABI needs its own test target: `root.zig` does not import `capi.zig` (the dependency
+    // runs the other way), so its tests are unreachable from `mod_tests`. That gap is not
+    // theoretical — the previous C ABI had NO reachable tests for its entire life, and shipped
+    // #21's double free, use-after-free and uninitialised refcount as a result. These drive the C
+    // entry points under `std.testing.allocator`, which catches what a C smoke test cannot: on
+    // the real allocator a double free corrupts the freelist silently and the test still prints OK.
     const capi_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/capi.zig"),
@@ -322,15 +280,10 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = .ReleaseSafe,
         }) });
-        const cabi_tests_safe = b.addTest(.{ .root_module = b.createModule(.{
-            .root_source_file = b.path("src/wasm_c_api.zig"),
-            .target = target,
-            .optimize = .ReleaseSafe,
-        }) });
-        // The ABI-2 surface is in the memory-safety gate from its first commit too: a C boundary
-        // is exactly where an out-of-range cast or a bad index stops being a wrong answer and
-        // becomes a corrupted heap, and ReleaseSafe is what turns that from silent UB in the
-        // SHIPPED build into a loud panic here.
+        // The C ABI is in the memory-safety gate as well: a C boundary is exactly where an
+        // out-of-range cast or a bad index stops being a wrong answer and becomes a corrupted
+        // heap, and ReleaseSafe is what turns that from silent UB in the SHIPPED build into a
+        // loud panic here.
         const capi_tests_safe = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path("src/capi.zig"),
             .target = target,
@@ -338,7 +291,6 @@ pub fn build(b: *std.Build) void {
         }) });
         const test_safe_step = b.step("test-safe", "Run the test suite under ReleaseSafe (optimized + safety checks kept)");
         test_safe_step.dependOn(&b.addRunArtifact(mod_tests_safe).step);
-        test_safe_step.dependOn(&b.addRunArtifact(cabi_tests_safe).step);
         test_safe_step.dependOn(&b.addRunArtifact(capi_tests_safe).step);
     }
 

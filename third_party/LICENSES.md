@@ -64,41 +64,34 @@ allowed, and did we document it?).
 
 ## Component Ledger
 
-Newest first. Copy the template for each adopted component.
+**EMPTY as of 2026-08-11 — wazmrt vendors nothing.** `third_party/` contains this file and no
+code, so there is no third-party licence to satisfy, no NOTICE to propagate, and nothing that has
+to travel with the artifact. `zig-out/include/` is a single file: our own `wazmrt.h`.
 
-### wasm-c-api (standard `wasm.h`)
-- **Source:** https://github.com/WebAssembly/wasm-c-api
-- **Version / commit:** `9d6b93764ac96cdd9db51081c363e09d2d488b4d` (pinned)
-- **License (SPDX):** `Apache-2.0`
-- **License file:** third_party/wasm-c-api/LICENSE
-- **What we reused:** `include/wasm.h` — the standard WebAssembly C API header,
-  vendored **verbatim** (not modified). It is the integration ABI wazmrt
-  implements, so `universalWasmLoader-*` and any wasm-c-api consumer (wasmtime,
-  wasmer) bind identically.
-- **Where it lives in wazmrt:** third_party/wasm-c-api/include/wasm.h
-- **Modifications:** none (verbatim). Our implementation lives in
-  `src/wasm_c_api.zig`; wazmrt-specific extensions live in `include/wazmrt.h`,
-  not in the vendored header.
-- **Obligations satisfied:** [x] license copied  [x] NOTICE propagated
-  [x] verbatim — no change-notes required  [x] provenance commit pinned
-  [x] **license SHIPS WITH THE ARTIFACT** — `build.zig` installs `LICENSE.wasm-c-api` and `NOTICE`
-      into `zig-out/include/` beside the header (added 2026-08-10). ⚠️ Until then the repo was
-      compliant and the **output tree was not**: `zig-out/include` carried `wasm.h` alone, and whoever
-      copies that directory never sees `third_party/`. **A compliant repository is not a compliant
-      distribution** — Apache-2.0 §4(a) binds on distribution, so the licence has to be where the
-      artifact goes.
-- **Benefit / drawback note:** Benefit — instant, standard interop; ~~loaders bind
-  once to a familiar ABI~~. Drawback — large surface (~740 lines); we implement it
-  incrementally, backing only what the runtime can do today.
-  ⚠️ **Benefit partly FALSIFIED 2026-08-10:** the standard-interop half is real, but
-  "loaders bind once to a familiar ABI" was never checked against the loaders. The
-  `universalWasmLoader-*` consumers use wasmtime's *other* C API (`wasmtime_*`
-  store/context/linker), and wasm-c-api's host-func callback cannot reach the
-  caller's memory — which is what nearly every loader host import needs. Full
-  account in `cmem/vision.md`; the caveat is on the decision in
-  `cmem/design-decisions.md`. **Checklist lesson: a "Benefit" line asserting what
-  another project does is a hypothesis — go read that project's source before
-  ticking it.**
+Newest first. Copy the template below for each adopted component.
+
+### ~~wasm-c-api (standard `wasm.h`)~~ — REMOVED 2026-08-11
+
+Vendored 2026-07-02, removed 2026-08-11 when the C ABI was replaced by the native `wazmrt.h`
+(ABI 2). `third_party/wasm-c-api/` and `src/wasm_c_api.zig` are both gone. Kept as a struck-through
+entry rather than deleted, because the reasoning is worth more than the row:
+
+- **What it was:** `include/wasm.h` from https://github.com/WebAssembly/wasm-c-api, commit
+  `9d6b93764ac96cdd9db51081c363e09d2d488b4d`, `Apache-2.0`, vendored verbatim.
+- **Why it went:** the benefit line in this very ledger — *"loaders bind once to a familiar
+  ABI"* — was **falsified**. The `universalWasmLoader-*` consumers use wasmtime's *other* C API
+  (`wasmtime_*` store/context/linker), and wasm-c-api's host callback cannot reach the caller's
+  memory, which is what nearly every loader import needs. The ABI could not do the job it was
+  chosen for. Full account in `cmem/vision.md`.
+- **What it cost while it was here:** 319 declared functions in the project's largest file, and
+  every C-ABI audit finding this project has ever had (**#20, #21, #22**).
+- **What its removal bought:** wazmrt is now **100% self-owned** — the whole reason `zig-out/`
+  had to carry `LICENSE.wasm-c-api` and `NOTICE` a day earlier evaporates, because there is no
+  longer anything third-party in the distribution.
+
+🎓 **The checklist lesson, which outlives the component: a "Benefit" line asserting what another
+project does is a HYPOTHESIS. Open that project's source and grep for it before ticking the box.**
+The loader header sat in a sibling repo for the entire life of this entry.
 
 <!--
 ### <component-name>
