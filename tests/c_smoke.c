@@ -11,6 +11,12 @@
  *     tests/c_smoke.c wazmrt.lib -o smoke.exe
  */
 /* Compiled with -DLIBWASM_STATIC (wazmrt ships a static lib). */
+/* `wasm.h` used to arrive via `wazmrt.h`, which was an extension header over the vendored
+ * wasm-c-api. As of the ABI-2 work `wazmrt.h` is the NEW standalone surface and includes
+ * nothing of the sort, so this legacy test names the header it actually needs. It still
+ * includes `wazmrt.h` for the two version symbols, which both ABIs export. This file goes
+ * away with the old surface at step 6 of the series in cmem/roadmap.md. */
+#include "wasm.h"
 #include "wazmrt.h"
 
 #include <stdio.h>
