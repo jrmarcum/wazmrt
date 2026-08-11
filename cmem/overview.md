@@ -30,15 +30,15 @@ wazmrt/
 │   ├── sexpr.zig          # S-expression lexer/parser for .wat/.wast (text toolchain front-end)
 │   ├── wat.zig            # WAT text → wasm binary assembler (reuses opcode.zig in reverse)
 │   ├── wast.zig           # WAST script runner (assert_return/assert_trap/invoke) — runs the spec testsuite
-│   ├── wasm_c_api.zig     # Implements the standard wasm-c-api (smp_allocator, no libc)
+│   ├── capi.zig           # The native wazmrt.h C ABI, ABI 2 (smp_allocator, no libc)
+│   ├── features.zig       # Per-proposal gating: which proposals a module may use
 │   ├── wasm_entry.zig     # Freestanding wasm32 export surface (wasm_allocator)
 │   ├── pin.zig            # Pin verification (Phase 5): SHA-256, content-addressed DB, decide() matrix
 │   └── sign.zig           # Ed25519 signature verify (authenticity): "signature" custom section + embedded root key
 ├── tests/
 │   └── c_smoke.c          # C smoke test exercising the wasm-c-api surface (zig cc)
 ├── third_party/
-│   ├── LICENSES.md        # Compliance ledger + adoption checklist + SPDX inventory
-│   └── wasm-c-api/        # Vendored standard wasm.h (Apache-2.0) + its LICENSE
+│   └── LICENSES.md        # Compliance ledger (EMPTY — nothing vendored) + adoption checklist
 ├── LICENSE-MIT · LICENSE-APACHE · NOTICE
 └── README.md              # Public, user-facing doc
 ```
@@ -56,13 +56,16 @@ The pipeline, in order: **decode → validate → execute**, with a text front-e
 | `src/interp.zig` | `Instance` + the switch interpreter (untyped `u64` slots, label stack). Runs int/float/memory (**multi-memory** + **complete SIMD (v128)**: two u64 slots per v128, the **entire `0xFD` set** incl. relaxed ops via `@Vector` — `memories: []*Memory`, load/store/`memory.*` select by index), **threads/atomics** (the whole `0xFE` family — atomic load/store/rmw/cmpxchg/fence/wait/notify, single-threaded semantics, `shared` memories), **memory64** (i64 addresses via `popAddr`, overflow-safe u64 bounds, i64 `memory.size`/`grow`; the address type is per-memory), `call_indirect` over multiple tables, reference types + table ops, element segments (incl. GC constant expressions in global/element inits), **imported functions** (`HostFunc`), **full WasmGC** (i31/struct/array heap, casts, subtyping), bulk memory/table ops, and **exception handling** — both the exnref form (`throw`/`throw_ref`/`try_table`, unwinding via `error.UncaughtException` + call-site catch) **and the legacy `try`/`catch`/`catch_all`/`rethrow`** form (inline handlers, Phase 6.3); carries the **trap backtrace** (`errdefer`-recorded frames). |
 | `src/sexpr.zig` / `src/wat.zig` / `src/wast.zig` | Text toolchain: S-expression parser → WAT→wasm-binary assembler (`wat.zig` maps names→`Op` via `stringToEnum`) → WAST script runner (`wast.zig`, drives an `Instance`, compares — **runs the official spec testsuite**). |
 | `src/wasi.zig` | **WASI preview 1** as native host imports: stdio/args/environ/clocks/`poll_oneoff`/random/`proc_exit` + the **sandboxed filesystem** (`--dir`/read-only `--ro-dir` preopens, host-fd table, and the security-critical handle-stack path resolver `walkFull` — follows symlinks, escape impossible by construction; see `security-model.md`). Read-only-ness rides the rights model: `path_open` only narrows an fd's rights against its parent, so a `--ro-dir`'s no-write mask propagates to the whole subtree. |
-| `src/wasm_c_api.zig` | The **standard wasm-c-api** — every one of the 319 functions `wasm.h` declares is defined (link-gated by `tests/c_abi_symbols.c`), with a refcounted `wasm_ref_t` object model. The ABI every `universalWasmLoader-*` port binds to (+ the `wazmrt_*` extension handshake). **The one file that hands raw ownership across a C boundary — memory-safety-critical (`design-decisions.md`), lifecycle-fuzzed.** |
+| `src/capi.zig` | The **native `wazmrt.h` C ABI (ABI 2)** — all 77 declared functions defined, link-gated by `tests/wazmrt_abi_symbols.c`. Engine/store/linker, caller-based host callbacks, `.wat` input, WASI, resource ceilings, proposal gating. **Value handles instead of refcounted objects**, which is what removes the `#20`/`#21`/`#22` bug class rather than re-policing it. Replaced `src/wasm_c_api.zig` (deleted 2026-08-11). |
+| `src/features.zig` | Per-proposal gating. Maps every `opcode.Op` to the proposal it belongs to and refuses a module that uses a disabled one, inspecting **types as well as code**. ⚠️ Its comptime `Op`-count assertion is load-bearing: an unclassified new opcode would silently pass every gate. |
 | `src/root.zig` | Library surface (`@import("wazmrt")`). Re-exports `types`/`Reader`/`Module`/`opcode`/`validate`/`interp`/`Instance`/`sexpr`/`wat`/`wast`/`wasi`/`pin`/`sign`/`decode`/`version`/`abi_version`. |
 
 ## Build targets (see architecture.md)
 
-- `zig build`      → native CLI `wazmrt` + C-ABI static lib `wazmrt` + installs the whole of `zig-out/include/`: `wasm.h`, `wazmrt.h`, **`LICENSE.wasm-c-api` and `NOTICE`** (the last two since 2026-08-10 — the vendored header is Apache-2.0 only; see the manifest below)
-- `zig build test` → runs the unit tests (**493 printed (489 pass, 4 skip) as of 2026-07-27**; green under Debug AND ReleaseSafe; see `testing.md`)
+- `zig build`      → native CLI `wazmrt` + C-ABI static lib `wazmrt` + installs **`include/wazmrt.h`, and nothing else** (2026-08-11: nothing third-party ships, so no licence has to travel with it)
+- `zig build test` → runs the unit tests (**510 printed as of 2026-08-11, ZERO skips from an NTFS cwd**; green under Debug AND ReleaseSafe; see `testing.md`)
+- `zig build capi-smoke` → compiles + runs `tests/capi_smoke.c` against the C ABI, with the generated link-time symbol gate (was `c-smoke` before 2026-08-11)
+- `zig build size -Doptimize=ReleaseSmall` → fails the build if a shipped artifact grew past `tools/size-ceilings.txt`
 - `zig build -Droot-key=<64 hex>` → embeds the Ed25519 signature trust anchor (empty ⇒ verification inert)
 - `zig build wasi-gate` → compiles real `wasm32-wasi` guests (Zig + C via `zig cc`; Rust with `-Drust-gate=true`) and runs them through wazmrt asserting stdout
 - `zig build wasm` → builds the runtime itself as a freestanding `wasm32` module
@@ -77,8 +80,8 @@ one the dev box happens to satisfy.
 | you are shipping | files a user needs | do NOT ship |
 | --- | --- | --- |
 | **the CLI** | `zig-out/bin/wazmrt.exe` — **one file** | `wazmrt.pdb` |
-| **the C ABI, dynamic** | `zig-out/bin/wazmrt.dll` + **the whole of `zig-out/include/`** | `wazmrt.pdb` |
-| **the C ABI, static** | `zig-out/lib/wazmrt.lib` + **the whole of `zig-out/include/`** | — |
+| **the C ABI, dynamic** | `zig-out/bin/wazmrt.dll` + `include/wazmrt.h` | `wazmrt.pdb` |
+| **the C ABI, static** | `zig-out/lib/wazmrt.lib` + `include/wazmrt.h` | — |
 | **the wasm build** | `zig-out/bin/wazmrt.wasm` | — |
 
 ✅ **wazmrt is standalone by construction.** `wazmrt.exe` and `wazmrt.dll` import **only `ntdll` and
@@ -88,11 +91,15 @@ libc-free design, and it is worth re-checking rather than assuming after any bui
 ⚠️ **`wazmrt.pdb` is 3.6 MB of debug symbols and the largest file in `zig-out/bin`** — easy to sweep up
 with a wildcard copy, and it carries source paths and symbol names.
 
-🔒 **Ship `zig-out/include/` whole — all four files, not just the headers.** `wasm.h` is vendored
-verbatim from https://github.com/WebAssembly/wasm-c-api and is **Apache-2.0**, so §4(a) obliges us to
-hand recipients a copy of the licence *when we distribute it*. `build.zig` therefore installs
-`LICENSE.wasm-c-api` and `NOTICE` beside the headers (added 2026-08-10 — before that the repo was
-compliant and the **output tree was not**).
+⚡ **CORRECTED 2026-08-11 — `zig-out/include/` is ONE file again.** For one day it was four: the
+vendored `wasm.h` plus `LICENSE.wasm-c-api` and `NOTICE`, because that header was **Apache-2.0** and
+§4(a) obliges us to hand recipients the licence *when we distribute it*. Deleting the vendored header
+deleted the obligation with it — **wazmrt vendors nothing, so nothing third-party ships and no licence
+has to travel with the artifact.**
+
+⚠️ **Keep the rule even though the case is gone** (`licensing.md`): a compliant repository is not a
+compliant distribution. The next vendored file will need its licence in the OUTPUT tree, not just the
+source tree, and named for the component it covers.
 
 ⚠️ **A compliant repository is not a compliant distribution.** Whoever copies `zig-out/include` never
 sees `third_party/`, so the licence has to be in the output. The file is named for the header it

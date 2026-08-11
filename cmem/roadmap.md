@@ -134,6 +134,18 @@ turning every host import into a `Deno.UnsafeCallback` (a JS↔native hop per ca
 re-introduces the boundary cost the vision claims to remove — measure it, do not assume it**), and
 reading guest memory via `Deno.UnsafePointerView`. No amount of wazmrt-side ABI work substitutes for it.
 
+### What is left after Track 1 (2026-08-11)
+
+- **Track 2c — comptime feature gating (`-Dwat=false` / `-Dwasi=false`).** Promoted from optional to
+  necessary by the measured growth above. ⚠️ `.wat` is NOT being descoped (owner, 2026-08-11) — the
+  CLI keeps assembling text unconditionally; the question is only whether an *embedder* who never
+  assembles text must carry the assembler.
+- **Track 3 — the bake-off harness.** wazmrt vs wasmrt vs wasmtime, on wasmtk's and rsxtk's real
+  corpora, **with wasmtime in a FAST-START configuration** (`OptLevel::None`/Winch), never only
+  `OptLevel::Speed`.
+- **wasmtk branch `test/cross-runtime-wazmrt-wasmrt`** (`72cf256ffad`) — the 5-runtime portability gate,
+  deliberately unmerged pending the runtime decision.
+
 ### The three tracks
 
 1. **ABI replacement.** Match `wasmrt.h`'s 74-function shape *exactly* (semantics + spelling modulo the
@@ -159,7 +171,35 @@ reading guest memory via `Deno.UnsafePointerView`. No amount of wazmrt-side ABI 
    wasmtime's supported list (verify tail-calls and relaxed-SIMD first; `return_call_ref` sits at 38/9
    in the last snapshot). Also unmeasured: rsxtk's own binary size and Cranelift's share of it.
 
-### 📋 AGREED CHANGE SERIES for Track 1 (owner-approved 2026-08-11) — build new, prove, then delete
+### ✅ TRACK 1 IS COMPLETE (2026-08-11) — shipped in 18 commits, every step verified before the next
+
+`src/wasm_c_api.zig`, `third_party/wasm-c-api/`, `tests/c_smoke.c`, `tests/c_abi_symbols.c` and
+`examples/deno_ffi.mjs` are **deleted**. The C ABI is `include/wazmrt.h` (ABI 2, 77 functions) over
+`src/capi.zig`. A clean `zig build` produces **three files**: `wazmrt.exe`, `wazmrt.lib`,
+`include/wazmrt.h`. **`third_party/` holds no code and the Component Ledger is EMPTY — wazmrt is 100%
+self-owned.**
+
+**Three outcomes worth carrying forward:**
+
+1. ⚠️ **IT GOT BIGGER, NOT SMALLER — the premise of the plan was wrong.** DLL **227 KB → 845 KB**, static
+   lib **279 KB → 974 KB**. Not waste: the embed artifact now carries the WAT assembler, WASI and an
+   `Io`, none of which the old surface had. The size gate refused the build and the ceilings were raised
+   deliberately, in the same commit, with the reason — which is the workflow the gate was built for two
+   days earlier. **This is what makes Track 2c (`-Dwat=false` / `-Dwasi=false`) necessary rather than
+   nice: every FFI consumer currently pays for both.**
+2. ✅ **The bug class is gone by construction, not by vigilance.** Value handles carry their store's
+   identity and are validated by lookup, so the double-free / use-after-free / uninitialised-refcount
+   family that produced `#20`, `#21` and `#22` cannot be expressed. Six hand-enforced rules became zero.
+3. 🎓 **Two gates earned their keep by FAILING.** The size gate caught the growth above. The symbol gate,
+   generated from the header, found four declared-but-undefined functions the moment it existed —
+   including two I had already listed and two I had not.
+
+**Deliberately absent from the ABI, additive later without moving `WAZMRT_ABI_VERSION`:** tables,
+multi-value returns, host-side imported memories/tables. `wazmrt_caller_get_memory` exists but always
+returns false (a durable memory handle needs a live store; the store is mid-borrow during a callback —
+use `wazmrt_caller_read`).
+
+### 📋 The agreed change series (owner-approved 2026-08-11) — build new, prove, then delete
 
 **Sequencing principle: the new surface is built ALONGSIDE the old, proven, and only then is the old
 deleted.** No step leaves a broken intermediate, and the two coexist long enough to *measure* what the
@@ -167,16 +207,17 @@ deletion buys. ⚠️ `src/wasm_c_api.zig` is the root module of **five** build-
 `dll`, `cabi_gnu` for c-smoke, `cabi_tests`, `cabi_tests_safe`) — nothing flips until the replacement
 satisfies all five.
 
-| # | Change | Gate |
-| --- | --- | --- |
-| 0 | **Size gate FIRST** — `zig build size` + checked-in ceilings | green at today's bytes |
-| 1 | `include/wazmrt.h` v2 — the full surface, header only | `-fsyntax-only` |
-| 2a–2e | `src/capi.zig` — lifecycle → memory/globals → **linker + caller-based host funcs** → WASI config → caps | `test` + `test-safe` |
-| 3 | `tests/wazmrt_abi_symbols.c` + new `c_smoke` | link-time completeness gate |
-| 4 | port `examples/deno_ffi.mjs` | `ffi-demo` |
-| 5 | flip the default; **`abi_version` → 2** | all green + **measure delta** |
-| 6 | **delete** old surface + `third_party/wasm-c-api/` | `zig-out/include` = 1 file |
-| 7 | memory + README sync | — |
+| # | Change | Gate | |
+| --- | --- | --- | --- |
+| 0 | **Size gate FIRST** — `zig build size` + checked-in ceilings | green at today's bytes | ✅ |
+| 1 | `include/wazmrt.h` v2 — the full surface, header only | compiles standalone | ✅ |
+| 2a–2e | `src/capi.zig` — lifecycle → memory/globals → **linker + caller-based host funcs** → WASI config → caps | `test` + `test-safe` | ✅ |
+| 2e-b | per-instance ceilings + **real per-proposal gating** (`src/features.zig`) | gating tests | ✅ |
+| 3 | `tests/wazmrt_abi_symbols.c` + `tests/capi_smoke.c` | link-time completeness gate | ✅ |
+| 4 | port the Deno demo → `examples/deno_ffi_capi.mjs` | `ffi-demo` | ✅ |
+| 5 | flip the default; **`abi_version` → 2**; trap-frame names | all green + measured delta | ✅ |
+| 6 | **delete** old surface + `third_party/wasm-c-api/` | `zig-out/include` = 1 file | ✅ |
+| 7 | memory + README sync | — | ✅ |
 
 **Owner decisions, 2026-08-11:**
 

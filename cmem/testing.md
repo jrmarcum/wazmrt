@@ -547,15 +547,22 @@ top of the standalone `mod_tests` run — so the printed total roughly doubles e
 quote the printed number as a distinct-test count; quote the per-target numbers from `--summary all`.**
 Green under **Debug AND ReleaseSafe**; `zig build c-smoke` 319/319.
 
-**Update 2026-08-11 — ABI-2 work in progress; the counts below are superseded.**
+**Update 2026-08-11 — ABI-2 COMPLETE; the counts below are superseded.**
 
-- **From an NTFS cwd: `zig build test` = 748/748, `test-safe` = 748/748, `test-security` = 3/3, all
-  ZERO skips.** From the D: (exFAT) repo the same runs report 742/748 with **6 skipped**.
-- **There are now THREE test binaries**, not two: `mod_tests`, `cabi_tests` and the new `capi_tests`
-  (`src/capi.zig`, the ABI-2 surface). Each imports `root.zig`, so each re-runs the core suite — the
-  printed total now **triples** the distinct-test count instead of doubling, and the skip count on
-  exFAT is 3 binaries × 2 symlink tests = 6. Both revert when step 6 deletes `cabi_tests`.
-  **Still: never quote the printed number as a distinct-test count.**
+- **From an NTFS cwd: `zig build test` = 510/510, `test-safe` = 510/510, `test-security` = 3/3, all
+  ZERO skips.** From the D: (exFAT) repo the same runs report 4 skips.
+- **TWO test binaries: `mod_tests` and `capi_tests`** (`src/capi.zig`). It was briefly three —
+  `cabi_tests` died with `src/wasm_c_api.zig` on 2026-08-11. ⚠️ **That is why the printed total FELL
+  from 763 to 510 without losing a single distinct test**: each binary imports `root.zig` and re-runs
+  the core suite, so the printed number is a multiple of the real one. **Never quote the printed
+  number as a distinct-test count.**
+- **`zig build c-smoke` is now `zig build capi-smoke`**, and its link-time symbol gate is
+  `tests/wazmrt_abi_symbols.c` — **generated from the header**, so it cannot drift by typo.
+  `zig build ffi-demo` now runs `examples/deno_ffi_capi.mjs`.
+- **New gate: `zig build size -Doptimize=ReleaseSmall`** — fails the build when a shipped artifact
+  exceeds `tools/size-ceilings.txt`. Ceilings are EXACT, so growth must raise the number in the same
+  commit and say what bought the bytes. Same shape as `test-security`: its entire value is that it CAN
+  go red, and it did — it caught the ABI-2 flip growing the DLL 227 KB → 845 KB.
 - ⚙️ **HOW to run from NTFS when the repo lives on the exFAT drive** — `zig build` roots itself where
   the repo is, so pointing it across the drive is the whole trick:
   ```

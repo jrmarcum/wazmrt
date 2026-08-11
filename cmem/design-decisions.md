@@ -420,7 +420,23 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   wazmrt already cedes to a JIT. Reserve `ReleaseFast` for a specifically compute-bound embedder.
   Aligns with the "smallest binary" goal at ~no cost to the win.
 
-- **Integration ABI = the standard wasm-c-api (2026-07-02).** The C ABI **is** the vendored standard
+- ⚡ **REVERSED AND EXECUTED 2026-08-11 — the integration ABI is now the native `wazmrt.h` (ABI 2).**
+  The entry below is the ORIGINAL decision, kept because its reasoning is why the replacement looks the
+  way it does. `src/wasm_c_api.zig` and `third_party/wasm-c-api/` are deleted.
+  **What replaced it (`src/capi.zig`, 77 functions):** value handles instead of refcounted objects —
+  which does not re-police the `#20`/`#21`/`#22` bug class but makes it *inexpressible*, since there is
+  no count to get wrong and no ownership to transfer; caller-based host callbacks, the capability
+  wasm-c-api structurally lacked; `.wat` accepted directly; WASI; five enforced resource ceilings; and
+  real per-proposal gating.
+  **What the reversal cost, measured:** the DLL grew **227 KB → 845 KB**, because the embed artifact
+  now carries the WAT assembler, WASI and an `Io`. The series was scoped expecting a *shrink*; the size
+  gate caught the growth and the ceilings were raised deliberately. That measurement is what promotes
+  comptime feature gating from optional to necessary.
+  🎓 **The durable lesson is one level up from the ABI: a design that rests on "consumer X already does
+  Y" is a hypothesis until someone opens X's source.** Everything below followed correctly from a
+  premise nobody checked.
+
+- **Integration ABI = the standard wasm-c-api (2026-07-02) — SUPERSEDED, see above.** The C ABI **is** the vendored standard
   `wasm.h` (Apache-2.0, `third_party/wasm-c-api/`); `include/wazmrt.h` is only a thin extension. Do NOT
   reinvent module/engine/store signatures — implement the standard ones (`src/wasm_c_api.zig`).
   Opaque `struct wasm_*_t*` handles; internal layout is free to change. Implement the standard

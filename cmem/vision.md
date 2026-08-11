@@ -189,6 +189,15 @@ Benefits:
   🎓 **The lesson (now in `wasmrt/cmem/best-practices.md`): a stated benefit is a hypothesis about
   someone ELSE's code — go read theirs.** The universal loaders were always meant to be the layer that
   standardises imports across languages; the runtime beneath them only ever had to serve **them**.
+
+  ✅ **RESOLVED 2026-08-11 — the ABI was replaced, not merely annotated.** `src/wasm_c_api.zig` and
+  `third_party/wasm-c-api/` are deleted; the C ABI is now the native `include/wazmrt.h` (ABI 2, 77
+  functions) whose shape came from the *actual* loader survey, and which does the two things
+  wasm-c-api could not: host callbacks reach the caller's memory, and `.wat` is accepted directly.
+  **wazmrt is 100% self-owned as a result** — nothing third-party ships, which is the second half of
+  "dependency-free, and self-owned" above. ⚠️ It also cost size (DLL 227 KB → 845 KB, because WAT +
+  WASI + `Io` now live in the embed artifact), which is recorded rather than smoothed over. Full
+  account: `roadmap.md` → TRACK 1 IS COMPLETE.
 - **Licensing freedom** — a structural win, not a preference. wazmrt is **`MIT OR Apache-2.0`** and
   100% team-owned; wasmtime is `Apache-2.0 WITH LLVM-exception`. Dropping the wasmtime dependency means
   a loader carries **no external-runtime license/NOTICE to propagate** and can license itself freely

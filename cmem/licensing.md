@@ -26,6 +26,21 @@ and change-statement obligations must be preserved. So:
   wazmrt still complies with, e.g., Apache-2.0 for any incorporated Apache-2.0 files. This is normal
   and expected — the dual choice covers our contributions, not the vendored code.
 
+## ⚡ Status 2026-08-11 — **wazmrt vendors NOTHING; the Component Ledger is EMPTY**
+
+`third_party/` contains `LICENSES.md` and no code. There is no third-party licence to satisfy, no
+NOTICE to propagate, and nothing that has to travel with the artifact: `zig-out/include/` is a single
+file, our own `wazmrt.h`.
+
+The one component ever vendored — the standard `wasm.h` (`Apache-2.0`) — went when the C ABI was
+replaced by the native `wazmrt.h`. **So wazmrt is now `MIT OR Apache-2.0` end to end, with no
+incorporated code under any other terms**, which is the "self-owned" half of the vision's
+*"dependency-free, and self-owned"*.
+
+⚠️ **Everything below stays anyway.** The obligations, the Adoption Checklist and the distribution
+rule describe what applies the moment something IS incorporated again. Deleting the machinery because
+it is currently unused is exactly how the next vendored file arrives unrecorded.
+
 ## The distribution rule (2026-08-10) — ⚠️ **a compliant repository is not a compliant distribution**
 
 Apache-2.0 §4(a) binds on **distribution**: recipients must get a copy of the license. The obligation

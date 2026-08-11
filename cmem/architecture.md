@@ -110,19 +110,63 @@ The core (`root.zig`) is compiled into three artifacts by `build.zig`:
   both always-on; a Rust guest (`rust_hello.rs` via `rustc`) behind `-Drust-gate=true`. The
   compiled-program conformance gate — see `testing.md` and the invariant in `design-decisions.md`.
 
-## C ABI contract — the standard wasm-c-api
+## C ABI contract — the native `wazmrt.h` (ABI 2)
 
-The integration ABI **is** the standard `wasm.h` (vendored, Apache-2.0, at
-`third_party/wasm-c-api/include/wasm.h`; ledger in `third_party/LICENSES.md`). `include/wazmrt.h` is a
-thin *extension* header (the wasmtime `wasm.h` + `wasmtime.h` pattern) that `#include`s `wasm.h` and
-adds only the wazmrt handshake.
+**The integration ABI is `include/wazmrt.h`: 77 functions, implemented by `src/capi.zig`.** It is
+wasmtime-*shaped* under our own names — not the standard wasm-c-api, and not wasmtime's symbols.
 
-⚠️ **The intended consumer does not bind to this surface (falsified 2026-08-10).** The
-`universalWasmLoader-*` ports use wasmtime's *other* C API — the `wasmtime_*` store/context/linker
-model — not wasm-c-api, and wasm-c-api's host-func callback **cannot reach the caller's memory**, which
-is what almost every loader host import needs. The ABI is still a correct, complete, standard one (and
-the Deno-FFI path is real); it is simply not the drop-in the decision claimed. Full account in
-`vision.md`; the decision entry in `design-decisions.md` carries the caveat and the lesson.
+⚡ **REPLACED 2026-08-11.** wazmrt shipped the vendored wasm-c-api (`wasm.h`, 319 declared functions,
+`src/wasm_c_api.zig`) from 2026-07-02 until then. It was deleted outright, and with it
+`third_party/wasm-c-api/`. The reasoning is in `vision.md` (the falsified payoff) and
+`design-decisions.md`; the short version is that it could not do the intended consumer's core job and
+concentrated every C-ABI audit finding this project has ever had.
+
+### The three things that define this surface
+
+1. **Value handles, not refcounted objects.** `wazmrt_instance_t`/`_func_t`/`_memory_t`/`_global_t` are
+   `struct { uint64_t id; }` encoding `(store_id << 32) | (slot + 1)`. The host never frees one.
+   Validity is decided by LOOKUP in the owning store, so a handle from another store, from a deleted
+   store, or an all-zero one a caller forgot to fill in, is *rejected* rather than naming someone
+   else's resource. Slot 0 is never used precisely so a zeroed handle is invalid by construction.
+   ⚠️ **This is the fix for the #20/#21/#22 class.** There is no count to get wrong and no ownership
+   transfer, so the double-free / use-after-free / uninitialised-refcount family cannot be expressed.
+   Opaque pointers (engine/store/module/linker/trap/error) remain ordinary C: one owner, one `_delete`.
+2. **Caller-based host callbacks.** `wazmrt_caller_read`/`_write`/`_memory_size` read and write GUEST
+   memory from inside a callback. wasm-c-api structurally could not, which is the load-bearing reason
+   it was replaced.
+3. **`.wat` as a first-class input.** `wazmrt_module_new_wat` assembles, decodes and validates text
+   in-process; `wazmrt_wat_to_wasm` hands back the binary to cache. No other embeddable runtime offers
+   this. ⚠️ The saving is a PIPELINE (no converter process, no temp file), not decode time.
+
+### Contract rules
+
+- **Errors and traps are different channels.** A function returning `wazmrt_error_t*` returns NULL on
+  success; a guest trap arrives through a separate `wazmrt_trap_t**` out-param. A call can return no
+  error and still have trapped — check both.
+- **Host/guest signatures are cross-checked at link time.** Two declarations exist (the module's and
+  the linker's), so they are compared rather than trusted; a mismatch fails instantiation naming the
+  import. Guest-to-guest imports via `define_instance` are checked the same way.
+- **Concurrency comes from multiple engines.** An engine carries a single-threaded `std.Io` and
+  everything reachable from it is single-threaded. An async/threaded host gives each concurrent
+  context its own engine; they share nothing.
+- **All five resource ceilings are enforced** (memory, table elements, GC objects, exception boxes,
+  call depth), re-checked by the interpreter at run time rather than only at instantiation.
+- **Per-proposal gating is real** (`src/features.zig`): a disabled proposal makes a module INVALID at
+  `wazmrt_module_new` *and* `wazmrt_module_validate`. Gating inspects types as well as code, because a
+  module can need a proposal without executing one of its instructions.
+- **Deliberately absent, and additive later without moving `WAZMRT_ABI_VERSION`:** tables, multi-value
+  returns, host-side imported memories/tables. No surveyed consumer needs them and an unused symbol is
+  pure size. `wazmrt_caller_get_memory` exists but always returns false — a durable memory handle must
+  be tagged against a live store and the store is mid-borrow during a callback; use `caller_read`.
+- **Bump `root.abi_version`** on any breaking change. It is **2**; version 1 was the wasm-c-api
+  surface, and nothing from it survives, so a v1 consumer fails to LINK rather than mislinking.
+- **The link-time completeness gate is `tests/wazmrt_abi_symbols.c`**, GENERATED from the header, so it
+  cannot drift by typo. A symbol declared but not defined breaks our build, not an embedder's.
+
+<!--
+RETIRED 2026-08-11 — the wasm-c-api surface this section used to document. Kept only as a marker that
+it existed; the implementation, the vendored header, its tests and its Deno demo are all deleted. Do
+not restore this list; see the git history if the detail is ever needed.
 
 **Implemented today** (`src/wasm_c_api.zig`) — the subset the runtime can back:
 
@@ -198,3 +242,8 @@ partial implementation is honest and safe.
 are `{ size_t size; T* data; }` the caller owns. **Windows:** consumers compile with `-DLIBWASM_STATIC`
 (we ship a static lib; otherwise `wasm.h` marks symbols `__declspec(dllimport)`). Bump `wazmrt_abi_version`
 on any wazmrt-extension break.
+-->
+
+⚠️ **`-DLIBWASM_STATIC` is no longer needed.** It was a wasm-c-api requirement; `wazmrt.h` declares
+nothing `__declspec(dllimport)`, so a consumer compiles the same way against the static library or
+the DLL.
