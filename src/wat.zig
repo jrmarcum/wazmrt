@@ -1576,11 +1576,11 @@ fn emitFoldedOne(ctx: *Ctx, l: []const Sexpr, i: usize) Error!usize {
         .try_table => try emitTryTable(ctx, l),
         .@"if" => try emitFoldedIf(ctx, l),
         .select => try emitFoldedSelect(ctx, l),
-        .call_indirect => {
+        .call_indirect, .return_call_indirect => {
             const ann = try parseCallIndirectType(ctx, l, 1);
             var j = ann.next;
             while (j < l.len) j = try emitOne(ctx, l, j); // operands
-            try emitCallIndirect(ctx, ann.idx, ann.table);
+            try emitCallIndirect(ctx, op, ann.idx, ann.table);
         },
         .ref_test, .ref_cast => {
             if (l.len < 2) return error.BadImmediate;
@@ -1633,8 +1633,10 @@ fn isTypeUse(s: Sexpr) bool {
     return std.mem.eql(u8, kw, "type") or std.mem.eql(u8, kw, "param") or std.mem.eql(u8, kw, "result");
 }
 
-fn emitCallIndirect(ctx: *Ctx, type_index: u32, table: u32) Error!void {
-    try ctx.out.append(ctx.a, @intFromEnum(Op.call_indirect));
+/// `op` is `call_indirect` or its tail-call twin `return_call_indirect` — the
+/// immediates are identical, only the opcode byte differs.
+fn emitCallIndirect(ctx: *Ctx, op: Op, type_index: u32, table: u32) Error!void {
+    try ctx.out.append(ctx.a, @intFromEnum(op));
     try uleb(ctx.a, ctx.out, type_index);
     try uleb(ctx.a, ctx.out, table);
 }
@@ -1887,9 +1889,9 @@ fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Erro
             try emitSelect(ctx, tys.items);
             return j;
         },
-        .call_indirect => {
+        .call_indirect, .return_call_indirect => {
             const ann = try parseCallIndirectType(ctx, items, i + 1);
-            try emitCallIndirect(ctx, ann.idx, ann.table);
+            try emitCallIndirect(ctx, op, ann.idx, ann.table);
             return ann.next;
         },
         .ref_test, .ref_cast => {
@@ -5298,5 +5300,74 @@ test "64-bit tables (table64): index operands take i64 end to end" {
         var om = try Module.decode(a, try assemble(a, ok));
         try std.testing.expect(!om.tables[0].limits.is64);
         try validate(a, &om);
+    }
+}
+
+test "tail calls reuse the frame, so recursion depth is unbounded" {
+
+    // 100_000 hops is ~100x the call-depth cap. A tail call implemented as
+    // call-then-return passes every shallow assertion and dies here, which is
+    // exactly what happened: `return_call_ref` shipped that way with
+    // function-references, and its deep-recursion assertions reported
+    // `CallStackExhausted`. Depth is the whole point of the proposal, so it is
+    // the property worth pinning.
+    const direct =
+        \\(module (func $count (export "count") (param i64) (result i64)
+        \\  (if (result i64) (i64.eqz (local.get 0))
+        \\    (then (local.get 0))
+        \\    (else (return_call $count (i64.sub (local.get 0) (i64.const 1)))))))
+    ;
+    try std.testing.expectEqual(@as(i64, 0), interp.asI64(try assembleAndRun(direct, "count", &.{interp.i64Value(100_000)})));
+
+    const indirect =
+        \\(module
+        \\  (type $t (func (param i64) (result i64)))
+        \\  (table 1 funcref) (elem (i32.const 0) $count)
+        \\  (func $count (export "count") (type $t)
+        \\    (if (result i64) (i64.eqz (local.get 0))
+        \\      (then (local.get 0))
+        \\      (else (return_call_indirect (type $t)
+        \\              (i64.sub (local.get 0) (i64.const 1)) (i32.const 0))))))
+    ;
+    try std.testing.expectEqual(@as(i64, 0), interp.asI64(try assembleAndRun(indirect, "count", &.{interp.i64Value(100_000)})));
+
+    // `return_call_ref` is now the same real tail call, not call-then-return.
+    const via_ref =
+        \\(module
+        \\  (type $t (func (param i64) (result i64)))
+        \\  (elem declare func $count)
+        \\  (func $count (export "count") (type $t)
+        \\    (if (result i64) (i64.eqz (local.get 0))
+        \\      (then (local.get 0))
+        \\      (else (return_call_ref $t
+        \\              (i64.sub (local.get 0) (i64.const 1)) (ref.func $count))))))
+    ;
+    try std.testing.expectEqual(@as(i64, 0), interp.asI64(try assembleAndRun(via_ref, "count", &.{interp.i64Value(100_000)})));
+}
+
+test "a tail call's results must be the calling function's results" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The callee REPLACES the frame, so its results are returned as ours —
+    // equality, not the subtyping a normal `call` would allow on the operand
+    // stack. A mismatch is invalid, not a coercion.
+    for ([_][]const u8{
+        "(module (func $g (result i32) (i32.const 0)) (func (export \"f\") (result i64) (return_call $g)))",
+        "(module (func $g (result i32) (i32.const 0)) (func (export \"f\") (return_call $g)))",
+        "(module (type $t (func (result i32))) (table 1 funcref)" ++
+            " (func (export \"f\") (result i64) (return_call_indirect (type $t) (i32.const 0))))",
+    }) |src| {
+        var m = try Module.decode(a, try assemble(a, src));
+        try std.testing.expectError(error.TypeMismatch, validate(a, &m));
+    }
+
+    // Matching results validate, and an i64 table index reaches the indirect form.
+    {
+        const ok = "(module (func $g (result i32) (i32.const 7)) (func (export \"f\") (result i32) (return_call $g)))";
+        var m = try Module.decode(a, try assemble(a, ok));
+        try validate(a, &m);
+        try std.testing.expectEqual(@as(i32, 7), interp.asI32(try assembleAndRun(ok, "f", &.{})));
     }
 }

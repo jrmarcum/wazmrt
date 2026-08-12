@@ -216,7 +216,8 @@ typedef enum {
     WAZMRT_FEATURE_MEMORY64                  = 10,
     WAZMRT_FEATURE_FUNCTION_REFERENCES       = 11,  /* requires REFERENCE_TYPES     */
     WAZMRT_FEATURE_GC                        = 12,  /* requires FUNCTION_REFERENCES */
-    WAZMRT_FEATURE_EXCEPTIONS                = 13   /* requires REFERENCE_TYPES     */
+    WAZMRT_FEATURE_EXCEPTIONS                = 13,  /* requires REFERENCE_TYPES     */
+    WAZMRT_FEATURE_TAIL_CALL                 = 14
 } wazmrt_feature_t;
 
 wazmrt_config_t *wazmrt_config_new(void);

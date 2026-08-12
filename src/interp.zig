@@ -1310,30 +1310,61 @@ pub const Instance = struct {
                 },
             }
         }
-        const defined = func_index - self.imported_funcs;
-        if (defined >= self.func_bodies.len) return error.UndefinedFunc;
-        const body = &self.func_bodies[defined];
+        // Tail-call loop. A `return_call` to a function defined here does NOT
+        // recurse: `run` returns with `frame.tail` set and we re-enter with the
+        // new function, reusing this native frame. That is the whole proposal —
+        // `return_call.wast` asks for a million hops, which any nesting scheme
+        // fails at the call-depth cap.
+        //
+        // Buffers are reused across hops rather than reallocated: `a` is an
+        // ARENA, so a fresh `locals` per hop would leak ~a million allocations
+        // into a single invocation. Self-recursion (the common shape) keeps the
+        // same sizes, so after the first hop this allocates nothing.
+        var cur_index = func_index;
+        var cur_args = args;
+        var locals_buf: []Value = &.{};
+        var frame: Frame = .{ .inst = self, .a = a, .body = undefined, .locals = &.{}, .depth = depth, .func_index = cur_index };
+        while (true) {
+            const defined = cur_index - self.imported_funcs;
+            if (defined >= self.func_bodies.len) return error.UndefinedFunc;
+            const body = &self.func_bodies[defined];
 
-        const locals = try a.alloc(Value, body.num_local_slots);
-        @memcpy(locals, body.local_defaults); // ref locals → null, numeric/v128 → 0
-        @memcpy(locals[0..args.len], args); // args are param slots (v128 = 2 each)
+            if (body.num_local_slots > locals_buf.len)
+                locals_buf = try a.realloc(locals_buf, body.num_local_slots);
+            const locals = locals_buf[0..body.num_local_slots];
+            @memcpy(locals, body.local_defaults); // ref locals → null, numeric/v128 → 0
+            if (cur_args.len > locals.len) return error.BadArgCount; // over-long args (unvalidated path)
+            @memcpy(locals[0..cur_args.len], cur_args); // args are param slots (v128 = 2 each)
 
-        var frame: Frame = .{ .inst = self, .a = a, .body = body, .locals = locals, .depth = depth, .func_index = func_index };
-        try frame.labels.append(a, .{
-            .is_loop = false,
-            .arity = typeSlots(body.type.results),
-            .target = body.ir.len,
-            .stack_base = 0,
-        });
-        try frame.run();
+            frame.body = body;
+            frame.locals = locals;
+            frame.func_index = cur_index;
+            frame.tail = null;
+            frame.underflowed = false;
+            frame.vstack.clearRetainingCapacity();
+            frame.labels.clearRetainingCapacity();
+            try frame.labels.append(a, .{
+                .is_loop = false,
+                .arity = typeSlots(body.type.results),
+                .target = body.ir.len,
+                .stack_base = 0,
+            });
+            try frame.run();
 
-        const n = typeSlots(body.type.results);
-        const res = try a.alloc(Value, n);
-        // A malicious body may under-produce its declared results; trap rather
-        // than copy from a wild base before the value stack.
-        const rbase = try frame.stackBase(n);
-        @memcpy(res, frame.vstack.items[rbase..]);
-        return res;
+            if (frame.tail) |t| {
+                cur_index = t.func_index;
+                cur_args = t.args;
+                continue;
+            }
+
+            const n = typeSlots(body.type.results);
+            const res = try a.alloc(Value, n);
+            // A malicious body may under-produce its declared results; trap rather
+            // than copy from a wild base before the value stack.
+            const rbase = try frame.stackBase(n);
+            @memcpy(res, frame.vstack.items[rbase..]);
+            return res;
+        }
     }
 };
 
@@ -1414,6 +1445,23 @@ const Frame = struct {
     labels: std.ArrayList(Label) = .empty,
     /// Set by `pop` when the operand stack was empty. See `pop`.
     underflowed: bool = false,
+    /// A pending TAIL CALL: `run` has returned early so `callFunction` can
+    /// re-enter with this function **in place of** the current frame.
+    ///
+    /// This is what makes `return_call` a tail call rather than a call followed
+    /// by a return. `return_call_ref` (which shipped first) takes the easy route
+    /// — call natively, then jump to the epilogue — which is semantically right
+    /// but grows the native stack per hop, so `count(1_000_000)` in
+    /// `return_call.wast` would die at the ~900-frame depth cap. The whole point
+    /// of the proposal is that it must not.
+    ///
+    /// Only set for a DEFINED function of this instance: an imported callee has
+    /// no frame of ours to reuse.
+    tail: ?struct { func_index: u32, args: []const Value } = null,
+    /// Reusable backing for `tail.args`. Grown, never re-allocated per hop: `a`
+    /// is an arena, so allocating fresh args a million times would retain a
+    /// million buffers for one invocation.
+    tail_buf: []Value = &.{},
 
     fn pushU64(self: *Frame, v: Value) Error!void {
         try self.vstack.append(self.a, v);
@@ -1958,6 +2006,46 @@ const Frame = struct {
                     for (results) |r| try self.pushU64(r);
                     pc += 1;
                 },
+                .return_call, .return_call_indirect => {
+                    // Resolve the callee: a direct func index, or a table slot.
+                    const f: u32 = if (instr.op == .return_call) instr.imm.func else blk: {
+                        const ci = instr.imm.call_indirect;
+                        if (ci.table >= self.inst.tables.len) return error.NoTable;
+                        const tab = self.inst.tables[ci.table];
+                        const slot = self.popMemU64(tab.is64);
+                        if (slot >= tab.entries.len) return error.TableOutOfBounds;
+                        if (tab.entries[@intCast(slot)] == null_ref) return error.UninitializedElement;
+                        const fi = std.math.cast(u32, tab.entries[@intCast(slot)]) orelse return error.UndefinedFunc;
+                        const want = self.inst.module.funcSig(ci.type_index) orelse return error.UndefinedType;
+                        const got = self.inst.module.funcType(fi) orelse return error.UndefinedFunc;
+                        if (!funcTypeEqual(want, got)) return error.IndirectTypeMismatch;
+                        break :blk fi;
+                    };
+                    const ft = self.inst.module.funcType(f) orelse return error.UndefinedFunc;
+                    const np = typeSlots(ft.params);
+                    const base = try self.stackBase(np);
+                    if (f >= self.inst.imported_funcs) {
+                        // Defined here: hand the args up and let `callFunction`
+                        // REPLACE this frame. Copied out because the vstack they
+                        // sit on dies with the frame.
+                        if (np > self.tail_buf.len) self.tail_buf = try self.a.realloc(self.tail_buf, np);
+                        @memcpy(self.tail_buf[0..np], self.vstack.items[base..]);
+                        self.tail = .{ .func_index = f, .args = self.tail_buf[0..np] };
+                        return;
+                    }
+                    // Imported (host or another instance): there is no frame of
+                    // ours to reuse, so this degrades to call-then-return. Depth
+                    // still grows, which is correct — the boundary is a real
+                    // native call either way.
+                    const args = self.vstack.items[base..];
+                    const results = self.inst.callFunction(self.a, f, args, self.depth + 1) catch |e| {
+                        pc = try self.onCallError(e);
+                        continue;
+                    };
+                    self.vstack.shrinkRetainingCapacity(base);
+                    for (results) |r| try self.pushU64(r);
+                    pc = ir.len; // the callee's results are ours
+                },
                 .call_indirect => {
                     const ci = instr.imm.call_indirect;
                     if (ci.table >= self.inst.tables.len) return error.NoTable;
@@ -1990,6 +2078,18 @@ const Frame = struct {
                     const ft = self.inst.module.funcType(f) orelse return error.UndefinedFunc;
                     const np = typeSlots(ft.params); // param slots (v128 = 2)
                     const base = try self.stackBase(np);
+                    // `return_call_ref` is a REAL tail call, same as its two
+                    // siblings. It shipped with function-references doing
+                    // call-then-jump-to-epilogue, which is semantically right but
+                    // grows the native stack per hop — so the deep-recursion
+                    // assertions in `return_call_ref.wast` hit the depth cap and
+                    // reported `CallStackExhausted` (6 of its 7 failures).
+                    if (instr.op == .return_call_ref and f >= self.inst.imported_funcs) {
+                        if (np > self.tail_buf.len) self.tail_buf = try self.a.realloc(self.tail_buf, np);
+                        @memcpy(self.tail_buf[0..np], self.vstack.items[base..]);
+                        self.tail = .{ .func_index = f, .args = self.tail_buf[0..np] };
+                        return;
+                    }
                     const args = self.vstack.items[base..];
                     const results = self.inst.callFunction(self.a, f, args, self.depth + 1) catch |e| {
                         pc = try self.onCallError(e);
@@ -1997,8 +2097,8 @@ const Frame = struct {
                     };
                     self.vstack.shrinkRetainingCapacity(base);
                     for (results) |r| try self.pushU64(r);
-                    // return_call_ref is a tail call: the callee's results become
-                    // ours (the epilogue takes the top `results.len`).
+                    // An imported `return_call_ref` still degrades to
+                    // call-then-return: there is no frame of ours to reuse.
                     pc = if (instr.op == .return_call_ref) ir.len else pc + 1;
                 },
                 .ref_as_non_null => {

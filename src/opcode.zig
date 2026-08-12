@@ -45,6 +45,11 @@ pub const Op = enum(u8) {
     @"return" = 0x0f,
     call = 0x10,
     call_indirect = 0x11,
+    // Tail calls (tail-call proposal). Same immediates as `call`/`call_indirect`;
+    // the callee REPLACES this frame rather than nesting inside it, so its
+    // results must be the current function's results.
+    return_call = 0x12,
+    return_call_indirect = 0x13,
     // Exception handling (exnref proposal, Phase 6).
     throw = 0x08, // immediate: a tag index — package operands into an exception + throw
     throw_ref = 0x0a, // rethrow the exnref on the stack (null → trap)
@@ -576,8 +581,8 @@ pub fn immediateKind(op: Op) ImmKind {
         0x1f => .try_table, // try_table <blocktype> vec(catch)
         0x0c, 0x0d, 0x09, 0x18 => .label, // br/br_if + legacy `rethrow`/`delegate`
         0x0e => .br_table,
-        0x10 => .func,
-        0x11 => .call_indirect,
+        0x10, 0x12 => .func, // call / return_call
+        0x11, 0x13 => .call_indirect, // call_indirect / return_call_indirect
         0x14, 0x15 => .func, // call_ref / return_call_ref — imm.func = type index
         0xd5, 0xd6 => .label, // br_on_null / br_on_non_null
         0x20, 0x21, 0x22 => .local,

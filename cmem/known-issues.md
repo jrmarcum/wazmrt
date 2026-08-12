@@ -138,7 +138,39 @@ nothing else binds a caught exception. We checked only that the label *resolved*
 whatever the enclosing frame had left in `handler_exn`. Same accept-invalid class as T1, in a feature
 wazmrt does implement. Now `error.InvalidRethrowLabel`.
 
-### ❌ T4 — MISCLASSIFIED (2026-08-12): not EH at all, it is the TAIL-CALL proposal
+### ✅ T4 — was the TAIL-CALL proposal, IMPLEMENTED 2026-08-12
+
+Corpus **288 → 275**, +176 passing. `return_call.wast` and `return_call_indirect.wast` are clean;
+`return_call_ref.wast` 7 → 1; `legacy/try_catch.wast` (the file that produced the original symptom)
+went 5 passed / 2 failed / 33 skipped → **31 passed / 1 failed / 7 skipped**.
+
+⚠️ **The interesting part is `return_call_ref`, which had "shipped" with function-references.** It was
+implemented as *call the callee, then jump to the epilogue* — semantically correct, and it passes
+every shallow assertion. But a tail call's entire purpose is that **depth is unbounded**, and that
+version grew the native stack per hop, so `return_call_ref.wast`'s deep-recursion assertions died at
+the ~900-frame cap with `CallStackExhausted`. The real implementation reuses the frame:
+`Frame.tail` reports the callee and `Instance.callFunction` LOOPS instead of recursing.
+
+- **The buffers must be reused, not re-allocated.** `callFunction`'s allocator is an ARENA, so a
+  fresh `locals`/args per hop would retain a million allocations for one invocation of
+  `count(1_000_000)`. `locals_buf` and `Frame.tail_buf` grow and are reused; self-recursion keeps
+  the same sizes, so after the first hop the loop allocates nothing.
+- An **imported** callee still degrades to call-then-return — there is no frame of ours to reuse,
+  and the host boundary is a real native call either way.
+- Results are matched by **equality**, not subtyping: the callee replaces the frame, so its results
+  *are* this function's results.
+
+✅ **The `features.zig` COVERAGE PIN earned its keep.** Adding two opcodes broke the build with
+*"opcode.Op has 240 members, features.zig was written against 238"* before the gate could silently
+pass them. A new `tail_call` feature (14) was added to `Feature`, `opFeature`, and
+`WAZMRT_FEATURE_TAIL_CALL` in `include/wazmrt.h` — the C enum casts straight across and must not
+drift. **This is the pattern the three producer/consumer blind spots lacked: a mechanical check that
+fails closed when a new case appears.**
+
+**Still open:** `return_call_ref.wast` 1 and `legacy/try_catch.wast` 1, both cross-module type/tag
+identity (see the GC section). `try_delegate.wast` remains the deliberate `delegate` refusal.
+
+#### The original misdiagnosis (kept — it is the lesson)
 
 `legacy/try_catch.wast` fails to build with `UnknownInstr`, and the triage read that as "some legacy
 `try`/`catch` variant we do not decode". It is neither legacy nor EH: lines 155 and 165 use

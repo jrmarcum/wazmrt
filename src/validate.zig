@@ -942,6 +942,26 @@ const FuncValidator = struct {
                 try self.popVals(ft.params);
                 try self.pushVals(ft.results);
             },
+            // Tail calls (§3.3.8). The callee REPLACES this frame, so its results
+            // ARE this function's results — they must match exactly, and nothing
+            // after the instruction is reachable. `return_call_ref` already had
+            // this shape; these two are its plain and indirect siblings.
+            .return_call => {
+                const ft = self.module.funcType(instr.imm.func) orelse return error.UndefinedFunc;
+                try self.popVals(ft.params);
+                if (!valTypesEqual(ft.results, self.results)) return error.TypeMismatch;
+                self.setUnreachable();
+            },
+            .return_call_indirect => {
+                const ci = instr.imm.call_indirect;
+                if (ci.table >= self.module.tables.len) return error.UndefinedTable;
+                if (!subtypeOf(self.module, self.module.tables[ci.table].element, .funcref)) return error.TypeMismatch;
+                const ft = self.module.funcSig(ci.type_index) orelse return error.UndefinedType;
+                _ = try self.popExpect(self.tableAddrTy(ci.table)); // the callee index
+                try self.popVals(ft.params);
+                if (!valTypesEqual(ft.results, self.results)) return error.TypeMismatch;
+                self.setUnreachable();
+            },
             .call_indirect => {
                 const ci = instr.imm.call_indirect;
                 if (ci.table >= self.module.tables.len) return error.UndefinedTable;

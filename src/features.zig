@@ -37,6 +37,7 @@ pub const Feature = enum(u8) {
     function_references = 11,
     gc = 12,
     exceptions = 13,
+    tail_call = 14,
 
     pub fn name(self: Feature) []const u8 {
         return @tagName(self);
@@ -98,6 +99,10 @@ fn opFeature(op: opcode.Op) ?Feature {
 
         // Typed function references.
         .call_ref, .return_call_ref, .ref_as_non_null, .br_on_null, .br_on_non_null => .function_references,
+
+        // Tail calls. `return_call_ref` above belongs to function-references, not
+        // here — it arrived with that proposal and is gated with its siblings.
+        .return_call, .return_call_indirect => .tail_call,
 
         // WasmGC: i31, struct, array, equality and the casts.
         .ref_eq, .ref_i31, .i31_get_s, .i31_get_u,
@@ -214,8 +219,8 @@ pub fn firstViolation(gpa: std.mem.Allocator, module: *const Module, fs: Set) !?
 // confirm it really is MVP core), and only then update the number.
 comptime {
     const n = @typeInfo(opcode.Op).@"enum".fields.len;
-    if (n != 238) @compileError(std.fmt.comptimePrint(
-        "opcode.Op has {d} members, features.zig was written against 238. A new opcode must be " ++
+    if (n != 240) @compileError(std.fmt.comptimePrint(
+        "opcode.Op has {d} members, features.zig was written against 240. A new opcode must be " ++
             "classified in opFeature() before this number is updated — an unclassified opcode " ++
             "silently passes every proposal gate.",
         .{n},

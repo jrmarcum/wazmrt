@@ -144,7 +144,7 @@ opposite of the failure mode most of the audit passes hunted, and in a corner no
 | **T1** 🔴 | **Accept-invalid** — malformed modules ACCEPTED | 43 → **68** | ✅ **fixed 2026-08-12** |
 | **T2** 🔴 | A custom-page-size module accepted **then mis-executed** — `memory.grow` → −1 | 12 | ✅ dissolved by T1 |
 | **T3** 🟠 | **legacy `rethrow`** — a stale workaround + an accept-invalid | 3 | ✅ **fixed 2026-08-12** |
-| **T4** 🟠 | ~~a legacy `try`/`catch` encoding not decoded~~ — actually the **tail-call proposal** | 2 | ❌ **not EH; owner's scope call** |
+| **T4** 🟠 | ~~a legacy `try`/`catch` encoding not decoded~~ — actually the **tail-call proposal** | 2 | ✅ **implemented 2026-08-12** |
 | **T5** 🟡 | oversized limits refused at the wrong STAGE (decode, not link) | 2 | ❌ **not a defect** — see below |
 
 **T1 was bigger than the triage said, and the guess about its cause was wrong.** Corpus
@@ -166,10 +166,16 @@ its error message can be a shadow of a defect three layers up.**
 existence (a symptom of T1), and T4's subject (tail calls, not EH). The triage classified 164 failures
 by each file's **first-failure text**, and that text names a symptom. Corpus **525 → 452 failures**.
 
-**Nothing on this list is now open.** T4 is the only item left and it is a **scope question for the
-owner**: implement the tail-call proposal (`return_call` / `return_call_indirect`, opcodes `0x12`/
-`0x13` — absent entirely, though `return_call_ref`'s tail-call machinery already exists), or record it
-as out of scope like the other 102 by-design failures.
+**The whole list is closed.** T1/T3 fixed, T2/T5 dissolved, T4 implemented (the tail-call proposal —
+`return_call`/`return_call_indirect`, opcodes `0x12`/`0x13`, plus `return_call_ref` rebuilt as a REAL
+tail call). Session total: **525 → 275 corpus failures**, 60,568 → 61,115 passing, zero regressions at
+any step.
+
+⚠️ **`return_call_ref` is the cautionary tale of the whole series.** It was recorded as shipped with
+function-references, and it passed every shallow assertion — but it was implemented as
+call-then-return, so the one property the proposal exists to provide (unbounded depth) was absent.
+**A feature can be present, tested, and green while failing at exactly the thing it is for.** Same
+family as the memory64 "COMPLETE" claim above.
 
 ### What is left after Track 1 (2026-08-11)
 
