@@ -16,6 +16,11 @@ pub const validate = @import("validate.zig").validate;
 pub const lastFailureSite = @import("validate.zig").lastFailureSite;
 pub const FailureSite = @import("validate.zig").FailureSite;
 pub const interp = @import("interp.zig");
+/// Type identity and import matching ACROSS module boundaries — a concrete
+/// `(ref $t)` carries a module-local index, so linking two modules cannot compare
+/// value types directly. Any linker that binds one module's export to another's
+/// import must go through this.
+pub const typematch = @import("typematch.zig");
 /// Per-proposal gating: which WebAssembly proposals a module is allowed to use.
 pub const features = @import("features.zig");
 pub const Instance = interp.Instance;

@@ -182,14 +182,19 @@ call-then-return, so the one property the proposal exists to provide (unbounded 
 **A feature can be present, tested, and green while failing at exactly the thing it is for.** Same
 family as the memory64 "COMPLETE" claim above.
 
-### 🎯 REVISED conformance list (2026-08-12) — the 275 that remain
+### 🎯 REVISED conformance list (2026-08-12) — the 275, now **237** after R1
 
 Successor to the T-list above, and built differently: every item below is grouped **by cause**, from a
 run with `-Dfailures=600` so all 275 failures were read, not just each file's first. The T-list was
 grouped by first-failure text and mislabelled three of its five items.
 
+⚠️ **The per-item counts below are as-triaged (275 total) and are NOT live.** R1 is done — corpus is
+**237**, of which 103 are by design and **134 actionable**. R1 also took failures out of R4, R6 and R7,
+so those counts are now high; re-measure before trusting any of them (`-Dfailures=600`, diff the
+per-file summary against the previous run).
+
 **103 of the 275 are BY DESIGN** — proposals wazmrt does not target, refused honestly. They are not
-defects and there is nothing to fix unless the scope changes:
+defects and there is nothing to fix unless the scope changes (**both counts unchanged by R1**):
 
 | | area | failures | note |
 | --- | --- | --- | --- |
@@ -200,19 +205,59 @@ defects and there is nothing to fix unless the scope changes:
 
 | | item | failures | why it matters |
 | --- | --- | --- | --- |
-| **R1** 🔴 | **Cross-module type identity** | 25 | `funcTypeEqual`/`funcTypeEq` compare `ValType` slices with `std.mem.eql`, but a concrete `(ref $t)` carries a **module-local index** — so types from two modules are never comparable. Needs STRUCTURAL comparison walking both type sections in step. 7 `unlinkable: module linked` (accept-invalid at link), 4 `IncompatibleImportType` (valid modules refused), 5 `IndirectTypeMismatch`. **Absorbs the last leftovers of T3, T4 and the GC work** — `try_catch.wast` and `return_call_ref.wast` each end here. |
-| **R2** 🔴 | **elem / linking / instance** | 42 | `elem.wast` 16, `linking.wast` 12, `instance.wast` 8, `linking0/3`. Includes **11 wrong-answer** (`result mismatch`) failures — the worst class in this codebase's taxonomy, a plausible wrong value handed to the guest. |
+| **R1** 🔴 | **Cross-module type identity** | 25 | ✅ **FIXED 2026-08-12 — and it was 38, not 25.** See below. |
+| **R2** 🔴 | **elem / linking / instance** | 42 → **35** | Now `elem.wast` 14, `linking.wast` 11, `instance.wast` 8, `linking0/3` 1 each. Includes the **wrong-answer** (`result mismatch`) failures — the worst class in this codebase's taxonomy, a plausible wrong value handed to the guest. All 11 of `linking.wast`'s remaining failures are that class. **Next.** |
 | **R3** 🟠 | **GC array data/elem ops MISSING** | ~10 | `array.new_data` / `array.init_data` / `array.new_elem` / `array.init_elem` are **absent from `opcode.zig` entirely** (`array_new_data.wast` 5, `array_init_data.wast` 2, `array.wast` 2). ⚠️ **GC is a TARGETED, shipped feature** — same shape as table64: a proposal recorded as done with a piece missing. |
-| **R4** 🟠 | **Accept-invalid in core files** | ~15 | `table.wast` 7, `try_table.wast` 2, `ref.wast` 2, `tag.wast` 1, and others. The safety class the whole T1 effort was about, still present in the main suite. |
+| **R4** 🟠 | **Accept-invalid in core files** | ~15 | Now `table.wast` 7, `try_table.wast` 6, `ref.wast` 2, `tag.wast` 1, and others. The safety class the whole T1 effort was about, still present in the main suite. R1 took `tag.wast` 3 → 1 by type-checking tag imports, which had **no check at all**. |
 | **R5** 🟡 | **Runner gaps, not wazmrt defects** | 41 | `(module quote …)` is unimplemented in `wast.zig` → 20 `BadCommand`; 21 `NoTarget` cascades from modules that never built. These suppress real verification rather than proving anything — the same red-washing as `(either …)` was. Cheap, and it makes every other number honest. |
-| **R6** 🟡 | GC type remainder + `i31` | 20 | `type-subtyping` 12, `type-rec` 9 (largely `(module quote …)`-adjacent), `i31.wast` 9. Partly falls out of R1/R5. |
-| **R7** 🟡 | threads | 15 | `proposals/threads/imports.wast` 13, `memory.wast` 2 — mostly shared-memory import matching, adjacent to R1. |
+| **R6** 🟡 | GC type remainder + `i31` | 20 → **8** | ✅ Mostly gone with R1, exactly as predicted: `type-subtyping` and `type-rec` are **clean**; only `i31.wast` 8 remains. |
+| **R7** 🟡 | threads | 15 | `proposals/threads/imports.wast` 13, `memory.wast` 2 — mostly shared-memory import matching. ⚠️ **R1 did NOT touch it** despite being "adjacent": those 13 are limits/`shared`-flag matching, not type identity. |
 | **R8** ⚠️ | **UTF-8 name validation is UNVERIFIED** | 0 failures | `utf8-invalid-encoding.wast` is **0 passed / 0 failed / 176 SKIPPED**. The 13th pass recorded UTF-8 name validation as fixed and this corpus checks **none** of it. Not a failure — a hole in the evidence, which is worse: an unverified security-relevant check reads as a passing one. Find out whether the skip is the runner's gap or ours. |
 
-**Recommended order: R1 → R2 → R3.** R1 is the only remaining *correctness* cluster that spans
-features (it is the reason three separate areas each have a stubborn leftover); R2 holds the wrong
-answers; R3 is a missing piece of a feature we claim. R5 is cheap and can be slotted in any time — do
-it before quoting conformance numbers again.
+**Recommended order: ~~R1~~ → R2 → R3.** R2 holds the wrong answers; R3 is a missing piece of a
+feature we claim. R5 is cheap and can be slotted in any time — do it before quoting conformance
+numbers again.
+
+### ✅ R1 IS DONE (2026-08-12) — 275 → 237, in three verified steps
+
+**38 failures, not the 25 estimated**, and the estimate was low for a structural reason worth keeping:
+the triage counted the failures whose MESSAGE named a type mismatch. The same root cause was also
+producing `TypeMismatch` at validation, `assert_invalid` acceptances, and — twice — a silently wrong
+*encoding*. Corpus **275 → 237**, 61,115 → 61,152 passing, **6 fewer SKIPS** (assertions that now
+actually run), zero regressions at any step. Clean files: `type-equivalence`, `type-subtyping`,
+`type-rec`, `imports`. `linking` 12 → 11, `elem` 16 → 14, `tag` 3 → 1, `i31` 9 → 8, `table` 8 → 7.
+
+New **`src/typematch.zig`** compares types structurally across modules under *iso*-recursive rules
+(§3.3.10): the unit of identity is the rec group, and two types match only at the same position in
+equivalent groups. `Module` now keeps `rec_start`/`rec_len` and the type index of every function and
+tag, because `Extern.func` keeps only the expanded signature — **and a signature is not an identity**.
+
+⚠️ **The bug was wrong in BOTH directions, and the accept side is the dangerous one.** Comparing
+module-local indices rejected valid links (two modules holding one type at different indices) *and*
+accepted invalid ones — `(ref $A)` at index 0 in one module and an unrelated `(ref $B)` at index 0 in
+another compared EQUAL, so the importer received values of a type it never agreed to. **Type confusion
+across a module boundary, reached by ordinary linking.** A defect that only ever showed up as
+"conformance failure" was also a soundness hole.
+
+**What the four steps actually found — three of them were not "type comparison" at all:**
+
+| | defect | why it was invisible |
+| --- | --- | --- |
+| 1 | link matching compared expanded signatures | the stated R1 item |
+| 2 | `call_indirect` compared signatures, not index subtyping | `(sub (func))` and `(sub final (func))` have identical params and results and are DIFFERENT types, so a final type answered a call naming the extensible one |
+| 3 | the WAT assembler **dropped element-segment types** | two of the eight elem encodings have `funcref` baked in and carry no type byte; the assembler picked them by shape, so any other element type vanished and the table rejected its own initializer |
+| 4 | inline function types were identified with rec-group MEMBERS | §6.6.12 allows only a singleton, final, no-supertype type; `internSig` matched on params/results alone |
+
+⚠️ **A cache key must name everything the answer depends on.** The matcher's memo was first keyed on
+the two rec-group start indices — a statement about *no particular modules* — so one link's verdict was
+served to an unrelated later link. It flipped 32 import assertions and was caught only because
+`imports.wast` regressed 5 → 21; every file R1 was aimed at had improved either way. **A win in the
+target files is not evidence the change is right.**
+
+⚠️ **`zig build test-security` cannot pass from this repo's own cwd.** `D:` is **exFAT**, which has no
+symlinks, and the sandbox-escape tests plant symlink fixtures under the cwd's `.zig-cache/tmp`. That is
+what the step's "run from an NTFS cwd" note means. Verified by running the same test binary from a `C:`
+cwd — 3/3 OK. Do not read those two failures as a regression; do not "fix" them in `wasi.zig`.
 
 ⚠️ **2,655 assertions are still SKIPPED and that is not a pass.** The largest pools: `br_table.wast`
 **161**, `custom-descriptors/exact-casts` 108, `wide-arithmetic` 107, `br_on_cast_desc_eq*` 101 each.

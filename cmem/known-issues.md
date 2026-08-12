@@ -276,12 +276,75 @@ the two halves agreed and the round trip looked clean. **Our assembler is not an
 decoder.** Any conformance failure that reaches the WAT path should be checked at BOTH ends before the
 runtime is suspected — and a decoder rule with no matching emitter rule is a bug that hides itself.
 
-**Still open — cross-module type identity (~15 of the 26).** `assert_unlinkable: module linked` (7),
-`IncompatibleImportType` (4), `IndirectTypeMismatch` (4). `funcTypeEqual`/`funcTypeEq` compare
-`ValType` slices with `std.mem.eql`, and a concrete `(ref $t)` carries a **module-local index**, so
-types from two modules are never comparable. Canonical ids do not help across a module boundary;
-this needs STRUCTURAL comparison of the two types, chasing both modules' type sections in step. That
-is the remaining GC work and it is a distinct piece.
+## 🧬 ✅ Cross-module type identity — R1, FIXED 2026-08-12 (the 4th gap, and the largest)
+
+Corpus **275 → 237**, 61,115 → 61,152 passing, **6 fewer SKIPS**, zero regressions across three
+commits. `type-equivalence`, `type-subtyping`, `type-rec` and `imports` are all **clean**.
+Triaged at 25 failures; it was **38**, because the triage counted the failures whose *message* named a
+type mismatch and the same root cause was also emitting `TypeMismatch` at validation, silent
+`assert_invalid` acceptances, and two wrong *encodings*.
+
+**The defect.** A concrete `(ref $t)` is a `ValType` carrying a **module-local type index**. Link
+matching compared two modules' expanded signatures with `std.mem.eql`, i.e. compared index numbers that
+mean different things on each side. ⚠️ **Wrong in BOTH directions, and the accept side is a soundness
+hole, not a conformance score:** `(ref $A)` at index 0 in one module and an unrelated `(ref $B)` at
+index 0 in another compared EQUAL, so an import linked to an export of a type it never agreed to and
+the guest received values it would read as something else. **Type confusion across a module boundary,
+reached by ordinary linking.**
+
+**The fix.** New `src/typematch.zig`: structural comparison walking both modules' type sections in
+step, under *iso*-recursive rules (§3.3.10) — the unit of identity is the rec group, and two types
+match only at the same position in equivalent groups. Equi-recursive comparison (unfold both to
+infinite trees) is the tempting simplification and is **too permissive**: it equates a self-referential
+group of one with a mutually referential group of two, which the spec keeps distinct. Import matching
+uses subtyping (§4.5.3); globals are invariant when mutable, table elements always, tags always.
+`Module` now keeps `rec_start`/`rec_len` and the type index of every function and tag — `Extern.func`
+kept only the expanded signature, and **a signature is not an identity**.
+
+**Three of the four defects were not "type comparison" at all**, which is why the estimate was low:
+
+1. **`call_indirect` compared signatures, not index subtyping.** §4.4.8 wants the entry's type to be a
+   *subtype* of the named one. Equality rejected valid calls; comparing signatures accepted invalid
+   ones — `(sub (func))` and `(sub final (func))` have identical params and results and are **different
+   types**, so a final type answered a call naming the extensible one and no trap fired.
+2. **The assembler dropped element-segment types.** Two of the eight elem encodings have `funcref`
+   baked in and carry no type byte (the func-index form's elemkind; flag 4). The assembler chose them
+   by *shape*, so any other element type was silently discarded and every
+   `(table (ref null $t) (elem $f))` rejected its own initializer.
+3. **Inline function types were identified with rec-group MEMBERS.** §6.6.12 allows only a singleton,
+   final, no-supertype type; `internSig` matched on params/results alone.
+
+⚠️ **A FOURTH producer/consumer blind spot** (after the data-count section, the `0x50` wrapper and the
+flattened rec groups above). Same shape every time: `wat.zig` dropped something, `Module.zig` did not
+require it, the round trip looked clean. The tally is now four in three days — treat "our assembler is
+not an oracle for our decoder" as a standing rule, not an observation.
+
+⚠️ **A CACHE KEY MUST NAME EVERYTHING THE ANSWER DEPENDS ON.** The matcher memoises rec-group pairs.
+Keyed on the two *start indices* alone it cached a statement about no particular modules, so one link's
+verdict was served to an unrelated later link — 32 import assertions flipped. **It was caught only
+because `imports.wast` regressed 5 → 21; every file R1 was aimed at improved either way.** A win in the
+target files is not evidence the change is correct — diff the WHOLE per-file summary, every run.
+
+⚠️ **`zig build test-security` cannot pass from this repo's cwd.** `D:` is **exFAT**, which has no
+symlinks, and those tests plant symlink fixtures under the cwd's `.zig-cache/tmp` — hence the step's
+"run from an NTFS cwd" note. Verified by running the same test binary from a `C:` cwd: 3/3 OK. **Not a
+regression, and not something to "fix" in `wasi.zig`.**
+
+⚠️ **THE SAME DEFECT WAS IN THE SHIPPED C ABI, AND ALMOST GOT WRITTEN OFF.** `capi.zig`'s
+`define_instance` path — one guest module's import bound to another's export — compared the two
+expanded signatures with `a != b`, i.e. exactly the module-local-index comparison this whole entry is
+about, in the path an *embedder* actually uses. It now goes through `typematch`. Two things about how
+it was found are worth more than the fix:
+
+- A first grep for `funcTypeEq|matchExtern|TypeMismatch` in `capi.zig` returned nothing, and that was
+  nearly recorded as "the C ABI does no import type checking at all". It does check — just under
+  different names, inline, with raw `!=`. **A grep for the names you expect finds the code you
+  expected to exist, not the code that is there.**
+- The path had **no behavioural test** (only a symbol-existence entry in `wazmrt_abi_symbols.c`), so
+  nothing would have caught either the original defect or a bad fix. A test now pins both directions:
+  the same type reached through a different index must LINK, and a different type at the same index
+  must be REFUSED. Verified discriminating by inverting the assertion and watching it fail — **a new
+  test that has never failed has not been shown to test anything.**
 
 ## 🧾 ABI-2 build (2026-08-11) — bugs and near-misses found while replacing the C ABI
 

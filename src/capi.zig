@@ -28,6 +28,7 @@ const root = @import("root.zig");
 
 const Module = root.Module;
 const interp = root.interp;
+const typematch = root.typematch;
 
 /// The C ABI's allocator. Under the test target this is the testing allocator, which fails on
 /// double-free and leaks; otherwise the libc-free `smp_allocator`. Comptime, so release builds
@@ -1538,6 +1539,11 @@ fn resolveImports(
     const globals = sa.alloc(interp.Value, nglobal) catch return errorf("out of memory", .{});
     const globals_hi = sa.alloc(interp.Value, nglobal) catch return errorf("out of memory", .{});
 
+    // One matcher per link, so its module-pointer-keyed memo lives no longer than
+    // the modules it names (see `typematch.Ctx`).
+    var tm: typematch.Ctx = .init(sa);
+    defer tm.deinit();
+
     var fi: usize = 0;
     var gi: usize = 0;
     for (cm.inner.imports) |im| {
@@ -1564,16 +1570,25 @@ fn resolveImports(
                         const oslot = store.instances.items[oi];
                         const idx = findExport(oslot.module, im.name, .func) orelse
                             return errorf("import '{s}'.'{s}': the published instance exports no such function", .{ im.module, im.name });
-                        const have = oslot.module.inner.funcType(idx) orelse
-                            return errorf("import '{s}'.'{s}': the published export has no type", .{ im.module, im.name });
                         // Same rule as for host callbacks: two declarations exist, so compare
                         // them rather than trusting that a shared name means a shared signature.
-                        if (have.params.len != want.params.len or have.results.len != want.results.len)
+                        //
+                        // ⚠️ Compare through `typematch`, NOT the two expanded signatures. Both
+                        // sides are real wasm modules here, so a parameter may be a concrete
+                        // `(ref $t)` — and that carries a MODULE-LOCAL type index, which made
+                        // `a != b` compare two unrelated numbering schemes. It rejected valid
+                        // links and, worse, accepted invalid ones whenever two different types
+                        // happened to sit at the same index in their modules, handing the guest
+                        // values of a type it never agreed to. This is the shipped embedder path,
+                        // so it had the defect `wast.zig` was fixed for and no test covering it.
+                        const want_ti = im.type_index orelse
+                            return errorf("import '{s}'.'{s}': the declared import has no type index", .{ im.module, im.name });
+                        const have_ti = oslot.module.inner.funcTypeIndex(idx) orelse
+                            return errorf("import '{s}'.'{s}': the published export has no type", .{ im.module, im.name });
+                        const compatible = tm.funcImportOk(&oslot.module.inner, have_ti, &cm.inner, want_ti) catch
+                            return errorf("out of memory", .{});
+                        if (!compatible)
                             return errorf("import '{s}'.'{s}': signature mismatch with the published instance", .{ im.module, im.name });
-                        for (want.params, have.params) |a, b| if (a != b)
-                            return errorf("import '{s}'.'{s}': parameter type mismatch with the published instance", .{ im.module, im.name });
-                        for (want.results, have.results) |a, b| if (a != b)
-                            return errorf("import '{s}'.'{s}': result type mismatch with the published instance", .{ im.module, im.name });
                         funcs[fi] = .{ .wasm = .{ .instance = &oslot.inst, .func_index = idx } };
                         fi += 1;
                         continue;
@@ -2485,6 +2500,71 @@ test "a host/guest signature disagreement is refused at link time" {
     const err2 = wazmrt_linker_instantiate(l, s, m, &inst, &trap);
     defer wazmrt_error_delete(err2);
     try testing.expect(err2 != null);
+}
+
+test "define_instance: a concrete (ref $t) import matches by TYPE, not by index" {
+    // The `define_instance` path binds one guest module's import to another's export, so both
+    // sides are real wasm modules and a parameter can be a concrete `(ref $t)` — which carries a
+    // MODULE-LOCAL type index. Comparing the expanded signatures compared those indices, which is
+    // two different numbering schemes: it rejected good links and accepted bad ones whenever two
+    // unrelated types sat at the same index. Nothing covered this path, so both directions are
+    // pinned here.
+    const provider_wat =
+        \\(module
+        \\  (type $pair (func (param i32 i32) (result i32)))
+        \\  (func $use (param (ref $pair)) (result i32) (i32.const 7))
+        \\  (export "use" (func $use))
+        \\)
+    ;
+    // Same type, reached through a DIFFERENT index (a padding type comes first). Must link.
+    const good_wat =
+        \\(module
+        \\  (type $pad (func (result f64)))
+        \\  (type $pair (func (param i32 i32) (result i32)))
+        \\  (func (import "P" "use") (param (ref $pair)) (result i32))
+        \\)
+    ;
+    // A DIFFERENT type at the SAME index the provider uses — the case raw index comparison
+    // wrongly accepted, handing the guest a reference of a type it never agreed to.
+    const bad_wat =
+        \\(module
+        \\  (type $other (func (param f32) (result i64)))
+        \\  (func (import "P" "use") (param (ref $other)) (result i32))
+        \\)
+    ;
+
+    const e = wazmrt_engine_new().?;
+    defer wazmrt_engine_delete(e);
+    const s = wazmrt_store_new(e).?;
+    defer wazmrt_store_delete(s);
+
+    var pm: *CModule = undefined;
+    try testing.expect(wazmrt_module_new_wat(e, provider_wat, provider_wat.len, &pm) == null);
+    defer wazmrt_module_delete(pm);
+
+    const pl = wazmrt_linker_new(e).?;
+    defer wazmrt_linker_delete(pl);
+    var pinst: InstanceHandle = .{ .id = 0 };
+    var trap: ?*Trap = null;
+    try testing.expect(wazmrt_linker_instantiate(pl, s, pm, &pinst, &trap) == null);
+
+    const l = wazmrt_linker_new(e).?;
+    defer wazmrt_linker_delete(l);
+    try testing.expect(wazmrt_linker_define_instance(l, "P", pinst) == null);
+
+    var gm: *CModule = undefined;
+    try testing.expect(wazmrt_module_new_wat(e, good_wat, good_wat.len, &gm) == null);
+    defer wazmrt_module_delete(gm);
+    var ginst: InstanceHandle = .{ .id = 0 };
+    try testing.expect(wazmrt_linker_instantiate(l, s, gm, &ginst, &trap) == null);
+
+    var bm: *CModule = undefined;
+    try testing.expect(wazmrt_module_new_wat(e, bad_wat, bad_wat.len, &bm) == null);
+    defer wazmrt_module_delete(bm);
+    var binst: InstanceHandle = .{ .id = 0 };
+    const err = wazmrt_linker_instantiate(l, s, bm, &binst, &trap);
+    defer wazmrt_error_delete(err);
+    try testing.expect(err != null);
 }
 
 test "unknown imports as traps: links, then traps when called" {
