@@ -59,6 +59,11 @@ this", "remember this for the project"), the required action is BOTH of:
    entries instead of duplicating.
 2. **Sync `README.md` where, and only where, the change is user-relevant** — install/usage, CLI/C-ABI
    surface, examples, status — so the README matches the new reality without absorbing internal detail.
+3. **If the work produced a transferable METHOD lesson — one that would apply to a completely
+   different subsystem — add it to [`best-practices.md`](best-practices.md) as well**, one bold rule
+   plus a citation back to the incident. The detail stays in its home file; only the rule is copied.
+   Lessons buried inside dated post-mortems do not get read by the next pass, which is how the same
+   producer/consumer blind spot recurred four times in two days.
 
 ### The "evaluate a reference project" trigger (binding on every agent)
 
@@ -88,7 +93,9 @@ categories:
    an assembler/decoder path that should return `error.UnknownInstr` / `error.UnsupportedOpcode` rather
    than emit wrong bytes.
 
-**Method:** for large files, **fan out parallel read-only investigators per category** (use the Agent
+**Method:** ⭐ **read [`best-practices.md`](best-practices.md) first** — it collects the investigation
+and verification rules this trigger depends on, each cited to the pass that paid for it. Then: for
+large files, **fan out parallel read-only investigators per category** (use the Agent
 tool / `Explore`), then consolidate. Report each finding as `file:line` + a one-line description +
 severity. **Fix the safe ones** and **keep the full suite green — diff the OUTPUT, not just exit codes**
 (`zig build test` *and* re-run the affected `.wast` conformance files via `wazmrt <file.wast>`, comparing
@@ -99,6 +106,7 @@ passes is a regression). Surface anything risky or ambiguous rather than fixing 
 
 | File | What it holds |
 | --- | --- |
+| [best-practices.md](best-practices.md) | ⭐ **READ FIRST before a conformance pass, an audit, or any change to a producer/consumer pair (added 2026-08-12).** The METHOD rules, extracted from what went wrong and each cited back to the incident that paid for it: diff the OUTPUT not the exit code; a win in the target files is not evidence a change is right; a conformance number says nothing about a surface the corpus does not reach; **our assembler is not an oracle for our decoder** (four occurrences in two days); a new test that has never failed has not been shown to test anything; record findings that were WRONG so they are not "fixed" again. Findings themselves stay in `known-issues.md` — this file holds only the transferable part |
 | [overview.md](overview.md) | 📦 **The distribution manifest (2026-08-10): exactly which files a user needs**, measured on a clean `PATH` rather than read off `build.zig` — CLI = `wazmrt.exe` ALONE; C ABI = the `.dll`/`.lib` + **`include/wazmrt.h`, and that is all** (⚖️ **2026-08-11: back to ONE header.** It was briefly four files — both headers plus `LICENSE.wasm-c-api` and `NOTICE` — because the vendored `wasm.h` was Apache-2.0 and §4(a) binds on distribution. Deleting the vendored header deleted the obligation with it: **nothing third-party ships, so nothing has to travel with the artifact**). ✅ Standalone by construction: both binaries import **only `ntdll` and `KERNEL32`**, which falls out of the libc-free design. ⚠️ **Do NOT ship `wazmrt.pdb`** — 3.6 MB of debug symbols, the largest file in `zig-out/bin`, and it carries source paths. Re-verify with `objdump -p | grep "DLL Name"` before a release: **"it runs here" is not evidence that it ships** (the Rust port silently needed a toolchain DLL and died with exit 127 on a clean machine). Plus: What wazmrt is, repo layout, the key source files, mental model |
 | [vision.md](vision.md) | The goal — a blazingly-fast, smallest-binary wasm runtime, itself wasm-compilable, embeddable via the `universalWasmLoader-*` loaders. **Performance target: beat wasmtk's Deno/V8 execution** (win on startup + boundary, not JIT hot-loops; native build only). **Integration goal:** wasmtk runs wasm via native wazmrt (Deno FFI, not wasm-on-V8). **Candidate direction:** wazmrt as the loaders' native backend (consistency + no-dep + licensing freedom; wasmtime optional for heavy compute). ⚠️⚠️ **FALSIFIED BENEFIT, struck through not deleted (2026-08-10, owner: "somehow that intent slipped"): the "low-friction swap" payoff of the wasm-c-api decision never existed.** It assumed the `universalWasmLoader-*` consumers were on wasm-c-api; wasmtime ships **two** C surfaces, and the real loader header uses the **`wasmtime_*` store/context/linker/typed-val model**. Worse, **wasm-c-api's host-func callback gets no handle to the caller's memory** — the load-bearing need of nearly every loader host import — so the chosen ABI could not do the consumer's core job (the Rust port closed it at T8 with a caller-based model, ~74 functions vs 319). What the decision DID deliver is real: a standard ABI, third-party interop, the proven Deno-FFI path. 🎓 **The lesson: a stated BENEFIT is a hypothesis about someone ELSE's code — open their source and grep for it BEFORE the decision, not after the implementation.** The loader header was in a sibling repo the whole time |
 | [architecture.md](architecture.md) | The decode → validate → instantiate → execute pipeline; module layout; the libc-free core; C ABI + freestanding-wasm build targets. ⚡ **2026-08-11: the "C ABI contract" section now describes `include/wazmrt.h` (ABI 2, 77 functions, `src/capi.zig`).** The wasm-c-api contract it used to describe is gone along with the file that implemented it |
