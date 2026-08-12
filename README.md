@@ -24,14 +24,17 @@ compliance process, and for the ledger of any reused code.
 > (`ref.test`/`ref.cast`, `br_on_cast`/`br_on_cast_fail`), **concrete
 > `(ref $t)` references** (self-referential structs, exact-type params), and
 > declared subtyping (`(sub $super …)`) over the `any`/`eq`/`i31`/`struct`/
-> `array` reference hierarchy — and runs a corpus of real modules to their
-> expected values
+> `array` reference hierarchy, with types compared **structurally across module
+> boundaries** when linking (so two modules that separately declare the same
+> recursive type link, and two that merely reuse a type index do not)
+> — and runs a corpus of real modules to their expected values
 > (`fib(20)=6765`, `sieve(30)=10`, …). It ships a native **WAT text assembler**
 > (`.wat` → wasm) and a **WAST script runner** (`wazmrt file.wast`) that runs the
 > official WebAssembly spec testsuite (positive assertions plus
 > `assert_invalid`/`assert_malformed`/`assert_trap`/`assert_unlinkable`) — e.g.
-> `table_init` 729/0, `table_copy` 1649/0, `imports` 137, `call_ref` 30, `start`
-> 11/0. It runs a module's **start function** at instantiation, embeds through a
+> `table_init` 729/0, `table_copy` 1649/0, `imports` 128/0, `call_ref` 31/0,
+> `start` 10/0. It runs a module's **start function** at instantiation, embeds
+> through a
 > small **native C ABI** (instantiate/call, host functions with a caller handle,
 > `.wat` straight from text, WASI, resource ceilings — loadable over FFI, see
 > below), and runs **WASI

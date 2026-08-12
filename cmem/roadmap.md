@@ -218,7 +218,7 @@ defects and there is nothing to fix unless the scope changes (**both counts unch
 feature we claim. R5 is cheap and can be slotted in any time — do it before quoting conformance
 numbers again.
 
-### ✅ R1 IS DONE (2026-08-12) — 275 → 237, in three verified steps
+### ✅ R1 IS DONE (2026-08-12) — 275 → 237, in four verified steps
 
 **38 failures, not the 25 estimated**, and the estimate was low for a structural reason worth keeping:
 the triage counted the failures whose MESSAGE named a type mismatch. The same root cause was also
@@ -254,12 +254,20 @@ served to an unrelated later link. It flipped 32 import assertions and was caugh
 `imports.wast` regressed 5 → 21; every file R1 was aimed at had improved either way. **A win in the
 target files is not evidence the change is right.**
 
+⚠️ **The 4th step was in the SHIPPED C ABI, and the corpus could never have found it.** `capi.zig`'s
+`define_instance` (one guest module's import bound to another's export) carried the same raw-`!=`
+signature comparison, in the path an *embedder* uses, with **no behavioural test** — only a
+symbol-existence entry. The `.wast` suite does not exercise the C ABI, so the corpus read 237 both
+before and after. **A conformance number says nothing about a surface the corpus does not reach.**
+`typematch` is now exported from `root.zig` so any future linker is pointed at it.
+
 ⚠️ **`zig build test-security` cannot pass from this repo's own cwd.** `D:` is **exFAT**, which has no
 symlinks, and the sandbox-escape tests plant symlink fixtures under the cwd's `.zig-cache/tmp`. That is
 what the step's "run from an NTFS cwd" note means. Verified by running the same test binary from a `C:`
 cwd — 3/3 OK. Do not read those two failures as a regression; do not "fix" them in `wasi.zig`.
 
-⚠️ **2,655 assertions are still SKIPPED and that is not a pass.** The largest pools: `br_table.wast`
+⚠️ **2,649 assertions are still SKIPPED and that is not a pass.** (2,655 before R1 — the 6 it
+recovered were assertions no longer suppressed by a module that failed to build.) The largest pools: `br_table.wast`
 **161**, `custom-descriptors/exact-casts` 108, `wide-arithmetic` 107, `br_on_cast_desc_eq*` 101 each.
 `br_table.wast` is core spec and worth a look on its own — 161 unrun assertions in a control-flow
 instruction is a bigger blind spot than most of the failures above.
