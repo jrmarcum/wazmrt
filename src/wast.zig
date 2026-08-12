@@ -21,6 +21,7 @@ const wat = @import("wat.zig");
 const types = @import("types.zig");
 const Module = @import("Module.zig");
 const interp = @import("interp.zig");
+const typematch = @import("typematch.zig");
 const validate = @import("validate.zig").validate;
 
 const V = types.ValType;
@@ -193,11 +194,15 @@ const Runner = struct {
         var gs: std.ArrayList(Value) = .empty;
         var ms: std.ArrayList(*interp.Instance.Memory) = .empty;
         var ts: std.ArrayList(*interp.Instance.Table) = .empty;
+        // One matcher per link: its memo is keyed by module pointer, and every
+        // module it names is alive for exactly this long.
+        var tm: typematch.Ctx = .init(self.a);
+        defer tm.deinit();
         for (m.imports) |imp| switch (imp.type) {
-            .func => |want| try fs.append(self.a, try self.resolveFuncImport(imp.module, imp.name, want)),
-            .global => |want| try gs.append(self.a, try self.resolveGlobalImport(imp.module, imp.name, want)),
+            .func => try fs.append(self.a, try self.resolveFuncImport(&tm, m, imp)),
+            .global => |want| try gs.append(self.a, try self.resolveGlobalImport(&tm, m, imp, want)),
             .memory => |want| try ms.append(self.a, try self.resolveMemoryImport(imp.module, imp.name, want)),
-            .table => |want| try ts.append(self.a, try self.resolveTableImport(imp.module, imp.name, want)),
+            .table => |want| try ts.append(self.a, try self.resolveTableImport(&tm, m, imp, want)),
             // An imported tag needs no host backing — it is just a local tag
             // identity in this module's tag index space (EH proposal).
             .tag => {},
@@ -205,16 +210,24 @@ const Runner = struct {
         return .{ .funcs = fs.items, .globals = gs.items, .memories = ms.items, .tables = ts.items };
     }
 
-    fn resolveFuncImport(self: *Runner, module: []const u8, name: []const u8, want: Module.FuncType) !HostFunc {
-        if (std.mem.eql(u8, module, "spectest")) {
-            const got = spectestFuncType(name) orelse return error.UnresolvedImport;
-            if (!funcTypeEq(got, want)) return error.IncompatibleImportType;
+    fn resolveFuncImport(self: *Runner, tm: *typematch.Ctx, m: *const Module, imp: Module.Import) !HostFunc {
+        if (std.mem.eql(u8, imp.module, "spectest")) {
+            const got = spectestFuncType(imp.name) orelse return error.UnresolvedImport;
+            if (!abstractFuncTypeEq(got, imp.type.func)) return error.IncompatibleImportType;
             return .{ .native = spectestNoop };
         }
-        if (self.modules.get(module)) |inst| {
+        const want_ti = imp.type_index orelse return error.IncompatibleImportType;
+        if (self.modules.get(imp.module)) |inst| {
             for (inst.module.exports) |e| {
-                if (e.type == .func and std.mem.eql(u8, e.name, name)) {
-                    if (!funcTypeEq(e.type.func, want)) return error.IncompatibleImportType;
+                if (e.type == .func and std.mem.eql(u8, e.name, imp.name)) {
+                    // Match by TYPE INDEX in each module, not by the two expanded
+                    // signatures: a `(ref $t)` inside a signature is a module-local
+                    // index, so comparing the signatures compared numbers that mean
+                    // different things on each side — rejecting good links and, worse,
+                    // accepting bad ones whenever two unrelated types happened to sit
+                    // at the same index. See `typematch.zig`.
+                    const got_ti = inst.module.funcTypeIndex(e.index) orelse return error.IncompatibleImportType;
+                    if (!try tm.funcImportOk(inst.module, got_ti, m, want_ti)) return error.IncompatibleImportType;
                     return .{ .wasm = .{ .instance = inst, .func_index = e.index } };
                 }
             }
@@ -222,17 +235,16 @@ const Runner = struct {
         return error.UnresolvedImport;
     }
 
-    fn resolveGlobalImport(self: *Runner, module: []const u8, name: []const u8, want: Module.GlobalType) !Value {
-        if (std.mem.eql(u8, module, "spectest")) {
-            const gt = spectestGlobalType(name) orelse return error.UnresolvedImport;
+    fn resolveGlobalImport(self: *Runner, tm: *typematch.Ctx, m: *const Module, imp: Module.Import, want: Module.GlobalType) !Value {
+        if (std.mem.eql(u8, imp.module, "spectest")) {
+            const gt = spectestGlobalType(imp.name) orelse return error.UnresolvedImport;
             if (gt.content != want.content or gt.mutable != want.mutable) return error.IncompatibleImportType;
-            return spectestGlobal(module, name).?;
+            return spectestGlobal(imp.module, imp.name).?;
         }
-        if (self.modules.get(module)) |inst| {
+        if (self.modules.get(imp.module)) |inst| {
             for (inst.module.exports) |e| {
-                if (e.type == .global and std.mem.eql(u8, e.name, name)) {
-                    const gt = e.type.global;
-                    if (gt.content != want.content or gt.mutable != want.mutable) return error.IncompatibleImportType;
+                if (e.type == .global and std.mem.eql(u8, e.name, imp.name)) {
+                    if (!try tm.globalImportOk(inst.module, e.type.global, m, want)) return error.IncompatibleImportType;
                     return inst.globals[e.index];
                 }
             }
@@ -261,16 +273,17 @@ const Runner = struct {
         return error.UnresolvedImport;
     }
 
-    fn resolveTableImport(self: *Runner, module: []const u8, name: []const u8, want: Module.TableType) !*interp.Instance.Table {
-        if (std.mem.eql(u8, module, "spectest") and std.mem.eql(u8, name, "table")) {
+    fn resolveTableImport(self: *Runner, tm: *typematch.Ctx, m: *const Module, imp: Module.Import, want: Module.TableType) !*interp.Instance.Table {
+        if (std.mem.eql(u8, imp.module, "spectest") and std.mem.eql(u8, imp.name, "table")) {
             if (want.element != .funcref or !limitsFit(.{ .min = 10, .max = 20 }, want.limits)) return error.IncompatibleImportType;
             return self.spectestTable();
         }
-        if (self.modules.get(module)) |inst| {
+        if (self.modules.get(imp.module)) |inst| {
             for (inst.module.exports) |e| {
-                if (e.type == .table and std.mem.eql(u8, e.name, name)) {
+                if (e.type == .table and std.mem.eql(u8, e.name, imp.name)) {
                     const tt = e.type.table;
-                    if (tt.element != want.element or !limitsFit(tt.limits, want.limits)) return error.IncompatibleImportType;
+                    if (!try tm.tableElemOk(inst.module, tt.element, m, want.element)) return error.IncompatibleImportType;
+                    if (!limitsFit(tt.limits, want.limits)) return error.IncompatibleImportType;
                     if (e.index < inst.tables.len) return inst.tables[e.index];
                 }
             }
@@ -704,10 +717,17 @@ const null_ref: Value = std.math.maxInt(u64);
 
 // --- Import linking: type compatibility ------------------------------------
 
-fn funcTypeEq(a: Module.FuncType, b: Module.FuncType) bool {
-    return valTypesEq(a.params, b.params) and valTypesEq(a.results, b.results);
+/// Function-type equality by RAW value type, valid only where neither side can
+/// contain a concrete `(ref $t)` — i.e. the `spectest` host signatures below,
+/// which are numeric throughout and belong to no module.
+///
+/// Everything else goes through `typematch.zig`. A concrete reference carries a
+/// module-local type index, so raw comparison across a module boundary compares
+/// two unrelated numbering schemes.
+fn abstractFuncTypeEq(a: Module.FuncType, b: Module.FuncType) bool {
+    return abstractValTypesEq(a.params, b.params) and abstractValTypesEq(a.results, b.results);
 }
-fn valTypesEq(a: []const types.ValType, b: []const types.ValType) bool {
+fn abstractValTypesEq(a: []const types.ValType, b: []const types.ValType) bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| if (x != y) return false;
     return true;

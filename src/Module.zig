@@ -116,6 +116,16 @@ pub const Import = struct {
     module: []const u8,
     name: []const u8,
     type: Extern,
+    /// The TYPE INDEX this import declared, for a `func` or `tag` import; null
+    /// for table/memory/global (which spell their type inline, not by index).
+    ///
+    /// `Extern.func` keeps only the expanded signature, and a signature is not an
+    /// identity: `(ref $t)` inside it carries a MODULE-LOCAL index, so comparing
+    /// two modules' signatures compares numbers that mean different things in
+    /// each. Link-time matching needs the index to reach the rec group, the
+    /// supertype chain and the finality flag — everything that makes two types
+    /// the same type (§4.5.3). See `typematch.zig`.
+    type_index: ?u32 = null,
 };
 
 pub const Export = struct {
@@ -198,8 +208,23 @@ supertypes: []const ?u32,
 /// only for `0x50`. Parallel to `comp_types`.
 type_finals: []const bool,
 /// Canonical identity per type index: equal ids mean the same type. See
-/// `canonOf` / `isSubtype`.
+/// `canonOf` / `isSubtype`. **Module-local** — two modules' ids are not
+/// comparable; crossing that boundary is `typematch.zig`'s job.
 canon: []const u32,
+/// First type index of the rec group each type index belongs to, and the group's
+/// length. A standalone `(type …)` is recorded as a group of one.
+///
+/// Rec groups are the UNIT OF TYPE IDENTITY under iso-recursive typing (§3.3.10):
+/// two types are the same only if they sit at the same position in equivalent
+/// groups. Flattening groups into consecutive indices loses that, so it is kept
+/// here — `canonicalizeTypes` needs it, and so does cross-module matching.
+rec_start: []const u32,
+rec_len: []const u32,
+/// Type index of each function in the function index space (imports first, then
+/// defined), and likewise for tags. Parallel to the spaces `funcType`/`tagType`
+/// walk.
+func_type_indices: []const u32,
+tag_type_indices: []const u32,
 /// Type index of each *defined* function (function section), in order.
 functions: []const u32,
 /// Type index of each exception tag (tag section §5.5.14, EH proposal). Each
@@ -254,11 +279,18 @@ const Decoder = struct {
     supertypes: []const ?u32 = &.{},
     type_finals: []const bool = &.{},
     canon: []const u32 = &.{},
+    rec_start: []const u32 = &.{},
+    rec_len: []const u32 = &.{},
     /// Composite kind of each type index, pre-scanned before bodies are decoded
     /// so a `(ref $t)` value type can collapse to the right family (func /
     /// struct / array) even when `$t` is a forward reference in a rec group.
     type_kinds: []const CompKind = &.{},
     func_space: std.ArrayList(FuncType) = .empty,
+    /// Type INDEX of each function in `func_space`, positionally parallel to it —
+    /// the identity `func_space`'s expanded signatures throw away.
+    func_type_space: std.ArrayList(u32) = .empty,
+    /// Type index of each tag in `tag_space`, positionally parallel to it.
+    tag_type_space: std.ArrayList(u32) = .empty,
     table_space: std.ArrayList(TableType) = .empty,
     mem_space: std.ArrayList(MemoryType) = .empty,
     global_space: std.ArrayList(GlobalType) = .empty,
@@ -372,6 +404,10 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
         .supertypes = d.supertypes,
         .type_finals = d.type_finals,
         .canon = d.canon,
+        .rec_start = d.rec_start,
+        .rec_len = d.rec_len,
+        .func_type_indices = try d.func_type_space.toOwnedSlice(a),
+        .tag_type_indices = try d.tag_type_space.toOwnedSlice(a),
         .functions = functions,
         .tags = tags,
         .imports = imports,
@@ -514,14 +550,25 @@ pub fn funcType(self: *const Module, index: u32) ?FuncType {
     return self.funcSig(self.functions[defined]);
 }
 
-/// The type index of a function (imports first, then defined), or null for an
-/// imported function (our import table keeps the signature, not the type index).
+/// The type index of a function (imports first, then defined), or null if out of
+/// range.
+///
+/// Imported functions used to answer null — "our import table keeps the
+/// signature, not the type index" — which cost two things. `ref.func` on an
+/// imported function pushed the abstract `funcref` head instead of its concrete
+/// `(ref $t)`, losing type information a valid module may depend on; and link-time
+/// matching had no index to work from at all, so it compared expanded signatures
+/// whose `(ref $t)` indices mean different things in each module. Both are the
+/// same omission, so both are fixed by recording the index at decode.
 pub fn funcTypeIndex(self: *const Module, func_index: u32) ?u32 {
-    const imported = self.importedFuncCount();
-    if (func_index < imported) return null;
-    const defined = func_index - imported;
-    if (defined >= self.functions.len) return null;
-    return self.functions[defined];
+    if (func_index >= self.func_type_indices.len) return null;
+    return self.func_type_indices[func_index];
+}
+
+/// The type index of a tag (imports first, then defined), or null if out of range.
+pub fn tagTypeIndex(self: *const Module, tag_index: u32) ?u32 {
+    if (tag_index >= self.tag_type_indices.len) return null;
+    return self.tag_type_indices[tag_index];
 }
 
 /// The function signature at type index `ti`, or null if `ti` is out of range
@@ -603,6 +650,42 @@ pub fn isFinal(self: *const Module, i: u32) bool {
 /// their canonical ids are equal. Out of range answers with the index itself.
 pub fn canonOf(self: *const Module, i: u32) u32 {
     return if (i < self.canon.len) self.canon[i] else i;
+}
+
+/// The rec group type index `i` belongs to, as `[start, start+len)`. A type
+/// outside the declared space reads as a group of one containing itself, so
+/// callers need no separate bounds check.
+pub fn recGroup(self: *const Module, i: u32) struct { start: u32, len: u32 } {
+    if (i >= self.rec_start.len) return .{ .start = i, .len = 1 };
+    return .{ .start = self.rec_start[i], .len = self.rec_len[i] };
+}
+
+/// Are two value types the SAME type within this module? Beyond an identical bit
+/// pattern, two concrete references match when their nullability and family bits
+/// agree and their type indices are canonically equal.
+///
+/// Raw `==` is wrong for exactly the case GC exists to support: `(ref $t1)` and
+/// `(ref $t2)` naming two isomorphic rec groups are one type but two indices, so
+/// `==` compares the index numbers and says no.
+pub fn valTypeEq(self: *const Module, x: types.ValType, y: types.ValType) bool {
+    if (x == y) return true;
+    if (!x.isConcrete() or !y.isConcrete()) return false;
+    if (types.ValType.flagBits(x) != types.ValType.flagBits(y)) return false;
+    return self.canonOf(x.concreteIndex()) == self.canonOf(y.concreteIndex());
+}
+
+/// `valTypeEq` over two lists, in order.
+pub fn valTypesEq(self: *const Module, xs: []const types.ValType, ys: []const types.ValType) bool {
+    if (xs.len != ys.len) return false;
+    for (xs, ys) |x, y| if (!self.valTypeEq(x, y)) return false;
+    return true;
+}
+
+/// Are two function types the same type within this module? Used wherever the
+/// spec calls for type IDENTITY rather than subtyping — `call_indirect`'s check
+/// against the table entry's actual signature, most importantly.
+pub fn funcTypeEq(self: *const Module, x: FuncType, y: FuncType) bool {
+    return self.valTypesEq(x.params, y.params) and self.valTypesEq(x.results, y.results);
 }
 
 /// Is type index `a` a (reflexive/transitive) subtype of `b`, walking the
@@ -866,7 +949,42 @@ fn decodeTypeSection(d: *Decoder, r: *Reader) Error!void {
     d.comp_types = try comp.toOwnedSlice(d.a);
     d.supertypes = try supers.toOwnedSlice(d.a);
     d.type_finals = try finals.toOwnedSlice(d.a);
-    d.canon = try canonicalizeTypes(d.a, d.comp_types, d.supertypes, d.type_finals, rec_start.items, rec_len.items);
+    d.rec_start = try rec_start.toOwnedSlice(d.a);
+    d.rec_len = try rec_len.toOwnedSlice(d.a);
+    try checkTypeRefScope(d.comp_types, d.rec_start, d.rec_len);
+    d.canon = try canonicalizeTypes(d.a, d.comp_types, d.supertypes, d.type_finals, d.rec_start, d.rec_len);
+}
+
+/// Reject a `(ref $t)` that points FORWARD, past the end of its own rec group
+/// (§3.1.1: a type may only refer to types declared before it or inside its own
+/// group — "unknown type").
+///
+/// `readValType` bounds a concrete index by the TOTAL declared type count, which
+/// accepts `(type $t1 (func (param (ref $t2)))) (type $t2 …)` — two separate
+/// groups referring forwards. That is not merely a missed rejection: it lets a
+/// module build reference cycles that span rec groups, and every algorithm that
+/// walks type references — canonicalisation, cross-module matching — assumes
+/// external references point strictly BACKWARDS to stay well-founded. Without
+/// this check a hand-built module can send them into unbounded recursion.
+///
+/// The supertype is already checked at its own site (`decodeSubType`), which is
+/// stricter still: a supertype must precede the type itself, not merely its group.
+fn checkTypeRefScope(comp_types: []const CompType, rec_start: []const u32, rec_len: []const u32) Error!void {
+    for (comp_types, 0..) |c, i| {
+        const limit = rec_start[i] + rec_len[i]; // one past this group's last member
+        switch (c) {
+            .func => |f| {
+                for (f.params) |v| try checkValTypeScope(v, limit);
+                for (f.results) |v| try checkValTypeScope(v, limit);
+            },
+            .@"struct" => |fs| for (fs) |fld| try checkValTypeScope(fld.storage.unpacked(), limit),
+            .array => |fld| try checkValTypeScope(fld.storage.unpacked(), limit),
+        }
+    }
+}
+
+fn checkValTypeScope(v: types.ValType, limit: u32) Error!void {
+    if (v.isConcrete() and v.concreteIndex() >= limit) return error.IndexOutOfRange;
 }
 
 /// Assign each type index a CANONICAL identity, so that two structurally
@@ -951,7 +1069,7 @@ fn writeValType(a: std.mem.Allocator, out: *std.ArrayList(u8), v: types.ValType,
     // Keep the concrete/nullable/family bits verbatim and canonicalise only the
     // index — `(ref $t)` and `(ref null $t)` stay distinct types.
     try out.append(a, 1);
-    const flags: u32 = @intFromEnum(v) & 0xF000_0000;
+    const flags: u32 = v.flagBits();
     try out.appendSlice(a, std.mem.asBytes(&flags));
     try writeTypeRef(a, out, v.concreteIndex(), start, len, canon);
 }
@@ -1125,10 +1243,14 @@ fn decodeImportSection(d: *Decoder, r: *Reader) Error![]const Import {
         imp.module = try readName(d.a, r);
         imp.name = try readName(d.a, r);
         const kind: types.ExternKind = @enumFromInt(try r.readByte());
+        imp.type_index = null;
         imp.type = switch (kind) {
             .func => blk: {
-                const ft = try funcTypeAt(d, try r.readVarU32());
+                const ti = try r.readVarU32();
+                const ft = try funcTypeAt(d, ti);
                 try d.func_space.append(d.a, ft);
+                try d.func_type_space.append(d.a, ti);
+                imp.type_index = ti;
                 break :blk .{ .func = ft };
             },
             .table => blk: {
@@ -1149,8 +1271,11 @@ fn decodeImportSection(d: *Decoder, r: *Reader) Error![]const Import {
             .tag => blk: {
                 // Tag import: an attribute byte (0 = exception) + a type index.
                 if ((try r.readByte()) != 0x00) return error.MalformedFlag;
-                const ft = try funcTypeAt(d, try r.readVarU32());
+                const ti = try r.readVarU32();
+                const ft = try funcTypeAt(d, ti);
                 try d.tag_space.append(d.a, ft);
+                try d.tag_type_space.append(d.a, ti);
+                imp.type_index = ti;
                 break :blk .{ .tag = ft };
             },
             else => return error.UnknownExternKind,
@@ -1165,6 +1290,7 @@ fn decodeFunctionSection(d: *Decoder, r: *Reader) Error![]const u32 {
     for (list) |*i| {
         i.* = try r.readVarU32();
         try d.func_space.append(d.a, try funcTypeAt(d, i.*));
+        try d.func_type_space.append(d.a, i.*);
     }
     return list;
 }
@@ -1179,6 +1305,7 @@ fn decodeTagSection(d: *Decoder, r: *Reader) Error![]const u32 {
         if (attr != 0x00) return error.MalformedFlag; // only the exception attribute (0) exists
         i.* = try r.readVarU32();
         try d.tag_space.append(d.a, try funcTypeAt(d, i.*)); // defined tags follow imported ones
+        try d.tag_type_space.append(d.a, i.*);
     }
     return list;
 }

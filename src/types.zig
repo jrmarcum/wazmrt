@@ -115,6 +115,14 @@ pub const ValType = enum(u32) {
         return @intFromEnum(self) & index_mask;
     }
 
+    /// Everything about a concrete reference EXCEPT its type index: the concrete
+    /// marker, nullability and family bits. Two concrete refs are the same type
+    /// only if these agree *and* their indices name the same type — `(ref $t)` and
+    /// `(ref null $t)` are distinct, so the index alone never settles it.
+    pub fn flagBits(self: ValType) u32 {
+        return @intFromEnum(self) & (concrete_bit | nullable_bit | kind_mask);
+    }
+
     /// True only for the defined value types (rejects garbage `@enumFromInt`).
     pub fn isValid(self: ValType) bool {
         if (self.isConcrete()) return true;

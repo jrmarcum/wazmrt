@@ -328,10 +328,6 @@ fn typeSlots(ts: []const types.ValType) u32 {
     return n;
 }
 
-fn funcTypeEqual(x: Module.FuncType, y: Module.FuncType) bool {
-    return std.mem.eql(V, x.params, y.params) and std.mem.eql(V, y.results, x.results);
-}
-
 /// Cap on guest call depth. A guest `call` recurses NATIVELY (one
 /// `callFunction`/`run` frame per guest frame), so the real resource is bytes of
 /// host stack and this frame count is only a proxy for it — which means the
@@ -2018,7 +2014,7 @@ const Frame = struct {
                         const fi = std.math.cast(u32, tab.entries[@intCast(slot)]) orelse return error.UndefinedFunc;
                         const want = self.inst.module.funcSig(ci.type_index) orelse return error.UndefinedType;
                         const got = self.inst.module.funcType(fi) orelse return error.UndefinedFunc;
-                        if (!funcTypeEqual(want, got)) return error.IndirectTypeMismatch;
+                        if (!self.inst.module.funcTypeEq(want, got)) return error.IndirectTypeMismatch;
                         break :blk fi;
                     };
                     const ft = self.inst.module.funcType(f) orelse return error.UndefinedFunc;
@@ -2057,7 +2053,7 @@ const Frame = struct {
                     const f = std.math.cast(u32, table[@intCast(slot)]) orelse return error.UndefinedFunc; // funcref value = function index
                     const want = self.inst.module.funcSig(ci.type_index) orelse return error.UndefinedType;
                     const ft = self.inst.module.funcType(f) orelse return error.UndefinedFunc;
-                    if (!funcTypeEqual(want, ft)) return error.IndirectTypeMismatch;
+                    if (!self.inst.module.funcTypeEq(want, ft)) return error.IndirectTypeMismatch;
                     const np = typeSlots(ft.params); // param slots (v128 = 2)
                     const base = try self.stackBase(np);
                     const args = self.vstack.items[base..];
