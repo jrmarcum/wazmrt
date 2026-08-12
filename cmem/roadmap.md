@@ -134,18 +134,23 @@ turning every host import into a `Deno.UnsafeCallback` (a JS↔native hop per ca
 re-introduces the boundary cost the vision claims to remove — measure it, do not assume it**), and
 reading guest memory via `Deno.UnsafePointerView`. No amount of wazmrt-side ABI work substitutes for it.
 
-### 🎯 Spec-conformance fix list (2026-08-11) — details in `known-issues.md`
+### 🎯 Spec-conformance fix list (2026-08-11) — ✅ CLOSED 2026-08-12. Details in `known-issues.md`
 
 From the full `tests/module/` run. ⚠️ **Every HIGH item is wazmrt being TOO PERMISSIVE** — the
 opposite of the failure mode most of the audit passes hunted, and in a corner nobody had run before.
 
-| | defect | assertions | status |
+**Every row below is RESOLVED — nothing here needs work.** T5 is marked "not a defect", which means
+*investigated and found not to exist*, not *left undone*: its two files pass and its class has zero
+instances corpus-wide. (An earlier revision used a bare ❌ for that, which reads as "failed". Say it
+in words.)
+
+| | defect | assertions | outcome |
 | --- | --- | --- | --- |
-| **T1** 🔴 | **Accept-invalid** — malformed modules ACCEPTED | 43 → **68** | ✅ **fixed 2026-08-12** |
-| **T2** 🔴 | A custom-page-size module accepted **then mis-executed** — `memory.grow` → −1 | 12 | ✅ dissolved by T1 |
-| **T3** 🟠 | **legacy `rethrow`** — a stale workaround + an accept-invalid | 3 | ✅ **fixed 2026-08-12** |
-| **T4** 🟠 | ~~a legacy `try`/`catch` encoding not decoded~~ — actually the **tail-call proposal** | 2 | ✅ **implemented 2026-08-12** |
-| **T5** 🟡 | oversized limits refused at the wrong STAGE (decode, not link) | 2 | ❌ **not a defect** — see below |
+| **T1** 🔴 | **Accept-invalid** — malformed modules ACCEPTED | 43 → **68** | ✅ FIXED 2026-08-12 |
+| **T2** 🔴 | A custom-page-size module accepted **then mis-executed** — `memory.grow` → −1 | 12 | ✅ RESOLVED — dissolved by T1 |
+| **T3** 🟠 | **legacy `rethrow`** — a stale workaround + an accept-invalid | 3 | ✅ FIXED 2026-08-12 |
+| **T4** 🟠 | ~~a legacy `try`/`catch` encoding not decoded~~ — actually the **tail-call proposal** | 2 | ✅ IMPLEMENTED 2026-08-12 |
+| **T5** 🟡 | oversized limits refused at the wrong STAGE (decode, not link) | 2 | ✅ RESOLVED — **was not a defect**; see below |
 
 **T1 was bigger than the triage said, and the guess about its cause was wrong.** Corpus
 **525 → 455 failures**, 86 → 82 files, zero regressions. Details in `known-issues.md`; the headline is
@@ -176,6 +181,43 @@ function-references, and it passed every shallow assertion — but it was implem
 call-then-return, so the one property the proposal exists to provide (unbounded depth) was absent.
 **A feature can be present, tested, and green while failing at exactly the thing it is for.** Same
 family as the memory64 "COMPLETE" claim above.
+
+### 🎯 REVISED conformance list (2026-08-12) — the 275 that remain
+
+Successor to the T-list above, and built differently: every item below is grouped **by cause**, from a
+run with `-Dfailures=600` so all 275 failures were read, not just each file's first. The T-list was
+grouped by first-failure text and mislabelled three of its five items.
+
+**103 of the 275 are BY DESIGN** — proposals wazmrt does not target, refused honestly. They are not
+defects and there is nothing to fix unless the scope changes:
+
+| | area | failures | note |
+| --- | --- | --- | --- |
+| — | `custom-descriptors` | 90 | untargeted proposal; exact refs + descriptors |
+| — | `custom-page-sizes` | 13 | untargeted; refused as `UnsupportedProposal` (scored as SKIPS, not passes) |
+
+**The 172 that are actionable, most valuable first:**
+
+| | item | failures | why it matters |
+| --- | --- | --- | --- |
+| **R1** 🔴 | **Cross-module type identity** | 25 | `funcTypeEqual`/`funcTypeEq` compare `ValType` slices with `std.mem.eql`, but a concrete `(ref $t)` carries a **module-local index** — so types from two modules are never comparable. Needs STRUCTURAL comparison walking both type sections in step. 7 `unlinkable: module linked` (accept-invalid at link), 4 `IncompatibleImportType` (valid modules refused), 5 `IndirectTypeMismatch`. **Absorbs the last leftovers of T3, T4 and the GC work** — `try_catch.wast` and `return_call_ref.wast` each end here. |
+| **R2** 🔴 | **elem / linking / instance** | 42 | `elem.wast` 16, `linking.wast` 12, `instance.wast` 8, `linking0/3`. Includes **11 wrong-answer** (`result mismatch`) failures — the worst class in this codebase's taxonomy, a plausible wrong value handed to the guest. |
+| **R3** 🟠 | **GC array data/elem ops MISSING** | ~10 | `array.new_data` / `array.init_data` / `array.new_elem` / `array.init_elem` are **absent from `opcode.zig` entirely** (`array_new_data.wast` 5, `array_init_data.wast` 2, `array.wast` 2). ⚠️ **GC is a TARGETED, shipped feature** — same shape as table64: a proposal recorded as done with a piece missing. |
+| **R4** 🟠 | **Accept-invalid in core files** | ~15 | `table.wast` 7, `try_table.wast` 2, `ref.wast` 2, `tag.wast` 1, and others. The safety class the whole T1 effort was about, still present in the main suite. |
+| **R5** 🟡 | **Runner gaps, not wazmrt defects** | 41 | `(module quote …)` is unimplemented in `wast.zig` → 20 `BadCommand`; 21 `NoTarget` cascades from modules that never built. These suppress real verification rather than proving anything — the same red-washing as `(either …)` was. Cheap, and it makes every other number honest. |
+| **R6** 🟡 | GC type remainder + `i31` | 20 | `type-subtyping` 12, `type-rec` 9 (largely `(module quote …)`-adjacent), `i31.wast` 9. Partly falls out of R1/R5. |
+| **R7** 🟡 | threads | 15 | `proposals/threads/imports.wast` 13, `memory.wast` 2 — mostly shared-memory import matching, adjacent to R1. |
+| **R8** ⚠️ | **UTF-8 name validation is UNVERIFIED** | 0 failures | `utf8-invalid-encoding.wast` is **0 passed / 0 failed / 176 SKIPPED**. The 13th pass recorded UTF-8 name validation as fixed and this corpus checks **none** of it. Not a failure — a hole in the evidence, which is worse: an unverified security-relevant check reads as a passing one. Find out whether the skip is the runner's gap or ours. |
+
+**Recommended order: R1 → R2 → R3.** R1 is the only remaining *correctness* cluster that spans
+features (it is the reason three separate areas each have a stubborn leftover); R2 holds the wrong
+answers; R3 is a missing piece of a feature we claim. R5 is cheap and can be slotted in any time — do
+it before quoting conformance numbers again.
+
+⚠️ **2,655 assertions are still SKIPPED and that is not a pass.** The largest pools: `br_table.wast`
+**161**, `custom-descriptors/exact-casts` 108, `wide-arithmetic` 107, `br_on_cast_desc_eq*` 101 each.
+`br_table.wast` is core spec and worth a look on its own — 161 unrun assertions in a control-flow
+instruction is a bigger blind spot than most of the failures above.
 
 ### What is left after Track 1 (2026-08-11)
 

@@ -101,7 +101,7 @@ failure mode in this codebase's taxonomy — is gone. The file's remaining failu
 class: a proposal wazmrt does not implement. If it is ever implemented, grow semantics need their own
 test.
 
-### ❌ T5 — NOT A DEFECT (2026-08-12) — strike it from the list
+### ✅ T5 — RESOLVED (2026-08-12): investigated, and there was NO DEFECT to fix
 
 `memory_max.wast` / `memory_max_i64.wast` reported `assert_unlinkable: non-link error InvalidLimits`,
 which read as a stage misclassification. **All four assertions in each file use `(pagesize …)`.** With
@@ -112,6 +112,11 @@ was. Both files went clean with T1.
 ⚠️ **The transferable lesson: a defect classified by its error message can be a shadow of a defect
 three layers up.** T5 was triaged as its own item, in its own severity band, from a symptom that had
 nothing to do with limits.
+
+**Re-verified 2026-08-12** after all the T-work landed, because "not a defect" is a claim that should
+be re-checked rather than trusted: `memory_max.wast` and `memory_max_i64.wast` do not appear in the
+failing set at all, and the corpus contains **zero** `assert_unlinkable: non-link error` failures in
+any of its 284 files. The class is empty, not merely these two files.
 
 ### 🟠 ✅ T3 — legacy `rethrow` — FIXED 2026-08-12. It was TWO defects, not one.
 
