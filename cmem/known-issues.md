@@ -16,7 +16,12 @@ about a file **deleted on 2026-08-11**. They are kept because they are the *evid
 replacement's design: value handles exist precisely so that class cannot recur. See
 `design-decisions.md`.
 
-## 🎯 TASK-TO-FIX LIST — 62 real defects from the proposal-dir spec runs (2026-08-11)
+## 🎯 TASK-TO-FIX LIST — from the proposal-dir spec runs (2026-08-11)
+
+⚠️ **Updated 2026-08-12: T1 is fixed, T2 dissolved with it, and T5 was never a defect.** The "62" below
+is the original triage's count and is now wrong in both directions — T1 was **68** assertions, not 43
+(25 of them in the *main* suite, which the proposal-dir framing hid), and T5's 2 were miscounted
+symptoms. **T3 and T4 remain.** Read the per-item sections for what actually happened.
 
 Ran wasmtk's `tests/module/` corpus: **427 files, 60,568 assertions passed / 525 failed / 3,038
 skipped**. 164 of those failures sit in `testsuite-main/proposals/` + `legacy/`. Classified every one
@@ -33,30 +38,80 @@ by its first-failure text:
 project's own rule — *a runtime that executes an invalid module is over-permissive, not authoritative*
 — is being broken in a corner nobody had run before.
 
-### 🔴 T1 — ACCEPT-INVALID: 43 modules accepted that the spec requires be REJECTED
+### 🔴 ✅ T1 — ACCEPT-INVALID — FIXED 2026-08-12 (and it took T2 and T5 with it)
 
-- `proposals/custom-descriptors/binary.wast` — **25 failures**, first: `assert_invalid/malformed:
-  module was accepted (should be rejected)`.
-- `proposals/custom-page-sizes/custom-page-sizes-invalid.wast` — **18 failures**, same verdict.
+Corpus **525 → 455 failures**, 86 → 82 files with failures, **zero regressions** (every baseline entry
+decreased or vanished). `testsuite-main/binary.wast` and the `custom-descriptors` copy are both
+**completely clean**.
 
-**Why it matters more than the count suggests:** these files are almost entirely *negative*
-assertions. wazmrt is not failing to run something — it is **building modules whose encodings are
-malformed**, which is the accept-invalid class the 12th/13th passes spent so much effort closing.
-**Likely cause:** an unknown/reserved bit in the memory-limits flag byte (custom-page-sizes adds a
-page-size field there) and unknown type-section forms (custom-descriptors) are being ignored rather
-than refused. The decoder already rejects *some* reserved limits flags (`MalformedFlag`) — this is the
-sibling case it misses. **Sweep for the sibling**, per the standing lesson.
+⚠️ **THE TRIAGE MISLOCATED IT AND THE HYPOTHESIS WAS WRONG.** Two lessons, both expensive to relearn:
 
-### 🔴 T2 — SILENT WRONG ANSWER on custom page sizes (12 failures)
+1. **It was a CORE-SPEC defect, not a proposal one.** The *main* `testsuite-main/binary.wast` carried
+   **the same 25 failures** as `proposals/custom-descriptors/binary.wast` — the two files differ by one
+   import-kind byte. Grouping the run's failures by directory made a core-decoder hole look like a
+   proposal gap. **When a proposal-dir file fails, diff it against its main-suite original before
+   believing the label.**
+2. **The suspected cause did not exist.** The guess was "an ignored reserved bit in the memory-limits
+   flag" — but `readLimits` already rejected `flag > 0x07`. Right instinct (*sweep for the sibling*),
+   wrong sibling.
 
-`proposals/custom-page-sizes/custom-page-sizes.wast` — first failure: `assert_return "grow": result
-mismatch (got 0xffffffff)`.
+**Method that found it:** the conformance runner only records each file's FIRST failure, so 25 defects
+looked like one. Splitting `binary.wast` into 127 one-form files and running the directory gave all 25
+at once, and they fell into three obvious classes immediately. **That splitter is worth rebuilding any
+time a single file shows a double-digit failure count.**
 
-wazmrt **accepted** a module declaring a custom page size, then executed it wrongly: `memory.grow`
-returned −1. This is worse than T1 and is the *worst* failure mode in this codebase's taxonomy — not a
-refusal, not a trap, but a plausible wrong value handed to the guest. Fixing T1 (reject the encoding)
-almost certainly fixes this too; if the proposal is ever implemented, the grow semantics need their own
+**The four gaps — each one hid the next:**
+
+| | rule | missed | where |
+| --- | --- | --- | --- |
+| 1 | §5.5.2 section **order + at-most-once** | 16 | `Module.decode` |
+| 2 | §5.5.1 section **size consumed exactly** | 7 | `Module.decode` |
+| 3 | §5.5.16 **data-count section required** for `memory.init`/`data.drop` | 2 | `validate` |
+| 4 | trailing forms in a WAT `(memory …)` field | 18 | `wat.zig` |
+
+- ⚠️ **`sectionRank` is NOT the section id.** `tag` (13) belongs between *memory* (5) and *global* (6);
+  `data_count` (12) between *element* (9) and *code* (10). Both proposals appended an id to the end of
+  the range while inserting the section into the middle of the grammar. Ordering by raw id would have
+  refused every valid EH and bulk-memory module — a gate wrong in the over-refusing direction, the
+  same shape as ABI-2 near-miss #3.
+- 🔴 **Gap 3 had a mirror-image half in our own assembler: it emitted the data-count section NEVER.**
+  Landing the decoder check alone turned **~96 previously passing corpus assertions red**. Every
+  `(data …)` module wazmrt assembled was malformed the moment a body touched a segment, and nothing
+  caught it because **the two halves of the same gap agreed with each other**. *A producer and a
+  consumer that share an author share their blind spots; conformance only bites when one of them is
+  someone else's.*
+- 🟠 **14 hand-written test fixtures were malformed** — code section before export, `tag`/`memory`
+  before `function`. They had decoded happily for the life of the project. This is the FOURTH sighting
+  of the ABI-2 lesson #6 shape. `ehModule` now asserts spec section order so the class cannot recur.
+- The duplicate-section half was the worse one: a second section just **reassigned** the field
+  (`imports = try decode…`), so the module built from the last copy and the first vanished silently.
+
+**Honesty note.** `(pagesize …)` is now `error.UnsupportedProposal`, listed in `isOurLimitation`, so
+those assertions score as **SKIPS, not passes** — the modules are valid under a proposal wazmrt does
+not target, so refusing them is our gap, not a verdict. That is why passes only rose 32 while failures
+fell 70. Fixing this also exposed the missing our-limitation arm in `assertUnlinkable`, the same
+green-washing hole `assertRejected` had already closed.
+
+### ✅ T2 — SILENT WRONG ANSWER on custom page sizes — DISSOLVED BY T1 (2026-08-12)
+
+`custom-page-sizes.wast` returned `0xffffffff` from `memory.grow` because the WAT assembler **dropped
+`(pagesize N)` on the floor** and built an ordinary 64 KiB-page memory. The module never matched its
+own source. It now refuses to build (`UnsupportedProposal`), so the silent wrong answer — the worst
+failure mode in this codebase's taxonomy — is gone. The file's remaining failures are the by-design
+class: a proposal wazmrt does not implement. If it is ever implemented, grow semantics need their own
 test.
+
+### ❌ T5 — NOT A DEFECT (2026-08-12) — strike it from the list
+
+`memory_max.wast` / `memory_max_i64.wast` reported `assert_unlinkable: non-link error InvalidLimits`,
+which read as a stage misclassification. **All four assertions in each file use `(pagesize …)`.** With
+the pagesize dropped, `(memory 0xFFFF_FFFF (pagesize 1))` became a *default*-page-size memory of 4 G
+pages, which legitimately overflows → `InvalidLimits` at decode. The stage was never wrong; the memory
+was. Both files went clean with T1.
+
+⚠️ **The transferable lesson: a defect classified by its error message can be a shadow of a defect
+three layers up.** T5 was triaged as its own item, in its own severity band, from a symptom that had
+nothing to do with limits.
 
 ### 🟠 T3 — legacy `rethrow` traps where it must return (3 failures)
 

@@ -90,6 +90,11 @@ pub const Error = Module.Error || error{
     UndefinedElem,
     /// A `memory.init`/`data.drop` data-segment index out of range.
     UndefinedData,
+    /// `memory.init`/`data.drop` appeared in a module with no data-count section.
+    /// §5.5.16 makes that section mandatory once either instruction is used —
+    /// a single-pass decoder has to know the segment count before the code
+    /// section, so its absence is malformed even though the indices resolve.
+    DataCountRequired,
     /// A struct/array field index out of range for its type (GC).
     UndefinedField,
     /// A `struct.set`/`array.set` on an immutable field (GC).
@@ -1103,12 +1108,14 @@ const FuncValidator = struct {
                 // differs by build mode. `data_drop` below is correct; its
                 // immediate really is `.data`.
                 try self.requireMemory(instr.imm.mem_init.mem);
+                if (self.module.data_count == null) return error.DataCountRequired;
                 if (instr.imm.mem_init.data >= self.module.data.len) return error.UndefinedData;
                 _ = try self.popExpect(.i32); // n (count into the data segment — i32)
                 _ = try self.popExpect(.i32); // src (offset into the segment — i32)
                 _ = try self.popExpect(self.memAddrTy(instr.imm.mem_init.mem)); // dst address (memory64: i64)
             },
             .data_drop => {
+                if (self.module.data_count == null) return error.DataCountRequired;
                 if (instr.imm.data >= self.module.data.len) return error.UndefinedData;
             },
             .table_copy => {
@@ -1633,11 +1640,50 @@ test "validates a well-typed add function" {
         types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
         [_]u8{ 0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f } ++
         [_]u8{ 0x03, 0x02, 0x01, 0x00 } ++
-        [_]u8{ 0x0a, 0x0b, 0x01, 0x09, 0x01, 0x01, 0x7f, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b } ++
-        [_]u8{ 0x07, 0x07, 0x01, 0x03, 'a', 'd', 'd', 0x00, 0x00 };
+        [_]u8{ 0x07, 0x07, 0x01, 0x03, 'a', 'd', 'd', 0x00, 0x00 } ++
+        [_]u8{ 0x0a, 0x0b, 0x01, 0x09, 0x01, 0x01, 0x7f, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b };
     var m = try Module.decode(std.testing.allocator, &bytes);
     defer m.deinit();
     try validate(std.testing.allocator, &m);
+}
+
+test "rejects memory.init/data.drop with no data-count section (§5.5.16)" {
+    // A module with a memory, one passive data segment and a body that uses it,
+    // but NO data-count section. Every index resolves — `data.len` is 1 — so
+    // nothing downstream noticed; §5.5.16 still requires the section, because a
+    // single-pass decoder must know the segment count before the code section.
+    //
+    // The mirror-image half of this gap lived in the ASSEMBLER, which emitted
+    // the section never: fixing only the check here turned ~96 previously
+    // passing corpus assertions red. Both halves are needed, and each one hid
+    // the other.
+    const with_count = [_]u8{ 0x0c, 0x01, 0x01 }; // data_count: 1 segment
+    const rest =
+        types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+        [_]u8{ 0x01, 0x04, 0x01, 0x60, 0x00, 0x00 } ++ // type: () -> ()
+        [_]u8{ 0x03, 0x02, 0x01, 0x00 } ++ // one func of type 0
+        [_]u8{ 0x05, 0x03, 0x01, 0x00, 0x01 }; // memory: min 1 page
+    // code(14) = count(1) + size(1) + body(12); body(12) = locals(1) + three
+    // `i32.const 0`(2 each) + `memory.init 0 0`(4) + end(1).
+    const tail =
+        [_]u8{ 0x0a, 0x0e, 0x01, 0x0c, 0x00, 0x41, 0x00, 0x41, 0x00, 0x41, 0x00, 0xfc, 0x08, 0x00, 0x00, 0x0b } ++
+        // data(4) = count(1) + flags(1) + len(1) + "a"(1): one passive segment.
+        [_]u8{ 0x0b, 0x04, 0x01, 0x01, 0x01, 0x61 };
+
+    {
+        const bytes = rest ++ tail;
+        var m = try Module.decode(std.testing.allocator, &bytes);
+        defer m.deinit();
+        try std.testing.expectError(error.DataCountRequired, validate(std.testing.allocator, &m));
+    }
+    // The same module WITH the section must validate — the check must key on the
+    // section's presence, not on `data.len`, which is 1 either way.
+    {
+        const bytes = rest ++ with_count ++ tail;
+        var m = try Module.decode(std.testing.allocator, &bytes);
+        defer m.deinit();
+        try validate(std.testing.allocator, &m);
+    }
 }
 
 test "rejects a stack underflow (i32.add with no operands)" {

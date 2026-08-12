@@ -547,6 +547,11 @@ const Runner = struct {
             error.NotAModule,
             error.UnknownInstr, // the assembler doesn't know this mnemonic
             error.UnsupportedInstr,
+            // Recognised syntax from a proposal we do not target (`pagesize`).
+            // The module may be valid under that proposal, so refusing it is our
+            // gap — banking these as passes is exactly the green-washing the
+            // comment above describes.
+            error.UnsupportedProposal,
             error.UnknownIdentifier,
             error.UnsupportedOpcode, // ambiguous → treat as ours
             error.UnsupportedInstruction,
@@ -577,8 +582,20 @@ const Runner = struct {
         };
         if (self.buildModule(inner)) |_| {
             self.fail("assert_unlinkable: module linked (should be rejected)", .{});
-        } else |e| {
-            if (isLinkError(e)) self.summary.passed += 1 else self.fail("assert_unlinkable: non-link error {s}", .{@errorName(e)});
+        } else |e| if (isLinkError(e)) {
+            self.summary.passed += 1;
+        } else if (isOurLimitation(e)) {
+            // We never got as far as linking, so we have no verdict to give.
+            // `assertRejected` already drew this line; this arm did not, and
+            // charged our own gaps as conformance failures — `memory_max.wast`
+            // reported two where one was simply `(pagesize …)`, syntax we refuse
+            // by design. NOTE the order: `isLinkError` is asked FIRST and this
+            // list stays narrow, so a real wrong-STAGE rejection (T5's
+            // `InvalidLimits` at decode where the spec wants a link failure)
+            // still lands in `fail` below where it belongs.
+            self.summary.skipped += 1;
+        } else {
+            self.fail("assert_unlinkable: non-link error {s}", .{@errorName(e)});
         }
     }
 };

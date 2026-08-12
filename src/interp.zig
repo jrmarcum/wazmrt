@@ -3878,8 +3878,8 @@ test "runs add(a,b) -> a+b" {
         types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
         [_]u8{ 0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f } ++
         [_]u8{ 0x03, 0x02, 0x01, 0x00 } ++
-        [_]u8{ 0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b } ++
-        [_]u8{ 0x07, 0x07, 0x01, 0x03, 'a', 'd', 'd', 0x00, 0x00 };
+        [_]u8{ 0x07, 0x07, 0x01, 0x03, 'a', 'd', 'd', 0x00, 0x00 } ++
+        [_]u8{ 0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b };
     var inst = try instantiate(&bytes);
     defer destroy(&inst);
 
@@ -3898,9 +3898,9 @@ test "runs an if/else (isNonZero)" {
         types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
         [_]u8{ 0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f } ++ // (i32)->(i32)
         [_]u8{ 0x03, 0x02, 0x01, 0x00 } ++
+        [_]u8{ 0x07, 0x06, 0x01, 0x02, 'n', 'z', 0x00, 0x00 } ++
         // body(12): locals(00) local.get0 if(i32) i32.const1 else i32.const0 end end
-        [_]u8{ 0x0a, 0x0e, 0x01, 0x0c, 0x00, 0x20, 0x00, 0x04, 0x7f, 0x41, 0x01, 0x05, 0x41, 0x00, 0x0b, 0x0b } ++
-        [_]u8{ 0x07, 0x06, 0x01, 0x02, 'n', 'z', 0x00, 0x00 };
+        [_]u8{ 0x0a, 0x0e, 0x01, 0x0c, 0x00, 0x20, 0x00, 0x04, 0x7f, 0x41, 0x01, 0x05, 0x41, 0x00, 0x0b, 0x0b };
     var inst = try instantiate(&bytes);
     defer destroy(&inst);
 
@@ -4031,9 +4031,9 @@ test "runs a br out of a block" {
         types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
         [_]u8{ 0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f } ++ // ()->(i32)
         [_]u8{ 0x03, 0x02, 0x01, 0x00 } ++
+        [_]u8{ 0x07, 0x05, 0x01, 0x01, 'f', 0x00, 0x00 } ++
         // body: block (result i32) ; i32.const 42 ; br 0 ; end ; end
-        [_]u8{ 0x0a, 0x0b, 0x01, 0x09, 0x00, 0x02, 0x7f, 0x41, 0x2a, 0x0c, 0x00, 0x0b, 0x0b } ++
-        [_]u8{ 0x07, 0x05, 0x01, 0x01, 'f', 0x00, 0x00 };
+        [_]u8{ 0x0a, 0x0b, 0x01, 0x09, 0x00, 0x02, 0x7f, 0x41, 0x2a, 0x0c, 0x00, 0x0b, 0x0b };
     var inst = try instantiate(&bytes);
     defer destroy(&inst);
 
@@ -4048,8 +4048,8 @@ test "traps on division by zero" {
         types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
         [_]u8{ 0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f } ++
         [_]u8{ 0x03, 0x02, 0x01, 0x00 } ++
-        [_]u8{ 0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6d, 0x0b } ++
-        [_]u8{ 0x07, 0x07, 0x01, 0x03, 'd', 'i', 'v', 0x00, 0x00 };
+        [_]u8{ 0x07, 0x07, 0x01, 0x03, 'd', 'i', 'v', 0x00, 0x00 } ++
+        [_]u8{ 0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6d, 0x0b };
     var inst = try instantiate(&bytes);
     defer destroy(&inst);
     try std.testing.expectError(error.DivByZero, inst.invoke("div", &.{ i32Value(1), i32Value(0) }));
@@ -4061,8 +4061,8 @@ test "runs f64.add" {
         types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
         [_]u8{ 0x01, 0x07, 0x01, 0x60, 0x02, 0x7c, 0x7c, 0x01, 0x7c } ++
         [_]u8{ 0x03, 0x02, 0x01, 0x00 } ++
-        [_]u8{ 0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0xa0, 0x0b } ++
-        [_]u8{ 0x07, 0x08, 0x01, 0x04, 'f', 'a', 'd', 'd', 0x00, 0x00 };
+        [_]u8{ 0x07, 0x08, 0x01, 0x04, 'f', 'a', 'd', 'd', 0x00, 0x00 } ++
+        [_]u8{ 0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0xa0, 0x0b };
     var inst = try instantiate(&bytes);
     defer destroy(&inst);
     const r = try inst.invoke("fadd", &.{ f64Value(1.5), f64Value(2.25) });
@@ -4076,8 +4076,8 @@ test "runs i32.trunc_f64_s and traps on NaN" {
         types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
         [_]u8{ 0x01, 0x06, 0x01, 0x60, 0x01, 0x7c, 0x01, 0x7f } ++
         [_]u8{ 0x03, 0x02, 0x01, 0x00 } ++
-        [_]u8{ 0x0a, 0x07, 0x01, 0x05, 0x00, 0x20, 0x00, 0xaa, 0x0b } ++
-        [_]u8{ 0x07, 0x07, 0x01, 0x03, 't', 'o', 'i', 0x00, 0x00 };
+        [_]u8{ 0x07, 0x07, 0x01, 0x03, 't', 'o', 'i', 0x00, 0x00 } ++
+        [_]u8{ 0x0a, 0x07, 0x01, 0x05, 0x00, 0x20, 0x00, 0xaa, 0x0b };
     var inst = try instantiate(&bytes);
     defer destroy(&inst);
 
@@ -4142,10 +4142,26 @@ fn ehUleb(a: std.mem.Allocator, out: *std.ArrayList(u8), v: usize) !void {
 
 const EhSection = struct { id: u8, body: []const u8 };
 
+/// Frame a module from raw section bodies. Sections must be listed in the order
+/// §5.5.2 fixes — which is NOT ascending id, because `tag` (13) sits between
+/// *memory* and *global*, and `data_count` (12) between *element* and *code*.
+///
+/// The assertion is not decoration: fourteen fixtures here listed `tag` or
+/// `memory` BEFORE the function section, and every one of them decoded happily
+/// until the decoder started enforcing the order. A malformed fixture that runs
+/// is a test proving something about a module the spec does not admit, so catch
+/// it at the helper — with the offending id in hand — rather than as a distant
+/// `SectionOrder` from `decode`.
 fn ehModule(a: std.mem.Allocator, sections: []const EhSection) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(a, &.{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 });
+    var last_rank: u8 = 0;
     for (sections) |s| {
+        if (s.id != 0) {
+            const rank = Module.sectionRank(@enumFromInt(s.id));
+            std.debug.assert(rank > last_rank); // out of order, or a duplicate
+            last_rank = rank;
+        }
         try out.append(a, s.id);
         try ehUleb(a, &out, s.body.len);
         try out.appendSlice(a, s.body);
@@ -4179,8 +4195,8 @@ test "EH: throw is caught by a matching catch, carrying the payload" {
     const a = arena.allocator();
     const bytes = try ehModule(a, &.{
         .{ .id = 1, .body = &.{ 0x02, 0x60, 0x01, 0x7f, 0x00, 0x60, 0x00, 0x01, 0x7f } }, // (func(param i32)), (func()->i32)
-        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } }, // tag 0 : type 0
         .{ .id = 3, .body = &.{ 0x01, 0x01 } }, // func 0 : type 1
+        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } }, // tag 0 : type 0
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{
             // try_table (result i32) (catch 0 0) ; i32.const 42 ; throw 0 ; end
@@ -4200,8 +4216,8 @@ test "EH: catch_all catches any tag and control resumes after the try_table" {
     const a = arena.allocator();
     const bytes = try ehModule(a, &.{
         .{ .id = 1, .body = &.{ 0x02, 0x60, 0x00, 0x00, 0x60, 0x00, 0x01, 0x7f } }, // (func), (func()->i32)
-        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } },
         .{ .id = 3, .body = &.{ 0x01, 0x01 } },
+        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } },
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{
             // try_table (catch_all 0) ; throw 0 ; end ; i32.const 55
@@ -4221,8 +4237,8 @@ test "EH: an uncaught throw traps (UncaughtException)" {
     const a = arena.allocator();
     const bytes = try ehModule(a, &.{
         .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x00 } }, // (func)
-        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } },
         .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } },
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{&.{ 0x00, 0x08, 0x00, 0x0b }}) }, // throw 0 ; end
     });
@@ -4237,8 +4253,8 @@ test "EH: an exception thrown in a callee is caught in the caller's try_table" {
     const a = arena.allocator();
     const bytes = try ehModule(a, &.{
         .{ .id = 1, .body = &.{ 0x02, 0x60, 0x00, 0x00, 0x60, 0x00, 0x01, 0x7f } }, // (func), (func()->i32)
-        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } },
         .{ .id = 3, .body = &.{ 0x02, 0x00, 0x01 } }, // func0:type0 (callee), func1:type1 (caller)
+        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } },
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x01 } }, // export caller (func 1)
         .{ .id = 10, .body = try ehCode(a, &.{
             &.{ 0x00, 0x08, 0x00, 0x0b }, // callee: throw 0 ; end
@@ -4259,8 +4275,8 @@ test "EH: catch_ref materializes a non-null exnref" {
     const a = arena.allocator();
     const bytes = try ehModule(a, &.{
         .{ .id = 1, .body = &.{ 0x02, 0x60, 0x00, 0x00, 0x60, 0x00, 0x01, 0x7f } },
-        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } },
         .{ .id = 3, .body = &.{ 0x01, 0x01 } },
+        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } },
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{
             // try_table (result exnref) (catch_ref 0 0) ; throw 0 ; end ; ref.is_null
@@ -4280,8 +4296,8 @@ test "EH: throw_ref rethrows a caught exnref to an outer catch_all" {
     const a = arena.allocator();
     const bytes = try ehModule(a, &.{
         .{ .id = 1, .body = &.{ 0x02, 0x60, 0x00, 0x00, 0x60, 0x00, 0x01, 0x7f } },
-        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } },
         .{ .id = 3, .body = &.{ 0x01, 0x01 } },
+        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } },
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{&.{
             0x00,
@@ -4337,8 +4353,8 @@ test "legacy EH: try/catch catches a thrown exception and binds its payload" {
     const a = arena.allocator();
     const bytes = try ehModule(a, &.{
         .{ .id = 1, .body = &.{ 0x02, 0x60, 0x01, 0x7f, 0x00, 0x60, 0x00, 0x01, 0x7f } },
-        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } }, // tag 0 : type 0 (param i32)
         .{ .id = 3, .body = &.{ 0x01, 0x01 } },
+        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } }, // tag 0 : type 0 (param i32)
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{
             // try (result i32) ; i32.const 42 ; throw 0 ; catch 0 ; end
@@ -4358,8 +4374,8 @@ test "legacy EH: a try body that does not throw skips the catch handler" {
     const a = arena.allocator();
     const bytes = try ehModule(a, &.{
         .{ .id = 1, .body = &.{ 0x02, 0x60, 0x01, 0x7f, 0x00, 0x60, 0x00, 0x01, 0x7f } },
-        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } },
         .{ .id = 3, .body = &.{ 0x01, 0x01 } },
+        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } },
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{
             // try (result i32) ; i32.const 7 ; catch 0 ; (unreached) ; end
@@ -4379,8 +4395,8 @@ test "legacy EH: catch_all catches any tag" {
     const a = arena.allocator();
     const bytes = try ehModule(a, &.{
         .{ .id = 1, .body = &.{ 0x02, 0x60, 0x00, 0x00, 0x60, 0x00, 0x01, 0x7f } }, // (func), (func()->i32)
-        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } },
         .{ .id = 3, .body = &.{ 0x01, 0x01 } },
+        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } },
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{
             // try (result i32) ; throw 0 ; catch_all ; i32.const 5 ; end
@@ -4407,8 +4423,8 @@ test "legacy EH: a delegate reached while unwinding TRAPS instead of mis-routing
     const a = arena.allocator();
     const bytes = try ehModule(a, &.{
         .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x00 } }, // one type: () -> ()
-        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } }, //       one tag, type 0
         .{ .id = 3, .body = &.{ 0x01, 0x00 } }, //              one func, type 0
+        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } }, //       one tag, type 0
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } }, // export "f" func 0
         .{ .id = 10, .body = try ehCode(a, &.{&.{
             0x00, //          0 locals
@@ -4429,8 +4445,8 @@ test "legacy EH: rethrow from an inner catch propagates to an outer catch" {
     const a = arena.allocator();
     const bytes = try ehModule(a, &.{
         .{ .id = 1, .body = &.{ 0x02, 0x60, 0x00, 0x00, 0x60, 0x00, 0x01, 0x7f } },
-        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } },
         .{ .id = 3, .body = &.{ 0x01, 0x01 } },
+        .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } },
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{&.{
             0x00,
@@ -4465,8 +4481,8 @@ test "multi-memory: a store to memory 1 does not touch memory 0 (index routing)"
     const a = arena.allocator();
     const bytes = try ehModule(a, &.{
         .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x01, 0x7f } }, // (func()->i32)
-        .{ .id = 5, .body = &.{ 0x02, 0x00, 0x01, 0x00, 0x01 } }, // 2 memories, each min 1
         .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+        .{ .id = 5, .body = &.{ 0x02, 0x00, 0x01, 0x00, 0x01 } }, // 2 memories, each min 1
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{&.{
             0x00,
@@ -4489,8 +4505,8 @@ test "multi-memory: memory.copy moves bytes between two memories" {
     const a = arena.allocator();
     const bytes = try ehModule(a, &.{
         .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x01, 0x7f } },
-        .{ .id = 5, .body = &.{ 0x02, 0x00, 0x01, 0x00, 0x01 } },
         .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+        .{ .id = 5, .body = &.{ 0x02, 0x00, 0x01, 0x00, 0x01 } },
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'g', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{&.{
             0x00,
@@ -4513,9 +4529,9 @@ test "multi-memory: memory.size / memory.grow select by index" {
     const a = arena.allocator();
     const bytes = try ehModule(a, &.{
         .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x01, 0x7f } },
+        .{ .id = 3, .body = &.{ 0x01, 0x00 } },
         // mem0 min 1, mem1 min 3
         .{ .id = 5, .body = &.{ 0x02, 0x00, 0x01, 0x00, 0x03 } },
-        .{ .id = 3, .body = &.{ 0x01, 0x00 } },
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{&.{
             0x00,
@@ -4567,8 +4583,8 @@ test "SIMD: i32x4.splat -> v128.store -> v128.load -> extract_lane" {
     const a = arena.allocator();
     const bytes = try ehModule(a, &.{
         .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x01, 0x7f } },
-        .{ .id = 5, .body = &.{ 0x01, 0x00, 0x01 } }, // 1 memory, min 1
         .{ .id = 3, .body = &.{ 0x01, 0x00 } },
+        .{ .id = 5, .body = &.{ 0x01, 0x00, 0x01 } }, // 1 memory, min 1
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'g', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{&.{
             0x00, // no locals

@@ -46,6 +46,14 @@ pub const Error = sexpr.Error || error{
     /// An `import` (top-level or inline) after a func/table/memory/global
     /// definition — malformed: imports must precede all definitions (§6.6.13).
     ImportAfterDefinition,
+    /// Syntax wazmrt RECOGNISES as belonging to a wasm proposal it does not
+    /// target — today only `(memory … (pagesize N))` (custom-page-sizes).
+    ///
+    /// Distinct from `BadModuleField` on purpose. The module may be perfectly
+    /// valid under its proposal, so refusing it is *our* gap, not a verdict on
+    /// the module; `wast.zig`'s `isOurLimitation` therefore scores it as a SKIP
+    /// rather than banking it as a conformance pass.
+    UnsupportedProposal,
 } || std.mem.Allocator.Error;
 
 // --- Shape-checked s-expression accessors -----------------------------------
@@ -378,6 +386,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 const imp = (try wantList(items[mi]));
                 mi += 1;
                 const lim = try parseMemLimits(items, &mi, this_is64, this_type_seen);
+                try checkMemTail(items, mi);
                 try mem_imports.append(a, .{ .module = (try strAt(imp, 1)), .name = (try strAt(imp, 2)), .min = lim.min, .max = lim.max, .shared = lim.shared, .is64 = lim.is64 });
             } else if (mi < items.len and eqKw(items[mi], "data")) {
                 // (memory (data "…")) — size the memory to the bytes and append an
@@ -402,6 +411,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 // type may sit here (canonical) or right after the name; `shared`
                 // (threads) follows the limits and requires a max.
                 const lim = try parseMemLimits(items, &mi, this_is64, this_type_seen);
+                try checkMemTail(items, mi);
                 try memories.append(a, .{ .min = lim.min, .max = lim.max, .shared = lim.shared, .is64 = lim.is64 });
             }
             try mem_names.append(a, this_name);
@@ -752,6 +762,20 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     }
     // Element section (9) — pre-encoded above (before the type section).
     if (elems.items.len != 0) try emitSection(a, &out, 9, elem_pay);
+    // Data-count section (12) — the segment count, ahead of the code that uses
+    // it. §5.5.16 REQUIRES it in any module whose code has `memory.init`/
+    // `data.drop`, and we emitted it never: every `(data …)` module this
+    // assembler produced was malformed the moment a body touched a segment.
+    // Nothing caught it because the decoder did not enforce the rule either —
+    // the two halves of the same gap agreed with each other. Emitting it
+    // whenever there IS a data section is simplest and always legal: when no
+    // instruction needs it the section is merely optional, and `decode` checks
+    // the count against `data.len` either way.
+    if (datas.items.len != 0) {
+        var s: List(u8) = .empty;
+        try uleb(a, &s, datas.items.len);
+        try emitSection(a, &out, 12, s.items);
+    }
     // Code section (10) — pre-encoded bodies
     {
         var s: List(u8) = .empty;
@@ -2570,6 +2594,26 @@ const MemLimits = struct { min: u64, max: ?u64 = null, shared: bool = false, is6
 /// emit); either position is accepted, neither required. Advances `mi`. One home
 /// for the parse the three memory sites (inline defined / inline import /
 /// top-level `(import … (memory …))`) used to each copy.
+/// Reject anything left over in a `(memory …)` field after its limits.
+///
+/// `parseMemLimits` stops at the first item that is not a number / `shared`, and
+/// the caller used to just walk away — so every trailing form was **silently
+/// dropped**. `(memory 0 (pagesize 3))` therefore assembled into a plain 64 KiB-
+/// page memory: the module built, ran, and disagreed with its own source. That
+/// is 18 of `custom-page-sizes-invalid.wast`'s assertions, and the *reason* the
+/// `memory.grow` in `custom-page-sizes.wast` answers −1 — the memory was never
+/// the one the text asked for. A trailing ATOM already failed (`parseU64` chokes
+/// on it); only lists slipped through, which is why this went unnoticed.
+///
+/// `pagesize` is named separately because it is real syntax from a real proposal
+/// we do not implement, not a typo — see `error.UnsupportedProposal`.
+fn checkMemTail(items: []const Sexpr, mi: usize) Error!void {
+    if (mi >= items.len) return;
+    if (items[mi].asList()) |l| if (l.len != 0 and eqAtom(l[0], "pagesize"))
+        return error.UnsupportedProposal;
+    return error.BadModuleField;
+}
+
 fn parseMemLimits(items: []const Sexpr, mi: *usize, is64_seen: bool, type_seen: bool) Error!MemLimits {
     var is64 = is64_seen;
     // Consume the index type here only if one wasn't already taken after the name
@@ -4933,4 +4977,56 @@ test "legacy EH: a raw throw inside a catch handler propagates to the OUTER try,
     var m = try Module.decode(a, try assemble(a, src));
     try validate(a, &m);
     try std.testing.expectEqual(@as(i32, 7), interp.asI32(try assembleAndRun(src, "f", &.{})));
+}
+
+test "a (memory …) field may not carry unconsumed trailing forms" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `(pagesize N)` is custom-page-sizes syntax wazmrt does not implement. It
+    // used to be DROPPED: `(memory 0 (pagesize 1))` assembled into an ordinary
+    // 64 KiB-page memory that then disagreed with its own source — the reason
+    // `custom-page-sizes.wast`'s `memory.grow` answered −1. A distinct error
+    // keeps it a SKIP in the conformance runner rather than a claimed pass.
+    try std.testing.expectError(error.UnsupportedProposal, assemble(a, "(module (memory 0 (pagesize 1)))"));
+    try std.testing.expectError(error.UnsupportedProposal, assemble(a, "(module (memory 0 (pagesize 3)))"));
+    try std.testing.expectError(error.UnsupportedProposal, assemble(a, "(module (memory (import \"m\" \"n\") 0 (pagesize 1)))"));
+
+    // The hole was lists specifically — a trailing ATOM already failed, because
+    // `parseU64` chokes on it. Anything unrecognised must now be refused.
+    try std.testing.expectError(error.BadModuleField, assemble(a, "(module (memory 1 (nonsense 4)))"));
+
+    // ...without refusing the forms that legitimately trail the limits.
+    _ = try assemble(a, "(module (memory 1))");
+    _ = try assemble(a, "(module (memory 1 2))");
+    _ = try assemble(a, "(module (memory 1 2 shared))");
+    _ = try assemble(a, "(module (memory i64 1 2))");
+    _ = try assemble(a, "(module (memory $m (export \"m\") 1 2))");
+    _ = try assemble(a, "(module (memory (data \"abc\")))");
+}
+
+test "the assembler emits a data-count section for any module with data segments" {
+    // §5.5.16 requires it once a body uses `memory.init`/`data.drop`, and we
+    // emitted it never — so every such module this assembler produced was
+    // malformed. Invisible until the decoder started enforcing the rule, since
+    // the two gaps agreed with each other.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const src =
+        \\(module (memory 1) (data $d "abc")
+        \\  (func (export "f")
+        \\    (memory.init $d (i32.const 0) (i32.const 0) (i32.const 3))
+        \\    (data.drop $d)))
+    ;
+    var m = try Module.decode(a, try assemble(a, src));
+    try std.testing.expectEqual(@as(?u32, 1), m.data_count);
+    try validate(a, &m); // would be `DataCountRequired` without the section
+
+    // No data segments ⇒ no section, which is equally required: an empty
+    // data-count section would then disagree with nothing but still be noise.
+    const m2 = try Module.decode(a, try assemble(a, "(module (memory 1))"));
+    try std.testing.expectEqual(@as(?u32, null), m2.data_count);
 }

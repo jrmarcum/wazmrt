@@ -204,6 +204,15 @@ exports: []const Export,
 /// Body of each defined function (code section), positionally matching
 /// `functions`. May be empty if the module has no code section.
 code: []const Code,
+/// Segment count from the data-count section (§5.5.16), or null if the module
+/// has no such section.
+///
+/// The VALUE is redundant — `decode` already checks it equals `data.len` — but
+/// the PRESENCE is not: §5.5.16 makes the section mandatory for any module whose
+/// code uses `memory.init`/`data.drop`, so that a streaming decoder knows the
+/// segment count before it reaches the code section. `validate` needs to tell
+/// "absent" from "present and 0", which `data.len` alone cannot.
+data_count: ?u32,
 /// The global index space (imported globals first, then defined), for
 /// resolving `global.get`/`global.set` during validation.
 globals: []const GlobalType,
@@ -276,6 +285,9 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
     var data_count: ?u32 = null;
     var func_names: ?[]const u8 = null;
 
+    // Rank of the last non-custom section seen, for the §5.5.2 order check below.
+    var last_rank: u8 = 0;
+
     while (!r.atEnd()) {
         const raw_id = try r.readByte();
         if (raw_id > types.SectionId.max) return error.InvalidSectionId;
@@ -284,6 +296,18 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
         const offset = r.pos;
         const payload = try r.readBytes(size);
         try sections.append(a, .{ .id = id, .offset = offset, .size = size });
+
+        // §5.5.2 fixes the section order and allows each non-custom section AT
+        // MOST ONCE. We used to decode whatever sequence arrived, so a duplicate
+        // section silently overwrote the first (`imports = try decode…` and its
+        // siblings just reassign) and a reversed pair decoded fine — 16 of the
+        // 25 `binary.wast` accept-invalid failures. STRICTLY increasing rank is
+        // both checks in one: equal rank is the duplicate, lower is disorder.
+        if (id != .custom) {
+            const rank = sectionRank(id);
+            if (rank <= last_rank) return error.SectionOrder;
+            last_rank = rank;
+        }
 
         var sub = Reader.init(payload);
         switch (id) {
@@ -317,6 +341,15 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
             .start => start = try sub.readVarU32(),
             else => {},
         }
+
+        // §5.5.1 makes a section's declared size part of the encoding: the
+        // contents must consume it EXACTLY. We read the payload as a bounded
+        // slice, so overrun already fails as `UnexpectedEof` — but leftover
+        // bytes were silently dropped, which accepted every "inconsistent count"
+        // module in `binary.wast` (a vec declaring 1 entry followed by 2, a data
+        // segment declaring 5 bytes followed by 6). A custom section is exempt:
+        // everything after its name is opaque by definition.
+        if (id != .custom and !sub.atEnd()) return error.SectionSizeMismatch;
     }
 
     // If present, the data-count section must equal the data-segment count (§5.5.16).
@@ -333,6 +366,7 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
         .imports = imports,
         .exports = exports,
         .code = code,
+        .data_count = data_count,
         .data = data,
         .elements = elements,
         .start = start,
@@ -341,6 +375,39 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
         .memories = try d.mem_space.toOwnedSlice(a),
         .tables = try d.table_space.toOwnedSlice(a),
         .func_names = func_names,
+    };
+}
+
+/// Position of a section in the fixed order of §5.5.2, as a dense rank.
+///
+/// ⚠️ **This is NOT the section id.** Two sections sit somewhere other than where
+/// their id would put them, and both are proposals that bolted an id onto the
+/// end of the range while inserting the section into the middle of the grammar:
+///
+///   - **tag** (id 13, EH) goes between *memory* (5) and *global* (6).
+///   - **data_count** (id 12) goes between *element* (9) and *code* (10) — it has
+///     to precede the code it counts for, or a single-pass validator could not
+///     use it.
+///
+/// Sorting by raw id would therefore reject every valid module that has one.
+/// `custom` never reaches here (it is exempt from ordering) and gets rank 0.
+pub fn sectionRank(id: types.SectionId) u8 {
+    return switch (id) {
+        .custom => 0,
+        .type => 1,
+        .import => 2,
+        .function => 3,
+        .table => 4,
+        .memory => 5,
+        .tag => 6,
+        .global => 7,
+        .@"export" => 8,
+        .start => 9,
+        .element => 10,
+        .data_count => 11,
+        .code => 12,
+        .data => 13,
+        _ => 0, // unreachable: `raw_id > max` is rejected before the call
     };
 }
 
@@ -1173,6 +1240,42 @@ test "rejects a reserved global-mutability byte" {
     try std.testing.expectError(error.MalformedFlag, Module.decode(std.testing.allocator, &bytes));
 }
 
+test "rejects a duplicate or out-of-order section (§5.5.2)" {
+    // 16 of `binary.wast`'s 25 accept-invalid failures were this one rule. A
+    // duplicate was the worse half: the second decode just REASSIGNED the field,
+    // so the module built from the last copy and the first silently vanished.
+    const hdr = types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 };
+    const cases = [_][]const u8{
+        &(hdr ++ [_]u8{ 0x07, 0x01, 0x00, 0x07, 0x01, 0x00 }), // export twice
+        &(hdr ++ [_]u8{ 0x08, 0x01, 0x00, 0x08, 0x01, 0x00 }), // start twice
+        &(hdr ++ [_]u8{ 0x02, 0x01, 0x00, 0x01, 0x01, 0x00 }), // import before type
+        &(hdr ++ [_]u8{ 0x05, 0x01, 0x00, 0x04, 0x01, 0x00 }), // memory before table
+    };
+    for (cases) |bytes|
+        try std.testing.expectError(error.SectionOrder, Module.decode(std.testing.allocator, bytes));
+
+    // ...but the order is NOT ascending id, and getting that wrong would refuse
+    // valid modules instead. `tag` (13) belongs between memory (5) and global
+    // (6); `data_count` (12) between element (9) and code (10). Both must decode.
+    const tag_then_global = types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+        [_]u8{ 0x01, 0x04, 0x01, 0x60, 0x00, 0x00 } ++ // type: () -> ()
+        [_]u8{ 0x0d, 0x03, 0x01, 0x00, 0x00 } ++ // tag: one tag of type 0
+        [_]u8{ 0x06, 0x04, 0x01, 0x7f, 0x00, 0x0b }; // global: i32 const 0
+    var m = try Module.decode(std.testing.allocator, &tag_then_global);
+    defer m.deinit();
+    try std.testing.expectEqual(@as(usize, 1), m.tags.len);
+}
+
+test "rejects a section whose declared size leaves trailing bytes (§5.5.1)" {
+    // A type section sized for TWO func types but declaring a count of one. The
+    // vector parsed fine and the extra `\60\00\00` was simply dropped, so the
+    // module built — `binary.wast` calls this "section size mismatch" and has
+    // seven of them (type/import/global/export/elem/data/data-segment).
+    const bytes = types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+        [_]u8{ 0x01, 0x07, 0x01, 0x60, 0x00, 0x00, 0x60, 0x00, 0x00 };
+    try std.testing.expectError(error.SectionSizeMismatch, Module.decode(std.testing.allocator, &bytes));
+}
+
 test "rejects a self-referential supertype (would otherwise hang isSubtype)" {
     // type section: one type = sub (0x50) with supertype [0] (itself), func [] -> [].
     const bytes = types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
@@ -1271,9 +1374,9 @@ test "decodes a code section with locals and a body" {
         types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
         [_]u8{ 0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f } ++ // type
         [_]u8{ 0x03, 0x02, 0x01, 0x00 } ++ // function: 1 func of type 0
+        [_]u8{ 0x07, 0x07, 0x01, 0x03, 'a', 'd', 'd', 0x00, 0x00 } ++ // export
         // code: 1 entry, size 9 = locals(01 01 7f) ++ body(20 00 20 01 6a 0b)
-        [_]u8{ 0x0a, 0x0b, 0x01, 0x09, 0x01, 0x01, 0x7f, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b } ++
-        [_]u8{ 0x07, 0x07, 0x01, 0x03, 'a', 'd', 'd', 0x00, 0x00 }; // export
+        [_]u8{ 0x0a, 0x0b, 0x01, 0x09, 0x01, 0x01, 0x7f, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b };
 
     var m = try Module.decode(std.testing.allocator, &bytes);
     defer m.deinit();

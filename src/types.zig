@@ -282,6 +282,13 @@ pub const DecodeError = error{
     LebOverflow,
     /// A section declared an identifier outside the defined range.
     InvalidSectionId,
+    /// A non-custom section appeared twice, or out of the order §5.5.2 fixes.
+    /// Custom sections are exempt: they may appear anywhere, any number of times.
+    SectionOrder,
+    /// A section's declared byte size did not match what its contents consumed —
+    /// the payload had trailing bytes left over. §5.5.1 makes the size part of
+    /// the encoding, so a mismatch is malformed even when the contents parse.
+    SectionSizeMismatch,
     /// A function type did not begin with the 0x60 form byte.
     BadFuncType,
     /// A type-section entry was not a valid composite type (func/struct/array),

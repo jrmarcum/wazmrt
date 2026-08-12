@@ -134,22 +134,35 @@ turning every host import into a `Deno.UnsafeCallback` (a JS↔native hop per ca
 re-introduces the boundary cost the vision claims to remove — measure it, do not assume it**), and
 reading guest memory via `Deno.UnsafePointerView`. No amount of wazmrt-side ABI work substitutes for it.
 
-### 🎯 Spec-conformance fix list (2026-08-11) — 62 defects, details in `known-issues.md`
+### 🎯 Spec-conformance fix list (2026-08-11) — details in `known-issues.md`
 
 From the full `tests/module/` run. ⚠️ **Every HIGH item is wazmrt being TOO PERMISSIVE** — the
 opposite of the failure mode most of the audit passes hunted, and in a corner nobody had run before.
 
-| | defect | assertions |
-| --- | --- | --- |
-| **T1** 🔴 | **Accept-invalid** — 43 malformed modules ACCEPTED (`custom-descriptors/binary` 25, `custom-page-sizes-invalid` 18). Suspect an ignored reserved bit in the memory-limits flag + unknown type-section forms | 43 |
-| **T2** 🔴 | A custom-page-size module accepted **then mis-executed** — `memory.grow` → −1. Silent wrong answer; likely free once T1 lands | 12 |
-| **T3** 🟠 | **legacy `rethrow` traps where it must return** — a real bug in an IMPLEMENTED feature | 3 |
-| **T4** 🟠 | a legacy `try`/`catch` encoding not decoded (`UnknownInstr`) | 2 |
-| **T5** 🟡 | oversized limits refused at the wrong STAGE (decode, not link) | 2 |
+| | defect | assertions | status |
+| --- | --- | --- | --- |
+| **T1** 🔴 | **Accept-invalid** — malformed modules ACCEPTED | 43 → **68** | ✅ **fixed 2026-08-12** |
+| **T2** 🔴 | A custom-page-size module accepted **then mis-executed** — `memory.grow` → −1 | 12 | ✅ dissolved by T1 |
+| **T3** 🟠 | **legacy `rethrow` traps where it must return** — a real bug in an IMPLEMENTED feature | 3 | open |
+| **T4** 🟠 | a legacy `try`/`catch` encoding not decoded (`UnknownInstr`) | 2 | open |
+| **T5** 🟡 | oversized limits refused at the wrong STAGE (decode, not link) | 2 | ❌ **not a defect** — see below |
 
-**Start with T1**: those files are almost entirely *negative* assertions, so this is not a failure to
-run something — it is building modules whose encodings are malformed. The decoder already rejects
-*some* reserved limits flags; **sweep for the sibling**, the lesson that has now paid off four times.
+**T1 was bigger than the triage said, and the guess about its cause was wrong.** Corpus
+**525 → 455 failures**, 86 → 82 files, zero regressions. Details in `known-issues.md`; the headline is
+that the *main* `testsuite-main/binary.wast` carried **the same 25 failures** as the
+`custom-descriptors` copy, so this was a **core-spec** defect that the proposal-dir framing hid. The
+suspected cause (a reserved limits-flag bit) was **not** it — `readLimits` already rejected `flag >
+0x07`. Four separate gaps, each hiding the next:
+section **order/uniqueness** unchecked (16) · section **size** unchecked (7) · **data-count section
+required** unenforced (2) · the **WAT assembler silently dropping trailing `(memory …)` forms** (18).
+
+⚠️ **T5 was never a defect — strike it.** All four assertions in `memory_max.wast` use `(pagesize …)`.
+The "wrong stage" was wazmrt *dropping* the pagesize and building `(memory 0xFFFF_FFFF (pagesize 1))`
+as a **default**-page-size memory, which legitimately overflows → `InvalidLimits` at decode. It was a
+symptom of T1's fourth gap, and both files went clean when that was fixed. **A defect classified by
+its error message can be a shadow of a defect three layers up.**
+
+**Next: T3**, the only remaining item in a feature wazmrt actually implements.
 
 ### What is left after Track 1 (2026-08-11)
 
