@@ -873,29 +873,48 @@ fn encodeElementSection(a: std.mem.Allocator, elems: []const ElemDef, sigs: *Lis
     var s: List(u8) = .empty;
     try uleb(a, &s, elems.len);
     for (elems) |e| {
-        // flag bits: bit0 = passive/declarative, bit1 = declarative-or-explicit-table,
-        // bit2 = const-expr form.
-        const explicit_table = e.mode == .active and e.table_index != 0;
+        // ⚠️ Two of the eight variants have `funcref` BAKED IN and carry no type
+        // byte at all: the func-index form's elemkind has no other encoding, and
+        // flag 4 (active, table 0, const-expr) omits the reftype entirely. So a
+        // segment whose element type is anything else — a concrete `(ref null $t)`
+        // from `(table (ref null $t) (elem $f))`, or `externref` — has to be
+        // written in a variant that can say so, or the type is silently DROPPED
+        // and the segment decodes as `funcref`. It was, which made every such
+        // table reject its own initializer as `TypeMismatch`.
+        const typed = e.elem_type != .funcref;
+        const as_expr = e.expr_form or typed;
+        // Flag 4 cannot carry a reftype, so a typed segment takes the
+        // explicit-table variant (flag 6) even when the table IS 0.
+        const explicit_table = e.mode == .active and (e.table_index != 0 or typed);
         var flag: u8 = 0;
         switch (e.mode) {
             .active => flag |= if (explicit_table) 0b010 else 0,
             .passive => flag |= 0b001,
             .declarative => flag |= 0b011,
         }
-        if (e.expr_form) flag |= 0b100;
+        if (as_expr) flag |= 0b100;
         try s.append(a, flag);
         if (explicit_table) try uleb(a, &s, e.table_index);
         if (e.mode == .active) try emitOffsetExpr(a, &s, sigs, type_names, global_names, func_names, e.offset_form);
         // The leading kind byte: elemkind (0x00) for non-flag-0 func-index
         // variants, reftype for non-flag-4 const-expr variants.
-        if (!e.expr_form and flag != 0) {
+        if (!as_expr and flag != 0) {
             try s.append(a, 0x00); // elemkind funcref
-        } else if (e.expr_form and flag != 4) {
+        } else if (as_expr and flag != 4) {
             try emitValType(a, &s, e.elem_type); // reftype
         }
         if (e.expr_form) {
             try uleb(a, &s, e.exprs.len);
             for (e.exprs) |ex| try emitElementExpr(a, &s, sigs, type_names, global_names, func_names, ex);
+        } else if (as_expr) {
+            // A typed segment written as bare function indices: each index goes
+            // out as the `(ref.func $f)` expression it abbreviates.
+            try uleb(a, &s, e.funcs.len);
+            for (e.funcs) |ref| {
+                try s.append(a, @intFromEnum(Op.ref_func));
+                try uleb(a, &s, try resolveByName(func_names, ref));
+                try s.append(a, @intFromEnum(Op.end));
+            }
         } else {
             try uleb(a, &s, e.funcs.len);
             for (e.funcs) |ref| try uleb(a, &s, try resolveByName(func_names, ref));
@@ -1110,7 +1129,11 @@ fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef
             if (inner.len != 0 and inner[0].asList() != null) {
                 try elems.append(a, .{ .mode = .active, .table_index = table_index, .offset_form = null, .elem_type = et, .expr_form = true, .funcs = &.{}, .exprs = inner });
             } else {
-                try elems.append(a, .{ .mode = .active, .table_index = table_index, .offset_form = null, .elem_type = .funcref, .expr_form = false, .funcs = inner, .exprs = &.{} });
+                // The inline abbreviation inherits the TABLE's element type — it
+                // is shorthand for `(elem (i32.const 0) <tabletype> (ref.func $f) …)`,
+                // not for a funcref segment. Hard-coding `funcref` made every
+                // `(table (ref null $t) (elem $f))` reject its own initializer.
+                try elems.append(a, .{ .mode = .active, .table_index = table_index, .offset_form = null, .elem_type = et, .expr_form = false, .funcs = inner, .exprs = &.{} });
             }
             try elem_names.append(a, null);
         } else {

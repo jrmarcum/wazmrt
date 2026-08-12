@@ -1521,6 +1521,22 @@ const Frame = struct {
         return asF64(self.pop());
     }
 
+    /// `call_indirect`'s §4.4.8 check: the function actually in the table slot must
+    /// have a type that is a SUBTYPE of the one the instruction names.
+    ///
+    /// Subtyping, not equality — a function of type `$sub` is a legitimate target
+    /// for `call_indirect (type $super)`, which is the whole point of declaring the
+    /// relationship. And the comparison is between type INDICES, not the two
+    /// expanded signatures: `(sub (func))` and `(sub final (func))` have identical
+    /// params and results and are different types, so comparing signatures let a
+    /// final type answer a call that named the extensible one.
+    fn checkIndirectType(self: *Frame, declared: u32, func_index: u32) Error!void {
+        const m = self.inst.module;
+        if (declared >= m.comp_types.len) return error.UndefinedType;
+        const actual = m.funcTypeIndex(func_index) orelse return error.UndefinedFunc;
+        if (!m.isSubtype(actual, declared)) return error.IndirectTypeMismatch;
+    }
+
     fn branch(self: *Frame, n: u32) Error!usize {
         // Label depth is control-flow-relative (not a static count), so it is
         // bounds-checked here rather than at load time. `len - 1 - n` underflows
@@ -2012,9 +2028,7 @@ const Frame = struct {
                         if (slot >= tab.entries.len) return error.TableOutOfBounds;
                         if (tab.entries[@intCast(slot)] == null_ref) return error.UninitializedElement;
                         const fi = std.math.cast(u32, tab.entries[@intCast(slot)]) orelse return error.UndefinedFunc;
-                        const want = self.inst.module.funcSig(ci.type_index) orelse return error.UndefinedType;
-                        const got = self.inst.module.funcType(fi) orelse return error.UndefinedFunc;
-                        if (!self.inst.module.funcTypeEq(want, got)) return error.IndirectTypeMismatch;
+                        try self.checkIndirectType(ci.type_index, fi);
                         break :blk fi;
                     };
                     const ft = self.inst.module.funcType(f) orelse return error.UndefinedFunc;
@@ -2051,9 +2065,8 @@ const Frame = struct {
                     if (slot >= table.len) return error.TableOutOfBounds;
                     if (table[@intCast(slot)] == null_ref) return error.UninitializedElement;
                     const f = std.math.cast(u32, table[@intCast(slot)]) orelse return error.UndefinedFunc; // funcref value = function index
-                    const want = self.inst.module.funcSig(ci.type_index) orelse return error.UndefinedType;
+                    try self.checkIndirectType(ci.type_index, f);
                     const ft = self.inst.module.funcType(f) orelse return error.UndefinedFunc;
-                    if (!self.inst.module.funcTypeEq(want, ft)) return error.IndirectTypeMismatch;
                     const np = typeSlots(ft.params); // param slots (v128 = 2)
                     const base = try self.stackBase(np);
                     const args = self.vstack.items[base..];
