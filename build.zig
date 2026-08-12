@@ -346,6 +346,8 @@ pub fn build(b: *std.Build) void {
         run_conf.addArg(testsuite orelse ""); // empty ⇒ the runner prints guidance
         run_conf.addArg(baseline orelse ""); // empty ⇒ gate on zero failures
         run_conf.addArg(if (write_baseline) "write" else "check");
+        const show_failures = b.option(usize, "failures", "List up to N failures per failing file (default 1)") orelse 1;
+        run_conf.addArg(b.fmt("{d}", .{show_failures}));
         const conf_step = b.step("conformance", "Run the spec testsuite (.wast) — needs -Dtestsuite=<dir>; add -Dbaseline=<file> to gate on regressions");
         conf_step.dependOn(&run_conf.step);
     }

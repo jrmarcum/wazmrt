@@ -33,6 +33,9 @@ pub fn main(init: std.process.Init) !void {
     const dir_path = if (args.len > 1) args[1] else "";
     const baseline_path = if (args.len > 2) args[2] else "";
     const write_baseline = args.len > 3 and std.mem.eql(u8, args[3], "write");
+    // How many failures to list per failing file (`-Dfailures=N`). 1 keeps the
+    // historical one-line-per-file output.
+    const show_failures: usize = if (args.len > 4) (std.fmt.parseInt(usize, args[4], 10) catch 1) else 1;
     if (dir_path.len == 0) {
         try out.print(
             \\conformance: no testsuite directory given.
@@ -146,6 +149,17 @@ pub fn main(init: std.process.Init) !void {
             try out.print("  FAIL {s}: {d} passed, {d} failed (baseline {d}), {d} skipped", .{ ent.path, s.passed, s.failed, exp.failures, s.skipped });
             if (s.first_failure) |ff| try out.print(" — first: {s}", .{ff});
             try out.print("\n", .{});
+            // `-Dfailures=N` lists up to N per file instead of just the first.
+            // Triage by first-failure text alone mislabelled three of the five
+            // items on the 2026-08-11 fix list: that text names a symptom, and
+            // the failures behind it are what identify the cause.
+            if (show_failures > 1) for (s.failures.items, 0..) |f, i| {
+                if (i + 1 > show_failures) {
+                    try out.print("      ... and {d} more\n", .{s.failed - i});
+                    break;
+                }
+                try out.print("      [{d}] {s}\n", .{ i + 1, f });
+            };
         } else if (s.failed < exp.failures or (exp.runner_error and s.failed == 0)) {
             improvements += 1;
             try out.print("  improved {s}: {d} failed (baseline {d}) — update the baseline\n", .{ ent.path, s.failed, exp.failures });

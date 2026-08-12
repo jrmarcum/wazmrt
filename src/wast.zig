@@ -51,15 +51,35 @@ pub const Summary = struct {
     failed: usize = 0,
     /// Commands the MVP does not handle yet (assert_invalid, register, …).
     skipped: usize = 0,
-    /// Description of the first failure, for debugging.
+    /// Description of the first failure, for debugging. Aliases `failures[0]`.
     first_failure: ?[]const u8 = null,
+    /// Every failure (up to `max_recorded_failures`), in order.
+    ///
+    /// ⚠️ **Owned by the CALLER's allocator, released by `deinit`.** These used
+    /// to come from `runScript`'s internal arena, which `runScript` then freed on
+    /// the way out — so both readers (`main.zig`, `tools/conformance.zig`)
+    /// printed freed memory and only looked correct because the page allocator
+    /// had not reused the pages yet.
+    failures: std.ArrayList([]const u8) = .empty,
+
+    /// Release the failure messages. Safe to call when there were none.
+    pub fn deinit(self: *Summary, gpa: std.mem.Allocator) void {
+        for (self.failures.items) |m| gpa.free(m);
+        self.failures.deinit(gpa);
+        self.first_failure = null;
+    }
 };
+
+/// Cap on per-file failure messages retained by `Summary.failures`. High enough
+/// that no file in the spec suite is truncated (the worst is ~100), low enough
+/// that a hostile script cannot exhaust memory.
+pub const max_recorded_failures = 512;
 
 /// Parse and run a whole `.wast` source, returning pass/fail counts.
 pub fn runScript(gpa: std.mem.Allocator, src: []const u8) Error!Summary {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    var r: Runner = .{ .a = arena.allocator() };
+    var r: Runner = .{ .a = arena.allocator(), .msg_a = gpa };
     // Guest linear memory is PAGE-ALLOCATOR owned, so the arena above does NOT
     // reclaim it — every `(memory N)` in every module, plus every `memory.grow`,
     // leaked for the life of the process, and `tools/conformance.zig`'s careful
@@ -78,6 +98,9 @@ const HostFunc = interp.Instance.HostFunc;
 
 const Runner = struct {
     a: std.mem.Allocator,
+    /// Allocator for failure messages ONLY — the caller's, not the arena's, so
+    /// the messages survive `runScript`. See `Summary.failures`.
+    msg_a: std.mem.Allocator,
     /// Every instance built by this script, so their page-allocator memories can
     /// be released (the runner arena cannot reclaim those). See `runScript`.
     instances: std.ArrayList(*interp.Instance) = .empty,
@@ -100,8 +123,16 @@ const Runner = struct {
 
     fn fail(self: *Runner, comptime fmt: []const u8, args: anytype) void {
         self.summary.failed += 1;
-        if (self.summary.first_failure == null)
-            self.summary.first_failure = std.fmt.allocPrint(self.a, fmt, args) catch "out of memory";
+        if (self.summary.failures.items.len >= max_recorded_failures) return;
+        // `msg_a`, not `a`: the arena dies with `runScript`, and these outlive it.
+        const msg = std.fmt.allocPrint(self.msg_a, fmt, args) catch return;
+        if (self.summary.first_failure == null) self.summary.first_failure = msg;
+        // Keep EVERY failure, not just the first. Reporting one per file made
+        // 25 distinct decoder defects in `binary.wast` look like one, and sent
+        // the 2026-08-11 triage to the wrong cause on three of its five items —
+        // the first failure names a symptom, and the ones behind it are what say
+        // WHICH symptom. `failed` still counts past the cap.
+        self.summary.failures.append(self.msg_a, msg) catch {};
     }
 
     fn command(self: *Runner, cmd: Sexpr) Error!void {
@@ -369,28 +400,54 @@ const Runner = struct {
         // pushes low then high). Comparing form count to slot count directly
         // reported "arity 2 != expected 1" for every SIMD assertion in the
         // testsuite, which is why none of them had ever actually run.
+        // An `(either …)` wrapper contributes the slots of its alternatives, which
+        // all share one type — so measure the shape from the first alternative.
         var want_slots: usize = 0;
-        for (expected) |exp_form| want_slots += if (isV128Form(exp_form)) 2 else 1;
+        for (expected) |exp_form| {
+            const alts = eitherAlts(exp_form);
+            want_slots += if (isV128Form(if (alts.len != 0) alts[0] else exp_form)) 2 else 1;
+        }
         if (results.len != want_slots) {
             self.fail("assert_return: arity {d} != expected {d}", .{ results.len, want_slots });
             return;
         }
         const action_name: []const u8 = actionName(form[1]);
         var ri: usize = 0;
+        var solo: [1]Sexpr = undefined; // backing for the not-an-`either` case
         for (expected) |exp_form| {
-            if (isV128Form(exp_form)) {
+            var alts = eitherAlts(exp_form);
+            if (alts.len == 0) {
+                solo[0] = exp_form;
+                alts = solo[0..1];
+            }
+            // Any alternative matching is a pass — that is what `either` means.
+            if (isV128Form(alts[0])) {
                 const lo = results[ri];
                 const hi = results[ri + 1];
                 ri += 2;
                 const got: u128 = (@as(u128, hi) << 64) | lo;
-                if (!try v128Matches(got, exp_form.asList().?)) {
+                var ok = false;
+                for (alts) |alt| {
+                    if (try v128Matches(got, alt.asList() orelse continue)) {
+                        ok = true;
+                        break;
+                    }
+                }
+                if (!ok) {
                     self.fail("assert_return \"{s}\": v128 mismatch (got 0x{x})", .{ action_name, got });
                     return;
                 }
             } else {
                 const got = results[ri];
                 ri += 1;
-                if (!try self.matches(got, exp_form)) {
+                var ok = false;
+                for (alts) |alt| {
+                    if (try self.matches(got, alt)) {
+                        ok = true;
+                        break;
+                    }
+                }
+                if (!ok) {
                     self.fail("assert_return \"{s}\": result mismatch (got 0x{x})", .{ action_name, got });
                     return;
                 }
@@ -717,6 +774,27 @@ fn v128Shape(kw: []const u8) ?struct { lanes: usize, width: usize, float: bool }
 
 /// True if `form` is a `(v128.const <shape> <lane>…)` literal — which occupies
 /// **two** result slots, unlike every other value form.
+/// The alternatives an expected-result form admits, or empty if it is not an
+/// `(either …)`.
+///
+/// `(either e1 e2 …)` is how the spec suite writes a result the standard leaves
+/// **implementation-defined** — the relaxed-SIMD instructions, where fused vs
+/// unfused multiply-add, NaN propagation and the sign of zero in `min`/`max` are
+/// all permitted to differ. Any listed alternative is a CORRECT answer.
+///
+/// We did not parse it, so `assert_return` counted the wrapper as one expected
+/// value and reported `arity 4 != expected 1` — 32 assertions across six relaxed
+/// SIMD files, none of which had ever actually compared anything. That is the
+/// mirror of green-washing: our own gap charged as a wazmrt failure, and it
+/// hides whether those instructions are right or wrong.
+fn eitherAlts(form: Sexpr) []const Sexpr {
+    const list = form.asList() orelse return &.{};
+    if (list.len < 2) return &.{};
+    const kw = list[0].asAtom() orelse return &.{};
+    if (!std.mem.eql(u8, kw, "either")) return &.{};
+    return list[1..];
+}
+
 fn isV128Form(form: Sexpr) bool {
     const list = form.asList() orelse return false;
     if (list.len < 2) return false;
@@ -890,7 +968,8 @@ test "runner rejects malformed commands without indexing out of bounds" {
     for (cases) |src| {
         // Either outcome (error or a recorded failure) is fine; the point is that
         // no path indexes out of bounds.
-        _ = runScript(std.testing.allocator, src) catch {};
+        var s = runScript(std.testing.allocator, src) catch continue;
+        s.deinit(std.testing.allocator);
     }
 }
 
@@ -997,9 +1076,13 @@ test "detects a wrong expected result" {
         \\(module (func (export "one") (result i32) (i32.const 1)))
         \\(assert_return (invoke "one") (i32.const 2))
     ;
-    const s = try runScript(std.testing.allocator, src);
+    var s = try runScript(std.testing.allocator, src);
+    defer s.deinit(std.testing.allocator); // failure messages are caller-owned
     try std.testing.expectEqual(@as(usize, 0), s.passed);
     try std.testing.expectEqual(@as(usize, 1), s.failed);
+    // The message must be READABLE here — it used to point into an arena
+    // `runScript` had already freed, so both callers printed freed memory.
+    try std.testing.expect(std.mem.indexOf(u8, s.first_failure.?, "one") != null);
 }
 
 test "float results incl. nan:canonical" {
@@ -1266,5 +1349,49 @@ test "assert_invalid/malformed does not count OUR limitations as passes" {
         const s = try runScript(gpa, src);
         try std.testing.expectEqual(@as(usize, 1), s.passed);
         try std.testing.expectEqual(@as(usize, 0), s.skipped);
+    }
+}
+
+test "(either …) accepts any listed alternative, and still rejects a non-alternative" {
+    const gpa = std.testing.allocator;
+    // Relaxed-SIMD results are implementation-defined, so the suite lists every
+    // permitted answer. We could not parse the wrapper and counted it as one
+    // expected value — `arity 1 != expected 1` never even got that far; the real
+    // report was `arity 4 != expected 1` for f32x4. 32 assertions across six
+    // files had therefore never compared anything.
+    {
+        const src =
+            \\(module (func (export "f") (result i32) (i32.const 7)))
+            \\(assert_return (invoke "f") (either (i32.const 5) (i32.const 7)))
+        ;
+        var s = try runScript(gpa, src);
+        defer s.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 1), s.passed);
+        try std.testing.expectEqual(@as(usize, 0), s.failed);
+    }
+    // A value in NO alternative must still fail — the wrapper widens the set of
+    // right answers, it does not stop checking.
+    {
+        const src =
+            \\(module (func (export "f") (result i32) (i32.const 7)))
+            \\(assert_return (invoke "f") (either (i32.const 5) (i32.const 6)))
+        ;
+        var s = try runScript(gpa, src);
+        defer s.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 0), s.passed);
+        try std.testing.expectEqual(@as(usize, 1), s.failed);
+    }
+    // v128 alternatives occupy TWO result slots each; the arity must come from
+    // an alternative's shape, not from the wrapper.
+    {
+        const src =
+            \\(module (func (export "f") (result v128) (v128.const i32x4 1 2 3 4)))
+            \\(assert_return (invoke "f")
+            \\  (either (v128.const i32x4 9 9 9 9) (v128.const i32x4 1 2 3 4)))
+        ;
+        var s = try runScript(gpa, src);
+        defer s.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 1), s.passed);
+        try std.testing.expectEqual(@as(usize, 0), s.failed);
     }
 }
