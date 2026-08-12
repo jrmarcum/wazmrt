@@ -90,6 +90,9 @@ pub const Error = Module.Error || error{
     UndefinedElem,
     /// A `memory.init`/`data.drop` data-segment index out of range.
     UndefinedData,
+    /// A legacy `rethrow l` whose label is not a `catch`/`catch_all` block.
+    /// Nothing else binds a caught exception, so there is nothing to re-raise.
+    InvalidRethrowLabel,
     /// `memory.init`/`data.drop` appeared in a module with no data-count section.
     /// §5.5.16 makes that section mandatory once either instruction is used —
     /// a single-pass decoder has to know the segment count before the code
@@ -826,9 +829,20 @@ const FuncValidator = struct {
                 return error.UnsupportedOpcode;
             },
             .rethrow => {
-                // Re-raise the exception caught `l` levels out. `l` must resolve,
-                // and control transfers, so the rest of the block is dead.
-                _ = try self.labelTypesAt(instr.imm.label);
+                // Re-raise the exception caught `l` levels out. `l` must resolve
+                // AND must name a `catch`/`catch_all` block — there is no caught
+                // exception at any other kind of label, so `(func (rethrow 0))`
+                // and `(func (block (rethrow 0)))` are invalid, not merely odd.
+                //
+                // We checked only that the label resolved, so both were ACCEPTED
+                // (`rethrow.wast`, "invalid rethrow label"). At run time
+                // `handler_exn` was then whatever the enclosing frame happened to
+                // leave there — a wrong exception re-raised, or a trap, decided by
+                // unrelated code. Same accept-invalid class as T1, in a feature we
+                // do implement.
+                if (instr.imm.label >= self.ctrls.items.len) return error.UnknownLabel;
+                const target = self.ctrls.items[self.ctrls.items.len - 1 - instr.imm.label];
+                if (target.kind != .catch_legacy) return error.InvalidRethrowLabel;
                 self.setUnreachable();
             },
             .throw_ref => {

@@ -143,8 +143,8 @@ opposite of the failure mode most of the audit passes hunted, and in a corner no
 | --- | --- | --- | --- |
 | **T1** 🔴 | **Accept-invalid** — malformed modules ACCEPTED | 43 → **68** | ✅ **fixed 2026-08-12** |
 | **T2** 🔴 | A custom-page-size module accepted **then mis-executed** — `memory.grow` → −1 | 12 | ✅ dissolved by T1 |
-| **T3** 🟠 | **legacy `rethrow` traps where it must return** — a real bug in an IMPLEMENTED feature | 3 | open |
-| **T4** 🟠 | a legacy `try`/`catch` encoding not decoded (`UnknownInstr`) | 2 | open |
+| **T3** 🟠 | **legacy `rethrow`** — a stale workaround + an accept-invalid | 3 | ✅ **fixed 2026-08-12** |
+| **T4** 🟠 | ~~a legacy `try`/`catch` encoding not decoded~~ — actually the **tail-call proposal** | 2 | ❌ **not EH; owner's scope call** |
 | **T5** 🟡 | oversized limits refused at the wrong STAGE (decode, not link) | 2 | ❌ **not a defect** — see below |
 
 **T1 was bigger than the triage said, and the guess about its cause was wrong.** Corpus
@@ -162,7 +162,14 @@ as a **default**-page-size memory, which legitimately overflows → `InvalidLimi
 symptom of T1's fourth gap, and both files went clean when that was fixed. **A defect classified by
 its error message can be a shadow of a defect three layers up.**
 
-**Next: T3**, the only remaining item in a feature wazmrt actually implements.
+⚠️ **THREE OF THE FIVE ITEMS WERE MISLABELLED** — T1's location (core spec, not a proposal dir), T5's
+existence (a symptom of T1), and T4's subject (tail calls, not EH). The triage classified 164 failures
+by each file's **first-failure text**, and that text names a symptom. Corpus **525 → 452 failures**.
+
+**Nothing on this list is now open.** T4 is the only item left and it is a **scope question for the
+owner**: implement the tail-call proposal (`return_call` / `return_call_indirect`, opcodes `0x12`/
+`0x13` — absent entirely, though `return_call_ref`'s tail-call machinery already exists), or record it
+as out of scope like the other 102 by-design failures.
 
 ### What is left after Track 1 (2026-08-11)
 

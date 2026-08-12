@@ -5030,3 +5030,57 @@ test "the assembler emits a data-count section for any module with data segments
     const m2 = try Module.decode(a, try assemble(a, "(module (memory 1))"));
     try std.testing.expectEqual(@as(?u32, null), m2.data_count);
 }
+
+test "legacy rethrow re-raises from the CURRENT position, so an inner try catches it" {
+    // `rethrow.wast`'s `rethrow-recatch`: the label picks WHICH exception, not
+    // where propagation starts. `rethrow 2` names the outer catch but fires from
+    // inside an inner try, so that inner try must catch it.
+    //
+    // This trapped with `UncaughtException`, because `rethrow` popped the label
+    // stack down past its target first — destroying exactly the intervening try
+    // that should have caught. The pop was a workaround for the target's own
+    // handler re-matching, which `throwException` has handled since 2026-07-27.
+    const src =
+        \\(module (tag $e0)
+        \\  (func (export "f") (param i32) (result i32)
+        \\    (try (result i32)
+        \\      (do (throw $e0))
+        \\      (catch $e0
+        \\        (try (result i32)
+        \\          (do (if (i32.eqz (local.get 0)) (then (rethrow 2))) (i32.const 42))
+        \\          (catch $e0 (i32.const 23)))))))
+    ;
+    // 0 -> rethrow fires, inner catch takes it; 1 -> no rethrow, falls through.
+    try std.testing.expectEqual(@as(i32, 23), interp.asI32(try assembleAndRun(src, "f", &.{interp.i32Value(0)})));
+    try std.testing.expectEqual(@as(i32, 42), interp.asI32(try assembleAndRun(src, "f", &.{interp.i32Value(1)})));
+}
+
+test "a rethrow label must name a catch block" {
+    // `rethrow l` re-raises the exception caught AT `l`; no other label kind
+    // binds one. We checked only that the label resolved, so both of these were
+    // accepted and then read whatever the enclosing frame had left behind.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    for ([_][]const u8{
+        "(module (func (rethrow 0)))", // the function body's implicit block
+        "(module (func (block (rethrow 0))))", // a plain block
+        "(module (func (loop (rethrow 0))))", // sibling: a loop
+        "(module (tag $e) (func (try (do (rethrow 0)) (catch $e))))", // the try's BODY, not its catch
+    }) |src| {
+        var m = try Module.decode(a, try assemble(a, src));
+        try std.testing.expectError(error.InvalidRethrowLabel, validate(a, &m));
+    }
+
+    // ...and the valid forms must still validate: label 0 from directly inside a
+    // catch, and a label reaching further out past an intervening block.
+    for ([_][]const u8{
+        "(module (tag $e) (func (try (do (throw $e)) (catch $e (rethrow 0)))))",
+        "(module (tag $e) (func (try (do (throw $e)) (catch_all (rethrow 0)))))",
+        "(module (tag $e) (func (try (do (throw $e)) (catch $e (block (rethrow 1))))))",
+    }) |src| {
+        var m = try Module.decode(a, try assemble(a, src));
+        try validate(a, &m);
+    }
+}

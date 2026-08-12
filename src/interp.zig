@@ -1556,8 +1556,9 @@ const Frame = struct {
                 // OUTWARD, not re-match the same handler: once a handler is entered
                 // (`caught` set) we are past the `catch` clause, outside the try's
                 // protected region. Re-matching loops forever on the legacy re-throw
-                // idiom `catch (e) { … throw e; }`. `rethrow` avoids this by popping
-                // the try before re-raising; a raw `throw` needs this guard.
+                // idiom `catch (e) { … throw e; }`. `rethrow` depends on this guard
+                // too — it used to pop the try itself, which also destroyed the
+                // intervening trys that ought to catch (see `.rethrow`).
                 if (label.caught == null) for (lt.handlers) |h| {
                     if (h.tag != null and h.tag.? != exn.tag) continue;
                     if (label.stack_base > self.vstack.items.len) return error.StackUnderflow;
@@ -1898,15 +1899,28 @@ const Frame = struct {
                     pc += 1;
                 },
                 .rethrow => {
-                    // Re-raise the exception caught by the try `label` levels out,
-                    // propagating from OUTSIDE that try (it already had its turn).
+                    // Re-raise the exception caught by the try `label` levels out.
+                    // The label only selects WHICH exception; propagation starts
+                    // HERE, so a try between this point and that label still gets
+                    // its turn to catch it.
+                    //
+                    // ⚠️ **STALE WORKAROUND, REMOVED.** This used to pop the label
+                    // stack down past the target first, to keep the target's own
+                    // handler from re-matching and looping. `throwException` has
+                    // done that properly since 2026-07-27 — it skips any try whose
+                    // `caught` is set, i.e. one already running its handler — and
+                    // the shrink then only destroyed the INTERVENING trys, which
+                    // are exactly the ones that should catch. `rethrow-recatch`
+                    // rethrows into an inner try and got `UncaughtException`
+                    // instead of 23. The comment at `throwException`'s guard even
+                    // said "`rethrow` avoids this by popping the try", describing
+                    // a division of labour that had already stopped being true.
                     const n = instr.imm.label;
-                    if (n >= self.labels.items.len) return error.UndefinedLabel; // unvalidated module
+                    // Both checks are for the UNVALIDATED path — `validate` now
+                    // proves the label names a `catch`/`catch_all`.
+                    if (n >= self.labels.items.len) return error.UndefinedLabel;
                     const tgt = self.labels.items[self.labels.items.len - 1 - n];
                     const exn = tgt.caught orelse return error.UncaughtException;
-                    self.labels.shrinkRetainingCapacity(self.labels.items.len - 1 - n);
-                    if (tgt.stack_base > self.vstack.items.len) return error.StackUnderflow;
-                    self.vstack.shrinkRetainingCapacity(tgt.stack_base);
                     if (try self.throwException(exn)) |target| {
                         pc = target;
                     } else {

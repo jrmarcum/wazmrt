@@ -113,21 +113,47 @@ was. Both files went clean with T1.
 three layers up.** T5 was triaged as its own item, in its own severity band, from a symptom that had
 nothing to do with limits.
 
-### 🟠 T3 — legacy `rethrow` traps where it must return (3 failures)
+### 🟠 ✅ T3 — legacy `rethrow` — FIXED 2026-08-12. It was TWO defects, not one.
 
-`legacy/rethrow.wast` — first failure: `assert_return: unexpected trap UncaughtException`.
+`legacy/rethrow.wast` is now **completely clean**; corpus 455 → 452. The triage saw only the first of
+its three failures, because the runner records one failure per file. **Splitting the file revealed a
+second, different defect** — and unlike T1, the module here is shared, so each assertion had to be
+re-paired with it rather than split off alone.
 
-⚠️ **This one is in a feature wazmrt DOES implement** (legacy EH, Phase 6.3), so it is a genuine
-runtime bug rather than a scope gap: a caught exception re-raised by `rethrow` is escaping the handler
-that should catch it. Same family as the 2026-07-27 fix where *"a throw inside a catch handler must go
-outward"* — this is the neighbouring case that fix did not cover.
+**1. Runtime — a stale workaround (1 failure).** `rethrow-recatch` trapped with `UncaughtException`
+instead of returning 23. `rethrow l` popped the label stack down past `l` before re-raising, to stop
+the target's own handler from re-matching and looping. **`throwException` has done that properly since
+2026-07-27** — it skips any try whose `caught` is set — so all the pop still did was destroy the
+INTERVENING trys, which are exactly the ones that must catch. The label selects *which exception*;
+propagation starts *where the rethrow is*.
 
-### 🟠 T4 — legacy `try`/`catch` encoding not decoded (2 failures)
+⚠️ **The guard's own comment described the obsolete division of labour** ("`rethrow` avoids this by
+popping the try before re-raising"), so the code that made the pop redundant documented it as still
+load-bearing. **A workaround whose replacement lands elsewhere does not announce itself** — this is
+audit-trigger category 1, found only because a spec test disagreed.
 
-`legacy/try_catch.wast` — first failure: `module failed to build: UnknownInstr`.
+**2. Validation — accept-invalid (2 failures).** `rethrow l` must name a `catch`/`catch_all` block;
+nothing else binds a caught exception. We checked only that the label *resolved*, so
+`(func (rethrow 0))` and `(func (block (rethrow 0)))` were **accepted**, and at run time re-raised
+whatever the enclosing frame had left in `handler_exn`. Same accept-invalid class as T1, in a feature
+wazmrt does implement. Now `error.InvalidRethrowLabel`.
 
-Legacy try/catch is implemented, so some *variant* in this file is not — likely a block-type or
-`catch_all` form the decoder does not accept. Find the exact opcode before assuming scope.
+### ❌ T4 — MISCLASSIFIED (2026-08-12): not EH at all, it is the TAIL-CALL proposal
+
+`legacy/try_catch.wast` fails to build with `UnknownInstr`, and the triage read that as "some legacy
+`try`/`catch` variant we do not decode". It is neither legacy nor EH: lines 155 and 165 use
+**`return_call` and `return_call_indirect`**. Opcodes **`0x12`/`0x13` do not exist anywhere in
+wazmrt** — no `opcode.zig` entry, no feature flag. The instructions merely happen to live in an EH
+test file.
+
+So T4 is the **by-design class** (a proposal wazmrt does not target), *not* a defect — unless the
+owner decides to target tail calls. **Scope decision, deliberately left open.** Note the cost is
+lower than it looks: `return_call_ref` (function-references) is already implemented, and its tail-call
+mechanism — `pc = ir.len` at `interp.zig` — is exactly what the other two need.
+
+⚠️ **Third mislabelled item in this list** (T1's location, T5's existence, now T4's subject). The
+triage classified 164 failures by their *first-failure text* alone, and that text names the symptom,
+never the cause.
 
 ### 🟡 T5 — wrong error STAGE for oversized memory limits (2 failures)
 
