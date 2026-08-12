@@ -543,7 +543,11 @@ pub const Instance = struct {
     /// reason `Memory.bytes` must come from `allocGuestMemory`: `table.grow`
     /// does `self.inst.gpa.realloc(entries, …)`. Two instances built with
     /// different allocators cannot share a `Table`.
-    pub const Table = struct { entries: []Value, max: ?u32 };
+    /// `max` is a `u64` and `is64` records the INDEX TYPE, because a 64-bit table
+    /// (table64) may declare a max past `u32` and takes i64 index operands. It
+    /// was `?u32` with no index type, so 64-bit tables could not be represented
+    /// even after the decoder learned to read them.
+    pub const Table = struct { entries: []Value, max: ?u64, is64: bool = false };
 
     /// A callable backing an imported function: another instance's exported
     /// function (module linking), a plain native host function, or a native
@@ -907,7 +911,7 @@ pub const Instance = struct {
                     gpa.free(entries);
                     return e;
                 };
-                tab.* = .{ .entries = entries, .max = if (tt.limits.max) |mx| @as(u32, @intCast(mx)) else null };
+                tab.* = .{ .entries = entries, .max = tt.limits.max, .is64 = tt.limits.is64 };
                 t.* = tab;
             }
             n_tables_init += 1;
@@ -1957,11 +1961,12 @@ const Frame = struct {
                 .call_indirect => {
                     const ci = instr.imm.call_indirect;
                     if (ci.table >= self.inst.tables.len) return error.NoTable;
-                    const table = self.inst.tables[ci.table].entries;
-                    const slot = @as(u32, @bitCast(self.popI32())); // table element index (top of stack)
+                    const tab = self.inst.tables[ci.table];
+                    const table = tab.entries;
+                    const slot = self.popMemU64(tab.is64); // table element index (top of stack)
                     if (slot >= table.len) return error.TableOutOfBounds;
-                    if (table[slot] == null_ref) return error.UninitializedElement;
-                    const f = std.math.cast(u32, table[slot]) orelse return error.UndefinedFunc; // funcref value = function index
+                    if (table[@intCast(slot)] == null_ref) return error.UninitializedElement;
+                    const f = std.math.cast(u32, table[@intCast(slot)]) orelse return error.UndefinedFunc; // funcref value = function index
                     const want = self.inst.module.funcSig(ci.type_index) orelse return error.UndefinedType;
                     const ft = self.inst.module.funcType(f) orelse return error.UndefinedFunc;
                     if (!funcTypeEqual(want, ft)) return error.IndirectTypeMismatch;
@@ -2023,55 +2028,59 @@ const Frame = struct {
 
                 // --- Table access ---
                 .table_get => {
-                    const t = self.inst.tables[instr.imm.table].entries;
-                    const i = @as(u32, @bitCast(self.popI32()));
-                    if (i >= t.len) return error.TableOutOfBounds;
-                    try self.pushU64(t[i]);
+                    const tab = self.inst.tables[instr.imm.table];
+                    const i = self.popMemU64(tab.is64);
+                    if (i >= tab.entries.len) return error.TableOutOfBounds;
+                    try self.pushU64(tab.entries[@intCast(i)]);
                     pc += 1;
                 },
                 .table_set => {
-                    const t = self.inst.tables[instr.imm.table].entries;
+                    const tab = self.inst.tables[instr.imm.table];
                     const v = self.pop();
-                    const i = @as(u32, @bitCast(self.popI32()));
-                    if (i >= t.len) return error.TableOutOfBounds;
-                    t[i] = v;
+                    const i = self.popMemU64(tab.is64);
+                    if (i >= tab.entries.len) return error.TableOutOfBounds;
+                    tab.entries[@intCast(i)] = v;
                     pc += 1;
                 },
                 .table_size => {
-                    try self.pushI32(@bitCast(@as(u32, @intCast(self.inst.tables[instr.imm.table].entries.len))));
+                    const tab = self.inst.tables[instr.imm.table];
+                    try self.pushTableLen(tab.is64, tab.entries.len);
                     pc += 1;
                 },
                 .table_grow => {
                     const tab = self.inst.tables[instr.imm.table];
-                    const delta = @as(u32, @bitCast(self.popI32()));
+                    const delta = self.popMemU64(tab.is64);
                     const init_val = self.pop();
                     const old = tab.entries;
-                    const new_len = @as(u64, old.len) + delta;
+                    // Saturating: a 64-bit `delta` can overflow the sum outright,
+                    // and any overflow is refused anyway.
+                    const new_len = std.math.add(u64, old.len, delta) catch std.math.maxInt(u64);
                     // Refuse past the table's declared max AND the instance's entry
                     // budget — a guest `table.grow` by ~2^32 would else realloc tens
                     // of GiB (the runtime twin of the instantiation-time cap).
-                    const max = @min(@as(u64, tab.max orelse std.math.maxInt(u32)), self.inst.max_table_elems);
+                    const declared: u64 = tab.max orelse (if (tab.is64) std.math.maxInt(u64) else std.math.maxInt(u32));
+                    const max = @min(declared, self.inst.max_table_elems);
                     if (new_len > max) {
-                        try self.pushI32(-1); // growth refused
+                        try self.pushTableFail(tab.is64); // growth refused
                     } else {
                         const grown = self.inst.gpa.realloc(old, @intCast(new_len)) catch {
-                            try self.pushI32(-1);
+                            try self.pushTableFail(tab.is64);
                             pc += 1;
                             continue;
                         };
                         @memset(grown[old.len..], init_val);
                         tab.entries = grown; // shared object → visible to importers
-                        try self.pushI32(@bitCast(@as(u32, @intCast(old.len))));
+                        try self.pushTableLen(tab.is64, old.len);
                     }
                     pc += 1;
                 },
                 .table_fill => {
-                    const t = self.inst.tables[instr.imm.table].entries;
-                    const n = @as(u32, @bitCast(self.popI32()));
+                    const tab = self.inst.tables[instr.imm.table];
+                    const n = self.popMemU64(tab.is64);
                     const val = self.pop();
-                    const dst = @as(u32, @bitCast(self.popI32()));
-                    if (@as(u64, dst) + n > t.len) return error.TableOutOfBounds;
-                    @memset(t[dst..][0..n], val);
+                    const dst = self.popMemU64(tab.is64);
+                    const start = memRange(dst, n, tab.entries.len) orelse return error.TableOutOfBounds;
+                    @memset(tab.entries[start..][0..@intCast(n)], val);
                     pc += 1;
                 },
                 // --- Bulk memory (multi-memory: each carries its memory index) ---
@@ -2126,13 +2135,17 @@ const Frame = struct {
                 },
 
                 .table_init => {
-                    const t = self.inst.tables[instr.imm.table_init.table].entries;
+                    const tab = self.inst.tables[instr.imm.table_init.table];
+                    const t = tab.entries;
                     const seg: []const Value = if (self.inst.elem_dropped[instr.imm.table_init.elem]) &.{} else self.inst.elem_values[instr.imm.table_init.elem];
-                    const n = @as(u32, @bitCast(self.popI32()));
-                    const src = @as(u32, @bitCast(self.popI32()));
-                    const dst = @as(u32, @bitCast(self.popI32()));
-                    if (@as(u64, src) + n > seg.len or @as(u64, dst) + n > t.len) return error.TableOutOfBounds;
-                    @memcpy(t[dst..][0..n], seg[src..][0..n]);
+                    // `src`/`n` index the element SEGMENT (always 32-bit); only
+                    // `dst` takes the table's index type.
+                    const n = @as(u64, @as(u32, @bitCast(self.popI32())));
+                    const src = @as(u64, @as(u32, @bitCast(self.popI32())));
+                    const dst = self.popMemU64(tab.is64);
+                    const si = memRange(src, n, seg.len) orelse return error.TableOutOfBounds;
+                    const di = memRange(dst, n, t.len) orelse return error.TableOutOfBounds;
+                    @memcpy(t[di..][0..@intCast(n)], seg[si..][0..@intCast(n)]);
                     pc += 1;
                 },
                 .elem_drop => {
@@ -2140,17 +2153,23 @@ const Frame = struct {
                     pc += 1;
                 },
                 .table_copy => {
-                    const dt = self.inst.tables[instr.imm.table_copy.dst].entries;
-                    const st = self.inst.tables[instr.imm.table_copy.src].entries;
-                    const n = @as(u32, @bitCast(self.popI32()));
-                    const src = @as(u32, @bitCast(self.popI32()));
-                    const dst = @as(u32, @bitCast(self.popI32()));
-                    if (@as(u64, src) + n > st.len or @as(u64, dst) + n > dt.len) return error.TableOutOfBounds;
+                    const dtab = self.inst.tables[instr.imm.table_copy.dst];
+                    const stab = self.inst.tables[instr.imm.table_copy.src];
+                    const dt = dtab.entries;
+                    const st = stab.entries;
+                    // table64: dst/src take their own table's index type; `n` the
+                    // smaller of the two — same rule as `memory.copy`.
+                    const n = self.popMemU64(dtab.is64 and stab.is64);
+                    const src = self.popMemU64(stab.is64);
+                    const dst = self.popMemU64(dtab.is64);
+                    const si = memRange(src, n, st.len) orelse return error.TableOutOfBounds;
+                    const di = memRange(dst, n, dt.len) orelse return error.TableOutOfBounds;
+                    const ni: usize = @intCast(n);
                     // Overlapping ranges within one table: copy in the safe direction.
-                    if (dst <= src) {
-                        std.mem.copyForwards(Value, dt[dst..][0..n], st[src..][0..n]);
+                    if (di <= si) {
+                        std.mem.copyForwards(Value, dt[di..][0..ni], st[si..][0..ni]);
                     } else {
-                        std.mem.copyBackwards(Value, dt[dst..][0..n], st[src..][0..n]);
+                        std.mem.copyBackwards(Value, dt[di..][0..ni], st[si..][0..ni]);
                     }
                     pc += 1;
                 },
@@ -2511,6 +2530,16 @@ const Frame = struct {
     /// Pop an address/count value that is i64 when `is64`, else i32 (zero-ext).
     fn popMemU64(self: *Frame, is64: bool) u64 {
         return if (is64) @bitCast(self.popI64()) else @as(u64, @as(u32, @bitCast(self.popI32())));
+    }
+
+    /// Push a table length / previous-size in the table's index type (table64).
+    fn pushTableLen(self: *Frame, is64: bool, len: usize) !void {
+        if (is64) try self.pushI64(@bitCast(@as(u64, len))) else try self.pushI32(@bitCast(@as(u32, @intCast(len))));
+    }
+
+    /// Push `table.grow`'s refusal sentinel, -1 in the table's index type.
+    fn pushTableFail(self: *Frame, is64: bool) !void {
+        if (is64) try self.pushI64(-1) else try self.pushI32(-1);
     }
 
     /// Overflow-safe range check: `base + n <= len`? Returns `base` as a `usize`

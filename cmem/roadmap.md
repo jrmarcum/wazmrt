@@ -294,6 +294,14 @@ compatibility, at a fraction of the footprint, faster on anything not precompile
 *(Sections below are dated as written. The **2026-07-27** state supersedes all earlier test counts and
 open-item lists; the fine-grained audit ledger lives in `known-issues.md`.)*
 
+> ⚠️ **CORRECTION (2026-08-12): "COMPLETE" below was false for 16 days.** memory64 has two halves and
+> only the memory one was built — `readTableType` carried a literal `// tables are 32-bit` and refused
+> `is64` outright, so **table64 did not exist**: ~78 corpus failures behind a completeness claim in the
+> authoritative memory. Implemented 2026-08-12 (see below). **The lesson is about the claim, not the
+> code:** it was written from the memory-side test files passing, and no one asked what else the
+> proposal contained. *A proposal is done when its spec files pass, not when the feature you had in
+> mind works.*
+
 **Latest (2026-07-27) — memory64 (Item 3), the last unimplemented proposal, is COMPLETE.** A memory
 declared `i64` now uses 64-bit addresses, and its `memory.size`/`grow` operate in i64 — implemented end
 to end and cross-checked value-by-value against **wasmtime** (`-W memory64=y`). The address *type* is

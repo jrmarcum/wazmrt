@@ -172,6 +172,41 @@ depending on a module that failed to build). ⚠️ `utf8-invalid-encoding.wast`
 176 skipped** — UTF-8 name validation is entirely unverified by this corpus despite the 13th pass
 recording it as fixed. Worth a separate look at whether the skip is the runner's gap or ours.
 
+## 🔢 table64 (2026-08-12) — memory64's other half, missing for 16 days behind a "COMPLETE" claim
+
+Corpus **372 → 288 failures**; `table_copy64` alone went from 22 build failures + 14 skips to **1,635
+passing assertions**; `table_{init,fill,get,grow,set,size}64` are clean. 2,957 → 2,826 skipped, i.e.
+~130 assertions that had never RUN now run.
+
+`Module.readTableType` carried `if (limits.shared or limits.is64) return error.MalformedFlag; //
+tables are 32-bit`, so a 64-bit table was refused at the first byte. Everything downstream then
+hard-coded `.i32` for every table index, length and count operand. What it took:
+
+- `tableAddrTy` in `validate` (the twin of `memAddrTy`) applied to `table.get/set/size/grow/fill`,
+  `table.copy`, `table.init`'s **dst only** (`src`/`n` index the element *segment*, always 32-bit),
+  and `call_indirect`'s callee index.
+- `Instance.Table.max` widened `?u32 → ?u64` plus an `is64` field; `table.grow`'s overflow made
+  saturating, since a 64-bit delta overflows the sum outright.
+- Active-elem offsets take the **table's** index type, exactly as active-data offsets take their
+  memory's.
+- Entry ceiling is 2^32-1 for a 32-bit table and 2^64-1 for a 64-bit one (so only the 32-bit case
+  actually bounds).
+
+⚠️ **Two failures here were nowhere near where they pointed:**
+
+1. `isOffsetForm` listed `offset` / `i32.const` / `global.get` — **not `i64.const`**. An
+   `(elem (table $t) (i64.const 2) …)` offset was therefore not recognised as an offset *at all*,
+   fell through to the element list, and was parsed as a **function index** → `BadImmediate`, an
+   error about immediates raised from a place that had nothing to do with the actual mistake.
+2. `limitsFit` compared only min/max, so a 32-bit table/memory satisfied a 64-bit import and vice
+   versa — all eight cross-width imports in `memory64-imports.wast` linked when the spec requires
+   them unlinkable. **The index type is part of the type**, not a detail of the limits: every index
+   operand changes width, so the importer would have driven the object with wrong-width operands.
+   `shared` was unchecked there too, and is now.
+
+**Still open in this family:** `table64.wast` 2 (a `(module quote …)` → `BadCommand`, a runner gap,
+plus its cascade).
+
 ## 🧬 GC type identity (2026-08-12) — three gaps, all mutually concealing
 
 `type-subtyping` + `type-rec` + `type-equivalence`: **64 → 26 failures**, corpus 420 → 372.

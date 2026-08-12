@@ -143,7 +143,9 @@ const GcField = struct { storage: GcStorage, mutable: bool };
 /// their fields here. Interned block-type/func sigs (beyond the named types)
 /// are implicitly `.func`.
 const GcTypeDef = union(enum) { func, @"struct": []const GcField, array: GcField };
-const TableDef = struct { min: u32, max: ?u32, elem: V = .funcref };
+/// `min`/`max` are `u64` and `is64` records the index type: a 64-bit table
+/// (table64) may declare limits past `u32`, exactly like a 64-bit memory.
+const TableDef = struct { min: u64, max: ?u64, elem: V = .funcref, is64: bool = false };
 /// An element segment. `funcs` (func-index form) OR `exprs` (const-expr form) —
 /// exactly one is non-empty. `offset` applies only to active segments.
 const ElemDef = struct {
@@ -162,7 +164,7 @@ const ElemDef = struct {
 const GlobalDef = struct { valtype: V, mutable: bool, init: []const Sexpr };
 /// An imported global (`(global (import "m" "n") type)`).
 const ImportedGlobal = struct { module: []const u8, name: []const u8, valtype: V, mutable: bool };
-const ImportedTable = struct { module: []const u8, name: []const u8, min: u32, max: ?u32, elem: V };
+const ImportedTable = struct { module: []const u8, name: []const u8, min: u64, max: ?u64, elem: V, is64: bool = false };
 const ImportedMemory = struct { module: []const u8, name: []const u8, min: u64, max: ?u64, shared: bool = false, is64: bool = false };
 const ImportedTag = struct { module: []const u8, name: []const u8, sig: u32 };
 
@@ -482,14 +484,19 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 for (items[exp_start..ti]) |ex|
                     try exports.append(a, .{ .name = try fieldStr(ex, 1), .kind = 1, .index = tidx });
                 ti += 1;
-                const tmin = try parseIndex(try nth(items, ti));
-                ti += 1;
-                var tmax: ?u32 = null;
-                if (ti < items.len and !isRefType(items[ti])) {
-                    tmax = try parseIndex(items[ti]);
+                var t_is64 = false;
+                if (ti < items.len and (eqAtom(items[ti], "i64") or eqAtom(items[ti], "i32"))) {
+                    t_is64 = eqAtom(items[ti], "i64");
                     ti += 1;
                 }
-                try table_imports.append(a, .{ .module = (try strAt(imp, 1)), .name = (try strAt(imp, 2)), .min = tmin, .max = tmax, .elem = try parseValType(try nth(items, ti), type_names.items) });
+                const tmin = try parseU64(try nth(items, ti));
+                ti += 1;
+                var tmax: ?u64 = null;
+                if (ti < items.len and !isRefType(items[ti])) {
+                    tmax = try parseU64(items[ti]);
+                    ti += 1;
+                }
+                try table_imports.append(a, .{ .module = (try strAt(imp, 1)), .name = (try strAt(imp, 2)), .min = tmin, .max = tmax, .elem = try parseValType(try nth(items, ti), type_names.items), .is64 = t_is64 });
                 try table_names.append(a, tname);
             } else {
                 try parseTable(a, items, &tables, &table_names, &elems, &elem_names, &exports, type_names.items);
@@ -513,14 +520,19 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                     tname = desc[ti].atom;
                     ti += 1;
                 }
-                const tmin = try parseIndex(try nth(desc, ti));
-                ti += 1;
-                var tmax: ?u32 = null;
-                if (ti < desc.len and !isRefType(desc[ti])) {
-                    tmax = try parseIndex(desc[ti]);
+                var t_is64 = false;
+                if (ti < desc.len and (eqAtom(desc[ti], "i64") or eqAtom(desc[ti], "i32"))) {
+                    t_is64 = eqAtom(desc[ti], "i64");
                     ti += 1;
                 }
-                try table_imports.append(a, .{ .module = (try strAt(items, 1)), .name = (try strAt(items, 2)), .min = tmin, .max = tmax, .elem = try parseValType(try nth(desc, ti), type_names.items) });
+                const tmin = try parseU64(try nth(desc, ti));
+                ti += 1;
+                var tmax: ?u64 = null;
+                if (ti < desc.len and !isRefType(desc[ti])) {
+                    tmax = try parseU64(desc[ti]);
+                    ti += 1;
+                }
+                try table_imports.append(a, .{ .module = (try strAt(items, 1)), .name = (try strAt(items, 2)), .min = tmin, .max = tmax, .elem = try parseValType(try nth(desc, ti), type_names.items), .is64 = t_is64 });
                 try table_names.append(a, tname);
             } else if (std.mem.eql(u8, dkw, "memory")) {
                 // (import "m" "n" (memory $id? i64? min max? shared?))
@@ -720,7 +732,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 try nameBytes(a, &s, t.name);
                 try s.append(a, 0x01); // table import
                 try emitValType(a, &s, t.elem); // element reftype
-                try emitLimits(a, &s, t.min, if (t.max) |mx| @as(u64, mx) else null, false, false);
+                try emitLimits(a, &s, t.min, t.max, false, t.is64);
                 ci[1] += 1;
             },
             .mem => {
@@ -765,7 +777,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         try uleb(a, &s, tables.items.len);
         for (tables.items) |t| {
             try emitValType(a, &s, t.elem); // element reftype (funcref / externref)
-            try emitLimits(a, &s, t.min, if (t.max) |mx| @as(u64, mx) else null, false, false);
+            try emitLimits(a, &s, t.min, t.max, false, t.is64);
         }
         try emitSection(a, &out, 4, s.items);
     }
@@ -1105,18 +1117,29 @@ fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef
             try tables.append(a, .{ .min = 0, .max = null, .elem = et });
         }
     } else {
-        const min = try parseIndex(shape);
+        // Optional index type `i64` (table64) / `i32`, ahead of the limits — the
+        // same position a memory takes it. Without this the `i64` fell through to
+        // `parseU64` as a non-number, which is the `BadImmediate` that made every
+        // 64-bit-table file in the suite fail to build.
+        var is64 = false;
+        var lim_shape = shape;
+        if (eqAtom(shape, "i64") or eqAtom(shape, "i32")) {
+            is64 = eqAtom(shape, "i64");
+            i += 1;
+            lim_shape = try nth(items, i);
+        }
+        const min = try parseU64(lim_shape);
         i += 1;
-        var max: ?u32 = null;
+        var max: ?u64 = null;
         if (i < items.len and !isRefType(items[i])) {
-            max = try parseIndex(items[i]);
+            max = try parseU64(items[i]);
             i += 1;
         }
         // `(table 1)` / `(table 1 2)` run out of items here — the twin-index
         // pattern: the `max` probe above is guarded, this read was not.
         const et = try parseValType(try nth(items, i), type_names);
         i += 1;
-        try tables.append(a, .{ .min = min, .max = max, .elem = et });
+        try tables.append(a, .{ .min = min, .max = max, .elem = et, .is64 = is64 });
         // Table initializer expression `(table N reftype initexpr)`: fill all N
         // slots with the value. We synthesize an active elem of N copies at
         // offset 0 — observably identical table state (a distinct 0x40 binary
@@ -1192,7 +1215,12 @@ fn isOffsetForm(s: Sexpr) bool {
     const l = s.asList() orelse return false;
     if (l.len == 0) return false;
     const kw = l[0].asAtom() orelse return false;
-    return std.mem.eql(u8, kw, "offset") or std.mem.eql(u8, kw, "i32.const") or std.mem.eql(u8, kw, "global.get");
+    // `i64.const` belongs here for a 64-bit table (table64), whose active-elem
+    // offset takes the table's index type. Without it the offset was not
+    // recognised as one at all and fell through to the element list, where it
+    // was read as a function index — `BadImmediate`, nowhere near the cause.
+    return std.mem.eql(u8, kw, "offset") or std.mem.eql(u8, kw, "i32.const") or
+        std.mem.eql(u8, kw, "i64.const") or std.mem.eql(u8, kw, "global.get");
 }
 
 /// `(global $name? (export "x")* (import "m" "n")? (mut? valtype) init-expr?)`.
@@ -5221,5 +5249,54 @@ test "a declared supertype must actually be one" {
     }) |src| {
         var m = try Module.decode(a, try assemble(a, src));
         try validate(a, &m);
+    }
+}
+
+test "64-bit tables (table64): index operands take i64 end to end" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The decoder hard-rejected `is64` on a table ("tables are 32-bit"), and the
+    // assembler could not parse the index type at all, so every 64-bit-table
+    // file in the suite failed to build. memory64 shipped with only its memory
+    // half done, while the roadmap recorded the proposal as COMPLETE.
+    const src =
+        \\(module
+        \\  (table $t i64 8 16 funcref)
+        \\  (func $f (result i32) (i32.const 7))
+        \\  (elem (table $t) (i64.const 2) func $f)
+        \\  (func (export "size") (result i64) (table.size $t))
+        \\  (func (export "grow") (result i64) (table.grow $t (ref.null func) (i64.const 4)))
+        \\  (func (export "call") (result i32) (call_indirect $t (type 0) (i64.const 2))))
+    ;
+    var m = try Module.decode(a, try assemble(a, src));
+    try std.testing.expect(m.tables[0].limits.is64);
+    try validate(a, &m);
+
+    // `table.size`/`table.grow` answer in the table's index type...
+    try std.testing.expectEqual(@as(i64, 8), interp.asI64(try assembleAndRun(src, "size", &.{})));
+    try std.testing.expectEqual(@as(i64, 8), interp.asI64(try assembleAndRun(src, "grow", &.{})));
+    // ...and an i64 `call_indirect` index reaches the element the i64 elem
+    // offset placed. `isOffsetForm` did not list `i64.const`, so that offset was
+    // read as a FUNCTION INDEX and the module failed to build.
+    try std.testing.expectEqual(@as(i32, 7), interp.asI32(try assembleAndRun(src, "call", &.{})));
+
+    // The index type is part of the type: 32-bit operands on a 64-bit table are
+    // a type error, not a convenience conversion.
+    {
+        const bad =
+            \\(module (table $t i64 8 funcref)
+            \\  (func (export "f") (result i64) (table.size $t) (drop) (i32.const 0) (table.get $t) (drop) (i64.const 0)))
+        ;
+        var bm = try Module.decode(a, try assemble(a, bad));
+        try std.testing.expectError(error.TypeMismatch, validate(a, &bm));
+    }
+    // A 32-bit table is unchanged — its operands stay i32.
+    {
+        const ok = "(module (table $t 8 funcref) (func (export \"f\") (result i32) (table.size $t)))";
+        var om = try Module.decode(a, try assemble(a, ok));
+        try std.testing.expect(!om.tables[0].limits.is64);
+        try validate(a, &om);
     }
 }

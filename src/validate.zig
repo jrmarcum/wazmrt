@@ -221,7 +221,10 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
             // reported it as an accept-invalid bug on the assumption that
             // `nullable()` was a predicate; verified false. Don't "fix" it again.
             if (elem.elem_type.nullable() != tet.nullable()) return error.TypeMismatch;
-            try validateConstExpr(module, elem.offset_expr, .i32, all_globals, null);
+            // The active-elem offset has the target TABLE's index type, exactly
+            // as an active-data offset takes its memory's (table64).
+            const off_ty: V = if (module.tables[elem.table_index].limits.is64) .i64 else .i32;
+            try validateConstExpr(module, elem.offset_expr, off_ty, all_globals, null);
         }
     }
 
@@ -250,6 +253,12 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
         } else if (mt.limits.shared) return error.InvalidLimits;
     }
     for (module.tables) |tt| {
+        // Entry-count ceiling: 2^32-1 for a 32-bit table, 2^64-1 for a 64-bit one
+        // (table64) — which every u64 satisfies, so only the 32-bit case bounds.
+        if (!tt.limits.is64) {
+            if (tt.limits.min > 0xffff_ffff) return error.InvalidLimits;
+            if (tt.limits.max) |mx| if (mx > 0xffff_ffff) return error.InvalidLimits;
+        }
         if (tt.limits.max) |mx| {
             if (tt.limits.min > mx) return error.InvalidLimits;
         }
@@ -643,6 +652,17 @@ const FuncValidator = struct {
         return if (self.module.memories[index].limits.is64) .i64 else .i32;
     }
 
+    /// The INDEX type of a table: `i64` for a 64-bit table (the table64 half of
+    /// memory64), else `i32`. Every table index, length and count operand takes
+    /// this type — they were all hard-coded `.i32`, which is why a 64-bit table
+    /// could not be used even once it decoded.
+    ///
+    /// Callers bounds-check the index first (`tableElemType`), except where noted.
+    fn tableAddrTy(self: *FuncValidator, index: u32) V {
+        if (index >= self.module.tables.len) return .i32; // unreachable after the check
+        return if (self.module.tables[index].limits.is64) .i64 else .i32;
+    }
+
     /// A memarg offset is decoded as `u64` (memory64), but on a 32-bit memory it
     /// must fit in `u32`. Callers `requireMemory` first, so the index is valid.
     fn checkMemOffset(self: *FuncValidator, index: u32, offset: u64) Error!void {
@@ -930,7 +950,7 @@ const FuncValidator = struct {
                 // `(table 1 (ref func))` is valid and was rejected.
                 if (!subtypeOf(self.module, self.module.tables[ci.table].element, .funcref)) return error.TypeMismatch;
                 const ft = self.module.funcSig(ci.type_index) orelse return error.UndefinedType;
-                _ = try self.popExpect(.i32);
+                _ = try self.popExpect(self.tableAddrTy(ci.table)); // the callee index
                 try self.popVals(ft.params);
                 try self.pushVals(ft.results);
             },
@@ -1057,29 +1077,31 @@ const FuncValidator = struct {
 
             .table_get => {
                 const et = try self.tableElemType(instr.imm.table);
-                _ = try self.popExpect(.i32);
+                _ = try self.popExpect(self.tableAddrTy(instr.imm.table));
                 try self.pushValT(et);
             },
             .table_set => {
                 const et = try self.tableElemType(instr.imm.table);
                 _ = try self.popExpect(et);
-                _ = try self.popExpect(.i32);
+                _ = try self.popExpect(self.tableAddrTy(instr.imm.table));
             },
             .table_size => {
                 _ = try self.tableElemType(instr.imm.table); // bounds-check the index
-                try self.pushValT(.i32);
+                try self.pushValT(self.tableAddrTy(instr.imm.table));
             },
             .table_grow => {
                 const et = try self.tableElemType(instr.imm.table);
-                _ = try self.popExpect(.i32); // delta
+                const at = self.tableAddrTy(instr.imm.table);
+                _ = try self.popExpect(at); // delta
                 _ = try self.popExpect(et); // init value
-                try self.pushValT(.i32);
+                try self.pushValT(at); // previous size
             },
             .table_fill => {
                 const et = try self.tableElemType(instr.imm.table);
-                _ = try self.popExpect(.i32); // n
+                const at = self.tableAddrTy(instr.imm.table);
+                _ = try self.popExpect(at); // n
                 _ = try self.popExpect(et); // value
-                _ = try self.popExpect(.i32); // dst
+                _ = try self.popExpect(at); // dst
             },
             .table_init => {
                 const tet = try self.tableElemType(instr.imm.table_init.table);
@@ -1088,9 +1110,11 @@ const FuncValidator = struct {
                 // equal to it — an `(elem (ref func) …)` into a `funcref` table is
                 // valid and was rejected.
                 if (!subtypeOf(self.module, self.module.elements[instr.imm.table_init.elem].elem_type, tet)) return error.TypeMismatch;
+                // `src` and `n` index the ELEMENT SEGMENT, which is always 32-bit;
+                // only `dst` takes the destination table's index type.
                 _ = try self.popExpect(.i32); // n
                 _ = try self.popExpect(.i32); // src
-                _ = try self.popExpect(.i32); // dst
+                _ = try self.popExpect(self.tableAddrTy(instr.imm.table_init.table)); // dst
             },
             .elem_drop => {
                 if (instr.imm.elem >= self.module.elements.len) return error.UndefinedElem;
@@ -1149,9 +1173,14 @@ const FuncValidator = struct {
                 const st = try self.tableElemType(instr.imm.table_copy.src);
                 // Same rule as table.init: src <: dst, not equality.
                 if (!subtypeOf(self.module, st, dt)) return error.TypeMismatch;
-                _ = try self.popExpect(.i32); // n
-                _ = try self.popExpect(.i32); // src
-                _ = try self.popExpect(.i32); // dst
+                // Each table contributes its own index type, and `n` takes the
+                // SMALLER of the two — same rule as `memory.copy`.
+                const dat = self.tableAddrTy(instr.imm.table_copy.dst);
+                const sat = self.tableAddrTy(instr.imm.table_copy.src);
+                const nt: V = if (dat == .i64 and sat == .i64) .i64 else .i32;
+                _ = try self.popExpect(nt); // n
+                _ = try self.popExpect(sat); // src
+                _ = try self.popExpect(dat); // dst
             },
 
             .ref_null => try self.pushValT(try refTypeValType(self.module, .{ .nullable = true, .heap = instr.imm.ref_type })),

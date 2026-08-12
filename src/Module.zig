@@ -754,7 +754,10 @@ fn readLimits(r: *Reader) Error!Limits {
 fn readTableType(r: *Reader, kinds: []const CompKind) Error!TableType {
     const element = try readValType(r, kinds);
     const limits = try readLimits(r);
-    if (limits.shared or limits.is64) return error.MalformedFlag; // tables are 32-bit, unshared
+    // A table may be 64-bit (memory64 proposal, "table64" half — the index type
+    // sits in the same limits-flag bit as a memory's). It may never be SHARED:
+    // the threads proposal defines shared memories only.
+    if (limits.shared) return error.MalformedFlag;
     return .{ .element = element, .limits = limits };
 }
 

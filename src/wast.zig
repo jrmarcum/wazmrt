@@ -716,6 +716,14 @@ fn valTypesEq(a: []const types.ValType, b: []const types.ValType) bool {
 /// provided.min ≥ required.min and, if required is bounded, provided is bounded
 /// no higher (§4.5.3 limits matching).
 fn limitsFit(provided: Module.Limits, required: Module.Limits) bool {
+    // The INDEX TYPE is part of the type, not a detail of the limits: a 32-bit
+    // table/memory cannot satisfy a 64-bit import or vice versa, because every
+    // index operand changes width. We compared only min/max, so all eight
+    // cross-width imports in `memory64-imports.wast` linked when the spec
+    // requires them unlinkable — and the importer would then have driven the
+    // object with operands of the wrong type.
+    if (provided.is64 != required.is64) return false;
+    if (provided.shared != required.shared) return false;
     if (provided.min < required.min) return false;
     if (required.max) |rmax| {
         const pmax = provided.max orelse return false;
