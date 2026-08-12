@@ -133,6 +133,18 @@ const Sig = struct {
     /// function section point at a non-func type (`BadType` at decode). It only
     /// worked when a real `(func)` type happened to be declared first.
     gc_placeholder: bool = false,
+    /// May an INLINE function type (`(func $f (param i32))`, a `call_indirect`
+    /// with no `(type …)`) be identified with this declared type?
+    ///
+    /// §6.6.12 says only when the type forms its own rec group of one, final and
+    /// with no supertype — because that is exactly the type the abbreviation
+    /// stands for. `internSig` matched on params/results alone and so handed an
+    /// inline type the index of a MEMBER OF A REC GROUP, which is a different
+    /// type: `(rec (type $ft (func)) (type (struct)))` then accepted
+    /// `(global (ref $ft) (ref.func $f))` for a plain `(func $f)`, three
+    /// accept-invalids in `type-rec.wast`. Types interned by `internSig` itself
+    /// are singletons by construction and keep the default.
+    implicit_reusable: bool = true,
 };
 
 /// A GC struct field / array element (assembler side): storage type + mutability.
@@ -264,12 +276,17 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // — every member became its own singleton group, and structurally identical
     // members then collapsed together. `type-rec.wast` catches it five ways.
     var rec_sizes: List(u32) = .empty;
+    // Size of the rec group each DECLARED type index belongs to, index-aligned
+    // with `type_forms` — `rec_sizes` is per group, and the implicit-type rule
+    // below has to ask the question per type.
+    var type_group_size: List(u32) = .empty;
     for (module[start..]) |field| {
         const kw = field.keyword() orelse continue;
         if (std.mem.eql(u8, kw, "type")) {
             try type_names.append(a, typeDefName((try wantList(field))));
             try type_forms.append(a, (try wantList(field)));
             try rec_sizes.append(a, 1);
+            try type_group_size.append(a, 1);
         } else if (std.mem.eql(u8, kw, "rec")) {
             var n: u32 = 0;
             for ((try wantList(field))[1..]) |t| {
@@ -280,11 +297,21 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 }
             }
             try rec_sizes.append(a, n);
+            var k: u32 = 0;
+            while (k < n) : (k += 1) try type_group_size.append(a, n);
         }
     }
     // Pre-pass B: parse the bodies now that all type names resolve.
     for (type_forms.items) |form|
         try parseTypeBody(a, form, type_names.items, &sigs, &gc_types, &gc_field_names, &gc_supers, &gc_finals);
+    // An inline function type stands for `(rec (type (func …)))` — a singleton,
+    // final, no supertype — so it may only be identified with a declared type of
+    // exactly that shape (§6.6.12). Everything else is a different type however
+    // well its params and results line up.
+    for (type_group_size.items, 0..) |n, ti| {
+        if (ti >= sigs.items.len) break;
+        sigs.items[ti].implicit_reusable = n == 1 and gc_finals.items[ti] and gc_supers.items[ti] == null;
+    }
 
     // Pass 1: collect the remaining definitions. Imports (top-level or inline)
     // must precede every func/table/memory/global/tag definition (§6.6.13), so an
@@ -3034,6 +3061,7 @@ fn resolveTagSig(a: std.mem.Allocator, sigs: *List(Sig), type_ref: ?u32, params:
 fn internSig(a: std.mem.Allocator, sigs: *List(Sig), params: []const V, results: []const V) Error!u32 {
     for (sigs.items, 0..) |sig, i| {
         if (sig.gc_placeholder) continue; // a struct/array slot is not a func type
+        if (!sig.implicit_reusable) continue; // see `Sig.implicit_reusable`
         if (std.mem.eql(V, sig.params, params) and std.mem.eql(V, sig.results, results)) return @intCast(i);
     }
     try sigs.append(a, .{ .params = params, .results = results });

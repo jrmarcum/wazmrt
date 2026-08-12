@@ -203,9 +203,13 @@ const Runner = struct {
             .global => |want| try gs.append(self.a, try self.resolveGlobalImport(&tm, m, imp, want)),
             .memory => |want| try ms.append(self.a, try self.resolveMemoryImport(imp.module, imp.name, want)),
             .table => |want| try ts.append(self.a, try self.resolveTableImport(&tm, m, imp, want)),
-            // An imported tag needs no host backing — it is just a local tag
-            // identity in this module's tag index space (EH proposal).
-            .tag => {},
+            // An imported tag needs no host backing — it is just a local identity
+            // in this module's tag index space (EH proposal) — but its TYPE still
+            // has to match the provider's, and that went unchecked entirely. A tag
+            // carries the payload of every exception thrown with it, so a
+            // mismatched link hands the catcher values it will read as the wrong
+            // types.
+            .tag => try self.checkTagImport(&tm, m, imp),
         };
         return .{ .funcs = fs.items, .globals = gs.items, .memories = ms.items, .tables = ts.items };
     }
@@ -229,6 +233,23 @@ const Runner = struct {
                     const got_ti = inst.module.funcTypeIndex(e.index) orelse return error.IncompatibleImportType;
                     if (!try tm.funcImportOk(inst.module, got_ti, m, want_ti)) return error.IncompatibleImportType;
                     return .{ .wasm = .{ .instance = inst, .func_index = e.index } };
+                }
+            }
+        }
+        return error.UnresolvedImport;
+    }
+
+    /// Tag imports match by type EQUIVALENCE, not subtyping: a tag names the exact
+    /// payload shape both sides must agree on, and there is no variance that keeps
+    /// a throw and its catch reading the same values.
+    fn checkTagImport(self: *Runner, tm: *typematch.Ctx, m: *const Module, imp: Module.Import) !void {
+        const want_ti = imp.type_index orelse return error.IncompatibleImportType;
+        if (self.modules.get(imp.module)) |inst| {
+            for (inst.module.exports) |e| {
+                if (e.type == .tag and std.mem.eql(u8, e.name, imp.name)) {
+                    const got_ti = inst.module.tagTypeIndex(e.index) orelse return error.IncompatibleImportType;
+                    if (!try tm.tagImportOk(inst.module, got_ti, m, want_ti)) return error.IncompatibleImportType;
+                    return;
                 }
             }
         }

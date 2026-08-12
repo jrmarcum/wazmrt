@@ -1588,14 +1588,21 @@ fn declaredSubtypeOk(module: *const Module, sub_i: u32, sup_i: u32) bool {
 /// immutable field is covariant, and cannot be re-opened as mutable.
 fn fieldMatches(module: *const Module, sub: Module.FieldType, sup: Module.FieldType) bool {
     if (sub.mutable != sup.mutable) return false;
-    if (sup.mutable) return storageEql(sub.storage, sup.storage);
+    if (sup.mutable) return storageEql(module, sub.storage, sup.storage);
     return storageSubtypeOf(module, sub.storage, sup.storage);
 }
 
-fn storageEql(a: Module.StorageType, b: Module.StorageType) bool {
+/// Storage-type IDENTITY (the invariant, mutable-field case).
+///
+/// Goes through `Module.valTypeEq` rather than `==` for the same reason
+/// everything else in this pass does: a concrete `(ref $t)` carries a type index,
+/// and two indices naming isomorphic rec groups are ONE type. Raw `==` rejected a
+/// valid `(sub $parent (struct (field (mut (ref $t2)))))` whenever the parent
+/// spelled the same field type through a different index.
+fn storageEql(module: *const Module, a: Module.StorageType, b: Module.StorageType) bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     return switch (a) {
-        .val => |v| v == b.val,
+        .val => |v| module.valTypeEq(v, b.val),
         .i8, .i16 => true,
     };
 }
@@ -1604,7 +1611,7 @@ fn storageEql(a: Module.StorageType, b: Module.StorageType) bool {
 /// subtype of `i16` or of `i32`, despite all three unpacking to `i32`.
 fn storageSubtypeOf(module: *const Module, sub: Module.StorageType, sup: Module.StorageType) bool {
     if (sub == .val and sup == .val) return subtypeOf(module, sub.val, sup.val);
-    return storageEql(sub, sup);
+    return storageEql(module, sub, sup);
 }
 
 fn subtypeOf(module: *const Module, sub: V, sup: V) bool {

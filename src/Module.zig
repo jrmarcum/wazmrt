@@ -666,26 +666,14 @@ pub fn recGroup(self: *const Module, i: u32) struct { start: u32, len: u32 } {
 ///
 /// Raw `==` is wrong for exactly the case GC exists to support: `(ref $t1)` and
 /// `(ref $t2)` naming two isomorphic rec groups are one type but two indices, so
-/// `==` compares the index numbers and says no.
+/// `==` compares the index numbers and says no. Use this wherever the spec asks
+/// for type IDENTITY within a module — an INVARIANT position, such as a mutable
+/// struct field, where subtyping would be unsound in both directions.
 pub fn valTypeEq(self: *const Module, x: types.ValType, y: types.ValType) bool {
     if (x == y) return true;
     if (!x.isConcrete() or !y.isConcrete()) return false;
     if (types.ValType.flagBits(x) != types.ValType.flagBits(y)) return false;
     return self.canonOf(x.concreteIndex()) == self.canonOf(y.concreteIndex());
-}
-
-/// `valTypeEq` over two lists, in order.
-pub fn valTypesEq(self: *const Module, xs: []const types.ValType, ys: []const types.ValType) bool {
-    if (xs.len != ys.len) return false;
-    for (xs, ys) |x, y| if (!self.valTypeEq(x, y)) return false;
-    return true;
-}
-
-/// Are two function types the same type within this module? Used wherever the
-/// spec calls for type IDENTITY rather than subtyping — `call_indirect`'s check
-/// against the table entry's actual signature, most importantly.
-pub fn funcTypeEq(self: *const Module, x: FuncType, y: FuncType) bool {
-    return self.valTypesEq(x.params, y.params) and self.valTypesEq(x.results, y.results);
 }
 
 /// Is type index `a` a (reflexive/transitive) subtype of `b`, walking the
