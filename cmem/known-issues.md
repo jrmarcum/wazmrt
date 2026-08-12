@@ -172,6 +172,45 @@ depending on a module that failed to build). ⚠️ `utf8-invalid-encoding.wast`
 176 skipped** — UTF-8 name validation is entirely unverified by this corpus despite the 13th pass
 recording it as fixed. Worth a separate look at whether the skip is the runner's gap or ours.
 
+## 🧬 GC type identity (2026-08-12) — three gaps, all mutually concealing
+
+`type-subtyping` + `type-rec` + `type-equivalence`: **64 → 26 failures**, corpus 420 → 372.
+`type-subtyping` alone went 43 → 12 (24 → 50 passing). Zero regressions.
+
+**1. Declared supertypes were never checked (19 accept-invalid).** The decoder recorded
+`supertypes[i]` and the validator trusted it, so a module could declare *any* type the supertype of
+*any* other — `(array i32)` under `(array i64)`, a struct under a func, `(func)` under `(func (param
+i32))`. `isSubtype`'s chain walk then agreed. ⚠️ **This is not a tidiness bug: it makes `ref.cast`
+unsound.** The cast succeeds and the interpreter reads the value at a type it does not have. Now
+`error.InvalidSubtype`, implementing §3.3.9 matching (params contravariant, results covariant, struct
+fields extendable-but-positional, mutable fields INVARIANT).
+
+**2. Finality was decoded and thrown away.** `0x50` (open) and `0x4f` (final) took the same branch, so
+extending a final type was accepted. The assembler had the mirror bug: it emitted the sub form **only
+when a supertype was present**, so `(type $e0 (sub (array i32)))` — `sub`, no supertype — went out as
+a bare composite and came back FINAL. Fixing only the validator therefore rejected valid modules.
+
+**3. Rec groups were flattened by the assembler (the big one).** `(rec …)` members were emitted
+ungrouped, and the decoder had no group boundaries either — so every member became its own singleton
+group. Types are canonicalised **by whole-group isomorphism plus position**, so this silently rewrote
+the module into a different one: `(rec (func) (struct))` and `(rec (struct) (func))` define four
+distinct types, but flattened they collapse to two. wazmrt now records rec extents and interns each
+group's serialised form — internal references rewritten as positions, external ones as the target's
+canonical id — in `Module.canonicalizeTypes`. `isSubtype` compares canonical ids.
+
+⚠️ **THE THIRD PRODUCER/CONSUMER BLIND SPOT IN TWO DAYS**, after the data-count section (T1) and the
+`0x50` wrapper above. Each time, `wat.zig` dropped something and `Module.zig` did not require it, so
+the two halves agreed and the round trip looked clean. **Our assembler is not an oracle for our
+decoder.** Any conformance failure that reaches the WAT path should be checked at BOTH ends before the
+runtime is suspected — and a decoder rule with no matching emitter rule is a bug that hides itself.
+
+**Still open — cross-module type identity (~15 of the 26).** `assert_unlinkable: module linked` (7),
+`IncompatibleImportType` (4), `IndirectTypeMismatch` (4). `funcTypeEqual`/`funcTypeEq` compare
+`ValType` slices with `std.mem.eql`, and a concrete `(ref $t)` carries a **module-local index**, so
+types from two modules are never comparable. Canonical ids do not help across a module boundary;
+this needs STRUCTURAL comparison of the two types, chasing both modules' type sections in step. That
+is the remaining GC work and it is a distinct piece.
+
 ## 🧾 ABI-2 build (2026-08-11) — bugs and near-misses found while replacing the C ABI
 
 None of these shipped; all were caught by a gate or a test. Recorded because each is a **shape** that

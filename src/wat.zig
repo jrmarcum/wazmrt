@@ -216,6 +216,9 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // Declared supertype (`(sub $super …)`) of each named type, or null; resolved
     // against `type_names` at type-section emission.
     var gc_supers: List(?Sexpr) = .empty;
+    // Whether each named GC type is FINAL (closed to extension) — true unless
+    // the source wrote `sub` without `final`. Index-aligned with `gc_supers`.
+    var gc_finals: List(bool) = .empty;
     var globals: List(GlobalDef) = .empty;
     var global_imports: List(ImportedGlobal) = .empty;
     var table_imports: List(ImportedTable) = .empty;
@@ -249,23 +252,37 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // field/param may forward-reference a later type, e.g. within a `(rec …)`
     // group — the assembler emits them ungrouped, the decoder flattens the same).
     var type_forms: List([]const Sexpr) = .empty;
+    // Size of each declared type group, in order — 1 for a standalone `(type …)`.
+    //
+    // ⚠️ **The grouping is part of the TYPE, not layout.** Two types are the same
+    // only if their whole rec groups are isomorphic *and* they sit at the same
+    // position, so `(rec (func) (struct))` and `(rec (struct) (func))` define
+    // four distinct types. We flattened `(rec …)` away here and emitted the
+    // members ungrouped, which silently rewrote the module into a different one
+    // — every member became its own singleton group, and structurally identical
+    // members then collapsed together. `type-rec.wast` catches it five ways.
+    var rec_sizes: List(u32) = .empty;
     for (module[start..]) |field| {
         const kw = field.keyword() orelse continue;
         if (std.mem.eql(u8, kw, "type")) {
             try type_names.append(a, typeDefName((try wantList(field))));
             try type_forms.append(a, (try wantList(field)));
+            try rec_sizes.append(a, 1);
         } else if (std.mem.eql(u8, kw, "rec")) {
+            var n: u32 = 0;
             for ((try wantList(field))[1..]) |t| {
                 if (std.mem.eql(u8, t.keyword() orelse continue, "type")) {
                     try type_names.append(a, typeDefName((try wantList(t))));
                     try type_forms.append(a, (try wantList(t)));
+                    n += 1;
                 }
             }
+            try rec_sizes.append(a, n);
         }
     }
     // Pre-pass B: parse the bodies now that all type names resolve.
     for (type_forms.items) |form|
-        try parseTypeBody(a, form, type_names.items, &sigs, &gc_types, &gc_field_names, &gc_supers);
+        try parseTypeBody(a, form, type_names.items, &sigs, &gc_types, &gc_field_names, &gc_supers, &gc_finals);
 
     // Pass 1: collect the remaining definitions. Imports (top-level or inline)
     // must precede every func/table/memory/global/tag definition (§6.6.13), so an
@@ -619,17 +636,47 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // any index beyond it is an interned func signature.
     {
         var s: List(u8) = .empty;
-        try uleb(a, &s, sigs.items.len);
+        // The section counts REC-TYPE entries, and a `(rec …)` of n members is
+        // ONE entry. Interned block-type signatures sit past the named defs and
+        // are each their own entry.
+        const named = gc_types.items.len;
+        var entries: usize = sigs.items.len - named;
+        for (rec_sizes.items) |n| entries += if (n == 0) 0 else 1;
+        try uleb(a, &s, entries);
+        // Walks `rec_sizes` alongside the type indices so a group header can be
+        // emitted before its first member.
+        var group: usize = 0;
+        var group_left: u32 = 0;
         for (sigs.items, 0..) |sig, ti| {
+            if (ti < named and group_left == 0) {
+                while (group < rec_sizes.items.len and rec_sizes.items[group] == 0) group += 1;
+                if (group < rec_sizes.items.len) {
+                    group_left = rec_sizes.items[group];
+                    group += 1;
+                    // A bare subtype IS a singleton group, so only n > 1 needs the
+                    // explicit `0x4e` header.
+                    if (group_left > 1) {
+                        try s.append(a, 0x4e);
+                        try uleb(a, &s, group_left);
+                    }
+                } else group_left = 1;
+            }
+            if (group_left > 0) group_left -= 1;
             const def: GcTypeDef = if (ti < gc_types.items.len) gc_types.items[ti] else .func;
-            // A declared supertype emits the sub form (`0x50` = sub, non-final) +
-            // a one-element supertype vector before the composite type. Finality
-            // is not tracked (unused by the decoder/validator).
-            if (ti < gc_supers.items.len) if (gc_supers.items[ti]) |sr| {
-                try s.append(a, 0x50);
-                try uleb(a, &s, 1);
-                try uleb(a, &s, try resolveType(type_names.items, sr));
-            };
+            // Emit the sub form whenever the source said `sub` — even with no
+            // supertype, because that is what makes the type EXTENSIBLE (`0x50`
+            // = non-final, `0x4f` = final). A bare composite type is `sub final`
+            // by definition, so only a `final`-with-supertype declaration needs
+            // the explicit `0x4f`.
+            const is_final = ti >= gc_finals.items.len or gc_finals.items[ti];
+            const super: ?Sexpr = if (ti < gc_supers.items.len) gc_supers.items[ti] else null;
+            if (!is_final or super != null) {
+                try s.append(a, if (is_final) 0x4f else 0x50);
+                if (super) |sr| {
+                    try uleb(a, &s, 1);
+                    try uleb(a, &s, try resolveType(type_names.items, sr));
+                } else try uleb(a, &s, 0);
+            }
             switch (def) {
                 .func => {
                     try s.append(a, 0x60);
@@ -907,24 +954,34 @@ fn typeDefName(items: []const Sexpr) ?[]const u8 {
 /// `sigs`) or the struct/array fields (to `gc_types`) plus the declared supertype
 /// (to `gc_supers`, resolved at emit) at the next type index — all index-aligned
 /// with `type_names` (already fully populated, so concrete `(ref $t)` resolves).
-fn parseTypeBody(a: std.mem.Allocator, items: []const Sexpr, type_names: []const ?[]const u8, sigs: *List(Sig), gc_types: *List(GcTypeDef), gc_field_names: *List([]const ?[]const u8), gc_supers: *List(?Sexpr)) Error!void {
+fn parseTypeBody(a: std.mem.Allocator, items: []const Sexpr, type_names: []const ?[]const u8, sigs: *List(Sig), gc_types: *List(GcTypeDef), gc_field_names: *List([]const ?[]const u8), gc_supers: *List(?Sexpr), gc_finals: *List(bool)) Error!void {
     var i: usize = 1;
     if (i < items.len and isId(items[i])) i += 1; // skip $name (already collected)
     var body = try wantList(try nth(items, i));
     // Unwrap a `(sub final? $super? <comptype>)`: the inner comptype is the last
     // element; a supertype id among the middle elements (skipping `final`) is
     // captured so the type section can emit the sub form (GC MVP: ≤1 supertype).
+    //
+    // ⚠️ FINALITY IS PART OF THE TYPE, not decoration. `(sub …)` without `final`
+    // opens the type for extension; a bare `(func …)` / `(struct …)` / `(array
+    // …)` is final. We recorded only the supertype, so `(type $e0 (sub (array
+    // i32)))` — `sub`, no supertype — emitted a BARE composite and came back
+    // final, and every later `(sub $e0 …)` then extended a closed type.
     var super_ref: ?Sexpr = null;
+    var final = true;
     if (body.len >= 2 and eqAtom(body[0], "sub")) {
+        final = false;
         for (body[1 .. body.len - 1]) |part| {
-            if (isId(part) or (part.asAtom() != null and !eqAtom(part, "final"))) {
-                super_ref = part;
-                break;
+            if (eqAtom(part, "final")) {
+                final = true;
+                continue;
             }
+            if (super_ref == null and (isId(part) or part.asAtom() != null)) super_ref = part;
         }
         body = body[body.len - 1].asList() orelse return error.BadModuleField;
     }
     try gc_supers.append(a, super_ref);
+    try gc_finals.append(a, final);
 
     const kw = try wantAtom(try nth(body, 0));
     if (std.mem.eql(u8, kw, "func")) {
@@ -5079,6 +5136,88 @@ test "a rethrow label must name a catch block" {
         "(module (tag $e) (func (try (do (throw $e)) (catch $e (rethrow 0)))))",
         "(module (tag $e) (func (try (do (throw $e)) (catch_all (rethrow 0)))))",
         "(module (tag $e) (func (try (do (throw $e)) (catch $e (block (rethrow 1))))))",
+    }) |src| {
+        var m = try Module.decode(a, try assemble(a, src));
+        try validate(a, &m);
+    }
+}
+
+test "rec groups survive assembly, and position within a group is part of identity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The assembler used to flatten `(rec …)` into ungrouped types, which is a
+    // DIFFERENT module: every member became its own singleton group, and
+    // structurally identical members from different groups then canonicalised
+    // together. Here `$f1` and `$f2` are both `(func)`, but sit at different
+    // positions in non-isomorphic groups, so they are distinct types and the
+    // global must be rejected.
+    {
+        const src =
+            \\(module
+            \\  (rec (type $f1 (func)) (type (struct)))
+            \\  (rec (type (struct)) (type $f2 (func)))
+            \\  (func $f (type $f2))
+            \\  (global (ref $f1) (ref.func $f)))
+        ;
+        var m = try Module.decode(a, try assemble(a, src));
+        try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, m.canon);
+        try std.testing.expectError(error.TypeMismatch, validate(a, &m));
+    }
+    // ...but two ISOMORPHIC groups do define the same types, so the same shape
+    // with the members in the same order must validate.
+    {
+        const src =
+            \\(module
+            \\  (rec (type $f1 (func)) (type (struct)))
+            \\  (rec (type $f2 (func)) (type (struct)))
+            \\  (func $f (type $f2))
+            \\  (global (ref $f1) (ref.func $f)))
+        ;
+        var m = try Module.decode(a, try assemble(a, src));
+        // Group 2 canonicalises onto group 1: same ids, so `$f1` == `$f2`.
+        try std.testing.expectEqualSlices(u32, &.{ 0, 1, 0, 1 }, m.canon);
+        try validate(a, &m);
+    }
+}
+
+test "a declared supertype must actually be one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // We recorded `supertypes[i]` and never checked it, so any type could be
+    // declared the supertype of any other — and `isSubtype` then agreed, which
+    // makes `ref.cast` succeed on a value that does not have the target type.
+    for ([_][]const u8{
+        // Final: a bare composite type is `sub final`, so it is closed.
+        "(module (type $t (func)) (type $s (sub $t (func))))",
+        "(module (type $t (struct)) (type $s (sub $t (struct))))",
+        // Kind mismatch.
+        "(module (type $f (sub (func (param i32)))) (type $s (sub $f (struct))))",
+        // Array element type must match.
+        "(module (type $a (sub (array i32))) (type $b (sub $a (array i64))))",
+        // Mutability is invariant, and cannot be re-opened.
+        "(module (type $a (sub (array (ref any)))) (type $b (sub $a (array (mut (ref any))))))",
+        // Function arity/params must match.
+        "(module (type $f (sub (func))) (type $g (sub $f (func (param i32)))))",
+        // A struct subtype may add fields but not drop or retype them.
+        "(module (type $s (sub (struct (field i32)))) (type $t (sub $s (struct (field i64)))))",
+        "(module (type $s (sub (struct (field i32) (field i32)))) (type $t (sub $s (struct (field i32)))))",
+    }) |src| {
+        var m = try Module.decode(a, try assemble(a, src));
+        try std.testing.expectError(error.InvalidSubtype, validate(a, &m));
+    }
+
+    // ...and the legitimate extensions must still validate.
+    for ([_][]const u8{
+        "(module (type $t (sub (func))) (type $s (sub $t (func))))",
+        "(module (type $s (sub (struct (field i32)))) (type $t (sub $s (struct (field i32) (field i64)))))",
+        "(module (type $a (sub (array i32))) (type $b (sub $a (array i32))))",
+        "(module (type $a (sub (array (mut i32)))) (type $b (sub $a (array (mut i32)))))",
+        // Explicit `final` with a supertype: extends, but is itself closed.
+        "(module (type $t (sub (func))) (type $s (sub final $t (func))))",
     }) |src| {
         var m = try Module.decode(a, try assemble(a, src));
         try validate(a, &m);

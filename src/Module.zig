@@ -193,6 +193,13 @@ comp_types: []const CompType,
 /// future `ref.cast`; unused by the current slice" until 2026-07-21, long after
 /// GC P3 shipped — dead-code bait that could have cost a live field.)
 supertypes: []const ?u32,
+/// Whether each type index is FINAL — closed to extension. True for a bare
+/// composite type (shorthand for `sub final`) and for an explicit `0x4f`; false
+/// only for `0x50`. Parallel to `comp_types`.
+type_finals: []const bool,
+/// Canonical identity per type index: equal ids mean the same type. See
+/// `canonOf` / `isSubtype`.
+canon: []const u32,
 /// Type index of each *defined* function (function section), in order.
 functions: []const u32,
 /// Type index of each exception tag (tag section §5.5.14, EH proposal). Each
@@ -245,6 +252,8 @@ const Decoder = struct {
     a: std.mem.Allocator,
     comp_types: []const CompType = &.{},
     supertypes: []const ?u32 = &.{},
+    type_finals: []const bool = &.{},
+    canon: []const u32 = &.{},
     /// Composite kind of each type index, pre-scanned before bodies are decoded
     /// so a `(ref $t)` value type can collapse to the right family (func /
     /// struct / array) even when `$t` is a forward reference in a rec group.
@@ -361,6 +370,8 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
         .sections = try sections.toOwnedSlice(a),
         .comp_types = d.comp_types,
         .supertypes = d.supertypes,
+        .type_finals = d.type_finals,
+        .canon = d.canon,
         .functions = functions,
         .tags = tags,
         .imports = imports,
@@ -582,12 +593,36 @@ pub fn refHead(self: *const Module, ht: opcode.HeapType) Error!types.ValType.Ref
     };
 }
 
+/// Is type index `i` FINAL (closed to extension)? Out of range reads as final —
+/// the conservative answer, since an unknown type must not become extensible.
+pub fn isFinal(self: *const Module, i: u32) bool {
+    return if (i < self.type_finals.len) self.type_finals[i] else true;
+}
+
+/// The canonical identity of type index `i`. Two indices name the SAME type iff
+/// their canonical ids are equal. Out of range answers with the index itself.
+pub fn canonOf(self: *const Module, i: u32) u32 {
+    return if (i < self.canon.len) self.canon[i] else i;
+}
+
 /// Is type index `a` a (reflexive/transitive) subtype of `b`, walking the
 /// declared GC supertype chain?
+///
+/// Compares CANONICAL ids, not raw indices: two separately-declared but
+/// structurally isomorphic rec groups define one type, so `$f1` and `$f2` below
+/// are the same type and each is its own subtype.
+///
+///     (rec (type $f1 (sub (func))) (type (struct (field (ref $f1)))))
+///     (rec (type $f2 (sub (func))) (type (struct (field (ref $f2)))))
+///
+/// Comparing raw indices said no, which rejected valid modules outright and —
+/// once declared supertypes started being checked — made legitimate `(sub …)`
+/// declarations across equivalent groups look ill-formed.
 pub fn isSubtype(self: *const Module, a: u32, b: u32) bool {
+    const target = self.canonOf(b);
     var cur: ?u32 = a;
     while (cur) |c| {
-        if (c == b) return true;
+        if (self.canonOf(c) == target) return true;
         cur = if (c < self.supertypes.len) self.supertypes[c] else null;
     }
     return false;
@@ -801,26 +836,171 @@ fn decodeTypeSection(d: *Decoder, r: *Reader) Error!void {
 
     var comp: std.ArrayList(CompType) = .empty;
     var supers: std.ArrayList(?u32) = .empty;
+    var finals: std.ArrayList(bool) = .empty;
+    // Rec-group extent per type index. Flattening the groups away lost the one
+    // piece of information canonicalisation needs — which references are
+    // INTERNAL to a group — so a standalone type is recorded as a group of one.
+    var rec_start: std.ArrayList(u32) = .empty;
+    var rec_len: std.ArrayList(u32) = .empty;
     var nrec = try r.readVarU32();
     while (nrec > 0) : (nrec -= 1) {
+        const start: u32 = @intCast(comp.items.len);
+        var members: u32 = 1;
         if (try r.peekByte() == 0x4e) {
             _ = try r.readByte(); // rec group
-            var k = try r.readVarU32();
-            while (k > 0) : (k -= 1) try decodeSubType(d, r, &comp, &supers);
+            members = try r.readVarU32();
+            var k = members;
+            while (k > 0) : (k -= 1) try decodeSubType(d, r, &comp, &supers, &finals);
         } else {
-            try decodeSubType(d, r, &comp, &supers);
+            try decodeSubType(d, r, &comp, &supers, &finals);
+        }
+        var k: u32 = 0;
+        while (k < members) : (k += 1) {
+            try rec_start.append(d.a, start);
+            try rec_len.append(d.a, members);
         }
     }
     d.comp_types = try comp.toOwnedSlice(d.a);
     d.supertypes = try supers.toOwnedSlice(d.a);
+    d.type_finals = try finals.toOwnedSlice(d.a);
+    d.canon = try canonicalizeTypes(d.a, d.comp_types, d.supertypes, d.type_finals, rec_start.items, rec_len.items);
+}
+
+/// Assign each type index a CANONICAL identity, so that two structurally
+/// isomorphic `rec` groups define one type rather than two (§3.3.10).
+///
+/// The whole difficulty is that a rec group's members refer to *each other* by
+/// absolute type index, so two copies of the same group are byte-different while
+/// being the same type. The fix is to serialise a group with its INTERNAL
+/// references rewritten as positions within the group, and its external ones as
+/// the canonical id of the target. That form is identical for isomorphic groups,
+/// so interning it in a hash map assigns them the same id.
+///
+/// Groups are processed in index order, so an external reference always points
+/// at a group whose canonical id is already known (a type index may only refer
+/// backwards, or inside its own group).
+fn canonicalizeTypes(
+    a: std.mem.Allocator,
+    comp_types: []const CompType,
+    supertypes: []const ?u32,
+    finals: []const bool,
+    rec_start: []const u32,
+    rec_len: []const u32,
+) Error![]const u32 {
+    const canon = try a.alloc(u32, comp_types.len);
+    var interned: std.StringHashMapUnmanaged(u32) = .{};
+    defer interned.deinit(a);
+
+    var key: std.ArrayList(u8) = .empty;
+    defer key.deinit(a);
+
+    var i: u32 = 0;
+    while (i < comp_types.len) {
+        const start = rec_start[i];
+        const len = rec_len[i];
+        key.clearRetainingCapacity();
+
+        var k: u32 = 0;
+        while (k < len) : (k += 1) {
+            const t = start + k;
+            try key.append(a, if (finals[t]) 1 else 0);
+            if (supertypes[t]) |s| {
+                try key.append(a, 1);
+                try writeTypeRef(a, &key, s, start, len, canon);
+            } else try key.append(a, 0);
+            try writeCompType(a, &key, comp_types[t], start, len, canon);
+        }
+
+        // The first group with a given shape names the shape; later copies of it
+        // reuse that group's base, which is what makes their members equal.
+        const gop = try interned.getOrPut(a, key.items);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try a.dupe(u8, key.items);
+            gop.value_ptr.* = start;
+        }
+        const base = gop.value_ptr.*;
+        k = 0;
+        while (k < len) : (k += 1) canon[start + k] = base + k;
+        i = start + len;
+    }
+    return canon;
+}
+
+/// Serialise a type reference: relative when it points inside the group being
+/// canonicalised, else by the target's already-assigned canonical id.
+fn writeTypeRef(a: std.mem.Allocator, out: *std.ArrayList(u8), t: u32, start: u32, len: u32, canon: []const u32) Error!void {
+    if (t >= start and t < start + len) {
+        try out.append(a, 0); // in-group: position, so isomorphic groups agree
+        try out.appendSlice(a, std.mem.asBytes(&(t - start)));
+    } else {
+        try out.append(a, 1);
+        const id = if (t < canon.len and t < start) canon[t] else t; // forward refs can't occur in a valid module
+        try out.appendSlice(a, std.mem.asBytes(&id));
+    }
+}
+
+fn writeValType(a: std.mem.Allocator, out: *std.ArrayList(u8), v: types.ValType, start: u32, len: u32, canon: []const u32) Error!void {
+    if (!v.isConcrete()) {
+        try out.append(a, 0);
+        try out.appendSlice(a, std.mem.asBytes(&@intFromEnum(v)));
+        return;
+    }
+    // Keep the concrete/nullable/family bits verbatim and canonicalise only the
+    // index — `(ref $t)` and `(ref null $t)` stay distinct types.
+    try out.append(a, 1);
+    const flags: u32 = @intFromEnum(v) & 0xF000_0000;
+    try out.appendSlice(a, std.mem.asBytes(&flags));
+    try writeTypeRef(a, out, v.concreteIndex(), start, len, canon);
+}
+
+fn writeFieldType(a: std.mem.Allocator, out: *std.ArrayList(u8), f: FieldType, start: u32, len: u32, canon: []const u32) Error!void {
+    try out.append(a, if (f.mutable) 1 else 0);
+    switch (f.storage) {
+        .val => |v| {
+            try out.append(a, 0);
+            try writeValType(a, out, v, start, len, canon);
+        },
+        .i8 => try out.append(a, 1),
+        .i16 => try out.append(a, 2),
+    }
+}
+
+fn writeCompType(a: std.mem.Allocator, out: *std.ArrayList(u8), c: CompType, start: u32, len: u32, canon: []const u32) Error!void {
+    switch (c) {
+        .func => |f| {
+            try out.append(a, 0);
+            try out.appendSlice(a, std.mem.asBytes(&@as(u32, @intCast(f.params.len))));
+            for (f.params) |p| try writeValType(a, out, p, start, len, canon);
+            try out.appendSlice(a, std.mem.asBytes(&@as(u32, @intCast(f.results.len))));
+            for (f.results) |r| try writeValType(a, out, r, start, len, canon);
+        },
+        .@"struct" => |fs| {
+            try out.append(a, 1);
+            try out.appendSlice(a, std.mem.asBytes(&@as(u32, @intCast(fs.len))));
+            for (fs) |f| try writeFieldType(a, out, f, start, len, canon);
+        },
+        .array => |f| {
+            try out.append(a, 2);
+            try writeFieldType(a, out, f, start, len, canon);
+        },
+    }
 }
 
 /// Decode one sub type: an optional `0x50`/`0x4f` (non-final / final) wrapper
 /// carrying a supertype list (GC MVP: at most one), then a composite type.
-fn decodeSubType(d: *Decoder, r: *Reader, comp: *std.ArrayList(CompType), supers: *std.ArrayList(?u32)) Error!void {
+fn decodeSubType(d: *Decoder, r: *Reader, comp: *std.ArrayList(CompType), supers: *std.ArrayList(?u32), finals: *std.ArrayList(bool)) Error!void {
     var super: ?u32 = null;
+    // FINAL unless an explicit `0x50` says otherwise: a bare composite type is
+    // shorthand for `sub final`, and `0x4f` is the spelled-out form. Only `0x50`
+    // opens a type for extension.
+    //
+    // Both wrapper bytes used to decode identically, so finality was thrown away
+    // and `(type $t (func))` `(type $s (sub $t (func)))` — extending a final type
+    // — was accepted. Two of `type-subtyping.wast`'s accept-invalid failures.
+    var final = true;
     const tag = try r.peekByte();
     if (tag == 0x50 or tag == 0x4f) {
+        final = tag == 0x4f;
         _ = try r.readByte();
         const ns = try r.readVarU32();
         if (ns > 1) return error.BadType; // MVP allows at most one supertype
@@ -835,6 +1015,7 @@ fn decodeSubType(d: *Decoder, r: *Reader, comp: *std.ArrayList(CompType), supers
     }
     try comp.append(d.a, try decodeCompType(d, r));
     try supers.append(d.a, super);
+    try finals.append(d.a, final);
 }
 
 /// Decode a composite type: `0x60` func / `0x5f` struct / `0x5e` array.

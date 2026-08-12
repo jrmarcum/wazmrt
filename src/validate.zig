@@ -90,6 +90,11 @@ pub const Error = Module.Error || error{
     UndefinedElem,
     /// A `memory.init`/`data.drop` data-segment index out of range.
     UndefinedData,
+    /// A `(type $s (sub $t …))` whose declared supertype is not a real one —
+    /// `$t` is final, a different composite kind, or structurally incompatible
+    /// (§3.3.9). Left unchecked, `isSubtype` believes it and `ref.cast` succeeds
+    /// on a value that does not have the target type.
+    InvalidSubtype,
     /// A legacy `rethrow l` whose label is not a `catch`/`catch_all` block.
     /// Nothing else binds a caught exception, so there is nothing to re-raise.
     InvalidRethrowLabel,
@@ -158,6 +163,13 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
     site = .{};
 
     if (module.functions.len != module.code.len) return error.CountMismatch;
+
+    // Every DECLARED supertype must actually be one (§3.3.9). This has to run
+    // before anything consults `isSubtype`, which simply trusts the chain — so
+    // an unchecked declaration turns `ref.cast` into a lie the interpreter then
+    // acts on.
+    for (module.supertypes, 0..) |maybe_sup, i| if (maybe_sup) |sup|
+        if (!declaredSubtypeOk(module, @intCast(i), sup)) return error.InvalidSubtype;
 
     // C.refs (§3.4.10, "undeclared function reference"): `ref.func x` inside a
     // FUNCTION BODY is well-typed only if `x` also occurs somewhere *outside*
@@ -1472,6 +1484,78 @@ fn refTypeValType(module: *const Module, rt: opcode.RefType) Error!V {
         .concrete => |ti| V.concreteRef(rt.nullable, head, ti),
         else => head.valType(rt.nullable),
     };
+}
+
+/// §3.3.9 — is a DECLARED supertype relation legitimate? `(type $s (sub $t …))`
+/// only type-checks if `$s`'s structure *matches* `$t`'s.
+///
+/// ⚠️ **We never checked this at all.** The decoder recorded `supertypes[i]` and
+/// the validator trusted it, so a module could declare any type the supertype of
+/// any other and `isSubtype`'s chain walk would then agree — `(array i32)` under
+/// `(array i64)`, a struct under a func, `(func)` under `(func (param i32))`.
+/// Nineteen of `type-subtyping.wast`'s accept-invalid failures, and every one of
+/// them makes `ref.cast`/`br_on_cast` unsound: the cast succeeds and the
+/// interpreter then reads the value at a type it does not have.
+fn declaredSubtypeOk(module: *const Module, sub_i: u32, sup_i: u32) bool {
+    if (sup_i >= module.comp_types.len or sub_i >= module.comp_types.len) return false;
+    // A final type is closed: nothing may name it as a supertype.
+    if (module.isFinal(sup_i)) return false;
+    const sub = module.comp_types[sub_i];
+    const sup = module.comp_types[sup_i];
+    return switch (sup) {
+        // Function: params CONTRAVARIANT, results COVARIANT, arities equal.
+        .func => |f_sup| switch (sub) {
+            .func => |f_sub| blk: {
+                if (f_sub.params.len != f_sup.params.len) break :blk false;
+                if (f_sub.results.len != f_sup.results.len) break :blk false;
+                for (f_sup.params, f_sub.params) |p_sup, p_sub|
+                    if (!subtypeOf(module, p_sup, p_sub)) break :blk false; // note the order
+                for (f_sub.results, f_sup.results) |r_sub, r_sup|
+                    if (!subtypeOf(module, r_sub, r_sup)) break :blk false;
+                break :blk true;
+            },
+            else => false, // kind mismatch: a struct/array is never a func subtype
+        },
+        // Struct: the subtype may ADD fields at the end, but every inherited
+        // field must still match positionally.
+        .@"struct" => |fs_sup| switch (sub) {
+            .@"struct" => |fs_sub| blk: {
+                if (fs_sub.len < fs_sup.len) break :blk false;
+                for (fs_sup, fs_sub[0..fs_sup.len]) |f_sup, f_sub|
+                    if (!fieldMatches(module, f_sub, f_sup)) break :blk false;
+                break :blk true;
+            },
+            else => false,
+        },
+        .array => |f_sup| switch (sub) {
+            .array => |f_sub| fieldMatches(module, f_sub, f_sup),
+            else => false,
+        },
+    };
+}
+
+/// §3.3.8 field matching. A MUTABLE field is INVARIANT — it is both read and
+/// written through the supertype, so widening it either way is unsound. An
+/// immutable field is covariant, and cannot be re-opened as mutable.
+fn fieldMatches(module: *const Module, sub: Module.FieldType, sup: Module.FieldType) bool {
+    if (sub.mutable != sup.mutable) return false;
+    if (sup.mutable) return storageEql(sub.storage, sup.storage);
+    return storageSubtypeOf(module, sub.storage, sup.storage);
+}
+
+fn storageEql(a: Module.StorageType, b: Module.StorageType) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .val => |v| v == b.val,
+        .i8, .i16 => true,
+    };
+}
+
+/// Packed storage types (`i8`/`i16`) relate only to themselves — `i8` is not a
+/// subtype of `i16` or of `i32`, despite all three unpacking to `i32`.
+fn storageSubtypeOf(module: *const Module, sub: Module.StorageType, sup: Module.StorageType) bool {
+    if (sub == .val and sup == .val) return subtypeOf(module, sub.val, sup.val);
+    return storageEql(sub, sup);
 }
 
 fn subtypeOf(module: *const Module, sub: V, sup: V) bool {
