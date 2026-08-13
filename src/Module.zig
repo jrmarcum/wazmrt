@@ -747,7 +747,17 @@ fn readValType(r: *Reader, kinds: []const CompKind) Error!types.ValType {
         // `externref` — which the C ABI would then hand out as a host pointer
         // although it is an `exn_store` index.
         0x69 => .exnref,
-        0x74 => .nullref, // nullexnref — bottom; closest modelled type
+        // `nullexnref` — the bottom of the EXN hierarchy. Modelled as `exnref`,
+        // not as `nullref`.
+        //
+        // ⚠️ It was `nullref` (the any-hierarchy bottom) as a "closest modelled
+        // type" approximation, and R10 made that inconsistency load-bearing: once
+        // `(ref.null noexn)` decoded to the exn head, the two spellings of the
+        // SAME type disagreed and `(global $nullexn nullexnref (ref.null noexn))`
+        // was a TypeMismatch against itself. Two encodings of one type must land
+        // on one value type; picking the wrong FAMILY is the error that shows up
+        // only when both spellings meet.
+        0x74 => .exnref,
         0x68 => .funcref_nn, // our synthetic non-null tags (assembler round-trip)
         0x67 => .externref_nn,
         0x66 => .anyref_nn,
@@ -799,7 +809,9 @@ fn readHeapTypeRef(r: *Reader, nullable: bool, kinds: []const CompKind) Error!ty
         -0x15 => .{ .structref, .structref_nn }, // struct
         -0x16 => .{ .arrayref, .arrayref_nn }, // array
         -0x0f => .{ .nullref, .nullref_nn }, // none
-        -0x17 => .{ .exnref, .exnref_nn }, // exn (EH proposal) — was folded into externref
+        -0x17, -0x0c => .{ .exnref, .exnref_nn }, // exn / noexn (EH) — `noexn` is the
+        // bottom of the exn hierarchy and only null inhabits it, so it folds onto
+        // the `exn` head the same way `nofunc`/`noextern` fold above.
         // An undefined heap-type code used to decode as `externref` ("other →
         // opaque"), so a malformed type was thereafter indistinguishable from a
         // real externref in validation, the C-ABI type objects, and the `.wast`

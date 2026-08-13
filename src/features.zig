@@ -110,6 +110,7 @@ fn opFeature(op: opcode.Op) ?Feature {
         .array_new, .array_new_default, .array_new_fixed, .array_get, .array_get_s, .array_get_u,
         .array_set, .array_len,
         .array_new_data, .array_new_elem, .array_fill, .array_copy, .array_init_data, .array_init_elem,
+        .extern_convert_any, .any_convert_extern,
         .ref_test, .ref_cast, .br_on_cast, .br_on_cast_fail,
         => .gc,
 
@@ -220,16 +221,16 @@ pub fn firstViolation(gpa: std.mem.Allocator, module: *const Module, fs: Set) !?
 // confirm it really is MVP core), and only then update the number.
 comptime {
     const n = @typeInfo(opcode.Op).@"enum".fields.len;
-    if (n != 246) @compileError(std.fmt.comptimePrint(
-        "opcode.Op has {d} members, features.zig was written against 246. A new opcode must be " ++
+    if (n != 248) @compileError(std.fmt.comptimePrint(
+        "opcode.Op has {d} members, features.zig was written against 248. A new opcode must be " ++
             "classified in opFeature() before this number is updated — an unclassified opcode " ++
             "silently passes every proposal gate.",
         .{n},
     ));
 }
 
-// The classification behind that 246, recorded so the next person can re-check it cheaply rather
-// than re-deriving it: 74 opcodes are mapped to a proposal in `opFeature`, and the remaining 172
+// The classification behind that 248, recorded so the next person can re-check it cheaply rather
+// than re-deriving it: 76 opcodes are mapped to a proposal in `opFeature`, and the remaining 172
 // are WebAssembly 1.0 core — control flow, numerics, comparisons, loads/stores, locals/globals,
 // `select`, `drop`, `nop`, `memory.size`/`grow`.
 //

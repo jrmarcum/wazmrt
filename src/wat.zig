@@ -1918,6 +1918,21 @@ fn emitFoldedIf(ctx: *Ctx, l: []const Sexpr) Error!void {
     _ = ctx.labels.pop();
 }
 
+/// Consume the optional label id that may follow a flat `else`/`end` (§6.5.2) and
+/// return how many items it took (0 or 1). The id must name the block being
+/// closed; a mismatch is malformed, which is the only reason the form exists.
+fn closingLabelId(ctx: *Ctx, items: []const Sexpr, j: usize) Error!usize {
+    if (j >= items.len) return 0;
+    const atom = items[j].asAtom() orelse return 0;
+    if (atom.len == 0 or atom[0] != '$') return 0;
+    const open = if (ctx.labels.items.len != 0) ctx.labels.items[ctx.labels.items.len - 1] else null;
+    // An id repeated on an UNLABELLED block, or naming a different one, is
+    // malformed — `(block … end $wrong)` must not assemble.
+    const nm = open orelse return error.BadImmediate;
+    if (!std.mem.eql(u8, nm, atom)) return error.BadImmediate;
+    return 1;
+}
+
 /// A flat instruction at `items[i]` (`name` is its atom); return the next index.
 fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Error!usize {
     if (lookupSimd(name)) |sd| return emitSimd(ctx, sd, items, i + 1, false);
@@ -1946,14 +1961,23 @@ fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Erro
             try ctx.labels.append(ctx.a, label);
             return j;
         },
+        // §6.5.2: a flat `else`/`end` may REPEAT the enclosing block's label —
+        // `if $body … else $body … end $body` — as a redundancy check on deeply
+        // nested code. We consumed neither, so the id was left to be assembled as
+        // the next instruction and came back `UnknownInstr` naming a label. That
+        // killed `stack.wast`'s only module and its whole file with it.
+        //
+        // The repetition is checked, not just skipped: that is the entire reason
+        // the form exists, and a mismatched id is malformed.
         .@"else" => {
             try ctx.out.append(ctx.a, @intFromEnum(Op.@"else"));
-            return i + 1;
+            return i + 1 + try closingLabelId(ctx, items, i + 1);
         },
         .end => {
             try ctx.out.append(ctx.a, @intFromEnum(Op.end));
+            const consumed = try closingLabelId(ctx, items, i + 1);
             if (ctx.labels.items.len != 0) _ = ctx.labels.pop();
-            return i + 1;
+            return i + 1 + consumed;
         },
         .br_table => {
             try ctx.out.append(ctx.a, @intFromEnum(Op.br_table));
@@ -2185,6 +2209,12 @@ fn abstractHeapCode(atom: []const u8) ?i64 {
         .{ "struct", -0x15 }, .{ "array", -0x16 }, .{ "none", -0x0f },
         .{ "func", -0x10 }, .{ "extern", -0x11 }, .{ "nofunc", -0x0d },
         .{ "noextern", -0x0e },
+        // ⚠️ `exn` was missing, so `(ref.null exn)` — the canonical way to write a
+        // null exception reference — was `BadImmediate`. That single omission
+        // failed `ref_null.wast`'s FIRST module and took the other 32 assertions
+        // in the file into `NoTarget` with it. `readHeapType`, `readHeapTypeRef`
+        // and `heapTypeToValType` all knew `exn`; this table did not.
+        .{ "exn", -0x17 }, .{ "noexn", -0x0c },
     };
     inline for (map) |m| if (std.mem.eql(u8, atom, m[0])) return m[1];
     return null;
@@ -3693,15 +3723,21 @@ test "SIMD audit regressions (sub_sat_u / nearest / i64x2 all_true+bitmask / dem
     , "f", &.{}));
 }
 
-test "#2f: br_table with mismatched label types (unreachable code) is rejected" {
+test "br_table label types need only agree in ARITY, and only in polymorphic code" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    // Otherwise valid: the block yields f64 → drop → i32.const → the func's i32.
-    // But `br_table 0 1` targets label 0 (the f64 block) and label 1 (the func,
-    // result i32) — incompatible. After `unreachable` the stack is polymorphic,
-    // so `popVals` can't catch it; the cross-label type check (#2f) must.
-    const bin = try assemble(a,
+
+    // ⚠️ **This test asserted the opposite until R10 (2026-08-13), and it was
+    // wrong.** A "#2f" audit finding added a pairwise subtype check between every
+    // `br_table` label and the default, on the reasoning that `popVals` cannot
+    // catch a mismatch once the stack is polymorphic. The reasoning was right and
+    // the RULE does not exist: §3.3.5.9 wants one `[t*]` that is a subtype of
+    // every label's type, and after `unreachable` the stack supplies ⊥, which is a
+    // subtype of everything. `br_table.wast` names the case `meet-bottom` and the
+    // official suite requires it ACCEPTED — the check rejected it and blacked out
+    // 161 assertions. A finding can be well-argued and still invent a rule.
+    const ok = try assemble(a,
         \\(module (func (result i32)
         \\  (block (result f64)
         \\    unreachable
@@ -3709,8 +3745,31 @@ test "#2f: br_table with mismatched label types (unreachable code) is rejected" 
         \\  drop
         \\  (i32.const 5)))
     );
-    var m = try Module.decode(a, bin);
-    try std.testing.expectError(error.TypeMismatch, validate(a, &m));
+    var m = try Module.decode(a, ok);
+    try validate(a, &m);
+
+    // Arity is still cross-checked — one `[t*]` cannot have two lengths. Here
+    // label 0 is the block (`[f64]`) and label 1 the function (`[]`).
+    var m2 = try Module.decode(a, try assemble(a,
+        \\(module (func
+        \\  (block (result f64)
+        \\    unreachable
+        \\    (br_table 0 1 (i32.const 0)))
+        \\  drop))
+    ));
+    try std.testing.expectError(error.TypeMismatch, validate(a, &m2));
+
+    // And in REACHABLE code a genuine mismatch is still caught, by the pops
+    // themselves: the first label leaves a concrete f64 the second must satisfy.
+    var m3 = try Module.decode(a, try assemble(a,
+        \\(module (func (result i32)
+        \\  (block (result f64)
+        \\    (f64.const 1)
+        \\    (br_table 0 1 (i32.const 0)))
+        \\  drop
+        \\  (i32.const 5)))
+    ));
+    try std.testing.expectError(error.TypeMismatch, validate(a, &m3));
 }
 
 test "assembles memory.size / memory.grow (WAT was missing the .mem_index arm)" {
@@ -4800,6 +4859,135 @@ test "GC array: array.new_fixed builds from operands" {
         \\      (i32.const 2))))
     ;
     try std.testing.expectEqual(@as(i32, 30), interp.asI32(try assembleAndRun(src, "third", &.{})));
+}
+
+// --- R10 (2026-08-13): the blockers that blacked out whole files -------------
+// Each of these failed the FIRST module of a spec file and took every remaining
+// assertion in it into `NoTarget`. The unit cost is one defect; the corpus cost
+// was 416 assertions.
+
+test "R10: extern.convert_any / any.convert_extern work in a function body" {
+    // They existed ONLY in the const-expr evaluator — no `Op`, so a body using
+    // one was `UnknownInstr` at the assembler. Five spec files open with a module
+    // that does (172 assertions).
+    const src =
+        \\(module
+        \\  (func (export "roundtrip") (result i32)
+        \\    (ref.is_null (any.convert_extern (extern.convert_any (ref.i31 (i32.const 7))))))
+        \\  (func (export "null_stays_null") (result i32)
+        \\    (ref.is_null (extern.convert_any (ref.null any))))
+        \\  (func (export "value") (result i32)
+        \\    (i31.get_u (ref.cast (ref i31)
+        \\      (any.convert_extern (extern.convert_any (ref.i31 (i32.const 42))))))))
+    ;
+    // A converted non-null reference is still non-null, and survives the round
+    // trip with its value — the conversion changes only the static type.
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "roundtrip", &.{})));
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(src, "null_stays_null", &.{})));
+    try std.testing.expectEqual(@as(i32, 42), interp.asI32(try assembleAndRun(src, "value", &.{})));
+
+    // The raw internal tag bytes must NOT decode — `0x16`/`0x17` are unassigned
+    // in the single-byte space, and their `immediateKind` is `.none`, which is
+    // reachable from real ops.
+    for ([_]u8{ 0x16, 0x17 }) |b| {
+        try std.testing.expectError(error.UnsupportedOpcode, opcode.decodeBody(std.testing.allocator, &[_]u8{b}));
+    }
+}
+
+test "R10: the exn heap type is spellable in ref.null" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // `abstractHeapCode` knew every head except `exn`/`noexn`, so `(ref.null exn)`
+    // was `BadImmediate` and `ref_null.wast` died on its first module.
+    for ([_][]const u8{
+        "(module (func (export \"f\") (result exnref) (ref.null exn)))",
+        "(module (func (export \"f\") (result exnref) (ref.null noexn)))",
+        "(module (global exnref (ref.null exn)))",
+        "(module (global nullexnref (ref.null noexn)))",
+    }) |src| {
+        var m = Module.decode(a, assemble(a, src) catch |e| {
+            std.debug.print("failed to assemble: {s}\n", .{src});
+            return e;
+        }) catch |e| {
+            std.debug.print("failed to decode: {s}\n", .{src});
+            return e;
+        };
+        validate(a, &m) catch |e| {
+            std.debug.print("failed to validate: {s}\n", .{src});
+            return e;
+        };
+    }
+}
+
+test "R10: flat else/end may repeat the block label" {
+    // §6.5.2's redundancy check. Unconsumed, the id was assembled as the next
+    // instruction — `UnknownInstr` naming a label — which killed `stack.wast`.
+    const src =
+        \\(module (func (export "f") (param i32) (result i32)
+        \\  block $b (result i32)
+        \\    local.get 0
+        \\    if $b (result i32)
+        \\      i32.const 10
+        \\    else $b
+        \\      i32.const 20
+        \\    end $b
+        \\  end $b))
+    ;
+    try std.testing.expectEqual(@as(i32, 10), interp.asI32(try assembleAndRun(src, "f", &.{interp.i32Value(1)})));
+    try std.testing.expectEqual(@as(i32, 20), interp.asI32(try assembleAndRun(src, "f", &.{interp.i32Value(0)})));
+
+    // A repeated id must MATCH — checking it is the only reason the form exists.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.BadImmediate, assemble(arena.allocator(),
+        \\(module (func block $b end $wrong))
+    ));
+}
+
+test "R10: br_on_non_null takes the NULLABLE operand for a non-null label" {
+    // The label's last type is `(ref ht)` and the operand is `(ref null ht)`;
+    // popping the label types wholesale asked the stack for the non-null form.
+    // This is the canonical idiom the instruction exists for.
+    const src =
+        \\(module
+        \\  (type $t (func (result i32)))
+        \\  (func $g (result i32) (i32.const 7))
+        \\  (elem declare func $g)
+        \\  (table 2 (ref null $t))
+        \\  (func (export "f") (param i32) (result i32)
+        \\    (block $l (result (ref $t))
+        \\      (br_on_non_null $l (table.get (local.get 0)))
+        \\      (return (i32.const -1)))
+        \\    (call_ref $t)))
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = try Module.decode(a, try assemble(a, src));
+    try validate(a, &m); // was TypeMismatch: expected (ref $t), found (ref null $t)
+}
+
+test "R10: br_on_cast_fail carries src MINUS dst to its label" {
+    // `null-diff`: with a NULLABLE dst, a null takes the fall-through, so the
+    // value reaching the label is non-null and the label may declare `(ref any)`.
+    // The subtraction was implemented for br_on_cast's fall-through only.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src =
+        \\(module
+        \\  (type $st (struct))
+        \\  (func (export "f") (param anyref) (result i32)
+        \\    (block $l (result (ref any))
+        \\      (block (result (ref null $st))
+        \\        (br_on_cast_fail $l (ref null any) (ref null $st) (local.get 0)))
+        \\      (return (i32.const 1)))
+        \\    (drop)
+        \\    (i32.const 2)))
+    ;
+    var m = try Module.decode(a, try assemble(a, src));
+    try validate(a, &m);
 }
 
 // --- R5 (2026-08-13): strict numeric literals --------------------------------

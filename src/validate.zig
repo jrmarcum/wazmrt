@@ -677,6 +677,28 @@ const FuncValidator = struct {
             _ = try self.popExpect(ts[i]);
         }
     }
+
+    /// `push_opds(pop_opds(ts))` — check that `ts` is on the stack and put back
+    /// **exactly what was there**, which on a polymorphic stack is `unknown` (⊥)
+    /// rather than the declared type. `popVals` + `pushVals` is NOT the same
+    /// operation: it substitutes concrete types for ⊥ and so makes a later probe
+    /// of the same slots fail. Used by `br_table`, which probes every label in
+    /// turn. Falls back to the declared types beyond a small fixed arity, where
+    /// nothing polymorphic can be involved in practice.
+    fn popPushVals(self: *FuncValidator, ts: []const V) Error!void {
+        var buf: [8]StackType = undefined;
+        if (ts.len > buf.len) {
+            try self.popVals(ts);
+            try self.pushVals(ts);
+            return;
+        }
+        var i = ts.len;
+        while (i > 0) {
+            i -= 1;
+            buf[i] = try self.popExpect(ts[i]);
+        }
+        for (buf[0..ts.len]) |st| try self.pushVal(st);
+    }
     /// Pop a value that must be a reference type (or polymorphic `unknown`).
     /// A linear memory must exist AND the instruction's memory index must be in
     /// range. The second half matters for multi-memory: checking only
@@ -999,18 +1021,38 @@ const FuncValidator = struct {
                 for (instr.imm.br_table.labels) |l| {
                     const lt = try self.labelTypesAt(l);
                     if (lt.len != default_lt.len) return error.TypeMismatch;
-                    // #2f: every target label must be type-compatible with the
-                    // default, not merely equal in arity. `popVals` catches a
-                    // mismatch in reachable code but NOT in stack-polymorphic
-                    // (post-`unreachable`) code, where the operand stack is
-                    // `unknown`. `subtypeOf` both ways rejects only genuinely
-                    // incompatible pairs (under single inheritance no common
-                    // operand type exists), so it never rejects a valid
-                    // subtyped `br_table`.
-                    for (lt, default_lt) |a, b|
-                        if (!subtypeOf(self.module, a, b) and !subtypeOf(self.module, b, a)) return error.TypeMismatch;
-                    try self.popVals(lt);
-                    try self.pushVals(lt);
+                    // ⚠️ **A "#2f" pairwise subtype check between each label and
+                    // the default used to live here, and the spec has no such
+                    // rule.** §3.3.5.9 asks for a single `[t*]` that is a subtype
+                    // of every label's type; after `unreachable` the operand stack
+                    // supplies ⊥, which is a subtype of anything, so labels that
+                    // are pairwise incompatible are still jointly satisfiable.
+                    // `br_table.wast` names the case `meet-bottom`:
+                    //
+                    //     (block (result f64) (block (result f32)
+                    //       (unreachable) (br_table 0 1 1 (i32.const 1))))
+                    //
+                    // f32 and f64 have no common supertype and the module is
+                    // VALID. The check's own comment claimed it "never rejects a
+                    // valid subtyped `br_table`"; it rejected this one and took the
+                    // other **161 assertions in the file** into `NoTarget`.
+                    //
+                    // It was redundant in the other direction too: in REACHABLE
+                    // code the pop/push below already catches a genuine mismatch,
+                    // because the first label leaves a concrete type the next
+                    // label's pop must satisfy. The algorithm below is the
+                    // Appendix's, unmodified — arity equality plus
+                    // `push_opds(pop_opds(label_types(l)))` — and arity is the only
+                    // cross-label rule there is: one `[t*]` cannot have two lengths.
+                    // ⚠️ Push back WHAT WAS POPPED, not the label's declared types.
+                    // `popVals(lt); pushVals(lt);` looks like a non-destructive
+                    // probe and is not: on a polymorphic stack `popVals` consumes
+                    // `unknown` (⊥) entries while `pushVals` puts CONCRETE ones
+                    // back, so checking label 0 of `meet-bottom` left a real `f32`
+                    // where ⊥ had been, and checking label 1 then failed
+                    // "expected f64, found f32". §Appendix's algorithm is
+                    // `push_opds(pop_opds(…))` — the popped entries, ⊥ and all.
+                    try self.popPushVals(lt);
                 }
                 try self.popVals(default_lt);
                 self.setUnreachable();
@@ -1547,9 +1589,22 @@ const FuncValidator = struct {
                 if (!subtypeOf(self.module, dst_vt, src_vt)) return error.TypeMismatch; // a downcast
                 const lt = try self.labelTypesAt(bc.label); // [t* carried]
                 if (lt.len == 0) return error.TypeMismatch;
+                // `rt1 \ rt2` — the source type MINUS what the cast would have
+                // caught. When the target is NULLABLE a null matches it, so a
+                // value that fails the cast is non-null and the difference loses
+                // nullability.
+                const diff = if (dst_vt.isNonNullRef()) src_vt else src_vt.nonNull();
                 // The type carried to the label: `dst` for br_on_cast (the branch
-                // fires on a match), `src` for br_on_cast_fail (fires on a miss).
-                const carried = if (instr.op == .br_on_cast) dst_vt else src_vt;
+                // fires on a match), the DIFFERENCE for br_on_cast_fail (fires on
+                // a miss).
+                //
+                // ⚠️ This used plain `src_vt` for the fail form. The subtraction
+                // was already implemented eleven lines below for br_on_cast's
+                // FALL-THROUGH — the same rule, applied on one of the two paths
+                // that need it — so `null-diff`, the test named for exactly this,
+                // was rejected: it branches `(ref null any)` into a label typed
+                // `(ref any)`.
+                const carried = if (instr.op == .br_on_cast) dst_vt else diff;
                 if (!subtypeOf(self.module, carried, lt[lt.len - 1])) return error.TypeMismatch;
                 const prefix = lt[0 .. lt.len - 1]; // t*
                 _ = try self.popExpect(src_vt); // the ref operand (top)
@@ -1561,10 +1616,21 @@ const FuncValidator = struct {
                 // NULLABLE, a null would have branched, so the fall-through ref is
                 // non-null — pushing `src_vt` unchanged over-approximated and
                 // rejected valid code that feeds it to a `(ref …)` parameter.
-                try self.pushValT(if (instr.op == .br_on_cast)
-                    (if (dst_vt.isNonNullRef()) src_vt else src_vt.nonNull())
-                else
-                    dst_vt);
+                try self.pushValT(if (instr.op == .br_on_cast) diff else dst_vt);
+            },
+
+            // GC: the extern↔any bridge. Both are representation-preserving and
+            // NULLABILITY-PRESERVING: `extern.convert_any` takes `(ref null? any)`
+            // to `(ref null? extern)` and `any.convert_extern` the reverse, with
+            // the null-ness carried across. Mirrors the const-expr arms, which
+            // were the only place these existed until R10.
+            .extern_convert_any => switch (try self.popRef()) {
+                .val => |v| try self.pushValT(if (v.isNonNullRef()) .externref_nn else .externref),
+                .unknown => try self.pushVal(.unknown),
+            },
+            .any_convert_extern => switch (try self.popRef()) {
+                .val => |v| try self.pushValT(if (v.isNonNullRef()) .anyref_nn else .anyref),
+                .unknown => try self.pushVal(.unknown),
             },
 
             // Spec: `[(ref null ht)] -> [(ref ht)]` — the op EXISTS to remove
@@ -1602,16 +1668,27 @@ const FuncValidator = struct {
                 // reject-valid, not a safety issue.
                 const lt = try self.labelTypesAt(instr.imm.label);
                 if (lt.len == 0 or !lt[lt.len - 1].isRef()) return error.TypeMismatch;
-                try self.popVals(lt);
-                try self.pushVals(lt);
-                // The operand is the nullable form of what the label expects; in
-                // unreachable code it is `.unknown` and matches anything.
+                // ⚠️ Pop the OPERAND first, and check only `t*` against the stack.
+                // The label's last type is the NON-NULL `(ref ht)`; the operand is
+                // its nullable counterpart `(ref null ht)`. Popping `lt` wholesale
+                // therefore asked the stack for `(ref any)` where `anyref` sits —
+                // "expected anyref_nn, found anyref" — and rejected the canonical
+                // idiom this instruction exists for:
+                //
+                //     (block $l (result (ref any))
+                //       (br_on_non_null $l (table.get …)) (return …))
+                //
+                // It cost the first module of `br_on_non_null.wast` AND of
+                // `br_on_cast_fail.wast`, i.e. 33 assertions across two files.
                 const r = try self.popRef();
                 switch (r) {
                     .val => |v| if (!subtypeOf(self.module, v, lt[lt.len - 1].nullable()))
                         return error.TypeMismatch,
                     .unknown => {},
                 }
+                const prefix = lt[0 .. lt.len - 1];
+                try self.popVals(prefix);
+                try self.pushVals(prefix);
             },
 
             .local_get => {

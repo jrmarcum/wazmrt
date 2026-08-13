@@ -2364,6 +2364,18 @@ const Frame = struct {
                     pc += 1;
                 },
 
+                // --- GC: the extern↔any bridge ---
+                // Both are IDENTITY at run time and that is not a shortcut: an
+                // `externref` and an `anyref` are the same `u64` here (a null
+                // sentinel, a tagged i31, or a heap index), so the conversion
+                // changes only the static type. The const-expr evaluator has
+                // treated them this way since GC landed; these are the same two
+                // ops finally reachable from a function body.
+                .extern_convert_any, .any_convert_extern => {
+                    _ = try self.peek(); // an empty stack is a trap, not a no-op
+                    pc += 1;
+                },
+
                 // --- GC: casts ---
                 .ref_test => {
                     const v = self.pop();

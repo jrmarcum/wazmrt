@@ -66,6 +66,20 @@ pub const Op = enum(u8) {
     call_ref = 0x14, // immediate: a type index (the func ref's signature)
     return_call_ref = 0x15,
 
+    // GC: the extern↔any bridge (`0xFB 0x1a` / `0x1b`). INTERNAL tags in the
+    // unassigned `0x16`/`0x17` slots — the wire form is the `0xFB` prefix, and
+    // `decodeBody` rejects the raw bytes alongside the other tag ranges.
+    //
+    // ⚠️ These existed ONLY in the constant-expression path (`validateConstExpr`
+    // and `evalConstExpr`) — there was no `Op`, so a function BODY using them was
+    // `UnknownInstr` at the assembler and undecodable after it. One missing
+    // mnemonic pair failed the first module of `ref_test`, `ref_cast`,
+    // `br_on_cast`, `br_on_cast_fail` and `extern`, blacking out **172
+    // assertions**. A feature implemented for one of its two contexts reads as
+    // implemented.
+    extern_convert_any = 0x16, // 0xFB 0x1a: [(ref null? any)] -> [(ref null? extern)]
+    any_convert_extern = 0x17, // 0xFB 0x1b: [(ref null? extern)] -> [(ref null? any)]
+
     // Reference
     ref_null = 0xd0, // immediate: a heaptype byte (func / extern)
     ref_is_null = 0xd1,
@@ -423,6 +437,8 @@ pub fn gcSubOpcode(op: Op) ?u8 {
         .ref_i31 => 0x1c,
         .i31_get_s => 0x1d,
         .i31_get_u => 0x1e,
+        .extern_convert_any => 0x1a,
+        .any_convert_extern => 0x1b,
         else => null,
     };
 }
@@ -645,8 +661,9 @@ pub fn immediateKind(op: Op) ImmKind {
         // Everything else in the core-MVP range has no immediate; `0xc5…0xcc` are
         // the saturating-truncation tags (also immediate-free).
         0x00, 0x01, 0x05, 0x0b, 0x0f, 0x1a, 0x1b, 0xd1, 0xd3, 0xd4, 0x45...0xcc => .none,
-        // GC ops with no immediate: ref.i31/i31.get_s/i31.get_u, array.len.
-        0xf0, 0xf1, 0xf2, 0xed => .none,
+        // GC ops with no immediate: ref.i31/i31.get_s/i31.get_u, array.len, and
+        // the extern↔any bridge (`0x16`/`0x17`, rejected as raw bytes below).
+        0xf0, 0xf1, 0xf2, 0xed, 0x16, 0x17 => .none,
         // GC ops with a single type index (`array.fill` = 0xDF included).
         0xe6, 0xe7, 0xe9, 0xea, 0xeb, 0xec, 0xf3, 0xf4, 0xdf => .gc_type,
         // GC struct ops with a type index + field index.
@@ -970,6 +987,12 @@ pub fn readHeapType(r: *Reader) DecodeError!HeapType {
         -0x0d => .nofunc,
         -0x0e => .noextern,
         -0x17 => .exn, // 0x69
+        // `noexn` (0x74) — the bottom of the exn hierarchy. Folded onto the `exn`
+        // head, exactly as `nofunc`/`noextern` fold onto func/extern in
+        // `Module.readHeapTypeRef`: only null inhabits it, so the distinction is
+        // unobservable in this model. Without it `(ref.null noexn)` was
+        // undecodable and `ref_null.wast`'s second module died on it.
+        -0x0c => .exn,
         else => error.UnsupportedOpcode,
     };
 }
@@ -1039,6 +1062,8 @@ pub fn decodeBodyTracked(
                 0x1c => .{ .op = .ref_i31, .imm = .none },
                 0x1d => .{ .op = .i31_get_s, .imm = .none },
                 0x1e => .{ .op = .i31_get_u, .imm = .none },
+                0x1a => .{ .op = .extern_convert_any, .imm = .none },
+                0x1b => .{ .op = .any_convert_extern, .imm = .none },
                 else => return error.UnsupportedOpcode,
             };
             try list.append(a, instr);
@@ -1112,7 +1137,13 @@ pub fn decodeBodyTracked(
         // (`.none`), whose kinds are legitimately reachable. A range check is the
         // property that actually holds. (`0xd0–0xd6` are real ops; `0xfb–0xfd`
         // are prefixes consumed above, and both sit outside this range.)
-        if ((b0 >= 0xc5 and b0 <= 0xcf) or (b0 >= 0xd7 and b0 <= 0xfa)) return error.UnsupportedOpcode;
+        // THREE ranges now: R10 put the extern↔any bridge in the unassigned
+        // `0x16`/`0x17` slots, the only pair left outside the two blocks below.
+        // Their `immediateKind` is `.none`, which is reachable from real ops, so
+        // without this arm a raw `0x16` byte would decode and EXECUTE as
+        // `extern.convert_any` — the accept-invalid R3 closed for `0xc5..0xcc`.
+        if (b0 == 0x16 or b0 == 0x17 or
+            (b0 >= 0xc5 and b0 <= 0xcf) or (b0 >= 0xd7 and b0 <= 0xfa)) return error.UnsupportedOpcode;
         const op: Op = @enumFromInt(b0);
         const imm: Imm = switch (immediateKind(op)) {
             .none => .none,

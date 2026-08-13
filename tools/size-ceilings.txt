@@ -120,6 +120,20 @@
 # functions are pure syntax and cost real bytes; they also close ~146 accept-invalid assertions
 # that nothing could reach before.
 
-wazmrt.exe  951808
-wazmrt.lib  1014058
-wazmrt.dll  876544
+# RAISED 2026-08-13 (R10 — the blockers that blacked out whole files). Measured ReleaseSmall,
+# Zig 0.16.0, x86_64-windows, static lib from a PLAIN `zig build` re-run after `zig build dll`.
+#
+#   artifact       after R5      after R10     R10's share
+#   wazmrt.exe      951,808       953,344          +1,536
+#   wazmrt.lib    1,014,058     1,016,766          +2,708
+#   wazmrt.dll      876,544       878,592          +2,048
+#
+# The smallest raise of the series, and it bought 416 unblocked assertions — most of R10 was
+# CORRECTING rules rather than adding them (`br_table`'s cross-label check was deleted outright, as
+# the spec has no such rule). What did add bytes: two new `Op` tags for `extern.convert_any` /
+# `any.convert_extern` with their decode/validate/execute arms, `popPushVals`, and
+# `closingLabelId`.
+
+wazmrt.exe  953344
+wazmrt.lib  1016766
+wazmrt.dll  878592
