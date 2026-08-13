@@ -129,6 +129,9 @@ const Runner = struct {
     spectest_table: ?*interp.Instance.Table = null,
     /// Cells for the `spectest` constant globals, by name. See `spectestGlobalCell`.
     spectest_globals: std.StringHashMapUnmanaged(*interp.Instance.Global) = .{},
+    /// `(module definition $M …)` bodies, by `$M` — assembled but NOT
+    /// instantiated, so `(module instance $I $M)` can build fresh instances.
+    definitions: std.StringHashMapUnmanaged([]const u8) = .{},
     /// Interned host externref payloads. A `(ref.extern N)` value is represented
     /// on the value stack as its *index* here (a small integer, never the
     /// `null_ref` = maxInt sentinel), so an externref of any payload — including
@@ -157,6 +160,16 @@ const Runner = struct {
         const kw = cmd.keyword() orelse return error.BadCommand;
         if (std.mem.eql(u8, kw, "module")) {
             const list = cmd.asList().?;
+            // `(module definition $M …)` DEFINES without instantiating, and
+            // `(module instance $I $M)` instantiates a definition — the pair
+            // `instance.wast` uses to check that instantiation is generative
+            // (two instances of one definition must not share state). Neither was
+            // implemented, so that whole file scored 0 passed / 8 failed / 12
+            // skipped: every failure was the harness, not the runtime.
+            if (list.len > 1) if (list[1].asAtom()) |k2| {
+                if (std.mem.eql(u8, k2, "definition")) return self.moduleDefinition(list);
+                if (std.mem.eql(u8, k2, "instance")) return self.moduleInstance(list);
+            };
             self.current = self.buildModule(list) catch |e| {
                 self.current = null;
                 self.fail("module failed to build: {s}", .{@errorName(e)});
@@ -188,8 +201,63 @@ const Runner = struct {
         }
     }
 
+    /// `(module definition $M <fields>)` — assemble and remember, WITHOUT
+    /// instantiating. It does not become `current`: a definition is not an
+    /// instance, and treating it as one is what makes "instantiation is
+    /// generative" untestable.
+    fn moduleDefinition(self: *Runner, list: []const Sexpr) Error!void {
+        // Re-shape to a plain `(module <fields>)` for the assembler: drop the
+        // `definition` keyword and the `$M`, keep everything after.
+        var i: usize = 2;
+        const name: ?[]const u8 = if (i < list.len and isId(list[i])) blk: {
+            defer i += 1;
+            break :blk list[i].atom;
+        } else null;
+        var form: std.ArrayList(Sexpr) = .empty;
+        try form.append(self.a, list[0]); // "module"
+        try form.appendSlice(self.a, list[i..]);
+        const bin = self.moduleBinary(form.items) catch |e| {
+            self.fail("module definition failed to assemble: {s}", .{@errorName(e)});
+            return;
+        };
+        if (name) |n| try self.definitions.put(self.a, n, bin);
+    }
+
+    /// `(module instance $I $M)` — instantiate the definition named `$M` afresh.
+    /// Each call allocates its own globals/tables/memories, which is precisely
+    /// the property `instance.wast` is checking.
+    fn moduleInstance(self: *Runner, list: []const Sexpr) Error!void {
+        var i: usize = 2;
+        const name: ?[]const u8 = if (i < list.len and isId(list[i])) blk: {
+            defer i += 1;
+            break :blk list[i].atom;
+        } else null;
+        const def_id = if (i < list.len and isId(list[i])) list[i].atom else {
+            self.fail("module instance: no definition named", .{});
+            return;
+        };
+        const bin = self.definitions.get(def_id) orelse {
+            self.fail("module instance: no definition '{s}'", .{def_id});
+            return;
+        };
+        const inst = self.instantiateBinary(bin) catch |e| {
+            self.current = null;
+            self.fail("module failed to build: {s}", .{@errorName(e)});
+            return;
+        };
+        self.current = inst;
+        if (name) |n| try self.module_names.put(self.a, n, inst);
+    }
+
     fn buildModule(self: *Runner, form: []const Sexpr) !*interp.Instance {
-        const bin = try self.moduleBinary(form);
+        return self.instantiateBinary(try self.moduleBinary(form));
+    }
+
+    /// Decode, validate, link and instantiate a module binary. Shared by
+    /// `(module …)` and `(module instance …)`, which differ only in where the
+    /// bytes come from — each call builds a FRESH instance, so two instances of
+    /// one definition share nothing.
+    fn instantiateBinary(self: *Runner, bin: []const u8) !*interp.Instance {
         const m = try self.a.create(Module);
         m.* = try Module.decode(self.a, bin);
         try validate(self.a, m);
@@ -214,6 +282,7 @@ const Runner = struct {
         var gs: std.ArrayList(*interp.Instance.Global) = .empty;
         var ms: std.ArrayList(*interp.Instance.Memory) = .empty;
         var ts: std.ArrayList(*interp.Instance.Table) = .empty;
+        var tgs: std.ArrayList(u64) = .empty;
         // One matcher per link: its memo is keyed by module pointer, and every
         // module it names is alive for exactly this long.
         var tm: typematch.Ctx = .init(self.a);
@@ -229,9 +298,9 @@ const Runner = struct {
             // carries the payload of every exception thrown with it, so a
             // mismatched link hands the catcher values it will read as the wrong
             // types.
-            .tag => try self.checkTagImport(&tm, m, imp),
+            .tag => try tgs.append(self.a, try self.resolveTagImport(&tm, m, imp)),
         };
-        return .{ .funcs = fs.items, .globals = gs.items, .memories = ms.items, .tables = ts.items, .store = self.store };
+        return .{ .funcs = fs.items, .globals = gs.items, .memories = ms.items, .tables = ts.items, .tags = tgs.items, .store = self.store };
     }
 
     fn resolveFuncImport(self: *Runner, tm: *typematch.Ctx, m: *const Module, imp: Module.Import) !HostFunc {
@@ -262,14 +331,20 @@ const Runner = struct {
     /// Tag imports match by type EQUIVALENCE, not subtyping: a tag names the exact
     /// payload shape both sides must agree on, and there is no variance that keeps
     /// a throw and its catch reading the same values.
-    fn checkTagImport(self: *Runner, tm: *typematch.Ctx, m: *const Module, imp: Module.Import) !void {
+    ///
+    /// Returns the provider's tag IDENTITY, which the importer adopts. It used to
+    /// return nothing — a tag import was "just a local identity in this module's
+    /// tag index space" — so importing one tag twice produced two identities that
+    /// did not match each other, and an exception thrown with one was not caught
+    /// by a handler naming the other (`instance.wast`).
+    fn resolveTagImport(self: *Runner, tm: *typematch.Ctx, m: *const Module, imp: Module.Import) !u64 {
         const want_ti = imp.type_index orelse return error.IncompatibleImportType;
         if (self.modules.get(imp.module)) |inst| {
             for (inst.module.exports) |e| {
                 if (e.type == .tag and std.mem.eql(u8, e.name, imp.name)) {
                     const got_ti = inst.module.tagTypeIndex(e.index) orelse return error.IncompatibleImportType;
                     if (!try tm.tagImportOk(inst.module, got_ti, m, want_ti)) return error.IncompatibleImportType;
-                    return;
+                    return inst.tagId(e.index);
                 }
             }
         }
@@ -1431,6 +1506,55 @@ test "a funcref in a shared table names its own instance, not the caller's index
     ;
     const s = try runScript(std.testing.allocator, src);
     try std.testing.expectEqual(@as(usize, 4), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "instantiation is generative: two instances of one definition share nothing" {
+    // `(module definition …)` / `(module instance …)` — the pair `instance.wast`
+    // uses. Neither was implemented, so the file scored 0 passed / 8 failed / 12
+    // skipped and the property went unchecked entirely.
+    const src =
+        \\(module definition $M
+        \\  (global (export "g") (mut i32) (i32.const 0))
+        \\  (func (export "bump") (result i32)
+        \\    (global.set 0 (i32.add (global.get 0) (i32.const 1)))
+        \\    (global.get 0)))
+        \\(module instance $I1 $M)
+        \\(module instance $I2 $M)
+        \\(assert_return (invoke $I1 "bump") (i32.const 1))
+        \\(assert_return (invoke $I1 "bump") (i32.const 2))
+        \\(assert_return (invoke $I2 "bump") (i32.const 1))
+        \\(assert_return (get $I1 "g") (i32.const 2))
+        \\(assert_return (get $I2 "g") (i32.const 1))
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 5), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "importing one tag twice yields ONE identity, so a throw matches either name" {
+    // A tag import used to carry no identity at all — it was "just a local index
+    // in this module's tag space" — so importing `A.t` as both $t1 and $t2 gave
+    // two indices that never compared equal. `throw $t2` then fell past
+    // `catch $t1` into `catch_all`. An exception routed to the wrong handler:
+    // the same class as a funcref resolving to the wrong function.
+    const src =
+        \\(module $A (tag (export "t")))
+        \\(register "A" $A)
+        \\(module $B
+        \\  (tag $t1 (import "A" "t"))
+        \\  (tag $t2 (import "A" "t"))
+        \\  (func (export "f") (result i32)
+        \\    (block $on_t1
+        \\      (block $other
+        \\        (try_table (catch $t1 $on_t1) (catch_all $other) (throw $t2))
+        \\        (unreachable))
+        \\      (return (i32.const 0)))
+        \\    (return (i32.const 1))))
+        \\(assert_return (invoke $B "f") (i32.const 1))
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 1), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
 

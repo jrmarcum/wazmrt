@@ -400,6 +400,15 @@ pub fn funcRefValue(store_slot: u32, func_index: u32) Value {
     return (@as(Value, store_slot) + 1) << 32 | @as(Value, func_index);
 }
 
+/// The identity of a tag DEFINED by the instance holding `store_slot`. Same
+/// shape as a funcref, in a deliberately separate space: a tag identity is
+/// compared only against other tag identities (`Instance.tagId`) and never
+/// reaches the value stack, so keeping the two namespaces distinct costs a bit
+/// and removes any chance of one being read as the other.
+fn tagIdValue(store_slot: u32, tag_index: u32) u64 {
+    return (@as(u64, 1) << 63) | funcRefValue(store_slot, tag_index);
+}
+
 /// Tag bit marking a value slot as an unboxed i31 (full GC). Set on `ref.i31`
 /// results so `ref.test`/`ref.cast` can distinguish an i31 from a heap-object
 /// index (bit 63 clear) within the `any` hierarchy. `null_ref` (all bits set)
@@ -468,7 +477,10 @@ const Label = struct {
 /// A thrown exception in flight: the tag it carries and its value payload
 /// (arena-owned by the invocation). Boxed in `Instance.exn_store` when an
 /// `exnref` must be materialized (`catch_ref` / `throw_ref`).
-const Exception = struct { tag: u32, values: []const Value };
+/// `tag` is the tag's STORE-WIDE identity (`Instance.tagId`), never a
+/// module-local index: an exception is caught by the tag it was thrown with, and
+/// two modules — or two imports in one module — number the same tag differently.
+const Exception = struct { tag: u64, values: []const Value };
 
 /// One inline handler of a legacy `try` (Phase 6.3). `tag == null` is
 /// `catch_all`; `handler_pc` is the first instruction after the `catch`.
@@ -552,6 +564,17 @@ pub const Instance = struct {
     owned_globals: []Global,
     /// How many leading entries of `globals` are imported (borrowed, not freed).
     imported_globals: usize,
+    /// Store-wide identity of each tag in this module's tag index space. A
+    /// defined tag gets a fresh one; an IMPORTED tag adopts the provider's, so
+    /// two imports of the same exported tag compare equal and an exception
+    /// thrown with one is caught by a handler naming the other.
+    ///
+    /// ⚠️ `Exception.tag` used to be the throwing module's own tag INDEX,
+    /// compared against the catching module's index. `instance.wast` imports
+    /// `I1.tag` twice, throws with the second and catches with the first: the
+    /// same tag, two indices, no match — the exception fell through to
+    /// `catch_all`. A tag is an identity, not a number, exactly as a funcref is.
+    tag_ids: []const u64,
     imported_funcs: u32,
     /// Backing callables for imported functions (index-aligned with the first
     /// `imported_funcs` entries of the function index space).
@@ -717,6 +740,10 @@ pub const Instance = struct {
         /// from a different store is `error.CrossStoreLink`, never a silent
         /// reinterpretation.
         store: ?*Store = null,
+        /// Identity of each imported TAG, in import order (see `Instance.tagId`).
+        /// A short list means the trailing imports get fresh identities, which is
+        /// what a host with no tag to share wants.
+        tags: []const u64 = &.{},
     };
 
     /// Instantiate `module` into `self`, with no imports.
@@ -1052,6 +1079,17 @@ pub const Instance = struct {
                 built = i + 1;
             }
         }
+        // Tag identities: imported tags adopt the provider's, defined ones get a
+        // fresh identity of their own. Same encoding as a funcref — this
+        // instance's store slot plus the local index — so it is unique across the
+        // store and stable for the instance's life.
+        const n_imported_tags = module.importedTagCount();
+        const tag_ids = try a.alloc(u64, module.tag_type_indices.len);
+        for (tag_ids, 0..) |*t, i| t.* = if (i < n_imported_tags and i < imports.tags.len)
+            imports.tags[i]
+        else
+            tagIdValue(store_slot, @intCast(i));
+
         // ⚠️ Active DATA segments are NOT copied here — they are applied in
         // `applyActiveSegments`, after the active ELEMENT segments. §4.5.5 runs
         // the element inits (steps 9–12) before the data inits (13–14), and this
@@ -1177,8 +1215,17 @@ pub const Instance = struct {
             .elem_values = elem_values,
             .elem_dropped = elem_dropped,
             .data_dropped = data_dropped,
+            .tag_ids = tag_ids,
             .gc_heap = gc_heap, // may already hold objects from const-expr inits
         };
+    }
+
+    /// The store-wide identity of a tag in THIS module's tag index space. See
+    /// `tag_ids`. Out-of-range indices are load-time rejected
+    /// (`checkStaticIndices`), so a miss here can only come from an unvalidated
+    /// module and answers "matches nothing".
+    pub fn tagId(self: *const Instance, tag_index: u32) u64 {
+        return if (tag_index < self.tag_ids.len) self.tag_ids[tag_index] else std.math.maxInt(u64);
     }
 
     /// §4.5.5 steps 9–14: copy every ACTIVE element segment into its table, then
@@ -1867,7 +1914,7 @@ const Frame = struct {
             // try_table to the clause's label.
             for (label.catches) |c| {
                 const matches = switch (c.kind) {
-                    .catch_, .catch_ref => c.tag == exn.tag,
+                    .catch_, .catch_ref => self.inst.tagId(c.tag) == exn.tag,
                     .catch_all, .catch_all_ref => true,
                 };
                 if (!matches) continue;
@@ -1917,7 +1964,7 @@ const Frame = struct {
                 // too — it used to pop the try itself, which also destroyed the
                 // intervening trys that ought to catch (see `.rethrow`).
                 if (label.caught == null) for (lt.handlers) |h| {
-                    if (h.tag != null and h.tag.? != exn.tag) continue;
+                    if (h.tag != null and self.inst.tagId(h.tag.?) != exn.tag) continue;
                     if (label.stack_base > self.vstack.items.len) return error.StackUnderflow;
                     self.vstack.shrinkRetainingCapacity(label.stack_base);
                     if (h.tag != null) for (exn.values) |v| try self.pushU64(v); // catch pushes the payload
@@ -2215,7 +2262,7 @@ const Frame = struct {
                     const tag = instr.imm.tag;
                     const ft = self.inst.module.tagType(tag).?; // load-time checked (checkStaticIndices)
                     const base = std.math.sub(usize, self.vstack.items.len, ft.params.len) catch return error.StackUnderflow;
-                    const exn: Exception = .{ .tag = tag, .values = try self.a.dupe(Value, self.vstack.items[base..]) };
+                    const exn: Exception = .{ .tag = self.inst.tagId(tag), .values = try self.a.dupe(Value, self.vstack.items[base..]) };
                     self.vstack.shrinkRetainingCapacity(base);
                     if (try self.throwException(exn)) |target| {
                         pc = target;

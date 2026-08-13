@@ -536,6 +536,15 @@ pub fn importedTableCount(self: Module) u32 {
     return n;
 }
 
+/// Number of imported tags (they occupy the low tag indices).
+pub fn importedTagCount(self: Module) u32 {
+    var n: u32 = 0;
+    for (self.imports) |imp| {
+        if (imp.type == .tag) n += 1;
+    }
+    return n;
+}
+
 /// Number of imported memories (they occupy the low memory indices).
 pub fn importedMemoryCount(self: Module) u32 {
     var n: u32 = 0;
