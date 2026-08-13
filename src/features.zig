@@ -109,6 +109,7 @@ fn opFeature(op: opcode.Op) ?Feature {
         .struct_new, .struct_new_default, .struct_get, .struct_get_s, .struct_get_u, .struct_set,
         .array_new, .array_new_default, .array_new_fixed, .array_get, .array_get_s, .array_get_u,
         .array_set, .array_len,
+        .array_new_data, .array_new_elem, .array_fill, .array_copy, .array_init_data, .array_init_elem,
         .ref_test, .ref_cast, .br_on_cast, .br_on_cast_fail,
         => .gc,
 
@@ -219,18 +220,23 @@ pub fn firstViolation(gpa: std.mem.Allocator, module: *const Module, fs: Set) !?
 // confirm it really is MVP core), and only then update the number.
 comptime {
     const n = @typeInfo(opcode.Op).@"enum".fields.len;
-    if (n != 240) @compileError(std.fmt.comptimePrint(
-        "opcode.Op has {d} members, features.zig was written against 240. A new opcode must be " ++
+    if (n != 246) @compileError(std.fmt.comptimePrint(
+        "opcode.Op has {d} members, features.zig was written against 246. A new opcode must be " ++
             "classified in opFeature() before this number is updated — an unclassified opcode " ++
             "silently passes every proposal gate.",
         .{n},
     ));
 }
 
-// The classification behind that 238, recorded so the next person can re-check it cheaply rather
-// than re-deriving it: 66 opcodes are mapped to a proposal in `opFeature`, and the remaining 172
+// The classification behind that 246, recorded so the next person can re-check it cheaply rather
+// than re-deriving it: 74 opcodes are mapped to a proposal in `opFeature`, and the remaining 172
 // are WebAssembly 1.0 core — control flow, numerics, comparisons, loads/stores, locals/globals,
 // `select`, `drop`, `nop`, `memory.size`/`grow`.
+//
+// ⚠️ The prose here read "that 238 … 66 opcodes" while the pin above said 240; both halves of a
+// note like this go stale independently, and only the pin is compiler-checked. R3 (2026-08-13)
+// added the six array bulk ops — 68 → 74 mapped, 240 → 246 total — and the core count is
+// unchanged at 172, which is the arithmetic that says the six really did land in `.gc`.
 //
 // ⚠️ Four of those 172 are spelled `@"unreachable"`, `@"if"`, `@"else"` and `@"return"` because
 // they collide with Zig keywords. A grep for `^    [a-z_]` misses all four — which is exactly how

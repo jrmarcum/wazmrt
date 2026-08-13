@@ -55,6 +55,31 @@
 # `module definition`/`instance` commands. The DLL is byte-identical because none of it is
 # reachable from the C ABI surface's own code paths — it is all in code the DLL already carried.
 
-wazmrt.exe  939008
-wazmrt.lib  999296
-wazmrt.dll  864768
+# RAISED 2026-08-13 (R3 — the six GC array bulk ops). Measured ReleaseSmall, Zig 0.16.0,
+# x86_64-windows, static lib from a PLAIN `zig build` (never after `zig build dll`).
+#
+#   artifact     ceiling was    at 6291038 (pre-R3)    after R3      R3's share
+#   wazmrt.exe       939,008               939,008      945,152          +6,144
+#   wazmrt.lib       999,296               999,186    1,007,444          +8,258
+#   wazmrt.dll       864,768               864,768      871,936          +7,168
+#
+# ✅ Unlike R2, ALL of this overshoot is R3's: the pre-R3 commit measures at (exe, dll) or just
+# under (lib, −110) its ceiling, so nothing was inherited. That is what the previous entry's
+# workflow lesson bought — HEAD was measured in a worktree before the ceilings were touched, not
+# assumed.
+#
+# ⚠️ The DLL is +7,168 here, and the R2 entry above recorded +0. That is not drift — it is the
+# first entry whose code the C ABI actually reaches: `array.new_data`/`new_elem`/`fill`/`copy`/
+# `init_data`/`init_elem` are decoder, validator AND interpreter arms, all of which any embedder
+# running a GC module executes. R2's Store/linking work was reachable only from paths the DLL
+# already carried, which is why it cost nothing there.
+#
+# What bought the bytes: six `Op` tags with three new `Imm` shapes (`gc_data`/`gc_elem`/
+# `gc_array_copy`) threaded through `decodeBody`, `immediateKind`, `emitInstr`, `checkStaticIndices`,
+# `FuncValidator.step` and the interpreter dispatch switch — plus `fieldByteSize`/`fieldFromBytes`
+# for the little-endian data-segment decode. Six instructions across six files is the honest price
+# of a proposal piece that was missing rather than merely unoptimised.
+
+wazmrt.exe  945152
+wazmrt.lib  1007444
+wazmrt.dll  871936

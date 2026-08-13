@@ -179,6 +179,38 @@ fn packField(storage: Module.StorageType, v: Value) Value {
     };
 }
 
+/// The byte width one array element occupies inside a DATA segment
+/// (`array.new_data` / `array.init_data`), or null for an element with no byte
+/// encoding. Validation already rejects a REFERENCE element for these ops; the
+/// null case that survives to run time is `v128`, which the flat
+/// one-`Value`-per-element object model cannot hold (see `fieldIsV128`).
+fn fieldByteSize(storage: Module.StorageType) ?usize {
+    return switch (storage) {
+        .i8 => 1,
+        .i16 => 2,
+        .val => |v| switch (v) {
+            .i32, .f32 => 4,
+            .i64, .f64 => 8,
+            else => null,
+        },
+    };
+}
+
+/// Decode one array element from `bytes` (little-endian, §4.4.5). The result is
+/// the value's stored form, so it matches what `packField` would have produced:
+/// a packed i8/i16 keeps its raw low bits and is widened later by
+/// `array.get_s`/`_u`, and an i32/f32 is zero-extended into the u64 slot exactly
+/// as `i32Value` leaves it.
+fn fieldFromBytes(bytes: []const u8) Value {
+    return switch (bytes.len) {
+        1 => bytes[0],
+        2 => std.mem.readInt(u16, bytes[0..2], .little),
+        4 => std.mem.readInt(u32, bytes[0..4], .little),
+        8 => std.mem.readInt(u64, bytes[0..8], .little),
+        else => unreachable, // `fieldByteSize` yields only these four widths
+    };
+}
+
 /// Widen a stored GC field value back to an i32 slot: `_s` sign-extends a packed
 /// field, `_u` zero-extends; an unpacked field is returned verbatim.
 fn unpackField(storage: Module.StorageType, v: Value, signed: bool) Value {
@@ -764,7 +796,7 @@ pub const Instance = struct {
             // A GC type index's required KIND depends on the op, so switch on it.
             switch (instr.op) {
                 .struct_new, .struct_new_default => if (module.structFields(instr.imm.gc_type) == null) return error.UndefinedType,
-                .array_new, .array_new_default, .array_get, .array_get_s, .array_get_u, .array_set => if (module.arrayField(instr.imm.gc_type) == null) return error.UndefinedType,
+                .array_new, .array_new_default, .array_get, .array_get_s, .array_get_u, .array_set, .array_fill => if (module.arrayField(instr.imm.gc_type) == null) return error.UndefinedType,
                 // `array_len` (imm = .none) and `array_new_fixed` (imm = .gc_type_n, checked below) carry no `.gc_type` — do not read it here.
                 else => {},
             }
@@ -789,6 +821,22 @@ pub const Instance = struct {
                     if (x.field >= fs.len) return error.GcOutOfBounds; // #GC3: bound field vs the STATIC type, not the object
                 },
                 .gc_type_n => |x| if (module.arrayField(x.type_index) == null) return error.UndefinedType,
+                // The array bulk ops: an array type index paired with a segment
+                // index (or a second array type). The interpreter indexes
+                // `module.data` / `elem_values` directly, so both halves are
+                // bounded here — this runs on the UNVALIDATED path too.
+                .gc_data => |x| {
+                    if (module.arrayField(x.type_index) == null) return error.UndefinedType;
+                    if (x.data >= module.data.len) return error.UndefinedData;
+                },
+                .gc_elem => |x| {
+                    if (module.arrayField(x.type_index) == null) return error.UndefinedType;
+                    if (x.elem >= module.elements.len) return error.UndefinedElement;
+                },
+                .gc_array_copy => |x| {
+                    if (module.arrayField(x.dst) == null) return error.UndefinedType;
+                    if (module.arrayField(x.src) == null) return error.UndefinedType;
+                },
                 .tag => |x| if (module.tagType(x) == null) return error.UndefinedType,
                 .block_type => |x| switch (x) {
                     .type_index => |ti| if (module.funcSig(ti) == null) return error.UndefinedType,
@@ -2193,6 +2241,104 @@ const Frame = struct {
                 .array_len => {
                     const obj = try self.inst.gcObject(self.pop());
                     try self.pushI32(@bitCast(@as(u32, @intCast(obj.len))));
+                    pc += 1;
+                },
+
+                // --- GC: the array bulk ops (R3) ---
+                // Operand order below is the SPEC's, read bottom-up off the stack:
+                // the last-pushed operand pops first.
+                .array_new_data => {
+                    const gd = instr.imm.gc_data;
+                    const f = self.inst.module.arrayField(gd.type_index).?;
+                    const width = fieldByteSize(f.storage) orelse return error.UnsupportedInstruction;
+                    const seg: []const u8 = if (self.inst.data_dropped[gd.data]) &.{} else self.inst.module.data[gd.data].bytes;
+                    const size = @as(u64, @as(u32, @bitCast(self.popI32())));
+                    const offset = @as(u64, @as(u32, @bitCast(self.popI32())));
+                    // `size` counts ELEMENTS, `offset` counts BYTES: the byte span
+                    // is size*width, which can overflow u64 on its own.
+                    const span = std.math.mul(u64, size, width) catch return error.MemoryOutOfBounds;
+                    const start = memRange(offset, span, seg.len) orelse return error.MemoryOutOfBounds;
+                    const obj = try self.inst.arena.allocator().alloc(Value, @intCast(size));
+                    for (obj, 0..) |*e, k| e.* = fieldFromBytes(seg[start + k * width ..][0..width]);
+                    try self.pushU64(try self.inst.allocObject(gd.type_index, obj));
+                    pc += 1;
+                },
+                .array_new_elem => {
+                    const ge = instr.imm.gc_elem;
+                    const seg: []const Value = if (self.inst.elem_dropped[ge.elem]) &.{} else self.inst.elem_values[ge.elem];
+                    const size = @as(u64, @as(u32, @bitCast(self.popI32())));
+                    const offset = @as(u64, @as(u32, @bitCast(self.popI32())));
+                    // Both operands count ELEMENTS here, so no width scaling.
+                    const start = memRange(offset, size, seg.len) orelse return error.TableOutOfBounds;
+                    const obj = try self.inst.arena.allocator().alloc(Value, @intCast(size));
+                    @memcpy(obj, seg[start..][0..@intCast(size)]);
+                    try self.pushU64(try self.inst.allocObject(ge.type_index, obj));
+                    pc += 1;
+                },
+                .array_fill => {
+                    const f = self.inst.module.arrayField(instr.imm.gc_type).?;
+                    if (fieldIsV128(f.storage)) return error.UnsupportedInstruction;
+                    const n = @as(u64, @as(u32, @bitCast(self.popI32())));
+                    const v = packField(f.storage, self.pop());
+                    const at = @as(u64, @as(u32, @bitCast(self.popI32())));
+                    const obj = try self.inst.gcObject(self.pop());
+                    const start = memRange(at, n, obj.len) orelse return error.GcOutOfBounds;
+                    @memset(obj[start..][0..@intCast(n)], v);
+                    pc += 1;
+                },
+                .array_copy => {
+                    // The two type indices are checked by `checkStaticIndices` and
+                    // carry no run-time work: validation has already forced the
+                    // source element type to be a subtype of the destination's, so
+                    // the stored `Value`s transfer without repacking.
+                    const n = @as(u64, @as(u32, @bitCast(self.popI32())));
+                    const src_at = @as(u64, @as(u32, @bitCast(self.popI32())));
+                    const src_ref = self.pop();
+                    const dst_at = @as(u64, @as(u32, @bitCast(self.popI32())));
+                    const dst_ref = self.pop();
+                    // §4.4.5 checks the DESTINATION first, then the source — and
+                    // both null checks come before either bounds check.
+                    const dst = try self.inst.gcObject(dst_ref);
+                    const src = try self.inst.gcObject(src_ref);
+                    const di = memRange(dst_at, n, dst.len) orelse return error.GcOutOfBounds;
+                    const si = memRange(src_at, n, src.len) orelse return error.GcOutOfBounds;
+                    const len: usize = @intCast(n);
+                    // The two refs may name the SAME object with overlapping ranges,
+                    // so this must behave like `memmove`, not `memcpy`. Validation
+                    // has already forced the storage widths to agree (packed only
+                    // matches itself), so the stored values copy verbatim.
+                    if (di <= si) {
+                        std.mem.copyForwards(Value, dst[di..][0..len], src[si..][0..len]);
+                    } else {
+                        std.mem.copyBackwards(Value, dst[di..][0..len], src[si..][0..len]);
+                    }
+                    pc += 1;
+                },
+                .array_init_data => {
+                    const gd = instr.imm.gc_data;
+                    const f = self.inst.module.arrayField(gd.type_index).?;
+                    const width = fieldByteSize(f.storage) orelse return error.UnsupportedInstruction;
+                    const seg: []const u8 = if (self.inst.data_dropped[gd.data]) &.{} else self.inst.module.data[gd.data].bytes;
+                    const n = @as(u64, @as(u32, @bitCast(self.popI32())));
+                    const src_at = @as(u64, @as(u32, @bitCast(self.popI32())));
+                    const dst_at = @as(u64, @as(u32, @bitCast(self.popI32())));
+                    const obj = try self.inst.gcObject(self.pop());
+                    const di = memRange(dst_at, n, obj.len) orelse return error.GcOutOfBounds;
+                    const span = std.math.mul(u64, n, width) catch return error.MemoryOutOfBounds;
+                    const si = memRange(src_at, span, seg.len) orelse return error.MemoryOutOfBounds;
+                    for (0..@as(usize, @intCast(n))) |k| obj[di + k] = fieldFromBytes(seg[si + k * width ..][0..width]);
+                    pc += 1;
+                },
+                .array_init_elem => {
+                    const ge = instr.imm.gc_elem;
+                    const seg: []const Value = if (self.inst.elem_dropped[ge.elem]) &.{} else self.inst.elem_values[ge.elem];
+                    const n = @as(u64, @as(u32, @bitCast(self.popI32())));
+                    const src_at = @as(u64, @as(u32, @bitCast(self.popI32())));
+                    const dst_at = @as(u64, @as(u32, @bitCast(self.popI32())));
+                    const obj = try self.inst.gcObject(self.pop());
+                    const di = memRange(dst_at, n, obj.len) orelse return error.GcOutOfBounds;
+                    const si = memRange(src_at, n, seg.len) orelse return error.TableOutOfBounds;
+                    @memcpy(obj[di..][0..@intCast(n)], seg[si..][0..@intCast(n)]);
                     pc += 1;
                 },
 

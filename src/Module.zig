@@ -903,12 +903,18 @@ fn skipConstExpr(r: *Reader) Error!void {
                 // misread as `end` (0x0b) and truncate the captured expression.
                 const sub = try r.readVarU32();
                 switch (sub) {
-                    0x00, 0x01, 0x06, 0x07 => _ = try r.readVarU32(), // struct.new*/array.new* : type index
-                    0x08 => { // array.new_fixed : type index + element count
+                    // One index: struct.new*, array.new*, array.get*, array.set,
+                    // array.fill.
+                    0x00, 0x01, 0x06, 0x07, 0x0b, 0x0c, 0x0d, 0x0e, 0x10 => _ = try r.readVarU32(),
+                    // Two indices: array.new_fixed (type + count), array.new_data /
+                    // array.init_data (type + data), array.new_elem /
+                    // array.init_elem (type + elem), array.copy (type + type),
+                    // struct.get*/struct.set (type + field).
+                    0x02, 0x03, 0x04, 0x05, 0x08, 0x09, 0x0a, 0x11, 0x12, 0x13 => {
                         _ = try r.readVarU32();
                         _ = try r.readVarU32();
                     },
-                    else => {}, // ref.i31 / *.convert_* : no immediate
+                    else => {}, // ref.i31 / array.len / *.convert_* : no immediate
                 }
             },
             else => {}, // other zero-operand ops (extended-const arithmetic, etc.)

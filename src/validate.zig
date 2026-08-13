@@ -652,6 +652,17 @@ const FuncValidator = struct {
         if (index >= self.module.memories.len) return error.MissingMemory;
     }
 
+    /// A function body naming a DATA index requires the data-count section
+    /// (§5.5.13), whatever the instruction — the section exists so the code
+    /// section can be validated before the data section is read. `memory.init`
+    /// and `data.drop` inlined this pair of checks; `array.new_data` /
+    /// `array.init_data` are data-index references too and need exactly the same
+    /// rule, so it lives in one place now rather than in four copies.
+    fn requireDataSegment(self: *FuncValidator, index: u32) Error!void {
+        if (self.module.data_count == null) return error.DataCountRequired;
+        if (index >= self.module.data.len) return error.UndefinedData;
+    }
+
     /// The address/count value type of memory `index` — `i64` for a memory64
     /// memory, else `i32`. Callers `requireMemory` first, so the index is valid.
     fn memAddrTy(self: *FuncValidator, index: u32) V {
@@ -1184,16 +1195,12 @@ const FuncValidator = struct {
                 // differs by build mode. `data_drop` below is correct; its
                 // immediate really is `.data`.
                 try self.requireMemory(instr.imm.mem_init.mem);
-                if (self.module.data_count == null) return error.DataCountRequired;
-                if (instr.imm.mem_init.data >= self.module.data.len) return error.UndefinedData;
+                try self.requireDataSegment(instr.imm.mem_init.data);
                 _ = try self.popExpect(.i32); // n (count into the data segment — i32)
                 _ = try self.popExpect(.i32); // src (offset into the segment — i32)
                 _ = try self.popExpect(self.memAddrTy(instr.imm.mem_init.mem)); // dst address (memory64: i64)
             },
-            .data_drop => {
-                if (self.module.data_count == null) return error.DataCountRequired;
-                if (instr.imm.data >= self.module.data.len) return error.UndefinedData;
-            },
+            .data_drop => try self.requireDataSegment(instr.imm.data),
             .table_copy => {
                 const dt = try self.tableElemType(instr.imm.table_copy.dst);
                 const st = try self.tableElemType(instr.imm.table_copy.src);
@@ -1356,6 +1363,95 @@ const FuncValidator = struct {
             .array_len => {
                 _ = try self.popExpect(.arrayref); // (ref null array)
                 try self.pushValT(.i32);
+            },
+
+            // GC: the array BULK ops. All six were missing until R3 (2026-08-13).
+            //
+            // `array.new_data $t $d : [i32 i32] -> [(ref $t)]` — the operands are a
+            // byte OFFSET into the data segment and an element COUNT. §3.3.7: the
+            // element type must be numeric/vector/packed; a REFERENCE element has
+            // no byte encoding, so a data segment cannot initialise one.
+            .array_new_data => {
+                const gd = instr.imm.gc_data;
+                const f = self.module.arrayField(gd.type_index) orelse return error.UndefinedType;
+                if (f.storage.unpacked().isRef()) return error.TypeMismatch;
+                try self.requireDataSegment(gd.data);
+                _ = try self.popExpect(.i32); // size (in elements)
+                _ = try self.popExpect(.i32); // offset (in bytes, into the segment)
+                try self.pushValT(V.concreteRef(false, .array, gd.type_index));
+            },
+            // `array.new_elem $t $e : [i32 i32] -> [(ref $t)]` — the mirror over an
+            // ELEMENT segment, so the element type must be a reference the segment
+            // can produce: `elem_type <: t'`, the same subtyping rule `table.init`
+            // uses (R2's C3 — family equality here would reject a valid module).
+            .array_new_elem => {
+                const ge = instr.imm.gc_elem;
+                const f = self.module.arrayField(ge.type_index) orelse return error.UndefinedType;
+                if (ge.elem >= self.module.elements.len) return error.UndefinedElem;
+                if (!subtypeOf(self.module, self.module.elements[ge.elem].elem_type, f.storage.unpacked())) return error.TypeMismatch;
+                _ = try self.popExpect(.i32); // size (in elements)
+                _ = try self.popExpect(.i32); // offset (in elements, into the segment)
+                try self.pushValT(V.concreteRef(false, .array, ge.type_index));
+            },
+            // `array.fill $t : [(ref null $t) i32 t' i32] -> []` (array, index,
+            // value, count). Writes, so the element must be mutable.
+            .array_fill => {
+                const f = self.module.arrayField(instr.imm.gc_type) orelse return error.UndefinedType;
+                if (!f.mutable) return error.ImmutableField;
+                _ = try self.popExpect(.i32); // count
+                _ = try self.popExpect(f.storage.unpacked()); // value
+                _ = try self.popExpect(.i32); // index
+                _ = try self.popExpect(V.concreteRef(true, .array, instr.imm.gc_type));
+            },
+            // `array.copy $t1 $t2 : [(ref null $t1) i32 (ref null $t2) i32 i32] -> []`
+            // (dst, dst_off, src, src_off, len). The destination must be mutable and
+            // the source element type a subtype of the destination's — the packed
+            // widths therefore agree, which is what lets the interpreter copy the
+            // stored `Value`s directly.
+            .array_copy => {
+                const ac = instr.imm.gc_array_copy;
+                const df = self.module.arrayField(ac.dst) orelse return error.UndefinedType;
+                const sf = self.module.arrayField(ac.src) orelse return error.UndefinedType;
+                if (!df.mutable) return error.ImmutableField;
+                // Packed storage is not a value type, so `unpacked()` alone would
+                // call `(array i8)` and `(array i32)` compatible — both project i32.
+                // Compare the STORAGE forms first, then the value types.
+                if (df.storage.isPacked() or sf.storage.isPacked()) {
+                    if (!std.meta.eql(df.storage, sf.storage)) return error.TypeMismatch;
+                } else if (!subtypeOf(self.module, sf.storage.unpacked(), df.storage.unpacked())) {
+                    return error.TypeMismatch;
+                }
+                _ = try self.popExpect(.i32); // len
+                _ = try self.popExpect(.i32); // src offset
+                _ = try self.popExpect(V.concreteRef(true, .array, ac.src));
+                _ = try self.popExpect(.i32); // dst offset
+                _ = try self.popExpect(V.concreteRef(true, .array, ac.dst));
+            },
+            // `array.init_data $t $d : [(ref null $t) i32 i32 i32] -> []`
+            // (array, dst_off, src_byte_off, len). Same element-type restriction as
+            // `array.new_data`, plus mutability because it writes in place.
+            .array_init_data => {
+                const gd = instr.imm.gc_data;
+                const f = self.module.arrayField(gd.type_index) orelse return error.UndefinedType;
+                if (!f.mutable) return error.ImmutableField;
+                if (f.storage.unpacked().isRef()) return error.TypeMismatch;
+                try self.requireDataSegment(gd.data);
+                _ = try self.popExpect(.i32); // len
+                _ = try self.popExpect(.i32); // src offset (bytes)
+                _ = try self.popExpect(.i32); // dst offset (elements)
+                _ = try self.popExpect(V.concreteRef(true, .array, gd.type_index));
+            },
+            // `array.init_elem $t $e : [(ref null $t) i32 i32 i32] -> []`.
+            .array_init_elem => {
+                const ge = instr.imm.gc_elem;
+                const f = self.module.arrayField(ge.type_index) orelse return error.UndefinedType;
+                if (!f.mutable) return error.ImmutableField;
+                if (ge.elem >= self.module.elements.len) return error.UndefinedElem;
+                if (!subtypeOf(self.module, self.module.elements[ge.elem].elem_type, f.storage.unpacked())) return error.TypeMismatch;
+                _ = try self.popExpect(.i32); // len
+                _ = try self.popExpect(.i32); // src offset (elements)
+                _ = try self.popExpect(.i32); // dst offset (elements)
+                _ = try self.popExpect(V.concreteRef(true, .array, ge.type_index));
             },
 
             // GC casts. `ref.test` consumes a reference and yields i32; `ref.cast`

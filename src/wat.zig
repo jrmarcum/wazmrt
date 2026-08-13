@@ -1214,7 +1214,14 @@ fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef
 fn isRefType(s: Sexpr) bool {
     if (s.asList()) |l| return l.len >= 1 and eqAtom(l[0], "ref");
     // `anyfunc` is the pre-standard spelling of `funcref`.
-    return eqAtom(s, "funcref") or eqAtom(s, "externref") or eqAtom(s, "anyfunc");
+    if (eqAtom(s, "anyfunc")) return true;
+    // Every abstract shorthand — `funcref`, `externref` and the GC heads
+    // (`anyref`/`eqref`/`i31ref`/`structref`/`arrayref`/`null*ref`) — comes from
+    // `shorthandRefType`, the single table the cast ops already use. Listing only
+    // `funcref`/`externref` here made `(elem $e i31ref (ref.i31 …))` fall through
+    // to the FUNC-INDEX form, where `i31ref` was read as a function name and
+    // failed as `BadImmediate` — a wrong answer three steps from its cause.
+    return s.asAtom() != null and shorthandRefType(s.asAtom().?) != null;
 }
 
 /// `(elem $id? mode? tableuse? offset? kind item*)` — active / passive /
@@ -1657,11 +1664,20 @@ fn emitFoldedOne(ctx: *Ctx, l: []const Sexpr, i: usize) Error!usize {
 /// `(param)(result)`) from `items[start..]`; return its type index + next index.
 fn parseCallIndirectType(ctx: *Ctx, items: []const Sexpr, start: usize) Error!struct { idx: u32, table: u32, next: usize } {
     var j = start;
-    // Optional explicit table index/id — only when an atom is *followed by* a
-    // `(type …)`/`(param …)`/`(result …)` annotation (`call_indirect $t (type …)`).
-    // Otherwise a bare atom is the next instruction (e.g. flat `call_indirect select`).
+    // Optional explicit table index/id. The predicate is `isIndexAtom` — a
+    // `$name` or a digit — because a FOLLOWING instruction is never either
+    // (`call_indirect select` is an atom too, which is why a bare `asAtom()`
+    // would be wrong here).
+    //
+    // ⚠️ This used to additionally require a `(type …)`/`(param …)`/`(result …)`
+    // to follow, which silently dropped the *abbreviated* form: the type use is
+    // OPTIONAL and absent means `[] -> []`, so `(call_indirect $t (i32.const 0))`
+    // left `$t` unconsumed, and the operand loop then tried to assemble `$t` as
+    // an instruction — `UnknownInstr`, naming a table. Same shape as the flat
+    // `br_table` fix: the guard was tightened around one form and excluded a
+    // sibling that is equally legal.
     var table: u32 = 0;
-    if (j + 1 < items.len and items[j].asAtom() != null and isTypeUse(items[j + 1])) {
+    if (j < items.len and isIndexAtom(items[j])) {
         table = try resolveByName(ctx.table_names, items[j]);
         j += 1;
     }
@@ -2283,6 +2299,27 @@ fn emitInstr(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
             try uleb(ctx.a, ctx.out, try resolveType(ctx.type_names, immediates[0]));
             try uleb(ctx.a, ctx.out, try resolveByName(&.{}, immediates[1])); // element count
         },
+        // `array.new_data $t $d` / `array.init_data $t $d` — the segment operand is
+        // resolved against the DATA names (`$d` or a numeric index), the same way
+        // `memory.init` does; the type index comes first in both text and binary.
+        .gc_data => {
+            if (immediates.len < 2) return error.BadImmediate;
+            try uleb(ctx.a, ctx.out, try resolveType(ctx.type_names, immediates[0]));
+            try uleb(ctx.a, ctx.out, try resolveByName(ctx.data_names, immediates[1]));
+        },
+        // `array.new_elem $t $e` / `array.init_elem $t $e` — same shape against the
+        // ELEMENT names.
+        .gc_elem => {
+            if (immediates.len < 2) return error.BadImmediate;
+            try uleb(ctx.a, ctx.out, try resolveType(ctx.type_names, immediates[0]));
+            try uleb(ctx.a, ctx.out, try resolveByName(ctx.elem_names, immediates[1]));
+        },
+        // `array.copy $dst $src` — two array TYPE indices, destination first.
+        .gc_array_copy => {
+            if (immediates.len < 2) return error.BadImmediate;
+            try uleb(ctx.a, ctx.out, try resolveType(ctx.type_names, immediates[0]));
+            try uleb(ctx.a, ctx.out, try resolveType(ctx.type_names, immediates[1]));
+        },
         else => return error.UnsupportedInstr, // block_type (handled structurally), call_indirect
     }
 }
@@ -2364,7 +2401,7 @@ fn flatImmCount(op: Op) usize {
         .local, .global, .func, .label, .i32c, .i64c, .f32c, .f64c, .ref_type, .gc_type => 1,
         .data, .data_init => 1, // memory.init / data.drop: a data index
         .tag => 1, // throw <tagidx>
-        .gc_field, .gc_type_n => 2,
+        .gc_field, .gc_type_n, .gc_data, .gc_elem, .gc_array_copy => 2,
         else => 0,
     };
 }
@@ -4584,6 +4621,221 @@ test "GC array: array.new_fixed builds from operands" {
         \\      (i32.const 2))))
     ;
     try std.testing.expectEqual(@as(i32, 30), interp.asI32(try assembleAndRun(src, "third", &.{})));
+}
+
+// --- R3 (2026-08-13): the six array bulk ops ---------------------------------
+// These six were absent from `opcode.zig` entirely, so nothing below could even
+// ASSEMBLE — every spec-suite file that reached one died at `UnknownInstr`. The
+// in-repo tests live here (rather than only in the external corpus) because the
+// `.wast` suite lives on removable media and cannot gate a commit.
+
+test "R3 array.new_data: elements are read little-endian at the element's width" {
+    const src =
+        \\(module
+        \\  (type $i32a (array (mut i32)))
+        \\  (type $i8a (array (mut i8)))
+        \\  (data $d "\01\00\00\00\02\00\00\00\ff\ff\ff\ff")
+        \\  (func (export "wide") (param i32) (result i32)
+        \\    (array.get $i32a (array.new_data $i32a $d (i32.const 0) (i32.const 3))
+        \\                     (local.get 0)))
+        \\  (func (export "packed_u") (param i32) (result i32)
+        \\    (array.get_u $i8a (array.new_data $i8a $d (i32.const 0) (i32.const 12))
+        \\                      (local.get 0)))
+        \\  (func (export "len") (result i32)
+        \\    (array.len (array.new_data $i32a $d (i32.const 4) (i32.const 2)))))
+    ;
+    // Three i32s from 12 bytes: 1, 2, -1.
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(src, "wide", &.{interp.i32Value(0)})));
+    try std.testing.expectEqual(@as(i32, 2), interp.asI32(try assembleAndRun(src, "wide", &.{interp.i32Value(1)})));
+    try std.testing.expectEqual(@as(i32, -1), interp.asI32(try assembleAndRun(src, "wide", &.{interp.i32Value(2)})));
+    // The same bytes as a packed i8 array: element 4 is the low byte of the
+    // second i32. A width bug would read it as 2 (element index scaled wrong).
+    try std.testing.expectEqual(@as(i32, 2), interp.asI32(try assembleAndRun(src, "packed_u", &.{interp.i32Value(4)})));
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "packed_u", &.{interp.i32Value(5)})));
+    // A byte OFFSET with an element COUNT: 4 bytes in, 2 elements = 8 bytes, fits.
+    try std.testing.expectEqual(@as(i32, 2), interp.asI32(try assembleAndRun(src, "len", &.{})));
+}
+
+test "R3 array.new_data: the segment bound is in BYTES, so size scales by the element width" {
+    // 12 bytes hold 12 i8s but only 3 i32s. `offset + size` (unscaled) would let
+    // the i32 form read 12 elements = 48 bytes off the end of the segment — the
+    // exact confusion the two operand units invite.
+    const src =
+        \\(module
+        \\  (type $i32a (array (mut i32)))
+        \\  (data $d "\01\00\00\00\02\00\00\00\03\00\00\00")
+        \\  (func (export "fits") (result i32)
+        \\    (array.len (array.new_data $i32a $d (i32.const 0) (i32.const 3))))
+        \\  (func (export "over") (result i32)
+        \\    (array.len (array.new_data $i32a $d (i32.const 0) (i32.const 4))))
+        \\  (func (export "off_by_a_byte") (result i32)
+        \\    (array.len (array.new_data $i32a $d (i32.const 1) (i32.const 3)))))
+    ;
+    try std.testing.expectEqual(@as(i32, 3), interp.asI32(try assembleAndRun(src, "fits", &.{})));
+    try std.testing.expectError(error.MemoryOutOfBounds, assembleAndRun(src, "over", &.{}));
+    try std.testing.expectError(error.MemoryOutOfBounds, assembleAndRun(src, "off_by_a_byte", &.{}));
+}
+
+test "R3 array.new_elem / array.init_elem: references come from an element segment" {
+    const src =
+        \\(module
+        \\  (type $arr (array (mut i31ref)))
+        \\  (elem $e i31ref (ref.i31 (i32.const 11)) (ref.i31 (i32.const 22)) (ref.i31 (i32.const 33)))
+        \\  (func (export "nth") (param i32) (result i32)
+        \\    (i31.get_u (array.get $arr (array.new_elem $arr $e (i32.const 0) (i32.const 3))
+        \\                               (local.get 0))))
+        \\  (func (export "oob") (result i32)
+        \\    (array.len (array.new_elem $arr $e (i32.const 1) (i32.const 3))))
+        \\  (func (export "init") (param i32) (result i32)
+        \\    (local $a (ref $arr))
+        \\    (local.set $a (array.new_default $arr (i32.const 4)))
+        \\    (array.init_elem $arr $e (local.get $a) (i32.const 1) (i32.const 1) (i32.const 2))
+        \\    (i31.get_u (array.get $arr (local.get $a) (local.get 0)))))
+    ;
+    try std.testing.expectEqual(@as(i32, 11), interp.asI32(try assembleAndRun(src, "nth", &.{interp.i32Value(0)})));
+    try std.testing.expectEqual(@as(i32, 33), interp.asI32(try assembleAndRun(src, "nth", &.{interp.i32Value(2)})));
+    // An elem-segment overrun is a TABLE out-of-bounds, not a memory one.
+    try std.testing.expectError(error.TableOutOfBounds, assembleAndRun(src, "oob", &.{}));
+    // init_elem writes segment[1..3] into array[1..3]: a[1]=22, a[2]=33.
+    try std.testing.expectEqual(@as(i32, 22), interp.asI32(try assembleAndRun(src, "init", &.{interp.i32Value(1)})));
+    try std.testing.expectEqual(@as(i32, 33), interp.asI32(try assembleAndRun(src, "init", &.{interp.i32Value(2)})));
+}
+
+test "R3 array.fill and array.init_data write in place" {
+    const src =
+        \\(module
+        \\  (type $arr (array (mut i32)))
+        \\  (data $d "\07\00\00\00\08\00\00\00")
+        \\  (func (export "fill") (param i32) (result i32)
+        \\    (local $a (ref $arr))
+        \\    (local.set $a (array.new_default $arr (i32.const 5)))
+        \\    (array.fill $arr (local.get $a) (i32.const 1) (i32.const 9) (i32.const 3))
+        \\    (array.get $arr (local.get $a) (local.get 0)))
+        \\  (func (export "fill_oob")
+        \\    (array.fill $arr (array.new_default $arr (i32.const 5))
+        \\                     (i32.const 3) (i32.const 9) (i32.const 3)))
+        \\  (func (export "fill_edge") (result i32)
+        \\    (local $a (ref $arr))
+        \\    (local.set $a (array.new_default $arr (i32.const 5)))
+        \\    (array.fill $arr (local.get $a) (i32.const 5) (i32.const 9) (i32.const 0))
+        \\    (array.len (local.get $a)))
+        \\  (func (export "init_data") (param i32) (result i32)
+        \\    (local $a (ref $arr))
+        \\    (local.set $a (array.new_default $arr (i32.const 4)))
+        \\    (array.init_data $arr $d (local.get $a) (i32.const 2) (i32.const 0) (i32.const 2))
+        \\    (array.get $arr (local.get $a) (local.get 0))))
+    ;
+    // fill a[1..4) with 9: a = [0,9,9,9,0].
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "fill", &.{interp.i32Value(0)})));
+    try std.testing.expectEqual(@as(i32, 9), interp.asI32(try assembleAndRun(src, "fill", &.{interp.i32Value(3)})));
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "fill", &.{interp.i32Value(4)})));
+    try std.testing.expectError(error.GcOutOfBounds, assembleAndRun(src, "fill_oob", &.{}));
+    // index == length with count 0 is IN bounds — the classic off-by-one.
+    try std.testing.expectEqual(@as(i32, 5), interp.asI32(try assembleAndRun(src, "fill_edge", &.{})));
+    // init_data copies the two i32s from $d into a[2..4).
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "init_data", &.{interp.i32Value(1)})));
+    try std.testing.expectEqual(@as(i32, 7), interp.asI32(try assembleAndRun(src, "init_data", &.{interp.i32Value(2)})));
+    try std.testing.expectEqual(@as(i32, 8), interp.asI32(try assembleAndRun(src, "init_data", &.{interp.i32Value(3)})));
+}
+
+test "R3 array.copy: overlapping ranges in ONE array behave like memmove" {
+    // Both refs may name the same object, so a naive forward `@memcpy` would
+    // smear the first element across the overlap when dst > src. `array.wast`
+    // exercises this, and a plain copy passes every non-overlapping case first.
+    const src =
+        \\(module
+        \\  (type $arr (array (mut i32)))
+        \\  (func $mk (result (ref $arr))
+        \\    (array.new_fixed $arr 5 (i32.const 1) (i32.const 2) (i32.const 3) (i32.const 4) (i32.const 5)))
+        \\  (func (export "forward") (param i32) (result i32)
+        \\    (local $a (ref $arr))
+        \\    (local.set $a (call $mk))
+        \\    (array.copy $arr $arr (local.get $a) (i32.const 0) (local.get $a) (i32.const 2) (i32.const 3))
+        \\    (array.get $arr (local.get $a) (local.get 0)))
+        \\  (func (export "backward") (param i32) (result i32)
+        \\    (local $a (ref $arr))
+        \\    (local.set $a (call $mk))
+        \\    (array.copy $arr $arr (local.get $a) (i32.const 2) (local.get $a) (i32.const 0) (i32.const 3))
+        \\    (array.get $arr (local.get $a) (local.get 0)))
+        \\  (func (export "between") (param i32) (result i32)
+        \\    (local $d (ref $arr))
+        \\    (local.set $d (array.new_default $arr (i32.const 5)))
+        \\    (array.copy $arr $arr (local.get $d) (i32.const 1) (call $mk) (i32.const 3) (i32.const 2))
+        \\    (array.get $arr (local.get $d) (local.get 0)))
+        \\  (func (export "oob")
+        \\    (array.copy $arr $arr (call $mk) (i32.const 3) (call $mk) (i32.const 0) (i32.const 3))))
+    ;
+    // dst < src: [1,2,3,4,5] -> [3,4,5,4,5].
+    try std.testing.expectEqual(@as(i32, 3), interp.asI32(try assembleAndRun(src, "forward", &.{interp.i32Value(0)})));
+    try std.testing.expectEqual(@as(i32, 5), interp.asI32(try assembleAndRun(src, "forward", &.{interp.i32Value(2)})));
+    // dst > src: [1,2,3,4,5] -> [1,2,1,2,3]. A forward copy would give [1,2,1,1,1].
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(src, "backward", &.{interp.i32Value(2)})));
+    try std.testing.expectEqual(@as(i32, 2), interp.asI32(try assembleAndRun(src, "backward", &.{interp.i32Value(3)})));
+    try std.testing.expectEqual(@as(i32, 3), interp.asI32(try assembleAndRun(src, "backward", &.{interp.i32Value(4)})));
+    // Between two distinct arrays: d[1..3) = src[3..5) = [4,5].
+    try std.testing.expectEqual(@as(i32, 4), interp.asI32(try assembleAndRun(src, "between", &.{interp.i32Value(1)})));
+    try std.testing.expectEqual(@as(i32, 5), interp.asI32(try assembleAndRun(src, "between", &.{interp.i32Value(2)})));
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "between", &.{interp.i32Value(3)})));
+    try std.testing.expectError(error.GcOutOfBounds, assembleAndRun(src, "oob", &.{}));
+}
+
+test "R3 array bulk ops: the accept-invalid cases validation has to refuse" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Case = struct { src: []const u8, want: anyerror };
+    for ([_]Case{
+        // A data segment has no encoding for a REFERENCE element (§3.3.7).
+        .{ .src =
+        \\(module (type $r (array (mut funcref))) (data $d "\00")
+        \\  (func (drop (array.new_data $r $d (i32.const 0) (i32.const 1)))))
+        , .want = error.TypeMismatch },
+        // `array.fill` / `array.init_*` / the `array.copy` destination all WRITE,
+        // so an immutable element type must be refused — the same rule
+        // `array.set` carries, and the one an accept-invalid would make a
+        // soundness hole rather than a conformance miss.
+        .{ .src =
+        \\(module (type $imm (array i32))
+        \\  (func (array.fill $imm (array.new $imm (i32.const 1) (i32.const 2))
+        \\                         (i32.const 0) (i32.const 1) (i32.const 1))))
+        , .want = error.ImmutableField },
+        .{ .src =
+        \\(module (type $imm (array i32)) (data $d "\00\00\00\00")
+        \\  (func (array.init_data $imm $d (array.new $imm (i32.const 1) (i32.const 2))
+        \\                                 (i32.const 0) (i32.const 0) (i32.const 1))))
+        , .want = error.ImmutableField },
+        .{ .src =
+        \\(module (type $imm (array i32)) (type $mut (array (mut i32)))
+        \\  (func (array.copy $imm $mut (array.new $imm (i32.const 1) (i32.const 2)) (i32.const 0)
+        \\                              (array.new $mut (i32.const 1) (i32.const 2)) (i32.const 0)
+        \\                              (i32.const 1))))
+        , .want = error.ImmutableField },
+        // `array.copy` between a PACKED and an unpacked element: both project i32
+        // onto the stack, so comparing `unpacked()` alone would call them equal
+        // and copy an i8 array's raw bytes into an i32 array.
+        .{ .src =
+        \\(module (type $p (array (mut i8))) (type $w (array (mut i32)))
+        \\  (func (array.copy $w $p (array.new_default $w (i32.const 2)) (i32.const 0)
+        \\                          (array.new_default $p (i32.const 2)) (i32.const 0)
+        \\                          (i32.const 1))))
+        , .want = error.TypeMismatch },
+        // An out-of-range segment index in either family.
+        .{ .src =
+        \\(module (type $w (array (mut i32))) (data $d "\00")
+        \\  (func (drop (array.new_data $w 7 (i32.const 0) (i32.const 0)))))
+        , .want = error.UndefinedData },
+        .{ .src =
+        \\(module (type $r (array (mut funcref)))
+        \\  (func (drop (array.new_elem $r 3 (i32.const 0) (i32.const 0)))))
+        , .want = error.UndefinedElem },
+    }) |c| {
+        var m = try Module.decode(a, try assemble(a, c.src));
+        std.testing.expectError(c.want, validate(a, &m)) catch |e| {
+            std.debug.print("case did not fail as expected:\n{s}\n", .{c.src});
+            return e;
+        };
+    }
 }
 
 test "GC ref.eq: identity of struct references" {
