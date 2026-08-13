@@ -173,9 +173,18 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
 
     // C.refs (§3.4.10, "undeclared function reference"): `ref.func x` inside a
     // FUNCTION BODY is well-typed only if `x` also occurs somewhere *outside*
-    // the code section — a global initializer, an element segment, an export,
-    // or the start function. That rule is why `(elem declare func $f)` exists:
-    // it is the way to admit a reference to a function nothing else mentions.
+    // the code section — a global initializer, an element segment, or an export.
+    // That rule is why `(elem declare func $f)` exists: it is the way to admit a
+    // reference to a function nothing else mentions.
+    //
+    // ⚠️ **The START function does NOT declare one**, and both this code and the
+    // comment above it used to say it did. §3.5.1 builds `C.refs` from
+    // `funcidx(module with funcs = ε with start = ε)` — the start index is
+    // explicitly erased along with the function section, precisely so that
+    // "the module runs it" does not double as "the module may take its address".
+    // `ref_func.wast` pins it: `(module (start $f) (func $f (drop (ref.func $f))))`
+    // is invalid, and we accepted it. A rule written into a comment is not
+    // evidence the rule exists.
     //
     // Populated below as the module-level structures are walked, then consulted
     // by the body validator's `.ref_func` arm. Sized over the whole function
@@ -184,7 +193,6 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
     var refs = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_funcs);
     defer refs.deinit(gpa);
     for (module.exports) |e| if (e.type.kind() == .func and e.index < n_funcs) refs.set(e.index);
-    if (module.start) |si| if (si < n_funcs) refs.set(si);
 
     // Global init const-exprs: each must be a constant expression producing
     // exactly the declared type. Defined globals occupy the tail of the space.
@@ -268,14 +276,40 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
         if (tt.limits.max) |mx| {
             if (tt.limits.min > mx) return error.InvalidLimits;
         }
+        // §3.2.4 + function-references: a table's element type must be
+        // DEFAULTABLE, unless the table supplies an explicit initializer
+        // (§5.5.6's `0x40` form). A non-nullable reference has no default value,
+        // so `(table 0 (ref func))` describes a table whose slots cannot be given
+        // a starting state — and the size does not save it: `table.grow` would
+        // still have to invent one, which is why even a 0-length table is invalid.
+        //
+        // ⚠️ Neither half of this existed. The rule was unchecked here, AND the
+        // initializer that exempts a table from it was never validated at all: a
+        // `0x40`-form table could name any const-expr of any type and only the
+        // INTERPRETER would find out, at instantiation. `table.wast` pins six
+        // modules on the first half.
+        if (tt.init_expr) |ie| {
+            try validateConstExpr(module, ie, tt.element, n_imported_globals, &refs);
+        } else if (tt.element.isNonNullRef()) {
+            return error.TypeMismatch;
+        }
     }
 
     // Tag types (§3.2, EH): a tag's type must be `[t1*] → []`. `throw` checked
     // this at its use site but the TAG SECTION ITSELF was never walked, so a
     // module declaring `(tag (type $ft))` with a result-producing `$ft`
     // validated — and could be exported or imported.
-    for (module.tags) |ti| {
-        const ft = module.funcSig(ti) orelse return error.UndefinedType;
+    //
+    // ⚠️ `module.tags` is the DEFINED tags only — imported tags lead the index
+    // space and are not in that slice — so the fix above checked exactly half the
+    // tags and `(import "" "" (tag (result i32)))` still validated. Walk the whole
+    // index space through `tagType`, which is the accessor that knows the layout.
+    // Same shape as the ref-identity work: **when a space has imported and defined
+    // halves, a loop over the defined slice is not a loop over the space.**
+    const n_tags = module.importedTagCount() + module.tags.len;
+    var ti: u32 = 0;
+    while (ti < n_tags) : (ti += 1) {
+        const ft = module.tagType(ti) orelse return error.UndefinedType;
         if (ft.results.len != 0) return error.InvalidTag;
     }
 
@@ -761,6 +795,15 @@ const FuncValidator = struct {
                 const ft = self.module.funcSig(i) orelse return error.UndefinedType;
                 break :blk .{ .pop = ft.params, .push = ft.results };
             },
+            // A single `(ref null? ht)` result. `refTypeValType` resolves a
+            // concrete index to its family head and — the point of this arm —
+            // fails `UndefinedType` when the index names no type at all, which is
+            // the "unknown type" `ref.wast` asks for.
+            .ref => |rt| blk: {
+                const r = try self.a.alloc(V, 1);
+                r[0] = try refTypeValType(self.module, rt);
+                break :blk .{ .pop = empty, .push = r };
+            },
         };
     }
 
@@ -780,14 +823,22 @@ const FuncValidator = struct {
                 const ft = self.module.tagType(c.tag) orelse return error.UndefinedTag;
                 try self.matchTypes(ft.params, lt);
             },
+            // ⚠️ The exception reference a `_ref` clause materializes is `(ref exn)`
+            // — NON-NULL. Checking it as the nullable `exnref` made the handler's
+            // pushed type weaker than it really is, so a label declaring
+            // `(ref exn)` was rejected: nullable does not satisfy a non-null
+            // expectation. `try_table.wast`'s `catch_ref1`/`catch_all_ref1` are
+            // exactly that module. The nullable-label case still passes, because
+            // `(ref exn) <: (ref null exn)` — the fix only widens what is accepted,
+            // in the direction the spec already required.
             .catch_ref => {
                 const ft = self.module.tagType(c.tag) orelse return error.UndefinedTag;
                 if (lt.len != ft.params.len + 1) return error.TypeMismatch;
                 try self.matchTypes(ft.params, lt[0..ft.params.len]);
-                if (!subtypeOf(self.module, .exnref, lt[lt.len - 1])) return error.TypeMismatch;
+                if (!subtypeOf(self.module, .exnref_nn, lt[lt.len - 1])) return error.TypeMismatch;
             },
             .catch_all => if (lt.len != 0) return error.TypeMismatch,
-            .catch_all_ref => if (lt.len != 1 or !subtypeOf(self.module, .exnref, lt[0])) return error.TypeMismatch,
+            .catch_all_ref => if (lt.len != 1 or !subtypeOf(self.module, .exnref_nn, lt[0])) return error.TypeMismatch,
         }
     }
 
@@ -818,15 +869,30 @@ const FuncValidator = struct {
             .try_table => {
                 const tt = instr.imm.try_table;
                 const s = try self.blockSig(tt.block_type);
-                try self.popVals(s.pop);
-                try self.pushCtrl(.try_table, s.pop, s.push);
-                // Each catch's target label must accept exactly the values the
-                // handler pushes: the tag's params, plus an `exnref` for `_ref`.
-                // Label indices are resolved with the try_table frame on top.
+                // ⚠️ **Catch labels resolve in the ENCLOSING context, NOT with the
+                // try_table's own frame pushed** (EH proposal §3.4: the catches are
+                // checked in `C`, only the body in `C, labels [t2*]`). This ran
+                // AFTER `pushCtrl`, so every catch label was off by one frame —
+                // and it failed in both directions at once:
+                //
+                //   (func (result exnref) (try_table (catch 0 0)) (unreachable))
+                //     — label 0 is the FUNCTION's block `[exnref]`, so a plain
+                //       `catch` delivering `[]` is a type mismatch. We resolved it
+                //       to the try_table's own empty block and ACCEPTED it.
+                //   (func (result exnref) (try_table (catch_ref $e 0) …))
+                //     — the same label is `[exnref]`, which `catch_ref` fits
+                //       exactly. We resolved it to `[]` and REJECTED a valid module.
+                //
+                // One off-by-one frame, an accept-invalid and a false reject in the
+                // same file. `wat.zig`'s `emitCatchClauses` had the mirror error, so
+                // a `$name` catch target resolved to the same wrong depth and the
+                // two halves agreed — the producer/consumer blind spot again.
                 for (tt.catches) |c| {
                     const lt = try self.labelTypesAt(c.label);
                     try self.checkCatch(c, lt);
                 }
+                try self.popVals(s.pop);
+                try self.pushCtrl(.try_table, s.pop, s.push);
             },
             .throw => {
                 const ft = self.module.tagType(instr.imm.tag) orelse return error.UndefinedTag;
@@ -2110,11 +2176,17 @@ test "validator: ref.func in a body requires the function to be declared (C.refs
     const cases = [_]struct { src: []const u8, ok: bool }{
         // Nothing outside the code section mentions $f -> undeclared.
         .{ .src = "(module (func $f) (func (export \"g\") (result funcref) (ref.func $f)))", .ok = false },
-        // Each of the four declaring positions in turn.
+        // Each of the three declaring positions in turn.
         .{ .src = "(module (func $f) (elem declare func $f) (func (export \"g\") (result funcref) (ref.func $f)))", .ok = true },
         .{ .src = "(module (func $f) (export \"f\" (func $f)) (func (export \"g\") (result funcref) (ref.func $f)))", .ok = true },
         .{ .src = "(module (func $f) (global funcref (ref.func $f)) (func (export \"g\") (result funcref) (ref.func $f)))", .ok = true },
-        .{ .src = "(module (func $f) (start $f) (func (export \"g\") (result funcref) (ref.func $f)))", .ok = true },
+        // ⚠️ The START function is NOT one of them, and this case asserted that it
+        // was until R4 (2026-08-13) — the test encoded the same wrong rule as the
+        // code and the comment above it ("four declaring positions"), so all three
+        // agreed and none of them was evidence. §3.5.1 erases `start` alongside the
+        // function section when building `C.refs`; `ref_func.wast` requires this
+        // module rejected.
+        .{ .src = "(module (func $f) (start $f) (func (export \"g\") (result funcref) (ref.func $f)))", .ok = false },
         // An ACTIVE segment declares it just as well as a declarative one.
         .{ .src = "(module (func $f) (table 1 funcref) (elem (i32.const 0) $f) (func (export \"g\") (result funcref) (ref.func $f)))", .ok = true },
     };

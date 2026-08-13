@@ -76,11 +76,13 @@ fn wantStr(s: Sexpr) Error![]const u8 {
     };
 }
 
-/// Cap on the synthesized element copies for `(table N reftype initexpr)`. `N`
-/// is attacker-written text and each copy is an `Sexpr`, so an unbounded `N`
-/// turns 48 bytes into a request for tens of GB. 2^20 entries is far beyond any
-/// real table literal.
-const max_table_init_copies: u32 = 1 << 20;
+// A `max_table_init_copies` cap lived here: `(table N reftype initexpr)` used to
+// synthesize N copies of the initializer as an active element segment, so an
+// attacker-written `N` turned 48 bytes of text into a request for tens of GB.
+// R4 (2026-08-13) emits §5.5.6's `0x40` form instead — one initializer, no copies
+// — so both the amplification and the cap that contained it are gone. **The best
+// bound on an allocation is not needing it.**
+
 /// The i-th element of a form, or `error.BadModuleField` if the form is too short.
 fn nth(items: []const Sexpr, i: usize) Error!Sexpr {
     return if (i < items.len) items[i] else error.BadModuleField;
@@ -157,7 +159,11 @@ const GcField = struct { storage: GcStorage, mutable: bool };
 const GcTypeDef = union(enum) { func, @"struct": []const GcField, array: GcField };
 /// `min`/`max` are `u64` and `is64` records the index type: a 64-bit table
 /// (table64) may declare limits past `u32`, exactly like a 64-bit memory.
-const TableDef = struct { min: u64, max: ?u64, elem: V = .funcref, is64: bool = false };
+/// `init` is `(table N reftype initexpr)`'s explicit initializer, emitted as
+/// §5.5.6's `0x40 0x00 tabletype expr` form. It is the ONLY way a table with a
+/// non-nullable element type can have a starting state, which is why the
+/// validator can require one.
+const TableDef = struct { min: u64, max: ?u64, elem: V = .funcref, is64: bool = false, init: ?Sexpr = null };
 /// An element segment. `funcs` (func-index form) OR `exprs` (const-expr form) —
 /// exactly one is non-empty. `offset` applies only to active segments.
 const ElemDef = struct {
@@ -664,6 +670,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // any signature they might intern lands in section 1. Const-exprs can't intern
     // a signature today, but this keeps the invariant structural, not incidental.
     const global_pay = try encodeGlobalSection(a, globals.items, &sigs, type_names.items, global_names.items, func_names.items);
+    const table_pay = try encodeTableSection(a, tables.items, &sigs, type_names.items, global_names.items, func_names.items);
     const elem_pay = try encodeElementSection(a, elems.items, &sigs, type_names.items, global_names.items, func_names.items);
     const data_pay = try encodeDataSection(a, datas.items, &sigs, type_names.items, global_names.items, func_names.items);
 
@@ -798,16 +805,9 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         for (func_type.items) |ti| try uleb(a, &s, ti);
         try emitSection(a, &out, 3, s.items);
     }
-    // Table section (4)
-    if (tables.items.len != 0) {
-        var s: List(u8) = .empty;
-        try uleb(a, &s, tables.items.len);
-        for (tables.items) |t| {
-            try emitValType(a, &s, t.elem); // element reftype (funcref / externref)
-            try emitLimits(a, &s, t.min, t.max, false, t.is64);
-        }
-        try emitSection(a, &out, 4, s.items);
-    }
+    // Table section (4) — pre-encoded above (before the type section), because a
+    // table initializer is a const-expr and may intern a signature.
+    if (tables.items.len != 0) try emitSection(a, &out, 4, table_pay);
     // Memory section (5) — the *defined* memories only (imported ones live in
     // the import section). Multi-memory: a vector of limits.
     if (memories.items.len != 0) {
@@ -889,6 +889,26 @@ fn encodeGlobalSection(a: std.mem.Allocator, globals: []const GlobalDef, sigs: *
         try emitValType(a, &s, g.valtype);
         try s.append(a, if (g.mutable) 0x01 else 0x00);
         try emitConstExpr(a, &s, sigs, type_names, global_names, func_names, g.init);
+    }
+    return s.items;
+}
+
+/// Encode the table section (4) payload. A table with no initializer is the
+/// plain `tabletype`; one with an initializer takes §5.5.6's second form,
+/// `0x40 0x00 tabletype expr` (function-references) — the only encoding in which
+/// a NON-NULLABLE element type has a starting value, and therefore the only one
+/// the validator can accept for such a table.
+fn encodeTableSection(a: std.mem.Allocator, tables: []const TableDef, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8) Error![]const u8 {
+    if (tables.len == 0) return &.{};
+    var s: List(u8) = .empty;
+    try uleb(a, &s, tables.len);
+    for (tables) |t| {
+        if (t.init != null) try s.appendSlice(a, &.{ 0x40, 0x00 }); // form + reserved byte
+        try emitValType(a, &s, t.elem); // element reftype
+        try emitLimits(a, &s, t.min, t.max, false, t.is64);
+        if (t.init) |init_expr| {
+            try emitConstExpr(a, &s, sigs, type_names, global_names, func_names, &[_]Sexpr{init_expr});
+        }
     }
     return s.items;
 }
@@ -1189,24 +1209,23 @@ fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef
         // pattern: the `max` probe above is guarded, this read was not.
         const et = try parseValType(try nth(items, i), type_names);
         i += 1;
-        try tables.append(a, .{ .min = min, .max = max, .elem = et, .is64 = is64 });
-        // Table initializer expression `(table N reftype initexpr)`: fill all N
-        // slots with the value. We synthesize an active elem of N copies at
-        // offset 0 — observably identical table state (a distinct 0x40 binary
-        // encoding is not required for the execution assertions).
-        if (i < items.len and items[i].asList() != null) {
-            const init_expr = items[i];
-            // `min` is attacker-written text: `(table 4000000000 funcref (…))` —
-            // 48 bytes — asks for ~96 GB of `Sexpr`. `alloc` overflow-checks the
-            // multiply so it fails cleanly rather than corrupting, but it is the
-            // text-side twin of the OOM amplification `Reader.readVecLen` closed
-            // on the binary side, so bound it the same way.
-            if (min > max_table_init_copies) return error.BadImmediate;
-            const copies = try a.alloc(Sexpr, min);
-            for (copies) |*c| c.* = init_expr;
-            try elems.append(a, .{ .mode = .active, .table_index = table_index, .offset_form = null, .elem_type = et, .expr_form = true, .funcs = &.{}, .exprs = copies });
-            try elem_names.append(a, null);
-        }
+        // Table initializer expression `(table N reftype initexpr)` → §5.5.6's
+        // `0x40 0x00 tabletype expr` form, recorded here and emitted by the table
+        // section encoder.
+        //
+        // ⚠️ This used to synthesize an active element segment of N copies of the
+        // initializer instead, on the reasoning that the resulting table state is
+        // observably identical and "a distinct 0x40 binary encoding is not
+        // required for the execution assertions". The state is identical; the
+        // MODULE is not. A table with an explicit initializer and a table with an
+        // element segment differ in exactly the property the validator needs to
+        // see — whether the table declares a starting value — so `(table 0
+        // (ref func))`, which has none and must be rejected, was indistinguishable
+        // from one that does. It also allocated `min` Sexprs, which is why the
+        // copy cap below existed at all. **An encoding chosen to make execution
+        // agree can erase the distinction validation runs on.**
+        const init: ?Sexpr = if (i < items.len and items[i].asList() != null) items[i] else null;
+        try tables.append(a, .{ .min = min, .max = max, .elem = et, .is64 = is64, .init = init });
     }
 }
 
@@ -1758,11 +1777,15 @@ fn emitTryTable(ctx: *Ctx, l: []const Sexpr) Error!void {
     var j: usize = 1;
     const label = parseOptLabel(l, &j);
     const bt = try parseBlockTypeSig(ctx, l, &j);
-    // Push the try_table's own label first so a `(catch … $l)` targeting it
-    // resolves to 0 (label 0 = the try_table block); outer labels are > 0.
-    try ctx.labels.append(ctx.a, label);
     try emitBlockTypeSig(ctx, bt);
+    // ⚠️ The catch clauses are emitted BEFORE the try_table's own label is
+    // pushed: a catch's target label is an index into the ENCLOSING label stack
+    // (EH proposal §3.4 checks the catches in `C`, only the body in
+    // `C, labels [t2*]`). Pushing first made `(catch … $l)` resolve one frame too
+    // deep — the exact mirror of the validator's bug, so the two halves agreed
+    // with each other and neither was an oracle for the other.
     try emitCatchClauses(ctx, l, &j);
+    try ctx.labels.append(ctx.a, label);
     try emitSeq(ctx, l[j..]);
     try ctx.out.append(ctx.a, @intFromEnum(Op.end));
     _ = ctx.labels.pop();
@@ -1910,16 +1933,17 @@ fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Erro
             return j;
         },
         .try_table => {
-            // Flat: `try_table $l? blocktype? catch* … end`. Push the label before
-            // resolving the catch labels (label 0 = the try_table itself); the
+            // Flat: `try_table $l? blocktype? catch* … end`. The catch labels are
+            // resolved in the ENCLOSING label scope, so they are emitted before the
+            // try_table's own label is pushed — see `emitTryTable` for why. The
             // body instructions follow and the eventual `end` pops the label.
             try ctx.out.append(ctx.a, @intFromEnum(op));
             var j = i + 1;
             const label = parseOptLabel(items, &j);
             const bt = try parseBlockTypeSig(ctx, items, &j);
-            try ctx.labels.append(ctx.a, label);
             try emitBlockTypeSig(ctx, bt);
             try emitCatchClauses(ctx, items, &j);
+            try ctx.labels.append(ctx.a, label);
             return j;
         },
         .@"else" => {
@@ -2095,10 +2119,21 @@ fn emitBlockTypeSig(ctx: *Ctx, bt: BlockTy) Error!void {
     if (sig.params.len == 0 and sig.results.len == 0) {
         try ctx.out.append(ctx.a, 0x40);
     } else if (sig.params.len == 0 and sig.results.len == 1 and !sig.results[0].isConcrete()) {
-        // Single non-concrete result → the value-type byte form. A concrete ref
-        // can't use the single-byte form (its `0x64 ti` would be misread as an
-        // s33 block type), so it falls through to an interned type index.
+        // Single non-concrete result → the single value-type byte.
         try ctx.out.append(ctx.a, @intCast(@intFromEnum(sig.results[0])));
+    } else if (sig.params.len == 0 and sig.results.len == 1 and sig.results[0].isConcrete()) {
+        // Single CONCRETE ref result → `0x63/0x64 <heaptype>`, the canonical
+        // multi-byte valtype form (§5.3.6).
+        //
+        // ⚠️ This used to fall through to an interned type index, because
+        // `readBlockType` could not decode the multi-byte form — a workaround in
+        // the producer for a gap in the consumer. It did not stay cosmetic:
+        // interning MANUFACTURES a type-section entry, so
+        // `(block (result (ref 1)))` in a one-type module made index 1 exist (the
+        // block's own signature, self-referentially) and the module validated,
+        // where `ref.wast` requires "unknown type". Both halves are canonical now.
+        try ctx.out.append(ctx.a, if (sig.results[0].isNonNullRef()) 0x64 else 0x63);
+        try sleb(ctx.a, ctx.out, @intCast(sig.results[0].concreteIndex()));
     } else {
         try sleb(ctx.a, ctx.out, try internSig(ctx.a, ctx.sigs, sig.params, sig.results));
     }
@@ -4623,6 +4658,144 @@ test "GC array: array.new_fixed builds from operands" {
     try std.testing.expectEqual(@as(i32, 30), interp.asI32(try assembleAndRun(src, "third", &.{})));
 }
 
+// --- R4 (2026-08-13): the accept-invalid class in core spec files ------------
+// Each case below was a module wazmrt ACCEPTED that the spec calls invalid — the
+// failure direction where a test passing proves nothing, because the runtime
+// happily executes the module it should have refused.
+
+test "R4: a table whose element type is non-defaultable needs an initializer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Accepted before R4: a `(ref …)` element type has no default value, so these
+    // describe tables whose slots cannot be given a starting state. The LENGTH is
+    // irrelevant — a 0-length table still fails, because `table.grow` would have
+    // to invent one.
+    for ([_][]const u8{
+        "(module (table 0 (ref func)))",
+        "(module (table 10 (ref func)))",
+        "(module (table 0 (ref extern)))",
+        "(module (type $f (func)) (table 0 (ref $f)))",
+        "(module (type $f (func)) (table 0 0 (ref $f)))",
+    }) |src| {
+        var m = try Module.decode(a, try assemble(a, src));
+        std.testing.expectError(error.TypeMismatch, validate(a, &m)) catch |e| {
+            std.debug.print("accepted a non-defaultable table: {s}\n", .{src});
+            return e;
+        };
+    }
+
+    // …and the forms that ARE legal must keep working: a defaultable element type
+    // needs no initializer, and an explicit initializer of the right type licenses
+    // a non-nullable one. The second is emitted as §5.5.6's `0x40` form, which is
+    // the encoding the rule above is really testing for.
+    for ([_][]const u8{
+        "(module (table 1 funcref))",
+        "(module (table 0 (ref null func)))",
+        "(module (func $g) (elem declare func $g) (table 1 (ref func) (ref.func $g)))",
+    }) |src| {
+        var m = try Module.decode(a, try assemble(a, src));
+        try validate(a, &m);
+    }
+
+    // An initializer of the WRONG type is still a mismatch — the `0x40` form was
+    // never validated at all before R4, so this reached the interpreter instead.
+    var bad = try Module.decode(a, try assemble(a, "(module (table 1 (ref func) (ref.null func)))"));
+    try std.testing.expectError(error.TypeMismatch, validate(a, &bad));
+}
+
+test "R4: a block type naming an out-of-range type index is an unknown type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Only one type exists in each module, so `(ref 1)` names nothing. These were
+    // accepted because the assembler INTERNED the block signature as a new type —
+    // manufacturing index 1 as the block's own (self-referential) signature. The
+    // canonical encoding is the multi-byte valtype `0x64 <heaptype>`, which
+    // creates no type and lets the decoder's existing bound check fire.
+    // The assertion is that the module is REFUSED, not which stage refuses it:
+    // `(ref 1)` in a two-result signature is caught by the decoder's type-count
+    // bound, while the single-result form now reaches the validator as an
+    // unresolvable heap type. Pinning the stage would make this test fail on a
+    // correct change.
+    for ([_][]const u8{
+        "(module (func $b (drop (block (result (ref 1)) (unreachable)))))",
+        "(module (func $l (drop (loop (result (ref 1)) (unreachable)))))",
+        "(module (func $i (drop (if (result (ref 1)) (then (unreachable)) (else (unreachable))))))",
+    }) |src| {
+        const refused = blk: {
+            const bin = assemble(a, src) catch break :blk true;
+            var m = Module.decode(a, bin) catch break :blk true;
+            validate(a, &m) catch break :blk true;
+            break :blk false;
+        };
+        if (!refused) {
+            std.debug.print("accepted an out-of-range block result type: {s}\n", .{src});
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // The in-range form still round-trips — and now through the canonical
+    // encoding, so this also pins `readBlockType`'s multi-byte valtype path.
+    const ok =
+        \\(module
+        \\  (type $t (func))
+        \\  (func $g)
+        \\  (elem declare func $g)
+        \\  (func (export "f") (result i32)
+        \\    (ref.is_null (block (result (ref null $t)) (ref.func $g)))))
+    ;
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(ok, "f", &.{})));
+}
+
+test "R4: a try_table catch label indexes the ENCLOSING scope" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `catch 0` here names the FUNCTION block, whose result is `[exnref]`; a plain
+    // `catch` on a tag with no params delivers `[]`, so this is a type mismatch.
+    // Read as "label 0 = the try_table itself" — the off-by-one `wat.zig`,
+    // `validate.zig` and `interp.zig` all shared — it type-checks and was accepted.
+    for ([_][]const u8{
+        "(module (tag) (func (result exnref) (try_table (catch 0 0)) (unreachable)))",
+        "(module (tag) (func (result exnref) (try_table (catch_all 0)) (unreachable)))",
+        "(module (tag) (func (try_table (catch_ref 0 0))))",
+        "(module (func (try_table (catch_all_ref 0))))",
+    }) |src| {
+        var m = try Module.decode(a, try assemble(a, src));
+        std.testing.expectError(error.TypeMismatch, validate(a, &m)) catch |e| {
+            std.debug.print("accepted a mistyped catch clause: {s}\n", .{src});
+            return e;
+        };
+    }
+
+    // The mirror: with the SAME index, a catch whose delivered values fit the
+    // enclosing label is valid — and was rejected before R4, because the label was
+    // resolved one frame too deep. One off-by-one, both failure directions.
+    const ok = "(module (tag $e) (func (result exnref) (try_table (catch_ref $e 0)) (unreachable)))";
+    var m = try Module.decode(a, try assemble(a, ok));
+    try validate(a, &m);
+}
+
+test "R4: an IMPORTED tag is type-checked like a defined one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // A tag's type must be `[t*] -> []`. The defined form was checked; the import
+    // form was not, because the loop walked `module.tags` — the DEFINED half of a
+    // space whose imported half leads it.
+    var imported = try Module.decode(a, try assemble(a, "(module (import \"\" \"\" (tag (result i32))))"));
+    try std.testing.expectError(error.InvalidTag, validate(a, &imported));
+    var defined = try Module.decode(a, try assemble(a, "(module (tag (result i32)))"));
+    try std.testing.expectError(error.InvalidTag, validate(a, &defined));
+    // A well-typed imported tag still validates.
+    var good = try Module.decode(a, try assemble(a, "(module (import \"\" \"\" (tag (param i32))))"));
+    try validate(a, &good);
+}
+
 // --- R3 (2026-08-13): the six array bulk ops ---------------------------------
 // These six were absent from `opcode.zig` entirely, so nothing below could even
 // ASSEMBLE — every spec-suite file that reached one died at `UnknownInstr`. The
@@ -5143,13 +5316,22 @@ test "a defined table larger than the entry budget is refused at instantiation" 
     inst.deinit();
 }
 
+// ⚠️ Both tests below used to write the handler as `(try_table (catch_all 0) …)`
+// directly in a `(func (result i32))` — i.e. label 0 meaning "the try_table
+// itself", which is how `wat.zig`, `validate.zig` and `interp.zig` all read it
+// until R4 (2026-08-13). A catch label is an index into the try_table's
+// ENCLOSING scope, so that form now means "branch to the function block", which
+// `catch_all` cannot do when the function returns i32 — correctly rejected. The
+// handler needs a real enclosing block, which is exactly how every module in the
+// spec suite's `try_table.wast` is written.
 test "EH wat: catch_all catches and control resumes after the try_table" {
     const src =
         \\(module
         \\  (tag $e)
         \\  (func (export "f") (result i32)
-        \\    (try_table (catch_all 0)
-        \\      throw $e)
+        \\    (block $h
+        \\      (try_table (catch_all $h)
+        \\        throw $e))
         \\    i32.const 55))
     ;
     try std.testing.expectEqual(@as(i32, 55), interp.asI32(try assembleAndRun(src, "f", &.{})));
@@ -5161,8 +5343,9 @@ test "EH wat: an exception thrown in a callee is caught in the caller" {
         \\  (tag $e)
         \\  (func $callee throw $e)
         \\  (func (export "f") (result i32)
-        \\    (try_table (catch_all 0)
-        \\      call $callee)
+        \\    (block $h
+        \\      (try_table (catch_all $h)
+        \\        call $callee))
         \\    i32.const 7))
     ;
     try std.testing.expectEqual(@as(i32, 7), interp.asI32(try assembleAndRun(src, "f", &.{})));

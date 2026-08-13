@@ -80,6 +80,25 @@
 # for the little-endian data-segment decode. Six instructions across six files is the honest price
 # of a proposal piece that was missing rather than merely unoptimised.
 
-wazmrt.exe  945152
-wazmrt.lib  1007444
-wazmrt.dll  871936
+# LOWERED 2026-08-13 (R4 — the accept-invalid class). Measured ReleaseSmall, Zig 0.16.0,
+# x86_64-windows, static lib from a PLAIN `zig build` (re-run AFTER `zig build dll`, which
+# overwrites `wazmrt.lib` with the DLL's 20 KB import library — that trap fired during this pass).
+#
+#   artifact       after R3      after R4      R4's share
+#   wazmrt.exe      945,152       944,640            -512
+#   wazmrt.lib    1,007,444     1,007,328            -116
+#   wazmrt.dll      871,936       871,424            -512
+#
+# ✅ A pass that ADDED five validation rules came out SMALLER, and the reason is worth keeping:
+# R4 deleted two workarounds that cost more than the rules do. `(table N reftype initexpr)` no
+# longer synthesizes N copies of the initializer as an element segment (it emits §5.5.6's `0x40`
+# form, one expression), which also retired the `max_table_init_copies` cap that existed only to
+# bound that amplification; and a single-concrete-ref block type no longer interns a function
+# signature. **Removing a workaround can pay for the rule that made it unnecessary.**
+#
+# Lowered rather than left with headroom, per the policy at the top of this file: a ceiling is
+# exact, and a win that is not recorded is headroom for the next unnoticed drift.
+
+wazmrt.exe  944640
+wazmrt.lib  1007328
+wazmrt.dll  871424

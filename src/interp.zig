@@ -791,6 +791,19 @@ pub const Instance = struct {
     /// their spaces) are exactly what the interpreter trusts at run time. Memory
     /// indices (guarded by `memBytes`), `call`/`call_ref` (guarded by
     /// `funcType`), branch depths, and dynamic ref-values are checked elsewhere.
+    /// Bound every type index a block signature can name. `.type_index` must be a
+    /// func type (`blockArity` `.?`-unwraps it); a `.ref` block type carries a
+    /// concrete heap type index that `refHead` must be able to resolve. Shared by
+    /// the `block`/`loop`/`if` arm and the `try_table` one, which carries its
+    /// block type nested inside its own immediate.
+    fn checkBlockType(module: *const Module, bt: opcode.BlockType) Error!void {
+        switch (bt) {
+            .type_index => |ti| if (module.funcSig(ti) == null) return error.UndefinedType,
+            .ref => |rt| _ = module.refHead(rt.heap) catch return error.UndefinedType,
+            else => {},
+        }
+    }
+
     fn checkStaticIndices(module: *const Module, num_locals: usize, ir: []const opcode.Instr) Error!void {
         for (ir) |instr| {
             // A GC type index's required KIND depends on the op, so switch on it.
@@ -838,18 +851,12 @@ pub const Instance = struct {
                     if (module.arrayField(x.src) == null) return error.UndefinedType;
                 },
                 .tag => |x| if (module.tagType(x) == null) return error.UndefinedType,
-                .block_type => |x| switch (x) {
-                    .type_index => |ti| if (module.funcSig(ti) == null) return error.UndefinedType,
-                    else => {},
-                },
+                .block_type => |x| try checkBlockType(module, x),
                 // `try_table` carries its block type INSIDE the immediate, so the
                 // `.block_type` arm above never sees it — `blockArity` would then
                 // `.?`-unwrap a null `funcSig` and iterate a garbage slice. Check
                 // the nested block type the same way (sibling of the arm above).
-                .try_table => |tt| switch (tt.block_type) {
-                    .type_index => |ti| if (module.funcSig(ti) == null) return error.UndefinedType,
-                    else => {},
-                },
+                .try_table => |tt| try checkBlockType(module, tt.block_type),
                 else => {},
             }
         }
@@ -1985,12 +1992,23 @@ const Frame = struct {
                     },
                     else => {},
                 }
-                // The clause's label index is relative to the try_table (label 0 =
-                // the try_table block); the try_table sits `d` deep, so branch to
-                // `d + c.label`. `c.label` is an unvalidated u32 from the module, so
-                // sum in u64 and reject an over-u32 total (it can't name a real
-                // label anyway) rather than `@intCast`-overflow (UB in ReleaseFast).
-                const target_label = std.math.cast(u32, @as(u64, d) + c.label) orelse return error.UndefinedLabel;
+                // The clause's label index is relative to the try_table's ENCLOSING
+                // scope — label 0 is the block containing the try_table, not the
+                // try_table itself (EH proposal §3.4 checks catches in `C`, only
+                // the body in `C, labels [t2*]`). The try_table sits `d` deep and
+                // its own frame does not count, so the target is `d + 1 + c.label`.
+                //
+                // ⚠️ This read `d + c.label` — off by exactly the try_table's own
+                // frame — and `wat.zig` and `validate.zig` were off by the same one,
+                // so all three agreed and the corpus passed. It took a spec rule,
+                // not a test, to see it: the three-way agreement is why
+                // `(func (result exnref) (try_table (catch 0 0)) (unreachable))`
+                // validated when the spec calls it a type mismatch.
+                //
+                // `c.label` is an unvalidated u32 from the module, so sum in u64 and
+                // reject an over-u32 total (it can't name a real label anyway)
+                // rather than `@intCast`-overflow (UB in ReleaseFast).
+                const target_label = std.math.cast(u32, @as(u64, d) + 1 + c.label) orelse return error.UndefinedLabel;
                 return try self.branch(target_label);
             }
             // Legacy `try`: a matching inline handler runs INSIDE the try (the try
@@ -2063,6 +2081,10 @@ const Frame = struct {
                 const ft = self.inst.module.funcSig(i).?;
                 break :blk typeSlots(if (want_params) ft.params else ft.results);
             },
+            // A single `(ref null? ht)` result — always one slot: every reference
+            // is one `u64`, so unlike `.value` this needs no `slotWidth` (only a
+            // `v128` is ever two, and a ref is never a v128).
+            .ref => if (want_params) 0 else 1,
         };
     }
 
@@ -4889,8 +4911,17 @@ test "EH: catch_all catches any tag and control resumes after the try_table" {
         .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } },
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{
-            // try_table (catch_all 0) ; throw 0 ; end ; i32.const 55
-            &.{ 0x00, 0x1f, 0x40, 0x01, 0x02, 0x00, 0x08, 0x00, 0x0b, 0x41, 0x37, 0x0b },
+            // block ; try_table (catch_all 0) ; throw 0 ; end ; end ; i32.const 55
+            //
+            // ⚠️ The `block` wrapper is not decoration. A catch label indexes the
+            // try_table's ENCLOSING scope, so `catch_all 0` names the block that
+            // ends right after the try_table — which is what "control resumes
+            // after the try_table" actually means. Until R4 (2026-08-13) this
+            // fixture had no block and read `catch_all 0` as the try_table itself,
+            // matching the off-by-one all three of `wat.zig`/`validate.zig`/
+            // `interp.zig` shared; with the function returning i32, that form is
+            // now correctly rejected.
+            &.{ 0x00, 0x02, 0x40, 0x1f, 0x40, 0x01, 0x02, 0x00, 0x08, 0x00, 0x0b, 0x0b, 0x41, 0x37, 0x0b },
         }) },
     });
     var inst: Instance = undefined;
@@ -4929,8 +4960,8 @@ test "EH: an exception thrown in a callee is caught in the caller's try_table" {
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x01 } }, // export caller (func 1)
         .{ .id = 10, .body = try ehCode(a, &.{
             &.{ 0x00, 0x08, 0x00, 0x0b }, // callee: throw 0 ; end
-            // caller: try_table (catch_all 0) ; call 0 ; end ; i32.const 7
-            &.{ 0x00, 0x1f, 0x40, 0x01, 0x02, 0x00, 0x10, 0x00, 0x0b, 0x41, 0x07, 0x0b },
+            // caller: block ; try_table (catch_all 0) ; call 0 ; end ; end ; i32.const 7
+            &.{ 0x00, 0x02, 0x40, 0x1f, 0x40, 0x01, 0x02, 0x00, 0x10, 0x00, 0x0b, 0x0b, 0x41, 0x07, 0x0b },
         }) },
     });
     var inst: Instance = undefined;
@@ -4951,8 +4982,13 @@ test "EH: catch_ref materializes a non-null exnref" {
         .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } },
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{
-            // try_table (result exnref) (catch_ref 0 0) ; throw 0 ; end ; ref.is_null
-            &.{ 0x00, 0x1f, 0x69, 0x01, 0x01, 0x00, 0x00, 0x08, 0x00, 0x0b, 0xd1, 0x0b },
+            // block (result exnref) ; try_table (catch_ref 0 0) ; throw 0 ; end ;
+            // unreachable ; end ; ref.is_null
+            //
+            // The `exnref` result moves from the try_table to the enclosing block,
+            // because that block is what the catch branches TO. `unreachable`
+            // covers the fall-through path, which cannot produce one.
+            &.{ 0x00, 0x02, 0x69, 0x1f, 0x40, 0x01, 0x01, 0x00, 0x00, 0x08, 0x00, 0x0b, 0x00, 0x0b, 0xd1, 0x0b },
         }) },
     });
     var inst: Instance = undefined;
@@ -4974,14 +5010,19 @@ test "EH: throw_ref rethrows a caught exnref to an outer catch_all" {
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{&.{
             0x00,
-            0x1f, 0x40, 0x01, 0x02, 0x00, // outer try_table (catch_all 0)
-            0x1f, 0x69, 0x01, 0x01, 0x00, 0x00, // inner try_table (result exnref) (catch_ref 0 0)
-            0x08, 0x00, // throw 0
-            0x0b, // end inner
-            0x0a, // throw_ref
-            0x0b, // end outer
-            0x41, 0x05, // i32.const 5
-            0x0b, // end func
+            0x02, 0x40, // block $out           — the outer catch_all's target
+            0x1f, 0x40, 0x01, 0x02, 0x00, //   outer try_table (catch_all $out = 0)
+            0x02, 0x69, //     block $inner (result exnref) — the catch_ref's target
+            0x1f, 0x40, 0x01, 0x01, 0x00, 0x00, // inner try_table (catch_ref 0 $inner = 0)
+            0x08, 0x00, //       throw 0
+            0x0b, //             end inner try_table
+            0x00, //             unreachable (fall-through cannot make an exnref)
+            0x0b, //           end block $inner — leaves the caught exnref
+            0x0a, //           throw_ref — rethrows it, into the OUTER try_table
+            0x0b, //         end outer try_table
+            0x0b, //       end block $out
+            0x41, 0x05, //  i32.const 5
+            0x0b, //        end func
         }}) },
     });
     var inst: Instance = undefined;

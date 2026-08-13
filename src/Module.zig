@@ -756,6 +756,14 @@ fn readValType(r: *Reader, kinds: []const CompKind) Error!types.ValType {
         0x61 => .structref_nn,
         0x59 => .arrayref_nn,
         0x58 => .nullref_nn,
+        // ⚠️ `exnref_nn` was defined in `types.zig` and taught to `readBlockType`,
+        // and THIS reader was missed — so `(ref exn)` round-tripped as a block
+        // type but was `BadValType` in every other position. `try_table.wast`'s
+        // last module uses it in a block RESULT LIST (two results, so the
+        // signature is interned and read back through here rather than through
+        // `readBlockType`), which is why one valid module was rejected. A tag
+        // added to one of two readers is a tag that works in half the positions.
+        0x57 => .exnref_nn,
         0x63 => try readHeapTypeRef(r, true, kinds), // (ref null ht)
         0x64 => try readHeapTypeRef(r, false, kinds), // (ref ht) — non-nullable
         else => error.BadValType,

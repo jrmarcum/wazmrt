@@ -432,6 +432,12 @@ pub const BlockType = union(enum) {
     empty,
     value: types.ValType,
     type_index: u32,
+    /// A single `(ref null? ht)` result — the two MULTI-byte valtypes, which the
+    /// decoder cannot collapse into `.value` because a concrete heap type index
+    /// needs the module's composite kinds to pick its family head. Kept
+    /// unresolved here and turned into a `ValType` by the validator/interpreter,
+    /// which have the module. (`.value` still carries every single-byte valtype.)
+    ref: RefType,
 };
 
 /// A load/store memory-immediate. `memory` is the target memory index
@@ -661,9 +667,26 @@ pub fn immediateKind(op: Op) ImmKind {
     };
 }
 
-/// Decode a block type (§5.3.6): an s33 — negative values encode empty/valtype,
-/// non-negative values are a type index.
+/// Decode a block type (§5.3.6): `0x40` (empty), a valtype, or a non-negative
+/// s33 type index. Every *single-byte* valtype encodes as a negative s33, which
+/// is what lets one `readVarS33` separate the three cases.
 fn readBlockType(r: *Reader) DecodeError!BlockType {
+    // ⚠️ …except the two MULTI-byte valtypes. `(ref null ht)` = `0x63 ht` and
+    // `(ref ht)` = `0x64 ht` are ordinary valtypes and therefore ordinary block
+    // types, but only their first byte is in the s33 stream — the heap type
+    // follows. Reading them as a bare s33 yields −29/−28, which matched no arm,
+    // so a concrete-ref block type was undecodable. `wat.zig` worked around it by
+    // interning a function type and emitting a type INDEX instead, which is legal
+    // but non-canonical — and it MANUFACTURED a type entry, so
+    // `(block (result (ref 1)))` in a module with one type resolved `(ref 1)` to
+    // the signature the block had just created and validated clean. `ref.wast`
+    // requires it rejected as "unknown type". **A workaround in the producer for
+    // a gap in the consumer does not stay cosmetic.**
+    const first = try r.peekByte();
+    if (first == 0x63 or first == 0x64) {
+        _ = try r.readByte();
+        return .{ .ref = .{ .nullable = first == 0x63, .heap = try readHeapType(r) } };
+    }
     const v = try r.readVarS33();
     if (v >= 0) {
         if (v > std.math.maxInt(u32)) return error.UnsupportedOpcode; // guard the @intCast
