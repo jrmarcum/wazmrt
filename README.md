@@ -20,7 +20,9 @@ compliance process, and for the ledger of any reused code.
 > `ref.as_non_null`, `br_on_null`, non-null refs with local-initialization
 > checking), and **WasmGC** — `i31` references (`ref.i31`, `i31.get_s`/`_u`),
 > **struct and array** heap objects (`struct.new`/`get`/`set`, `array.new`/
-> `new_fixed`/`get`/`set`/`len`, `ref.eq`, packed `i8`/`i16` fields), casts
+> `new_default`/`new_fixed`/`get`/`set`/`len`, the array bulk ops
+> `array.fill`/`copy`/`new_data`/`new_elem`/`init_data`/`init_elem`, `ref.eq`,
+> packed `i8`/`i16` fields), casts
 > (`ref.test`/`ref.cast`, `br_on_cast`/`br_on_cast_fail`), **concrete
 > `(ref $t)` references** (self-referential structs, exact-type params), and
 > declared subtyping (`(sub $super …)`) over the `any`/`eq`/`i31`/`struct`/

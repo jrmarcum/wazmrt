@@ -193,6 +193,26 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
 - **Reuse, don't duplicate, the opcode table.** The assembler builds a
   name→`Op` map from `opcode.zig`; the encoder must stay in lockstep with the
   decoder (same authority).
+- ⚠️ **That rule applies to EVERY table here, not only the opcode one (R3,
+  2026-08-13).** `isRefType` carried its own hand-written list of reference-type
+  keywords — `funcref`, `externref`, `anyfunc` — while `shorthandRefType`, in the
+  same file, already mapped all ten abstract heads. `(elem $e i31ref …)` therefore
+  missed the const-expr form, fell through to the func-index form, and reported
+  `BadImmediate` about a type name it had read as a function name. It now defers
+  to `shorthandRefType`. **A second copy of a lookup table is a second place to be
+  incomplete**, and the copy is always the one that goes stale.
+- ⚠️ **An OPTIONAL clause must not be required by the code that consumes it
+  (R3).** `call_indirect`'s table index was consumed only when a
+  `(type …)`/`(param …)`/`(result …)` followed it — but the type use is optional
+  (absent means `[] -> []`), so `(call_indirect $t (i32.const 0))` left `$t` for
+  the operand loop and failed as `UnknownInstr` naming a table. `isIndexAtom` is
+  the right predicate, as the flat `br_table` fix had already established. When a
+  grammar clause is optional, the parser's lookahead must not assume its sibling.
+- ⚠️ **A missing MNEMONIC surfaces here, not where it is missing from.** R3's six
+  GC array ops were absent from `opcode.zig`, but every `.wast` failure read
+  `UnknownInstr` from `wat.zig`, because the corpus reaches the decoder only
+  through the text path. When triaging an instruction-level failure, the file
+  named by the error is rarely the file to fix.
 - **Self-contained.** No external assembler at build or test time (matches the
   libc-free / no-deps ethos).
 - Coverage tracks the interpreter: instructions the interpreter can't yet run

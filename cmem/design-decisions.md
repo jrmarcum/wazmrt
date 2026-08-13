@@ -557,10 +557,14 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
     something invokes it automatically, run `zig build size -Doptimize=ReleaseSmall` before any
     commit that touches `src/`. **Attribute an overshoot before paying for it** — build the parent
     commit in a `git worktree` and diff, rather than assuming the growth is yours; R2's true share
-    of that overshoot was +5,120 / +1,068 / **+0**.
-    **Live sizes (2026-08-13, ReleaseSmall, Zig 0.16.0, x86_64-windows):** exe **939,008**, static
-    lib **999,296**, dll **864,768**. ⚠️ Measure the static lib from a PLAIN `zig build` — `zig build
-    dll` overwrites `wazmrt.lib` with the DLL's much smaller import library.
+    of that overshoot was +5,120 / +1,068 / **+0**, while R3's was **all of it** (+6,144 / +8,258 /
+    +7,168). Both answers are only worth having because the parent was actually measured.
+    **Live sizes (2026-08-13 after R3, ReleaseSmall, Zig 0.16.0, x86_64-windows):** exe **945,152**,
+    static lib **1,007,444**, dll **871,936**. ⚠️ Measure the static lib from a PLAIN `zig build` —
+    `zig build dll` overwrites `wazmrt.lib` with the DLL's much smaller import library. ⚠️ And
+    **`zig build` does not produce the DLL at all**, so the gate silently grades a stale one: R3's
+    first run reported the DLL at exactly its ceiling, from a file two builds old. **A delta of
+    exactly zero is a reason to check the timestamp, not a result.**
   - **`tests/wazmrt_abi_symbols.c`** — GENERATED from the header, because a hand-kept list drifts by
     exactly the typo it exists to catch. ⚠️ **Demonstrating it requires a symbol nothing calls
     internally.** The first attempt renamed `wazmrt_bytes_delete`, which `module_new_wat` calls, so it
@@ -769,7 +773,15 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
         compatibly — field 0 aligns — and the runtime bounds-checks accesses). Concrete `(ref $t)`
         *value types* still collapse to their head (the remaining limitation); cast *targets* and now
         supertypes carry the concrete index.
-    - **br_on_cast / br_on_cast_fail slice DONE 2026-07-14 — WasmGC op coverage is now complete.**
+    - ⚠️ **"WasmGC op coverage is now complete" (2026-07-14) WAS FALSE FOR 30 DAYS — corrected
+      2026-08-13 by R3.** Six array instructions had never been written: `array.new_data`,
+      `array.new_elem`, `array.fill`, `array.copy`, `array.init_data`, `array.init_elem` (`0xFB`
+      0x09/0x0a/0x10/0x11/0x12/0x13). The claim below was made from the ops the *slices* had covered,
+      not from the proposal's instruction list — the same way memory64 was recorded COMPLETE without
+      table64 and function-references shipped `return_call_ref` as call-then-return. **Check a
+      proposal off against its specification's opcode table, never against your own plan's slices.**
+      See `known-issues.md` → "GC array bulk ops".
+    - **br_on_cast / br_on_cast_fail slice DONE 2026-07-14 — cast op coverage complete.**
       `0xFB` 0x18/0x19; immediate = a flags byte (bit 0 src-nullable, bit 1 dst-nullable) + label +
       src & dst heap types (`s33`). `br_on_cast $l src dst` branches to `$l` (delivering the ref as
       `dst`) when the ref casts to `dst`, else falls through with the ref as `src`; `br_on_cast_fail`

@@ -36,8 +36,14 @@ roughly doubled in a month while "smallest binary" was a stated goal. — `desig
 `testing.md`
 
 **Pass counts over a corpus you cannot fully run are UPPER BOUNDS, not measurements.** Skips are not
-passes. 2,637 assertions are still skipped in the spec suite; any headline figure that ignores them is
+passes. 2,412 assertions are still skipped in the spec suite; any headline figure that ignores them is
 overstated. — `testing.md`
+
+**Read the SKIP column in the same row as the failure count.** A build failure takes every assertion
+that targets that module into skips, so a small failure count can hide a total blackout:
+`array_fill.wast` read `0 passed, 1 failed, 29 skipped` — one failure, and the whole file unrun. R3
+was triaged at ~10 failures, scored 16, and freed **225 suppressed assertions**. Failures fell 36
+while real runs rose 225 — the second number is the size of the item. — R3, `roadmap.md`
 
 **Run one `zig build` at a time on this box, and expect `error: Unexpected` to mean the environment,
 not the code.** Chained builds race the cache lock; a `D:` cache dir fails outright (use
@@ -95,6 +101,27 @@ three subsystems: R1's types (rec-group position, not module-local index), R2's 
 index, not index), R2's tags (a shared identity, not each importer's own slot). Whenever a thing can
 be imported, ask what makes two of them the same thing. — R1/R2, `roadmap.md`
 
+**A guard covers the cases its author was debugging, not the cases that match its reason.** The
+raw-internal-tag guard rejected `0xd7..0xfa` and left `0xc5..0xcc` — tags that already existed when it
+landed — so a raw `0xC5` byte, not a wasm opcode at all, decoded *and executed* as
+`i32.trunc_sat_f32_s`. When you write a guard, enumerate everything with the property, not everything
+in the bug you are on. — R3, `roadmap.md`
+
+**A second copy of a lookup table is a second place to be incomplete.** The assembler's `isRefType`
+listed `funcref`/`externref` while `shorthandRefType` next door held all ten heads, so
+`(elem $e i31ref …)` was read as a list of function names. Deduplicating it closed R6 outright.
+Before adding a membership test, grep for the table that already answers it. — R3, `roadmap.md`
+
+**The type the stack shows you is not the type the memory has.** A packed `i8` element and a plain
+`i32` element both project `i32` onto the operand stack, so `array.copy` comparing `unpacked()` forms
+called `(array i8)` and `(array i32)` compatible and would copy between different element widths.
+Compare storage, not projection. — R3, `roadmap.md`
+
+**When one instruction's operands are in different UNITS, the bound is the product, not the sum.**
+`array.new_data` takes a byte offset and an element count, so the check is `offset + size × width`;
+the unscaled form would read 36 bytes past a 12-byte segment. Ask what each operand counts before
+writing the bounds check. — R3, `roadmap.md`
+
 **A feature can be present, tested, and green while failing at exactly the thing it is for.**
 `return_call_ref` shipped as call-then-return: every shallow assertion passed, and the one property the
 proposal exists to provide — unbounded depth — was absent. Test the *purpose*, not the surface. — T4,
@@ -133,7 +160,15 @@ measuring it, and the artifacts doubled. — `design-decisions.md`
 gate was built to stop silent drift, works correctly, and drift accrued anyway: by R2 the ceilings
 were over by +22 KB exe / +24 KB lib / +19 KB dll, none of it R2's, left by commits that never
 invoked `zig build size`. **Attribute an overshoot before paying for it** — measure the parent commit
-in a worktree rather than assuming the growth is yours. — R2, `tools/size-ceilings.txt`
+in a worktree rather than assuming the growth is yours. R3 did exactly that and the answer came back
+the other way: all of its +6 KB / +8 KB / +7 KB was its own. Both answers are only worth having
+because the measurement was made. — R2/R3, `tools/size-ceilings.txt`
+
+**A size gate reads whatever is in `zig-out`, including yesterday's artifact.** R3's first run showed
+the DLL at *exactly* its ceiling — because `zig build` does not build the DLL, and the file on disk
+was two builds old. A number that matches the ceiling to the byte is evidence of a stale file, not of
+a change that cost nothing. Build every artifact you are about to report. — R3,
+`tools/size-ceilings.txt`
 
 **Guard the property, not a proxy for it.** — `design-decisions.md`
 

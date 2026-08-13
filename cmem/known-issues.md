@@ -418,6 +418,64 @@ leave entries in another module's table" test.
 against the restored old behaviour before being kept** — the funcref-in-a-table one, and the
 funcref-in-a-global one, which reproduced `elem.wast`'s `CallStackExhausted` symptom exactly.
 
+## 🧮 ✅ GC array bulk ops — R3, FIXED 2026-08-13 (six ops missing, 225 assertions unblocked)
+
+Triaged as "four ops absent from `opcode.zig`, ~10 failures". It was **six** ops and 16 failures, and
+the failure count was the least interesting number in the item. Programme state and the method
+lessons are in `roadmap.md` → "R3 IS DONE"; this entry is the defect record.
+
+**The six.** `array.new_data` (`0xFB 0x09`), `array.new_elem` (`0x0a`), `array.fill` (`0x10`),
+`array.copy` (`0x11`), `array.init_data` (`0x12`), `array.init_elem` (`0x13`). `array.fill` and
+`array.copy` were never named in the triage because their files died on the first instruction and
+reported one failure each having run **nothing**.
+
+**Where they died was the ASSEMBLER, not the decoder.** Every failure message read `UnknownInstr`,
+which `wat.zig` raises — the `.wast` corpus reaches the decoder only through the text path. The item
+was filed against `opcode.zig` (correctly, as the root) but the *observable* was one layer up. Same
+producer/consumer pair as the four incidents in the section below, in the direction that is easier to
+miss: the emitter had no rule because the op did not exist.
+
+**Three semantic traps the ops themselves carry.**
+
+- ⚠️ **`array.new_data`'s two operands are in different units** — offset in *bytes*, size in
+  *elements* — so the segment bound is `offset + size × width`. Unscaled, a 12-byte segment would
+  serve twelve `i32`s: **36 bytes past the end**, on a path the unvalidated runner also uses.
+- ⚠️ **`array.copy` may name the same array twice**, so it is `memmove`. Every non-overlapping case
+  passes with a forward copy; a backward overlap smears one element across the range.
+- ⚠️ **`array.copy`'s element check cannot compare `unpacked()` types.** Packed `i8` and plain `i32`
+  both project `i32` onto the operand stack, so the projection says `(array i8)` and `(array i32)`
+  are compatible — and the copy then moves values between different storage widths. Storage forms are
+  compared first, and only then value-type subtyping.
+
+**Two defects found INSIDE the R3 files that were not R3.** ("A failure's cause count is not known
+until it passes" — twice in one item.)
+
+1. **`isRefType` (assembler) listed only `funcref`/`externref`** while `shorthandRefType`, twenty
+   lines away, held all ten abstract heads. `(elem $e i31ref …)` therefore fell through to the
+   func-index form and read `i31ref` as a function name → `BadImmediate`, three steps from the cause.
+   Deduplicating onto `shorthandRefType` closed **R6 entirely** (`i31.wast` 8 → 0) and took
+   `br_on_cast`/`br_on_cast_fail` 5 → 2 (core) and 6 → 3 (`custom-descriptors`).
+2. **`call_indirect $t` with no type annotation would not assemble.** The table index was consumed
+   only if a `(type …)`/`(param …)`/`(result …)` followed, but the type use is optional (absent =
+   `[] -> []`), so `(call_indirect $t (i32.const 0))` left `$t` to the operand loop, which tried to
+   assemble a *table name* as an instruction → `UnknownInstr`. `isIndexAtom` is the correct
+   predicate, and the flat `br_table` fix had already learned this.
+
+**🔴 An accept-invalid found by reading, not by a test: a raw `0xC5` byte executed as
+`i32.trunc_sat_f32_s`.** Found while looking for free `Op` values. `0xc5..0xcc` are internal tags for
+the saturating-truncation ops (real wire form `0xFC` + sub-opcode), and `immediateKind` classifies
+`0x45...0xcc` as `.none`, so eight bytes that are **not wasm opcodes at all** decoded and executed as
+real instructions. The guard that exists precisely to stop this covered `0xd7..0xfa` only — the range
+its author was debugging — and `0xc5..0xcc` already existed when it landed. Now two ranges,
+`0xc5..0xcf` and `0xd7..0xfa`, because `0xd0..0xd6` are genuine single-byte ops in between; the
+regression test asserts both the rejections and the acceptance of `0xc0..0xc4` and `0xd0..0xd6` on
+either side.
+
+**Tests.** Six in-repo tests (`wat.zig`, `opcode.zig`) rather than corpus-only, because the `.wast`
+suite lives on removable media and cannot gate a commit. Three were confirmed to FAIL against
+deliberately broken implementations — width scaling removed, `memmove` reduced to `memcpy`, the
+packed-storage comparison disabled — before being kept.
+
 ## 🧾 ABI-2 build (2026-08-11) — bugs and near-misses found while replacing the C ABI
 
 None of these shipped; all were caught by a gate or a test. Recorded because each is a **shape** that

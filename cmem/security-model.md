@@ -180,6 +180,29 @@ see `known-issues.md` on why they had drifted.)*
   (`error.CrossStoreLink`) rather than silently reinterpreted. See the entry below for what this
   replaced.
 
+### Eight non-opcodes were decoded and EXECUTED — CLOSED 2026-08-13 (R3)
+
+**Not reachable as an escape, and recorded because the reasoning that let it survive is the reusable
+part.** `opcode.zig` gives internal `Op` tags to instructions whose real wire form is a prefix byte
+plus a LEB sub-opcode. A raw byte in that tag range is *not a wasm opcode*, and accepting one runs a
+non-standard encoding as a real instruction. A guard exists for exactly this — and it covered
+`0xd7..0xfa` only, so `0xc5..0xcc` (the eight saturating-truncation tags, which **already existed
+when the guard was written**) stayed open: `immediateKind` classifies `0x45...0xcc` as `.none`, so a
+body containing a bare `0xC5` validated and executed as `i32.trunc_sat_f32_s`.
+
+- **Severity is low and should be stated as low.** The synthesised instruction is memory-safe and
+  type-checked like any other; the loss is that wazmrt *accepts a module the spec calls malformed*,
+  and an embedder's `validate` therefore answers a question it was not asked.
+- ⚠️ **It was found by reading, not by a test** — while looking for free enum values. The regression
+  test that now covers it asserts both directions: the tag bytes are rejected, and the real ops on
+  either side (`0xc0..0xc4` sign-extension, `0xd0..0xd6` reference ops) still decode. The guard is
+  necessarily **two ranges**, because genuine single-byte opcodes sit between the two tag blocks.
+- 🔑 **The lesson: a guard covers the cases its author was debugging, not the cases that match its
+  reason.** The original fix enumerated the tags in the bug in front of it. When the property is
+  "this byte is an internal tag", the guard must enumerate every internal tag — and must be re-checked
+  whenever tags are added, which is why R3's new tags went in beside a widened range and a test that
+  names them.
+
 ### Cross-module reference confusion — CLOSED 2026-08-13 (R2)
 
 **Not a sandbox escape, and worth recording precisely because it looked like one and was not.** A

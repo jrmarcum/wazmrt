@@ -81,9 +81,9 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
   validation**, which is strong evidence the type-checker is correct across real, deeply-nested
   control flow (not just the simple `wasm_mod` set).
 
-## 📊 CURRENT spec-testsuite score (measured 2026-08-13, after R1 + R2)
+## 📊 CURRENT spec-testsuite score (measured 2026-08-13, after R1 + R2 + R3)
 
-**284 files — 61,187 assertions passed / 193 failed / 2,637 skipped.** This is the number to quote;
+**284 files — 61,412 assertions passed / 157 failed / 2,412 skipped.** This is the number to quote;
 every snapshot below it is older and kept as history. Reproduce exactly:
 
 ```
@@ -96,13 +96,36 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
 - **Failure messages carry the source LINE** of the `.wast` command that produced them (`L342: …`),
   added 2026-08-13 via `sexpr.parseAllWithLines`. Before that, matching 35 failures back to their
   assertions was hand work.
-- **193 is not 193 defects.** **101 are BY DESIGN** — `custom-descriptors` 88 and
-  `custom-page-sizes` 13, proposals wazmrt does not target, refused honestly. **92 are actionable**,
-  itemised as the R-list in `roadmap.md` (R1 and R2 done; R3 next).
-- ⚠️ **2,637 SKIPPED IS NOT 2,637 PASSED**, and the largest pool is core spec: `br_table.wast` alone
+- **157 is not 157 defects.** **95 are BY DESIGN** — `custom-descriptors` 82, `custom-page-sizes` 13,
+  proposals wazmrt does not target, refused honestly. **62 are actionable**, itemised as the R-list
+  in `roadmap.md` (R1, R2, R3 done, R6 closed by R3; R4/R5 next).
+- ⚠️ **2,412 SKIPPED IS NOT 2,412 PASSED**, and the largest pool is core spec: `br_table.wast` alone
   has **161** unrun assertions. Any headline figure that ignores skips is an upper bound.
+- ⚠️ **READ THE SKIP COLUMN WHEN TRIAGING, NOT JUST THE FAILURE COLUMN.** R3 was triaged at ~10
+  failures and scored 16 — but a module that fails to build sends every assertion targeting it into
+  `NoTarget`, so those 16 were suppressing **225 assertions**. `array_fill.wast` read
+  `0 passed, 1 failed, 29 skipped`: one failure, and *nothing in the file ever ran*. Failures fell
+  36 while real runs rose 225. **A single-digit failure count next to a double-digit skip count is a
+  blackout, not a small defect.**
 - ⚠️ **Run `zig build size -Doptimize=ReleaseSmall` in the same session.** Nothing invokes it
   automatically and the ceilings drifted 22–25 KB between 2026-08-11 and 2026-08-13 because of that.
+  ⚠️ **And run `zig build dll -Doptimize=ReleaseSmall` too** — plain `zig build` does not produce the
+  DLL, so the gate grades whatever stale one is in `zig-out`. R3's first run showed the DLL at
+  *exactly* its ceiling; the file was two builds old. **An exactly-zero delta is a timestamp check
+  waiting to happen.**
+
+**Unit tests: 579** (`zig build test --summary all`, 2026-08-13 after R3) — 575 pass / 4 skip from
+this repo's own `D:` cwd, **579/579 from an NTFS cwd**, which is the number to quote. R3 added 7
+(6 in `wat.zig`, 1 in `opcode.zig`); each core test raises the printed total by two because the
+C-ABI target re-runs the core suite.
+
+⚠️ **Three of R3's tests were confirmed to FAIL before being kept** — the rule that a new test which
+has never failed has not been shown to test anything. Each inversion was applied to the *implementation*
+and the specific test watched to fail: the byte-width scaling removed from `array.new_data` (caught),
+`array.copy`'s memmove reduced to a forward copy (caught, "expected 3, found 1"), and the
+packed-storage comparison disabled in `array.copy` validation (caught — the module then validated
+clean). The GC array ops are covered in-repo rather than only by the corpus because the `.wast` suite
+lives on removable media and cannot gate a commit.
 
 **Windows/this box:** run one `zig build` at a time, and pass `--cache-dir`/`--global-cache-dir` on
 `C:` — a `D:` cache fails with `error: Unexpected`. `zig build test-security` must be run from an

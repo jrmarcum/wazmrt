@@ -63,9 +63,9 @@ The pipeline, in order: **decode → validate → execute**, with a text front-e
 ## Build targets (see architecture.md)
 
 - `zig build`      → native CLI `wazmrt` + C-ABI static lib `wazmrt` + installs **`include/wazmrt.h`, and nothing else** (2026-08-11: nothing third-party ships, so no licence has to travel with it)
-- `zig build test` → runs the unit tests (**565 as of 2026-08-13** — 510 at 2026-08-11, the rest from R1/R2 regression tests; ZERO skips from an NTFS cwd, 4 skipped from this repo’s own `D:` cwd because exFAT has no symlinks; green under Debug AND ReleaseSafe; see `testing.md`)
+- `zig build test` → runs the unit tests (**579 as of 2026-08-13** — 510 at 2026-08-11, then R1/R2 regression tests, then R3's 7 (×2 targets: the C-ABI target re-runs the core tests, so each new core test raises the printed total by two); ZERO skips from an NTFS cwd, 4 skipped from this repo’s own `D:` cwd because exFAT has no symlinks; green under Debug AND ReleaseSafe; see `testing.md`)
 - `zig build capi-smoke` → compiles + runs `tests/capi_smoke.c` against the C ABI, with the generated link-time symbol gate (was `c-smoke` before 2026-08-11)
-- `zig build size -Doptimize=ReleaseSmall` → fails the build if a shipped artifact grew past `tools/size-ceilings.txt`. **Live 2026-08-13: exe 939,008 / static lib 999,296 / dll 864,768.** ⚠️ Nothing invokes this automatically and the ceilings drifted 22–25 KB unnoticed between 2026-08-11 and 2026-08-13 — **run it before any commit touching `src/`**, and measure the static lib from a PLAIN `zig build` (`zig build dll` overwrites `wazmrt.lib` with the DLL import library)
+- `zig build size -Doptimize=ReleaseSmall` → fails the build if a shipped artifact grew past `tools/size-ceilings.txt`. **Live 2026-08-13 (after R3): exe 945,152 / static lib 1,007,444 / dll 871,936.** ⚠️ Nothing invokes this automatically and the ceilings drifted 22–25 KB unnoticed between 2026-08-11 and 2026-08-13 — **run it before any commit touching `src/`**, and measure the static lib from a PLAIN `zig build` (`zig build dll` overwrites `wazmrt.lib` with the DLL import library). ⚠️ **`zig build` does not build the DLL at all**, so the gate happily reports whatever `.dll` is left in `zig-out` from a previous session — R3's first run showed the DLL at *exactly* its ceiling, which was a stale file, not a free change. **A delta of exactly zero is a reason to check the timestamp**; run `zig build dll -Doptimize=ReleaseSmall` before reporting a DLL number
 - `zig build -Droot-key=<64 hex>` → embeds the Ed25519 signature trust anchor (empty ⇒ verification inert)
 - `zig build wasi-gate` → compiles real `wasm32-wasi` guests (Zig + C via `zig cc`; Rust with `-Drust-gate=true`) and runs them through wazmrt asserting stdout
 - `zig build wasm` → builds the runtime itself as a freestanding `wasm32` module
@@ -135,7 +135,9 @@ needed a *toolchain* DLL (`libunwind.dll`) while every dev-box test passed, and 
   typed/untyped `select`, `if`-without-`else`, alignment ≤ natural, memory presence) and the **decoder
   rejects malformed binaries** (spec-correct LEB128 bounds, custom-section names, data-count
   consistency, reserved flag/valtype bytes). Imported tables/memories, bulk table/memory ops, the
-  **function-references** proposal, **full WasmGC** (i31/struct/array, casts, subtyping, concrete
+  **function-references** proposal, **full WasmGC** (i31/struct/array incl. the array bulk ops
+  `fill`/`copy`/`new_data`/`new_elem`/`init_data`/`init_elem` — added by R3 on 2026-08-13, having
+  been missing behind a "coverage is complete" claim since 2026-07-14 — casts, subtyping, concrete
   refs), and **exception handling** (both the exnref `throw`/`throw_ref`/`try_table` form and the legacy
   `try`/`catch`/`catch_all`/`rethrow` form), **multi-memory** (decode+execute AND text assembly),
   **threads/atomics** (the whole `0xFE` family + `shared` memories), **GC constant expressions**, and

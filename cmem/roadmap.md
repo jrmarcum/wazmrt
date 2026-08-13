@@ -182,25 +182,29 @@ call-then-return, so the one property the proposal exists to provide (unbounded 
 **A feature can be present, tested, and green while failing at exactly the thing it is for.** Same
 family as the memory64 "COMPLETE" claim above.
 
-### 🎯 REVISED conformance list (2026-08-12) — the 275, now **193** after R1 + R2
+### 🎯 REVISED conformance list (2026-08-12) — the 275, now **157** after R1 + R2 + R3
 
 Successor to the T-list above, and built differently: every item below is grouped **by cause**, from a
 run with `-Dfailures=600` so all 275 failures were read, not just each file's first. The T-list was
 grouped by first-failure text and mislabelled three of its five items.
 
-⚠️ **The per-item counts below are as-triaged (275 total) and are NOT live.** R1 and R2 are done —
-corpus is **193 failures / 61,187 passing / 2,637 skipped** (measured 2026-08-13). Of the 193, **101
-are by design** and **92 actionable**. R1 took failures out of R4/R6/R7 and R2 took them out of R4,
-R5 and the threads/table files, so every count below is high; re-measure before trusting any of them
-(`-Dfailures=600`, diff the per-file summary against the previous run).
+⚠️ **The per-item counts below are as-triaged (275 total) and are NOT live.** R1, R2 and R3 are done —
+corpus is **157 failures / 61,412 passing / 2,412 skipped** (measured 2026-08-13, after R3). Of the
+157, **95 are by design** and **62 actionable**. R1 took failures out of R4/R6/R7, R2 out of R4, R5
+and the threads/table files, and R3 emptied R6 entirely, so every count below is high; re-measure
+before trusting any of them (`-Dfailures=600`, diff the per-file summary against the previous run).
 
-**101 of the current 193 are BY DESIGN** — proposals wazmrt does not target, refused honestly. They
+**95 of the current 157 are BY DESIGN** — proposals wazmrt does not target, refused honestly. They
 are not defects and there is nothing to fix unless the scope changes:
 
 | | area | failures | note |
 | --- | --- | --- | --- |
-| — | `custom-descriptors` | 90 → **88** | untargeted proposal; exact refs + descriptors (R2's `module definition` support took 2) |
+| — | `custom-descriptors` | 90 → 88 → **82** | untargeted proposal; exact refs + descriptors (R2's `module definition` took 2, R3's elem-shorthand fix took 6) |
 | — | `custom-page-sizes` | 13 | untargeted; refused as `UnsupportedProposal` (scored as SKIPS, not passes) |
+
+⚠️ **`wide-arithmetic` 2 was counted as ACTIONABLE and is not** — it is an untargeted proposal like
+the two above, so the "101 by design / 92 actionable" split written on 2026-08-12 was off by two in
+both directions. Corrected here rather than propagated.
 
 **The 172 that are actionable, most valuable first:**
 
@@ -208,15 +212,93 @@ are not defects and there is nothing to fix unless the scope changes:
 | --- | --- | --- | --- |
 | **R1** 🔴 | **Cross-module type identity** | 25 | ✅ **FIXED 2026-08-12 — and it was 38, not 25.** See below. |
 | **R2** 🔴 | **elem / linking / instance** | 42 → 35 | ✅ **FIXED 2026-08-13 — five causes, and 44 failures, not 35.** All five files CLEAN. See below. |
-| **R3** 🟠 | **GC array data/elem ops MISSING** | ~10 | `array.new_data` / `array.init_data` / `array.new_elem` / `array.init_elem` are **absent from `opcode.zig` entirely** (`array_new_data.wast` 5, `array_init_data.wast` 2, `array.wast` 2). ⚠️ **GC is a TARGETED, shipped feature** — same shape as table64: a proposal recorded as done with a piece missing. |
+| **R3** 🟠 | **GC array bulk ops MISSING** | ~10 → **16** | ✅ **FIXED 2026-08-13 — SIX ops missing, not four, and the cost was in SKIPS, not failures.** See below. |
 | **R4** 🟠 | **Accept-invalid in core files** | ~15 | Now `table.wast` **6**, `try_table.wast` **4**, `ref.wast` 2, and others. The safety class the whole T1 effort was about, still present in the main suite. R1 took `tag.wast` 3 → 1 by type-checking tag imports; R2's tag-identity fix took `tag.wast` to **0** and `try_table` 6 → 4. |
 | **R5** 🟡 | **Runner gaps, not wazmrt defects** | 41 → **~23** | ✅ Half-closed by R2: `(module definition …)`/`(module instance …)` are implemented, so `BadCommand` is down to **2**. What remains is `(module quote …)` and **21 `NoTarget`** cascades from modules that never built. These suppress real verification rather than proving anything — the same red-washing as `(either …)` was. **Do this before quoting conformance numbers again.** |
-| **R6** 🟡 | GC type remainder + `i31` | 20 → **8** | ✅ Mostly gone with R1, exactly as predicted: `type-subtyping` and `type-rec` are **clean**; only `i31.wast` 8 remains. |
+| **R6** 🟡 | GC type remainder + `i31` | 20 → 8 → **0** | ✅ **CLOSED 2026-08-13, and R3 closed it without aiming at it.** R1 took `type-subtyping`/`type-rec`; the last 8 were `i31.wast`, and they were not an i31 defect at all — the file uses `(elem $e i31ref …)` and the assembler's `isRefType` listed only `funcref`/`externref`, so the whole segment was misread as func indices. One shorthand-table fix, `i31.wast` 8 → 0. |
 | **R7** 🟡 | threads | 15 | `proposals/threads/imports.wast` 13, `memory.wast` 2 — mostly shared-memory import matching. ⚠️ **R1 did NOT touch it** despite being "adjacent": those 13 are limits/`shared`-flag matching, not type identity. |
 | **R8** ⚠️ | **UTF-8 name validation is UNVERIFIED** | 0 failures | `utf8-invalid-encoding.wast` is **0 passed / 0 failed / 176 SKIPPED**. The 13th pass recorded UTF-8 name validation as fixed and this corpus checks **none** of it. Not a failure — a hole in the evidence, which is worse: an unverified security-relevant check reads as a passing one. Find out whether the skip is the runner's gap or ours. |
 
-**Recommended order: ~~R1~~ → ~~R2~~ → R3.** R3 is a missing piece of a feature we claim. R5 is now
-half-done and cheap to finish — do it before quoting conformance numbers again.
+**Recommended order: ~~R1~~ → ~~R2~~ → ~~R3~~ → R4 / R5.** ~~R6 is closed~~ (by R3, incidentally).
+R5 is half-done and cheap to finish — do it before quoting conformance numbers again. R4 is the
+safety class and is unmoved at `table.wast` 6 / `try_table.wast` 4 / `ref.wast` 2.
+
+### ✅ R3 IS DONE (2026-08-13) — 193 → 157, and **225 skipped assertions became real runs**
+
+**Corpus 193 → 157 failures, 61,187 → 61,412 passing, 2,637 → 2,412 skipped**, zero regressions in
+the full per-file diff. All seven target files are CLEAN: `array.wast`, `array_copy.wast`,
+`array_fill.wast`, `array_init_data.wast`, `array_init_elem.wast`, `array_new_data.wast`,
+`array_new_elem.wast` — together **20 passed / 16 failed / 197 skipped → 215 passed / 0 failed /
+2 skipped**.
+
+⚠️ **The item named four ops. SIX were missing.** `array.new_data`, `array.new_elem`,
+`array.init_data`, `array.init_elem` — *and* `array.fill` and `array.copy`, which the triage never
+mentioned because it read failure messages and every one of those files died on its *first*
+instruction. `array_fill.wast` and `array_copy.wast` each reported exactly **1 failure** while
+running **zero** assertions. **An estimate built from error messages undercounts** — third time.
+
+⚠️ **THE REAL COST WAS NEVER IN THE FAILURE COLUMN.** R3 was triaged at ~10 failures and scored 16,
+which reads as a small item. It was not: a module that fails to build takes *every assertion that
+targets it* into `NoTarget` skips, so the six missing ops were suppressing **197 assertions in the
+target files and 225 corpus-wide**. Failures went down 36; *runs* went up 225. **When triaging by
+failure count, read the SKIP column in the same row** — a file at `0 passed, 1 failed, 34 skipped`
+is a total blackout wearing the badge of a single defect.
+
+**What each op needed, and where the work actually was:**
+
+| | layer | what was missing |
+| --- | --- | --- |
+| C1 | `opcode.zig` | six `Op` tags + three new `Imm` shapes (`gc_data`, `gc_elem`, `gc_array_copy`) and their `0xFB` sub-opcodes `0x09/0x0a/0x10/0x11/0x12/0x13` |
+| C2 | `wat.zig` | the mnemonics — **this is where every `.wast` actually died**, at `UnknownInstr`, before the decoder was ever reached |
+| C3 | `validate.zig` | element-type rules (a data segment cannot initialise a *reference* element), mutability for the four writing forms, `elem_type <: t'` by subtyping, and the data-count requirement |
+| C4 | `interp.zig` | little-endian element decode at the element's own byte width, and memmove semantics for `array.copy` |
+| C5 | `features.zig` | the `.gc` classification — caught automatically by the coverage pin, which failed the build until all six were classified |
+
+⚠️ **The two operands of `array.new_data` are in DIFFERENT UNITS** — the offset counts *bytes* into
+the segment, the size counts *elements* — so the bound is `offset + size × width`. Getting this
+wrong is not a conformance nicety: with 12 bytes of segment, `array.new_data` for 12 `i32`s would
+read 48 bytes, i.e. **36 bytes past the segment**, and the arms are on the unvalidated path too.
+The in-repo test asserts the trap in both the scaled and off-by-one-byte directions.
+
+⚠️ **`array.copy` can name the SAME array twice, so it is `memmove`, not `memcpy`.** Every
+non-overlapping case passes with a forward copy; only a backward overlap exposes it, and it smears
+one element across the range when it does. A test that only copies between two distinct arrays would
+have shipped this.
+
+⚠️ **`array.copy`'s type check cannot go through `unpacked()`.** A packed `i8` element and a plain
+`i32` element both project `i32` onto the operand stack, so comparing the *unpacked* forms calls
+`(array i8)` and `(array i32)` compatible — and then copies raw bytes between arrays of different
+element widths. The storage forms must be compared first. Same family as R2's C3: **the type the
+stack shows you is not the type the memory has.**
+
+⚠️ **Two defects surfaced INSIDE the R3 files that were not R3** — the "a failure's cause count is
+not known until it passes" rule again, twice in one item:
+
+1. **`isRefType` in the assembler listed only `funcref`/`externref`**, so `(elem $e i31ref …)` fell
+   through to the *func-index* form and read `i31ref` as a function name → `BadImmediate`. It now
+   defers to `shorthandRefType`, the table the cast ops already use. This closed **R6 entirely**
+   (`i31.wast` 8 → 0) plus `br_on_cast`/`br_on_cast_fail` 5 → 2 in core and 6 → 3 under
+   `custom-descriptors`. **A second copy of a lookup table is a second place to be incomplete.**
+2. **`call_indirect $t` with no type annotation would not assemble.** The table index was consumed
+   only when a `(type …)`/`(param …)`/`(result …)` followed it, but the type use is *optional* and
+   absent means `[] -> []`, so `(call_indirect $t (i32.const 0))` left `$t` for the operand loop,
+   which tried to assemble a table name as an instruction → `UnknownInstr`. Identical shape to the
+   flat `br_table` fix: a guard tightened around one form, excluding a sibling that is equally
+   legal. `isIndexAtom` is the right predicate in both.
+
+⚠️ **A raw `0xC5` byte decoded and EXECUTED as `i32.trunc_sat_f32_s`** — found while looking for
+free `Op` values, not by a test. `0xc5..0xcc` are internal tags for the saturating-truncation ops
+(wire form `0xFC` + sub-opcode); the guard that rejects raw internal-tag bytes covered `0xd7..0xfa`
+only, and `immediateKind` classifies `0x45...0xcc` as `.none`, so eight non-opcodes were accepted as
+real instructions. The guard is now two ranges — `0xc5..0xcf` **and** `0xd7..0xfa`, because
+`0xd0..0xd6` are genuine single-byte ops sitting between them. **A guard written against the tags
+that existed when it landed does not cover the tags that already existed elsewhere**; the fix that
+introduced it stopped at the range it was debugging.
+
+**Size:** +6,144 exe / +8,258 lib / **+7,168 dll**, and unlike R2 *all* of it is R3's — the pre-R3
+commit was measured in a worktree first and sat at (exe, dll) or just under (lib) its ceiling. The
+DLL moves for the first time in three entries because these are decoder/validator/interpreter arms
+the C ABI genuinely reaches, where R2's linking work was not.
 
 ### ✅ R2 IS DONE (2026-08-13) — 237 → 193, five causes, and it was 44 failures, not 35
 
