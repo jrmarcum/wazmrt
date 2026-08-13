@@ -2711,24 +2711,31 @@ fn parseV128Const(items: []const Sexpr, start: usize, out: *[16]u8) Error!usize 
     // Number of lane values that must follow the shape atom.
     const count: usize = if (std.mem.eql(u8, shape, "i8x16")) 16 else if (std.mem.eql(u8, shape, "i16x8") or std.mem.eql(u8, shape, "f32x4") or std.mem.eql(u8, shape, "i32x4")) (if (std.mem.eql(u8, shape, "i16x8")) 8 else 4) else if (std.mem.eql(u8, shape, "i64x2") or std.mem.eql(u8, shape, "f64x2")) 2 else return error.BadImmediate;
     if (j + count > items.len) return error.BadImmediate;
+    // ⚠️ **Each lane is bounded by its OWN width, not by i32.** These arms used to
+    // parse every integer lane as an i32/i64 and then mask it down, so
+    // `v128.const i8x16 0x100 …` silently became sixteen zero bytes and
+    // `-0x81` became `0x7f`. `simd_const.wast` has ~40 `assert_malformed`s on
+    // exactly that, none of which could run before `(module quote …)` did.
+    // `parseIntLitN` refuses anything outside the lane type's signed OR unsigned
+    // range, which makes the truncation below lossless by construction.
     if (std.mem.eql(u8, shape, "i8x16")) {
         for (0..16) |k| {
-            out[k] = @intCast(@as(u32, @bitCast(@as(i32, @truncate(try parseWatI32(items[j]))))) & 0xff);
+            out[k] = @truncate(@as(u64, @bitCast(try parseIntLitN(i8, u8, items[j].asAtom() orelse return error.BadImmediate))));
             j += 1;
         }
     } else if (std.mem.eql(u8, shape, "i16x8")) {
         for (0..8) |k| {
-            std.mem.writeInt(u16, out[k * 2 ..][0..2], @truncate(@as(u64, @bitCast(try parseWatI32(items[j])))), .little);
+            std.mem.writeInt(u16, out[k * 2 ..][0..2], @truncate(@as(u64, @bitCast(try parseIntLitN(i16, u16, items[j].asAtom() orelse return error.BadImmediate)))), .little);
             j += 1;
         }
     } else if (std.mem.eql(u8, shape, "i32x4")) {
         for (0..4) |k| {
-            std.mem.writeInt(u32, out[k * 4 ..][0..4], @truncate(@as(u64, @bitCast(try parseWatI32(items[j])))), .little);
+            std.mem.writeInt(u32, out[k * 4 ..][0..4], @truncate(@as(u64, @bitCast(try parseIntLitN(i32, u32, items[j].asAtom() orelse return error.BadImmediate)))), .little);
             j += 1;
         }
     } else if (std.mem.eql(u8, shape, "i64x2")) {
         for (0..2) |k| {
-            std.mem.writeInt(u64, out[k * 8 ..][0..8], @bitCast(try parseWatI64(items[j])), .little);
+            std.mem.writeInt(u64, out[k * 8 ..][0..8], @bitCast(try parseIntLitN(i64, u64, items[j].asAtom() orelse return error.BadImmediate)), .little);
             j += 1;
         }
     } else if (std.mem.eql(u8, shape, "f32x4")) {
@@ -2848,18 +2855,121 @@ fn parseMemLimits(items: []const Sexpr, mi: *usize, is64_seen: bool, type_seen: 
     return .{ .min = min, .max = max, .shared = shared, .is64 = is64 };
 }
 
+// --- Strict numeric-literal syntax (§6.3.1) ---------------------------------
+//
+// ⚠️ **`std.fmt.parseInt`/`parseFloat` are NOT wasm-text literal parsers**, and
+// treating them as one was an accept-invalid class ~70 assertions wide. Zig's
+// grammar is close enough to look right and differs exactly where the spec is
+// strict: it takes `_` in positions wasm forbids (`0x_100`, `0x00_`,
+// `0xff__ffff`) and `parseFloat` accepts a leading-point form (`.0`, `.0e0`)
+// that wasm requires a digit before. Every one of those is an `assert_malformed`
+// in `const.wast` / `float_literals.wast` / `int_literals.wast`, and **all of
+// them were invisible until `(module quote …)` ran** — the literals only appear
+// in quoted text.
+//
+// The grammar, with the underscore rule stated once because it is the whole
+// subtlety: `_` is a *separator BETWEEN digits*, so it may never lead, trail, or
+// double.
+//
+//     num     ::= digit (_? digit)*
+//     hexnum  ::= hexdigit (_? hexdigit)*
+//     float   ::= num (. num?)? ((e|E) sign? num)?
+//     hexfloat::= 0x hexnum (. hexnum?)? ((p|P) sign? num)?
+
+fn isDigit(c: u8) bool {
+    return c >= '0' and c <= '9';
+}
+fn isHexDigit(c: u8) bool {
+    return isDigit(c) or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+}
+
+/// Consume `num`/`hexnum` at `s[i.*..]`, advancing `i`. False if there is not at
+/// least one digit, or if an `_` is not surrounded by digits on both sides.
+fn scanDigits(s: []const u8, i: *usize, comptime hex: bool) bool {
+    const ok = if (hex) isHexDigit else isDigit;
+    if (i.* >= s.len or !ok(s[i.*])) return false; // must START with a digit
+    while (i.* < s.len) {
+        if (ok(s[i.*])) {
+            i.* += 1;
+        } else if (s[i.*] == '_') {
+            // A separator needs a digit on each side: the previous character is
+            // one by construction, so only the NEXT has to be checked.
+            if (i.* + 1 >= s.len or !ok(s[i.* + 1])) return false;
+            i.* += 1;
+        } else break;
+    }
+    return true;
+}
+
+/// Is `lit` a syntactically valid wasm-text integer literal (`sign? uN`)?
+fn validIntLit(lit: []const u8) bool {
+    var i: usize = 0;
+    if (i < lit.len and (lit[i] == '+' or lit[i] == '-')) i += 1;
+    const hex = std.mem.startsWith(u8, lit[i..], "0x") or std.mem.startsWith(u8, lit[i..], "0X");
+    if (hex) i += 2;
+    if (!(if (hex) scanDigits(lit, &i, true) else scanDigits(lit, &i, false))) return false;
+    return i == lit.len; // no trailing junk
+}
+
+/// Is `lit` a syntactically valid wasm-text float literal? Covers `inf`/`nan`
+/// and the `nan:…` payload forms as well as `float`/`hexfloat`.
+fn validFloatLit(lit: []const u8) bool {
+    var i: usize = 0;
+    if (i < lit.len and (lit[i] == '+' or lit[i] == '-')) i += 1;
+    const rest = lit[i..];
+    if (std.mem.eql(u8, rest, "inf")) return true;
+    if (std.mem.eql(u8, rest, "nan")) return true;
+    if (std.mem.startsWith(u8, rest, "nan:")) {
+        const tail = rest[4..];
+        if (std.mem.eql(u8, tail, "canonical") or std.mem.eql(u8, tail, "arithmetic")) return true;
+        if (!std.mem.startsWith(u8, tail, "0x")) return false;
+        var j: usize = 2;
+        return scanDigits(tail, &j, true) and j == tail.len;
+    }
+    const hex = std.mem.startsWith(u8, rest, "0x") or std.mem.startsWith(u8, rest, "0X");
+    if (hex) i += 2;
+    if (!(if (hex) scanDigits(lit, &i, true) else scanDigits(lit, &i, false))) return false;
+    if (i < lit.len and lit[i] == '.') {
+        i += 1;
+        // The fraction is OPTIONAL (`1.` is valid) but must be well-formed if present.
+        if (i < lit.len and (if (hex) isHexDigit(lit[i]) else isDigit(lit[i]))) {
+            if (!(if (hex) scanDigits(lit, &i, true) else scanDigits(lit, &i, false))) return false;
+        }
+    }
+    if (i < lit.len) {
+        // The exponent marker is `p`/`P` for hexfloat, `e`/`E` for decimal —
+        // crossing them (`0x1e5`, `1p3`) is not an exponent at all.
+        const marker: [2]u8 = if (hex) .{ 'p', 'P' } else .{ 'e', 'E' };
+        if (lit[i] != marker[0] and lit[i] != marker[1]) return false;
+        i += 1;
+        if (i < lit.len and (lit[i] == '+' or lit[i] == '-')) i += 1;
+        if (!scanDigits(lit, &i, false)) return false; // the exponent is always decimal
+    }
+    return i == lit.len;
+}
+
+/// Parse an `iN` literal that must fit N bits in EITHER spelling — signed
+/// `[-2^(N-1), 2^(N-1)-1]` or unsigned `[0, 2^N-1]` — and return it as the
+/// sign-extended pattern the SLEB encoder wants.
+///
+/// ⚠️ **`i32.const 0x100000000` used to become `0`.** The old code parsed into an
+/// `i64` and `@truncate`d, so an out-of-range literal was silently reinterpreted
+/// rather than refused — a wrong VALUE compiled from valid-looking source, not
+/// merely a missed `assert_malformed`. §6.3.2 says a literal outside the type's
+/// range is malformed, and `const.wast` pins ~20 of them.
+fn parseIntLitN(comptime S: type, comptime U: type, atom: []const u8) Error!i64 {
+    if (!validIntLit(atom)) return error.BadImmediate;
+    if (std.fmt.parseInt(S, atom, 0)) |v| return v else |_| {}
+    if (std.fmt.parseInt(U, atom, 0)) |u| return @as(S, @bitCast(u)) else |_| {}
+    return error.BadImmediate;
+}
+
 fn parseWatI32(s: Sexpr) Error!i64 {
-    const atom = s.asAtom() orelse return error.BadImmediate;
-    const v = std.fmt.parseInt(i64, atom, 0) catch (std.fmt.parseInt(u32, atom, 0) catch return error.BadImmediate);
-    return @as(i32, @truncate(v)); // sign-extended back to i64 for SLEB
+    return parseIntLitN(i32, u32, s.asAtom() orelse return error.BadImmediate);
 }
 
 fn parseWatI64(s: Sexpr) Error!i64 {
-    const atom = s.asAtom() orelse return error.BadImmediate;
-    return std.fmt.parseInt(i64, atom, 0) catch {
-        const u = std.fmt.parseInt(u64, atom, 0) catch return error.BadImmediate;
-        return @bitCast(u);
-    };
+    return parseIntLitN(i64, u64, s.asAtom() orelse return error.BadImmediate);
 }
 
 fn floatBits(ctx: *Ctx, comptime U: type, s: Sexpr) Error!void {
@@ -2875,20 +2985,54 @@ fn floatBits(ctx: *Ctx, comptime U: type, s: Sexpr) Error!void {
 /// ordinary values plus plain `inf`/`nan`; this adds the wasm `nan:canonical` /
 /// `nan:arithmetic` / `nan:0x<payload>` forms. Returns null on a malformed literal.
 fn floatLitBits(comptime U: type, comptime F: type, lit: []const u8) ?U {
-    if (std.mem.indexOfScalar(u8, lit, ':')) |c| {
+    // Syntax first, value second: `std.fmt.parseFloat` would happily take `.0`
+    // and `0x_1.0`, which the text format does not define. See `validFloatLit`.
+    if (!validFloatLit(lit)) return null;
+    // Every `nan` form goes through here, including the BARE one.
+    //
+    // ⚠️ This used to key on the presence of a `:`, so `nan:0x…`/`nan:canonical`
+    // got their sign bit applied and a plain `-nan` did not — it fell through to
+    // `std.fmt.parseFloat`, which returns a positive NaN. `float_literals.wast`'s
+    // `f32.negative_nan`/`f64.negative_nan` are exactly that, and they were
+    // failing before R5 too; the sign of a NaN is observable through
+    // `f32.copysign` and `i32.reinterpret_f32`, so this is a wrong VALUE, not a
+    // cosmetic bit.
+    const neg = lit.len != 0 and lit[0] == '-';
+    const body = if (lit.len != 0 and (lit[0] == '-' or lit[0] == '+')) lit[1..] else lit;
+    if (std.mem.startsWith(u8, body, "nan")) {
         const canonical: U = if (F == f32) 0x7fc00000 else 0x7ff8000000000000;
         const sign_bit: U = @as(U, 1) << (@bitSizeOf(F) - 1);
         const mant_mask: U = (@as(U, 1) << std.math.floatMantissaBits(F)) - 1;
         var bits: U = canonical;
-        const tail = lit[c + 1 ..];
-        if (!std.mem.eql(u8, tail, "canonical") and !std.mem.eql(u8, tail, "arithmetic")) {
-            const payload = std.fmt.parseInt(U, tail, 0) catch return null;
-            bits = (canonical & ~mant_mask) | (payload & mant_mask);
+        if (std.mem.startsWith(u8, body, "nan:")) {
+            const tail = body[4..];
+            // `nan:canonical` / `nan:arithmetic` are RESULT MATCHERS in a `.wast`
+            // assertion, not values: no module may contain them, and
+            // `(f32.const nan:arithmetic)` is malformed. `wast.zig` recognises the
+            // two spellings itself (it has to compare a *class* of NaNs, not a bit
+            // pattern), so this parser — which exists only to emit a module — must
+            // refuse them rather than quietly encode a canonical NaN.
+            if (std.mem.eql(u8, tail, "canonical") or std.mem.eql(u8, tail, "arithmetic")) return null;
+            {
+                const payload = std.fmt.parseInt(U, tail, 0) catch return null;
+                // A NaN payload of zero would encode an INFINITY, not a NaN.
+                if (payload & mant_mask == 0) return null;
+                bits = (canonical & ~mant_mask) | (payload & mant_mask);
+            }
         }
-        if (lit.len != 0 and lit[0] == '-') bits |= sign_bit;
+        if (neg) bits |= sign_bit;
         return bits;
     }
     const f = parseFloatLit(F, lit) orelse return null;
+    // §6.3.3: a float literal that ROUNDS TO INFINITY is out of range — only the
+    // literal `inf` may produce one. `0x1p128` is 2^128, past f32's maximum, and
+    // silently became `+inf`: a wrong value, and one that then compares equal to
+    // a legitimate overflow result.
+    //
+    // The `inf` spelling has to be excluded explicitly. Writing this check as a
+    // bare `isInf` first REJECTED `inf` — the guard has to distinguish "the value
+    // is infinite" from "the source said infinite", which is the whole rule.
+    if (std.math.isInf(f) and !std.mem.eql(u8, body, "inf")) return null;
     return @bitCast(f);
 }
 
@@ -4656,6 +4800,114 @@ test "GC array: array.new_fixed builds from operands" {
         \\      (i32.const 2))))
     ;
     try std.testing.expectEqual(@as(i32, 30), interp.asI32(try assembleAndRun(src, "third", &.{})));
+}
+
+// --- R5 (2026-08-13): strict numeric literals --------------------------------
+// None of these could be reached from the spec suite until `(module quote …)`
+// was implemented — the literals only appear inside quoted module text.
+
+test "R5: literal syntax follows the wasm text format, not Zig's" {
+    // `_` is a separator BETWEEN digits: never leading, trailing, or doubled.
+    for ([_][]const u8{ "0x_100", "0x00_", "0xff__ffff", "_100", "100_", "1__0" }) |bad| {
+        std.testing.expect(!validIntLit(bad)) catch |e| {
+            std.debug.print("accepted a bad int literal: {s}\n", .{bad});
+            return e;
+        };
+    }
+    for ([_][]const u8{ "0", "100", "1_0", "0xff", "0xff_ff", "-1", "+0x7f" }) |good| {
+        std.testing.expect(validIntLit(good)) catch |e| {
+            std.debug.print("rejected a good int literal: {s}\n", .{good});
+            return e;
+        };
+    }
+    // A float needs a digit before the point, and the same underscore rule; the
+    // exponent marker belongs to its own radix (`e` decimal, `p` hex).
+    // `0x1e5p1` is deliberately in the GOOD list below: in hex, `e` is a digit and
+    // `p` is the marker, so it reads as 0x1e5 × 2¹. Writing it here first was a
+    // test bug, not a code one — the radix decides which letters are digits.
+    for ([_][]const u8{ ".0", ".0e0", "0x_1.0", "1e", "1e+", "0x1p", "1p3", "1e5p1", "nan:0x_1" }) |bad| {
+        std.testing.expect(!validFloatLit(bad)) catch |e| {
+            std.debug.print("accepted a bad float literal: {s}\n", .{bad});
+            return e;
+        };
+    }
+    for ([_][]const u8{ "0.0", "1.", "1e5", "1E+5", "0x1p3", "0x1.8p+1", "0x1e5p1", "0xff", "inf", "-inf", "nan", "-nan", "nan:0x200000", "nan:canonical" }) |good| {
+        std.testing.expect(validFloatLit(good)) catch |e| {
+            std.debug.print("rejected a good float literal: {s}\n", .{good});
+            return e;
+        };
+    }
+}
+
+test "R5: a constant outside its type's range is refused, not truncated" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Silently truncating is the dangerous half: `i32.const 0x100000000` became 0,
+    // a wrong VALUE compiled from source that looked fine. Each lane of a
+    // `v128.const` is bounded by its own width for the same reason.
+    for ([_][]const u8{
+        "(module (func (i32.const 0x100000000) drop))",
+        "(module (func (i64.const 0x10000000000000000) drop))",
+        "(module (func (v128.const i8x16 0x100 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0) drop))",
+        "(module (func (v128.const i8x16 -0x81 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0) drop))",
+        "(module (func (v128.const i16x8 0x10000 0 0 0 0 0 0 0) drop))",
+        "(module (func (f32.const 0x1p128) drop))", // rounds to inf -> out of range
+        "(module (func (f32.const nan:arithmetic) drop))", // a matcher, not a value
+    }) |src| {
+        std.testing.expectError(error.BadImmediate, assemble(a, src)) catch |e| {
+            std.debug.print("accepted an out-of-range constant: {s}\n", .{src});
+            return e;
+        };
+    }
+
+    // ⚠️ The syntax cases belong HERE, going through `assemble`, not only in the
+    // predicate test above. Inverting the fix showed why: disabling the
+    // `validIntLit`/`validFloatLit` CALL SITES left the predicate test green,
+    // because it calls the predicates directly. A test of a rule is not a test
+    // that the rule is consulted.
+    for ([_][]const u8{
+        "(module (func (i32.const 0x_100) drop))",
+        "(module (func (i32.const 0x00_) drop))",
+        "(module (func (i32.const 0xff__ffff) drop))",
+        "(module (func (f32.const .0) drop))",
+        "(module (func (f32.const .0e0) drop))",
+        "(module (func (f32.const 0x_1.0) drop))",
+    }) |src| {
+        std.testing.expectError(error.BadImmediate, assemble(a, src)) catch |e| {
+            std.debug.print("accepted an out-of-range constant: {s}\n", .{src});
+            return e;
+        };
+    }
+
+    // The boundary values on both spellings must still assemble, and `inf` — the
+    // one literal allowed to BE infinite — must survive the overflow check.
+    for ([_][]const u8{
+        "(module (func (i32.const 0xffffffff) drop))",
+        "(module (func (i32.const -0x80000000) drop))",
+        "(module (func (i64.const 0xffffffffffffffff) drop))",
+        "(module (func (f32.const inf) drop))",
+        "(module (func (f32.const -inf) drop))",
+        "(module (func (v128.const i8x16 0xff -0x80 0 0 0 0 0 0 0 0 0 0 0 0 0 0) drop))",
+    }) |src| {
+        _ = assemble(a, src) catch |e| {
+            std.debug.print("rejected a valid constant: {s}\n", .{src});
+            return e;
+        };
+    }
+}
+
+test "R5: a negative NaN keeps its sign bit" {
+    // `-nan` fell through to std.fmt.parseFloat, which returns a POSITIVE NaN, so
+    // the sign — observable via reinterpret/copysign — was silently dropped.
+    const src =
+        \\(module
+        \\  (func (export "neg") (result i32) (i32.reinterpret_f32 (f32.const -nan)))
+        \\  (func (export "pos") (result i32) (i32.reinterpret_f32 (f32.const nan))))
+    ;
+    try std.testing.expectEqual(@as(i32, @bitCast(@as(u32, 0xffc00000))), interp.asI32(try assembleAndRun(src, "neg", &.{})));
+    try std.testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x7fc00000))), interp.asI32(try assembleAndRun(src, "pos", &.{})));
 }
 
 // --- R4 (2026-08-13): the accept-invalid class in core spec files ------------

@@ -40,6 +40,41 @@ fn nth(items: []const Sexpr, i: usize) Error!Sexpr {
     return if (i < items.len) items[i] else error.BadCommand;
 }
 /// A form as a string literal (an action/register name), or `error.BadCommand`.
+/// A `(module quote …)` payload is EITHER a complete `(module …)` form or a bare
+/// sequence of module fields (`"(func …)" "(global …)"`) — the spec's text format
+/// allows both, and the corpus uses both, sometimes with the opening `(module`
+/// split across string pieces. Wrap only when the text does not already open one.
+///
+/// The test is deliberately syntactic and cheap: skip whitespace and comments,
+/// then look for `(module` followed by a delimiter. Getting it wrong is safe in
+/// one direction only — wrapping an already-complete module yields
+/// `(module (module …))`, which fails to assemble and would score a malformed
+/// module as correctly rejected **for the wrong reason**, the false-pass shape
+/// R4 hit with `StackUnderflow`. Hence the explicit delimiter check rather than
+/// a bare `startsWith`.
+fn wrapModuleText(a: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var i: usize = 0;
+    while (i < text.len) {
+        switch (text[i]) {
+            ' ', '\t', '\r', '\n' => i += 1,
+            ';' => { // `;;` line comment — a quoted module may lead with one
+                if (i + 1 >= text.len or text[i + 1] != ';') break;
+                while (i < text.len and text[i] != '\n') i += 1;
+            },
+            else => break,
+        }
+    }
+    const rest = text[i..];
+    const kw = "(module";
+    const already = std.mem.startsWith(u8, rest, kw) and
+        (rest.len == kw.len or switch (rest[kw.len]) {
+            ' ', '\t', '\r', '\n', '(', ')', ';', '$' => true,
+            else => false,
+        });
+    if (already) return text;
+    return std.fmt.allocPrint(a, "(module {s})", .{text});
+}
+
 fn asStr(s: Sexpr) Error![]const u8 {
     return switch (s) {
         .string => |x| x,
@@ -184,6 +219,8 @@ const Runner = struct {
             try self.assertTrap(cmd.asList().?);
         } else if (std.mem.eql(u8, kw, "assert_exhaustion")) {
             try self.assertExhaustion(cmd.asList().?);
+        } else if (std.mem.eql(u8, kw, "assert_exception")) {
+            try self.assertException(cmd.asList().?);
         } else if (std.mem.eql(u8, kw, "assert_invalid") or std.mem.eql(u8, kw, "assert_malformed")) {
             try self.assertRejected(cmd.asList().?);
         } else if (std.mem.eql(u8, kw, "assert_unlinkable")) {
@@ -463,7 +500,34 @@ const Runner = struct {
                     };
                     return bytes.items;
                 }
-                return error.BadCommand; // (module quote …) not supported yet
+                // `(module quote "…" …)` — the module given as SOURCE TEXT, in one
+                // or more string literals. The lexer has already resolved escapes
+                // to bytes, so `"\80"` really is byte 0x80 here; that is the whole
+                // point for the UTF-8 corpus, whose names must reach the decoder
+                // with their invalid bytes intact.
+                //
+                // ⚠️ **This single `BadCommand` was suppressing 1,291 assertions**
+                // — more than half of every skip in the suite — because a `quote`
+                // module is how the spec tests anything about *text*: malformed
+                // literals, bad tokens, invalid names. `utf8-invalid-encoding.wast`
+                // is 176 of them, which is why UTF-8 name validation could be
+                // recorded as fixed and be checked by nothing (R8).
+                if (std.mem.eql(u8, kw, "quote")) {
+                    var text: std.ArrayList(u8) = .empty;
+                    for (form[i + 1 ..]) |it| switch (it) {
+                        // Pieces are separate source lines. A newline (not a space)
+                        // is the safe join: a piece may end in a line comment, and
+                        // `";; …" "(func)"` concatenated on one line would swallow
+                        // the next piece.
+                        .string => |s| {
+                            try text.appendSlice(self.a, s);
+                            try text.append(self.a, '\n');
+                        },
+                        else => {},
+                    };
+                    return wat.assemble(self.a, try wrapModuleText(self.a, text.items));
+                }
+                return error.BadCommand;
             }
         }
         return wat.assembleModule(self.a, form);
@@ -691,6 +755,30 @@ const Runner = struct {
             // bug (UnsupportedInstruction, UndefinedFunc, a decode/assemble error)
             // must NOT be green-washed as the expected trap.
             if (e == error.NoTarget) self.summary.skipped += 1 else if (isRuntimeTrap(e)) self.summary.passed += 1 else self.fail("assert_trap: non-trap error {s}", .{@errorName(e)});
+        }
+    }
+
+    /// `assert_exception (invoke …)` — the action must terminate with an UNCAUGHT
+    /// exception (EH proposal). Distinct from `assert_trap`: any runtime trap
+    /// satisfies that, but only `UncaughtException` satisfies this, so a module
+    /// that traps for an unrelated reason is a failure and not a pass.
+    ///
+    /// ⚠️ 41 of these were being skipped as an unknown command keyword — in
+    /// `throw.wast`, `throw_ref.wast`, `try_table.wast` and the three legacy EH
+    /// files, i.e. exactly the assertions that check exceptions actually ESCAPE.
+    /// The EH implementation was carrying that property untested.
+    fn assertException(self: *Runner, form: []const Sexpr) Error!void {
+        if (form.len < 2) return self.fail("assert_exception: missing action", .{});
+        if (self.runAction(form[1])) |_| {
+            self.fail("assert_exception: expected an exception, got a result", .{});
+        } else |e| {
+            if (e == error.NoTarget) {
+                self.summary.skipped += 1;
+            } else if (e == error.UncaughtException) {
+                self.summary.passed += 1;
+            } else {
+                self.fail("assert_exception: got {s}", .{@errorName(e)});
+            }
         }
     }
 
@@ -1681,13 +1769,36 @@ test "assert_invalid/malformed does not count OUR limitations as passes" {
     // verdicts; this was the arm that didn't.
     const gpa = std.testing.allocator;
 
-    // (a) `(module quote …)` is unimplemented -> BadCommand -> must SKIP.
+    // (a) A limitation reached THROUGH `(module quote …)` must still skip. The
+    //     original case here used `(module quote …)` itself as the example of an
+    //     unimplemented form; R5 implemented it, so the example moved inside the
+    //     quoted text while the property being tested did not change.
     {
-        const src = "(assert_malformed (module quote \"not wasm\") \"unexpected token\")";
+        const src = "(assert_malformed (module quote \"(func (some.bogus.instruction))\") \"unexpected token\")";
         const s = try runScript(gpa, src);
         try std.testing.expectEqual(@as(usize, 0), s.passed);
         try std.testing.expectEqual(@as(usize, 0), s.failed);
         try std.testing.expectEqual(@as(usize, 1), s.skipped);
+    }
+
+    // (a2) …and a quoted module that is GENUINELY malformed must now pass, which
+    //      is the whole point of implementing the form. Before R5 this scored as a
+    //      skip, and 1,291 assertions across the suite went with it.
+    {
+        const src = "(assert_malformed (module quote \"(func (i32.const 0x100000000) drop)\") \"constant out of range\")";
+        const s = try runScript(gpa, src);
+        try std.testing.expectEqual(@as(usize, 1), s.passed);
+        try std.testing.expectEqual(@as(usize, 0), s.failed);
+        try std.testing.expectEqual(@as(usize, 0), s.skipped);
+    }
+
+    // (a3) A quoted module that is VALID must build — the wrapping has to accept
+    //      both a bare field sequence and a complete `(module …)` form.
+    {
+        const s = try runScript(gpa, "(module quote \"(func (export \\\"f\\\"))\")");
+        try std.testing.expectEqual(@as(usize, 0), s.failed);
+        const s2 = try runScript(gpa, "(module quote \"(module (func (export \\\"f\\\")))\")");
+        try std.testing.expectEqual(@as(usize, 0), s2.failed);
     }
 
     // (b) an unknown mnemonic is an ASSEMBLER gap, not evidence of invalidity.

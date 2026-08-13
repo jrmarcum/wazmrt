@@ -99,6 +99,27 @@
 # Lowered rather than left with headroom, per the policy at the top of this file: a ceiling is
 # exact, and a win that is not recorded is headroom for the next unnoticed drift.
 
-wazmrt.exe  944640
-wazmrt.lib  1007328
-wazmrt.dll  871424
+# RAISED 2026-08-13 (R5 — the runner gap, and the literal class it exposed). Measured
+# ReleaseSmall, Zig 0.16.0, x86_64-windows, static lib from a PLAIN `zig build` re-run after
+# `zig build dll`.
+#
+#   artifact       after R4      after R5      R5's share
+#   wazmrt.exe      944,640       951,808          +7,168
+#   wazmrt.lib    1,007,328     1,014,058          +6,730
+#   wazmrt.dll      871,424       876,544          +5,120
+#
+# All of it is R5's, and this is the one case where no worktree measurement was needed: the
+# previous commit set these ceilings TO its own measured values, so delta-vs-ceiling and
+# delta-vs-parent are the same number. (That is a property of the exact-ceiling policy, not a
+# general licence to skip the check — attribute first whenever the ceilings carry any slack.)
+#
+# What bought the bytes: `(module quote …)` in the WAST runner (assemble module text at run time,
+# plus the field-vs-module wrapping), `assert_exception`, and — the bulk of it — the strict
+# numeric-literal grammar in `wat.zig`: `validIntLit`/`validFloatLit`/`scanDigits`/`parseIntLitN`,
+# which replace `std.fmt.parseInt`/`parseFloat` as the ARBITER of what is a wasm literal. Those
+# functions are pure syntax and cost real bytes; they also close ~146 accept-invalid assertions
+# that nothing could reach before.
+
+wazmrt.exe  951808
+wazmrt.lib  1014058
+wazmrt.dll  876544
