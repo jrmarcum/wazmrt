@@ -180,6 +180,30 @@ see `known-issues.md` on why they had drifted.)*
   (`error.CrossStoreLink`) rather than silently reinterpreted. See the entry below for what this
   replaced.
 
+### The accept-invalid class is CLOSED in core spec files — R4, 2026-08-13
+
+**wazmrt no longer accepts any module the core spec testsuite calls invalid.** The 29 `assert_invalid`
+failures that remain are 20 in `custom-descriptors` and 9 in `proposals/threads` — an untargeted
+proposal and R7's item. This is the property the T-list opened with in 2026-08-11 and it took four
+passes to reach.
+
+Why it belongs here rather than only in the conformance record: **`wasm_module_validate` is a shipped
+C-ABI entry point**, so every accepted-but-invalid module is the embedder asking "is this safe to
+run?" and being told yes. None of R4's five was memory-unsafe on its own — the interpreter's own
+bounds checks hold regardless — but each one is the verifier disagreeing with the specification an
+embedder is entitled to assume.
+
+- ⚠️ **One of the five could not have been found by testing.** The `try_table` catch-label off-by-one
+  was identical in the assembler, the validator and the interpreter, so every round trip agreed. A
+  verifier and the thing it verifies sharing a mistake is the same shape as R2's `call_indirect` type
+  check, one level up: there, the check read the callee's type from the same wrong module; here,
+  three components computed the same wrong label depth. **Ask what the verifier and the verified have
+  in common** — and count how many implementations of the rule exist.
+- ⚠️ **The regression guard is one grep.** Over a `-Dfailures=600` conformance run,
+  `grep "should be rejected"` is the entire accept-invalid class. Run it after any decoder or
+  validator change; a new hit is a security-relevant regression even when the failure count as a
+  whole improves.
+
 ### Eight non-opcodes were decoded and EXECUTED — CLOSED 2026-08-13 (R3)
 
 **Not reachable as an escape, and recorded because the reasoning that let it survive is the reusable

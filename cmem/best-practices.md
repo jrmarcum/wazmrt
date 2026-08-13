@@ -85,6 +85,22 @@ Searching `capi.zig` for `funcTypeEq|matchExtern|TypeMismatch` returned nothing,
 import type checking at all" was nearly written into memory. It checks — inline, unnamed, with raw
 `!=`. — R1, `known-issues.md`
 
+**When a rule is off by a CONSTANT, look for failures in both directions.** R4's catch-label
+off-by-one was filed as an accept-invalid item; the same one-frame error was also rejecting valid
+modules in the same file. An item framed as "things we wrongly accept" will not make you look for the
+things you wrongly reject — check both before believing the framing. — R4, `roadmap.md`
+
+**A test that encodes the same misreading as the code is not evidence — it is the misreading,
+restated.** R4's `C.refs` rule was wrong in the code, in the comment above it, and in a unit test
+asserting the wrong case valid under a heading that miscounted the positions. When a fix breaks
+existing tests, decide which of the two encodes the rule by checking the spec and the external
+corpus, never by which one is older. — R4, `testing.md`
+
+**A negative assertion satisfied by the WRONG error is a false pass.** R4's `if (result (ref 1))`
+case was already "rejected" — with `StackUnderflow`, from an unrelated malformation — so it scored
+green while testing nothing. Same family as counting our own limitations as passes. — R4,
+`known-issues.md`
+
 **A failure's cause count is not known until it PASSES.** Fixing one defect twice exposed the next
 one inside the same failure: `linking.wast` L410 went from `result mismatch 0x4` to `trap
 UndefinedFunc` when funcref identity was fixed — the wrong answer had been hiding a segment-ordering
@@ -136,6 +152,28 @@ groups, and element-segment types. — `known-issues.md`
 
 **A decoder rule with no matching emitter rule is a bug that hides itself.** Any conformance failure
 reaching the WAT path must be checked at BOTH ends before the runtime is suspected. — `known-issues.md`
+
+**Two consumers agreeing is not corroboration when they share the mistake — and there can be THREE.**
+R4's `try_table` catch label was resolved one frame too deep by the assembler, the validator *and*
+the interpreter, identically, so every round trip was self-consistent and the whole corpus was green.
+No test could have found it; only the spec rule did. Count the implementations of a rule before
+trusting that they check each other. — R4, `roadmap.md`
+
+**A workaround in the producer for a gap in the consumer does not stay cosmetic.** `readBlockType`
+could not decode a concrete-ref block type, so the assembler interned a function signature instead —
+which MANUFACTURED a type-section entry and made `(block (result (ref 1)))` valid in a module with
+one type. Fix the gap; don't route around it. — R4, `known-issues.md`
+
+**An encoding chosen to make EXECUTION agree can erase the distinction VALIDATION runs on.** A table
+initializer was lowered to an equivalent element segment — identical table state, and no longer
+distinguishable from a table that declares no starting value, which is exactly what the
+defaultability rule tests. Ask what the encoding you picked throws away, not just what it preserves.
+— R4, `roadmap.md`
+
+**A tag added to one of two readers works in half the positions.** `exnref_nn` reached `types.zig`
+and `readBlockType` but not `Module.readValType`, so `(ref exn)` round-tripped as a block type and
+was `BadValType` everywhere else. When a type gains an encoding, grep for every reader of that
+encoding. — R4, `known-issues.md`
 
 **Fixing only the consumer rejects valid input.** Finality was thrown away by the decoder *and*
 mis-emitted by the assembler; repairing the validator alone turned a silent accept into a loud reject

@@ -213,6 +213,29 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
   `UnknownInstr` from `wat.zig`, because the corpus reaches the decoder only
   through the text path. When triaging an instruction-level failure, the file
   named by the error is rarely the file to fix.
+- ⚠️ **THE ASSEMBLER IS PART OF THE VALIDATION SURFACE (R4, 2026-08-13).** Two
+  accept-invalid classes were caused by encodings chosen here, not by missing
+  validator rules:
+  - `(table N reftype initexpr)` was lowered to a synthetic active element segment
+    of N copies, which is execution-equivalent and **validation-destroying**: a
+    table with an initializer and one with an element segment differ in exactly
+    the property the defaultability rule tests, so `(table 0 (ref func))` could not
+    be told from a legal table. It now emits §5.5.6's `0x40 0x00 tt expr` form —
+    which also retired the `max_table_init_copies` cap, since there are no copies.
+  - A single concrete-ref block type was emitted as an INTERNED type index, because
+    `readBlockType` could not decode the canonical `0x63/0x64 heaptype` valtype.
+    Interning creates a type-section entry, so `(block (result (ref 1)))` in a
+    one-type module made index 1 exist — as the block's own signature — and the
+    module validated. Both ends are canonical now.
+
+  **Before choosing an encoding, ask what it erases, not only what it preserves.**
+- ⚠️ **`try_table` catch labels resolve in the ENCLOSING scope (R4).** The
+  try_table's own label is pushed for its BODY only, so `emitCatchClauses` runs
+  before `ctx.labels.append`. This was wrong here, in `validate.zig` and in
+  `interp.zig` — all three off by the same frame, so they agreed and the corpus
+  passed. Numeric catch labels are emitted verbatim and were unaffected; only
+  `$name` targets moved, which is why the breakage appeared as *runtime* failures
+  in `catch-complex-1`-style modules rather than as assembly errors.
 - **Self-contained.** No external assembler at build or test time (matches the
   libc-free / no-deps ethos).
 - Coverage tracks the interpreter: instructions the interpreter can't yet run

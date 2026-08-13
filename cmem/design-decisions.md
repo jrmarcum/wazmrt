@@ -558,9 +558,14 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
     commit that touches `src/`. **Attribute an overshoot before paying for it** — build the parent
     commit in a `git worktree` and diff, rather than assuming the growth is yours; R2's true share
     of that overshoot was +5,120 / +1,068 / **+0**, while R3's was **all of it** (+6,144 / +8,258 /
-    +7,168). Both answers are only worth having because the parent was actually measured.
-    **Live sizes (2026-08-13 after R3, ReleaseSmall, Zig 0.16.0, x86_64-windows):** exe **945,152**,
-    static lib **1,007,444**, dll **871,936**. ⚠️ Measure the static lib from a PLAIN `zig build` —
+    +7,168). Both answers are only worth having because the parent was actually measured. R4 then
+    went the other way — **−512 / −116 / −512, and the ceilings were LOWERED to match**: it deleted
+    two assembler workarounds (the N-copies table-init lowering and its `max_table_init_copies` cap,
+    and the interned block-type signature) that cost more than the five validation rules it added.
+    **Removing a workaround can pay for the rule that made it unnecessary**, and a win left
+    unrecorded is headroom for the next unnoticed drift.
+    **Live sizes (2026-08-13 after R4, ReleaseSmall, Zig 0.16.0, x86_64-windows):** exe **944,640**,
+    static lib **1,007,328**, dll **871,424**. ⚠️ Measure the static lib from a PLAIN `zig build` —
     `zig build dll` overwrites `wazmrt.lib` with the DLL's much smaller import library. ⚠️ And
     **`zig build` does not produce the DLL at all**, so the gate silently grades a stale one: R3's
     first run reported the DLL at exactly its ceiling, from a file two builds old. **A delta of

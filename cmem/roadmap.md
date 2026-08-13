@@ -182,25 +182,26 @@ call-then-return, so the one property the proposal exists to provide (unbounded 
 **A feature can be present, tested, and green while failing at exactly the thing it is for.** Same
 family as the memory64 "COMPLETE" claim above.
 
-### 🎯 REVISED conformance list (2026-08-12) — the 275, now **157** after R1 + R2 + R3
+### 🎯 REVISED conformance list (2026-08-12) — the 275, now **143** after R1 + R2 + R3 + R4
 
 Successor to the T-list above, and built differently: every item below is grouped **by cause**, from a
 run with `-Dfailures=600` so all 275 failures were read, not just each file's first. The T-list was
 grouped by first-failure text and mislabelled three of its five items.
 
-⚠️ **The per-item counts below are as-triaged (275 total) and are NOT live.** R1, R2 and R3 are done —
-corpus is **157 failures / 61,412 passing / 2,412 skipped** (measured 2026-08-13, after R3). Of the
-157, **95 are by design** and **62 actionable**. R1 took failures out of R4/R6/R7, R2 out of R4, R5
-and the threads/table files, and R3 emptied R6 entirely, so every count below is high; re-measure
-before trusting any of them (`-Dfailures=600`, diff the per-file summary against the previous run).
+⚠️ **The per-item counts below are as-triaged (275 total) and are NOT live.** R1–R4 are done and R6
+was closed by R3 — corpus is **143 failures / 61,429 passing / 2,407 skipped** (measured 2026-08-13,
+after R4). Of the 143, **97 are by design** and **46 actionable**. Every count below is high;
+re-measure before trusting any of them (`-Dfailures=600`, diff the per-file summary against the
+previous run).
 
-**95 of the current 157 are BY DESIGN** — proposals wazmrt does not target, refused honestly. They
+**97 of the current 143 are BY DESIGN** — proposals wazmrt does not target, refused honestly. They
 are not defects and there is nothing to fix unless the scope changes:
 
 | | area | failures | note |
 | --- | --- | --- | --- |
-| — | `custom-descriptors` | 90 → 88 → **82** | untargeted proposal; exact refs + descriptors (R2's `module definition` took 2, R3's elem-shorthand fix took 6) |
+| — | `custom-descriptors` | 90 → 88 → 82 | untargeted proposal; exact refs + descriptors (R2's `module definition` took 2, R3's elem-shorthand fix took 6) |
 | — | `custom-page-sizes` | 13 | untargeted; refused as `UnsupportedProposal` (scored as SKIPS, not passes) |
+| — | `wide-arithmetic` | 2 | untargeted; was miscounted as actionable until R3 |
 
 ⚠️ **`wide-arithmetic` 2 was counted as ACTIONABLE and is not** — it is an untargeted proposal like
 the two above, so the "101 by design / 92 actionable" split written on 2026-08-12 was off by two in
@@ -213,15 +214,85 @@ both directions. Corrected here rather than propagated.
 | **R1** 🔴 | **Cross-module type identity** | 25 | ✅ **FIXED 2026-08-12 — and it was 38, not 25.** See below. |
 | **R2** 🔴 | **elem / linking / instance** | 42 → 35 | ✅ **FIXED 2026-08-13 — five causes, and 44 failures, not 35.** All five files CLEAN. See below. |
 | **R3** 🟠 | **GC array bulk ops MISSING** | ~10 → **16** | ✅ **FIXED 2026-08-13 — SIX ops missing, not four, and the cost was in SKIPS, not failures.** See below. |
-| **R4** 🟠 | **Accept-invalid in core files** | ~15 | Now `table.wast` **6**, `try_table.wast` **4**, `ref.wast` 2, and others. The safety class the whole T1 effort was about, still present in the main suite. R1 took `tag.wast` 3 → 1 by type-checking tag imports; R2's tag-identity fix took `tag.wast` to **0** and `try_table` 6 → 4. |
+| **R4** 🟠 | **Accept-invalid in core files** | ~15 → **12** | ✅ **FIXED 2026-08-13 — five causes, and two of them ALSO caused false rejects.** Core accept-invalid is now **0**. See below. |
 | **R5** 🟡 | **Runner gaps, not wazmrt defects** | 41 → **~23** | ✅ Half-closed by R2: `(module definition …)`/`(module instance …)` are implemented, so `BadCommand` is down to **2**. What remains is `(module quote …)` and **21 `NoTarget`** cascades from modules that never built. These suppress real verification rather than proving anything — the same red-washing as `(either …)` was. **Do this before quoting conformance numbers again.** |
 | **R6** 🟡 | GC type remainder + `i31` | 20 → 8 → **0** | ✅ **CLOSED 2026-08-13, and R3 closed it without aiming at it.** R1 took `type-subtyping`/`type-rec`; the last 8 were `i31.wast`, and they were not an i31 defect at all — the file uses `(elem $e i31ref …)` and the assembler's `isRefType` listed only `funcref`/`externref`, so the whole segment was misread as func indices. One shorthand-table fix, `i31.wast` 8 → 0. |
 | **R7** 🟡 | threads | 15 | `proposals/threads/imports.wast` 13, `memory.wast` 2 — mostly shared-memory import matching. ⚠️ **R1 did NOT touch it** despite being "adjacent": those 13 are limits/`shared`-flag matching, not type identity. |
 | **R8** ⚠️ | **UTF-8 name validation is UNVERIFIED** | 0 failures | `utf8-invalid-encoding.wast` is **0 passed / 0 failed / 176 SKIPPED**. The 13th pass recorded UTF-8 name validation as fixed and this corpus checks **none** of it. Not a failure — a hole in the evidence, which is worse: an unverified security-relevant check reads as a passing one. Find out whether the skip is the runner's gap or ours. |
 
-**Recommended order: ~~R1~~ → ~~R2~~ → ~~R3~~ → R4 / R5.** ~~R6 is closed~~ (by R3, incidentally).
-R5 is half-done and cheap to finish — do it before quoting conformance numbers again. R4 is the
-safety class and is unmoved at `table.wast` 6 / `try_table.wast` 4 / `ref.wast` 2.
+**Recommended order: ~~R1~~ → ~~R2~~ → ~~R3~~ → ~~R4~~ → R5 → R7 → R8.** ~~R6 closed by R3~~.
+R5 is half-done and cheap — do it before quoting conformance numbers again. **R7 (threads) now holds
+the only accept-invalids left in the corpus outside the untargeted proposals**, so it inherits R4's
+safety argument.
+
+### ✅ R4 IS DONE (2026-08-13) — 157 → 143, and core accept-invalid is now ZERO
+
+**Corpus 157 → 143 failures, 61,412 → 61,429 passing, 2,412 → 2,407 skipped**, zero regressions in
+the full per-file diff. Five core files went entirely clean — `table.wast`, `ref.wast`,
+`ref_func.wast`, `tag.wast`, `try_table.wast`. **Every accept-invalid in a core spec file is closed**;
+the 29 that remain are 20 in `custom-descriptors` (untargeted) and 9 in `proposals/threads`, which is
+R7's.
+
+The 12 triaged failures were **five causes**, and the item's framing — "modules we wrongly accept" —
+was only half the story: **two of the five ALSO caused false rejects**, so the same off-by-one was
+simultaneously letting invalid modules in and keeping valid ones out.
+
+| | cause | count | what it actually was |
+| --- | --- | --- | --- |
+| C1 | **a non-defaultable table element type with no initializer** | 5 | `(table 0 (ref func))` has no starting value for its slots and is invalid at ANY length; the rule was unchecked, and the `0x40`-form initializer that exempts a table from it was never validated either |
+| C2 | **`try_table` catch labels resolved one frame too deep** | 3 | +1 false reject — see below |
+| C3 | **a block type naming an out-of-range type index** | 2 | the assembler INTERNED the signature, manufacturing the very index that made it valid |
+| C4 | **an imported tag's result type unchecked** | 1 | the loop walked `module.tags`, the DEFINED half of the space |
+| C5 | **the start function treated as declaring a `ref.func`** | 1 | §3.5.1 erases `start` when building `C.refs`; the code, the comment above it, and the test all said otherwise |
+
+⚠️ **C2 is the headline, and it is the producer/consumer rule generalised: THREE implementations
+agreed with each other.** A `try_table` catch clause's label indexes the *enclosing* scope — the EH
+proposal checks the catches in `C` and only the body in `C, labels [t2*]`. `wat.zig` pushed the
+try_table's own label before resolving catch targets, `validate.zig` resolved them after
+`pushCtrl`, and `interp.zig` branched to `d + c.label`. All three were off by exactly one frame, in
+the same direction, so every round trip was self-consistent and the corpus was green. It took
+reading the spec rule to see it — no test could, because the three parties that would have to
+disagree never did. **Two consumers agreeing is not corroboration when they share the mistake.**
+
+⚠️ **And it failed in both directions at once.** `(func (result exnref) (try_table (catch 0 0))
+(unreachable))` was ACCEPTED (label 0 is really the function block `[exnref]`, which a plain `catch`
+delivering `[]` cannot satisfy), while `(func (result exnref) (try_table (catch_ref $e 0)) …)` was
+REJECTED (the same label fits `catch_ref` exactly). One off-by-one, an accept-invalid and a false
+reject, in the same file. **When a rule is off by a constant, look for failures in both directions
+before believing the item's framing.**
+
+⚠️ **C1 and C3 were both workarounds in the ASSEMBLER, and both stopped being cosmetic.**
+- `(table N reftype initexpr)` was lowered to a synthetic active element segment of N copies, on the
+  recorded reasoning that the resulting table state is observably identical and the distinct `0x40`
+  encoding "is not required for the execution assertions". The state is identical; the MODULE is not
+  — a table with an explicit initializer and a table with an element segment differ in exactly the
+  property validation needs, so `(table 0 (ref func))` became indistinguishable from a legal one.
+- A block type with a single concrete-ref result was emitted as an interned type index, because
+  `readBlockType` could not decode the canonical multi-byte valtype `0x63/0x64 ht`. Interning
+  *creates a type-section entry*, so `(block (result (ref 1)))` in a one-type module made index 1
+  exist — as the block's own signature, self-referentially — and validated clean.
+
+**An encoding chosen to make execution agree can erase the distinction validation runs on**, and **a
+workaround in the producer for a gap in the consumer does not stay cosmetic**. Both are fixed at both
+ends; `readBlockType` now decodes the canonical form and `BlockType` grew a `.ref` variant.
+
+⚠️ **C5's wrong rule was written down three times.** The code set `refs` from the start function, the
+comment above it listed "or the start function" among the declaring positions, and the unit test
+asserted `(module (func $f) (start $f) … (ref.func $f))` valid under the heading "each of the four
+declaring positions". There are three. **A test that encodes the same misreading as the code is not
+evidence — it is the misreading, restated.**
+
+⚠️ **Two more defects surfaced inside the R4 files after the five landed**, both false rejects:
+`exnref_nn` was defined in `types.zig` and taught to `readBlockType` but never to `Module.readValType`
+(so `(ref exn)` worked as a block type and was `BadValType` everywhere else), and `checkCatch`
+compared the materialized exception reference as the *nullable* `exnref` when `catch_ref` produces a
+non-null `(ref exn)`. Fixing the first only changed the error message of the second — **a failure's
+cause count is not known until it passes**, for the third pass running.
+
+**Size: R4 came out SMALLER** — −512 exe / −116 lib / −512 dll — because deleting the two workarounds
+cost more than the five rules add. The N-copies table lowering is gone, and with it the
+`max_table_init_copies` cap that existed only to bound its allocation amplification. **Removing a
+workaround can pay for the rule that made it unnecessary.**
 
 ### ✅ R3 IS DONE (2026-08-13) — 193 → 157, and **225 skipped assertions became real runs**
 

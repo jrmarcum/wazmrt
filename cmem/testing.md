@@ -81,9 +81,9 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
   validation**, which is strong evidence the type-checker is correct across real, deeply-nested
   control flow (not just the simple `wasm_mod` set).
 
-## 📊 CURRENT spec-testsuite score (measured 2026-08-13, after R1 + R2 + R3)
+## 📊 CURRENT spec-testsuite score (measured 2026-08-13, after R1 + R2 + R3 + R4)
 
-**284 files — 61,412 assertions passed / 157 failed / 2,412 skipped.** This is the number to quote;
+**284 files — 61,429 assertions passed / 143 failed / 2,407 skipped.** This is the number to quote;
 every snapshot below it is older and kept as history. Reproduce exactly:
 
 ```
@@ -96,10 +96,14 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
 - **Failure messages carry the source LINE** of the `.wast` command that produced them (`L342: …`),
   added 2026-08-13 via `sexpr.parseAllWithLines`. Before that, matching 35 failures back to their
   assertions was hand work.
-- **157 is not 157 defects.** **95 are BY DESIGN** — `custom-descriptors` 82, `custom-page-sizes` 13,
-  proposals wazmrt does not target, refused honestly. **62 are actionable**, itemised as the R-list
-  in `roadmap.md` (R1, R2, R3 done, R6 closed by R3; R4/R5 next).
-- ⚠️ **2,412 SKIPPED IS NOT 2,412 PASSED**, and the largest pool is core spec: `br_table.wast` alone
+- **143 is not 143 defects.** **97 are BY DESIGN** — `custom-descriptors` 82, `custom-page-sizes` 13,
+  `wide-arithmetic` 2, proposals wazmrt does not target, refused honestly. **46 are actionable**,
+  itemised as the R-list in `roadmap.md` (R1–R4 done, R6 closed by R3; R5/R7/R8 next).
+- ✅ **ACCEPT-INVALID IN CORE SPEC FILES IS ZERO** as of R4. The 29 `assert_invalid` failures left are
+  20 in `custom-descriptors` (untargeted) and 9 in `proposals/threads` (R7's). This is the class the
+  whole T1 → R4 arc was about, and it is the one worth re-checking after any decoder or validator
+  change: `grep "should be rejected"` over a `-Dfailures=600` run is the whole test.
+- ⚠️ **2,407 SKIPPED IS NOT 2,407 PASSED**, and the largest pool is core spec: `br_table.wast` alone
   has **161** unrun assertions. Any headline figure that ignores skips is an upper bound.
 - ⚠️ **READ THE SKIP COLUMN WHEN TRIAGING, NOT JUST THE FAILURE COLUMN.** R3 was triaged at ~10
   failures and scored 16 — but a module that fails to build sends every assertion targeting it into
@@ -114,10 +118,17 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
   *exactly* its ceiling; the file was two builds old. **An exactly-zero delta is a timestamp check
   waiting to happen.**
 
-**Unit tests: 579** (`zig build test --summary all`, 2026-08-13 after R3) — 575 pass / 4 skip from
-this repo's own `D:` cwd, **579/579 from an NTFS cwd**, which is the number to quote. R3 added 7
-(6 in `wat.zig`, 1 in `opcode.zig`); each core test raises the printed total by two because the
-C-ABI target re-runs the core suite.
+**Unit tests: 587** (`zig build test --summary all`, 2026-08-13 after R4) — 583 pass / 4 skip from
+this repo's own `D:` cwd, **587/587 from an NTFS cwd**, which is the number to quote. R3 added 7 and
+R4 added 4; each core test raises the printed total by two because the C-ABI target re-runs the core
+suite.
+
+⚠️ **R4 also had to CHANGE seven existing tests, and that is the interesting part.** Four hand-built
+EH fixtures in `interp.zig` and two WAT tests encoded the try_table catch-label off-by-one, and the
+`C.refs` test asserted outright that the start function declares a `ref.func`. They passed for years
+because the code they tested made the same mistake. **When a fix breaks existing tests, decide which
+of the two encodes the rule — check the spec and the external corpus, not the test count.** Here the
+corpus settled it in both directions: the five target files went clean and nothing else regressed.
 
 ⚠️ **Three of R3's tests were confirmed to FAIL before being kept** — the rule that a new test which
 has never failed has not been shown to test anything. Each inversion was applied to the *implementation*

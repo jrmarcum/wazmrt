@@ -418,6 +418,73 @@ leave entries in another module's table" test.
 against the restored old behaviour before being kept** — the funcref-in-a-table one, and the
 funcref-in-a-global one, which reproduced `elem.wast`'s `CallStackExhausted` symptom exactly.
 
+## 🛡️ ✅ Accept-invalid in core spec files — R4, FIXED 2026-08-13 (five causes, core class now ZERO)
+
+The class the whole T1 → R4 arc was about: modules the spec calls invalid that wazmrt accepted and
+would then happily execute. **Every one in a core spec file is closed.** Programme state and the
+method lessons are in `roadmap.md` → "R4 IS DONE"; this entry is the defect record.
+
+**C1 — a table with a non-defaultable element type and no initializer (5).** `(table 0 (ref func))`
+declares slots that have no starting value, and no length saves it: even at 0 entries `table.grow`
+would have to invent one. Unchecked. **And the exemption was unchecked too** — a table using
+§5.5.6's `0x40` initializer form could name a const-expr of any type, with only the interpreter
+finding out at instantiation.
+
+- ⚠️ **Why it was invisible: the assembler erased the distinction.** `(table N reftype initexpr)` was
+  lowered to a synthetic active element segment of N copies of the initializer, recorded at the site
+  as safe because the resulting table state is observably identical and the `0x40` encoding "is not
+  required for the execution assertions". The state is identical; the module is not. A table with an
+  initializer and a table with an element segment differ in precisely the property the rule needs.
+  The assembler now emits the real form, and the N-copy allocation (plus the
+  `max_table_init_copies` cap that existed only to bound it) is gone.
+
+**C2 — `try_table` catch labels resolved one frame too deep (3, plus 1 false reject).** A catch
+clause's label indexes the try_table's ENCLOSING scope (EH proposal §3.4 validates the catches in
+`C`, only the body in `C, labels [t2*]`). `wat.zig` pushed the try_table's label before resolving
+catch targets, `validate.zig` resolved them after `pushCtrl`, and `interp.zig` branched to
+`d + c.label`.
+
+- ⚠️ **All three were wrong in the same direction, so they agreed and the corpus was green.** This is
+  the producer/consumer blind spot with three parties instead of two, and no test could have found it
+  — the round trip is self-consistent. Only the spec rule exposes it.
+- ⚠️ **It produced an accept-invalid and a false reject simultaneously.**
+  `(func (result exnref) (try_table (catch 0 0)) (unreachable))` was accepted (label 0 is really the
+  function block `[exnref]`; a plain `catch` delivers `[]`), and
+  `(func (result exnref) (try_table (catch_ref $e 0)) …)` was rejected (the same label fits exactly).
+- Fixing it required updating six in-repo tests that encoded the old convention — four hand-built EH
+  binaries and two WAT modules.
+
+**C3 — a block type naming an out-of-range type index (2).** `(block (result (ref 1)))` in a module
+with one type must be "unknown type". `readBlockType` could not decode the canonical multi-byte
+valtype (`0x63/0x64 heaptype`), so the assembler interned a function signature and emitted a type
+INDEX instead — **manufacturing index 1 as the block's own signature**, self-referentially, which
+made the module valid. Both halves are canonical now; `BlockType` gained a `.ref` variant because the
+decoder cannot resolve a concrete heap type to its family head without the module's kinds.
+
+- ⚠️ **The `if` form of the same test was already "passing" — for the wrong reason.** It failed
+  `StackUnderflow` on an unrelated malformation, scoring as a correct rejection. A negative assertion
+  satisfied by the wrong error is a false pass, the same family as `isOurLimitation`.
+
+**C4 — an imported tag's result type unchecked (1).** The tag-section walk iterated `module.tags`,
+which is the DEFINED tags only; imported tags lead the index space. Half a space is not a space —
+the same shape as the imported/defined splits in the funcref and global work.
+
+**C5 — the start function treated as declaring a `ref.func` (1).** §3.5.1 builds `C.refs` from
+`funcidx(module with funcs = ε with start = ε)`: `start` is erased along with the function section,
+so "the module runs it" does not double as "the module may take its address".
+
+- ⚠️ **The wrong rule was written down three times** — in the code, in the comment above it ("a
+  global initializer, an element segment, an export, **or the start function**"), and in a unit test
+  asserting the start case valid under the heading "each of the four declaring positions". There are
+  three. A test that restates the code's misreading is not evidence.
+
+**Two more, found after the five landed, both false rejects.** `exnref_nn` was defined in `types.zig`
+and taught to `opcode.readBlockType` but never to `Module.readValType`, so `(ref exn)` worked as a
+block type and was `BadValType` in every other position; and `checkCatch` compared the materialized
+exception reference as the nullable `exnref` when `catch_ref` produces a non-null `(ref exn)`. Fixing
+the first only changed the second's error message — **a failure's cause count is not known until it
+passes**, third pass running.
+
 ## 🧮 ✅ GC array bulk ops — R3, FIXED 2026-08-13 (six ops missing, 225 assertions unblocked)
 
 Triaged as "four ops absent from `opcode.zig`, ~10 failures". It was **six** ops and 16 failures, and
