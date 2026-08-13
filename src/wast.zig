@@ -1434,6 +1434,39 @@ test "a funcref in a shared table names its own instance, not the caller's index
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
 
+test "element segments applied before a failed data segment persist AND stay callable" {
+    // §4.5.5 runs element inits before data inits, and entries already written
+    // into an imported table survive a later trap. Two defects stacked here:
+    //
+    //  1. data segments were applied FIRST, so the out-of-bounds data below
+    //     aborted before the element segment ran and slot 7 stayed empty;
+    //  2. even once it ran, the funcref it wrote named an instance that
+    //     instantiation then threw away, so the call resolved to nothing.
+    //
+    // Both have to be fixed for this to pass, and the second is why the store
+    // keeps a failed instance alive rather than tearing it down.
+    const src =
+        \\(module $A
+        \\  (type $r (func (result i32)))
+        \\  (table (export "t") 10 funcref)
+        \\  (func (export "at") (param i32) (result i32)
+        \\    (call_indirect (type $r) (local.get 0))))
+        \\(register "A" $A)
+        \\(assert_trap
+        \\  (module
+        \\    (table (import "A" "t") 10 funcref)
+        \\    (func $f (result i32) (i32.const 7))
+        \\    (elem (i32.const 7) $f)
+        \\    (memory 1)
+        \\    (data (i32.const 0x10000) "d"))
+        \\  "out of bounds memory access")
+        \\(assert_return (invoke $A "at" (i32.const 7)) (i32.const 7))
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 2), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
 test "an imported mutable global is SHARED, not copied at instantiation" {
     // Imported globals were copied by value, so a `(mut i32)` import was a
     // snapshot taken at link time. $B re-exports $A's global; $A then writes 241

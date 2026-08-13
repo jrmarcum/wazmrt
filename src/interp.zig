@@ -339,14 +339,30 @@ pub const FuncAddr = struct { instance: *Instance, index: u32 };
 pub const Store = struct {
     gpa: std.mem.Allocator,
     instances: std.ArrayList(?*Instance) = .empty,
+    /// Instances whose segment initialization TRAPPED. §4.5.5 allocates the
+    /// module instance before running the segment inits, so entries an element
+    /// segment already wrote into an imported table stay valid — which means the
+    /// functions they name must stay callable, and the failed instance therefore
+    /// has to outlive the call that rejected it. Nobody else has a handle to it,
+    /// so the store owns its teardown. See `Instance.applyActiveSegments`.
+    orphans: std.ArrayList(*Instance) = .empty,
 
     pub fn init(gpa: std.mem.Allocator) Store {
         return .{ .gpa = gpa };
     }
 
+    /// Free the store. Orphaned instances are torn down here — after every
+    /// normally-owned instance, since a live one may still hold funcrefs into
+    /// them.
     pub fn deinit(self: *Store) void {
+        for (self.orphans.items) |inst| inst.deinit();
+        self.orphans.deinit(self.gpa);
         self.instances.deinit(self.gpa);
         self.* = undefined;
+    }
+
+    fn adopt(self: *Store, inst: *Instance) Error!void {
+        try self.orphans.append(self.gpa, inst);
     }
 
     /// Claim a slot for `inst`. Slots are never reused, so a value that named a
@@ -774,6 +790,32 @@ pub const Instance = struct {
     /// afterwards would leave those references pointing at a dead slot — so the
     /// old `init`/`initWithImports` spelling is gone rather than kept as a trap.
     pub fn instantiateWithImports(self: *Instance, gpa: std.mem.Allocator, module: *const Module, imports: Imports) Error!void {
+        // §4.5.4 allocation, then §4.5.5 steps 9–14. Split so `allocate`'s
+        // errdefers — which free the tables, memories and segment arrays it
+        // built — cannot fire for a segment-init trap, where the instance is
+        // deliberately kept ALIVE. They did, and the same storage was then freed
+        // again when the store tore the orphan down.
+        try self.allocate(gpa, module, imports);
+        self.applyActiveSegments() catch |e| {
+            // An instance that owns its store has no importers by construction —
+            // nothing outside it can hold a reference into it — so there is
+            // nothing to keep alive and the normal teardown applies.
+            if (self.owns_store) {
+                self.deinit();
+                return e;
+            }
+            // Otherwise hand it to the store to outlive this call. Its funcrefs
+            // may already be sitting in another module's table, and the spec
+            // requires those entries to keep working.
+            self.store.adopt(self) catch {
+                self.deinit(); // nothing left to record it with; free rather than leak
+                return e;
+            };
+            return e;
+        };
+    }
+
+    fn allocate(self: *Instance, gpa: std.mem.Allocator, module: *const Module, imports: Imports) Error!void {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const a = arena.allocator();
@@ -1010,16 +1052,13 @@ pub const Instance = struct {
                 built = i + 1;
             }
         }
-        for (module.data) |seg| {
-            if (!seg.active) continue;
-            if (seg.mem_index >= memories.len) return error.NoMemory;
-            const mem = memories[seg.mem_index];
-            const offset = try evalConstOffset(globals, seg.offset_expr, mem.is64);
-            const start = std.math.cast(usize, offset) orelse return error.MemoryOutOfBounds;
-            const end = std.math.add(usize, start, seg.bytes.len) catch return error.MemoryOutOfBounds;
-            if (end > mem.bytes.len) return error.MemoryOutOfBounds;
-            @memcpy(mem.bytes[start..][0..seg.bytes.len], seg.bytes);
-        }
+        // ⚠️ Active DATA segments are NOT copied here — they are applied in
+        // `applyActiveSegments`, after the active ELEMENT segments. §4.5.5 runs
+        // the element inits (steps 9–12) before the data inits (13–14), and this
+        // ran them the other way round. A module whose data segment is out of
+        // bounds therefore aborted before its element segments were applied, so
+        // entries the spec requires to persist in an imported table were never
+        // written at all (`linking0.wast`'s slot 7).
 
         // Tables: imported tables (the low indices) borrow host-supplied shared
         // objects; defined tables allocate their own. Entries are `Value` slots
@@ -1091,27 +1130,6 @@ pub const Instance = struct {
                 .store_slot = store_slot,
             }, ex);
             dropped.* = elem.mode != .passive;
-            if (elem.mode == .active) {
-                if (elem.table_index >= tables.len) return error.NoTable;
-                const tbl = tables[elem.table_index].entries;
-                const offset = try evalConstOffset(globals, elem.offset_expr, false); // tables are always 32-bit
-                // Bound the WHOLE range before writing anything, exactly as the
-                // active-data branch above does. The check used to sit inside the
-                // loop, so an over-long segment wrote a partial prefix and *then*
-                // failed instantiation.
-                //
-                // That is not merely untidy: for an IMPORTED table, `tbl` is the
-                // exporting instance's live shared storage, so the writes outlive
-                // the instantiation that was rejected. A module which fails to
-                // instantiate could thereby install entries into another module's
-                // table and make it dispatch through slots it never populated —
-                // the importer chooses the function indices, and the *owning*
-                // module reinterprets them. `call_indirect`'s type check still
-                // applies, so it is wrong-function dispatch rather than memory
-                // unsafety, but the entry point is a module that was REJECTED.
-                if (@as(u64, offset) + vals.len > tbl.len) return error.TableOutOfBounds;
-                for (vals, 0..) |v, k| tbl[offset + k] = v;
-            }
         }
 
         self.* = .{
@@ -1141,6 +1159,44 @@ pub const Instance = struct {
             .data_dropped = data_dropped,
             .gc_heap = gc_heap, // may already hold objects from const-expr inits
         };
+    }
+
+    /// §4.5.5 steps 9–14: copy every ACTIVE element segment into its table, then
+    /// every active data segment into its memory. Passive and declarative
+    /// segments are untouched.
+    ///
+    /// ⚠️ **Order matters and is observable.** Elements first, then data. Running
+    /// data first meant a module with an out-of-bounds data segment aborted
+    /// before its element segments ran — and the spec requires the element
+    /// entries already written into an IMPORTED table to survive the failed
+    /// instantiation (`linking0.wast`, `linking.wast`'s "Unlike in the v1 spec"
+    /// case). Each segment is also bounds-checked in full before it writes
+    /// anything, so a too-long one leaves no partial prefix.
+    fn applyActiveSegments(self: *Instance) Error!void {
+        const module = self.module;
+        for (module.elements, self.elem_values) |elem, vals| {
+            if (elem.mode != .active) continue;
+            if (elem.table_index >= self.tables.len) return error.NoTable;
+            const tbl = self.tables[elem.table_index].entries;
+            const offset = try evalConstOffset(self.globals, elem.offset_expr, false); // tables are always 32-bit
+            // Bound the WHOLE range before writing anything. The check used to
+            // sit inside the loop, so an over-long segment wrote a partial prefix
+            // and *then* failed instantiation — and for an imported table that
+            // storage belongs to the exporter, so a module which failed to
+            // instantiate installed entries into another module's table.
+            if (@as(u64, offset) + vals.len > tbl.len) return error.TableOutOfBounds;
+            for (vals, 0..) |v, k| tbl[offset + k] = v;
+        }
+        for (module.data) |seg| {
+            if (!seg.active) continue;
+            if (seg.mem_index >= self.memories.len) return error.NoMemory;
+            const mem = self.memories[seg.mem_index];
+            const offset = try evalConstOffset(self.globals, seg.offset_expr, mem.is64);
+            const start = std.math.cast(usize, offset) orelse return error.MemoryOutOfBounds;
+            const end = std.math.add(usize, start, seg.bytes.len) catch return error.MemoryOutOfBounds;
+            if (end > mem.bytes.len) return error.MemoryOutOfBounds;
+            @memcpy(mem.bytes[start..][0..seg.bytes.len], seg.bytes);
+        }
     }
 
     pub fn deinit(self: *Instance) void {
