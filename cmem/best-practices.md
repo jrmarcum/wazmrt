@@ -47,6 +47,11 @@ runner reports a skip total with no per-reason breakdown. R8 was 176 of the same
 separate item because it landed in a different column. Size a runner gap by grepping the corpus for
 the form, not by reading the report. — R5, `roadmap.md`
 
+**Rank remaining work by ASSERTIONS UNBLOCKED, not by failures closed.** The R-list has re-learned
+this three times: R3 was ~10 failures and freed 225, R5 was "~23" and freed 978, and R10 stands at 13
+failures suppressing ~420. A file reading `0 passed, 1 failed, 161 skipped` is the highest-value
+target in the suite and looks like the lowest. — R3/R5/R10, `roadmap.md`
+
 **Judge a conformance pass by what it RUNS, not by the failure total.** R5 took failures 143 → 216
 and that was the point: passes 61,429 → 62,333, skips 2,407 → 1,429. A number that only ever goes
 down can be improved by running less. Check that no file LOST passes (join the per-file counts) —

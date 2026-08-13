@@ -103,10 +103,15 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
 - **Failure messages carry the source LINE** of the `.wast` command that produced them (`L342: …`),
   added 2026-08-13 via `sexpr.parseAllWithLines`. Before that, matching 35 failures back to their
   assertions was hand work.
-- **216 is not 216 defects.** Roughly 100 are BY DESIGN (`custom-descriptors`, `custom-page-sizes`,
-  `wide-arithmetic` — proposals wazmrt does not target, refused honestly); the rest is itemised as
-  the R-list in `roadmap.md` (R1–R5 done, R6 closed by R3, R8 closed by R5; **R9** — the text-level
-  accept-invalid class R5 revealed — and R7 next).
+- **216 is not 216 defects: 98 are BY DESIGN** (`custom-descriptors` 84, `custom-page-sizes` 12,
+  `wide-arithmetic` 2 — proposals wazmrt does not target, refused honestly) and **118 actionable**,
+  itemised as the R-list in `roadmap.md`: **R9** 85 (text-front-end accept-invalid), **R7** 18
+  (threads), **R10** 13, legacy EH 2. R1–R5 are done; R6 was closed by R3 and R8 by R5.
+- 🔴 **The item to do next is R10, and it is not close: 13 failures suppressing ~420 assertions.**
+  Nine core files fail on their FIRST module and take the rest of the file into `NoTarget` —
+  `br_table.wast` alone is 161 unrun assertions, and one cause is a single missing `exn` entry in
+  the assembler's `abstractHeapCode`. **Rank remaining work by assertions unblocked, not by failures
+  closed**; this list has now re-learned that at R3, R5 and R10.
 - ⚠️ **"ACCEPT-INVALID IN CORE SPEC FILES IS ZERO" (recorded at R4) IS NO LONGER TRUE, and it was
   true when written.** R4 closed every accept-invalid the corpus could *see*. R5 implemented
   `(module quote …)`, the corpus gained sight of the TEXT front-end, and 88 more appeared in core

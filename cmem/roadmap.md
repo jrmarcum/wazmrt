@@ -203,17 +203,20 @@ more.
 **Of the current 216, by design** — proposals wazmrt does not target, refused honestly. They
 are not defects and there is nothing to fix unless the scope changes:
 
-| | area | failures | note |
+| | area | failures (live, after R5) | note |
 | --- | --- | --- | --- |
-| — | `custom-descriptors` | 90 → 88 → 82 | untargeted proposal; exact refs + descriptors (R2's `module definition` took 2, R3's elem-shorthand fix took 6) |
-| — | `custom-page-sizes` | 13 | untargeted; refused as `UnsupportedProposal` (scored as SKIPS, not passes) |
-| — | `wide-arithmetic` | 2 | untargeted; was miscounted as actionable until R3 |
+| — | `custom-descriptors` | 90 → 88 → 82 → **84** | untargeted proposal; exact refs + descriptors. R5 unblocked more of it than it fixed, hence the rise |
+| — | `custom-page-sizes` | **12** | untargeted; refused as `UnsupportedProposal` (scored as SKIPS, not passes) |
+| — | `wide-arithmetic` | **2** | untargeted; was miscounted as actionable until R3 |
 
 ⚠️ **`wide-arithmetic` 2 was counted as ACTIONABLE and is not** — it is an untargeted proposal like
 the two above, so the "101 by design / 92 actionable" split written on 2026-08-12 was off by two in
 both directions. Corrected here rather than propagated.
 
-**The 172 that are actionable, most valuable first:**
+**LIVE SPLIT after R5 (2026-08-13): 216 failures = 98 by design + 118 actionable.** The 118 are
+R9 (85) + R7 (18) + R10's non-accept-invalid residue (13) + legacy EH (2).
+
+**The actionable items, most valuable first:**
 
 | | item | failures | why it matters |
 | --- | --- | --- | --- |
@@ -223,12 +226,19 @@ both directions. Corrected here rather than propagated.
 | **R4** 🟠 | **Accept-invalid in core files** | ~15 → **12** | ✅ **FIXED 2026-08-13 — five causes, and two of them ALSO caused false rejects.** Core accept-invalid is now **0**. See below. |
 | **R5** 🟡 | **Runner gaps, not wazmrt defects** | 41 → ~23 → **1,291** | ✅ **FIXED 2026-08-13 — and the item was undercounted by 50×.** `(module quote …)` alone was suppressing **1,291 assertions**. See below. |
 | **R6** 🟡 | GC type remainder + `i31` | 20 → 8 → **0** | ✅ **CLOSED 2026-08-13, and R3 closed it without aiming at it.** R1 took `type-subtyping`/`type-rec`; the last 8 were `i31.wast`, and they were not an i31 defect at all — the file uses `(elem $e i31ref …)` and the assembler's `isRefType` listed only `funcref`/`externref`, so the whole segment was misread as func indices. One shorthand-table fix, `i31.wast` 8 → 0. |
-| **R7** 🟡 | threads | 15 | `proposals/threads/imports.wast` 13, `memory.wast` 2 — mostly shared-memory import matching. ⚠️ **R1 did NOT touch it** despite being "adjacent": those 13 are limits/`shared`-flag matching, not type identity. |
+| **R7** 🟡 | threads | 15 → **18** | `proposals/threads/imports.wast` 13, `memory.wast` 5 (R5 unblocked 3 more). Mostly shared-memory import matching, plus **12 accept-invalids** — the only ones left outside core and the untargeted proposals, so R4's safety argument applies here. ⚠️ **R1 did NOT touch it** despite being "adjacent": those 13 are limits/`shared`-flag matching, not type identity. |
 | **R8** ⚠️ | **UTF-8 name validation is UNVERIFIED** | 0 failures | ✅ **CLOSED 2026-08-13 by R5 — it was the runner's gap, and the answer was "all 176 pass".** `utf8-invalid-encoding.wast` was 0/0/**176 skipped** because every assertion in it is an `assert_malformed (module quote …)`, and the runner could not build a quoted module. Implementing that form ran all 176 and they pass: UTF-8 name validation was genuinely correct, and had simply never been checked. **The question the item asked — "is the skip the runner's gap or ours?" — was the right one, and R5 answers it.** |
+| **R10** 🔴 | **NEW — a handful of first-module failures BLACK OUT ~420 assertions** | 13 failures / **~420 skips** | 🆕 **Opened 2026-08-13 (R5's residue). Highest value left, by a wide margin.** Nine core files fail on their FIRST module and take the whole file into `NoTarget`: `br_table.wast` **161 skipped** (a `TypeMismatch` on `(block (drop (i32.ctz (br_table 0 0 …))))` — br_table in a polymorphic position), `ref_test` **66**, `simd_lane` **51**, `ref_cast` **40**, `ref_null` **32** (`(ref.null exn)` — `abstractHeapCode` has no `exn` entry, a ONE-LINE gap), `br_on_cast`/`br_on_cast_fail` **25 each**, `extern` **16** (`extern.convert_any`/`any.convert_extern` have no mnemonic in the assembler although the decoder and interpreter both implement them — the producer/consumer pair again), `id` (exotic and quoted `$"…"` identifiers). ⚠️ **13 failures, ~420 assertions suppressed** — the R3/R5 shape for the third time: **a single-digit failure count next to a triple-digit skip count is a blackout.** |
+| **R9** 🟠 | **NEW — accept-invalid in the TEXT front end** | **85** | 🆕 **Opened 2026-08-13; this is R5's output.** The class R4 closed for the binary decoder, on the surface the corpus could not reach until `(module quote …)` ran. Groups: **35** type-use ordering (`(if (type $sig) (result i32) (param i32) …)` in `func`/`call_indirect`/`return_call_indirect`), **15** token separation (`(data"a")` needs whitespace between a keyword and a string — `token.wast`), **8** SIMD lane rules, and ~27 spread over `table`/`memory`/`type`/`global`/`id`/`start`/`struct`/`block`/`if`/`loop`/`obsolete-keywords`. Same safety argument as R4: `wasm_module_validate` is a shipped C-ABI entry point. |
 
-**Recommended order: ~~R1~~ → ~~R2~~ → ~~R3~~ → ~~R4~~ → ~~R5~~ → R9 → R7.** ~~R6 closed by R3~~,
-~~R8 closed by R5~~. **R9 is new and is R5's output**: 88 accept-invalids in the TEXT front-end that
-nothing could see until `(module quote …)` ran. R7 (threads) keeps its 12.
+**Recommended order: ~~R1~~ → ~~R2~~ → ~~R3~~ → ~~R4~~ → ~~R5~~ → R10 → R9 → R7.** ~~R6 closed by
+R3~~, ~~R8 closed by R5~~.
+
+**Do R10 first, and it is not close.** It is 13 failures against ~420 suppressed assertions — the
+best ratio of verification-unblocked to work in the whole list, and at least one of its nine causes
+is a single missing table entry (`exn` in `abstractHeapCode`). R9 is 85 real defects but they are 85
+separate refusals to write; R7 is 18 and self-contained. **The ordering rule this list keeps
+re-learning: rank by assertions unblocked, not by failures closed.**
 
 ### ✅ R5 IS DONE (2026-08-13) — 978 suppressed assertions unblocked, and the item was 50× bigger than filed
 
