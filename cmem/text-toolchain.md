@@ -83,7 +83,17 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
   compares (NaN-aware). CLI `.wast` mode. **Passes thousands of positive + negative official-testsuite
   assertions** (see `testing.md`). Handles `(register "name" $id?)` + cross-module imports, **module
   `$name` tracking so `(invoke $M …)` / `(get $M …)` / `(register "x" $M)` target a named (non-current)
-  module** (`9745ecb`), and the `(get …)` action (reads an exported global). Deferred: `(module quote …)`.
+  module** (`9745ecb`), and the `(get …)` action (reads an exported global).
+  **Added 2026-08-13 (R2):** `(module definition $M …)` + `(module instance $I $M)` — a definition is
+  assembled but NOT instantiated, and each `instance` command builds a fresh one, which is how
+  `instance.wast` checks that instantiation is generative. That file had been scoring 0 passed / 8
+  failed / 12 skipped, and **every one of those failures was this gap, not a runtime defect** —
+  worth remembering when a whole file looks broken. Also **every failure message now carries the
+  1-based source LINE** of the command that produced it (`L342: assert_return …`), from
+  `sexpr.parseAllWithLines`.
+  **Still deferred: `(module quote …)`** — the last big runner gap, and the bulk of R5 in
+  `roadmap.md`. It costs `BadCommand` skips that suppress real verification rather than proving
+  anything; close it before quoting conformance numbers again.
 
 ## Staged plan
 
@@ -111,14 +121,14 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
 7. ~~Reference types~~ **DONE 2026-07-09** (`ref.null`/`ref.is_null`/`ref.func` `0xD0`–`0xD2` across
    opcode/interp/validator; `(ref null? func|extern)` value types + heaptype immediates in the
    assembler; `(ref.null …)`/`(ref.extern N)`/`(ref.func)` value literals in the WAST runner). Null =
-   `maxInt(u64)` stack sentinel; a funcref is its function index. `select.wast` 0 → **124/0**.
+   `maxInt(u64)` stack sentinel; a funcref is its function index (⚠️ **SUPERSEDED 2026-08-13, R2 — it names its instance too**). `select.wast` 0 → **124/0**.
 8. ~~Multi-table + NaN-payload float literals~~ **DONE 2026-07-09**. Interp holds an array of funcref
    tables; `call_indirect` uses `imm.table`; element segments apply to their `table_index`. Assembler
    tracks table names, resolves `call_indirect $t` (gated on a following `(type …)` annotation so a
    flat `call_indirect select` isn't misread), emits per-table element flags (`0x02`). `floatBits`
    parses `nan:canonical`/`nan:arithmetic`/`nan:0x<payload>`. `call_indirect.wast` 120/1 → **132/0**,
    `local_tee.wast` 0 → **55/0**; no regressions (HEAD-baselined).
-9. ~~Imported globals + extended-const init expressions~~ **DONE 2026-07-09**. `Instance.initWithImports`
+9. ~~Imported globals + extended-const init expressions~~ **DONE 2026-07-09**. `Instance.initWithImports` (⚠️ renamed `instantiateWithImports` 2026-08-13; imported globals are now BORROWED CELLS, not copied values)
    fills imported-global slots from host values (imports head the global index space); the WAST runner
    backs the standard `spectest` globals; the assembler parses `(global (import "m" "n") type)` and
    emits an import section (2); `ref.null`/`ref.func` work in const-inits; and `evalConstExpr` is now a

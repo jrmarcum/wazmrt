@@ -31,9 +31,11 @@ compliance process, and for the ledger of any reused code.
 > (`fib(20)=6765`, `sieve(30)=10`, …). It ships a native **WAT text assembler**
 > (`.wat` → wasm) and a **WAST script runner** (`wazmrt file.wast`) that runs the
 > official WebAssembly spec testsuite (positive assertions plus
-> `assert_invalid`/`assert_malformed`/`assert_trap`/`assert_unlinkable`) — e.g.
+> `assert_invalid`/`assert_malformed`/`assert_trap`/`assert_unlinkable`, and the
+> `(module definition …)`/`(module instance …)` script forms) — e.g.
 > `table_init` 729/0, `table_copy` 1649/0, `imports` 128/0, `call_ref` 31/0,
-> `start` 10/0. It runs a module's **start function** at instantiation, embeds
+> `start` 10/0. Failures are reported with the **source line** of the assertion
+> that produced them. It runs a module's **start function** at instantiation, embeds
 > through a
 > small **native C ABI** (instantiate/call, host functions with a caller handle,
 > `.wat` straight from text, WASI, resource ceilings — loadable over FFI, see
@@ -67,6 +69,8 @@ zig build wasi-gate                # compile Zig+C wasm32-wasi programs, run the
 zig build conformance -Dtestsuite=<dir>   # run a WebAssembly spec-testsuite checkout (.wast)
                                    #   -Dbaseline=<file>        gate on regressions, not zero failures
                                    #   -Dwrite-baseline=true    generate that baseline from today's run
+                                   #   -Dfailures=N             list up to N failures per file (default 1)
+zig build size -Doptimize=ReleaseSmall    # fail the build if a shipped artifact grew past its ceiling
 zig build wasm                     # build the runtime itself as a wasm module
 zig build dll                      # C-ABI shared library (for FFI: Deno, ctypes, …)
 zig build capi-smoke               # build + run the C example (needs no external deps)

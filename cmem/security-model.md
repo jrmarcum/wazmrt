@@ -53,7 +53,7 @@ A subtle but load-bearing consequence, worth stating because the two wazmrt run 
   the outside world is the **imports** the host wires at instantiation. No import for a thing ⇒ the module
   physically cannot do that thing (capability-security by construction).
 - **`wazmrt <module> <export> [args]`** (a plain exported-function call) wires **no imports**
-  (`runFunction` → `Instance.init` = `initWithImports(..., .{})`). The function computes over its own
+  (`runFunction` → `Instance.instantiate` = `instantiateWithImports(…, .{})`; spelled `init`/`initWithImports` until 2026-08-13). The function computes over its own
   linear memory and returns a value; it **cannot read or write files** — a module that imports a file
   function either fails to instantiate (`MissingImport`) or traps (`UnsupportedImportCall`) at the call.
 - **`wazmrt <module.wasm>`** (a WASI `_start` command) wires the `wasi_snapshot_preview1` imports —
@@ -174,6 +174,36 @@ see `known-issues.md` on why they had drifted.)*
   widen by reopening.
 - **Symlink containment** (#17) — no symlink is traversed; a guest cannot be redirected out of a preopen.
 - **Sockets are not implemented** (`sock_*` → `NOTSUP`).
+- **A reference value cannot be reinterpreted by the module that receives it (2026-08-13, R2).** A
+  `funcref` names its defining instance, not an index; a tag carries a store-wide identity; and
+  linking against an instance or table from a different `interp.Store` is refused
+  (`error.CrossStoreLink`) rather than silently reinterpreted. See the entry below for what this
+  replaced.
+
+### Cross-module reference confusion — CLOSED 2026-08-13 (R2)
+
+**Not a sandbox escape, and worth recording precisely because it looked like one and was not.** A
+`funcref` was a bare function index resolved against whatever instance was *executing*, so a funcref
+written into a shared table by one module dispatched, in another module, to whatever function sat at
+that index there. Two modules linked by ordinary `register`/import — no hostile input needed —
+disagreed about what a reference meant.
+
+**Why it stopped short of a memory-safety issue:** the reading instance resolved the index, the type,
+and the body all in its *own* module, so the call was internally consistent — wrong function, but a
+real function called with its real signature. The damage is **wrong-answer**, not type confusion:
+`interp.zig`'s own comment reached that conclusion ("wrong-function dispatch rather than memory
+unsafety") and was right about it, while missing that the same sentence described a general defect
+rather than a quirk of rejected modules.
+
+⚠️ **The lesson is about the CHECK, not the bug.** `call_indirect`'s type check read the callee's
+type from the reader's module too — so it agreed with the wrong function and passed. **A check that
+resolves its subject the same wrong way as the code it checks provides no safety margin at all.** Ask
+what a verifier and the verified have in common before counting the verifier as defence in depth.
+
+Same shape, same day: an exception thrown with an imported tag was not caught by a handler naming a
+*different import of the same tag*, because a tag import carried no identity — so exceptions routed
+to the wrong handler across a link. Both are fixed by giving the linked entity an identity that
+outlives the index; details in `known-issues.md` → "Reference identity across a link".
 
 **Therefore the only way a guest introduces code to the machine is: it writes a file, and something
 *else* with real privilege executes it.** The wasm side is inert throughout. Privilege is always

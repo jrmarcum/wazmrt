@@ -54,7 +54,9 @@ bytes ──► DECODE ──► VALIDATE ──► INSTANTIATE ──► EXECUT
   flow with multi-value/type-index block types, direct `call` and **`call_indirect` over multiple
   tables**, **reference types** (`ref.null`/`ref.is_null`/`ref.func`, funcref/externref values), the
   **reference-type table ops** (`table.get`/`.set`/`.size`/`.grow`/`.fill`; tables are `[]Value` slots
-  so funcref + externref share one representation), **linear memory** (allocate min pages + active
+  so funcref + externref share one representation — ⚠️ a funcref slot holds
+  `(store_slot+1)<<32 | func_index`, **not** a bare function index, so a table shared across a link
+  means the same thing to every sharer), **linear memory** (allocate min pages + active
   data-segment init; load/store all widths, `memory.size`/`grow`), element segments (func-index +
   const-expr forms), **imported functions** (`HostFunc`: a cross-module `wasm` call runs in the
   exporting instance, or a `native` host fn), and traps (`unreachable`, div-by-zero, overflow,
@@ -240,9 +242,12 @@ table → borrowed shared object** (`interp.Imports.globals`/`memories`/`tables`
 `Instance.Memory` — growing an *exported* memory reallocs the interp's shared bytes, so the running module
 observes it. **Verified from C** (`zig build c-smoke`): read/write an exported global, `store` into memory
 then read it back via `wasm_memory_data`, and `wasm_memory_grow`. **Deferred:** `wasm_table_get`/`_set`/
-`_grow` (need a `wasm_ref_t` funcref/externref object model); a *shared mutable* imported global (the
+`_grow` (need a `wasm_ref_t` funcref/externref object model); ~~a *shared mutable* imported global (the
 interpreter value-copies imported globals rather than sharing a pointer, so post-instantiation
-`wasm_global_set` on the host global doesn't reach the instance); type `_copy` constructors; module
+`wasm_global_set` on the host global doesn't reach the instance)~~ — ⚠️ **the interpreter limitation
+behind that one is GONE as of 2026-08-13 (R2): `Instance.Global` is a shared cell and imported
+globals are borrowed, so the ABI-2 `define_instance` path now shares mutable globals for real**;
+type `_copy` constructors; module
 sharable-ref extras. An undefined symbol in a static lib only errors if a consumer references it, so
 partial implementation is honest and safe.
 

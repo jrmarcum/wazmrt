@@ -4,6 +4,55 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
 
 ## Invariants
 
+- 🔑 **A REFERENCE VALUE NAMES AN ENTITY, NOT AN INDEX — AND THE ENTITIES ARE OWNED BY AN
+  `interp.Store` (2026-08-13, R2).** A `funcref` is `(store_slot+1) << 32 | func_index`, resolved
+  through the `Store` shared by every instance that can exchange values with this one; a tag carries
+  a store-wide identity the same way (`Instance.tag_ids`, imports adopt the provider's). **Never
+  reintroduce "the value is the index"**: it was, and any funcref crossing a module boundary then
+  named whatever function sat at that index in the READER's module — the defect that made
+  `linking.wast` hand out plausible wrong answers, with `call_indirect`'s type check reading the
+  callee's type from the same wrong module so it agreed. Full account: `known-issues.md` →
+  "Reference identity across a link".
+  Three consequences that are load-bearing and easy to undo by accident:
+  - **Store slots are TOMBSTONED on `deinit`, never reused.** A stale funcref, or an arbitrary
+    integer handed in through the C ABI, must resolve to a clean `error.UndefinedFunc` — never to a
+    live-but-different function, and never to a dangling pointer. That is also why the value is an
+    index into the store rather than a pointer to the instance.
+  - **Linking across two stores is `error.CrossStoreLink`**, checked against every imported
+    `HostFunc.wasm` and every imported `Table.store`. Reference values are only meaningful within one
+    store, so the alternative is silently reinterpreting the other side's funcrefs. Refuse loudly.
+  - **Cross-instance `call_indirect` compares types through `typematch`**, not raw indices — the same
+    rule R1 established for imports, for the same reason: an index means something only inside the
+    module that wrote it.
+
+- 🔒 **AN INSTANCE'S ADDRESS IS PART OF ITS IDENTITY, SO INSTANTIATION TAKES A DESTINATION POINTER
+  (2026-08-13, R2).** `Instance.init`/`initWithImports` are **gone**; use
+  `instantiate`/`instantiateWithImports(self, gpa, module, imports)`. Element segments and global
+  initializers create funcrefs naming `self` *before* instantiation returns, so building an instance
+  and moving it afterwards leaves those references pointing at a dead slot. Spelled as a signature
+  rather than a comment deliberately: the compiler finds every call site, a convention would not.
+  ⚠️ Same family as **`ArenaAllocator` is not movable once `allocator()` is taken** — two unrelated
+  types in this codebase now have address identity, and both fail *later*, not at the move.
+
+- 🔒 **AN IMPORTED ENTITY IS BORROWED, NOT COPIED — GLOBALS INCLUDED (2026-08-13, R2).**
+  `Instance.Global` is a shared cell (`globals: []*Global`, imports at the head of the index space),
+  exactly as `Memory` and `Table` already were. Globals were the one kind of import still copied by
+  value, so a `(mut i32)` import was a snapshot and the exporter's `global.set` was invisible.
+  ⚠️ **The C ABI had the same defect on a path the corpus cannot reach** — `define_instance` read a
+  published instance's global once at link time, commented as *"a snapshot, which is what the ABI can
+  carry"*. It binds the cell now. **When you fix a linking rule, grep `capi.zig` for the same rule
+  before closing the item**; this is the second consecutive item where the shipped embedder path
+  carried the defect and no test covered it (see R1's `define_instance`).
+
+- 🔒 **INSTANTIATION IS `allocate` (§4.5.4) THEN `applyActiveSegments` (§4.5.5), AND A FAILED
+  INSTANCE STAYS ALIVE (2026-08-13, R2).** Element segments are applied **before** data segments
+  (§4.5.5 steps 9–12 then 13–14) — reversing them means an out-of-bounds data segment aborts before
+  the element segments run, and the spec requires entries already written into an *imported* table to
+  persist. Because those entries name functions in the failed module, the instance must outlive the
+  call that rejected it: the `Store` adopts it and tears it down with itself. ⚠️ **The split exists
+  so `allocate`'s errdefers cannot fire on the segment-trap path** — the first cut kept them in scope
+  and the same storage was freed twice.
+
 - 🔒 **SYMLINK CREATION IS DENIED BY DEFAULT (owner, 2026-08-10).** `--dir` grants
   `readWriteRights = all & ~path_symlink`; `--allow-symlink` opts back in for installer-shaped work;
   `--ro-dir` denied it already. Composing modules over shared linear memory is the **runtime's** job,
@@ -176,7 +225,8 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   (→ a multi-object `for` over unequal-length slices, which in ReleaseFast iterates the *first* length and
   reads `Module.Code` structs OOB). Only `validate.zig` compared these, and the CLI run path never
   validates. **Rule: any cross-section consistency property you rely on at run time must be re-checked
-  there (`CountMismatch` in `initWithImports`, `orelse` on `funcType`) — never inherited from the
+  there (`CountMismatch` in `instantiateWithImports` — spelled `initWithImports` until R2 renamed it
+  2026-08-13, `orelse` on `funcType`) — never inherited from the
   validator.** Corollary for multi-object `for`: unequal lengths are *illegal behavior*, unchecked in
   ReleaseFast — guard the lengths before the loop whenever the slices come from separate sections.
 - **Linear memory is page-allocator memory obtained via `rawAlloc` — never `Allocator.alloc` (owner,
@@ -224,13 +274,23 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   constant, because every operand must have been produced by at least one instruction — so the bound is
   provably ≥ any valid `n`. **Prefer a derived bound over a magic number whenever one exists**; a constant
   here would have been a guess that could reject a legitimate module.
-- **`ValType.nullable()` returns a TYPE, not a bool — do not "fix" the element/table check (2026-07-20).**
-  `validate.zig`'s active-element check is `elem.elem_type.nullable() != tet.nullable()`, which compares
-  heap types with nullability normalized away — correct. A 10th-pass audit reported it as accept-invalid
-  on the assumption that `nullable()` was a predicate; **verified false** (an `externref` segment against a
-  `funcref` table is rejected `TypeMismatch`). A comment sits at the site. *General rule this earned: an
-  audit finding is a hypothesis. Confirm the mechanism before changing security-relevant code — this one
-  came with a plausible write-up and died on a two-minute check.*
+- **~~`ValType.nullable()` returns a TYPE, not a bool — do not "fix" the element/table check~~
+  (2026-07-20) — ⚠️ HALF-REVERSED 2026-08-13 (R2). The check WAS wrong; the audit's reason for
+  saying so was not.**
+  `validate.zig`'s active-element check used to be `elem.elem_type.nullable() != tet.nullable()`,
+  comparing heap types with nullability normalized away. A 10th-pass audit reported it as
+  accept-invalid on the assumption that `nullable()` was a predicate; that assumption is still
+  **false** (`nullable()` returns the nullable form of the type), so the finding was retracted and a
+  `Don't "fix" it again` comment went in at the site.
+  **R2 found the rule wrong anyway.** §3.5.11 requires the segment's element type to be a SUBTYPE of
+  the table's, and erasing nullability accepts a nullable `funcref` segment into a `(ref func)`
+  table — nulls in a table whose type promises none (`elem.wast` requires that rejection). The check
+  is now `subtypeOf(module, elem.elem_type, tet)`, matching what `table.init` already did a few
+  hundred lines below. **Do not restore the equality check.**
+  *General rule this earned, REVISED: an audit finding is a hypothesis, and so is a retraction. A
+  retraction re-checks the REASONING; it does not re-check the REQUIREMENT. When you kill a finding,
+  say which of the two you verified — this one killed the argument, left the defect, and the
+  "don't fix it again" note then guarded the defect for three weeks.*
 - **A gate that cannot pass is not a gate (2026-07-20).** `zig build conformance` originally failed unless
   the upstream testsuite produced **zero** failures, which it never has here (see `testing.md`'s snapshot),
   so it would have been permanently red and therefore ignored. It now takes `-Dbaseline=<file>` (expected
@@ -490,6 +550,17 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
     fails the build and must raise the number *in the same commit* with a reason. Headroom would let
     drift accumulate under a green check, which is the failure it exists to prevent. It caught the
     ABI-2 flip growing the DLL 227→845 KB. A SHRINK is reported too, so a win gets locked in.
+    ⚠️ **AND IT STILL DRIFTED, because nothing RAN it (found 2026-08-13, R2).** By then all three
+    ceilings were over — exe +22,016, lib +24,628, dll +19,456 — left by the R1 commits of
+    2026-08-12, which grew the artifacts without invoking the step. **A gate only gates the commits
+    that run it; a gate with no trigger is a preference, exactly like a goal with no gate.** Until
+    something invokes it automatically, run `zig build size -Doptimize=ReleaseSmall` before any
+    commit that touches `src/`. **Attribute an overshoot before paying for it** — build the parent
+    commit in a `git worktree` and diff, rather than assuming the growth is yours; R2's true share
+    of that overshoot was +5,120 / +1,068 / **+0**.
+    **Live sizes (2026-08-13, ReleaseSmall, Zig 0.16.0, x86_64-windows):** exe **939,008**, static
+    lib **999,296**, dll **864,768**. ⚠️ Measure the static lib from a PLAIN `zig build` — `zig build
+    dll` overwrites `wazmrt.lib` with the DLL's much smaller import library.
   - **`tests/wazmrt_abi_symbols.c`** — GENERATED from the header, because a hand-kept list drifts by
     exactly the typo it exists to catch. ⚠️ **Demonstrating it requires a symbol nothing calls
     internally.** The first attempt renamed `wazmrt_bytes_delete`, which `module_new_wat` calls, so it

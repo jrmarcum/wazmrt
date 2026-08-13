@@ -81,6 +81,33 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
   validation**, which is strong evidence the type-checker is correct across real, deeply-nested
   control flow (not just the simple `wasm_mod` set).
 
+## 📊 CURRENT spec-testsuite score (measured 2026-08-13, after R1 + R2)
+
+**284 files — 61,187 assertions passed / 193 failed / 2,637 skipped.** This is the number to quote;
+every snapshot below it is older and kept as history. Reproduce exactly:
+
+```
+zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
+  -Dtestsuite=<wasmtk>/tests/module/wasm_wast/testsuite-main
+```
+
+- **`-Dfailures=600` is not optional for triage.** With the default (1) each file reports only its
+  first failure, and *that text names a symptom* — it mislabelled three of the T-list's five items.
+- **Failure messages carry the source LINE** of the `.wast` command that produced them (`L342: …`),
+  added 2026-08-13 via `sexpr.parseAllWithLines`. Before that, matching 35 failures back to their
+  assertions was hand work.
+- **193 is not 193 defects.** **101 are BY DESIGN** — `custom-descriptors` 88 and
+  `custom-page-sizes` 13, proposals wazmrt does not target, refused honestly. **92 are actionable**,
+  itemised as the R-list in `roadmap.md` (R1 and R2 done; R3 next).
+- ⚠️ **2,637 SKIPPED IS NOT 2,637 PASSED**, and the largest pool is core spec: `br_table.wast` alone
+  has **161** unrun assertions. Any headline figure that ignores skips is an upper bound.
+- ⚠️ **Run `zig build size -Doptimize=ReleaseSmall` in the same session.** Nothing invokes it
+  automatically and the ceilings drifted 22–25 KB between 2026-08-11 and 2026-08-13 because of that.
+
+**Windows/this box:** run one `zig build` at a time, and pass `--cache-dir`/`--global-cache-dir` on
+`C:` — a `D:` cache fails with `error: Unexpected`. `zig build test-security` must be run from an
+NTFS cwd (`D:` is exFAT, no symlinks).
+
 ## Spec-testsuite conformance — first REAL measurement (2026-07-21, 13th pass)
 
 **Score: 57 827 passed / 752 failed / 4 507 skipped, over 258 files** (upstream `WebAssembly/spec`,
@@ -195,7 +222,7 @@ regressions).
 Added `ref.null`/`ref.is_null`/`ref.func` (`0xD0`–`0xD2`) end to end, `(ref null? func|extern)` value
 types in the assembler, and reference value literals in the WAST runner (`(ref.null …)`,
 `(ref.extern N)`, `(ref.func)` = any-non-null / with-index = exact). Null references use a
-`maxInt(u64)` sentinel on the value stack; a funcref value is its function index. Also made
+`maxInt(u64)` sentinel on the value stack; a funcref value is its function index (⚠️ **SUPERSEDED 2026-08-13, R2: a funcref is `(store_slot+1)<<32 | func_index`** — the bare index named a different function in every other instance). Also made
 `call_indirect` skip an optional explicit table id (`call_indirect $t (type …)`) — consumed but not
 encoded (single-table). **Remaining gaps are now two distinct features, not reference types:**
 `call_indirect.wast`'s last failure and `local_tee.wast` need **multi-table** support (multiple
@@ -216,7 +243,7 @@ element segments, imported globals — the next features), while `elem`/`stack` 
 unchanged.
 
 **Update 2026-07-09 — imported globals + extended-const init expressions:** `global.wast` 0 →
-**62 passed, 1 failed**. `Instance.initWithImports` fills imported-global slots from host-supplied
+**62 passed, 1 failed**. `Instance.initWithImports` (⚠️ renamed `instantiateWithImports` 2026-08-13) fills imported-global slots from host-supplied
 values (imports occupy the head of the global index space); the WAST runner backs the standard
 `spectest` globals (`global_i32`/`i64` = 666, `global_f32`/`f64` = 666.6); the assembler parses
 `(global (import "m" "n") type)` and emits an **import section (2)**; `ref.null`/`ref.func` are accepted
@@ -230,7 +257,7 @@ regressions** (HEAD-baselined: `data` 0/13 and `memory`'s slowness are pre-exist
 `table_set.wast` 0 → **18/0**. Added `table.get`/`table.set` (`0x25`/`0x26`) across
 opcode/interp/validator (typed by the table's element type), and refactored interp tables from `[]u32`
 (funcref indices) to `[]Value` slots so **funcref and externref tables share one representation**
-(`null_ref` = uninitialized; a funcref is its function index; an externref is its host value). The
+(`null_ref` = uninitialized; a funcref is its function index — ⚠️ **SUPERSEDED 2026-08-13, R2: it names an instance too**; an externref is its host value). The
 assembler parses `externref`/`(ref …)` table element types + emits the correct element byte, and emits
 `table.get`/`.set` (optional explicit table id, default 0). No regressions.
 
