@@ -3713,7 +3713,8 @@ test "reads an imported global from the host value" {
     );
     var m = try Module.decode(a, bin);
     var inst: interp.Instance = undefined;
-    try inst.instantiateWithImports(a, &m, .{ .globals = &.{interp.i32Value(777)} });
+    var imported_x: interp.Instance.Global = .{ .value = interp.i32Value(777) };
+    try inst.instantiateWithImports(a, &m, .{ .globals = &.{&imported_x} });
     try std.testing.expectEqual(@as(i32, 777), interp.asI32((try inst.invoke("get-x", &.{}))[0]));
     // A defined global's init may read the imported one: 777 + 1.
     try std.testing.expectEqual(@as(i32, 778), interp.asI32((try inst.invoke("get-y", &.{}))[0]));
@@ -3735,7 +3736,8 @@ test "v128 global inits from an imported v128 global (both 64-bit halves)" {
     const lo: interp.Value = 10 | (@as(u64, 20) << 32);
     const hi: interp.Value = 30 | (@as(u64, 40) << 32);
     var inst: interp.Instance = undefined;
-    try inst.instantiateWithImports(a, &m, .{ .globals = &.{lo}, .globals_hi = &.{hi} });
+    var imported_v: interp.Instance.Global = .{ .value = lo, .hi = hi };
+    try inst.instantiateWithImports(a, &m, .{ .globals = &.{&imported_v} });
     // The defined global copied both halves — lane 0 from the low, lane 3 from the high.
     try std.testing.expectEqual(@as(i32, 10), interp.asI32((try inst.invoke("lo", &.{}))[0]));
     try std.testing.expectEqual(@as(i32, 40), interp.asI32((try inst.invoke("hi", &.{}))[0]));

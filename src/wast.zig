@@ -127,6 +127,8 @@ const Runner = struct {
     /// funcref, max 20), created lazily and shared by every importer.
     spectest_memory: ?*interp.Instance.Memory = null,
     spectest_table: ?*interp.Instance.Table = null,
+    /// Cells for the `spectest` constant globals, by name. See `spectestGlobalCell`.
+    spectest_globals: std.StringHashMapUnmanaged(*interp.Instance.Global) = .{},
     /// Interned host externref payloads. A `(ref.extern N)` value is represented
     /// on the value stack as its *index* here (a small integer, never the
     /// `null_ref` = maxInt sentinel), so an externref of any payload — including
@@ -209,7 +211,7 @@ const Runner = struct {
     /// a type mismatch → `IncompatibleImportType` (both = "unlinkable").
     fn resolveImports(self: *Runner, m: *const Module) !interp.Instance.Imports {
         var fs: std.ArrayList(HostFunc) = .empty;
-        var gs: std.ArrayList(Value) = .empty;
+        var gs: std.ArrayList(*interp.Instance.Global) = .empty;
         var ms: std.ArrayList(*interp.Instance.Memory) = .empty;
         var ts: std.ArrayList(*interp.Instance.Table) = .empty;
         // One matcher per link: its memo is keyed by module pointer, and every
@@ -274,11 +276,11 @@ const Runner = struct {
         return error.UnresolvedImport;
     }
 
-    fn resolveGlobalImport(self: *Runner, tm: *typematch.Ctx, m: *const Module, imp: Module.Import, want: Module.GlobalType) !Value {
+    fn resolveGlobalImport(self: *Runner, tm: *typematch.Ctx, m: *const Module, imp: Module.Import, want: Module.GlobalType) !*interp.Instance.Global {
         if (std.mem.eql(u8, imp.module, "spectest")) {
             const gt = spectestGlobalType(imp.name) orelse return error.UnresolvedImport;
             if (gt.content != want.content or gt.mutable != want.mutable) return error.IncompatibleImportType;
-            return spectestGlobal(imp.module, imp.name).?;
+            return self.spectestGlobalCell(imp.name, spectestGlobal(imp.module, imp.name).?);
         }
         if (self.modules.get(imp.module)) |inst| {
             for (inst.module.exports) |e| {
@@ -289,6 +291,18 @@ const Runner = struct {
             }
         }
         return error.UnresolvedImport;
+    }
+
+    /// A cell holding a `spectest` global's constant value. An imported global is
+    /// a borrowed CELL now, not a copied value, so the runner has to own storage
+    /// for the host-side constants that lives as long as any importer. They are
+    /// immutable, so one cell per name is shared.
+    fn spectestGlobalCell(self: *Runner, name: []const u8, v: Value) !*interp.Instance.Global {
+        if (self.spectest_globals.get(name)) |g| return g;
+        const g = try self.a.create(interp.Instance.Global);
+        g.* = .{ .value = v };
+        try self.spectest_globals.put(self.a, name, g);
+        return g;
     }
 
     fn resolveMemoryImport(self: *Runner, module: []const u8, name: []const u8, want: Module.MemoryType) !*interp.Instance.Memory {
@@ -430,7 +444,7 @@ const Runner = struct {
         for (inst.module.exports) |e| {
             if (e.type == .global and std.mem.eql(u8, e.name, name)) {
                 const v = try self.a.alloc(Value, 1);
-                v[0] = inst.globals[e.index];
+                v[0] = inst.globals[e.index].value;
                 return v;
             }
         }
@@ -1414,6 +1428,31 @@ test "a funcref in a shared table names its own instance, not the caller's index
         \\(assert_return (invoke $A "at" (i32.const 1)) (i32.const 11))
         \\(assert_return (invoke $B "bt" (i32.const 0)) (i32.const 22))
         \\(assert_return (invoke $B "bt" (i32.const 1)) (i32.const 11))
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 4), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "an imported mutable global is SHARED, not copied at instantiation" {
+    // Imported globals were copied by value, so a `(mut i32)` import was a
+    // snapshot taken at link time. $B re-exports $A's global; $A then writes 241
+    // through its own setter, and the read through $B still returned the old
+    // 142 — `linking.wast`'s `Mg.mut_glob`. The value was stale, not garbage,
+    // which is why it never looked like a bug from inside $B.
+    const src =
+        \\(module $A
+        \\  (global (export "g") (mut i32) (i32.const 142))
+        \\  (func (export "set") (param i32) (global.set 0 (local.get 0))))
+        \\(register "A" $A)
+        \\(module $B
+        \\  (global $g (import "A" "g") (mut i32))
+        \\  (export "g" (global $g))
+        \\  (func (export "get") (result i32) (global.get $g)))
+        \\(assert_return (get $B "g") (i32.const 142))
+        \\(assert_return (invoke $A "set" (i32.const 241)))
+        \\(assert_return (get $B "g") (i32.const 241))
+        \\(assert_return (invoke $B "get") (i32.const 241))
     ;
     const s = try runScript(std.testing.allocator, src);
     try std.testing.expectEqual(@as(usize, 4), s.passed);

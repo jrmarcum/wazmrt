@@ -1545,8 +1545,7 @@ fn resolveImports(
     };
 
     const funcs = sa.alloc(interp.Instance.HostFunc, nfunc) catch return errorf("out of memory", .{});
-    const globals = sa.alloc(interp.Value, nglobal) catch return errorf("out of memory", .{});
-    const globals_hi = sa.alloc(interp.Value, nglobal) catch return errorf("out of memory", .{});
+    const globals = sa.alloc(*interp.Instance.Global, nglobal) catch return errorf("out of memory", .{});
 
     // One matcher per link, so its module-pointer-keyed memo lives no longer than
     // the modules it names (see `typematch.Ctx`).
@@ -1643,8 +1642,11 @@ fn resolveImports(
                 fi += 1;
             },
             .global => |want| {
-                // A published instance's exported global, read at link time — a snapshot, which
-                // is what the ABI can carry (it has no mutable-global sharing).
+                // A published instance's exported global, bound as the SHARED CELL — a
+                // `(mut i32)` the exporter writes is now visible here. It used to be read once
+                // at link time and copied, so the importer held a snapshot that never changed:
+                // the same defect `linking.wast` caught on the `.wast` path, on the embedder
+                // path the corpus never reaches (R1's lesson, again).
                 if (lk.find(im.module, im.name) == null) {
                     if (lk.findInstance(im.module)) |h| {
                         const oi = store.resolve(h.id, store.instances.items.len) orelse
@@ -1655,7 +1657,6 @@ fn resolveImports(
                         if (idx >= oslot.inst.globals.len)
                             return errorf("import '{s}'.'{s}': published global is out of range", .{ im.module, im.name });
                         globals[gi] = oslot.inst.globals[idx];
-                        globals_hi[gi] = if (idx < oslot.inst.global_hi.len) oslot.inst.global_hi[idx] else 0;
                         gi += 1;
                         continue;
                     }
@@ -1670,8 +1671,11 @@ fn resolveImports(
                 var two: [2]interp.Value = .{ 0, 0 };
                 _ = valToSlots(v, want.content, &two) orelse
                     return errorf("import '{s}'.'{s}': global value has the wrong type", .{ im.module, im.name });
-                globals[gi] = two[0];
-                globals_hi[gi] = two[1];
+                // A host-defined constant needs a cell of its own, on the instance's arena so
+                // it outlives every read the guest makes through it.
+                const cell = sa.create(interp.Instance.Global) catch return errorf("out of memory", .{});
+                cell.* = .{ .value = two[0], .hi = two[1] };
+                globals[gi] = cell;
                 gi += 1;
             },
             // Refused LOUDLY rather than left unbound: an unbacked memory or table import would
@@ -1686,7 +1690,6 @@ fn resolveImports(
     out.* = .{
         .funcs = funcs,
         .globals = globals,
-        .globals_hi = globals_hi,
         // The engine's ceilings, carried per-instance so `memory.grow`/`table.grow` re-check
         // them at run time rather than only at instantiation.
         .max_memory_bytes = lk.engine.max_memory_bytes,
@@ -2044,10 +2047,10 @@ export fn wazmrt_global_get(s: ?*const Store, h: GlobalHandle, out: ?*Val) bool 
     const vt = slot.module.inner.globals[r.index].content;
     // A v128 global keeps its high half in a parallel array, so it cannot be read as one slot.
     if (vt == .v128) {
-        var two = [2]interp.Value{ slot.inst.globals[r.index], slot.inst.global_hi[r.index] };
+        var two = [2]interp.Value{ slot.inst.globals[r.index].value, slot.inst.globals[r.index].hi };
         return slotsToVal(&two, vt, out_p) != null;
     }
-    const one = [1]interp.Value{slot.inst.globals[r.index]};
+    const one = [1]interp.Value{slot.inst.globals[r.index].value};
     return slotsToVal(&one, vt, out_p) != null;
 }
 

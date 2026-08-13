@@ -520,10 +520,22 @@ pub const Instance = struct {
     /// given), and so must free it in `deinit`.
     owns_store: bool,
     func_bodies: []FuncBody,
-    globals: []Value,
-    /// High 64 bits of each global (only v128 globals use it; 0 otherwise), so a
-    /// v128 global's two slots are `globals[i]` (low) + `global_hi[i]` (high).
-    global_hi: []Value,
+    /// The global index space: imported globals first (BORROWED — they point at
+    /// the exporting instance's cells), then defined ones (owned, living in
+    /// `owned_globals`).
+    ///
+    /// ⚠️ **Imported globals used to be copied by VALUE at instantiation**, so a
+    /// `(mut i32)` import was a snapshot: the exporter's `global.set` was
+    /// invisible to the importer, and `linking.wast` read 142 from a global the
+    /// owner had already set to 241. A mutable global is a shared cell — the same
+    /// relationship memories and tables already had here, and the one kind of
+    /// import that did not get it.
+    globals: []*Global,
+    /// Cells for this module's DEFINED globals, in index-space order after the
+    /// imports. Owned; freed by `deinit`.
+    owned_globals: []Global,
+    /// How many leading entries of `globals` are imported (borrowed, not freed).
+    imported_globals: usize,
     imported_funcs: u32,
     /// Backing callables for imported functions (index-aligned with the first
     /// `imported_funcs` entries of the function index space).
@@ -632,6 +644,13 @@ pub const Instance = struct {
     /// (table64) may declare a max past `u32` and takes i64 index operands. It
     /// was `?u32` with no index type, so 64-bit tables could not be represented
     /// even after the decoder learned to read them.
+    /// A global's storage cell. Shared between the defining instance and every
+    /// importer, so a `global.set` on a mutable global is visible across the
+    /// module boundary — exactly as `Memory` and `Table` already were.
+    /// `hi` holds the high 64 bits of a v128 global (0 for every scalar one), so
+    /// a v128 global's two stack slots are `value` (low) then `hi`.
+    pub const Global = struct { value: Value, hi: Value = 0 };
+
     /// `store` is the store whose funcref values this table's entries are
     /// written in. Carried so linking can REFUSE to import a table from another
     /// store rather than silently reinterpret its entries.
@@ -655,11 +674,11 @@ pub const Instance = struct {
     /// imports of that kind (imports occupy the low indices of their space).
     pub const Imports = struct {
         funcs: []const HostFunc = &.{},
-        globals: []const Value = &.{},
-        /// High 64 bits of each imported global (only v128 globals use it; the
-        /// low half is in `globals[i]`). May be shorter than `globals` — a
-        /// missing entry means 0, which is correct for every non-v128 global.
-        globals_hi: []const Value = &.{},
+        /// Cells backing the imported globals, in import order. **Borrowed, not
+        /// copied** — the cell must outlive the instance, and a write through it
+        /// by the exporter must be visible here. For a host-defined constant,
+        /// point at storage the host keeps alive for the instance's lifetime.
+        globals: []const *Global = &.{},
         memories: []const *Memory = &.{},
         tables: []const *Table = &.{},
         /// Ceiling on linear memory this instance may allocate, summed over all
@@ -915,39 +934,29 @@ pub const Instance = struct {
         var gc_heap: std.ArrayList(HeapObject) = .empty;
         errdefer gc_heap.deinit(gpa);
 
-        const globals = try a.alloc(Value, module.globals.len);
-        @memset(globals, 0);
-        // A v128 global needs 128 bits: `globals[i]` holds the low 64 and this
-        // parallel array the high 64 (0 for scalar globals). Keeping `globals`
-        // index-aligned means the scalar const-expr evaluator is unchanged.
-        const global_hi = try a.alloc(Value, module.globals.len);
-        @memset(global_hi, 0);
-        // Imported globals occupy the head of the index space; fill them from the
-        // host-supplied values (both halves, for imported v128 globals). Defined
-        // globals (each with an init expr) follow.
+        // Imported globals occupy the head of the index space and BORROW the
+        // exporter's cell; defined globals (each with an init expr) follow and
+        // own theirs.
         const defined_start = module.globals.len - module.global_inits.len;
-        // A short `imports.globals` used to leave the rest at the `@memset` zero,
-        // so a module importing a global the host never supplied silently read
-        // **0** instead of failing — while imported memories and tables both
-        // return `MissingImport` a few lines below. The asymmetric sibling.
+        const globals = try a.alloc(*Global, module.globals.len);
+        const owned_globals = try a.alloc(Global, module.global_inits.len);
+        @memset(owned_globals, .{ .value = 0 });
+        // A short `imports.globals` used to leave the rest at a zero default, so
+        // a module importing a global the host never supplied silently read **0**
+        // instead of failing — while imported memories and tables both return
+        // `MissingImport` a few lines below. The asymmetric sibling.
         if (defined_start > imports.globals.len) return error.MissingImport;
-        for (imports.globals, 0..) |gv, i| {
-            if (i >= defined_start) break;
-            globals[i] = gv;
-            // NOTE: a short `globals_hi` is fine — it is only meaningful for v128
-            // globals and 0 is correct for every scalar one.
-            if (i < imports.globals_hi.len) global_hi[i] = imports.globals_hi[i];
-        }
+        for (globals, 0..) |*g, i| g.* = if (i < defined_start) imports.globals[i] else &owned_globals[i - defined_start];
         for (module.global_inits, 0..) |init_expr, gi| {
             const gidx = defined_start + gi;
             if (module.globals[gidx].content == .v128) {
                 // Init is `v128.const` or `global.get` of a preceding/imported
                 // v128 global — both need the 128-bit-aware evaluator.
-                const v = try evalConstV128(init_expr, globals[0..gidx], global_hi[0..gidx]);
-                globals[gidx] = @truncate(v);
-                global_hi[gidx] = @truncate(v >> 64);
+                const v = try evalConstV128(init_expr, globals[0..gidx]);
+                globals[gidx].value = @truncate(v);
+                globals[gidx].hi = @truncate(v >> 64);
             } else {
-                globals[gidx] = try evalConstExpr(.{
+                globals[gidx].value = try evalConstExpr(.{
                     .globals = globals[0..gidx],
                     .module = module,
                     .arena = a,
@@ -1114,7 +1123,8 @@ pub const Instance = struct {
             .owns_store = owns_store,
             .func_bodies = bodies,
             .globals = globals,
-            .global_hi = global_hi,
+            .owned_globals = owned_globals,
+            .imported_globals = defined_start,
             .imported_funcs = module.importedFuncCount(),
             .import_funcs = imports.funcs,
             .memories = memories,
@@ -2522,15 +2532,15 @@ const Frame = struct {
                 },
                 .global_get => {
                     const gi = instr.imm.global;
-                    try self.pushU64(self.inst.globals[gi]);
+                    try self.pushU64(self.inst.globals[gi].value);
                     // A v128 global is two slots: low then high.
-                    if (self.inst.module.globals[gi].content == .v128) try self.pushU64(self.inst.global_hi[gi]);
+                    if (self.inst.module.globals[gi].content == .v128) try self.pushU64(self.inst.globals[gi].hi);
                     pc += 1;
                 },
                 .global_set => {
                     const gi = instr.imm.global;
-                    if (self.inst.module.globals[gi].content == .v128) self.inst.global_hi[gi] = self.pop(); // high (top)
-                    self.inst.globals[gi] = self.pop(); // low
+                    if (self.inst.module.globals[gi].content == .v128) self.inst.globals[gi].hi = self.pop(); // high (top)
+                    self.inst.globals[gi].value = self.pop(); // low
                     pc += 1;
                 },
 
@@ -3830,13 +3840,13 @@ fn satTruncLane(comptime Int: type, x: anytype) Int {
 /// Evaluate a v128 global's init const-expr to a u128: either `v128.const <16
 /// bytes>` or `global.get <idx>` of a preceding/imported v128 global (whose two
 /// halves are read from `lo[idx]` / `hi[idx]`). Any other opcode errors.
-fn evalConstV128(expr: []const u8, lo: []const Value, hi: []const Value) Error!u128 {
+fn evalConstV128(expr: []const u8, globals: []const *Instance.Global) Error!u128 {
     var r = Reader.init(expr);
     const op = try r.readByte();
     if (op == 0x23) { // global.get of a preceding/imported v128 global
         const idx = try r.readVarU32();
-        if (idx >= lo.len) return error.UndefinedGlobal;
-        return (@as(u128, hi[idx]) << 64) | lo[idx];
+        if (idx >= globals.len) return error.UndefinedGlobal;
+        return (@as(u128, globals[idx].hi) << 64) | globals[idx].value;
     }
     if (op != 0xfd) return error.UnsupportedInstruction;
     if ((try r.readVarU32()) != 0x0c) return error.UnsupportedInstruction; // v128.const
@@ -3848,7 +3858,7 @@ fn evalConstV128(expr: []const u8, lo: []const Value, hi: []const Value) Error!u
 
 /// Evaluate a constant offset expression (data / element segment offset) to an
 /// i32 address.
-fn evalConstOffset(globals: []const Value, expr: []const u8, is64: bool) Error!u64 {
+fn evalConstOffset(globals: []const *Instance.Global, expr: []const u8, is64: bool) Error!u64 {
     // Offset const-exprs never allocate, so no GC context is needed. A 64-bit
     // memory's active-data offset is i64 (memory64); a 32-bit one is i32.
     const v = try evalConstExpr(.{ .globals = globals }, expr);
@@ -3860,7 +3870,7 @@ fn evalConstOffset(globals: []const Value, expr: []const u8, is64: bool) Error!u
 /// element expressions during `Instance.init`) — an offset-only context leaves
 /// them null and a GC op there fails loud.
 const ConstCtx = struct {
-    globals: []const Value,
+    globals: []const *Instance.Global,
     module: ?*const Module = null,
     /// Arena for a new object's field/element slice (matches the run path).
     arena: ?std.mem.Allocator = null,
@@ -3902,7 +3912,7 @@ fn evalConstExpr(ctx: ConstCtx, expr: []const u8) Error!Value {
             0x23 => { // global.get
                 const gi = try r.readVarU32();
                 if (gi >= globals.len) return error.UndefinedGlobal;
-                try push(&stack, &sp, globals[gi]);
+                try push(&stack, &sp, globals[gi].value);
             },
             0xd0 => { // ref.null <heaptype>
                 _ = try r.readByte();
