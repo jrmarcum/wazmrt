@@ -180,7 +180,26 @@ see `known-issues.md` on why they had drifted.)*
   (`error.CrossStoreLink`) rather than silently reinterpreted. See the entry below for what this
   replaced.
 
-### The accept-invalid class is CLOSED in core spec files — R4, 2026-08-13
+### UTF-8 name validation is VERIFIED at last — R5, 2026-08-13
+
+`utf8-invalid-encoding.wast` ran **0 of its 176 assertions** for as long as the corpus has been used,
+because every one is an `assert_malformed (module quote …)` and the runner could not build a quoted
+module. It was recorded as an evidence hole (R8) precisely because **an unverified security-relevant
+check is indistinguishable from a passing one**. R5 implemented the form; all 176 now execute and
+pass. The validation was correct all along — which is the outcome to hope for and never the outcome
+to assume.
+
+⚠️ **Note what the fix was: the RUNNER, not the runtime.** The item asked "is the skip the runner's
+gap or ours?" — the right question, and unanswerable without running the thing. Any other
+security-relevant property whose corpus reads `0 passed / 0 failed / N skipped` deserves the same
+question before it is treated as held.
+
+### The accept-invalid class in core spec files — R4, 2026-08-13 (⚠️ superseded in scope by R5)
+
+⚠️ **Read this entry with R5's correction.** R4 closed every accept-invalid the corpus could then
+*reach*; R5 gave the corpus access to the TEXT front-end and **88 more appeared in core files**, in
+the assembler rather than the decoder. The class is not closed — it is closed on one of two surfaces.
+The severity argument below is unchanged and applies to both.
 
 **wazmrt no longer accepts any module the core spec testsuite calls invalid.** The 29 `assert_invalid`
 failures that remain are 20 in `custom-descriptors` and 9 in `proposals/threads` — an untargeted

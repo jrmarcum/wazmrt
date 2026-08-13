@@ -81,10 +81,17 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
   validation**, which is strong evidence the type-checker is correct across real, deeply-nested
   control flow (not just the simple `wasm_mod` set).
 
-## 📊 CURRENT spec-testsuite score (measured 2026-08-13, after R1 + R2 + R3 + R4)
+## 📊 CURRENT spec-testsuite score (measured 2026-08-13, after R1–R5)
 
-**284 files — 61,429 assertions passed / 143 failed / 2,407 skipped.** This is the number to quote;
-every snapshot below it is older and kept as history. Reproduce exactly:
+**284 files — 62,333 assertions passed / 216 failed / 1,429 skipped.** This is the number to quote;
+every snapshot below it is older and kept as history.
+
+⚠️ **The failed count ROSE from 143 at R4 and that is an improvement.** R5 implemented
+`(module quote …)`, which had been suppressing 978 assertions; 904 of them pass, 73 fail. Passing
+went 61,429 → 62,333 and skipped 2,407 → 1,429. **Quote all three numbers or none** — the failure
+count alone can be improved by running less, which is exactly the state R5 found.
+
+Reproduce exactly:
 
 ```
 zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
@@ -96,14 +103,18 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
 - **Failure messages carry the source LINE** of the `.wast` command that produced them (`L342: …`),
   added 2026-08-13 via `sexpr.parseAllWithLines`. Before that, matching 35 failures back to their
   assertions was hand work.
-- **143 is not 143 defects.** **97 are BY DESIGN** — `custom-descriptors` 82, `custom-page-sizes` 13,
-  `wide-arithmetic` 2, proposals wazmrt does not target, refused honestly. **46 are actionable**,
-  itemised as the R-list in `roadmap.md` (R1–R4 done, R6 closed by R3; R5/R7/R8 next).
-- ✅ **ACCEPT-INVALID IN CORE SPEC FILES IS ZERO** as of R4. The 29 `assert_invalid` failures left are
-  20 in `custom-descriptors` (untargeted) and 9 in `proposals/threads` (R7's). This is the class the
-  whole T1 → R4 arc was about, and it is the one worth re-checking after any decoder or validator
-  change: `grep "should be rejected"` over a `-Dfailures=600` run is the whole test.
-- ⚠️ **2,407 SKIPPED IS NOT 2,407 PASSED**, and the largest pool is core spec: `br_table.wast` alone
+- **216 is not 216 defects.** Roughly 100 are BY DESIGN (`custom-descriptors`, `custom-page-sizes`,
+  `wide-arithmetic` — proposals wazmrt does not target, refused honestly); the rest is itemised as
+  the R-list in `roadmap.md` (R1–R5 done, R6 closed by R3, R8 closed by R5; **R9** — the text-level
+  accept-invalid class R5 revealed — and R7 next).
+- ⚠️ **"ACCEPT-INVALID IN CORE SPEC FILES IS ZERO" (recorded at R4) IS NO LONGER TRUE, and it was
+  true when written.** R4 closed every accept-invalid the corpus could *see*. R5 implemented
+  `(module quote …)`, the corpus gained sight of the TEXT front-end, and 88 more appeared in core
+  files — the same class, one layer up. **A conformance number says nothing about a surface the
+  corpus does not reach, and "the corpus reaches it" is itself a claim that can silently be false.**
+  The guard is still one grep — `grep "should be rejected"` over a `-Dfailures=600` run — but read it
+  next to the skip count, or it only measures the part of the runtime the runner can currently drive.
+- ⚠️ **1,429 SKIPPED IS NOT 1,429 PASSED**, and the largest pool is core spec: `br_table.wast` alone
   has **161** unrun assertions. Any headline figure that ignores skips is an upper bound.
 - ⚠️ **READ THE SKIP COLUMN WHEN TRIAGING, NOT JUST THE FAILURE COLUMN.** R3 was triaged at ~10
   failures and scored 16 — but a module that fails to build sends every assertion targeting it into
@@ -111,6 +122,13 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
   `0 passed, 1 failed, 29 skipped`: one failure, and *nothing in the file ever ran*. Failures fell
   36 while real runs rose 225. **A single-digit failure count next to a double-digit skip count is a
   blackout, not a small defect.**
+- ⚠️⚠️ **AND AN ITEM WHOSE SYMPTOM IS A SKIP WILL BE UNDERCOUNTED BY ANY AMOUNT.** R5 was filed at
+  "~23" from the failure column; the real figure was **1,291**, because an unimplemented command form
+  produces no failures at all — only skips, which were never itemised per reason. R8 was a *subset*
+  of it (176 of the same skip) and was filed as a separate item because it was counted in a different
+  column. **The runner reports a skip TOTAL with no breakdown; that is why both numbers were wrong.**
+  Until it reports reasons, `grep -c "(module quote" <corpus>` and its siblings are the only way to
+  size a runner gap.
 - ⚠️ **Run `zig build size -Doptimize=ReleaseSmall` in the same session.** Nothing invokes it
   automatically and the ceilings drifted 22–25 KB between 2026-08-11 and 2026-08-13 because of that.
   ⚠️ **And run `zig build dll -Doptimize=ReleaseSmall` too** — plain `zig build` does not produce the
@@ -118,10 +136,16 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
   *exactly* its ceiling; the file was two builds old. **An exactly-zero delta is a timestamp check
   waiting to happen.**
 
-**Unit tests: 587** (`zig build test --summary all`, 2026-08-13 after R4) — 583 pass / 4 skip from
-this repo's own `D:` cwd, **587/587 from an NTFS cwd**, which is the number to quote. R3 added 7 and
-R4 added 4; each core test raises the printed total by two because the C-ABI target re-runs the core
-suite.
+**Unit tests: 593** (`zig build test --summary all`, 2026-08-13 after R5) — 589 pass / 4 skip from
+this repo's own `D:` cwd, **593/593 from an NTFS cwd**, which is the number to quote. R3 added 7,
+R4 4 and R5 3; each core test raises the printed total by two because the C-ABI target re-runs the
+core suite.
+
+⚠️ **R5's inversion check caught a test that tested the RULE but not that the rule is CONSULTED.**
+The literal-syntax test called `validIntLit`/`validFloatLit` directly, so disabling their *call
+sites* left it green while the assembler happily took `0xff__ffff` again. The fix was to assert the
+same cases through `assemble`. **When a predicate and its wiring are separate, invert the wiring, not
+just the predicate** — otherwise the test proves the function works and nothing about the product.
 
 ⚠️ **R4 also had to CHANGE seven existing tests, and that is the interesting part.** Four hand-built
 EH fixtures in `interp.zig` and two WAT tests encoded the try_table catch-label off-by-one, and the

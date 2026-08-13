@@ -182,19 +182,25 @@ call-then-return, so the one property the proposal exists to provide (unbounded 
 **A feature can be present, tested, and green while failing at exactly the thing it is for.** Same
 family as the memory64 "COMPLETE" claim above.
 
-### 🎯 REVISED conformance list (2026-08-12) — the 275, now **143** after R1 + R2 + R3 + R4
+### 🎯 REVISED conformance list (2026-08-12) — the 275, now **216** after R1–R5 (and that is PROGRESS)
 
 Successor to the T-list above, and built differently: every item below is grouped **by cause**, from a
 run with `-Dfailures=600` so all 275 failures were read, not just each file's first. The T-list was
 grouped by first-failure text and mislabelled three of its five items.
 
-⚠️ **The per-item counts below are as-triaged (275 total) and are NOT live.** R1–R4 are done and R6
-was closed by R3 — corpus is **143 failures / 61,429 passing / 2,407 skipped** (measured 2026-08-13,
-after R4). Of the 143, **97 are by design** and **46 actionable**. Every count below is high;
-re-measure before trusting any of them (`-Dfailures=600`, diff the per-file summary against the
-previous run).
+⚠️ **The per-item counts below are as-triaged (275 total) and are NOT live.** R1–R5 are done, R6 was
+closed by R3 and R8 by R5 — corpus is **216 failures / 62,333 passing / 1,429 skipped** (measured
+2026-08-13, after R5). Every count below is high; re-measure before trusting any of them
+(`-Dfailures=600`, diff the per-file summary against the previous run).
 
-**97 of the current 143 are BY DESIGN** — proposals wazmrt does not target, refused honestly. They
+⚠️ **THE FAILURE COUNT WENT UP AT R5 AND THAT IS THE PASS WORKING.** 143 → 216 while passes went
+61,429 → 62,333 and skips 2,407 → 1,429: R5 implemented `(module quote …)`, so 978 assertions that
+had never executed started to, and 904 of them pass. **Judge a conformance pass by what it RUNS, not
+by the failure total** — and check that no file lost passes (join the per-file counts; R5 did, and
+none had). A pass that only ever drives the red number down is a pass that can be gamed by skipping
+more.
+
+**Of the current 216, by design** — proposals wazmrt does not target, refused honestly. They
 are not defects and there is nothing to fix unless the scope changes:
 
 | | area | failures | note |
@@ -215,15 +221,64 @@ both directions. Corrected here rather than propagated.
 | **R2** 🔴 | **elem / linking / instance** | 42 → 35 | ✅ **FIXED 2026-08-13 — five causes, and 44 failures, not 35.** All five files CLEAN. See below. |
 | **R3** 🟠 | **GC array bulk ops MISSING** | ~10 → **16** | ✅ **FIXED 2026-08-13 — SIX ops missing, not four, and the cost was in SKIPS, not failures.** See below. |
 | **R4** 🟠 | **Accept-invalid in core files** | ~15 → **12** | ✅ **FIXED 2026-08-13 — five causes, and two of them ALSO caused false rejects.** Core accept-invalid is now **0**. See below. |
-| **R5** 🟡 | **Runner gaps, not wazmrt defects** | 41 → **~23** | ✅ Half-closed by R2: `(module definition …)`/`(module instance …)` are implemented, so `BadCommand` is down to **2**. What remains is `(module quote …)` and **21 `NoTarget`** cascades from modules that never built. These suppress real verification rather than proving anything — the same red-washing as `(either …)` was. **Do this before quoting conformance numbers again.** |
+| **R5** 🟡 | **Runner gaps, not wazmrt defects** | 41 → ~23 → **1,291** | ✅ **FIXED 2026-08-13 — and the item was undercounted by 50×.** `(module quote …)` alone was suppressing **1,291 assertions**. See below. |
 | **R6** 🟡 | GC type remainder + `i31` | 20 → 8 → **0** | ✅ **CLOSED 2026-08-13, and R3 closed it without aiming at it.** R1 took `type-subtyping`/`type-rec`; the last 8 were `i31.wast`, and they were not an i31 defect at all — the file uses `(elem $e i31ref …)` and the assembler's `isRefType` listed only `funcref`/`externref`, so the whole segment was misread as func indices. One shorthand-table fix, `i31.wast` 8 → 0. |
 | **R7** 🟡 | threads | 15 | `proposals/threads/imports.wast` 13, `memory.wast` 2 — mostly shared-memory import matching. ⚠️ **R1 did NOT touch it** despite being "adjacent": those 13 are limits/`shared`-flag matching, not type identity. |
-| **R8** ⚠️ | **UTF-8 name validation is UNVERIFIED** | 0 failures | `utf8-invalid-encoding.wast` is **0 passed / 0 failed / 176 SKIPPED**. The 13th pass recorded UTF-8 name validation as fixed and this corpus checks **none** of it. Not a failure — a hole in the evidence, which is worse: an unverified security-relevant check reads as a passing one. Find out whether the skip is the runner's gap or ours. |
+| **R8** ⚠️ | **UTF-8 name validation is UNVERIFIED** | 0 failures | ✅ **CLOSED 2026-08-13 by R5 — it was the runner's gap, and the answer was "all 176 pass".** `utf8-invalid-encoding.wast` was 0/0/**176 skipped** because every assertion in it is an `assert_malformed (module quote …)`, and the runner could not build a quoted module. Implementing that form ran all 176 and they pass: UTF-8 name validation was genuinely correct, and had simply never been checked. **The question the item asked — "is the skip the runner's gap or ours?" — was the right one, and R5 answers it.** |
 
-**Recommended order: ~~R1~~ → ~~R2~~ → ~~R3~~ → ~~R4~~ → R5 → R7 → R8.** ~~R6 closed by R3~~.
-R5 is half-done and cheap — do it before quoting conformance numbers again. **R7 (threads) now holds
-the only accept-invalids left in the corpus outside the untargeted proposals**, so it inherits R4's
-safety argument.
+**Recommended order: ~~R1~~ → ~~R2~~ → ~~R3~~ → ~~R4~~ → ~~R5~~ → R9 → R7.** ~~R6 closed by R3~~,
+~~R8 closed by R5~~. **R9 is new and is R5's output**: 88 accept-invalids in the TEXT front-end that
+nothing could see until `(module quote …)` ran. R7 (threads) keeps its 12.
+
+### ✅ R5 IS DONE (2026-08-13) — 978 suppressed assertions unblocked, and the item was 50× bigger than filed
+
+**Corpus 143 → 216 failures, 61,429 → 62,333 passing, 2,407 → 1,429 skipped.** No file lost a single
+pass — verified by joining the per-file pass counts, not by reading the totals. The failure count
+went UP and that is the pass working: 978 assertions that had never executed now do, 904 of them
+passing.
+
+⚠️ **The item said "~23". It was 1,291.** R5 was filed as "`(module quote …)` and 21 `NoTarget`
+cascades", triaged from the FAILURE column. But an unimplemented command form does not produce
+failures — it produces **skips**, and skips were never itemised. One `return error.BadCommand` in
+`moduleBinary` was suppressing **1,291 assertions, more than half of every skip in the suite**,
+because a quoted module is how the spec tests anything about *text*: malformed literals, bad tokens,
+invalid names. **An item triaged from the failure column will always undercount a defect whose
+symptom is a skip** — R3 hit the same shape at a tenth the scale.
+
+⚠️ **R8 was a subset of R5 and nobody noticed.** `utf8-invalid-encoding.wast` is 176
+`assert_malformed (module quote …)` assertions — every one skipped for the same single reason. R8
+was filed separately, as "an unverified security-relevant check", and its own text asked exactly the
+right question: *is the skip the runner's gap or ours?* It was the runner's. All 176 now run and
+pass. **Two items with one cause, filed apart because one was counted in failures and the other in
+skips.**
+
+**What R5 revealed is bigger than what it fixed.** Running those 1,291 assertions surfaced **215
+accept-invalid failures in the WAT assembler** — the same class R4 had just closed for the binary
+decoder, in a surface the corpus had never been able to reach. Two causes accounted for ~146 and are
+fixed here because they are one theme, *lenient literals*:
+
+| | cause | count | what it was |
+| --- | --- | --- | --- |
+| C1 | **`std.fmt.parseInt`/`parseFloat` used as the wasm literal grammar** | ~70 | Zig accepts `_` where wasm forbids it (`0x_100`, `0x00_`, `0xff__ffff`) and takes a leading-point float (`.0`, `.0e0`). Replaced by `validIntLit`/`validFloatLit` over §6.3.1. |
+| C2 | **out-of-range constants silently TRUNCATED** | ~76 | `i32.const 0x100000000` became `0`; `v128.const i8x16 0x100` became sixteen zero bytes; `f32.const 0x1p128` became `+inf`. Each is a **wrong value compiled from source that looked fine**, not merely a missed assertion. Each `v128` lane is now bounded by its own width. |
+
+Two smaller ones went with them: a bare `-nan` lost its sign bit (the sign was applied only on the
+`nan:…` path, and NaN sign is observable through `reinterpret`/`copysign`), and
+`(f32.const nan:arithmetic)` assembled — those two spellings are result MATCHERS for an assertion,
+never values in a module.
+
+⚠️ **R4's "core accept-invalid is ZERO" is now FALSE, and it was true when written.** R4 closed every
+accept-invalid the corpus could *see*; R5 gave the corpus eyes for the text front-end and 88 more
+appeared in core files. This is the cleanest instance yet of the standing rule: **a conformance
+number says nothing about a surface the corpus does not reach** — and "the corpus reaches it" is
+itself a property that can silently be false.
+
+**R9 — the remainder, for whoever takes it next.** 88 core accept-invalids, grouped:
+`func`/`call_indirect`/`return_call_indirect` **35** (the `(type $sig) (result …) (param …)` ordering
+rule in a type use), `token.wast` **15** (token separation — `(data"a")` needs whitespace between a
+keyword and a string), `simd_lane` **8**, and ~30 spread over `table`/`memory`/`type`/`global`/
+`id`/`start`/`struct`/`block`/`if`/`loop`/`obsolete-keywords`. Plus 20 `custom-descriptors` and 12
+threads, which belong to the untargeted proposal and R7 respectively.
 
 ### ✅ R4 IS DONE (2026-08-13) — 157 → 143, and core accept-invalid is now ZERO
 

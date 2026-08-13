@@ -25,10 +25,12 @@ R1's type-matcher memo was keyed on two rec-group start indices, so one link's v
 unrelated later link and 32 import assertions flipped. Every file R1 was aimed at improved anyway; it
 surfaced only because `imports.wast` regressed 5 → 21 in the full diff. — R1, `roadmap.md`
 
-**A conformance number says nothing about a surface the corpus does not reach.** The same R1 defect sat
-in the shipped C ABI's `define_instance` path, which the `.wast` suite never touches — the corpus read
-237 identically before and after the fix. Ask what the number does *not* cover before treating it as
-coverage. — R1, `known-issues.md`
+**A conformance number says nothing about a surface the corpus does not reach — and "it reaches it"
+is itself a claim that can be silently false.** The same R1 defect sat in the shipped C ABI's
+`define_instance` path, which the `.wast` suite never touches. Worse, R4 recorded "core
+accept-invalid is ZERO" **truthfully**, and R5 made the corpus able to drive the text front-end for
+the first time; 88 more appeared in core files immediately. Ask what the number does not cover, and
+then ask what the *runner* cannot currently execute. — R1/R5, `known-issues.md`
 
 **Re-measure before quoting any number.** Sizes, pass counts and timings in these files go stale
 silently, and a stale number is worse than none because it reads as current. The shipped artifacts
@@ -38,6 +40,28 @@ roughly doubled in a month while "smallest binary" was a stated goal. — `desig
 **Pass counts over a corpus you cannot fully run are UPPER BOUNDS, not measurements.** Skips are not
 passes. 2,412 assertions are still skipped in the spec suite; any headline figure that ignores them is
 overstated. — `testing.md`
+
+**An item whose symptom is a SKIP cannot be sized from the failure column at all.** R5 was filed at
+"~23" and was **1,291** — an unimplemented command form produces no failures, only skips, and the
+runner reports a skip total with no per-reason breakdown. R8 was 176 of the same skip, filed as a
+separate item because it landed in a different column. Size a runner gap by grepping the corpus for
+the form, not by reading the report. — R5, `roadmap.md`
+
+**Judge a conformance pass by what it RUNS, not by the failure total.** R5 took failures 143 → 216
+and that was the point: passes 61,429 → 62,333, skips 2,407 → 1,429. A number that only ever goes
+down can be improved by running less. Check that no file LOST passes (join the per-file counts) —
+that is the regression test; the total is not. — R5, `testing.md`
+
+**When a predicate and its wiring are separate, invert the WIRING.** R5's literal-syntax test called
+`validIntLit`/`validFloatLit` directly, so disabling their call sites left it green while the
+assembler accepted `0xff__ffff` again. A test of a rule is not a test that the rule is consulted. —
+R5, `testing.md`
+
+**`std.fmt.parseInt`/`parseFloat` are not a spec's literal grammar.** They are close enough to look
+right and differ exactly where the spec is strict — Zig takes `_` in positions wasm forbids and
+accepts a leading-point float. Worse, the permissive path SILENTLY TRUNCATED: `i32.const
+0x100000000` compiled to `0`. When a format defines its own lexical syntax, write it. — R5,
+`known-issues.md`
 
 **Read the SKIP column in the same row as the failure count.** A build failure takes every assertion
 that targets that module into skips, so a small failure count can hide a total blackout:

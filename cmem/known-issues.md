@@ -418,7 +418,54 @@ leave entries in another module's table" test.
 against the restored old behaviour before being kept** — the funcref-in-a-table one, and the
 funcref-in-a-global one, which reproduced `elem.wast`'s `CallStackExhausted` symptom exactly.
 
-## 🛡️ ✅ Accept-invalid in core spec files — R4, FIXED 2026-08-13 (five causes, core class now ZERO)
+## 📜 ✅ The runner could not build a quoted module — R5, FIXED 2026-08-13 (1,291 assertions)
+
+A single `return error.BadCommand` in `wast.zig`'s `moduleBinary`, commented
+`// (module quote …) not supported yet`, was suppressing **1,291 assertions — more than half of every
+skip in the suite**. A `(module quote "…")` gives the module as SOURCE TEXT, which is how the spec
+tests anything about text: malformed literals, bad tokens, invalid names. Programme state is in
+`roadmap.md` → "R5 IS DONE"; this entry is the defect record.
+
+- The fix is small: concatenate the string pieces (the lexer has already resolved escapes to bytes,
+  so `"\80"` really is byte 0x80 — the point of the whole UTF-8 corpus), wrap in `(module …)` unless
+  the text already opens one, and assemble.
+- ⚠️ **The wrapping test has to be exact.** Wrapping an already-complete module yields
+  `(module (module …))`, which fails to assemble — and would then score a malformed module as
+  correctly rejected **for the wrong reason**. Same false-pass shape as R4's `StackUnderflow` case,
+  which is why the check looks for `(module` followed by a delimiter rather than a bare `startsWith`.
+- `assert_exception` was skipped as an unknown keyword too — 41 assertions across `throw.wast`,
+  `throw_ref.wast`, `try_table.wast` and the legacy EH files, i.e. exactly the ones that check
+  exceptions ESCAPE.
+
+**R8 was a subset of this and was filed as its own item.** `utf8-invalid-encoding.wast` is 176
+`assert_malformed (module quote …)`; all 176 now run and **pass**. UTF-8 name validation was correct
+all along and had simply never been executed — the item's own question ("is the skip the runner's gap
+or ours?") had the right shape and the answer was "the runner's".
+
+**What it revealed is larger than what it fixed: 215 accept-invalids in the WAT assembler**, the
+class R4 had just closed for the binary decoder, in a surface nothing could previously reach.
+~146 are fixed here because they are one theme:
+
+- **`std.fmt.parseInt`/`parseFloat` were being used as the wasm literal grammar.** Zig accepts `_`
+  where wasm forbids it (`0x_100`, `0x00_`, `0xff__ffff` — the separator must sit *between* digits)
+  and `parseFloat` takes a leading-point form (`.0`, `.0e0`) that wasm requires a digit before.
+  Replaced by `validIntLit`/`validFloatLit` over §6.3.1.
+- **Out-of-range constants were silently TRUNCATED.** `i32.const 0x100000000` compiled to `0`;
+  `v128.const i8x16 0x100 …` to sixteen zero bytes; `f32.const 0x1p128` to `+inf`. These are wrong
+  VALUES from source that looks fine, not merely missed assertions. Each `v128` lane is now bounded
+  by its own width, and a float literal that rounds to infinity is refused unless it *is* `inf` —
+  a guard that, written as a bare `isInf`, rejects `inf` itself.
+- **A bare `-nan` lost its sign bit** (applied only on the `nan:…` path). NaN sign is observable via
+  `reinterpret`/`copysign`, so this was a wrong value too; it had been failing since before R5.
+- **`(f32.const nan:arithmetic)` assembled.** Those two spellings are result MATCHERS for an
+  assertion, never values in a module; `wast.zig` recognises them itself because it must compare a
+  *class* of NaNs rather than a bit pattern.
+
+**The remaining 88 are R9** — see `roadmap.md`. They are core-file accept-invalids in the text front
+end: type-use ordering (35), token separation (15), SIMD lanes (8), and a spread of ~30.
+
+## 🛡️ ✅ Accept-invalid in core spec files — R4, FIXED 2026-08-13 (five causes, core class now ZERO
+## when measured through the paths the corpus could then reach — see R5 above, which found 88 more)
 
 The class the whole T1 → R4 arc was about: modules the spec calls invalid that wazmrt accepted and
 would then happily execute. **Every one in a core spec file is closed.** Programme state and the

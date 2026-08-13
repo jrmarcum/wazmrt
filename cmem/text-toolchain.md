@@ -213,6 +213,20 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
   `UnknownInstr` from `wat.zig`, because the corpus reaches the decoder only
   through the text path. When triaging an instruction-level failure, the file
   named by the error is rarely the file to fix.
+- ⚠️ **NUMERIC LITERALS HAVE THEIR OWN GRAMMAR — `std.fmt` IS NOT IT (R5, 2026-08-13).**
+  `validIntLit`/`validFloatLit`/`scanDigits` implement §6.3.1 and run BEFORE `std.fmt.parseInt`/
+  `parseFloat`, which are close enough to look right and differ exactly where the spec is strict:
+  Zig takes `_` in positions wasm forbids (the separator must sit *between* digits) and `parseFloat`
+  accepts `.0`. And the permissive path did not just over-accept — it **silently truncated**:
+  `i32.const 0x100000000` compiled to `0`, `v128.const i8x16 0x100` to zero bytes, `f32.const
+  0x1p128` to `+inf`. Every `v128` lane is now bounded by its own width via `parseIntLitN`, and a
+  literal that rounds to infinity is refused unless it *is* `inf`.
+- ⚠️ **`(module quote …)` IS THE ONLY WAY THE SUITE TESTS TEXT (R5).** The WAST runner assembles the
+  quoted source at run time, wrapping it in `(module …)` only when it does not already open one —
+  the wrapping test must be exact, because `(module (module …))` fails to assemble and would score a
+  malformed module as correctly rejected for the wrong reason. Implementing it unblocked **1,291
+  assertions** and immediately exposed 215 accept-invalids in this file. **Whatever the assembler
+  gets wrong is invisible until the runner can hand it text.**
 - ⚠️ **THE ASSEMBLER IS PART OF THE VALIDATION SURFACE (R4, 2026-08-13).** Two
   accept-invalid classes were caused by encodings chosen here, not by missing
   validator rules:
