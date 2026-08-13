@@ -36,7 +36,7 @@ roughly doubled in a month while "smallest binary" was a stated goal. — `desig
 `testing.md`
 
 **Pass counts over a corpus you cannot fully run are UPPER BOUNDS, not measurements.** Skips are not
-passes. 2,649 assertions are still skipped in the spec suite; any headline figure that ignores them is
+passes. 2,637 assertions are still skipped in the spec suite; any headline figure that ignores them is
 overstated. — `testing.md`
 
 **Run one `zig build` at a time on this box, and expect `error: Unexpected` to mean the environment,
@@ -79,6 +79,22 @@ Searching `capi.zig` for `funcTypeEq|matchExtern|TypeMismatch` returned nothing,
 import type checking at all" was nearly written into memory. It checks — inline, unnamed, with raw
 `!=`. — R1, `known-issues.md`
 
+**A failure's cause count is not known until it PASSES.** Fixing one defect twice exposed the next
+one inside the same failure: `linking.wast` L410 went from `result mismatch 0x4` to `trap
+UndefinedFunc` when funcref identity was fixed — the wrong answer had been hiding a segment-ordering
+bug — and closing a pure harness gap turned `instance.wast` from 0/8 into 10/2, where the 2 were a
+real tag-identity defect. Re-triage after every step, never only at the start. — R2, `roadmap.md`
+
+**A check that makes the same mistake as the thing it checks is not a check.** `call_indirect`
+dispatched through the reader's function index space *and* read the callee's type from the reader's
+module, so the type check agreed with the wrong function and let the call through. Ask what the
+verifier and the verified have in common before trusting a green check. — R2, `roadmap.md`
+
+**An entity reached across a link has an IDENTITY, and its index is not it.** Three times now, in
+three subsystems: R1's types (rec-group position, not module-local index), R2's funcrefs (instance +
+index, not index), R2's tags (a shared identity, not each importer's own slot). Whenever a thing can
+be imported, ask what makes two of them the same thing. — R1/R2, `roadmap.md`
+
 **A feature can be present, tested, and green while failing at exactly the thing it is for.**
 `return_call_ref` shipped as call-then-return: every shallow assertion passed, and the one property the
 proposal exists to provide — unbounded depth — was absent. Test the *purpose*, not the surface. — T4,
@@ -113,6 +129,12 @@ symbol-existence entry before. — R1, `known-issues.md`
 **A goal with no gate is a preference.** "Smallest binary" was a stated goal for a month with nothing
 measuring it, and the artifacts doubled. — `design-decisions.md`
 
+**A gate only gates the commits that RUN it — a gate with no trigger is a preference too.** The size
+gate was built to stop silent drift, works correctly, and drift accrued anyway: by R2 the ceilings
+were over by +22 KB exe / +24 KB lib / +19 KB dll, none of it R2's, left by commits that never
+invoked `zig build size`. **Attribute an overshoot before paying for it** — measure the parent commit
+in a worktree rather than assuming the growth is yours. — R2, `tools/size-ceilings.txt`
+
 **Guard the property, not a proxy for it.** — `design-decisions.md`
 
 **A cache key must name everything the answer depends on.** — R1, `roadmap.md`
@@ -127,6 +149,13 @@ evidence a module is invalid. `assert_invalid`, `assert_trap` and `assert_unlink
 **Record findings that were WRONG, so they are not "fixed" again.** At least two audit findings have
 been retracted after being verified false, and one carries an inline `Don't "fix" it again` comment at
 the site. A retraction is as valuable as a finding. — `testing.md`, `roadmap.md`, `validate.zig`
+
+**A retraction re-checks the REASONING; it does not re-check the REQUIREMENT.** The elem/table type
+comparison in `validate.zig` carried exactly such a `Don't "fix" it again` note. The retraction was
+right — the audit's claim about `ValType.nullable()` was false — and the rule was still wrong:
+§3.5.11 wants subtyping, not nullability-erased equality. When a retraction says "the argument was
+bad", that is not the same as "the code is correct"; go back to the spec, not to the argument. — R2,
+`roadmap.md`
 
 **Say which claims are live and which are as-triaged.** The R-list's per-item counts were accurate when
 written and stale the moment R1 landed; they now say so explicitly rather than reading as current. —

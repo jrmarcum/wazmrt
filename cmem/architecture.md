@@ -36,8 +36,16 @@ bytes ──► DECODE ──► VALIDATE ──► INSTANTIATE ──► EXECUT
   reference), and **load/store** (alignment ≤ natural, memory must exist). **Verified:** thousands of
   positive-conformance assertions pass and the negative `assert_invalid`/`assert_malformed` suites now
   run with ~zero over-acceptance — see `testing.md`.
-- **INSTANTIATE / EXECUTE** (`interp.zig`) — first slice done. `Instance.init` prepares each defined
-  function (decodes body → IR once, precomputes matching `end`/`else` for every `block`/`loop`/`if`).
+- **INSTANTIATE / EXECUTE** (`interp.zig`) — first slice done. `Instance.instantiate` /
+  `instantiateWithImports` prepare each defined function (decode body → IR once, precompute matching
+  `end`/`else` for every `block`/`loop`/`if`). ⚠️ **They take a DESTINATION POINTER and do not return
+  an `Instance`** (renamed from `init`/`initWithImports` in R2, 2026-08-13): an instance's address is
+  part of its identity — every `funcref` it creates names it, and element segments create funcrefs
+  before instantiation returns — so it cannot be built somewhere else and moved. Instantiation splits
+  into `allocate` (§4.5.4) and `applyActiveSegments` (§4.5.5); an instance whose segment init traps
+  stays alive, adopted by its `Store`, because entries it already wrote into an imported table must
+  keep working. **Reference values live in an `interp.Store`** shared by every linked instance — see
+  `known-issues.md` → "Reference identity across a link".
   `Instance.invoke(name, args)` runs the switch interpreter (Option A): untyped `u64` value slots, a
   per-call label stack, a branch that carries block/loop arity and resets the stack. **Implemented:**
   i32/i64 **and f32/f64** arithmetic/comparison/bitwise, all conversions (incl. trapping float→int,

@@ -182,23 +182,24 @@ call-then-return, so the one property the proposal exists to provide (unbounded 
 **A feature can be present, tested, and green while failing at exactly the thing it is for.** Same
 family as the memory64 "COMPLETE" claim above.
 
-### 🎯 REVISED conformance list (2026-08-12) — the 275, now **237** after R1
+### 🎯 REVISED conformance list (2026-08-12) — the 275, now **193** after R1 + R2
 
 Successor to the T-list above, and built differently: every item below is grouped **by cause**, from a
 run with `-Dfailures=600` so all 275 failures were read, not just each file's first. The T-list was
 grouped by first-failure text and mislabelled three of its five items.
 
-⚠️ **The per-item counts below are as-triaged (275 total) and are NOT live.** R1 is done — corpus is
-**237**, of which 103 are by design and **134 actionable**. R1 also took failures out of R4, R6 and R7,
-so those counts are now high; re-measure before trusting any of them (`-Dfailures=600`, diff the
-per-file summary against the previous run).
+⚠️ **The per-item counts below are as-triaged (275 total) and are NOT live.** R1 and R2 are done —
+corpus is **193 failures / 61,187 passing / 2,637 skipped** (measured 2026-08-13). Of the 193, **101
+are by design** and **92 actionable**. R1 took failures out of R4/R6/R7 and R2 took them out of R4,
+R5 and the threads/table files, so every count below is high; re-measure before trusting any of them
+(`-Dfailures=600`, diff the per-file summary against the previous run).
 
-**103 of the 275 are BY DESIGN** — proposals wazmrt does not target, refused honestly. They are not
-defects and there is nothing to fix unless the scope changes (**both counts unchanged by R1**):
+**101 of the current 193 are BY DESIGN** — proposals wazmrt does not target, refused honestly. They
+are not defects and there is nothing to fix unless the scope changes:
 
 | | area | failures | note |
 | --- | --- | --- | --- |
-| — | `custom-descriptors` | 90 | untargeted proposal; exact refs + descriptors |
+| — | `custom-descriptors` | 90 → **88** | untargeted proposal; exact refs + descriptors (R2's `module definition` support took 2) |
 | — | `custom-page-sizes` | 13 | untargeted; refused as `UnsupportedProposal` (scored as SKIPS, not passes) |
 
 **The 172 that are actionable, most valuable first:**
@@ -206,17 +207,88 @@ defects and there is nothing to fix unless the scope changes (**both counts unch
 | | item | failures | why it matters |
 | --- | --- | --- | --- |
 | **R1** 🔴 | **Cross-module type identity** | 25 | ✅ **FIXED 2026-08-12 — and it was 38, not 25.** See below. |
-| **R2** 🔴 | **elem / linking / instance** | 42 → **35** | Now `elem.wast` 14, `linking.wast` 11, `instance.wast` 8, `linking0/3` 1 each. Includes the **wrong-answer** (`result mismatch`) failures — the worst class in this codebase's taxonomy, a plausible wrong value handed to the guest. All 11 of `linking.wast`'s remaining failures are that class. **Next.** |
+| **R2** 🔴 | **elem / linking / instance** | 42 → 35 | ✅ **FIXED 2026-08-13 — five causes, and 44 failures, not 35.** All five files CLEAN. See below. |
 | **R3** 🟠 | **GC array data/elem ops MISSING** | ~10 | `array.new_data` / `array.init_data` / `array.new_elem` / `array.init_elem` are **absent from `opcode.zig` entirely** (`array_new_data.wast` 5, `array_init_data.wast` 2, `array.wast` 2). ⚠️ **GC is a TARGETED, shipped feature** — same shape as table64: a proposal recorded as done with a piece missing. |
-| **R4** 🟠 | **Accept-invalid in core files** | ~15 | Now `table.wast` 7, `try_table.wast` 6, `ref.wast` 2, `tag.wast` 1, and others. The safety class the whole T1 effort was about, still present in the main suite. R1 took `tag.wast` 3 → 1 by type-checking tag imports, which had **no check at all**. |
-| **R5** 🟡 | **Runner gaps, not wazmrt defects** | 41 | `(module quote …)` is unimplemented in `wast.zig` → 20 `BadCommand`; 21 `NoTarget` cascades from modules that never built. These suppress real verification rather than proving anything — the same red-washing as `(either …)` was. Cheap, and it makes every other number honest. |
+| **R4** 🟠 | **Accept-invalid in core files** | ~15 | Now `table.wast` **6**, `try_table.wast` **4**, `ref.wast` 2, and others. The safety class the whole T1 effort was about, still present in the main suite. R1 took `tag.wast` 3 → 1 by type-checking tag imports; R2's tag-identity fix took `tag.wast` to **0** and `try_table` 6 → 4. |
+| **R5** 🟡 | **Runner gaps, not wazmrt defects** | 41 → **~23** | ✅ Half-closed by R2: `(module definition …)`/`(module instance …)` are implemented, so `BadCommand` is down to **2**. What remains is `(module quote …)` and **21 `NoTarget`** cascades from modules that never built. These suppress real verification rather than proving anything — the same red-washing as `(either …)` was. **Do this before quoting conformance numbers again.** |
 | **R6** 🟡 | GC type remainder + `i31` | 20 → **8** | ✅ Mostly gone with R1, exactly as predicted: `type-subtyping` and `type-rec` are **clean**; only `i31.wast` 8 remains. |
 | **R7** 🟡 | threads | 15 | `proposals/threads/imports.wast` 13, `memory.wast` 2 — mostly shared-memory import matching. ⚠️ **R1 did NOT touch it** despite being "adjacent": those 13 are limits/`shared`-flag matching, not type identity. |
 | **R8** ⚠️ | **UTF-8 name validation is UNVERIFIED** | 0 failures | `utf8-invalid-encoding.wast` is **0 passed / 0 failed / 176 SKIPPED**. The 13th pass recorded UTF-8 name validation as fixed and this corpus checks **none** of it. Not a failure — a hole in the evidence, which is worse: an unverified security-relevant check reads as a passing one. Find out whether the skip is the runner's gap or ours. |
 
-**Recommended order: ~~R1~~ → R2 → R3.** R2 holds the wrong answers; R3 is a missing piece of a
-feature we claim. R5 is cheap and can be slotted in any time — do it before quoting conformance
-numbers again.
+**Recommended order: ~~R1~~ → ~~R2~~ → R3.** R3 is a missing piece of a feature we claim. R5 is now
+half-done and cheap to finish — do it before quoting conformance numbers again.
+
+### ✅ R2 IS DONE (2026-08-13) — 237 → 193, five causes, and it was 44 failures, not 35
+
+**Corpus 237 → 193 failures, 61,152 → 61,187 passing, 2,649 → 2,637 skipped** (12 assertions that
+were suppressed now actually run), zero regressions at any of the five steps. **All five target files
+are CLEAN**: `elem.wast`, `linking.wast`, `linking0.wast`, `linking3.wast`, `instance.wast`. R2 also
+took failures out of `try_table` (6→4), `legacy/try_catch` (1→0), `tag` (1→0), `table` (7→6),
+`table64` (2→1), `memory`, `memory64` and `custom-descriptors/exact-func-import` (7→5).
+
+**The 35 triaged split into FIVE causes, only two of which the item name suggested:**
+
+| | cause | count | what it actually was |
+| --- | --- | --- | --- |
+| C1 | **a funcref was a bare function index** | 17 | resolved against whatever instance was *executing*, so any funcref crossing a boundary re-bound to a different function |
+| C2 | **an imported global was copied by value** | 1 | a `(mut i32)` import was a snapshot; the exporter's writes were invisible |
+| C3 | **the §5.5.6 typed-table form did not decode** | 8 | `0x40 0x00 tt expr`; plus elem/table types compared by family instead of subtyping |
+| C4 | **`(module definition)`/`(module instance)` unimplemented** | 8 | a HARNESS gap, not a wazmrt defect — and it was hiding a real one (tag identity) |
+| C5 | **data segments applied before element segments** | 1 | §4.5.5 order is elements first; plus a failed instance was discarded, killing its funcrefs |
+
+⚠️ **C1 is the headline and it was a soundness-shaped defect, not just a conformance one.** A funcref
+value was the function's index, and `call_indirect` looked that index up in *the reading instance's*
+module. Put a funcref in a shared table — which is the entire point of an imported table — and the
+reader dispatches to whatever sits at that index in ITS module. `interp.zig` even carried a comment
+describing the symptom ("the importer chooses the function indices, and the *owning* module
+reinterprets them") as an acceptable consequence of a rejected module, rather than as the general
+defect it was. Reference values now live in an `interp.Store` shared by everything linked together.
+
+⚠️ **The type check did not protect the call, because it was wrong in the same direction.**
+`checkIndirectType` read the callee's type from the reader's module too — so the wrong function's
+type came from the wrong module, agreed with itself, and the call proceeded. **A check that makes the
+same mistake as the thing it checks is not a check.** Cross-instance `call_indirect` now compares
+through `typematch`, the same way R1 made imports compare.
+
+⚠️ **Fixing one defect exposed the next in the same failure — twice.** `linking.wast` L410/L423 went
+from `result mismatch 0x4` to `trap UndefinedFunc` when C1 landed: the wrong answer had been *hiding*
+C5. And C4 — a pure harness gap — turned instance.wast from 0/8 into 10/2, where the 2 were a genuine
+tag-identity defect (an exception thrown with one import of a tag was not caught by a handler naming
+another import of the same tag). **A failure's cause count is not known until it passes.**
+
+⚠️ **A retraction that re-checks the reasoning has not re-checked the requirement.** C3's elem/table
+type comparison was raised by a 10th-pass audit, retracted as false, and marked `Don't "fix" it
+again` at the site. The retraction was right that `ValType.nullable()` is not a predicate — and the
+RULE was still wrong: §3.5.11 wants subtyping, and family-equality accepted a nullable `funcref`
+segment into a `(ref func)` table. Switching to real subtyping then rejected four valid modules,
+because the decoder recorded elem forms 0–3 as `funcref` when §5.5.12 gives them `(ref func)`. Three
+defects stacked behind one retracted finding.
+
+⚠️ **A gate only gates the commits that RUN it.** `zig build size` failed on all three artifacts —
+but measuring against a worktree at the pre-R2 commit showed most of the overshoot was already there,
+left by the R1 commits of 2026-08-12. R2's true share is +5,120 exe / +1,068 lib / **+0 dll**. The
+gate works; nothing invoked it. See `tools/size-ceilings.txt`.
+
+**Structural changes worth knowing before touching this code:**
+
+- **`Instance.init`/`initWithImports` are GONE**, replaced by
+  `instantiate`/`instantiateWithImports` taking a DESTINATION POINTER. An instance's address is part
+  of its identity now — element segments create funcrefs naming `self` before instantiation returns —
+  so it cannot be built and then moved. The compiler finds every call site; a comment would not.
+- **`interp.Store`** holds the instances a group of linked modules share. Slots are tombstoned on
+  `deinit`, never reused, so a stale funcref (or an arbitrary integer from the C ABI) is a clean
+  `UndefinedFunc`, never a dangling pointer. Linking across two stores is `error.CrossStoreLink`.
+- **`Instance.Global`** is a shared cell, like `Memory` and `Table` already were; `global_hi` folded
+  into it. **The C ABI shared this defect and the corpus could not see it** — `define_instance`
+  copied a published instance's global at link time, commented as "a snapshot, which is what the ABI
+  can carry". It binds the cell now. Same shape as R1's `define_instance` finding.
+- **Instantiation is `allocate` (§4.5.4) + `applyActiveSegments` (§4.5.5)**, so an instance whose
+  segment init traps stays ALIVE (the store adopts it) and the entries it already wrote into an
+  imported table keep working. The first cut kept the allocation errdefers in scope and double-freed;
+  the existing "a rejected module cannot leave entries in another module's table" test caught it.
+- **`.wast` failures now carry the source LINE** (`sexpr.parseAllWithLines`). Triaging 35 failures by
+  re-deriving which assertion each one was is exactly the hand work that mislabelled three of five
+  items on the 2026-08-11 list.
 
 ### ✅ R1 IS DONE (2026-08-12) — 275 → 237, in four verified steps
 
@@ -266,8 +338,9 @@ symlinks, and the sandbox-escape tests plant symlink fixtures under the cwd's `.
 what the step's "run from an NTFS cwd" note means. Verified by running the same test binary from a `C:`
 cwd — 3/3 OK. Do not read those two failures as a regression; do not "fix" them in `wasi.zig`.
 
-⚠️ **2,649 assertions are still SKIPPED and that is not a pass.** (2,655 before R1 — the 6 it
-recovered were assertions no longer suppressed by a module that failed to build.) The largest pools: `br_table.wast`
+⚠️ **2,637 assertions are still SKIPPED and that is not a pass.** (2,655 before R1 → 2,649 after it
+→ 2,637 after R2; both times the recovered assertions were ones no longer suppressed by a module that
+failed to build — R2's 12 came from implementing `(module definition)`/`(module instance)`.) The largest pools: `br_table.wast`
 **161**, `custom-descriptors/exact-casts` 108, `wide-arithmetic` 107, `br_on_cast_desc_eq*` 101 each.
 `br_table.wast` is core spec and worth a look on its own — 161 unrun assertions in a control-flow
 instruction is a bigger blind spot than most of the failures above.

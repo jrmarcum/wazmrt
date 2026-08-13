@@ -346,6 +346,78 @@ it was found are worth more than the fix:
   must be REFUSED. Verified discriminating by inverting the assertion and watching it fail — **a new
   test that has never failed has not been shown to test anything.**
 
+## 🔗 ✅ Reference identity across a link — R2, FIXED 2026-08-13 (five causes, 44 failures)
+
+Triaged as 35 failures in `elem` / `linking` / `instance` / `linking0` / `linking3`; closing them
+took 44 out of the corpus (**237 → 193**, 61,152 → 61,187 passing, 2,649 → 2,637 skipped) because
+three of the five causes were also failing files nobody had attributed to R2. Programme state and the
+method lessons are in `roadmap.md` → "R2 IS DONE"; this entry is the defect record.
+
+**C1 — a `funcref` was a bare function index (17).** `interp.zig`'s `call_indirect` carried the
+comment `// funcref value = function index` and resolved it against `self.inst`. A funcref that
+crossed an instance boundary — a shared table, a `funcref` global, a param, a result — therefore
+named *a different function*: whatever sat at that index in the reader's module.
+
+- **It stayed self-consistent, which is why it read as correct.** `checkIndirectType` also read the
+  callee's type from the reader's module, so the type check agreed with the wrong function.
+- **It was reachable by ordinary linking**, not by anything adversarial: an imported table exists to
+  be written by one module and read by another.
+- The `linking.wast` `$Mt`/`$Ot` pair predicts six observations exactly under the hypothesis (Mt
+  reads slot 1 as its own `h` = −4, Ot reads slot 3 as its own imported `$h` = −4, …). Constructing
+  that prediction *before* touching the code is what identified the cause in one pass.
+- ⚠️ **The symptom was already written down as acceptable.** A comment in the active-element loop
+  described "the importer chooses the function indices, and the *owning* module reinterprets them"
+  as a consequence of a *rejected* module — the general defect was in the sentence and went unread.
+- Fix: `interp.Store` holds the instances that share reference values; a funcref is
+  `(slot+1)<<32 | func_index`. Slots are tombstoned on `deinit`, never reused, so a stale funcref or
+  an arbitrary integer from the C ABI is a clean `UndefinedFunc`, never a dangling pointer.
+  Cross-store linking is `error.CrossStoreLink`. Cross-instance `call_indirect` compares types
+  through `typematch`, as R1 made imports do.
+- ⚠️ **`Instance.init`/`initWithImports` are gone**, replaced by `instantiate`/
+  `instantiateWithImports` taking a destination pointer: an instance's ADDRESS is part of its
+  identity, and element segments create funcrefs naming it before instantiation returns.
+
+**C2 — an imported global was copied by value (1).** `Imports.globals: []const Value`, so a
+`(mut i32)` import was a snapshot and the exporter's `global.set` was invisible. `Instance.Global` is
+a shared cell now, like `Memory` and `Table` already were. ⚠️ **The C ABI had the same defect on a
+path the corpus does not reach**: `define_instance` read a published instance's global once at link
+time, commented as "a snapshot, which is what the ABI can carry". Same shape as R1's `define_instance`
+finding, one release later.
+
+**C3 — the §5.5.6 typed-table form did not decode (8).** `0x40 0x00 tabletype expr` gives a table an
+explicit initializer; `0x40` is not a valtype byte, so the whole form failed `BadValType`. It is the
+*only* way to declare a non-nullable element type — there is no null to start the slots from. Two
+more defects sat behind it: the active-elem/table type check compared families with nullability
+erased instead of subtyping (§3.5.11), and once that became real subtyping it rejected four valid
+modules because the decoder recorded elem forms 0–3 as `funcref` when §5.5.12 gives them `(ref func)`.
+⚠️ The type check carried a `Don't "fix" it again` retraction: right about the mechanism, wrong about
+the rule.
+
+**C4 — `(module definition)`/`(module instance)` unimplemented (8) — a HARNESS gap hiding a real
+defect.** `instance.wast` scored 0 passed / 8 failed / 12 skipped and *every* failure was the runner.
+With the commands implemented it read 10/2, and the 2 were genuine: `Exception.tag` was the throwing
+module's tag INDEX compared against the catching module's index. `instance.wast` imports one tag
+twice and throws with the second, catches with the first — one tag, two indices, no match, so the
+exception fell through to `catch_all`. **An exception routed to the wrong handler**, and `wast.zig`
+returned no identity at all for a tag import ("just a local identity in this module's tag index
+space"). Tags now carry a store-wide identity: defined tags get a fresh one, imported tags adopt the
+provider's. That also took `try_table` 6 → 4, `tag` 1 → 0, `legacy/try_catch` 1 → 0.
+
+**C5 — active data segments were applied before active element segments (1).** §4.5.5 runs the
+element inits (steps 9–12) before the data inits (13–14). A module with an out-of-bounds data segment
+aborted before its element segments ran, so entries the spec requires to persist in an imported table
+were never written (`linking0.wast` slot 7). `linking.wast` hid this: an earlier module had already
+written that slot, so the read looked right for the wrong reason. Second half: a
+partially-instantiated instance was thrown away, killing the funcrefs its segments had already
+stored. Instantiation is now `allocate` (§4.5.4) + `applyActiveSegments` (§4.5.5), and the store
+adopts an instance whose segment init traps. ⚠️ The first cut left the allocation errdefers in scope,
+so the same storage was freed twice — caught immediately by the existing "a rejected module cannot
+leave entries in another module's table" test.
+
+**Every fix has a `.wast`-level regression test, and the two most important were confirmed to FAIL
+against the restored old behaviour before being kept** — the funcref-in-a-table one, and the
+funcref-in-a-global one, which reproduced `elem.wast`'s `CallStackExhausted` symptom exactly.
+
 ## 🧾 ABI-2 build (2026-08-11) — bugs and near-misses found while replacing the C ABI
 
 None of these shipped; all were caught by a gate or a test. Recorded because each is a **shape** that
