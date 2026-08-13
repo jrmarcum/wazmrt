@@ -35,6 +35,26 @@
 # text should not have to carry the assembler. `-Dwat=false` / `-Dwasi=false` build flags are the
 # recorded compromise; until they exist, every FFI consumer pays for both.
 
-wazmrt.exe  911872
-wazmrt.lib  973600
-wazmrt.dll  845312
+# RAISED 2026-08-13 (R2). Measured ReleaseSmall, Zig 0.16.0, x86_64-windows, static lib from a
+# PLAIN `zig build` (never after `zig build dll`).
+#
+#   artifact     ceiling was    at 3dd41a0 (pre-R2)    after R2      R2's share
+#   wazmrt.exe       911,872               933,888      939,008          +5,120
+#   wazmrt.lib       973,600               998,228      999,296          +1,068
+#   wazmrt.dll       845,312               864,768      864,768               0
+#
+# ⚠️ MOST OF THIS OVERSHOOT IS NOT R2's. The ceilings were ALREADY breached at 3dd41a0 — exe
+# +22,016, lib +24,628, dll +19,456 — by the R1/typematch commits of 2026-08-12, which grew the
+# artifacts without running `zig build size`. R2 is charged +5,120 exe / +1,068 lib / +0 dll, and
+# the rest is drift that this gate was built to catch and did not, because nothing RAN it. The
+# gate works; the workflow around it did not. **A gate only gates the commits that run it** — the
+# lesson is the same shape as "a goal with no gate is a preference", one level up.
+#
+# What bought R2's bytes: `interp.Store` (funcref resolution + the orphan list), `Instance.Global`
+# as a shared cell, per-instance `tag_ids`, the §5.5.6 typed-table decode path, and `wast.zig`'s
+# `module definition`/`instance` commands. The DLL is byte-identical because none of it is
+# reachable from the C ABI surface's own code paths — it is all in code the DLL already carried.
+
+wazmrt.exe  939008
+wazmrt.lib  999296
+wazmrt.dll  864768
