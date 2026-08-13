@@ -1085,7 +1085,27 @@ pub const Instance = struct {
                 total_table_elems = std.math.add(usize, total_table_elems, min_elems) catch return error.TableLimitExceeded;
                 if (total_table_elems > imports.max_table_elems) return error.TableLimitExceeded;
                 const entries = try gpa.alloc(Value, tt.limits.min);
-                @memset(entries, null_ref);
+                // A table declared with an explicit initializer (§5.5.6's
+                // `0x40` form) starts with every slot holding that value, not
+                // null — which is the only way a NON-NULLABLE element type can
+                // have a starting state at all.
+                if (tt.init_expr) |ie| {
+                    // `entries` is not covered by the errdefer below yet (see the
+                    // note on `n_tables_init`), so release it by hand if the
+                    // initializer does not evaluate.
+                    const v = evalConstExpr(.{
+                        .globals = globals,
+                        .module = module,
+                        .arena = a,
+                        .gc_heap = &gc_heap,
+                        .gpa = gpa,
+                        .store_slot = store_slot,
+                    }, ie) catch |e| {
+                        gpa.free(entries);
+                        return e;
+                    };
+                    @memset(entries, v);
+                } else @memset(entries, null_ref);
                 // Mirror the memory branch above: `n_tables_init` hasn't been
                 // advanced yet, so the errdefer doesn't cover `entries` either.
                 const tab = gpa.create(Table) catch |e| {
@@ -5505,6 +5525,37 @@ test "hardening: a bare else with no matching if is rejected at load time" {
     });
     var bad: Instance = undefined;
     try std.testing.expectError(error.UnbalancedControl, instantiate(&bad, bytes));
+}
+
+test "a table declared with an initializer starts FILLED, not null" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // §5.5.6's second table form, `0x40 0x00 tabletype expr` — the only way to
+    // declare a NON-NULLABLE element type, since there is no null to start from.
+    // `0x40` is not a valtype byte, so the whole form used to fail decoding with
+    // `BadValType`; seven `elem.wast` modules are exactly this shape.
+    //
+    // Table 0: `(table 1 (ref func) (ref.func 0))`, so slot 0 holds func 0
+    // WITHOUT any element segment. `run` calls through it and must see 42.
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x01, 0x60, 0x00, 0x01, 0x7f } }, // (func (result i32))
+        .{ .id = 3, .body = &.{ 0x02, 0x00, 0x00 } }, // 2 funcs, both type 0
+        // count=1, 0x40, reserved 0x00, elemtype 0x64 0x70 = (ref func),
+        // limits 0x00 min=1, init expr `ref.func 0` `end`.
+        .{ .id = 4, .body = &.{ 0x01, 0x40, 0x00, 0x64, 0x70, 0x00, 0x01, 0xd2, 0x00, 0x0b } },
+        .{ .id = 7, .body = &.{ 0x01, 0x03, 'r', 'u', 'n', 0x00, 0x01 } }, // export "run" = func 1
+        .{ .id = 10, .body = try ehCode(a, &.{
+            &.{ 0x00, 0x41, 0x2a, 0x0b }, // func 0: i32.const 42
+            &.{ 0x00, 0x41, 0x00, 0x11, 0x00, 0x00, 0x0b }, // func 1: call_indirect (type 0) 0
+        }) },
+    });
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
+    defer destroy(&inst);
+    const r = try inst.invoke("run", &.{});
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqual(@as(i32, 42), asI32(r[0]));
 }
 
 test "SIMD: fNxM.min/max propagate NaN and match the scalar ops on signed zero" {

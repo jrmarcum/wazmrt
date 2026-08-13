@@ -87,7 +87,12 @@ pub const CompType = union(enum) {
 /// the counts are kept as u64 (a 32-bit memory still fits ≤ 2^16).
 pub const Limits = struct { min: u64, max: ?u64, shared: bool = false, is64: bool = false };
 
-pub const TableType = struct { element: types.ValType, limits: Limits };
+/// `init_expr` is the table's explicit initializer (§5.5.6's `0x40 0x00 tt e`
+/// form, function-references): every slot starts as that value instead of null.
+/// Null for the plain form and for every imported table. A table whose element
+/// type is NON-NULLABLE has no null to start from, so this is the only way to
+/// declare one.
+pub const TableType = struct { element: types.ValType, limits: Limits, init_expr: ?[]const u8 = null };
 pub const MemoryType = struct { limits: Limits };
 pub const GlobalType = struct { content: types.ValType, mutable: bool };
 
@@ -1305,7 +1310,23 @@ fn decodeTagSection(d: *Decoder, r: *Reader) Error![]const u32 {
 
 fn decodeTableSection(d: *Decoder, r: *Reader) Error!void {
     var count = try r.readVarU32();
-    while (count > 0) : (count -= 1) try d.table_space.append(d.a, try readTableType(r, d.type_kinds));
+    while (count > 0) : (count -= 1) {
+        // §5.5.6: `table ::= tt:tabletype | 0x40 0x00 tt:tabletype e:expr`. The
+        // second form (function-references) carries an explicit initializer.
+        // `0x40` is not a valtype byte, so the whole form used to decode as
+        // `BadValType` — seven `elem.wast` modules, every one of them a table
+        // with a non-nullable `(ref func)` element type, which cannot be
+        // expressed WITHOUT this form.
+        if ((try r.peekByte()) != 0x40) {
+            try d.table_space.append(d.a, try readTableType(r, d.type_kinds));
+            continue;
+        }
+        _ = try r.readByte(); // 0x40
+        if ((try r.readByte()) != 0x00) return error.MalformedFlag; // reserved
+        var tt = try readTableType(r, d.type_kinds);
+        tt.init_expr = try readConstExprBytes(d.a, r);
+        try d.table_space.append(d.a, tt);
+    }
 }
 
 fn decodeMemorySection(d: *Decoder, r: *Reader) Error!void {
@@ -1414,6 +1435,14 @@ fn decodeElementSection(d: *Decoder, r: *Reader) Error![]const Element {
             // Func-index form. Non-flag-0 variants carry a leading elemkind byte.
             if (flags != 0) _ = try r.readByte(); // elemkind (0x00 = funcref)
             e.funcs = try readFuncVec(d.a, r);
+            // §5.5.12 gives forms 0–3 the type `(ref func)` — NON-nullable — not
+            // `funcref`: each entry expands to `ref.func y`, which can never be
+            // null. Only form 4 defaults to nullable `funcref`. Recording them
+            // all as `funcref` was invisible while the segment/table type check
+            // normalized nullability away; once that check became real subtyping
+            // (§3.5.11), it rejected every funcidx segment aimed at a
+            // `(ref func)` table — four valid `elem.wast` modules.
+            e.elem_type = .funcref_nn;
         } else {
             // Const-expr form. Non-flag-4 variants carry a leading reftype byte.
             if (flags != 4) e.elem_type = try readValType(r, d.type_kinds);

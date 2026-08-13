@@ -213,14 +213,20 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
         if (elem.mode == .active) {
             if (elem.table_index >= module.tables.len) return error.UndefinedTable;
             const tet = module.tables[elem.table_index].element;
-            // Family match (nullable-normalized) — non-nullability isn't enforced
-            // on segment application, and the flag-4 binary form can't carry it.
-            // NOTE (2026-07-20): `ValType.nullable()` returns the *nullable form
-            // of the type*, not a bool, so this compares heap types with
-            // nullability normalized away — which is correct. A 10th-pass audit
-            // reported it as an accept-invalid bug on the assumption that
-            // `nullable()` was a predicate; verified false. Don't "fix" it again.
-            if (elem.elem_type.nullable() != tet.nullable()) return error.TypeMismatch;
+            // §3.5.11: the segment's element type must be a SUBTYPE of the
+            // table's — the same rule `table.init` already used below.
+            //
+            // ⚠️ This was a nullability-normalized EQUALITY check. A 10th-pass
+            // audit called it an accept-invalid bug on the theory that
+            // `ValType.nullable()` was a predicate; that theory was wrong and the
+            // finding was retracted with a "don't fix it again" note. The
+            // mechanism was indeed as the retraction described — and the RULE was
+            // still wrong. Normalizing nullability away accepts a `funcref`
+            // segment into a `(ref func)` table, which `elem.wast` requires to be
+            // rejected: it would put nulls in a table whose type promises none.
+            // A retraction that only checks the reasoning does not re-check the
+            // requirement.
+            if (!subtypeOf(module, elem.elem_type, tet)) return error.TypeMismatch;
             // The active-elem offset has the target TABLE's index type, exactly
             // as an active-data offset takes its memory's (table64).
             const off_ty: V = if (module.tables[elem.table_index].limits.is64) .i64 else .i32;

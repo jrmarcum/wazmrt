@@ -1434,6 +1434,37 @@ test "a funcref in a shared table names its own instance, not the caller's index
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
 
+test "an element segment's type must be a SUBTYPE of its table's, not the same family" {
+    // §3.5.11. The check normalized nullability away, so a nullable `funcref`
+    // segment was accepted into a `(ref func)` table — putting nulls in a table
+    // whose type promises there are none. A 10th-pass audit raised this and the
+    // finding was RETRACTED on a mistaken reading of `ValType.nullable()`; the
+    // reading was indeed mistaken and the rule was still wrong.
+    //
+    // The second module is the other direction and must stay VALID: a funcidx
+    // segment has type `(ref func)` (§5.5.12 forms 0-3), which is a subtype of
+    // both table types.
+    const src =
+        \\(assert_invalid
+        \\  (module
+        \\    (func)
+        \\    (table 1 (ref func) (ref.func 0))
+        \\    (elem (i32.const 0) funcref (ref.func 0)))
+        \\  "type mismatch")
+        \\(module
+        \\  (func)
+        \\  (table 1 (ref func) (ref.func 0))
+        \\  (elem (i32.const 0) func 0))
+        \\(module
+        \\  (func)
+        \\  (table 1 funcref)
+        \\  (elem (i32.const 0) func 0))
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 1), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
 test "element segments applied before a failed data segment persist AND stay callable" {
     // §4.5.5 runs element inits before data inits, and entries already written
     // into an imported table survive a later trap. Two defects stacked here:
