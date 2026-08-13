@@ -80,7 +80,12 @@ pub const max_recorded_failures = 512;
 pub fn runScript(gpa: std.mem.Allocator, src: []const u8) Error!Summary {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    var r: Runner = .{ .a = arena.allocator(), .msg_a = gpa };
+    // One store for the whole script: every module a `.wast` file builds can be
+    // `register`ed and imported by a later one, so they all have to agree on what
+    // a reference value means.
+    var store: interp.Store = .init(gpa);
+    defer store.deinit();
+    var r: Runner = .{ .a = arena.allocator(), .msg_a = gpa, .store = &store };
     // Guest linear memory is PAGE-ALLOCATOR owned, so the arena above does NOT
     // reclaim it — every `(memory N)` in every module, plus every `memory.grow`,
     // leaked for the life of the process, and `tools/conformance.zig`'s careful
@@ -91,7 +96,12 @@ pub fn runScript(gpa: std.mem.Allocator, src: []const u8) Error!Summary {
         // instance frees it — but its bytes are page-allocator owned too.
         if (r.spectest_memory) |m| interp.freeGuestMemory(m.bytes);
     }
-    for (try sexpr.parseAll(r.a, src)) |cmd| try r.command(cmd);
+    var lines: std.ArrayList(u32) = .empty;
+    const forms = try sexpr.parseAllWithLines(r.a, src, &lines);
+    for (forms, 0..) |cmd, i| {
+        r.line = lines.items[i];
+        try r.command(cmd);
+    }
     return r.summary;
 }
 
@@ -102,6 +112,8 @@ const Runner = struct {
     /// Allocator for failure messages ONLY — the caller's, not the arena's, so
     /// the messages survive `runScript`. See `Summary.failures`.
     msg_a: std.mem.Allocator,
+    /// The store shared by every instance this script builds. See `interp.Store`.
+    store: *interp.Store,
     /// Every instance built by this script, so their page-allocator memories can
     /// be released (the runner arena cannot reclaim those). See `runScript`.
     instances: std.ArrayList(*interp.Instance) = .empty,
@@ -120,13 +132,16 @@ const Runner = struct {
     /// `null_ref` = maxInt sentinel), so an externref of any payload — including
     /// one equal to the sentinel — is never misclassified as null (#9).
     extern_pool: std.ArrayList(u64) = .empty,
+    /// 1-based source line of the top-level command being run, prefixed onto
+    /// every failure message so a failure names the assertion that produced it.
+    line: u32 = 0,
     summary: Summary = .{},
 
     fn fail(self: *Runner, comptime fmt: []const u8, args: anytype) void {
         self.summary.failed += 1;
         if (self.summary.failures.items.len >= max_recorded_failures) return;
         // `msg_a`, not `a`: the arena dies with `runScript`, and these outlive it.
-        const msg = std.fmt.allocPrint(self.msg_a, fmt, args) catch return;
+        const msg = std.fmt.allocPrint(self.msg_a, "L{d}: " ++ fmt, .{self.line} ++ args) catch return;
         if (self.summary.first_failure == null) self.summary.first_failure = msg;
         // Keep EVERY failure, not just the first. Reporting one per file made
         // 25 distinct decoder defects in `binary.wast` look like one, and sent
@@ -176,8 +191,11 @@ const Runner = struct {
         const m = try self.a.create(Module);
         m.* = try Module.decode(self.a, bin);
         try validate(self.a, m);
+        // Allocated first, then instantiated IN PLACE: the instance's address is
+        // baked into every funcref its element segments and global initializers
+        // create, so it cannot be built somewhere else and moved here.
         const inst = try self.a.create(interp.Instance);
-        inst.* = try interp.Instance.initWithImports(self.a, m, try self.resolveImports(m));
+        try inst.instantiateWithImports(self.a, m, try self.resolveImports(m));
         // Register before `runStart`: even if the start function traps, the
         // instance already owns page-allocator memory that must be released.
         try self.instances.append(self.a, inst);
@@ -211,7 +229,7 @@ const Runner = struct {
             // types.
             .tag => try self.checkTagImport(&tm, m, imp),
         };
-        return .{ .funcs = fs.items, .globals = gs.items, .memories = ms.items, .tables = ts.items };
+        return .{ .funcs = fs.items, .globals = gs.items, .memories = ms.items, .tables = ts.items, .store = self.store };
     }
 
     fn resolveFuncImport(self: *Runner, tm: *typematch.Ctx, m: *const Module, imp: Module.Import) !HostFunc {
@@ -338,7 +356,7 @@ const Runner = struct {
         const entries = try self.a.alloc(Value, 10); // 10 funcref
         @memset(entries, null_ref);
         const t = try self.a.create(interp.Instance.Table);
-        t.* = .{ .entries = entries, .max = 20 };
+        t.* = .{ .entries = entries, .max = 20, .store = self.store };
         self.spectest_table = t;
         return t;
     }
@@ -1363,6 +1381,68 @@ test "a rejected module cannot leave entries in another module's table" {
     ;
     const s = try runScript(std.testing.allocator, src);
     try std.testing.expectEqual(@as(usize, 2), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "a funcref in a shared table names its own instance, not the caller's index" {
+    // A funcref used to be a bare function index, resolved against whatever
+    // instance was executing `call_indirect`. $B writes its `$b` (index 1 in
+    // $B: the imported `$a` takes index 0) into $A's table at slot 0. Reading
+    // that slot from $A then dispatched to *$A's* function 1 — `at`, the very
+    // function doing the reading — instead of $B's `$b`.
+    //
+    // The old answer was not an error, it was 11: plausible, self-consistent,
+    // and wrong. Both directions are asserted, because the defect was symmetric
+    // — each instance saw its own function through the other's entry.
+    const src =
+        \\(module $A
+        \\  (type $r (func (result i32)))
+        \\  (table (export "t") 2 funcref)
+        \\  (func (export "a") (type $r) (i32.const 11))
+        \\  (func (export "at") (param i32) (result i32)
+        \\    (call_indirect (type $r) (local.get 0))))
+        \\(register "A" $A)
+        \\(module $B
+        \\  (type $r (func (result i32)))
+        \\  (func $a (import "A" "a") (type $r))
+        \\  (table (import "A" "t") 2 funcref)
+        \\  (func $b (type $r) (i32.const 22))
+        \\  (elem (i32.const 0) $b $a)
+        \\  (func (export "bt") (param i32) (result i32)
+        \\    (call_indirect (type $r) (local.get 0))))
+        \\(assert_return (invoke $A "at" (i32.const 0)) (i32.const 22))
+        \\(assert_return (invoke $A "at" (i32.const 1)) (i32.const 11))
+        \\(assert_return (invoke $B "bt" (i32.const 0)) (i32.const 22))
+        \\(assert_return (invoke $B "bt" (i32.const 1)) (i32.const 11))
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 4), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "a funcref crossing a module boundary in a global keeps its identity" {
+    // The same defect reached through a `funcref` GLOBAL rather than a table:
+    // $M exports `(ref.func 0)`, and the importer drops it into its own table.
+    // Resolving that value locally selected the importer's own function 0 —
+    // which here is the caller itself, so the corpus saw it as unbounded
+    // recursion (`elem.wast`'s `call_imported_elem`, CallStackExhausted) rather
+    // than as a wrong value. Same bug, unrecognisable symptom.
+    const src =
+        \\(module $M
+        \\  (func (result i32) (i32.const 42))
+        \\  (global (export "f") funcref (ref.func 0)))
+        \\(register "M" $M)
+        \\(module $N
+        \\  (import "M" "f" (global funcref))
+        \\  (type $r (func (result i32)))
+        \\  (table 1 funcref)
+        \\  (elem (offset (i32.const 0)) funcref (global.get 0))
+        \\  (func (export "call") (type $r)
+        \\    (call_indirect (type $r) (i32.const 0))))
+        \\(assert_return (invoke $N "call") (i32.const 42))
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 1), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
 

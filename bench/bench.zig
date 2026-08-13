@@ -92,7 +92,8 @@ fn benchHash(io: Io, a: std.mem.Allocator, path: []const u8) !void {
         const funcs = a.alloc(wazmrt.interp.Instance.HostFunc, nfuncs) catch unreachable;
         defer a.free(funcs);
         for (funcs) |*f| f.* = .{ .native_env = .{ .ctx = &stub_ctx, .call = stubCall } };
-        var inst = wazmrt.Instance.initWithImports(a, &m, .{ .funcs = funcs }) catch |e| {
+        var inst: wazmrt.Instance = undefined;
+        inst.instantiateWithImports(a, &m, .{ .funcs = funcs }) catch |e| {
             std.debug.print("  instantiate FAILED: {t}\n", .{e});
             inst_ok = false;
             break;
@@ -184,7 +185,8 @@ pub fn main(init: std.process.Init) !void {
     {
         var module = try wazmrt.decode(a, bin);
         defer module.deinit();
-        var inst = try wazmrt.Instance.init(a, &module);
+        var inst: wazmrt.Instance = undefined;
+        try inst.instantiate(a, &module);
         defer inst.deinit();
 
         const n: i32 = 1_000_000;
@@ -219,7 +221,8 @@ pub fn main(init: std.process.Init) !void {
         const start = nowNs(io);
         for (0..reps) |_| {
             var module = try wazmrt.decode(a, bin);
-            var inst = try wazmrt.Instance.init(a, &module);
+            var inst: wazmrt.Instance = undefined;
+            try inst.instantiate(a, &module);
             a.free(try inst.invoke("sum", &.{wazmrt.interp.i32Value(0)}));
             inst.deinit();
             module.deinit();

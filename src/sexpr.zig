@@ -66,10 +66,37 @@ const max_depth: usize = 1024;
 /// Parse an entire source into its sequence of top-level forms. Everything is
 /// allocated from `a` (typically an arena).
 pub fn parseAll(a: std.mem.Allocator, src: []const u8) Error![]const Sexpr {
+    return (try parseAllWithLines(a, src, null));
+}
+
+/// As `parseAll`, but also records the 1-based source LINE each top-level form
+/// starts on into `lines` (same length and order as the returned forms).
+///
+/// The `.wast` runner needs this: a failure message that names only its error
+/// ("result mismatch") cannot be matched back to an assertion in a 1,000-line
+/// script, and triaging 35 failures across five files by re-deriving which
+/// assertion each one was is exactly the hand work that mislabelled three of
+/// five items on the 2026-08-11 list. Only top-level forms are tracked — that is
+/// the granularity a `.wast` command has.
+pub fn parseAllWithLines(
+    a: std.mem.Allocator,
+    src: []const u8,
+    lines: ?*std.ArrayList(u32),
+) Error![]const Sexpr {
     var p: Parser = .{ .src = src, .a = a };
     var forms: std.ArrayList(Sexpr) = .empty;
+    // Walked forward with `pos` rather than recounting from 0 each form, so a
+    // 40k-line script stays linear overall instead of quadratic.
+    var line: u32 = 1;
+    var counted: usize = 0;
     p.skipTrivia();
     while (p.pos < src.len) {
+        if (lines) |l| {
+            while (counted < p.pos) : (counted += 1) {
+                if (src[counted] == '\n') line += 1;
+            }
+            try l.append(a, line);
+        }
         try forms.append(a, try p.parseValue());
         p.skipTrivia();
     }

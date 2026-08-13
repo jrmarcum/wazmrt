@@ -954,7 +954,8 @@ fn runWasi(
             try funcs.append(arena, .{ .native_env = .{ .ctx = &wasi, .call = unresolvedImport } });
     }
 
-    var inst = try interp.Instance.initWithImports(arena, module, .{ .funcs = funcs.items, .max_memory_bytes = max_memory, .max_table_elems = max_table_elems });
+    var inst: interp.Instance = undefined;
+    try inst.instantiateWithImports(arena, module, .{ .funcs = funcs.items, .max_memory_bytes = max_memory, .max_table_elems = max_table_elems });
     defer inst.deinit();
     wasi.memory = inst.memory0(); // module memory now exists
 
@@ -1024,7 +1025,8 @@ fn runFunction(
         };
     }
 
-    var inst = interp.Instance.init(arena, module) catch |e| {
+    var inst: interp.Instance = undefined;
+    inst.instantiate(arena, module) catch |e| {
         try out.print("error: instantiate: {s}\n", .{@errorName(e)});
         return exit_failure;
     };

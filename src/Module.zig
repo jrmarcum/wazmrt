@@ -517,6 +517,11 @@ pub fn importedFuncCount(self: Module) u32 {
     return n;
 }
 
+/// Size of the function index space: imported functions then defined ones.
+pub fn funcCount(self: *const Module) u32 {
+    return self.importedFuncCount() + @as(u32, @intCast(self.functions.len));
+}
+
 /// Number of imported tables (they occupy the low table indices).
 pub fn importedTableCount(self: Module) u32 {
     var n: u32 = 0;

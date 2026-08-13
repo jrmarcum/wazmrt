@@ -447,6 +447,12 @@ const Ref = struct { inst: u32, index: u32 };
 pub const Store = struct {
     id: u64,
     engine: *Engine,
+    /// The interpreter-side store every instance here joins, so a `funcref` means
+    /// the same function to all of them. `define_instance` links one guest module
+    /// to another's exports, which is exactly the case that needs it: without a
+    /// shared store the importer would resolve the exporter's funcrefs against
+    /// its OWN function index space. See `interp.Store`.
+    refs: interp.Store = undefined,
     instances: std.ArrayList(*InstanceSlot) = .empty,
     funcs: std.ArrayList(Ref) = .empty,
     memories: std.ArrayList(Ref) = .empty,
@@ -477,6 +483,7 @@ export fn wazmrt_store_new(e: ?*Engine) ?*Store {
     const eng = e orelse return null;
     const s = alloc.create(Store) catch return null;
     s.* = .{ .id = next_store_id.fetchAdd(1, .monotonic), .engine = eng };
+    s.refs = .init(alloc);
     return s;
 }
 
@@ -506,6 +513,8 @@ export fn wazmrt_store_delete(s: ?*Store) void {
         releaseModule(slot.module);
         alloc.destroy(slot);
     }
+    // After every instance is gone: `Instance.deinit` tombstones its slot here.
+    store.refs.deinit();
     store.instances.deinit(alloc);
     store.funcs.deinit(alloc);
     store.memories.deinit(alloc);
@@ -1718,7 +1727,8 @@ export fn wazmrt_linker_instantiate(
         return msg;
     }
 
-    slot.inst = interp.Instance.initWithImports(sa, &cm.inner, imports) catch |err| {
+    imports.store = &store.refs;
+    slot.inst.instantiateWithImports(sa, &cm.inner, imports) catch |err| {
         if (slot.wasi) |w| w.wasi.deinit();
         slot.arena.deinit();
         alloc.destroy(slot);

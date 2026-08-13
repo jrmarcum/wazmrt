@@ -22,6 +22,7 @@ const types = @import("types.zig");
 const Module = @import("Module.zig");
 const opcode = @import("opcode.zig");
 const Reader = @import("Reader.zig");
+const typematch = @import("typematch.zig");
 
 const V = types.ValType;
 const Op = opcode.Op;
@@ -292,16 +293,96 @@ pub const Error = Module.Error || error{
     /// path never validates, so instantiation must reject it itself — the two
     /// slices are iterated in lockstep below.
     CountMismatch,
+    /// More instances registered in one `Store` than a funcref value can name
+    /// (2^31 - 2). Unreachable in practice; the encoding says so out loud.
+    TooManyInstances,
+    /// An import was backed by an instance or table belonging to a DIFFERENT
+    /// `Store`. Reference values are only meaningful within one store, so
+    /// linking across two would hand the importer funcrefs it resolves against
+    /// the wrong instances — the exact defect `Store` exists to remove. Refused
+    /// loudly rather than answered wrongly.
+    CrossStoreLink,
 };
 
 /// Null reference sentinel — on the value stack (`ref.null`) and as an
-/// uninitialized table entry. A funcref value is a function index (always small),
-/// and host externref values are boxed to small non-sentinel handles at the host
-/// boundary (see the WAST runner's `internExtern`, #9), so neither collides.
+/// uninitialized table entry. A funcref value names an instance SLOT plus a
+/// function index (see `funcRefValue`; the slot is biased by 1, so no funcref
+/// reaches all-ones), and host externref values are boxed to small non-sentinel
+/// handles at the host boundary (see the WAST runner's `internExtern`, #9), so
+/// neither collides.
 ///
 /// Public because the C ABI speaks this model directly: `wasm_table_get`/`set`
 /// translate between table slots and `wasm_ref_t`.
 pub const null_ref: Value = std.math.maxInt(u64);
+
+/// A function ADDRESS — the instance a function belongs to plus its index in
+/// that instance's function index space. This is what a `funcref` denotes.
+pub const FuncAddr = struct { instance: *Instance, index: u32 };
+
+/// The instance set a group of linked instances share, so a reference VALUE
+/// means the same thing to all of them.
+///
+/// ⚠️ **A funcref used to be a bare function index, resolved against whatever
+/// instance happened to be executing.** Every funcref that crossed an instance
+/// boundary — through a shared table, a `funcref` global, a param or a result —
+/// therefore re-bound to a *different* function: the one sitting at that index
+/// in the reader's module. That is not an edge case, it is what an imported
+/// table is FOR. It produced 17 wrong answers in the spec suite (`linking`,
+/// `elem`, `linking3`) and, worse, produced them silently: `call_indirect`'s
+/// type check read the type from the reader's module too, so the call was
+/// self-consistent and plausible all the way down. See cmem/known-issues.md, R2.
+///
+/// Instances are never removed, only tombstoned (`null`) on `deinit`, so a
+/// funcref outliving its instance resolves to a clean `error.UndefinedFunc`
+/// rather than a dangling pointer — and an arbitrary integer arriving as a
+/// funcref through the C ABI does the same.
+pub const Store = struct {
+    gpa: std.mem.Allocator,
+    instances: std.ArrayList(?*Instance) = .empty,
+
+    pub fn init(gpa: std.mem.Allocator) Store {
+        return .{ .gpa = gpa };
+    }
+
+    pub fn deinit(self: *Store) void {
+        self.instances.deinit(self.gpa);
+        self.* = undefined;
+    }
+
+    /// Claim a slot for `inst`. Slots are never reused, so a value that named a
+    /// dead instance never silently names a live one.
+    fn register(self: *Store, inst: *Instance) Error!u32 {
+        // `slot + 1` must fit the funcref encoding's 31 usable high bits.
+        if (self.instances.items.len >= std.math.maxInt(u31) - 1) return error.TooManyInstances;
+        const slot: u32 = @intCast(self.instances.items.len);
+        try self.instances.append(self.gpa, inst);
+        return slot;
+    }
+
+    fn tombstone(self: *Store, slot: u32) void {
+        if (slot < self.instances.items.len) self.instances.items[slot] = null;
+    }
+
+    /// Resolve a funcref value, or null if it is not a live function address.
+    pub fn resolve(self: *const Store, v: Value) ?FuncAddr {
+        if (v == null_ref) return null;
+        const biased = v >> 32;
+        if (biased == 0 or biased > self.instances.items.len) return null;
+        const inst = self.instances.items[@intCast(biased - 1)] orelse return null;
+        const index: u32 = @truncate(v);
+        if (index >= inst.module.funcCount()) return null;
+        return .{ .instance = inst, .index = index };
+    }
+};
+
+/// Build the `funcref` value for function `func_index` of the instance holding
+/// store slot `store_slot`. The slot is biased by 1 so slot 0 / function 0 is
+/// not the integer 0 (which a host could plausibly hand us as "nothing"), and so
+/// the encoding never collides with `null_ref`. Bit 63 stays clear, so it never
+/// collides with `i31_tag` either.
+pub fn funcRefValue(store_slot: u32, func_index: u32) Value {
+    return (@as(Value, store_slot) + 1) << 32 | @as(Value, func_index);
+}
 
 /// Tag bit marking a value slot as an unboxed i31 (full GC). Set on `ref.i31`
 /// results so `ref.test`/`ref.cast` can distinguish an i31 from a heap-object
@@ -430,6 +511,14 @@ pub const Instance = struct {
     gpa: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     module: *const Module,
+    /// The store this instance's reference VALUES live in — shared with every
+    /// instance it links to. See `Store`.
+    store: *Store,
+    /// This instance's slot in `store`; the high half of every funcref it makes.
+    store_slot: u32,
+    /// True when this instance created `store` itself (no `Imports.store` was
+    /// given), and so must free it in `deinit`.
+    owns_store: bool,
     func_bodies: []FuncBody,
     globals: []Value,
     /// High 64 bits of each global (only v128 globals use it; 0 otherwise), so a
@@ -543,7 +632,10 @@ pub const Instance = struct {
     /// (table64) may declare a max past `u32` and takes i64 index operands. It
     /// was `?u32` with no index type, so 64-bit tables could not be represented
     /// even after the decoder learned to read them.
-    pub const Table = struct { entries: []Value, max: ?u64, is64: bool = false };
+    /// `store` is the store whose funcref values this table's entries are
+    /// written in. Carried so linking can REFUSE to import a table from another
+    /// store rather than silently reinterpret its entries.
+    pub const Table = struct { entries: []Value, max: ?u64, is64: bool = false, store: ?*Store = null };
 
     /// A callable backing an imported function: another instance's exported
     /// function (module linking), a plain native host function, or a native
@@ -582,10 +674,19 @@ pub const Instance = struct {
         /// Ceiling on total defined-table entries, summed over all defined tables
         /// and enforced again by `table.grow`. See `default_max_table_elems`.
         max_table_elems: usize = default_max_table_elems,
+        /// The `Store` this instance joins. **Every instance that can exchange
+        /// reference values with this one must be given the SAME store** — that
+        /// is what makes a funcref mean the same function on both sides. Null
+        /// means "this instance links to nothing": it creates a private store and
+        /// frees it in `deinit`. Passing an import backed by an instance or table
+        /// from a different store is `error.CrossStoreLink`, never a silent
+        /// reinterpretation.
+        store: ?*Store = null,
     };
 
-    pub fn init(gpa: std.mem.Allocator, module: *const Module) Error!Instance {
-        return initWithImports(gpa, module, .{});
+    /// Instantiate `module` into `self`, with no imports.
+    pub fn instantiate(self: *Instance, gpa: std.mem.Allocator, module: *const Module) Error!void {
+        return self.instantiateWithImports(gpa, module, .{});
     }
 
     /// Reject a function body whose static index immediates are out of range,
@@ -644,10 +745,45 @@ pub const Instance = struct {
         }
     }
 
-    pub fn initWithImports(gpa: std.mem.Allocator, module: *const Module, imports: Imports) Error!Instance {
+    /// Instantiate `module` into `self`.
+    ///
+    /// ⚠️ **Takes a destination pointer instead of returning an `Instance`,
+    /// deliberately.** An instance's ADDRESS is part of its identity now: every
+    /// `funcref` this module produces names `self` (see `Store`), and element
+    /// segments and global initializers produce funcrefs *before this function
+    /// returns*. Returning by value and letting the caller move the result
+    /// afterwards would leave those references pointing at a dead slot — so the
+    /// old `init`/`initWithImports` spelling is gone rather than kept as a trap.
+    pub fn instantiateWithImports(self: *Instance, gpa: std.mem.Allocator, module: *const Module, imports: Imports) Error!void {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const a = arena.allocator();
+
+        // Join the caller's store, or open a private one for an instance that
+        // links to nothing. Registered BEFORE any reference value is built, since
+        // `store_slot` is the high half of every funcref below.
+        const owns_store = imports.store == null;
+        const store: *Store = if (imports.store) |s| s else blk: {
+            const s = try gpa.create(Store);
+            s.* = .init(gpa);
+            break :blk s;
+        };
+        errdefer if (owns_store) {
+            store.deinit();
+            gpa.destroy(store);
+        };
+        const store_slot = try store.register(self);
+        // A failed instantiation must not leave a live slot pointing at storage
+        // the caller is about to reuse.
+        errdefer store.tombstone(store_slot);
+
+        // Reference values only mean anything within one store, so refuse to
+        // link across two rather than reinterpret the other side's funcrefs.
+        for (imports.funcs) |hf| switch (hf) {
+            .wasm => |w| if (w.instance.store != store) return error.CrossStoreLink,
+            else => {},
+        };
+        for (imports.tables) |t| if (t.store != null and t.store != store) return error.CrossStoreLink;
 
         // A v128 can reach a `drop`/`select` from outside a function's own body:
         // a `global.get` of a v128 global, or a `call` whose signature returns
@@ -817,6 +953,7 @@ pub const Instance = struct {
                     .arena = a,
                     .gc_heap = &gc_heap,
                     .gpa = gpa,
+                    .store_slot = store_slot,
                 }, init_expr);
             }
         }
@@ -907,7 +1044,7 @@ pub const Instance = struct {
                     gpa.free(entries);
                     return e;
                 };
-                tab.* = .{ .entries = entries, .max = tt.limits.max, .is64 = tt.limits.is64 };
+                tab.* = .{ .entries = entries, .max = tt.limits.max, .is64 = tt.limits.is64, .store = store };
                 t.* = tab;
             }
             n_tables_init += 1;
@@ -931,13 +1068,18 @@ pub const Instance = struct {
             const vals = try gpa.alloc(Value, elem.funcs.len + elem.exprs.len);
             ev.* = vals;
             n_elem_alloc += 1;
-            for (elem.funcs, 0..) |f, k| vals[k] = @as(Value, f);
+            // A segment's `funcidx` list names functions in THIS module's index
+            // space; the value written into the table has to name them
+            // absolutely, or an importer of the table dispatches these slots
+            // through its own function indices instead. That was the defect.
+            for (elem.funcs, 0..) |f, k| vals[k] = funcRefValue(store_slot, f);
             for (elem.exprs, 0..) |ex, k| vals[k] = try evalConstExpr(.{
                 .globals = globals,
                 .module = module,
                 .arena = a,
                 .gc_heap = &gc_heap,
                 .gpa = gpa,
+                .store_slot = store_slot,
             }, ex);
             dropped.* = elem.mode != .passive;
             if (elem.mode == .active) {
@@ -963,10 +1105,13 @@ pub const Instance = struct {
             }
         }
 
-        return .{
+        self.* = .{
             .gpa = gpa,
             .arena = arena,
             .module = module,
+            .store = store,
+            .store_slot = store_slot,
+            .owns_store = owns_store,
             .func_bodies = bodies,
             .globals = globals,
             .global_hi = global_hi,
@@ -989,6 +1134,17 @@ pub const Instance = struct {
     }
 
     pub fn deinit(self: *Instance) void {
+        // Retire the store slot first: any funcref still naming this instance
+        // must resolve to "gone" (a clean `UndefinedFunc`), never to freed
+        // storage. Slots are tombstoned, never reused, so the value cannot come
+        // back meaning a different function.
+        self.store.tombstone(self.store_slot);
+        const own_store: ?*Store = if (self.owns_store) self.store else null;
+        const gpa = self.gpa;
+        defer if (own_store) |s| {
+            s.deinit();
+            gpa.destroy(s);
+        };
         // Free only owned (defined) memories/tables; imported ones belong to the
         // exporting instance.
         for (self.memories[self.imported_memories..]) |m| {
@@ -1240,15 +1396,71 @@ pub const Instance = struct {
         }
     }
 
-    /// The type index of a *defined* function (for `ref.cast` of a funcref to a
-    /// concrete func type); null for an imported function (no type index kept).
-    fn definedFuncType(self: *Instance, findex: Value) ?u32 {
-        const fi = std.math.cast(u32, findex) orelse return null;
-        const imported = self.module.importedFuncCount();
-        if (fi < imported) return null;
-        const d = fi - imported;
-        if (d >= self.module.functions.len) return null;
-        return self.module.functions[d];
+    /// The type index of the function a funcref VALUE names (for `ref.cast` of a
+    /// funcref to a concrete func type), read from the DEFINING instance's
+    /// module; null when the value names no live function or names an imported
+    /// one (whose type index belongs to a third module).
+    ///
+    /// ⚠️ Null for a funcref DEFINED IN ANOTHER INSTANCE too: the caller feeds
+    /// this index to `self.module.isSubtype`, and a type index only means
+    /// something inside the module that wrote it (R1). Comparing across modules
+    /// needs `typematch`, which `refMatches` has no allocator for — so a concrete
+    /// `ref.cast` of a foreign funcref TRAPS rather than answering from an index
+    /// that means nothing here. A false negative, loudly, instead of a wrong
+    /// cast quietly.
+    fn definedFuncType(self: *Instance, fref: Value) ?u32 {
+        const ad = self.store.resolve(fref) orelse return null;
+        const m = ad.instance.module;
+        if (m != self.module) return null;
+        const imported = m.importedFuncCount();
+        if (ad.index < imported) return null;
+        const d = ad.index - imported;
+        if (d >= m.functions.len) return null;
+        return m.functions[d];
+    }
+
+    /// Run `callee` in ITS instance's context and bring the result — or the trap
+    /// — back across the boundary. Reached from an imported-function call and
+    /// from any `call_indirect`/`call_ref` whose funcref names another instance,
+    /// which is routine once a table is shared.
+    fn callAcross(
+        self: *Instance,
+        a: std.mem.Allocator,
+        callee: struct { instance: *Instance, func_index: u32 },
+        args: []const Value,
+        depth: usize,
+    ) Error![]Value {
+        const other = callee.instance;
+        // The trap trace is per-Instance and only `invoke` resets it — but a
+        // module-linked callee is entered through here, never through `invoke`.
+        // Its trace therefore accumulated frames from every trap it had ever
+        // taken, pinning at `max_trap_frames` frames drawn from unrelated
+        // invocations and leaving `trapTruncated()` permanently true.
+        other.trap_len = 0;
+        other.trap_depth = 0;
+        return other.callFunction(a, callee.func_index, args, depth + 1) catch |e| {
+            // `pending_exn` is per-Instance, but an exception unwinding out of a
+            // cross-module call must stay findable by the CALLER's handlers —
+            // otherwise `onCallError` sees null on this instance and a
+            // `try_table (catch_all …)` around the call could never fire. Hand
+            // it across the boundary.
+            //
+            // The payload lifetime is sound: the callee ran on `a`, the caller's
+            // own invocation scratch arena.
+            if (e == error.UncaughtException) {
+                if (other.pending_exn) |exn| {
+                    self.pending_exn = exn;
+                    other.pending_exn = null;
+                }
+            }
+            // Take the callee's frames as our own innermost ones. The embedder
+            // reads the trace off the instance IT called, so without this the
+            // backtrace for a cross-instance trap was missing the frame that
+            // actually faulted. Our own frames are appended after, as this error
+            // unwinds — which keeps the whole trace innermost-first.
+            self.adoptTrapFrames(other);
+            return e;
+        };
     }
 
     fn callFunction(self: *Instance, a: std.mem.Allocator, func_index: u32, args: []const Value, depth: usize) Error![]Value {
@@ -1257,41 +1469,7 @@ pub const Instance = struct {
             if (func_index >= self.import_funcs.len) return error.UnsupportedImportCall;
             switch (self.import_funcs[func_index]) {
                 // Cross-module call: run in the exporting instance's context.
-                .wasm => |w| {
-                    // The trap trace is per-Instance and only `invoke` resets it —
-                    // but a module-linked callee is entered through here, never
-                    // through `invoke`. Its trace therefore accumulated frames
-                    // from every trap it had ever taken, pinning at
-                    // `max_trap_frames` frames drawn from unrelated invocations
-                    // and leaving `trapTruncated()` permanently true.
-                    w.instance.trap_len = 0;
-                    w.instance.trap_depth = 0;
-                    return w.instance.callFunction(a, w.func_index, args, depth + 1) catch |e| {
-                        // `pending_exn` is per-Instance, but an exception
-                        // unwinding out of a cross-module call must stay findable
-                        // by the CALLER's handlers — otherwise `onCallError` sees
-                        // null on this instance and a `try_table (catch_all …)`
-                        // around the call could never fire. Hand it across the
-                        // boundary.
-                        //
-                        // The payload lifetime is sound: the callee ran on `a`,
-                        // the caller's own invocation scratch arena.
-                        if (e == error.UncaughtException) {
-                            if (w.instance.pending_exn) |exn| {
-                                self.pending_exn = exn;
-                                w.instance.pending_exn = null;
-                            }
-                        }
-                        // Take the callee's frames as our own innermost ones. The
-                        // embedder reads the trace off the instance IT called, so
-                        // without this the backtrace for a cross-instance trap was
-                        // missing the frame that actually faulted. Our own frames
-                        // are appended after, as this error unwinds — which keeps
-                        // the whole trace innermost-first.
-                        self.adoptTrapFrames(w.instance);
-                        return e;
-                    };
-                },
+                .wasm => |w| return self.callAcross(a, .{ .instance = w.instance, .func_index = w.func_index }, args, depth),
                 .native => |f| {
                     const ft = self.module.funcType(func_index) orelse return error.UndefinedFunc;
                     const results = try a.alloc(Value, typeSlots(ft.results));
@@ -1530,11 +1708,40 @@ const Frame = struct {
     /// expanded signatures: `(sub (func))` and `(sub final (func))` have identical
     /// params and results and are different types, so comparing signatures let a
     /// final type answer a call that named the extensible one.
-    fn checkIndirectType(self: *Frame, declared: u32, func_index: u32) Error!void {
+    /// Resolve a `funcref` VALUE — which names an instance and a function inside
+    /// it, not a function index in whatever module happens to be running — to the
+    /// function it denotes. A value that names no live function traps rather than
+    /// being reinterpreted locally.
+    fn resolveFuncRef(self: *Frame, v: Value) Error!FuncAddr {
+        if (v == null_ref) return error.NullReference;
+        return self.inst.store.resolve(v) orelse error.UndefinedFunc;
+    }
+
+    /// Call a resolved function address, crossing instances when it is not ours.
+    fn callAddr(self: *Frame, callee: FuncAddr, args: []const Value) Error![]Value {
+        if (callee.instance == self.inst)
+            return self.inst.callFunction(self.a, callee.index, args, self.depth + 1);
+        return self.inst.callAcross(self.a, .{ .instance = callee.instance, .func_index = callee.index }, args, self.depth);
+    }
+
+    /// `declared` is a type index in THIS module; `callee` may live in another
+    /// one, so its type index is read from ITS module and the two are compared
+    /// structurally (`typematch`) rather than as raw numbers — the same rule
+    /// R1 established for imports, for the same reason: an index is only
+    /// meaningful inside the module that wrote it.
+    fn checkIndirectType(self: *Frame, declared: u32, callee: FuncAddr) Error!void {
         const m = self.inst.module;
         if (declared >= m.comp_types.len) return error.UndefinedType;
-        const actual = m.funcTypeIndex(func_index) orelse return error.UndefinedFunc;
-        if (!m.isSubtype(actual, declared)) return error.IndirectTypeMismatch;
+        const cm = callee.instance.module;
+        const actual = cm.funcTypeIndex(callee.index) orelse return error.UndefinedFunc;
+        if (cm == m) {
+            if (!m.isSubtype(actual, declared)) return error.IndirectTypeMismatch;
+            return;
+        }
+        var tm: typematch.Ctx = .init(self.a);
+        defer tm.deinit();
+        const ok = tm.funcImportOk(cm, actual, m, declared) catch return error.IndirectTypeMismatch;
+        if (!ok) return error.IndirectTypeMismatch;
     }
 
     fn branch(self: *Frame, n: u32) Error!usize {
@@ -1721,7 +1928,10 @@ const Frame = struct {
                     pc += 1;
                 },
                 .ref_func => {
-                    try self.pushU64(instr.imm.func); // a funcref is its function index
+                    // A funcref names THIS instance plus the function index, so it
+                    // still means this function after it is stored in a shared
+                    // table or handed to another module.
+                    try self.pushU64(funcRefValue(self.inst.store_slot, instr.imm.func));
                     pc += 1;
                 },
 
@@ -2019,28 +2229,34 @@ const Frame = struct {
                     pc += 1;
                 },
                 .return_call, .return_call_indirect => {
-                    // Resolve the callee: a direct func index, or a table slot.
-                    const f: u32 = if (instr.op == .return_call) instr.imm.func else blk: {
+                    // Resolve the callee: a direct func index (always ours), or a
+                    // table slot (a funcref, which may name another instance).
+                    const callee: FuncAddr = if (instr.op == .return_call)
+                        .{ .instance = self.inst, .index = instr.imm.func }
+                    else blk: {
                         const ci = instr.imm.call_indirect;
                         if (ci.table >= self.inst.tables.len) return error.NoTable;
                         const tab = self.inst.tables[ci.table];
                         const slot = self.popMemU64(tab.is64);
                         if (slot >= tab.entries.len) return error.TableOutOfBounds;
                         if (tab.entries[@intCast(slot)] == null_ref) return error.UninitializedElement;
-                        const fi = std.math.cast(u32, tab.entries[@intCast(slot)]) orelse return error.UndefinedFunc;
-                        try self.checkIndirectType(ci.type_index, fi);
-                        break :blk fi;
+                        const ad = try self.resolveFuncRef(tab.entries[@intCast(slot)]);
+                        try self.checkIndirectType(ci.type_index, ad);
+                        break :blk ad;
                     };
-                    const ft = self.inst.module.funcType(f) orelse return error.UndefinedFunc;
+                    const ft = callee.instance.module.funcType(callee.index) orelse return error.UndefinedFunc;
                     const np = typeSlots(ft.params);
                     const base = try self.stackBase(np);
-                    if (f >= self.inst.imported_funcs) {
+                    if (callee.instance == self.inst and callee.index >= self.inst.imported_funcs) {
                         // Defined here: hand the args up and let `callFunction`
                         // REPLACE this frame. Copied out because the vstack they
-                        // sit on dies with the frame.
+                        // sit on dies with the frame. Only OUR OWN defined
+                        // functions can reuse this frame — a callee in another
+                        // instance runs on that instance's state, so there is no
+                        // frame of ours to reuse.
                         if (np > self.tail_buf.len) self.tail_buf = try self.a.realloc(self.tail_buf, np);
                         @memcpy(self.tail_buf[0..np], self.vstack.items[base..]);
-                        self.tail = .{ .func_index = f, .args = self.tail_buf[0..np] };
+                        self.tail = .{ .func_index = callee.index, .args = self.tail_buf[0..np] };
                         return;
                     }
                     // Imported (host or another instance): there is no frame of
@@ -2048,7 +2264,7 @@ const Frame = struct {
                     // still grows, which is correct — the boundary is a real
                     // native call either way.
                     const args = self.vstack.items[base..];
-                    const results = self.inst.callFunction(self.a, f, args, self.depth + 1) catch |e| {
+                    const results = self.callAddr(callee, args) catch |e| {
                         pc = try self.onCallError(e);
                         continue;
                     };
@@ -2064,13 +2280,13 @@ const Frame = struct {
                     const slot = self.popMemU64(tab.is64); // table element index (top of stack)
                     if (slot >= table.len) return error.TableOutOfBounds;
                     if (table[@intCast(slot)] == null_ref) return error.UninitializedElement;
-                    const f = std.math.cast(u32, table[@intCast(slot)]) orelse return error.UndefinedFunc; // funcref value = function index
-                    try self.checkIndirectType(ci.type_index, f);
-                    const ft = self.inst.module.funcType(f) orelse return error.UndefinedFunc;
+                    const callee = try self.resolveFuncRef(table[@intCast(slot)]);
+                    try self.checkIndirectType(ci.type_index, callee);
+                    const ft = callee.instance.module.funcType(callee.index) orelse return error.UndefinedFunc;
                     const np = typeSlots(ft.params); // param slots (v128 = 2)
                     const base = try self.stackBase(np);
                     const args = self.vstack.items[base..];
-                    const results = self.inst.callFunction(self.a, f, args, self.depth + 1) catch |e| {
+                    const results = self.callAddr(callee, args) catch |e| {
                         pc = try self.onCallError(e);
                         continue;
                     };
@@ -2079,12 +2295,10 @@ const Frame = struct {
                     pc += 1;
                 },
                 .call_ref, .return_call_ref => {
-                    // The function reference (a function index) is on top of the
-                    // stack; a null ref traps.
-                    const f_ref = self.pop();
-                    if (f_ref == null_ref) return error.NullReference;
-                    const f = std.math.cast(u32, f_ref) orelse return error.UndefinedFunc;
-                    const ft = self.inst.module.funcType(f) orelse return error.UndefinedFunc;
+                    // The function reference is on top of the stack; a null ref
+                    // traps. It names its own instance, which need not be ours.
+                    const callee = try self.resolveFuncRef(self.pop());
+                    const ft = callee.instance.module.funcType(callee.index) orelse return error.UndefinedFunc;
                     const np = typeSlots(ft.params); // param slots (v128 = 2)
                     const base = try self.stackBase(np);
                     // `return_call_ref` is a REAL tail call, same as its two
@@ -2093,14 +2307,14 @@ const Frame = struct {
                     // grows the native stack per hop — so the deep-recursion
                     // assertions in `return_call_ref.wast` hit the depth cap and
                     // reported `CallStackExhausted` (6 of its 7 failures).
-                    if (instr.op == .return_call_ref and f >= self.inst.imported_funcs) {
+                    if (instr.op == .return_call_ref and callee.instance == self.inst and callee.index >= self.inst.imported_funcs) {
                         if (np > self.tail_buf.len) self.tail_buf = try self.a.realloc(self.tail_buf, np);
                         @memcpy(self.tail_buf[0..np], self.vstack.items[base..]);
-                        self.tail = .{ .func_index = f, .args = self.tail_buf[0..np] };
+                        self.tail = .{ .func_index = callee.index, .args = self.tail_buf[0..np] };
                         return;
                     }
                     const args = self.vstack.items[base..];
-                    const results = self.inst.callFunction(self.a, f, args, self.depth + 1) catch |e| {
+                    const results = self.callAddr(callee, args) catch |e| {
                         pc = try self.onCallError(e);
                         continue;
                     };
@@ -3654,6 +3868,10 @@ const ConstCtx = struct {
     /// `struct.new`/`array.new` append here and the reference value is the index.
     gc_heap: ?*std.ArrayList(Instance.HeapObject) = null,
     gpa: ?std.mem.Allocator = null,
+    /// Store slot of the instance being built, so `ref.func` in a global or
+    /// element initializer produces a funcref that names THAT instance. Null in
+    /// the offset-only contexts, which cannot contain `ref.func`.
+    store_slot: ?u32 = null,
 };
 
 /// Evaluate a constant expression (§3.3.7, incl. the extended-const `i32`/`i64`
@@ -3690,7 +3908,11 @@ fn evalConstExpr(ctx: ConstCtx, expr: []const u8) Error!Value {
                 _ = try r.readByte();
                 try push(&stack, &sp, null_ref);
             },
-            0xd2 => try push(&stack, &sp, @as(Value, try r.readVarU32())), // ref.func <funcidx>
+            0xd2 => { // ref.func <funcidx>
+                const fi = try r.readVarU32();
+                const slot = ctx.store_slot orelse return error.UnsupportedInstruction;
+                try push(&stack, &sp, funcRefValue(slot, fi));
+            },
             0x6a, 0x6b, 0x6c => { // i32 add / sub / mul
                 if (sp < 2) return error.UnsupportedInstruction;
                 const b = asI32(stack[sp - 1]);
@@ -4008,12 +4230,15 @@ fn truncSatU(comptime U: type, comptime F: type, x: F) U {
 
 const Module_decode = Module.decode;
 
-fn instantiate(bytes: []const u8) !Instance {
+/// Takes a destination pointer for the same reason `instantiateWithImports`
+/// does: an instance's ADDRESS is part of its identity, so it cannot be built
+/// here and returned by value into the caller's slot.
+fn instantiate(out: *Instance, bytes: []const u8) !void {
     const m = try std.testing.allocator.create(Module);
     errdefer std.testing.allocator.destroy(m);
     m.* = try Module_decode(std.testing.allocator, bytes);
     errdefer m.deinit();
-    return Instance.init(std.testing.allocator, m);
+    return out.instantiate(std.testing.allocator, m);
 }
 
 fn destroy(inst: *Instance) void {
@@ -4032,7 +4257,8 @@ test "runs add(a,b) -> a+b" {
         [_]u8{ 0x03, 0x02, 0x01, 0x00 } ++
         [_]u8{ 0x07, 0x07, 0x01, 0x03, 'a', 'd', 'd', 0x00, 0x00 } ++
         [_]u8{ 0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b };
-    var inst = try instantiate(&bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, &bytes);
     defer destroy(&inst);
 
     const r = try inst.invoke("add", &.{ i32Value(10), i32Value(20) });
@@ -4053,7 +4279,8 @@ test "runs an if/else (isNonZero)" {
         [_]u8{ 0x07, 0x06, 0x01, 0x02, 'n', 'z', 0x00, 0x00 } ++
         // body(12): locals(00) local.get0 if(i32) i32.const1 else i32.const0 end end
         [_]u8{ 0x0a, 0x0e, 0x01, 0x0c, 0x00, 0x20, 0x00, 0x04, 0x7f, 0x41, 0x01, 0x05, 0x41, 0x00, 0x0b, 0x0b };
-    var inst = try instantiate(&bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, &bytes);
     defer destroy(&inst);
 
     const r = try inst.invoke("nz", &.{i32Value(5)});
@@ -4074,7 +4301,8 @@ test "runs a nested call (quad = double(double(x)))" {
         [_]u8{ 0x07, 0x08, 0x01, 0x04, 'q', 'u', 'a', 'd', 0x00, 0x01 } ++ // export quad = func 1
         // code: double body(7) (local.get0 local.get0 i32.add end); quad body(8) (local.get0 call0 call0 end)
         [_]u8{ 0x0a, 0x12, 0x02, 0x07, 0x00, 0x20, 0x00, 0x20, 0x00, 0x6a, 0x0b, 0x08, 0x00, 0x20, 0x00, 0x10, 0x00, 0x10, 0x00, 0x0b };
-    var inst = try instantiate(&bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, &bytes);
     defer destroy(&inst);
 
     const r = try inst.invoke("quad", &.{i32Value(5)});
@@ -4095,7 +4323,8 @@ test "a trap records where it happened, innermost frame first" {
         // boom body(4) = 00 locals, nop, unreachable, end -> traps at pc 1.
         // outer body(5) = 00 locals, nop, call 0, end     -> calls at pc 1.
         [_]u8{ 0x0a, 0x0c, 0x02, 0x04, 0x00, 0x01, 0x00, 0x0b, 0x05, 0x00, 0x01, 0x10, 0x00, 0x0b };
-    var inst = try instantiate(&bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, &bytes);
     defer destroy(&inst);
 
     try std.testing.expectError(error.Unreachable, inst.invoke("outer", &.{}));
@@ -4132,7 +4361,8 @@ test "trap frames carry real byte offsets, not IR indices" {
         [_]u8{ 0x03, 0x02, 0x01, 0x00 } ++
         [_]u8{ 0x07, 0x05, 0x01, 0x01, 'f', 0x00, 0x00 } ++
         [_]u8{ 0x0a, 0x09, 0x01, 0x07, 0x00, 0x41, 0x80, 0x01, 0x1a, 0x00, 0x0b };
-    var inst = try instantiate(&bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, &bytes);
     defer destroy(&inst);
 
     try std.testing.expectError(error.Unreachable, inst.invoke("f", &.{}));
@@ -4162,7 +4392,8 @@ test "the trap trace resets per invoke and survives a deeper-than-buffer stack" 
             0x20, 0x00, 0x45, 0x04, 0x40, 0x00, 0x05,
             0x20, 0x00, 0x41, 0x01, 0x6b, 0x10, 0x00, 0x0b, 0x0b,
         };
-    var inst = try instantiate(&bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, &bytes);
     defer destroy(&inst);
 
     try std.testing.expectError(error.Unreachable, inst.invoke("f", &.{i32Value(40)}));
@@ -4186,7 +4417,8 @@ test "runs a br out of a block" {
         [_]u8{ 0x07, 0x05, 0x01, 0x01, 'f', 0x00, 0x00 } ++
         // body: block (result i32) ; i32.const 42 ; br 0 ; end ; end
         [_]u8{ 0x0a, 0x0b, 0x01, 0x09, 0x00, 0x02, 0x7f, 0x41, 0x2a, 0x0c, 0x00, 0x0b, 0x0b };
-    var inst = try instantiate(&bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, &bytes);
     defer destroy(&inst);
 
     const r = try inst.invoke("f", &.{});
@@ -4202,7 +4434,8 @@ test "traps on division by zero" {
         [_]u8{ 0x03, 0x02, 0x01, 0x00 } ++
         [_]u8{ 0x07, 0x07, 0x01, 0x03, 'd', 'i', 'v', 0x00, 0x00 } ++
         [_]u8{ 0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6d, 0x0b };
-    var inst = try instantiate(&bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, &bytes);
     defer destroy(&inst);
     try std.testing.expectError(error.DivByZero, inst.invoke("div", &.{ i32Value(1), i32Value(0) }));
 }
@@ -4215,7 +4448,8 @@ test "runs f64.add" {
         [_]u8{ 0x03, 0x02, 0x01, 0x00 } ++
         [_]u8{ 0x07, 0x08, 0x01, 0x04, 'f', 'a', 'd', 'd', 0x00, 0x00 } ++
         [_]u8{ 0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0xa0, 0x0b };
-    var inst = try instantiate(&bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, &bytes);
     defer destroy(&inst);
     const r = try inst.invoke("fadd", &.{ f64Value(1.5), f64Value(2.25) });
     defer std.testing.allocator.free(r);
@@ -4230,7 +4464,8 @@ test "runs i32.trunc_f64_s and traps on NaN" {
         [_]u8{ 0x03, 0x02, 0x01, 0x00 } ++
         [_]u8{ 0x07, 0x07, 0x01, 0x03, 't', 'o', 'i', 0x00, 0x00 } ++
         [_]u8{ 0x0a, 0x07, 0x01, 0x05, 0x00, 0x20, 0x00, 0xaa, 0x0b };
-    var inst = try instantiate(&bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, &bytes);
     defer destroy(&inst);
 
     const r = try inst.invoke("toi", &.{f64Value(3.7)});
@@ -4250,7 +4485,8 @@ test "stores then loads through linear memory" {
         [_]u8{ 0x05, 0x03, 0x01, 0x00, 0x01 } ++ // memory: min 1 page
         [_]u8{ 0x07, 0x06, 0x01, 0x02, 'r', 't', 0x00, 0x00 } ++ // export "rt"
         [_]u8{ 0x0a, 0x10, 0x01, 0x0e, 0x00, 0x41, 0x00, 0x20, 0x00, 0x36, 0x02, 0x00, 0x41, 0x00, 0x28, 0x02, 0x00, 0x0b };
-    var inst = try instantiate(&bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, &bytes);
     defer destroy(&inst);
     const r = try inst.invoke("rt", &.{i32Value(0x12345678)});
     defer std.testing.allocator.free(r);
@@ -4268,7 +4504,8 @@ test "initializes memory from an active data segment" {
         [_]u8{ 0x07, 0x07, 0x01, 0x03, 'g', 'e', 't', 0x00, 0x00 } ++
         [_]u8{ 0x0a, 0x09, 0x01, 0x07, 0x00, 0x41, 0x00, 0x28, 0x02, 0x00, 0x0b } ++ // code
         [_]u8{ 0x0b, 0x0a, 0x01, 0x00, 0x41, 0x00, 0x0b, 0x04, 0xef, 0xbe, 0xad, 0xde }; // data
-    var inst = try instantiate(&bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, &bytes);
     defer destroy(&inst);
     const r = try inst.invoke("get", &.{});
     defer std.testing.allocator.free(r);
@@ -4332,13 +4569,13 @@ fn ehCode(a: std.mem.Allocator, bodies: []const []const u8) ![]u8 {
     return out.toOwnedSlice(a);
 }
 
-fn instantiateValidated(bytes: []const u8) !Instance {
+fn instantiateValidated(out: *Instance, bytes: []const u8) !void {
     const m = try std.testing.allocator.create(Module);
     errdefer std.testing.allocator.destroy(m);
     m.* = try Module_decode(std.testing.allocator, bytes);
     errdefer m.deinit();
     try @import("validate.zig").validate(std.testing.allocator, m);
-    return Instance.init(std.testing.allocator, m);
+    return out.instantiate(std.testing.allocator, m);
 }
 
 test "EH: throw is caught by a matching catch, carrying the payload" {
@@ -4355,7 +4592,8 @@ test "EH: throw is caught by a matching catch, carrying the payload" {
             &.{ 0x00, 0x1f, 0x7f, 0x01, 0x00, 0x00, 0x00, 0x41, 0x2a, 0x08, 0x00, 0x0b, 0x0b },
         }) },
     });
-    var inst = try instantiateValidated(bytes);
+    var inst: Instance = undefined;
+    try instantiateValidated(&inst, bytes);
     defer destroy(&inst);
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
@@ -4376,7 +4614,8 @@ test "EH: catch_all catches any tag and control resumes after the try_table" {
             &.{ 0x00, 0x1f, 0x40, 0x01, 0x02, 0x00, 0x08, 0x00, 0x0b, 0x41, 0x37, 0x0b },
         }) },
     });
-    var inst = try instantiateValidated(bytes);
+    var inst: Instance = undefined;
+    try instantiateValidated(&inst, bytes);
     defer destroy(&inst);
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
@@ -4394,7 +4633,8 @@ test "EH: an uncaught throw traps (UncaughtException)" {
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{&.{ 0x00, 0x08, 0x00, 0x0b }}) }, // throw 0 ; end
     });
-    var inst = try instantiateValidated(bytes);
+    var inst: Instance = undefined;
+    try instantiateValidated(&inst, bytes);
     defer destroy(&inst);
     try std.testing.expectError(error.UncaughtException, inst.invoke("f", &.{}));
 }
@@ -4414,7 +4654,8 @@ test "EH: an exception thrown in a callee is caught in the caller's try_table" {
             &.{ 0x00, 0x1f, 0x40, 0x01, 0x02, 0x00, 0x10, 0x00, 0x0b, 0x41, 0x07, 0x0b },
         }) },
     });
-    var inst = try instantiateValidated(bytes);
+    var inst: Instance = undefined;
+    try instantiateValidated(&inst, bytes);
     defer destroy(&inst);
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
@@ -4435,7 +4676,8 @@ test "EH: catch_ref materializes a non-null exnref" {
             &.{ 0x00, 0x1f, 0x69, 0x01, 0x01, 0x00, 0x00, 0x08, 0x00, 0x0b, 0xd1, 0x0b },
         }) },
     });
-    var inst = try instantiateValidated(bytes);
+    var inst: Instance = undefined;
+    try instantiateValidated(&inst, bytes);
     defer destroy(&inst);
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
@@ -4463,7 +4705,8 @@ test "EH: throw_ref rethrows a caught exnref to an outer catch_all" {
             0x0b, // end func
         }}) },
     });
-    var inst = try instantiateValidated(bytes);
+    var inst: Instance = undefined;
+    try instantiateValidated(&inst, bytes);
     defer destroy(&inst);
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
@@ -4487,7 +4730,8 @@ test "EH: an imported tag leads the tag index space and can be thrown + caught" 
             &.{ 0x00, 0x1f, 0x7f, 0x01, 0x00, 0x00, 0x00, 0x41, 0x2a, 0x08, 0x00, 0x0b, 0x0b },
         }) },
     });
-    var inst = try instantiateValidated(bytes);
+    var inst: Instance = undefined;
+    try instantiateValidated(&inst, bytes);
     defer destroy(&inst);
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
@@ -4513,7 +4757,8 @@ test "legacy EH: try/catch catches a thrown exception and binds its payload" {
             &.{ 0x00, 0x06, 0x7f, 0x41, 0x2a, 0x08, 0x00, 0x07, 0x00, 0x0b, 0x0b },
         }) },
     });
-    var inst = try instantiate(bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
     defer destroy(&inst);
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
@@ -4534,7 +4779,8 @@ test "legacy EH: a try body that does not throw skips the catch handler" {
             &.{ 0x00, 0x06, 0x7f, 0x41, 0x07, 0x07, 0x00, 0x0b, 0x0b },
         }) },
     });
-    var inst = try instantiate(bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
     defer destroy(&inst);
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
@@ -4555,7 +4801,8 @@ test "legacy EH: catch_all catches any tag" {
             &.{ 0x00, 0x06, 0x7f, 0x08, 0x00, 0x19, 0x41, 0x05, 0x0b, 0x0b },
         }) },
     });
-    var inst = try instantiate(bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
     defer destroy(&inst);
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
@@ -4586,7 +4833,8 @@ test "legacy EH: a delegate reached while unwinding TRAPS instead of mis-routing
             0x0b, //          end func
         }}) },
     });
-    var inst = try instantiate(bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
     defer destroy(&inst);
     try std.testing.expectError(error.UnsupportedInstruction, inst.invoke("f", &.{}));
 }
@@ -4615,7 +4863,8 @@ test "legacy EH: rethrow from an inner catch propagates to an outer catch" {
             0x0b, // end func
         }}) },
     });
-    var inst = try instantiate(bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
     defer destroy(&inst);
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
@@ -4644,7 +4893,8 @@ test "multi-memory: a store to memory 1 does not touch memory 0 (index routing)"
             0x0b,
         }}) },
     });
-    var inst = try instantiate(bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
     defer destroy(&inst);
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
@@ -4668,7 +4918,8 @@ test "multi-memory: memory.copy moves bytes between two memories" {
             0x0b,
         }}) },
     });
-    var inst = try instantiate(bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
     defer destroy(&inst);
     const r = try inst.invoke("g", &.{});
     defer std.testing.allocator.free(r);
@@ -4691,7 +4942,8 @@ test "multi-memory: memory.size / memory.grow select by index" {
             0x0b,
         }}) },
     });
-    var inst = try instantiate(bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
     defer destroy(&inst);
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
@@ -4722,7 +4974,8 @@ test "SIMD: v128 in a local, i32x4.add, extract_lane" {
             0x0b,
         }}) },
     });
-    var inst = try instantiate(bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
     defer destroy(&inst);
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
@@ -4750,7 +5003,8 @@ test "SIMD: i32x4.splat -> v128.store -> v128.load -> extract_lane" {
             0x0b,
         }}) },
     });
-    var inst = try instantiate(bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
     defer destroy(&inst);
     const r = try inst.invoke("g", &.{});
     defer std.testing.allocator.free(r);
@@ -4777,7 +5031,8 @@ test "SIMD: f32x4.mul lane-wise" {
                 [_]u8{ 0xfd, 0xe6, 0x01, 0xfd, 0x1f, 0x01, 0x0b }), // f32x4.mul ; f32x4.extract_lane 1 ; end
         }) },
     });
-    var inst = try instantiate(bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
     defer destroy(&inst);
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
@@ -4801,7 +5056,8 @@ test "SIMD: i32x4.eq produces an all-ones lane mask" {
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{&body}) },
     });
-    var inst = try instantiate(bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
     defer destroy(&inst);
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
@@ -4821,7 +5077,8 @@ test "SIMD: i32x4.max_s picks the signed max per lane" {
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{&body}) },
     });
-    var inst = try instantiate(bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
     defer destroy(&inst);
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
@@ -4840,7 +5097,8 @@ test "SIMD: drop of a v128 pops both slots (width-aware)" {
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{&body}) },
     });
-    var inst = try instantiate(bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
     defer destroy(&inst);
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
@@ -4861,7 +5119,8 @@ test "SIMD: select of two v128s picks the whole vector (width-aware)" {
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{&body}) },
     });
-    var inst = try instantiate(bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
     defer destroy(&inst);
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
@@ -4882,7 +5141,8 @@ test "SIMD: typed select (select_t v128) is width-aware" {
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{&body}) },
     });
-    var inst = try instantiate(bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
     defer destroy(&inst);
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
@@ -4902,7 +5162,8 @@ test "SIMD: i8x16.add_sat_s saturates instead of wrapping" {
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{&body}) },
     });
-    var inst = try instantiate(bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
     defer destroy(&inst);
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
@@ -4921,7 +5182,8 @@ test "SIMD: i16x8.extend_low_i8x16_s sign-extends" {
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{&body}) },
     });
-    var inst = try instantiate(bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
     defer destroy(&inst);
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
@@ -4943,7 +5205,8 @@ test "SIMD: a v128 global initializes, gets, and extracts a lane" {
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{&fbody}) },
     });
-    var inst = try instantiate(bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
     defer destroy(&inst);
     const r = try inst.invoke("f", &.{});
     defer std.testing.allocator.free(r);
@@ -4970,7 +5233,8 @@ test "hardening: guest linear memory is zero-initialized, in every build mode" {
     const bytes = try ehModule(a, &.{
         .{ .id = 5, .body = &.{ 0x01, 0x00, 0x02 } },
     });
-    var inst = try instantiate(bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
     defer destroy(&inst);
     const mem = inst.memory0().?.bytes;
     try std.testing.expectEqual(@as(usize, 2 * page_size), mem.len);
@@ -4986,7 +5250,8 @@ test "hardening: a memory minimum past the budget is refused, not allocated" {
     const bytes = try ehModule(a, &.{
         .{ .id = 5, .body = &.{ 0x01, 0x00, 0xff, 0xff, 0x03 } }, // min = 65535 pages ≈ 4 GiB
     });
-    try std.testing.expectError(error.MemoryLimitExceeded, instantiate(bytes));
+    var bad: Instance = undefined;
+    try std.testing.expectError(error.MemoryLimitExceeded, instantiate(&bad, bytes));
 }
 
 test "hardening: popping an empty operand stack traps instead of unwrapping null" {
@@ -5002,7 +5267,8 @@ test "hardening: popping an empty operand stack traps instead of unwrapping null
         .{ .id = 3, .body = &.{ 0x01, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{&fbody}) },
     });
-    var inst = try instantiate(bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
     defer destroy(&inst);
     try std.testing.expectError(error.StackUnderflow, inst.invokeIndex(0, &.{}));
 }
@@ -5018,7 +5284,8 @@ test "hardening: local.get past the local count is rejected at load time" {
         .{ .id = 3, .body = &.{ 0x01, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{&fbody}) },
     });
-    try std.testing.expectError(error.UndefinedLocal, instantiate(bytes));
+    var bad: Instance = undefined;
+    try std.testing.expectError(error.UndefinedLocal, instantiate(&bad, bytes));
 }
 
 test "hardening: global.get of a nonexistent global is rejected at load time" {
@@ -5032,7 +5299,8 @@ test "hardening: global.get of a nonexistent global is rejected at load time" {
         .{ .id = 3, .body = &.{ 0x01, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{&fbody}) },
     });
-    try std.testing.expectError(error.UndefinedGlobal, instantiate(bytes));
+    var bad: Instance = undefined;
+    try std.testing.expectError(error.UndefinedGlobal, instantiate(&bad, bytes));
 }
 
 test "hardening: a branch past the label stack traps instead of underflowing" {
@@ -5048,7 +5316,8 @@ test "hardening: a branch past the label stack traps instead of underflowing" {
         .{ .id = 7, .body = &.{ 0x01, 0x04, 't', 'r', 'a', 'p', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{&fbody}) },
     });
-    var inst = try instantiate(bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
     defer destroy(&inst);
     try std.testing.expectError(error.UndefinedLabel, inst.invoke("trap", &.{}));
 }
@@ -5068,7 +5337,8 @@ test "hardening: struct.set through a bogus (i31) ref traps, not an arbitrary wr
         .{ .id = 7, .body = &.{ 0x01, 0x04, 't', 'r', 'a', 'p', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{&fbody}) },
     });
-    var inst = try instantiate(bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
     defer destroy(&inst);
     try std.testing.expectError(error.GcOutOfBounds, inst.invoke("trap", &.{}));
 }
@@ -5090,7 +5360,8 @@ test "hardening: a call with too few operands traps, not a wild memcpy into loca
         .{ .id = 7, .body = &.{ 0x01, 0x04, 't', 'r', 'a', 'p', 0x00, 0x01 } },
         .{ .id = 10, .body = try ehCode(a, &.{ &body0, &body1 }) },
     });
-    var inst = try instantiate(bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
     defer destroy(&inst);
     try std.testing.expectError(error.StackUnderflow, inst.invoke("trap", &.{}));
 }
@@ -5108,7 +5379,8 @@ test "hardening: a function under-producing its declared results traps, not an O
         .{ .id = 7, .body = &.{ 0x01, 0x04, 't', 'r', 'a', 'p', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{&fbody}) },
     });
-    var inst = try instantiate(bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
     defer destroy(&inst);
     try std.testing.expectError(error.StackUnderflow, inst.invoke("trap", &.{}));
 }
@@ -5126,7 +5398,8 @@ test "hardening: a branch whose arity exceeds the stack traps, not a wild copy" 
         .{ .id = 7, .body = &.{ 0x01, 0x04, 't', 'r', 'a', 'p', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{&fbody}) },
     });
-    var inst = try instantiate(bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
     defer destroy(&inst);
     try std.testing.expectError(error.StackUnderflow, inst.invoke("trap", &.{}));
 }
@@ -5146,7 +5419,8 @@ test "hardening: a branch whose destination base exceeds the stack traps, not an
         .{ .id = 7, .body = &.{ 0x01, 0x04, 't', 'r', 'a', 'p', 0x00, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{&fbody}) },
     });
-    var inst = try instantiate(bytes);
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
     defer destroy(&inst);
     try std.testing.expectError(error.StackUnderflow, inst.invoke("trap", &.{}));
 }
@@ -5163,7 +5437,8 @@ test "hardening: a bare else with no matching if is rejected at load time" {
         .{ .id = 3, .body = &.{ 0x01, 0x00 } },
         .{ .id = 10, .body = try ehCode(a, &.{&fbody}) },
     });
-    try std.testing.expectError(error.UnbalancedControl, instantiate(bytes));
+    var bad: Instance = undefined;
+    try std.testing.expectError(error.UnbalancedControl, instantiate(&bad, bytes));
 }
 
 test "SIMD: fNxM.min/max propagate NaN and match the scalar ops on signed zero" {
@@ -5224,7 +5499,8 @@ test "SIMD: fNxM.min/max propagate NaN and match the scalar ops on signed zero" 
             .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } },
             .{ .id = 10, .body = try ehCode(a, &.{body.items}) },
         });
-        var inst = try instantiate(bytes);
+        var inst: Instance = undefined;
+        try instantiate(&inst, bytes);
         defer destroy(&inst);
         const r = try inst.invoke("f", &.{});
         defer std.testing.allocator.free(r);

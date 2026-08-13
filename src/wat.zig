@@ -3186,7 +3186,8 @@ fn assembleAndRun(src: []const u8, name: []const u8, args: []const interp.Value)
     const a = arena.allocator();
     const bin = try assemble(a, src);
     var m = try Module.decode(a, bin);
-    var inst = try interp.Instance.init(a, &m);
+    var inst: interp.Instance = undefined;
+    try inst.instantiate(a, &m);
     const r = try inst.invoke(name, args);
     return r[0];
 }
@@ -3655,7 +3656,8 @@ test "table.size / table.grow / table.fill" {
         \\  (func (export "get") (param i32) (result externref) (table.get $t (local.get 0))))
     );
     var m = try Module.decode(a, bin);
-    var inst = try interp.Instance.init(a, &m);
+    var inst: interp.Instance = undefined;
+    try inst.instantiate(a, &m);
     try std.testing.expectEqual(@as(i32, 1), interp.asI32((try inst.invoke("size", &.{}))[0]));
     // grow by 2 (init 99) → returns old size 1; size now 3.
     try std.testing.expectEqual(@as(i32, 1), interp.asI32((try inst.invoke("grow", &.{ interp.i32Value(2), interp.i64Value(99) }))[0]));
@@ -3680,7 +3682,8 @@ test "table.get / table.set on an externref table" {
         \\  (func (export "get") (param i32) (result externref) (table.get $t (local.get 0))))
     );
     var m = try Module.decode(a, bin);
-    var inst = try interp.Instance.init(a, &m);
+    var inst: interp.Instance = undefined;
+    try inst.instantiate(a, &m);
     _ = try inst.invoke("set", &.{ interp.i32Value(1), interp.i64Value(42) });
     try std.testing.expectEqual(@as(i64, 42), interp.asI64((try inst.invoke("get", &.{interp.i32Value(1)}))[0]));
     // Slot 0 was never set → null reference sentinel.
@@ -3709,7 +3712,8 @@ test "reads an imported global from the host value" {
         \\  (func (export "get-y") (result i32) (global.get $y)))
     );
     var m = try Module.decode(a, bin);
-    var inst = try interp.Instance.initWithImports(a, &m, .{ .globals = &.{interp.i32Value(777)} });
+    var inst: interp.Instance = undefined;
+    try inst.instantiateWithImports(a, &m, .{ .globals = &.{interp.i32Value(777)} });
     try std.testing.expectEqual(@as(i32, 777), interp.asI32((try inst.invoke("get-x", &.{}))[0]));
     // A defined global's init may read the imported one: 777 + 1.
     try std.testing.expectEqual(@as(i32, 778), interp.asI32((try inst.invoke("get-y", &.{}))[0]));
@@ -3730,7 +3734,8 @@ test "v128 global inits from an imported v128 global (both 64-bit halves)" {
     // Imported v128 = i32x4 { 10, 20, 30, 40 }: low half is lanes 0/1, high 2/3.
     const lo: interp.Value = 10 | (@as(u64, 20) << 32);
     const hi: interp.Value = 30 | (@as(u64, 40) << 32);
-    var inst = try interp.Instance.initWithImports(a, &m, .{ .globals = &.{lo}, .globals_hi = &.{hi} });
+    var inst: interp.Instance = undefined;
+    try inst.instantiateWithImports(a, &m, .{ .globals = &.{lo}, .globals_hi = &.{hi} });
     // The defined global copied both halves — lane 0 from the low, lane 3 from the high.
     try std.testing.expectEqual(@as(i32, 10), interp.asI32((try inst.invoke("lo", &.{}))[0]));
     try std.testing.expectEqual(@as(i32, 40), interp.asI32((try inst.invoke("hi", &.{}))[0]));
@@ -3752,7 +3757,8 @@ test "calls an imported (host) function" {
     );
     var m = try Module.decode(a, bin);
     const imports: interp.Instance.Imports = .{ .funcs = &.{.{ .native = hostAdd }} };
-    var inst = try interp.Instance.initWithImports(a, &m, imports);
+    var inst: interp.Instance = undefined;
+    try inst.instantiateWithImports(a, &m, imports);
     // The imported func occupies index 0; call-add dispatches to the host adder.
     try std.testing.expectEqual(@as(i32, 7), interp.asI32((try inst.invoke("call-add", &.{ interp.i32Value(3), interp.i32Value(4) }))[0]));
 }
@@ -4288,7 +4294,8 @@ test "assembles multi-value function results" {
         \\  (local.get 1) (local.get 0)))
     );
     var m = try Module.decode(a, bin);
-    var inst = try interp.Instance.init(a, &m);
+    var inst: interp.Instance = undefined;
+    try inst.instantiate(a, &m);
     const r = try inst.invoke("swap", &.{ interp.i32Value(3), interp.i32Value(7) });
     try std.testing.expectEqual(@as(usize, 2), r.len);
     try std.testing.expectEqual(@as(i32, 7), interp.asI32(r[0]));
@@ -4873,10 +4880,12 @@ test "a defined table larger than the entry budget is refused at instantiation" 
     // the per-instance entry budget refuses it cleanly instead. (Assembles and
     // decodes fine — the ceiling is an instantiation-time resource limit.)
     var m = try Module.decode(a, try assemble(a, "(module (table 0xffffffff funcref))"));
-    try std.testing.expectError(error.TableLimitExceeded, interp.Instance.init(a, &m));
+    var too_big: interp.Instance = undefined;
+    try std.testing.expectError(error.TableLimitExceeded, too_big.instantiate(a, &m));
     // A modest table instantiates.
     var ok = try Module.decode(a, try assemble(a, "(module (table 10 funcref))"));
-    var inst = try interp.Instance.init(a, &ok);
+    var inst: interp.Instance = undefined;
+    try inst.instantiate(a, &ok);
     inst.deinit();
 }
 
