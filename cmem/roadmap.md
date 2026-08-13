@@ -182,15 +182,17 @@ call-then-return, so the one property the proposal exists to provide (unbounded 
 **A feature can be present, tested, and green while failing at exactly the thing it is for.** Same
 family as the memory64 "COMPLETE" claim above.
 
-### 🎯 REVISED conformance list (2026-08-12) — the 275, now **216** after R1–R5 (and that is PROGRESS)
+### 🎯 REVISED conformance list (2026-08-12) — the 275, now **207** after R1–R5 + R10
 
 Successor to the T-list above, and built differently: every item below is grouped **by cause**, from a
 run with `-Dfailures=600` so all 275 failures were read, not just each file's first. The T-list was
 grouped by first-failure text and mislabelled three of its five items.
 
-⚠️ **The per-item counts below are as-triaged (275 total) and are NOT live.** R1–R5 are done, R6 was
-closed by R3 and R8 by R5 — corpus is **216 failures / 62,333 passing / 1,429 skipped** (measured
-2026-08-13, after R5). Every count below is high; re-measure before trusting any of them
+⚠️ **The per-item counts below are as-triaged (275 total) and are NOT live.** R1–R5 and R10 are done, R6 was
+closed by R3 and R8 by R5 — corpus is **207 failures / 62,737 passing / 1,013 skipped** (measured
+2026-08-13, after R10). **LIVE SPLIT: 98 by design + 109 actionable** (R9 85, R7 18, R10 residue 32
+ is in the skip column not the failure one, legacy EH 2, misc 4). Every count below is high;
+re-measure before trusting any of them
 (`-Dfailures=600`, diff the per-file summary against the previous run).
 
 ⚠️ **THE FAILURE COUNT WENT UP AT R5 AND THAT IS THE PASS WORKING.** 143 → 216 while passes went
@@ -213,8 +215,9 @@ are not defects and there is nothing to fix unless the scope changes:
 the two above, so the "101 by design / 92 actionable" split written on 2026-08-12 was off by two in
 both directions. Corrected here rather than propagated.
 
-**LIVE SPLIT after R5 (2026-08-13): 216 failures = 98 by design + 118 actionable.** The 118 are
-R9 (85) + R7 (18) + R10's non-accept-invalid residue (13) + legacy EH (2).
+**LIVE SPLIT after R10 (2026-08-13): 207 failures = 98 by design + 109 actionable** — R9 **85**,
+R7 **18**, legacy EH **2**, misc **4**. R10's residue (32) now sits in the SKIP column, not the
+failure one: `ref_null` 27 and `id` 5 are files whose first module still will not build.
 
 **The actionable items, most valuable first:**
 
@@ -228,17 +231,53 @@ R9 (85) + R7 (18) + R10's non-accept-invalid residue (13) + legacy EH (2).
 | **R6** 🟡 | GC type remainder + `i31` | 20 → 8 → **0** | ✅ **CLOSED 2026-08-13, and R3 closed it without aiming at it.** R1 took `type-subtyping`/`type-rec`; the last 8 were `i31.wast`, and they were not an i31 defect at all — the file uses `(elem $e i31ref …)` and the assembler's `isRefType` listed only `funcref`/`externref`, so the whole segment was misread as func indices. One shorthand-table fix, `i31.wast` 8 → 0. |
 | **R7** 🟡 | threads | 15 → **18** | `proposals/threads/imports.wast` 13, `memory.wast` 5 (R5 unblocked 3 more). Mostly shared-memory import matching, plus **12 accept-invalids** — the only ones left outside core and the untargeted proposals, so R4's safety argument applies here. ⚠️ **R1 did NOT touch it** despite being "adjacent": those 13 are limits/`shared`-flag matching, not type identity. |
 | **R8** ⚠️ | **UTF-8 name validation is UNVERIFIED** | 0 failures | ✅ **CLOSED 2026-08-13 by R5 — it was the runner's gap, and the answer was "all 176 pass".** `utf8-invalid-encoding.wast` was 0/0/**176 skipped** because every assertion in it is an `assert_malformed (module quote …)`, and the runner could not build a quoted module. Implementing that form ran all 176 and they pass: UTF-8 name validation was genuinely correct, and had simply never been checked. **The question the item asked — "is the skip the runner's gap or ours?" — was the right one, and R5 answers it.** |
-| **R10** 🔴 | **NEW — a handful of first-module failures BLACK OUT ~420 assertions** | 13 failures / **~420 skips** | 🆕 **Opened 2026-08-13 (R5's residue). Highest value left, by a wide margin.** Nine core files fail on their FIRST module and take the whole file into `NoTarget`: `br_table.wast` **161 skipped** (a `TypeMismatch` on `(block (drop (i32.ctz (br_table 0 0 …))))` — br_table in a polymorphic position), `ref_test` **66**, `simd_lane` **51**, `ref_cast` **40**, `ref_null` **32** (`(ref.null exn)` — `abstractHeapCode` has no `exn` entry, a ONE-LINE gap), `br_on_cast`/`br_on_cast_fail` **25 each**, `extern` **16** (`extern.convert_any`/`any.convert_extern` have no mnemonic in the assembler although the decoder and interpreter both implement them — the producer/consumer pair again), `id` (exotic and quoted `$"…"` identifiers). ⚠️ **13 failures, ~420 assertions suppressed** — the R3/R5 shape for the third time: **a single-digit failure count next to a triple-digit skip count is a blackout.** |
+| **R10** 🔴 | **first-module failures that BLACK OUT whole files** | 13 failures / ~420 skips | ✅ **FIXED 2026-08-13 — 416 assertions unblocked for +1.5 KB, the best ratio of the series.** Six causes; see below. Residue: `ref_null` 27 + `id` 5, both diagnosed. *(Original entry: )* **Opened 2026-08-13 (R5's residue). Highest value left, by a wide margin.** Nine core files fail on their FIRST module and take the whole file into `NoTarget`: `br_table.wast` **161 skipped** (a `TypeMismatch` on `(block (drop (i32.ctz (br_table 0 0 …))))` — br_table in a polymorphic position), `ref_test` **66**, `simd_lane` **51**, `ref_cast` **40**, `ref_null` **32** (`(ref.null exn)` — `abstractHeapCode` has no `exn` entry, a ONE-LINE gap), `br_on_cast`/`br_on_cast_fail` **25 each**, `extern` **16** (`extern.convert_any`/`any.convert_extern` have no mnemonic in the assembler although the decoder and interpreter both implement them — the producer/consumer pair again), `id` (exotic and quoted `$"…"` identifiers). ⚠️ **13 failures, ~420 assertions suppressed** — the R3/R5 shape for the third time: **a single-digit failure count next to a triple-digit skip count is a blackout.** |
 | **R9** 🟠 | **NEW — accept-invalid in the TEXT front end** | **85** | 🆕 **Opened 2026-08-13; this is R5's output.** The class R4 closed for the binary decoder, on the surface the corpus could not reach until `(module quote …)` ran. Groups: **35** type-use ordering (`(if (type $sig) (result i32) (param i32) …)` in `func`/`call_indirect`/`return_call_indirect`), **15** token separation (`(data"a")` needs whitespace between a keyword and a string — `token.wast`), **8** SIMD lane rules, and ~27 spread over `table`/`memory`/`type`/`global`/`id`/`start`/`struct`/`block`/`if`/`loop`/`obsolete-keywords`. Same safety argument as R4: `wasm_module_validate` is a shipped C-ABI entry point. |
 
 **Recommended order: ~~R1~~ → ~~R2~~ → ~~R3~~ → ~~R4~~ → ~~R5~~ → R10 → R9 → R7.** ~~R6 closed by
 R3~~, ~~R8 closed by R5~~.
 
-**Do R10 first, and it is not close.** It is 13 failures against ~420 suppressed assertions — the
-best ratio of verification-unblocked to work in the whole list, and at least one of its nine causes
-is a single missing table entry (`exn` in `abstractHeapCode`). R9 is 85 real defects but they are 85
-separate refusals to write; R7 is 18 and self-contained. **The ordering rule this list keeps
-re-learning: rank by assertions unblocked, not by failures closed.**
+**Recommended order after R10: R9 → R7.** R9 is 85 real defects but they are 85 separate refusals to
+write; R7 is 18 and self-contained. **The ordering rule this list keeps re-learning: rank by
+assertions unblocked, not by failures closed** — R10 proved it again, closing 416 for +1.5 KB.
+
+### ✅ R10 IS DONE (2026-08-13) — 416 assertions unblocked, six causes, +1,536 bytes
+
+**Corpus 216 → 207 failures, 62,333 → 62,737 passing, 1,429 → 1,013 skipped.** No file lost a pass.
+The failure count barely moved and 404 more assertions PASS — which is the whole point of the item:
+these were files nobody could run, not files that were failing.
+
+| | cause | unblocked | what it was |
+| --- | --- | --- | --- |
+| C1 | **`extern.convert_any` / `any.convert_extern` existed only in const-exprs** | **172** | `validateConstExpr` and `evalConstExpr` implemented them; there was no `Op`, so a FUNCTION BODY using one was `UnknownInstr`. Opened `ref_test`, `ref_cast`, `br_on_cast`, `br_on_cast_fail`, `extern`. **A feature implemented for one of its two contexts reads as implemented.** |
+| C2 | **`br_table` carried a cross-label rule the spec does not have** | **161** | A "#2f" audit finding added a pairwise subtype check between each label and the default. §3.3.5.9 wants one `[t*]` that is a subtype of every label; after `unreachable` the stack supplies ⊥, so pairwise-incompatible labels are jointly satisfiable. `br_table.wast` names the case `meet-bottom`. **Deleted, not narrowed** — the pops already catch real mismatches in reachable code. |
+| C3 | **`popVals` + `pushVals` is not `push_opds(pop_opds(…))`** | (with C2) | The probe substituted CONCRETE types for the ⊥ it popped, so checking label 0 poisoned label 1's check. Now `popPushVals` puts back exactly what it took. |
+| C4 | **flat `else $l` / `end $l` unconsumed** | **5** | §6.5.2's label repetition. The id was assembled as the next instruction → `UnknownInstr` naming a label, killing `stack.wast`. Now consumed *and checked*, which is the only reason the form exists. |
+| C5 | **`br_on_non_null` popped the label's types wholesale** | **33** | The label's last type is `(ref ht)`; the operand is `(ref null ht)`. Popping `lt` asked the stack for the non-null form and rejected the canonical idiom. Two files. |
+| C6 | **`br_on_cast_fail` carried `src`, not `src \ dst`** | **25** | With a nullable dst a null takes the fall-through, so the branch value is non-null. The subtraction was already written eleven lines below for br_on_cast's fall-through — **the same rule applied to one of the two paths that need it.** |
+
+⚠️ **Two of the six were rules we INVENTED, not rules we missed.** C2's cross-label check came from an
+audit finding whose reasoning was sound — `popVals` genuinely cannot catch a mismatch on a
+polymorphic stack — and whose conclusion was wrong, because on a polymorphic stack there is nothing
+to catch. Its comment even claimed it "never rejects a valid subtyped `br_table`". **A finding can be
+well-argued, land a real check, and still be inventing a requirement**; the corpus is the arbiter, and
+it had been telling us so from behind a `NoTarget` cascade for months. The unit test that encoded the
+invented rule had to be inverted along with the code.
+
+⚠️ **`nullexnref` was modelled as `nullref` (the ANY-family bottom) and R10 made that
+load-bearing.** Once `(ref.null noexn)` decoded to the exn head, the two spellings of one type
+disagreed and `(global $nullexn nullexnref (ref.null noexn))` was a `TypeMismatch` against itself.
+Fixed by mapping `0x74` into the exn family. **Two encodings of one type must land on one value type;
+picking the wrong FAMILY only shows up when both spellings meet.**
+
+**R10's residue (32 assertions), diagnosed and left:**
+- `ref_null.wast` **27** — `(func (result (ref null $t)) (global.get $nullfunc))` where `$nullfunc`
+  is `nullfuncref`. We fold `nullfuncref`/`nullexternref` onto `funcref`/`externref`, which loses
+  their BOTTOM-ness, so they cannot flow into a concrete `(ref null $t)`. The real fix is distinct
+  bottom types in `types.zig` plus `subtypeOf` support — a lattice change with wide blast radius,
+  and its own item rather than an R10 footnote.
+- `id.wast` **5** — exotic identifiers (`$!?@#a$%^&*b-+_.:9'`|/\<=>~`) and quoted `$"…"` ids, a
+  lexer gap in `sexpr.zig`.
 
 ### ✅ R5 IS DONE (2026-08-13) — 978 suppressed assertions unblocked, and the item was 50× bigger than filed
 

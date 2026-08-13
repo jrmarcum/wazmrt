@@ -81,9 +81,9 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
   validation**, which is strong evidence the type-checker is correct across real, deeply-nested
   control flow (not just the simple `wasm_mod` set).
 
-## 📊 CURRENT spec-testsuite score (measured 2026-08-13, after R1–R5)
+## 📊 CURRENT spec-testsuite score (measured 2026-08-13, after R1–R5 + R10)
 
-**284 files — 62,333 assertions passed / 216 failed / 1,429 skipped.** This is the number to quote;
+**284 files — 62,737 assertions passed / 207 failed / 1,013 skipped.** This is the number to quote;
 every snapshot below it is older and kept as history.
 
 ⚠️ **The failed count ROSE from 143 at R4 and that is an improvement.** R5 implemented
@@ -103,15 +103,18 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
 - **Failure messages carry the source LINE** of the `.wast` command that produced them (`L342: …`),
   added 2026-08-13 via `sexpr.parseAllWithLines`. Before that, matching 35 failures back to their
   assertions was hand work.
-- **216 is not 216 defects: 98 are BY DESIGN** (`custom-descriptors` 84, `custom-page-sizes` 12,
-  `wide-arithmetic` 2 — proposals wazmrt does not target, refused honestly) and **118 actionable**,
+- **207 is not 207 defects: 98 are BY DESIGN** (`custom-descriptors` 84, `custom-page-sizes` 12,
+  `wide-arithmetic` 2 — proposals wazmrt does not target, refused honestly) and **109 actionable**,
   itemised as the R-list in `roadmap.md`: **R9** 85 (text-front-end accept-invalid), **R7** 18
-  (threads), **R10** 13, legacy EH 2. R1–R5 are done; R6 was closed by R3 and R8 by R5.
-- 🔴 **The item to do next is R10, and it is not close: 13 failures suppressing ~420 assertions.**
-  Nine core files fail on their FIRST module and take the rest of the file into `NoTarget` —
-  `br_table.wast` alone is 161 unrun assertions, and one cause is a single missing `exn` entry in
-  the assembler's `abstractHeapCode`. **Rank remaining work by assertions unblocked, not by failures
-  closed**; this list has now re-learned that at R3, R5 and R10.
+  (threads), legacy EH 2. R1–R5 and R10 are done; R6 was closed by R3 and R8 by R5.
+- ✅ **R10 closed 416 of those for +1,536 bytes** — the best ratio in the series, and the clearest
+  demonstration of the rule: **rank remaining work by assertions unblocked, not by failures closed.**
+  Its residue is 32 assertions still behind two unbuildable first modules (`ref_null` 27, `id` 5),
+  both diagnosed in `roadmap.md`.
+- ⚠️ **Two of R10's six causes were rules we INVENTED**, not rules we missed — `br_table`'s
+  cross-label subtype check came from an audit finding with sound reasoning and a wrong conclusion,
+  and its unit test had to be inverted along with the code. **When a check you added is what the
+  corpus trips over, suspect the check.**
 - ⚠️ **"ACCEPT-INVALID IN CORE SPEC FILES IS ZERO" (recorded at R4) IS NO LONGER TRUE, and it was
   true when written.** R4 closed every accept-invalid the corpus could *see*. R5 implemented
   `(module quote …)`, the corpus gained sight of the TEXT front-end, and 88 more appeared in core
@@ -141,9 +144,9 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
   *exactly* its ceiling; the file was two builds old. **An exactly-zero delta is a timestamp check
   waiting to happen.**
 
-**Unit tests: 593** (`zig build test --summary all`, 2026-08-13 after R5) — 589 pass / 4 skip from
-this repo's own `D:` cwd, **593/593 from an NTFS cwd**, which is the number to quote. R3 added 7,
-R4 4 and R5 3; each core test raises the printed total by two because the C-ABI target re-runs the
+**Unit tests: 603** (`zig build test --summary all`, 2026-08-13 after R10) — 599 pass / 4 skip from
+this repo's own `D:` cwd, **603/603 from an NTFS cwd**, which is the number to quote. R3 added 7,
+R4 4, R5 3 and R10 5; each core test raises the printed total by two because the C-ABI target re-runs the
 core suite.
 
 ⚠️ **R5's inversion check caught a test that tested the RULE but not that the rule is CONSULTED.**

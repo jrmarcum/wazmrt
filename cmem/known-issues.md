@@ -418,6 +418,59 @@ leave entries in another module's table" test.
 against the restored old behaviour before being kept** — the funcref-in-a-table one, and the
 funcref-in-a-global one, which reproduced `elem.wast`'s `CallStackExhausted` symptom exactly.
 
+## 🚧 ✅ First-module failures that blacked out whole files — R10, FIXED 2026-08-13 (416 assertions)
+
+Nine core spec files failed on their FIRST module and took every remaining assertion into
+`NoTarget`. Thirteen failures, ~420 suppressed assertions, and +1,536 bytes to fix — the best ratio
+of the series. Programme state is in `roadmap.md` → "R10 IS DONE"; this entry is the defect record.
+
+**C1 — `extern.convert_any` / `any.convert_extern` existed only in constant expressions (172).**
+`validateConstExpr` and `evalConstExpr` both implemented `0xFB 0x1a`/`0x1b`; there was no `Op`, so a
+function BODY using one was `UnknownInstr` at the assembler and undecodable after it. `ref_test`,
+`ref_cast`, `br_on_cast`, `br_on_cast_fail` and `extern` all open with such a module. **A feature
+implemented for one of its two contexts reads as implemented.** The internal tags went in the
+unassigned `0x16`/`0x17` slots, so the raw-byte guard is now three ranges.
+
+**C2 — `br_table` carried a cross-label rule the spec does not have (161).** A "#2f" audit finding
+added a pairwise subtype check between each label and the default, reasoning that `popVals` cannot
+catch a mismatch once the stack is polymorphic. True, and beside the point: §3.3.5.9 wants one `[t*]`
+that is a subtype of every label's type, and after `unreachable` the stack supplies ⊥, which is a
+subtype of everything. `br_table.wast` names the case `meet-bottom` and requires it ACCEPTED.
+
+- ⚠️ **Deleted, not narrowed.** In reachable code the pops already catch a genuine mismatch, because
+  the first label leaves a concrete type the next label's pop must satisfy. What remains is the
+  Appendix algorithm verbatim: arity equality plus `push_opds(pop_opds(label_types(l)))`.
+- ⚠️ **A unit test encoded the invented rule** and had to be inverted with the code. Its comment
+  claimed the check "never rejects a valid subtyped `br_table`".
+
+**C3 — `popVals` + `pushVals` is not `push_opds(pop_opds(…))`.** The probe pops ⊥ and pushes back
+CONCRETE declared types, so probing label 0 poisoned label 1's probe — `meet-bottom` then failed
+"expected f64, found f32" for a second, different reason. `popPushVals` puts back what it took.
+
+**C4 — flat `else $l` / `end $l` unconsumed (5).** §6.5.2 lets a block's label be repeated at its
+`else`/`end` as a redundancy check. Unconsumed, the id was assembled as the next instruction and came
+back `UnknownInstr` naming a label, killing `stack.wast`. It is now consumed *and verified against
+the open block*, which is the only reason the form exists.
+
+**C5 — `br_on_non_null` popped the label's types wholesale (33).** The label's last type is the
+non-null `(ref ht)` and the operand is `(ref null ht)`, so popping `lt` asked the stack for the
+non-null form — "expected anyref_nn, found anyref" — and rejected the canonical idiom the
+instruction exists for. Two files.
+
+**C6 — `br_on_cast_fail` carried `src` instead of `src \ dst` (25).** With a NULLABLE target a null
+matches and takes the fall-through, so the value reaching the label is non-null. The subtraction was
+already implemented eleven lines below, for br_on_cast's fall-through — **the same rule applied to
+one of the two paths that need it.** `br_on_cast_fail.wast` names the case `null-diff`.
+
+**Also fixed: `nullexnref` was modelled as `nullref`**, the ANY-family bottom. Harmless until
+`(ref.null noexn)` started decoding to the exn head, at which point the two spellings of one type
+disagreed and `(global $nullexn nullexnref (ref.null noexn))` was a `TypeMismatch` against itself.
+
+**Residue (32 assertions), diagnosed and left:** `ref_null.wast` 27 needs distinct BOTTOM types —
+we fold `nullfuncref`/`nullexternref` onto `funcref`/`externref`, losing the bottom-ness that lets
+them flow into a concrete `(ref null $t)`, and fixing it is a `types.zig` lattice change with wide
+blast radius. `id.wast` 5 is a lexer gap on exotic and quoted identifiers.
+
 ## 📜 ✅ The runner could not build a quoted module — R5, FIXED 2026-08-13 (1,291 assertions)
 
 A single `return error.BadCommand` in `wast.zig`'s `moduleBinary`, commented

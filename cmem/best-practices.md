@@ -248,6 +248,24 @@ evidence a module is invalid. `assert_invalid`, `assert_trap` and `assert_unlink
 
 ## 5. Recording what you found
 
+**A finding can be well-argued, land a real check, and still be INVENTING a requirement.** R10 deleted
+a `br_table` cross-label subtype check whose reasoning was sound — `popVals` genuinely cannot catch a
+mismatch on a polymorphic stack — and whose conclusion was wrong, because on a polymorphic stack
+there is nothing to catch. Its comment claimed it "never rejects a valid subtyped `br_table`"; it
+rejected the case the spec suite names `meet-bottom` and blacked out 161 assertions. **When the
+corpus trips over a check you added, suspect the check** — and go to the spec's algorithm, not to the
+finding's argument. — R10, `roadmap.md`
+
+**A feature implemented for ONE of its two contexts reads as implemented.** `extern.convert_any` /
+`any.convert_extern` existed in the constant-expression evaluator and nowhere else, so a function
+BODY using one was `UnknownInstr` — five spec files open with such a module. When an instruction is
+valid in both const-exprs and bodies, check both. — R10, `known-issues.md`
+
+**Two encodings of one type must land on one value type, and the FAMILY is the part that bites.**
+`nullexnref` was modelled as `nullref` (the any-family bottom) while `(ref.null noexn)` decoded to the
+exn head, so a global declaring one and initialising with the other was a `TypeMismatch` against
+itself. The disagreement is invisible until both spellings meet. — R10, `roadmap.md`
+
 **Record findings that were WRONG, so they are not "fixed" again.** At least two audit findings have
 been retracted after being verified false, and one carries an inline `Don't "fix" it again` comment at
 the site. A retraction is as valuable as a finding. — `testing.md`, `roadmap.md`, `validate.zig`
