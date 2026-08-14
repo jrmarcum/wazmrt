@@ -302,6 +302,26 @@ per-append-site check structurally cannot see `(import "" "" (memory $foo 1))` b
 because the script and the modules inside it go through one lexer. Budget for that: the fix pulled a
 separately-filed item into the same pass. — R9, `text-toolchain.md`
 
+**A DOC COMMENT'S SUBJECT IS NOT THE FIELD'S NAME — READ THE STRUCT, NOT THE PROSE ABOVE IT.**
+Advice sent to the wasmrt team named `Pools.type_canon` as their store-wide type registry. No such
+field exists: the registry is `Pools.types`, and `Module::type_canon` is a per-Module `Vec<u32>` that
+cannot answer a cross-module question — the very thing the reported bug was about. The name was
+lifted from the first line of `TypeRegistry`'s doc comment, which *contrasts itself against*
+`type_canon`. **Advice with a wrong mechanism is worse than no advice**, because the recipient has to
+disprove it. — the GC report, `wasmrt/cmem/known-issues.md`
+
+⚠️ **THAT WAS THE THIRD READ-NOT-VERIFY ERROR IN ONE SESSION**, and the pattern is the lesson: a CLI's
+`valid wasm v1` header read as a verdict; a benchmark's missing `--` read as a competitor's defect;
+a comment's subject read as a field name. **Each was cheap to check and expensive to propagate.**
+When a claim will leave this repo — a commit message, a cross-project report, a number in a README —
+verify it against the artifact, not against something that talks about the artifact.
+
+**MEASURE THE FLOOR BEFORE ATTRIBUTING A DIFFERENCE.** wazmrt beat wasmtime by ~50 ms end to end, and
+banking that as engine speed would have been natural. `--version` — no wasm work at all — costs
+30 ms vs 76 ms, so ~46 ms of the gap exists before either engine starts; the whole wasm pipeline on a
+2 MB module is under 3 ms. The advantage is real and is mostly *binary load time*. A benchmark that
+does not measure its own floor cannot tell you which component it measured. — Track 3, `roadmap.md`
+
 **A RECORDED PREDICTION THAT THE MEASUREMENT REFUTES IS WORTH MORE THAN ONE QUIETLY DELETED.** The
 roadmap predicted a large module would widen wazmrt's startup lead over Cranelift. A 210× size ladder
 (9 KB → 1.97 MB) showed the opposite: nothing moves, so the advantage is FLAT in module size, not

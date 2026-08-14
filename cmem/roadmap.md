@@ -924,6 +924,62 @@ handled differently by wasmtime. Worth checking into wasmtk (whose
 exactly, it should already see this) and into wasmrt. **The differential check found this on its
 first run, which is the argument for having no privileged oracle.**
 
+### ⚠️ THE SPAWN FLOOR (2026-08-14) — the CLI benchmark is ~90% process spawn, and that reframes the claim
+
+Measured on the same loaded box, 25 reps, median:
+
+| | wazmrt | wasmtime |
+| --- | --- | --- |
+| `--version` — **no wasm work at all** | **30.32 ms** | **76.47 ms** |
+| the 1.97 MB module, end to end | 33.26 ms | 85.83 ms |
+| **⇒ all wasm work (decode+validate+instantiate+run)** | **~2.9 ms** | **~9.4 ms** |
+
+🎯 **The end-to-end advantage is mostly "a smaller binary loads faster", not "a faster engine".**
+Spawning wazmrt costs 30 ms before a byte of wasm is touched; the entire wasm pipeline on a 2 MB
+module is under 3 ms. Both facts are real, and the *first* is what a dev loop actually experiences —
+but they are **different claims**, and the CLI benchmark cannot separate them. It is also why the
+size ladder is flat: the variable part is ~3 ms inside a ~33 ms measurement.
+
+This does not weaken the position — it relocates it. The project's thesis has always been that
+**footprint is the differentiator**, and this is that thesis showing up in the startup number rather
+than a separate advantage. It does mean the honest phrasing is *"a wazmrt invocation costs ~2.5× less
+end to end, most of it because the binary is a fraction of the size"* — not *"the engine decodes
+2.5× faster"*, which is a claim this measurement never made and which someone would check.
+
+⚠️ **Measure the floor before attributing a difference.** Two runtimes differed by ~50 ms and it
+would have been natural to bank that as engine speed; ~46 ms of it is there before either engine
+starts.
+
+**This is exactly what the remaining Track 3 item is for.**
+
+### 📋 SCOPED, NOT STARTED — Track 3's last item: the in-process breakdown
+
+**The question it answers, which nothing else can:** of wazmrt's ~2.9 ms of wasm work on a 2 MB
+module, how much is decode, how much validate, how much instantiate — and how does each compare to
+wasmtime doing the same? The CLI harness cannot tell you, because ~90% of what it times is spawn.
+
+**Shape.** Two harnesses reporting the same three phases in one process, N reps, medians:
+
+| side | how | why |
+| --- | --- | --- |
+| wazmrt | extend `zig build bench` — `Module.decode` / `validate` / `instantiate` are already separate calls | no new dependency; the phases exist as functions already |
+| wasmtime | a small Rust bin using the `wasmtime` crate: `Module::from_binary` (decode+compile) then `Instance::new` | cargo is already a project dependency via wasmrt; the C SDK would have to be fetched per triplet |
+| wasmrt | its own crate, same three phases | it TIES wazmrt end to end, so the interesting comparison is where the ~3 ms goes |
+
+⚠️ **The phases do not line up, and pretending they do is the trap.** wasmtime's `Module::new`
+*compiles*; wazmrt's `decode` builds an IR and `validate` type-checks. There is no honest
+phase-by-phase row — the comparable quantity is **total time from bytes to a callable instance**,
+with each runtime's internal split reported *beside* it rather than aligned against it. Say that in
+the output, the way the current harness states its scope.
+
+⚠️ **Report the floor with the result**, per the entry above. An in-process number without the
+process-spawn context invites exactly the misattribution this section documents.
+
+**Estimated size:** small on the wazmrt side (the calls are already separate); the Rust harness is a
+~50-line `main.rs` plus a `Cargo.toml`. The judgement call worth making deliberately is whether a
+cargo build belongs in this repo's `zig build` graph at all, or whether the Rust side lives in
+`bench/` as an opt-in step like `-Drust-gate`.
+
 ### ✅ TRACK 2c IS DONE (2026-08-14) — the embed artifact is optional-weight now
 
 **`-Dwat=false` / `-Dwasi=false` compile the WAT assembler / the WASI host out of the EMBED

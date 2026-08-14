@@ -99,13 +99,22 @@ wasmtk's `wasm_mod` corpus (12 invocations × 9 reps, ReleaseFast, x86_64-window
 
 wasmtime is measured in its **fast-start** configurations as well as its default,
 because beating a compiler in its slowest-starting mode would prove nothing. All
-three land within 2% of each other here: at this module size the cost is runtime
-start-up, not compilation.
+three land within 2% of each other, and that holds from 9 KB to a 1.97 MB module —
+a 210× range over which none of the numbers move.
 
-This is the cost of *one invocation*, which is what a dev loop pays. It is not
-steady-state throughput — a JIT wins hot loops — and the corpus is small modules,
-where a compiler has little to compile. Every result is checked against the
-expected value; a wrong answer is disqualified rather than timed.
+**What this is, precisely.** It is the cost of *one invocation*, which is what a
+dev loop pays. It is **not** engine speed: `wazmrt --version`, which touches no
+wasm at all, costs 30 ms of the 33 ms, so most of the advantage is that a ~1 MB
+binary loads faster than a large one. The entire wasm pipeline on that 2 MB module
+is under 3 ms. Both facts are real and the first is what you feel — but the honest
+phrasing is *"an invocation costs less, mostly because the binary is small"*, not
+*"the engine decodes faster"*.
+
+It is also not steady-state throughput; a JIT wins hot loops. Every result is
+checked, and in `-Dmode=start` no runtime is treated as the oracle — they must
+agree with each other, and a disagreement is reported rather than adjudicated.
+Runtimes are sampled once per repetition, interleaved, so machine drift cancels
+instead of being attributed to one of them.
 
 ### Slimming the embedded library
 
