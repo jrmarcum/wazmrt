@@ -411,6 +411,11 @@ const InstanceSlot = struct {
     /// only say `HostTrap` — it cannot carry the host's message. Consumed by whoever reports the
     /// failure, so the embedder gets its own trap back instead of a generic one.
     pending_trap: ?*Trap = null,
+    /// The store this slot belongs to. Needed wherever a value crosses the ABI:
+    /// references are HANDLES issued by that store's table, so converting one
+    /// requires knowing which store to ask. Set at creation; the store outlives
+    /// its slots.
+    store: *Store = undefined,
 
     /// Take the host trap if there is one, else make one from the interpreter's error.
     fn takeTrap(self: *InstanceSlot, err: anyerror) ?*Trap {
@@ -460,6 +465,28 @@ pub const Store = struct {
     funcs: std.ArrayList(Ref) = .empty,
     memories: std.ArrayList(Ref) = .empty,
     globals: std.ArrayList(Ref) = .empty,
+    /// Interned INTERNAL reference values the host has been shown, so a
+    /// `funcref`/`externref` crossing the ABI is a HANDLE like every other value
+    /// kind here — not the interpreter's raw encoding.
+    ///
+    /// ⚠️ **This was a raw pass-through, and it was the last hole in the
+    /// value-handle model.** Instances, funcs, memories and globals have been
+    /// `(store_id << 32) | (slot+1)`, validated by lookup, since ABI 2 — the
+    /// header's whole premise is dropping the object model so the bug class is
+    /// *inexpressible rather than policed*. References were the one kind still
+    /// handed over raw, which meant the interpreter's private encoding leaked
+    /// across the boundary: bit 63 marks an i31, bit 62 a host reference,
+    /// all-ones is null, and a structured high half is an (owner, index) pair.
+    /// A host that passed back exactly what it got was fine; nothing enforced
+    /// that, and there was no `is_valid` for refs as there is for the rest. **An
+    /// undocumented forbidden value space is an interop bug before it is a
+    /// security one.**
+    ///
+    /// Boxing is complete here precisely because the ABI has **no API for a host
+    /// to CREATE a reference** — the host only ever sees handles this table
+    /// issued, so an inbound value is always a lookup and an unknown one is
+    /// refused rather than guessed.
+    ext_refs: std.ArrayList(interp.Value) = .empty,
 
     /// Does `id` name a live slot in this store? The whole point of value handles: validity is
     /// *decided here*, never trusted from the caller.
@@ -478,7 +505,43 @@ pub const Store = struct {
     fn instanceOf(self: *Store, r: Ref) *InstanceSlot {
         return self.instances.items[r.inst];
     }
+
+    /// Hand the host a HANDLE for an internal reference value.
+    ///
+    /// Null maps to handle 0, which is invalid-by-construction everywhere else
+    /// in this ABI (slot 0 is never used) — so a `memset`-zeroed `wazmrt_val_t`
+    /// is a null reference rather than a wild one, the same trick the other
+    /// handle kinds already play.
+    ///
+    /// Interned by value, so the same reference always yields the same handle:
+    /// a host comparing two handles for equality gets the answer it expects, and
+    /// returning one reference in a loop does not grow the table.
+    fn boxRef(self: *Store, v: interp.Value) ?u64 {
+        if (v == interp.null_ref) return 0;
+        for (self.ext_refs.items, 0..) |e, i| {
+            if (e == v) return Handle.make(self.id, @intCast(i));
+        }
+        // Bounded like every other guest-driven table here (`max_gc_objects`,
+        // `exn_store`): a guest that returns a fresh reference per call must not
+        // be able to grow host memory without limit.
+        if (self.ext_refs.items.len >= max_ext_refs) return null;
+        self.ext_refs.append(alloc, v) catch return null;
+        return Handle.make(self.id, @intCast(self.ext_refs.items.len - 1));
+    }
+
+    /// The internal reference value a host handle names, or null if it names
+    /// none — a handle from another store, a stale one, or a value the host
+    /// invented. **Refused, never reinterpreted.**
+    fn unboxRef(self: *const Store, h: u64) ?interp.Value {
+        if (h == 0) return interp.null_ref;
+        const i = self.resolve(h, self.ext_refs.items.len) orelse return null;
+        return self.ext_refs.items[i];
+    }
 };
+
+/// Ceiling on distinct references handed across the C ABI per store. Generous —
+/// a real embedder holds a handful — and finite, which is the point.
+const max_ext_refs: usize = 1 << 20;
 
 var next_store_id: std.atomic.Value(u64) = .init(1);
 
@@ -522,6 +585,7 @@ export fn wazmrt_store_delete(s: ?*Store) void {
     store.funcs.deinit(alloc);
     store.memories.deinit(alloc);
     store.globals.deinit(alloc);
+    store.ext_refs.deinit(alloc);
     alloc.destroy(store);
 }
 
@@ -544,6 +608,11 @@ export fn wazmrt_memory_is_valid(s: ?*const Store, h: MemoryHandle) bool {
     const store = s orelse return false;
     return store.owns(h.id, store.memories.items.len);
 }
+export fn wazmrt_ref_is_valid(s: ?*const Store, ref: u64) bool {
+    const st = s orelse return false;
+    return st.unboxRef(ref) != null;
+}
+
 export fn wazmrt_global_is_valid(s: ?*const Store, h: GlobalHandle) bool {
     const store = s orelse return false;
     return store.owns(h.id, store.globals.items.len);
@@ -866,7 +935,7 @@ fn valKindOf(vt: root.types.ValType) ?ValKind {
 
 /// Write one value into `slots`, returning how many it consumed. Null if the kind disagrees with
 /// the declared parameter type — a mismatch is refused, never reinterpreted.
-fn valToSlots(v: Val, want: root.types.ValType, slots: []interp.Value) ?u32 {
+fn valToSlots(st: *Store, v: Val, want: root.types.ValType, slots: []interp.Value) ?u32 {
     const k = valKindOf(want) orelse return null;
     if (v.kind != k) return null;
     switch (want) {
@@ -874,7 +943,7 @@ fn valToSlots(v: Val, want: root.types.ValType, slots: []interp.Value) ?u32 {
         .i64 => slots[0] = interp.i64Value(v.of.i64),
         .f32 => slots[0] = interp.f32Value(v.of.f32),
         .f64 => slots[0] = interp.f64Value(v.of.f64),
-        .funcref, .externref => slots[0] = v.of.ref,
+        .funcref, .externref => slots[0] = st.unboxRef(v.of.ref) orelse return null,
         .v128 => {
             // Low half first, matching how the interpreter stacks a vector.
             slots[0] = std.mem.readInt(u64, v.of.v128[0..8], .little);
@@ -885,7 +954,7 @@ fn valToSlots(v: Val, want: root.types.ValType, slots: []interp.Value) ?u32 {
     return interp.slotWidth(want);
 }
 
-fn slotsToVal(slots: []const interp.Value, got: root.types.ValType, out: *Val) ?u32 {
+fn slotsToVal(st: *Store, slots: []const interp.Value, got: root.types.ValType, out: *Val) ?u32 {
     const k = valKindOf(got) orelse return null;
     out.kind = k;
     switch (got) {
@@ -893,7 +962,7 @@ fn slotsToVal(slots: []const interp.Value, got: root.types.ValType, out: *Val) ?
         .i64 => out.of.i64 = interp.asI64(slots[0]),
         .f32 => out.of.f32 = interp.asF32(slots[0]),
         .f64 => out.of.f64 = interp.asF64(slots[0]),
-        .funcref, .externref => out.of.ref = slots[0],
+        .funcref, .externref => out.of.ref = st.boxRef(slots[0]) orelse return null,
         .v128 => {
             std.mem.writeInt(u64, out.of.v128[0..8], slots[0], .little);
             std.mem.writeInt(u64, out.of.v128[8..16], slots[1], .little);
@@ -1481,7 +1550,7 @@ fn hostTrampoline(ctx: *anyopaque, args: []const interp.Value, results: []interp
             t.slot.pending_trap = wazmrt_trap_new("host call: argument slots exhausted");
             return false;
         }
-        _ = slotsToVal(args[si..], vt, &in[i]) orelse {
+        _ = slotsToVal(t.slot.store, args[si..], vt, &in[i]) orelse {
             t.slot.pending_trap = wazmrt_trap_new("host call: argument type cannot cross the ABI");
             return false;
         };
@@ -1504,7 +1573,7 @@ fn hostTrampoline(ctx: *anyopaque, args: []const interp.Value, results: []interp
             t.slot.pending_trap = wazmrt_trap_new("host call: result slots exhausted");
             return false;
         }
-        _ = valToSlots(out[i], vt, results[oi..]) orelse {
+        _ = valToSlots(t.slot.store, out[i], vt, results[oi..]) orelse {
             t.slot.pending_trap = wazmrt_trap_new("host call: result has the wrong type");
             return false;
         };
@@ -1703,7 +1772,7 @@ fn resolveImports(
                     .instance => return errorf("import '{s}'.'{s}': namespace entry used as a value", .{ im.module, im.name }),
                 };
                 var two: [2]interp.Value = .{ 0, 0 };
-                _ = valToSlots(v, want.content, &two) orelse
+                _ = valToSlots(store, v, want.content, &two) orelse
                     return errorf("import '{s}'.'{s}': global value has the wrong type", .{ im.module, im.name });
                 // A host-defined constant needs a cell of its own, on the instance's arena so
                 // it outlives every read the guest makes through it.
@@ -1754,7 +1823,7 @@ export fn wazmrt_linker_instantiate(
     // The slot is allocated FIRST so the arena has its final address before `allocator()` is
     // taken from it — see the warning on `InstanceSlot`.
     const slot = alloc.create(InstanceSlot) catch return errorf("out of memory", .{});
-    slot.* = .{ .arena = std.heap.ArenaAllocator.init(alloc), .inst = undefined, .module = cm };
+    slot.* = .{ .arena = std.heap.ArenaAllocator.init(alloc), .inst = undefined, .module = cm, .store = store };
     const sa = slot.arena.allocator();
 
     var imports: interp.Instance.Imports = .{};
@@ -1986,7 +2055,7 @@ export fn wazmrt_func_call(
     var si: usize = 0;
     for (ft.params, 0..) |vt, i| {
         const v = (args orelse return errorf("wazmrt_func_call: args is NULL", .{}))[i];
-        const w = valToSlots(v, vt, slots[si..]) orelse
+        const w = valToSlots(slot.store, v, vt, slots[si..]) orelse
             return errorf("wazmrt_func_call: argument {d} has the wrong type", .{i});
         si += w;
     }
@@ -2003,7 +2072,7 @@ export fn wazmrt_func_call(
         for (ft.results, 0..) |vt, i| {
             const w = interp.slotWidth(vt);
             if (gi + w > got.len) return errorf("wazmrt_func_call: result {d} is missing", .{i});
-            _ = slotsToVal(got[gi..], vt, &dst[i]) orelse
+            _ = slotsToVal(slot.store, got[gi..], vt, &dst[i]) orelse
                 return errorf("wazmrt_func_call: result {d} has a type this ABI cannot carry", .{i});
             gi += w;
         }
@@ -2082,10 +2151,10 @@ export fn wazmrt_global_get(s: ?*const Store, h: GlobalHandle, out: ?*Val) bool 
     // A v128 global keeps its high half in a parallel array, so it cannot be read as one slot.
     if (vt == .v128) {
         var two = [2]interp.Value{ slot.inst.globals[r.index].value, slot.inst.globals[r.index].hi };
-        return slotsToVal(&two, vt, out_p) != null;
+        return slotsToVal(slot.store, &two, vt, out_p) != null;
     }
     const one = [1]interp.Value{slot.inst.globals[r.index].value};
-    return slotsToVal(&one, vt, out_p) != null;
+    return slotsToVal(slot.store, &one, vt, out_p) != null;
 }
 
 // =========================================================================================

@@ -204,6 +204,72 @@ int main(void) {
         wazmrt_bytes_delete(bin, bin_len);
     }
 
+    /* ---- Reference values are HANDLES, checked by the store that issued them.
+     *
+     * This is the surface the .wast corpus can never reach — the R1 lesson, which
+     * cost this project a real defect in `define_instance` that no conformance
+     * number could have found. A guest returns an externref; the host gets a
+     * handle, hands it straight back, and must get the SAME reference. A handle
+     * the store never issued must be refused rather than reinterpreted: before
+     * boxing, `of.ref` was the interpreter's raw encoding, so an invented value
+     * could be read as a GC object, an i31, or null depending on its bits. */
+    {
+        static const char kRefWat[] =
+            "(module (func (export \"id\") (param externref) (result externref) (local.get 0))"
+            "        (func (export \"mk\") (result externref) (ref.null extern)))";
+        uint8_t *rb = NULL; size_t rb_len = 0;
+        wazmrt_error_t *e2 = wazmrt_wat_to_wasm(kRefWat, strlen(kRefWat), &rb, &rb_len);
+        check(e2 == NULL, "ref module assembles");
+        if (e2) wazmrt_error_delete(e2);
+        if (rb) {
+            wazmrt_module_t *rm = NULL;
+            e2 = wazmrt_module_new(engine, rb, rb_len, &rm);
+            check(e2 == NULL && rm != NULL, "ref module loads");
+            if (e2) wazmrt_error_delete(e2);
+            if (rm) {
+                wazmrt_instance_t ri; wazmrt_trap_t *rt = NULL;
+                e2 = wazmrt_linker_instantiate(linker, store, rm, &ri, &rt);
+                check(e2 == NULL, "ref module instantiates");
+                if (e2) wazmrt_error_delete(e2);
+                else {
+                    /* A null reference is handle 0 — so a zeroed wazmrt_val_t is
+                     * null by construction, and 0 is always a valid handle. */
+                    wazmrt_func_t mk, id;
+                    wazmrt_val_t out = {0}, in = {0};
+                    if (wazmrt_instance_get_func(store, ri, "mk", &mk) &&
+                        wazmrt_instance_get_func(store, ri, "id", &id)) {
+                        e2 = wazmrt_func_call(store, mk, NULL, 0, &out, 1, &rt);
+                        check(e2 == NULL && rt == NULL, "mk() returns");
+                        if (e2) wazmrt_error_delete(e2);
+                        check(out.kind == WAZMRT_EXTERNREF, "mk() returns an externref");
+                        check(out.of.ref == 0, "a null reference is handle 0");
+                        check(wazmrt_ref_is_valid(store, out.of.ref), "handle 0 is valid");
+
+                        /* Round trip: what the host passes back must come back. */
+                        in = out;
+                        wazmrt_val_t back = {0};
+                        e2 = wazmrt_func_call(store, id, &in, 1, &back, 1, &rt);
+                        check(e2 == NULL && rt == NULL, "id(ref) returns");
+                        if (e2) wazmrt_error_delete(e2);
+                        check(back.of.ref == in.of.ref, "a reference round-trips unchanged");
+
+                        /* An invented handle is REFUSED, not reinterpreted. */
+                        check(!wazmrt_ref_is_valid(store, 0xDEADBEEFu),
+                              "an invented reference handle is invalid");
+                        wazmrt_val_t bogus = {0};
+                        bogus.kind = WAZMRT_EXTERNREF;
+                        bogus.of.ref = 0xDEADBEEFu;
+                        e2 = wazmrt_func_call(store, id, &bogus, 1, &back, 1, &rt);
+                        check(e2 != NULL, "calling with an invented reference is refused");
+                        if (e2) wazmrt_error_delete(e2);
+                    }
+                }
+                wazmrt_module_delete(rm);
+            }
+            wazmrt_bytes_delete(rb, rb_len);
+        }
+    }
+
     wazmrt_functype_delete(ft);
     wazmrt_linker_delete(linker);
     wazmrt_store_delete(store);

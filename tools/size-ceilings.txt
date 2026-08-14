@@ -290,6 +290,21 @@
 # min** — nothing. **Sequential A/B on a loaded box is not a measurement**; it nearly reversed a
 # correct design decision. Interleave, or do not compare.
 
+# RAISED 2026-08-14 (C-ABI reference BOXING — the last hole in the value-handle model).
+#
+#   artifact       before        after      share
+#   wazmrt.exe    964,608      964,608         +0
+#   wazmrt.lib  1,028,892    1,029,720       +828
+#   wazmrt.dll    887,808      888,832     +1,024
+#
+# The exe is unchanged: the CLI never crosses a reference through the C ABI. The cost lands
+# exactly where the feature does, which is the shape a per-surface change should have.
+#
+# What bought them: `Store.ext_refs` (an interned box table with a cap), `boxRef`/`unboxRef`, the
+# `InstanceSlot.store` back-pointer, and `wazmrt_ref_is_valid`. It closes the one value kind that
+# was still handed to embedders as the interpreter's RAW encoding while instances, funcs,
+# memories and globals had been checked handles since ABI 2.
+
 wazmrt.exe  964608
-wazmrt.lib  1028892
-wazmrt.dll  887808
+wazmrt.lib  1029720
+wazmrt.dll  888832

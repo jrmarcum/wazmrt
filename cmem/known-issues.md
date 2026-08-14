@@ -917,8 +917,25 @@ Measured against the real `.wat` corpus at `wasmtk/tests` (**493 files**): assem
 - **The memory-index immediate was emitted as 0 WITHOUT being read**, so `(memory.size 7)` and
   `(memory.size $nope)` ran against memory 0 — the sole silent acceptor among index spaces. Now: unknown
   name → `UnknownIdentifier`, non-zero index → `UnsupportedInstr`.
-- 🔴 **OPEN — the C ABI hands a host `externref` to the guest UNTAGGED, so it can still be read as
-  a GC heap index. Needs an owner decision (found 2026-08-14, S1).**
+- ✅ **CLOSED 2026-08-14 — references cross the C ABI as HANDLES now, like every other value kind.**
+  `Store.ext_refs` interns the internal value; the host gets `(store_id << 32) | (slot+1)`, with
+  **null as handle 0** so a `memset`-zeroed `wazmrt_val_t` is null by construction. An inbound
+  handle is looked up and **refused if this store did not issue it** — never reinterpreted.
+  `wazmrt_ref_is_valid` completes the set beside the instance/func/memory/global checks.
+  **Boxing is complete rather than best-effort because the ABI has no API for a host to CREATE a
+  reference**: every handle an embedder holds came from a guest value crossing the boundary, so an
+  unknown one is unambiguously an error. That fact is also what dissolved the objection this entry
+  was parked on — there is no "host-invented value" case to round-trip.
+  ⚠️ **The real argument was never the security one.** The header promised *"opaque to the host"*
+  while handing over the interpreter's private encoding: bit 63 an i31, bit 62 a host reference,
+  all-ones null, a structured high half an (owner, index) pair. **An undocumented forbidden value
+  space is an interop bug before it is a security one**, and there was no `is_valid` for refs as
+  there was for everything else. The ABI already boxed instances, funcs, memories and globals —
+  refs were the one kind left out, *the same enumeration failure as R2 converting only funcrefs*.
+  Verified in `tests/capi_smoke.c` (a reference round-trips unchanged; an invented handle is
+  refused), because this is the surface the corpus cannot reach — R1's lesson.
+  Size: **+0 exe / +828 lib / +1,024 dll** — nothing in the CLI, which never crosses a reference
+  through the C ABI. *(Original report:)*
   **Surfaces when:** an embedder passes a `WAZMRT_EXTERNREF` value it invented (a small integer
   handle, the natural choice) into a guest that does `any.convert_extern` and then
   `ref.test`/`ref.cast`/`struct.get`.
