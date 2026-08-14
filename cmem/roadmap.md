@@ -821,6 +821,48 @@ failed to build — R2's 12 came from implementing `(module definition)`/`(modul
 `br_table.wast` is core spec and worth a look on its own — 161 unrun assertions in a control-flow
 instruction is a bigger blind spot than most of the failures above.
 
+### ✅ TRACK 3 — FIRST MEASUREMENT (2026-08-14): 5.3× on end-to-end invocation, and the fairness rule did not change it
+
+`zig build bakeoff -Dcorpus=<dir> [-Dreps=N]` (`tools/bakeoff.mjs`, driven by deno like `ffi-demo`).
+12 invocations from wasmtk's `wasm_mod` corpus × 9 reps, ReleaseFast, x86_64-windows:
+
+| runtime | configuration | median ms | min ms | vs wazmrt |
+| --- | --- | --- | --- | --- |
+| **wazmrt** | interpreter | **6.77** | **5.61** | — |
+| wasmtime | `-C compiler=winch` (fast start) | 36.63 | 33.22 | 5.41× |
+| wasmtime | `-O opt-level=0` (fast start) | 36.27 | 32.47 | 5.36× |
+| wasmtime | default `opt-level=2` (slowest start) | 35.92 | 33.72 | 5.31× |
+| wasmer | default (cranelift) | 36.69 | 33.61 | 5.42× |
+
+🎯 **THE BINDING FAIRNESS RULE WAS APPLIED IN FULL AND THE CONCLUSION SURVIVED IT.** wasmtime's three
+configurations land within **2% of each other** (35.92 / 36.27 / 36.63), so on modules this size the
+startup cost is *runtime and process initialisation, not Cranelift compile time*. That is what makes
+the number quotable: it is not the "beat a runtime in its slowest configuration" claim the rule
+exists to forbid. **Fast-start wasmtime is still 5.4× slower here.**
+
+⚠️ **State exactly what this measures, every time.** End-to-end PROCESS wall-clock —
+`spawn → read → decode → validate → instantiate → call → print → exit` — which is what one
+invocation costs in the dev-loop regime Decision 2 targets. It is **not** in-process decode timing
+and **not** steady-state throughput; a JIT wins hot loops and this table cannot see that (the
+2026-07-14 bench already recorded exactly that shape). The defensible claim stays *"wasmtime-class
+module compatibility, at a fraction of the footprint, faster on anything not precompiled."*
+
+⚠️ **And the honest caveat the table cannot show: these modules are 55–6,225 bytes.** Cranelift has
+almost nothing to compile, which is *why* the three wasmtime rows converge. On a large module the
+fast-start configurations should separate from the default and the absolute gap should widen — so
+this corpus, if anything, understates the advantage while proving the smaller claim cleanly. Adding
+a large module is the obvious next measurement.
+
+⚠️ **A benchmark that mis-invokes a competitor reports that competitor as BROKEN.** The first run
+disqualified wasmer on `add(100, -1)`: the harness omitted the `--` separator, so `-1` parsed as a
+flag. It looked exactly like a wrong answer. **Check a disqualification against a hand-run before
+believing it** — the same discipline as an audit finding being a hypothesis. Verifying every result
+is still right: a benchmark that does not check its output is measuring the wrong thing.
+
+**wazero is absent from the table on purpose**: it is in wasmtk's cross-runtime list, but its CLI
+runs `_start` only and cannot invoke a named export, so it cannot participate in this comparison at
+all. Recorded so the absence reads as a fact about the tool, not an omission.
+
 ### ✅ TRACK 2c IS DONE (2026-08-14) — the embed artifact is optional-weight now
 
 **`-Dwat=false` / `-Dwasi=false` compile the WAT assembler / the WASI host out of the EMBED
@@ -875,9 +917,9 @@ now takes the feature string and refuses anything but `wat,wasi`, the same shape
 ReleaseSmall check. **A gate that measures "whatever is on disk" needs to know what produced it.**
 
 ### What is left after Track 1 (2026-08-11)
-- **Track 3 — the bake-off harness.** wazmrt vs wasmrt vs wasmtime, on wasmtk's and rsxtk's real
-  corpora, **with wasmtime in a FAST-START configuration** (`OptLevel::None`/Winch), never only
-  `OptLevel::Speed`.
+- **Track 3 — the bake-off harness.** ✅ **FIRST CUT LANDED 2026-08-14 — see below.** Still open:
+  wasmrt (the Rust competitor) as a fourth entrant, rsxtk's corpus, and an IN-PROCESS
+  decode/validate/instantiate breakdown (which needs a Rust-side harness to be comparable).
 - **wasmtk branch `test/cross-runtime-wazmrt-wasmrt`** (`72cf256ffad`) — the 5-runtime portability gate,
   deliberately unmerged pending the runtime decision.
 

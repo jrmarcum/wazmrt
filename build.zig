@@ -343,6 +343,28 @@ pub fn build(b: *std.Build) void {
         test_safe_step.dependOn(&b.addRunArtifact(capi_tests_safe).step);
     }
 
+    // ---- Bake-off harness (`zig build bakeoff -Dcorpus=<dir>`) -------------
+    // Track 3: measure wazmrt against the runtimes it means to replace, on real
+    // modules, with the comparison configured FAIRLY — wasmtime in its
+    // fast-start modes (winch / opt-level=0), not only its slowest-starting
+    // default. Driven by a Deno script for the same reason `ffi-demo` is: it
+    // needs to spawn and time other processes, and deno is already a dependency
+    // of one step rather than a new one.
+    {
+        const corpus = b.option([]const u8, "corpus", "Directory of .wasm + .test.json for `zig build bakeoff` (wasmtk's tests/module/wasm_mod)");
+        const reps = b.option(usize, "reps", "Repetitions per invocation for `zig build bakeoff` (default 7)") orelse 7;
+        const bake = b.addSystemCommand(&.{ "deno", "run", "--allow-read", "--allow-run", "--allow-env" });
+        bake.addFileArg(b.path("tools/bakeoff.mjs"));
+        bake.addArg(corpus orelse "");
+        bake.addArg(b.fmt("{d}", .{reps}));
+        bake.has_side_effects = true; // it is a measurement; never serve a cached verdict
+        // Needs the CLI built in the mode being measured — benchmarking a Debug
+        // build would produce a number that flatters every competitor.
+        bake.step.dependOn(b.getInstallStep());
+        const bake_step = b.step("bakeoff", "Benchmark wazmrt vs wasmtime/wasmer on a real corpus (needs deno; -Dcorpus=<dir>)");
+        bake_step.dependOn(&bake.step);
+    }
+
     // ---- Feature-gate build check (`zig build features`) -------------------
     // Compiles the C ABI in ALL FOUR `-Dwat`/`-Dwasi` combinations. A comptime
     // gate rots the moment someone adds an ungated `root.wasi.…` reference, and

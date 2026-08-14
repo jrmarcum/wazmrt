@@ -302,6 +302,24 @@ per-append-site check structurally cannot see `(import "" "" (memory $foo 1))` b
 because the script and the modules inside it go through one lexer. Budget for that: the fix pulled a
 separately-filed item into the same pass. — R9, `text-toolchain.md`
 
+**A BENCHMARK THAT MIS-INVOKES A COMPETITOR REPORTS THAT COMPETITOR AS BROKEN.** The bake-off's first
+run disqualified wasmer for a wrong answer; the cause was a missing `--` in the harness, so a
+negative argument parsed as a flag. It was indistinguishable from a real defect. Check a
+disqualification against a hand-run before believing it — an audit finding is a hypothesis, and so is
+a benchmark's verdict on someone else's tool. — Track 3, `bakeoff.mjs`
+
+**APPLYING A FAIRNESS RULE IS WHAT MAKES A NUMBER QUOTABLE.** wasmtime was measured in both
+fast-start configurations as well as its default; all three landed within 2%, so the 5.4× result is
+not the "beat a runtime in its slowest setting" claim the rule exists to forbid. Had the rule been
+skipped, the same number would have been worthless the moment anyone checked — the exact fate of the
+falsified wasm-c-api payoff. **A constraint that survives its own test strengthens the claim.** —
+Track 3, `roadmap.md`
+
+**SAY WHICH REGIME A PERFORMANCE NUMBER BELONGS TO, IN THE SAME BREATH.** End-to-end process
+wall-clock, in-process decode time and steady-state throughput are three different claims, and a
+runtime can win one while losing another (a JIT wins hot loops; this project wins invocations). The
+bake-off prints its own scope next to its table for that reason. — Track 3, `bakeoff.mjs`
+
 **RANK SIZE LEVERS BY MEASUREMENT, NOT BY WHICH ONE IS EASIER TO PICTURE.** Track 2c was written up
 naming `-Dwat=false` first for months; measured, WASI is the bigger half by 3× (−52% vs −16% of the
 DLL), because `wasi.zig` drags in `std.Io` and `Io.Threaded` while the assembler is mostly its own

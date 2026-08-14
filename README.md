@@ -80,7 +80,32 @@ zig build ffi-demo                 # build the DLL + run examples/deno_ffi_capi.
 zig build size -Doptimize=ReleaseSmall   # fail if a shipped artifact grew past its ceiling
 zig build features                 # compile the C ABI in all four -Dwat/-Dwasi combinations
 zig build bench                    # interpreter microbenchmark (ReleaseFast)
+zig build bakeoff -Dcorpus=<dir>   # benchmark vs wasmtime/wasmer on a real corpus (needs deno)
 ```
+
+### Startup
+
+`zig build bakeoff` times a full invocation — process spawn, decode, validate,
+instantiate, call — against the runtimes wazmrt is meant to replace. Over
+wasmtk's `wasm_mod` corpus (12 invocations × 9 reps, ReleaseFast, x86_64-windows):
+
+| runtime | configuration | median | vs wazmrt |
+| --- | --- | --- | --- |
+| **wazmrt** | interpreter | **6.77 ms** | — |
+| wasmtime | `-C compiler=winch` | 36.63 ms | 5.4× |
+| wasmtime | `-O opt-level=0` | 36.27 ms | 5.4× |
+| wasmtime | default (`opt-level=2`) | 35.92 ms | 5.3× |
+| wasmer | default | 36.69 ms | 5.4× |
+
+wasmtime is measured in its **fast-start** configurations as well as its default,
+because beating a compiler in its slowest-starting mode would prove nothing. All
+three land within 2% of each other here: at this module size the cost is runtime
+start-up, not compilation.
+
+This is the cost of *one invocation*, which is what a dev loop pays. It is not
+steady-state throughput — a JIT wins hot loops — and the corpus is small modules,
+where a compiler has little to compile. Every result is checked against the
+expected value; a wrong answer is disqualified rather than timed.
 
 ### Slimming the embedded library
 
