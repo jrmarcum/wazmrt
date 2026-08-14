@@ -971,13 +971,21 @@ Measured against the real `.wat` corpus at `wasmtk/tests` (**493 files**): assem
   instances, which is why nothing caught this for months. Regression tests:
   `tests/gc_cross_instance_repro.wast` (9 assertions) and an in-repo `wast.zig` test, the latter
   because the `.wast` corpus lives on removable media and cannot gate a commit.
-  ⚠️ **One deliberate residual, matching R2's `definedFuncType` precedent exactly:** the ABSTRACT
-  head travels correctly across instances (`struct`/`array`/`eq`/`any` are properties of the
-  object), but a CONCRETE `(ref $t)` target against a FOREIGN object returns false / traps rather
-  than comparing type indices that mean different things in the two modules (R1). The spec answer
-  for two structurally identical types is *succeed*; deciding it needs `typematch`, which needs an
-  allocator `refMatches` does not have on the cast hot path. **A false negative, loudly, instead of
-  a wrong cast quietly.** Pinned by the reproducer so it is a recorded choice, not a surprise.
+  ✅ **AND THE RESIDUAL IS CLOSED TOO (same day) — a store-wide `TypeRegistry`.** The fix above left
+  concrete `(ref $t)` against a FOREIGN object as a deliberate loud false negative, because the
+  indices mean different things in the two modules (R1) and deciding it needed `typematch`, which
+  needs an allocator `refMatches` lacks on the cast path. Rec groups are now **interned as each
+  module joins the store** — content-addressed, with outside references keyed by their
+  already-assigned store id (available because groups intern in index order and outside refs point
+  strictly backwards, which `Module.checkTypeRefScope` already guaranteed). A cross-module cast is
+  an integer compare plus a supertype walk; the structural work happens once, at instantiation.
+  ⚠️ **The key must reference outside groups by ID, never inline them** — inlining is the obvious
+  way to make keys self-contained and blows up exponentially on chained groups, a DoS surface on
+  exactly the untrusted path. ⚠️ **And it must still REFUSE a structurally different type**: the
+  regression test pins both directions, because replacing a false negative with a false positive is
+  R1's failure mode and the dangerous one. Cross-module declared subtyping travels too.
+  ⚠️ **Startup cost: none measurable (+0.01 ms median), and the first measurement said +40%** — see
+  `best-practices.md` on interleaving A/B runs.
   *(Original report:)*
   **Surfaces when:** two linked instances pass a `structref`/`arrayref`/`anyref` between them — an
   exported global, a shared `anyref` table, or a call parameter.

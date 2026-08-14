@@ -1285,6 +1285,11 @@ test "a GC reference crossing an instance boundary names its OWN object" {
     // exactly this for funcrefs ("a reference names an ENTITY, not an index");
     // only funcrefs had been converted.
     //
+    // The concrete cross-module cast answers CORRECTLY (111, not a refusal)
+    // because the store-wide `TypeRegistry` interns both modules' rec groups at
+    // instantiation: `$ta` and `$tb` are structurally identical, so they land on
+    // one canonical id and the comparison is an integer compare.
+    //
     // Kept in-repo as well as in `tests/gc_cross_instance_repro.wast` because the
     // `.wast` corpus lives on removable media and cannot gate a commit — and
     // because the spec suite crosses GC references between instances almost
@@ -1301,16 +1306,52 @@ test "a GC reference crossing an instance boundary names its OWN object" {
         \\  (func (export "isArray") (result i32) (ref.test (ref array) (global.get $fromA)))
         \\  (func (export "ownRead") (result i32)
         \\    (struct.get $tb 0 (ref.cast (ref $tb) (global.get $mine))))
-        \\  (func (export "concreteTest") (result i32) (ref.test (ref $tb) (global.get $fromA))))
+        \\  (func (export "concreteTest") (result i32) (ref.test (ref $tb) (global.get $fromA)))
+        \\  (func (export "concreteRead") (result i32)
+        \\    (struct.get $tb 0 (ref.cast (ref $tb) (global.get $fromA)))))
         \\(assert_return (invoke $B "seed"))
         \\(assert_return (invoke $B "ownRead") (i32.const 222))
         \\(assert_return (invoke $B "isStruct") (i32.const 1))
         \\(assert_return (invoke $B "isArray") (i32.const 0))
-        \\(assert_return (invoke $B "concreteTest") (i32.const 0))
+        \\(assert_return (invoke $B "concreteTest") (i32.const 1))
+        \\(assert_return (invoke $B "concreteRead") (i32.const 111))
     ;
     const s = try runScript(std.testing.allocator, src);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
-    try std.testing.expectEqual(@as(usize, 5), s.passed);
+    try std.testing.expectEqual(@as(usize, 6), s.passed);
+
+    // ⚠️ The registry must still REFUSE a structurally different type, or it has
+    // replaced a false negative with a false POSITIVE — R1's failure mode, and
+    // the dangerous direction. A's object is `(struct i32)`; B's index 0 is a
+    // `(struct i64)` and its index 1 is the match, so the two answers must
+    // differ. (This is the shape that catches wasmrt today: it reads A's type
+    // index against B's table and answers 1 / 0 — both wrong.)
+    const negative =
+        \\(module $A (type $ta (struct (field i32)))
+        \\  (global (export "g") anyref (struct.new $ta (i32.const 111))))
+        \\(register "A" $A)
+        \\(module $B
+        \\  (type $b0 (struct (field i64)))
+        \\  (type $b1 (struct (field i32)))
+        \\  (global $fromA (import "A" "g") anyref)
+        \\  (func (export "wrong") (result i32) (ref.test (ref $b0) (global.get $fromA)))
+        \\  (func (export "right") (result i32) (ref.test (ref $b1) (global.get $fromA))))
+        \\(assert_return (invoke $B "wrong") (i32.const 0))
+        \\(assert_return (invoke $B "right") (i32.const 1))
+        \\(module $C
+        \\  (type $base (sub (struct (field i32))))
+        \\  (type $derived (sub $base (struct (field i32) (field i32))))
+        \\  (global (export "d") anyref (struct.new $derived (i32.const 7) (i32.const 8))))
+        \\(register "C" $C)
+        \\(module $D
+        \\  (type $base2 (sub (struct (field i32))))
+        \\  (global $fromC (import "C" "d") anyref)
+        \\  (func (export "isBase") (result i32) (ref.test (ref $base2) (global.get $fromC))))
+        \\(assert_return (invoke $D "isBase") (i32.const 1))
+    ;
+    const s2 = try runScript(std.testing.allocator, negative);
+    try std.testing.expectEqual(@as(usize, 0), s2.failed);
+    try std.testing.expectEqual(@as(usize, 3), s2.passed);
 }
 
 test "L1: an import matches a memory/table's CURRENT size, not its declared minimum" {

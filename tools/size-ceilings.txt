@@ -271,6 +271,25 @@
 # (owner, index) in the same 64-bit slot — which is why it is 452 bytes and not a data-structure
 # rewrite. Same shape as R4 coming out smaller: the cheapest fixes change what a value MEANS.
 
-wazmrt.exe  958976
-wazmrt.lib  1022972
-wazmrt.dll  883200
+# RAISED 2026-08-14 (store-wide TYPE REGISTRY — cross-module concrete casts answer correctly).
+#
+#   artifact       before        after      share
+#   wazmrt.exe    958,976      964,608     +5,632
+#   wazmrt.lib  1,022,972    1,028,892     +5,920
+#   wazmrt.dll    883,200      887,808     +4,608
+#
+# What bought them: `TypeRegistry` (a content-addressed rec-group intern table + a canonical
+# supertype forest), the structural key builder (`groupKey`/`appendValType`/`appendField`), and
+# `Instance.canon_ids`. It turns a cross-module `ref.test`/`ref.cast (ref $t)` from a REFUSAL into
+# the correct answer, and moves the structural work off the cast path to instantiation.
+#
+# ⚠️ **STARTUP COST: NONE MEASURABLE — and the first measurement said +40%.** Sequential runs
+# showed 6.88 -> 9.60 ms median, which looked like a clear regression. It was machine drift: three
+# repeats climbed 9.60 -> 10.65 -> 11.49 -> 12.90 with no code change at all. An INTERLEAVED A/B of
+# two binaries in one session (60 alternating pairs) put the delta at **+0.01 ms median / -0.07 ms
+# min** — nothing. **Sequential A/B on a loaded box is not a measurement**; it nearly reversed a
+# correct design decision. Interleave, or do not compare.
+
+wazmrt.exe  964608
+wazmrt.lib  1028892
+wazmrt.dll  887808

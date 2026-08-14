@@ -373,8 +373,191 @@ pub const GcAddr = struct { inst: *Instance, index: usize };
 /// funcref outliving its instance resolves to a clean `error.UndefinedFunc`
 /// rather than a dangling pointer — and an arbitrary integer arriving as a
 /// funcref through the C ABI does the same.
+/// **Store-wide type identity** — what makes a concrete `(ref $t)` comparable
+/// ACROSS modules with an integer compare.
+///
+/// `Module.canonOf` decides identity *within* a module. Across a boundary those
+/// indices name unrelated types, and `typematch` — the structural comparison R1
+/// added — needs an allocator and a walk, which is fine at link time and not on
+/// the cast hot path. So rec groups are **interned as each module joins the
+/// store**: a group's structural key refers to types OUTSIDE the group by their
+/// already-assigned store-wide id, which is available because groups intern in
+/// index order and an outside reference always points strictly backwards
+/// (`Module.checkTypeRefScope` enforces that at decode). Two modules spelling
+/// out the same group therefore land on the same ids, and matching becomes an
+/// integer compare.
+///
+/// ⚠️ **The key must reference outside groups by ID, never inline them.**
+/// Inlining is the obvious way to make keys self-contained and it blows up
+/// exponentially on chained groups — a denial-of-service surface on exactly the
+/// untrusted path. Interning in order is what avoids it.
+///
+/// The shape is wasmtime's, arrived at independently here and confirmed against
+/// wasmrt's `TypeRegistry`, which reached the same design.
+pub const TypeRegistry = struct {
+    /// Structural key of a rec group → store-wide id of its FIRST member.
+    /// Members of one group get consecutive ids, so member `k` is `first + k`.
+    groups: std.StringHashMapUnmanaged(u32) = .empty,
+    /// Canonical supertype of each store-wide id, or null. The GC MVP allows at
+    /// most one, so the relation is a forest and `isSub` is a walk.
+    parents: std.ArrayList(?u32) = .empty,
+    /// Keys owned here; the map borrows them.
+    keys: std.ArrayList([]u8) = .empty,
+
+    pub fn deinit(self: *TypeRegistry, gpa: std.mem.Allocator) void {
+        for (self.keys.items) |k| gpa.free(k);
+        self.keys.deinit(gpa);
+        self.parents.deinit(gpa);
+        self.groups.deinit(gpa);
+    }
+
+    /// Is store-wide type `sub` the same as, or a declared subtype of, `sup`?
+    /// Bounded by the chain length, which `parents` builds strictly backwards.
+    pub fn isSub(self: *const TypeRegistry, sub: u32, sup: u32) bool {
+        var cur = sub;
+        var guard: usize = 0;
+        while (guard <= self.parents.items.len) : (guard += 1) {
+            if (cur == sup) return true;
+            const p = if (cur < self.parents.items.len) self.parents.items[cur] else null;
+            cur = p orelse return false;
+        }
+        return false; // a cycle cannot happen, but never loop forever on one
+    }
+
+    /// Assign store-wide ids to every type of `m`.
+    ///
+    /// ⚠️ **Two allocators, deliberately.** The registry outlives every instance
+    /// in the store, so its own storage must come from the STORE's allocator —
+    /// while the returned map belongs to the instance and is freed by
+    /// `Instance.deinit` with the instance's. Using one for both looks tidier and
+    /// is a double-free: the `.wast` runner instantiates from an ARENA, so the
+    /// keys were arena-allocated and then freed against the store's gpa. It
+    /// panicked as "Invalid free" three frames away from the cause.
+    fn internModule(
+        self: *TypeRegistry,
+        reg_gpa: std.mem.Allocator,
+        out_gpa: std.mem.Allocator,
+        m: *const Module,
+    ) Error![]u32 {
+        const gpa = reg_gpa;
+        const out = try out_gpa.alloc(u32, m.comp_types.len);
+        errdefer out_gpa.free(out);
+        var i: u32 = 0;
+        while (i < m.comp_types.len) {
+            const g = m.recGroup(i);
+            var key: std.ArrayList(u8) = .empty;
+            defer key.deinit(gpa);
+            try groupKey(gpa, &key, m, g.start, g.len, out);
+
+            if (self.groups.get(key.items)) |first| {
+                for (0..g.len) |k| out[g.start + k] = first + @as(u32, @intCast(k));
+            } else {
+                const first: u32 = @intCast(self.parents.items.len);
+                for (0..g.len) |k| {
+                    try self.parents.append(gpa, null);
+                    out[g.start + k] = first + @as(u32, @intCast(k));
+                }
+                // Supertypes resolved AFTER the group's own ids exist, so a
+                // supertype inside the group resolves to the id just assigned.
+                for (0..g.len) |k| {
+                    const local = g.start + @as(u32, @intCast(k));
+                    if (local < m.supertypes.len) if (m.supertypes[local]) |sup|
+                        if (sup < out.len) {
+                            self.parents.items[first + k] = out[sup];
+                        };
+                }
+                const owned = try gpa.dupe(u8, key.items);
+                errdefer gpa.free(owned);
+                try self.keys.append(gpa, owned);
+                try self.groups.put(gpa, owned, first);
+            }
+            i = g.start + g.len;
+        }
+        return out;
+    }
+};
+
+/// Serialise one rec group structurally. A concrete reference INSIDE the group
+/// is written by position (so the key is independent of where the group sits);
+/// one OUTSIDE is written by its store-wide id from `assigned`, which is filled
+/// because outside references point strictly backwards.
+fn groupKey(
+    gpa: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    m: *const Module,
+    start: u32,
+    len: u32,
+    assigned: []const u32,
+) Error!void {
+    try appendU32(gpa, out, len);
+    for (0..len) |k| {
+        const i = start + @as(u32, @intCast(k));
+        const c = m.comp_types[i];
+        try out.append(gpa, if (i < m.type_finals.len and m.type_finals[i]) 1 else 0);
+        if (i < m.supertypes.len and m.supertypes[i] != null) {
+            try out.append(gpa, 1);
+            try appendTypeRef(gpa, out, m.supertypes[i].?, start, len, assigned);
+        } else try out.append(gpa, 0);
+        try out.append(gpa, @intFromEnum(c.kind()));
+        switch (c) {
+            .func => |f| {
+                try appendU32(gpa, out, @intCast(f.params.len));
+                for (f.params) |v| try appendValType(gpa, out, v, start, len, assigned);
+                try appendU32(gpa, out, @intCast(f.results.len));
+                for (f.results) |v| try appendValType(gpa, out, v, start, len, assigned);
+            },
+            .@"struct" => |fs| {
+                try appendU32(gpa, out, @intCast(fs.len));
+                for (fs) |fld| try appendField(gpa, out, fld, start, len, assigned);
+            },
+            .array => |fld| try appendField(gpa, out, fld, start, len, assigned),
+        }
+    }
+}
+
+fn appendU32(gpa: std.mem.Allocator, out: *std.ArrayList(u8), v: u32) Error!void {
+    try out.appendSlice(gpa, std.mem.asBytes(&v));
+}
+
+fn appendTypeRef(gpa: std.mem.Allocator, out: *std.ArrayList(u8), ti: u32, start: u32, len: u32, assigned: []const u32) Error!void {
+    if (ti >= start and ti < start + len) {
+        try out.append(gpa, 1); // in-group: by POSITION, so the key is location-independent
+        try appendU32(gpa, out, ti - start);
+    } else {
+        try out.append(gpa, 2); // outside: by store-wide id (already assigned)
+        try appendU32(gpa, out, if (ti < assigned.len) assigned[ti] else std.math.maxInt(u32));
+    }
+}
+
+fn appendValType(gpa: std.mem.Allocator, out: *std.ArrayList(u8), v: types.ValType, start: u32, len: u32, assigned: []const u32) Error!void {
+    if (v.isConcrete()) {
+        // Nullability is part of the type; the KIND bits are a decoder
+        // placeholder (see `ValType.concreteRef`) and must stay out of the key,
+        // or two spellings of one type would hash apart.
+        try out.append(gpa, if (v.isNonNullRef()) 3 else 4);
+        try appendTypeRef(gpa, out, v.concreteIndex(), start, len, assigned);
+    } else {
+        try out.append(gpa, 0);
+        try appendU32(gpa, out, @intFromEnum(v));
+    }
+}
+
+fn appendField(gpa: std.mem.Allocator, out: *std.ArrayList(u8), f: Module.FieldType, start: u32, len: u32, assigned: []const u32) Error!void {
+    try out.append(gpa, if (f.mutable) 1 else 0);
+    switch (f.storage) {
+        .i8 => try out.append(gpa, 10),
+        .i16 => try out.append(gpa, 11),
+        .val => |v| {
+            try out.append(gpa, 12);
+            try appendValType(gpa, out, v, start, len, assigned);
+        },
+    }
+}
+
 pub const Store = struct {
     gpa: std.mem.Allocator,
+    /// See `TypeRegistry`. Populated as each instance joins.
+    canon: TypeRegistry = .{},
     instances: std.ArrayList(?*Instance) = .empty,
     /// Instances whose segment initialization TRAPPED. §4.5.5 allocates the
     /// module instance before running the segment inits, so entries an element
@@ -394,6 +577,7 @@ pub const Store = struct {
     pub fn deinit(self: *Store) void {
         for (self.orphans.items) |inst| inst.deinit();
         self.orphans.deinit(self.gpa);
+        self.canon.deinit(self.gpa);
         self.instances.deinit(self.gpa);
         self.* = undefined;
     }
@@ -646,6 +830,11 @@ pub const Instance = struct {
     store: *Store,
     /// This instance's slot in `store`; the high half of every funcref it makes.
     store_slot: u32,
+    /// Local type index → STORE-WIDE canonical id (`Store.canon`). Computed
+    /// once at instantiation, so a concrete `(ref $t)` comparison against
+    /// another module is an integer compare rather than a structural walk.
+    /// `gpa`-owned.
+    canon_ids: []u32 = &.{},
     /// True when this instance created `store` itself (no `Imports.store` was
     /// given), and so must free it in `deinit`.
     owns_store: bool,
@@ -990,6 +1179,13 @@ pub const Instance = struct {
         // the caller is about to reuse.
         errdefer store.tombstone(store_slot);
 
+        // Intern this module's types into the store, so a concrete `(ref $t)`
+        // against ANOTHER module is an integer compare rather than a structural
+        // walk on the cast hot path. Done here, right after the slot is claimed:
+        // every reference value built below may end up compared cross-module.
+        const canon_ids = try store.canon.internModule(store.gpa, gpa, module);
+        errdefer gpa.free(canon_ids);
+
         // Reference values only mean anything within one store, so refuse to
         // link across two rather than reinterpret the other side's funcrefs.
         for (imports.funcs) |hf| switch (hf) {
@@ -1321,6 +1517,7 @@ pub const Instance = struct {
             .module = module,
             .store = store,
             .store_slot = store_slot,
+            .canon_ids = canon_ids,
             .owns_store = owns_store,
             .func_bodies = bodies,
             .globals = globals,
@@ -1421,6 +1618,7 @@ pub const Instance = struct {
         };
         self.gpa.free(self.tables);
         self.gc_heap.deinit(self.gpa); // object slices are arena-backed (freed below)
+        self.gpa.free(self.canon_ids);
         self.arena.deinit();
         self.* = undefined;
     }
@@ -1636,20 +1834,25 @@ pub const Instance = struct {
                     .array => .array,
                     .func => .func,
                 };
-                // ⚠️ **The ABSTRACT head travels; the CONCRETE type index does
+                // ⚠️ **The ABSTRACT head travels; a CONCRETE type index does
                 // not.** `struct`/`array`/`eq`/`any` are properties of the
-                // object, so they answer correctly across instances. A concrete
-                // `(ref $t)` target compares type INDICES, and an index only
-                // means something inside the module that wrote it (R1) — so a
-                // foreign object is refused rather than judged against a number
-                // that means something else here.
+                // object and answer correctly anywhere. A concrete `(ref $t)`
+                // compares type INDICES, and an index only means something
+                // inside the module that wrote it (R1) — so when the object
+                // belongs to a DIFFERENT module the comparison goes through the
+                // store-wide canonical ids instead. One integer compare plus a
+                // supertype walk; the structural work happened once, at
+                // instantiation. See `TypeRegistry`.
                 //
-                // Exactly the trade R2 made for `definedFuncType`: deciding it
-                // properly needs `typematch`, which needs an allocator that
-                // `refMatches` does not have on the cast hot path. **A false
-                // negative, loudly, instead of a wrong cast quietly.** Recorded
-                // in `known-issues.md` with the funcref twin.
-                if (e.inst != self and rt.heap == .concrete) return false;
+                // Same module (including two instances of one module — the
+                // `(module definition)`/`(module instance)` case) keeps the
+                // direct index path: the indices already ARE the identities.
+                if (rt.heap == .concrete and e.inst.module != self.module) {
+                    const want_local = rt.heap.concrete;
+                    if (want_local >= self.canon_ids.len) return false;
+                    if (obj.type_index >= e.inst.canon_ids.len) return false;
+                    return self.store.canon.isSub(e.inst.canon_ids[obj.type_index], self.canon_ids[want_local]);
+                }
                 return self.headMatches(kind, obj.type_index, rt.heap);
             },
             .func => return self.headMatches(.func, self.definedFuncType(v), rt.heap),

@@ -55,10 +55,40 @@
 (assert_return (invoke $B "isArray")  (i32.const 0))
 (assert_return (invoke $B "isEq")     (i32.const 1))
 
-;; ⚠️ DELIBERATE FALSE NEGATIVE, matching R2's `definedFuncType` precedent for
-;; funcrefs. The spec answer is 1 / 111 — `$ta` and `$tb` are structurally
-;; identical, so the cast should succeed. Deciding that needs `typematch`, which
-;; needs an allocator `refMatches` does not have on the cast hot path. A false
-;; negative, loudly, instead of a wrong cast quietly. See `known-issues.md`.
-(assert_return (invoke $B "concreteTest") (i32.const 0))
-(assert_trap (invoke $B "concreteCast") "cast failure")
+;; The CONCRETE cross-module case answers correctly too, since the store-wide
+;; `TypeRegistry` interns both modules' rec groups at instantiation: `$ta` and
+;; `$tb` are structurally identical, so they land on one canonical id and the
+;; comparison is an integer compare on the cast path.
+;;
+;; (This pair asserted 0 / trap for one commit — the deliberate false negative
+;; that stood before the registry existed. Kept in mind, not in the file: a test
+;; that pins a limitation has to be updated when the limitation goes, or it
+;; starts defending it.)
+(assert_return (invoke $B "concreteTest") (i32.const 1))
+(assert_return (invoke $B "concreteCast") (i32.const 111))
+;; The registry must REFUSE a structurally different type, or it has just
+;; replaced a false negative with a false positive — the R1 failure mode.
+(module $A (type $ta (struct (field i32)))
+  (global (export "g") anyref (struct.new $ta (i32.const 111))))
+(register "A" $A)
+(module $B
+  (type $b0 (struct (field i64)))          ;; index 0: DIFFERENT type
+  (type $b1 (struct (field i32)))          ;; index 1: the matching one
+  (global $fromA (import "A" "g") anyref)
+  (func (export "wrong") (result i32) (ref.test (ref $b0) (global.get $fromA)))
+  (func (export "right") (result i32) (ref.test (ref $b1) (global.get $fromA))))
+(assert_return (invoke $B "wrong") (i32.const 0))
+(assert_return (invoke $B "right") (i32.const 1))
+
+;; …and declared subtyping must travel: an object of a SUBtype satisfies a
+;; target naming its supertype, across modules.
+(module $C
+  (type $base (sub (struct (field i32))))
+  (type $derived (sub $base (struct (field i32) (field i32))))
+  (global (export "d") anyref (struct.new $derived (i32.const 7) (i32.const 8))))
+(register "C" $C)
+(module $D
+  (type $base2 (sub (struct (field i32))))
+  (global $fromC (import "C" "d") anyref)
+  (func (export "isBase") (result i32) (ref.test (ref $base2) (global.get $fromC))))
+(assert_return (invoke $D "isBase") (i32.const 1))

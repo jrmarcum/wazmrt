@@ -302,6 +302,14 @@ per-append-site check structurally cannot see `(import "" "" (memory $foo 1))` b
 because the script and the modules inside it go through one lexer. Budget for that: the fix pulled a
 separately-filed item into the same pass. — R9, `text-toolchain.md`
 
+**SEQUENTIAL A/B ON A LOADED MACHINE IS NOT A MEASUREMENT — INTERLEAVE, OR DO NOT COMPARE.** The
+type registry appeared to cost +40% startup (6.88 → 9.60 ms median) against a baseline taken an hour
+earlier. Three repeats with **no code change** then climbed 9.60 → 10.65 → 11.49 → 12.90: the box was
+degrading under sustained build load, not the code. An interleaved A/B of two binaries in one
+session — 60 alternating pairs — put the real delta at **+0.01 ms median**, i.e. nothing. The false
+reading was about to reverse a correct design decision. **The absolute numbers drifted 2×; only the
+interleaved difference was meaningful.** — the type registry, `size-ceilings.txt`
+
 **WHEN AN INVARIANT IS WRITTEN DOWN, ENUMERATE EVERY VALUE KIND IT GOVERNS IN THE SAME PASS.** R2
 established "a reference value names an ENTITY, not an index" and converted `funcref` only. GC heap
 references kept the old encoding and had the identical cross-instance defect, found a day later —
