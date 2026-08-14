@@ -46,6 +46,10 @@ pub const Error = sexpr.Error || error{
     /// An `import` (top-level or inline) after a func/table/memory/global
     /// definition — malformed: imports must precede all definitions (§6.6.13).
     ImportAfterDefinition,
+    /// §6.6.13 — two identifiers bound in the same index space (or two locals,
+    /// or two fields of one struct). Malformed, not invalid: nothing downstream
+    /// can see it, because the binary format has no names at all.
+    DuplicateName,
     /// Syntax wazmrt RECOGNISES as belonging to a wasm proposal it does not
     /// target — today only `(memory … (pagesize N))` (custom-page-sizes).
     ///
@@ -380,14 +384,18 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             // `tag_names` length gives (imported tags are appended there too).
             var tag_exports: List([]const u8) = .empty;
             var import_mn: ?struct { m: []const u8, n: []const u8 } = null;
+            var tag_seen: u8 = 0; // §6.6.5 type-use ordering — see `typeUseOrder`
             while (j < items.len) : (j += 1) {
                 const tkw = items[j].keyword() orelse break;
                 if (std.mem.eql(u8, tkw, "type")) {
+                    try typeUseOrder(&tag_seen, 1);
                     type_ref = try resolveType(type_names.items, try nth(try wantList(items[j]), 1));
                 } else if (std.mem.eql(u8, tkw, "param")) {
-                    try parseDecls(a, (try wantList(items[j])), &params, null, type_names.items);
+                    try typeUseOrder(&tag_seen, 2);
+                    try parseDecls(a, (try wantList(items[j])), &params, null, type_names.items, true);
                 } else if (std.mem.eql(u8, tkw, "result")) {
-                    try parseDecls(a, (try wantList(items[j])), &results, null, type_names.items);
+                    try typeUseOrder(&tag_seen, 3);
+                    try parseDecls(a, (try wantList(items[j])), &results, null, type_names.items, false);
                 } else if (std.mem.eql(u8, tkw, "export")) {
                     try tag_exports.append(a, try fieldStr(items[j], 1));
                 } else if (std.mem.eql(u8, tkw, "import")) {
@@ -596,6 +604,11 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         } else if (std.mem.eql(u8, kw, "start")) {
             // (start $f | N) — resolve after the func index space is complete.
             if (items.len < 2) return error.BadModuleField;
+            // A module has at most ONE start function (§2.5.9 — the start
+            // section is optional and singular). A second `(start …)` used to
+            // overwrite the first, so the module ran a start function its own
+            // source did not name first.
+            if (start_ref != null) return error.BadModuleField;
             start_ref = items[1];
         } else if (!std.mem.eql(u8, kw, "type") and !std.mem.eql(u8, kw, "rec")) {
             // Anything else is a typo or an unsupported field, and silently
@@ -613,6 +626,25 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         if (global_imports.items.len > imp_before[3]) try import_order.append(a, .global);
         if (tag_imports.items.len > imp_before[4]) try import_order.append(a, .tag);
     }
+
+    // §6.6.13: identifiers bound in the same index space must be pairwise
+    // distinct. Checked HERE, once per space, rather than at each append site:
+    // every space is filled from two places (an import and a definition) and the
+    // spec's rule spans both — `(import … (memory $foo 1))` next to
+    // `(memory $foo 1)` is a duplicate, and a per-site check is the shape that
+    // misses exactly that pair. Nothing downstream can catch it either: names do
+    // not survive into the binary, so the assembler is the only layer that ever
+    // sees the collision.
+    for ([_][]const ?[]const u8{
+        func_names.items, table_names.items,  mem_names.items,
+        global_names.items, tag_names.items,  type_names.items,
+        elem_names.items,   data_names.items,
+    }) |space| try checkUniqueNames(a, space);
+    // A function's local space is its params followed by its declared locals —
+    // one namespace, so `(param $foo i32) (local $foo i32)` collides.
+    for (funcs.items) |f| try checkUniqueNames(a, f.local_names.items);
+    // …and each struct type's fields are their own namespace.
+    for (gc_field_names.items) |fields| try checkUniqueNames(a, fields);
 
     // Module-level exports, resolved now that every index space is complete.
     // Doing this in-pass rejected forward references — and binaryen emits all
@@ -640,13 +672,24 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // Imported-function type indices (for the import section).
     var func_import_type: List(u32) = .empty;
     for (func_imports.items) |fi| {
-        const ti = if (fi.type_ref) |tr| try resolveType(type_names.items, tr) else try internSig(a, &sigs, fi.params, fi.results);
+        const ti = if (fi.type_ref) |tr| blk: {
+            const idx = try resolveType(type_names.items, tr);
+            try checkInlineTypeUse(&sigs, idx, fi.params, fi.results);
+            break :blk idx;
+        } else try internSig(a, &sigs, fi.params, fi.results);
         try func_import_type.append(a, ti);
     }
 
     var func_type: List(u32) = .empty;
     for (funcs.items) |*f| {
-        const ti = if (f.type_ref) |tr| try resolveType(type_names.items, tr) else try internSig(a, &sigs, f.params.items, f.results.items);
+        const ti = if (f.type_ref) |tr| blk: {
+            const idx = try resolveType(type_names.items, tr);
+            // The inline `(param …)`/`(result …)`, when written alongside a
+            // `(type …)`, is a CHECK on the named type — not a second, silently
+            // ignored declaration. See `checkInlineTypeUse`.
+            try checkInlineTypeUse(&sigs, idx, f.params.items, f.results.items);
+            break :blk idx;
+        } else try internSig(a, &sigs, f.params.items, f.results.items);
         try func_type.append(a, ti);
         // A `(type $t)` reference supplies the params; when they aren't *also*
         // written inline, they still occupy the low local indices, so prepend
@@ -1065,15 +1108,22 @@ fn parseTypeBody(a: std.mem.Allocator, items: []const Sexpr, type_names: []const
     if (std.mem.eql(u8, kw, "func")) {
         var params: List(V) = .empty;
         var results: List(V) = .empty;
+        // §6.6.4 `functype ::= '(' 'func' param* result* ')'` — ordered, and a
+        // `(type …)` has no place inside one.
+        var seen: u8 = 0;
         for (body[1..]) |part| {
             // An unrecognised part used to be skipped, so
             // `(type $t (func (parm i32) (reslt i32)))` interned `() -> ()` and a
             // `call_indirect` against `$t` then checked the WRONG signature.
             const pk = part.keyword() orelse return error.BadModuleField;
             if (std.mem.eql(u8, pk, "param")) {
-                try parseDecls(a, (try wantList(part)), &params, null, type_names);
+                try typeUseOrder(&seen, 2);
+                // A type definition IS a binding position for parameter ids —
+                // `(type (func (param $x i32)))` is legal, unlike a block type.
+                try parseDecls(a, (try wantList(part)), &params, null, type_names, true);
             } else if (std.mem.eql(u8, pk, "result")) {
-                try parseDecls(a, (try wantList(part)), &results, null, type_names);
+                try typeUseOrder(&seen, 3);
+                try parseDecls(a, (try wantList(part)), &results, null, type_names, false);
             } else return error.BadModuleField;
         }
         try sigs.append(a, .{ .params = params.items, .results = results.items });
@@ -1433,6 +1483,9 @@ fn parseFunc(a: std.mem.Allocator, form: []const Sexpr, type_names: []const ?[]c
         f.name = form[i].atom;
         i += 1;
     }
+    // §6.6.13: `(func id? (export …)* (import …)? typeuse local* instr*)`, and
+    // the type use is itself ordered — see `typeUseOrder`.
+    var seen: u8 = 0;
     while (i < form.len) : (i += 1) {
         const kw = form[i].keyword() orelse break; // start of the body
         const list = (try wantList(form[i]));
@@ -1440,24 +1493,62 @@ fn parseFunc(a: std.mem.Allocator, form: []const Sexpr, type_names: []const ?[]c
             try f.exports.append(a, (try strAt(list, 1)));
         } else if (std.mem.eql(u8, kw, "import")) {
             f.import = .{ .module = (try strAt(list, 1)), .name = (try strAt(list, 2)) }; // (import "m" "n")
-        } else if (std.mem.eql(u8, kw, "type")) {
-            f.type_ref = try nth(list, 1); // (type $t)
-        } else if (std.mem.eql(u8, kw, "param")) {
-            try parseDecls(a, list, &f.params, &f.local_names, type_names);
-        } else if (std.mem.eql(u8, kw, "result")) {
-            try parseDecls(a, list, &f.results, null, type_names);
-        } else if (std.mem.eql(u8, kw, "local")) {
-            try parseDecls(a, list, &f.locals, &f.local_names, type_names);
+        } else if (typeUseRank(kw)) |rank| {
+            try typeUseOrder(&seen, rank);
+            switch (rank) {
+                1 => f.type_ref = try nth(list, 1), // (type $t)
+                2 => try parseDecls(a, list, &f.params, &f.local_names, type_names, true),
+                3 => try parseDecls(a, list, &f.results, null, type_names, false),
+                else => try parseDecls(a, list, &f.locals, &f.local_names, type_names, true),
+            }
         } else break; // body starts (e.g. a folded instruction)
     }
     f.body = form[i..];
+    // A `(param …)` / `(result …)` / `(local …)` AFTER the body starts is not a
+    // late declaration — there is no such instruction, and the grammar has no
+    // position for one. Letting it fall through to the instruction emitter
+    // reported `UnknownInstr`, which `wast.zig` scores as an assembler gap (a
+    // SKIP) rather than the malformed verdict it is.
+    //
+    // ⚠️ **In FLAT syntax a type use IS a top-level body form** — `block`,
+    // `loop`, `if`, `select` and `call_indirect` are bare atoms there, with
+    // their `(result …)` / `(param …)` following as siblings. So the
+    // discriminator is what comes BEFORE: after an atom it is that instruction's
+    // type use; after a FOLDED instruction it has no legal reading.
+    //
+    // ⚠️ And a type-use form CHAINS off another — `select (result i32) (result)`
+    // and `call_indirect (type $proc) (param) (result)` are both in the corpus,
+    // so "the previous item is an atom" is too narrow and cost `select.wast` and
+    // `stack.wast` a module each. Carry the permission forward instead.
+    var prev_opens_type_use = false;
+    for (f.body) |b| {
+        const k = b.keyword() orelse {
+            prev_opens_type_use = b.asAtom() != null; // a string opens nothing
+            continue;
+        };
+        if (typeUseRank(k) == null) {
+            prev_opens_type_use = false; // a folded instruction
+            continue;
+        }
+        if (!prev_opens_type_use) return error.BadModuleField;
+    }
     return f;
 }
 
 /// Parse a `(param …)` / `(result …)` / `(local …)` group. Handles the named
 /// single form `(param $x i32)` and the anonymous multi form `(param i32 i32)`.
-fn parseDecls(a: std.mem.Allocator, list: []const Sexpr, out_types: *List(V), out_names: ?*List(?[]const u8), type_names: []const ?[]const u8) Error!void {
-    if (list.len >= 3 and isId(list[1])) {
+///
+/// `allow_id` is whether an identifier may be bound here. An id names a LOCAL,
+/// so it is legal only where locals exist — a function definition, a
+/// `(type (func …))` definition, a tag. A block type and a `call_indirect` type
+/// use have no local context, and `(result …)` never takes an id anywhere.
+fn parseDecls(a: std.mem.Allocator, list: []const Sexpr, out_types: *List(V), out_names: ?*List(?[]const u8), type_names: []const ?[]const u8, allow_id: bool) Error!void {
+    if (list.len >= 2 and isId(list[1])) {
+        if (!allow_id) return error.BadModuleField;
+        // The named form declares exactly ONE type. `(param $x i32 i64)` used to
+        // keep the `i32` and silently drop the `i64` — a signature that does not
+        // match its own source.
+        if (list.len != 3) return error.BadModuleField;
         try out_types.append(a, try parseValType(list[2], type_names));
         if (out_names) |n| try n.append(a, list[1].atom);
     } else {
@@ -1465,6 +1556,63 @@ fn parseDecls(a: std.mem.Allocator, list: []const Sexpr, out_types: *List(V), ou
             try out_types.append(a, try parseValType(t, type_names));
             if (out_names) |n| try n.append(a, null);
         }
+    }
+}
+
+/// Section rank of a type-use / function-header keyword, or null when `kw` is
+/// none of them — which inside a `func` means the body has started.
+fn typeUseRank(kw: []const u8) ?u8 {
+    if (std.mem.eql(u8, kw, "type")) return 1;
+    if (std.mem.eql(u8, kw, "param")) return 2;
+    if (std.mem.eql(u8, kw, "result")) return 3;
+    if (std.mem.eql(u8, kw, "local")) return 4;
+    return null;
+}
+
+/// §6.6.5 orders a type use strictly — at most one `(type x)`, then every
+/// `(param …)`, then every `(result …)` — and §6.6.13 puts a function's
+/// `(local …)` groups after all three. `seen` is the highest rank consumed so
+/// far.
+///
+/// ⚠️ **Every site parsed these in ANY order and any repetition.** So
+/// `(func (result i32) (param i32) (i32.const 0))` — an explicit
+/// `assert_malformed` in five core files — assembled into an ordinary
+/// `[i32] -> [i32]` function. The order is not decoration: it is what makes the
+/// abbreviated form readable without backtracking, and 22 corpus assertions
+/// pin it.
+fn typeUseOrder(seen: *u8, rank: u8) Error!void {
+    // `param`/`result`/`local` may repeat, so an equal rank is a violation only
+    // for the at-most-once `(type …)`.
+    if (rank < seen.* or (rank == 1 and seen.* >= 1)) return error.BadModuleField;
+    seen.* = rank;
+}
+
+/// §6.6.5: when a type use gives BOTH `(type x)` and an inline `(param …)` /
+/// `(result …)`, the inline form is a CHECK on `C.types[x]`, not extra
+/// information — it must reproduce that type exactly.
+///
+/// ⚠️ Ignoring it let `(func (type $sig) (result i32) …)`, with `$sig` being
+/// `[i32] -> [i32]`, assemble against `$sig` while the source declared
+/// `[] -> [i32]`. The function then had a parameter its own text denied.
+fn checkInlineTypeUse(sigs: *const List(Sig), type_ref: u32, params: []const V, results: []const V) Error!void {
+    if (params.len == 0 and results.len == 0) return; // nothing inline to check
+    if (type_ref >= sigs.items.len) return; // a bad index is a downstream verdict
+    const sig = sigs.items[type_ref];
+    if (!std.mem.eql(V, sig.params, params) or !std.mem.eql(V, sig.results, results))
+        return error.BadModuleField;
+}
+
+/// §6.6.13 — reject a repeated identifier in one namespace. Anonymous entries
+/// (`null`) never collide. Hash-set rather than the obvious O(n²) scan: a
+/// binaryen-optimized module carries tens of thousands of named functions, and
+/// `decode → validate → instantiate` is a first-class metric here.
+fn checkUniqueNames(a: std.mem.Allocator, names: []const ?[]const u8) Error!void {
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(a);
+    try seen.ensureTotalCapacity(a, @intCast(names.len));
+    for (names) |n| {
+        const nm = n orelse continue;
+        if (seen.getOrPutAssumeCapacity(nm).found_existing) return error.DuplicateName;
     }
 }
 
@@ -1703,12 +1851,25 @@ fn parseCallIndirectType(ctx: *Ctx, items: []const Sexpr, start: usize) Error!st
     var type_ref: ?Sexpr = null;
     var params: List(V) = .empty;
     var results: List(V) = .empty;
+    var seen: u8 = 0;
     while (j < items.len and items[j].keyword() != null) : (j += 1) {
         const kw = items[j].keyword().?;
-        if (std.mem.eql(u8, kw, "type")) type_ref = try nth(try wantList(items[j]), 1) else if (std.mem.eql(u8, kw, "param")) try parseDecls(ctx.a, (try wantList(items[j])), &params, null, ctx.type_names) else if (std.mem.eql(u8, kw, "result")) try parseDecls(ctx.a, (try wantList(items[j])), &results, null, ctx.type_names) else break;
+        const rank = typeUseRank(kw) orelse break;
+        if (rank == 4) break; // `local` is not part of a type use
+        try typeUseOrder(&seen, rank);
+        // No local context here, so no `(param $x …)` — see `parseDecls`.
+        switch (rank) {
+            1 => type_ref = try nth(try wantList(items[j]), 1),
+            2 => try parseDecls(ctx.a, (try wantList(items[j])), &params, null, ctx.type_names, false),
+            else => try parseDecls(ctx.a, (try wantList(items[j])), &results, null, ctx.type_names, false),
+        }
     }
-    const idx = if (type_ref) |tr| try resolveType(ctx.type_names, tr) else try internSig(ctx.a, ctx.sigs, params.items, results.items);
-    return .{ .idx = idx, .table = table, .next = j };
+    if (type_ref) |tr| {
+        const idx = try resolveType(ctx.type_names, tr);
+        try checkInlineTypeUse(ctx.sigs, idx, params.items, results.items);
+        return .{ .idx = idx, .table = table, .next = j };
+    }
+    return .{ .idx = try internSig(ctx.a, ctx.sigs, params.items, results.items), .table = table, .next = j };
 }
 
 /// True if the form is a `call_indirect` type annotation: `(type …)` /
@@ -1730,7 +1891,7 @@ fn emitCallIndirect(ctx: *Ctx, op: Op, type_index: u32, table: u32) Error!void {
 fn emitFoldedSelect(ctx: *Ctx, l: []const Sexpr) Error!void {
     var j: usize = 1;
     var tys: List(V) = .empty;
-    while (j < l.len and eqKw(l[j], "result")) : (j += 1) try parseDecls(ctx.a, (try wantList(l[j])), &tys, null, ctx.type_names);
+    while (j < l.len and eqKw(l[j], "result")) : (j += 1) try parseDecls(ctx.a, (try wantList(l[j])), &tys, null, ctx.type_names, false);
     while (j < l.len) j = try emitOne(ctx, l, j); // operands
     try emitSelect(ctx, tys.items);
 }
@@ -1999,7 +2160,7 @@ fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Erro
         .select => {
             var j = i + 1;
             var tys: List(V) = .empty;
-            while (j < items.len and eqKw(items[j], "result")) : (j += 1) try parseDecls(ctx.a, (try wantList(items[j])), &tys, null, ctx.type_names);
+            while (j < items.len and eqKw(items[j], "result")) : (j += 1) try parseDecls(ctx.a, (try wantList(items[j])), &tys, null, ctx.type_names, false);
             try emitSelect(ctx, tys.items);
             return j;
         },
@@ -2117,17 +2278,22 @@ fn parseBlockTypeSig(ctx: *Ctx, l: []const Sexpr, j: *usize) Error!BlockTy {
     var type_ref: ?u32 = null;
     var params: List(V) = .empty;
     var results: List(V) = .empty;
+    var seen: u8 = 0;
     while (j.* < l.len) {
         const kw = l[j.*].keyword() orelse break;
-        if (std.mem.eql(u8, kw, "type")) {
-            type_ref = try resolveType(ctx.type_names, try nth(try wantList(l[j.*]), 1));
-        } else if (std.mem.eql(u8, kw, "param")) {
-            try parseDecls(ctx.a, try wantList(l[j.*]), &params, null, ctx.type_names);
-        } else if (std.mem.eql(u8, kw, "result")) {
-            try parseDecls(ctx.a, try wantList(l[j.*]), &results, null, ctx.type_names);
-        } else break;
+        const rank = typeUseRank(kw) orelse break;
+        if (rank == 4) break; // `local` is not part of a type use
+        try typeUseOrder(&seen, rank);
+        // A block has no local context, so `(block (param $x i32) …)` is
+        // malformed even though the same spelling is fine on a `func`.
+        switch (rank) {
+            1 => type_ref = try resolveType(ctx.type_names, try nth(try wantList(l[j.*]), 1)),
+            2 => try parseDecls(ctx.a, try wantList(l[j.*]), &params, null, ctx.type_names, false),
+            else => try parseDecls(ctx.a, try wantList(l[j.*]), &results, null, ctx.type_names, false),
+        }
         j.* += 1;
     }
+    if (type_ref) |tr| try checkInlineTypeUse(ctx.sigs, tr, params.items, results.items);
     return .{ .type_ref = type_ref, .sig = .{ .params = params.items, .results = results.items } };
 }
 
@@ -2563,9 +2729,11 @@ fn emitSimd(ctx: *Ctx, sd: SimdOp, items: []const Sexpr, start: usize, is_folded
             lane = try simdLaneByte(items[j]);
             j += 1;
         },
+        // A shuffle index is a `laneidx` too — same rule, so the same parser.
+        // A second copy of it is a second place to be incomplete.
         .shuffle => for (0..16) |k| {
             if (j >= items.len) return error.BadImmediate;
-            cbytes[k] = std.math.cast(u8, @as(u32, @bitCast(@as(i32, @truncate(try parseWatI32(items[j])))))) orelse return error.BadImmediate;
+            cbytes[k] = try simdLaneByte(items[j]);
             j += 1;
         },
         .const_ => j = try parseV128Const(items, j, &cbytes),
@@ -2631,8 +2799,17 @@ fn emitSimd(ctx: *Ctx, sd: SimdOp, items: []const Sexpr, start: usize, is_folded
 /// Parse a SIMD lane / shuffle index atom into a byte (the decoder range-checks
 /// it against the op's lane count). `(i32x4.extract_lane 999)` -> `BadImmediate`
 /// rather than an `@intCast(u32->u8)` overflow (UB in ReleaseFast).
+///
+/// ⚠️ **A `laneidx` is `u8` — a NAT, so a sign is not part of the literal.**
+/// `(i32x4.replace_lane +3 …)` used to assemble as lane 3 because this went
+/// through `parseWatI32`, whose grammar is `sign? uN`. Leading zeros and `_`
+/// separators stay legal (`03`, `0x0_7`); only the sign goes.
 fn simdLaneByte(s: Sexpr) Error!u8 {
-    return std.math.cast(u8, @as(u32, @bitCast(@as(i32, @truncate(try parseWatI32(s)))))) orelse error.BadImmediate;
+    const atom = s.asAtom() orelse return error.BadImmediate;
+    if (atom.len > 0 and (atom[0] == '+' or atom[0] == '-')) return error.BadImmediate;
+    if (!validIntLit(atom)) return error.BadImmediate;
+    const v = std.fmt.parseInt(u32, atom, 0) catch return error.BadImmediate;
+    return std.math.cast(u8, v) orelse error.BadImmediate;
 }
 
 /// Map an atomic (`0xFE`) mnemonic to its sub-opcode, or null. The rmw/cmpxchg
@@ -3273,15 +3450,17 @@ fn parseTagType(a: std.mem.Allocator, items: []const Sexpr, start: usize, sigs: 
     var type_ref: ?u32 = null;
     var params: List(V) = .empty;
     var results: List(V) = .empty;
+    var seen: u8 = 0;
     while (j < items.len) : (j += 1) {
         const tkw = items[j].keyword() orelse break;
-        if (std.mem.eql(u8, tkw, "type")) {
-            type_ref = try resolveType(type_names, try nth(try wantList(items[j]), 1));
-        } else if (std.mem.eql(u8, tkw, "param")) {
-            try parseDecls(a, (try wantList(items[j])), &params, null, type_names);
-        } else if (std.mem.eql(u8, tkw, "result")) {
-            try parseDecls(a, (try wantList(items[j])), &results, null, type_names);
-        } else break;
+        const rank = typeUseRank(tkw) orelse break;
+        if (rank == 4) break; // `local` is not part of a type use
+        try typeUseOrder(&seen, rank);
+        switch (rank) {
+            1 => type_ref = try resolveType(type_names, try nth(try wantList(items[j]), 1)),
+            2 => try parseDecls(a, (try wantList(items[j])), &params, null, type_names, true),
+            else => try parseDecls(a, (try wantList(items[j])), &results, null, type_names, false),
+        }
     }
     return resolveTagSig(a, sigs, type_ref, params.items, results.items);
 }
@@ -3292,13 +3471,7 @@ fn parseTagType(a: std.mem.Allocator, items: []const Sexpr, start: usize, sigs: 
 /// inline signature. Shared by imported (`parseTagType`) and defined tags.
 fn resolveTagSig(a: std.mem.Allocator, sigs: *List(Sig), type_ref: ?u32, params: []const V, results: []const V) Error!u32 {
     if (type_ref) |tr| {
-        // Guard the index — a malformed numeric type index is caught downstream at
-        // decode/validate; here we only cross-check when both forms are present.
-        if ((params.len != 0 or results.len != 0) and tr < sigs.items.len) {
-            const sig = sigs.items[tr];
-            if (!std.mem.eql(V, sig.params, params) or !std.mem.eql(V, sig.results, results))
-                return error.BadModuleField;
-        }
+        try checkInlineTypeUse(sigs, tr, params, results);
         return tr;
     }
     return try internSig(a, sigs, params, results);
@@ -3467,6 +3640,18 @@ test "assembler rejects malformed forms without indexing out of bounds" {
     // `@intCast(u32→u8)`-overflow (UB in ReleaseFast).
     try std.testing.expectError(error.BadImmediate, assemble(a, "(module (func (i32x4.extract_lane 999)))"));
     try std.testing.expectError(error.BadImmediate, assemble(a, "(module (func (i8x16.shuffle 999 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0)))"));
+    // A `laneidx` is `u8`, a NAT — a sign is not part of the literal, in either
+    // the lane or the shuffle position.
+    for ([_][]const u8{
+        "(module (func (result i32) (i32x4.extract_lane +3 (v128.const i32x4 0 0 0 0))))",
+        "(module (func (result i32) (i8x16.extract_lane_u +0x0f (v128.const i8x16 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0))))",
+        "(module (func (i8x16.shuffle +1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0)))",
+    }) |src| {
+        try std.testing.expectError(error.BadImmediate, assemble(a, src));
+    }
+    // …but leading zeros and `_` separators stay legal in that position.
+    _ = try assemble(a, "(module (func (result i32) (i32x4.extract_lane 03 (v128.const i32x4 0 0 0 0))))");
+    _ = try assemble(a, "(module (func (result i32) (i16x8.extract_lane_u 0x0_7 (v128.const i16x8 0 0 0 0 0 0 0 0))))");
 }
 
 test "parser rejects a deeply-nested paren bomb instead of overflowing the stack" {
@@ -6307,4 +6492,113 @@ test "a tail call's results must be the calling function's results" {
         try validate(a, &m);
         try std.testing.expectEqual(@as(i32, 7), interp.asI32(try assembleAndRun(ok, "f", &.{})));
     }
+}
+
+test "R9: a type use is ORDERED — (type) then param* then result*" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sig = "(type $sig (func (param i32) (result i32)))";
+    for ([_][]const u8{
+        // Every permutation the corpus pins, in a `func`…
+        "(module " ++ sig ++ " (func (type $sig) (result i32) (param i32) (i32.const 0)))",
+        "(module " ++ sig ++ " (func (param i32) (type $sig) (result i32) (i32.const 0)))",
+        "(module " ++ sig ++ " (func (param i32) (result i32) (type $sig) (i32.const 0)))",
+        "(module " ++ sig ++ " (func (result i32) (type $sig) (param i32) (i32.const 0)))",
+        "(module " ++ sig ++ " (func (result i32) (param i32) (type $sig) (i32.const 0)))",
+        "(module (func (result i32) (param i32) (i32.const 0)))",
+        // …and in a `call_indirect` type use.
+        "(module " ++ sig ++ " (table 0 funcref) (func (result i32)" ++
+            " (call_indirect (result i32) (param i32) (i32.const 0) (i32.const 0))))",
+        // A second `(type …)` is not a repetition the grammar allows.
+        "(module " ++ sig ++ " (func (type $sig) (type $sig) (i32.const 0)))",
+        // §6.6.13: locals come after the whole type use.
+        "(module (func (local i32) (param i32)))",
+        "(module (func (local i32) (result i32) (local.get 0)))",
+        // §6.6.4: a `functype` in a type definition is ordered too.
+        "(module (type (func (result i32) (param i32))))",
+    }) |src| {
+        try std.testing.expectError(error.BadModuleField, assemble(a, src));
+    }
+    // The ordered spellings still assemble, including repeated groups.
+    _ = try assemble(a, "(module " ++ sig ++ " (func (type $sig) (param i32) (result i32) (local i64) (local.get 0)))");
+    _ = try assemble(a, "(module (type (func (param i32 i32) (param i64) (result f32) (result f64))))");
+    // A `(param …)` after a FOLDED instruction is malformed, but the same form
+    // after a flat `block` atom is that block's type — see `parseFunc`.
+    try std.testing.expectError(error.BadModuleField, assemble(a, "(module (func (nop) (local i32)))"));
+    _ = try assemble(a, "(module (func (result i32) (nop) block (result i32) (i32.const 1) end))");
+    // …and a flat type use CHAINS off another one, which is why the permission
+    // is carried forward rather than tested against the single previous item.
+    _ = try assemble(a, "(module (table 1 funcref) (func (result i32) unreachable select (result i32) (result)))");
+    _ = try assemble(a, "(module (type $proc (func)) (table 1 funcref)" ++
+        " (func block i32.const 0 call_indirect (type $proc) (param) (result) end))");
+}
+
+test "R9: a type use's inline signature must reproduce the type it names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "(module (type $sig (func)) (func (type $sig) (result i32) (i32.const 0)))",
+        "(module (type $sig (func (param i32) (result i32))) (func (type $sig) (result i32) (i32.const 0)))",
+        "(module (type $sig (func (param i32) (result i32))) (func (type $sig) (param i32) (i32.const 0)))",
+        "(module (type $sig (func (param i32 i32) (result i32)))" ++
+            " (func (type $sig) (param i32) (result i32) (unreachable)))",
+    }) |src| {
+        try std.testing.expectError(error.BadModuleField, assemble(a, src));
+    }
+    // An inline form that AGREES is the legal redundant spelling.
+    _ = try assemble(a, "(module (type $sig (func (param i32) (result i32)))" ++
+        " (func (type $sig) (param i32) (result i32) (local.get 0)))");
+}
+
+test "R9: parameter ids bind only where locals exist" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "(module (func (i32.const 0) (block (param $x i32) (drop))))",
+        "(module (func (i32.const 0) (loop (param $x i32) (drop))))",
+        "(module (func (i32.const 0) (i32.const 1) (if (param $x i32) (then (drop)) (else (drop)))))",
+        "(module (table 0 funcref) (func (call_indirect (param $x i32) (i32.const 0) (i32.const 0))))",
+        "(module (type (func (result $x i32))))", // `result` never takes an id
+        "(module (func (param $x i32 i64)))", // the named form declares ONE type
+    }) |src| {
+        try std.testing.expectError(error.BadModuleField, assemble(a, src));
+    }
+    // A func and a type definition ARE binding positions for a parameter id.
+    _ = try assemble(a, "(module (func (param $x i32) (drop (local.get $x))))");
+    _ = try assemble(a, "(module (type (func (param $x i32) (result i32))))");
+}
+
+test "R9: an identifier may not be bound twice in one namespace" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "(module (func $foo) (func $foo))",
+        // …and the rule spans imports and definitions, which is exactly the pair
+        // a per-append-site check would miss.
+        "(module (import \"\" \"\" (func $foo)) (func $foo))",
+        "(module (import \"\" \"\" (func $foo)) (import \"\" \"\" (func $foo)))",
+        "(module (global $foo i32 (i32.const 0)) (global $foo i32 (i32.const 0)))",
+        "(module (import \"\" \"\" (global $foo i32)) (global $foo i32 (i32.const 0)))",
+        "(module (memory $foo 1) (memory $foo 1))",
+        "(module (import \"\" \"\" (memory $foo 1)) (memory $foo 1))",
+        "(module (table $foo 1 funcref) (table $foo 1 funcref))",
+        "(module (import \"\" \"\" (table $foo 1 funcref)) (table $foo 1 funcref))",
+        // Params and locals share one namespace.
+        "(module (func (param $foo i32) (param $foo i32)))",
+        "(module (func (param $foo i32) (local $foo i32)))",
+        "(module (func (local $foo i32) (local $foo i32)))",
+        // A struct's fields are their own namespace.
+        "(module (type (struct (field $x i32) (field $x i32))))",
+    }) |src| {
+        try std.testing.expectError(error.DuplicateName, assemble(a, src));
+    }
+    // At most one start section (§2.5.9) — not a name clash, the same family.
+    try std.testing.expectError(error.BadModuleField, assemble(a, "(module (func $a (unreachable)) (func $b (unreachable)) (start $a) (start $b))"));
+    // Distinct names in the same space, and the same name in DIFFERENT spaces,
+    // both stay legal.
+    _ = try assemble(a, "(module (func $a) (func $b) (global $a i32 (i32.const 0)) (memory $a 1))");
 }

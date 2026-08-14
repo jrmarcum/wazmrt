@@ -134,6 +134,30 @@
 # `any.convert_extern` with their decode/validate/execute arms, `popPushVals`, and
 # `closingLabelId`.
 
-wazmrt.exe  953344
-wazmrt.lib  1016766
-wazmrt.dll  878592
+# RAISED 2026-08-14 (R9 — the accept-invalid class in the TEXT front end). Measured ReleaseSmall,
+# Zig 0.16.0, x86_64-windows: `zig build dll` then a plain `zig build`, the same sequence on both
+# sides so the static lib is the real one and not the DLL's import library.
+#
+#   artifact     at 6a9dc9b (pre-R9)     after R9      R9's share
+#   wazmrt.exe              953,344       956,928          +3,584
+#   wazmrt.lib            1,016,760     1,020,890          +4,130
+#   wazmrt.dll              878,592       882,176          +3,584
+#
+# ✅ All of it is R9's: the pre-R9 commit measures EXACTLY at its exe/dll ceilings and 6 bytes under
+# the lib one, verified in a worktree before these numbers were touched. No inherited drift.
+#
+# ⚠️ The DLL moves by the same +3,584 as the exe, and that is the point of the pass rather than an
+# accident: `wazmrt_module_new_wat` and `wazmrt_wat_to_wasm` are shipped C-ABI entry points, so the
+# text front end IS embed weight. Every rule R9 adds is one an embedder's `.wat` input now gets
+# checked against — which is the whole safety argument for doing the item at all.
+#
+# What bought the bytes, and note that four of the nine causes cost almost nothing because they
+# DELETE leniency rather than add machinery: `typeUseOrder` + `typeUseRank` + `checkInlineTypeUse`
+# threaded through the five type-use sites; `checkUniqueNames` (a `StringHashMapUnmanaged` over each
+# index space, chosen over the obvious O(n²) scan because a binaryen module carries tens of
+# thousands of named functions and startup is a first-class metric here); `parseQuotedId` plus the
+# `reserved`/`stringchar` rules in the lexer; and `parseDecls`'s `allow_id` parameter.
+
+wazmrt.exe  956928
+wazmrt.lib  1020890
+wazmrt.dll  882176
