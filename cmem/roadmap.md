@@ -182,18 +182,25 @@ call-then-return, so the one property the proposal exists to provide (unbounded 
 **A feature can be present, tested, and green while failing at exactly the thing it is for.** Same
 family as the memory64 "COMPLETE" claim above.
 
-### 🎯 REVISED conformance list (2026-08-12) — the 275, now **207** after R1–R5 + R10
+### 🎯 REVISED conformance list (2026-08-12) — the 275, now **133** after R1–R5 + R10 + R9
 
 Successor to the T-list above, and built differently: every item below is grouped **by cause**, from a
 run with `-Dfailures=600` so all 275 failures were read, not just each file's first. The T-list was
 grouped by first-failure text and mislabelled three of its five items.
 
-⚠️ **The per-item counts below are as-triaged (275 total) and are NOT live.** R1–R5 and R10 are done, R6 was
-closed by R3 and R8 by R5 — corpus is **207 failures / 62,737 passing / 1,013 skipped** (measured
-2026-08-13, after R10). **LIVE SPLIT: 98 by design + 109 actionable** (R9 85, R7 18, R10 residue 32
- is in the skip column not the failure one, legacy EH 2, misc 4). Every count below is high;
-re-measure before trusting any of them
-(`-Dfailures=600`, diff the per-file summary against the previous run).
+⚠️ **The per-item counts below are as-triaged (275 total) and are NOT live.** R1–R5, R10 and R9 are
+done, R6 was closed by R3 and R8 by R5 — corpus is **133 failures / 62,825 passing / 998 skipped**
+(measured 2026-08-14, after R9). **LIVE SPLIT: 98 by design + 35 actionable** — R7 **15**, legacy EH
+**2**, and **18** core singletons (`br_on_cast`/`br_on_cast_fail` 2 each, `ref_test` 2, `imports4` 2,
+`table_grow` 2, plus one each in `call_indirect64`, `extern`, `global`, `obsolete-keywords`,
+`ref_cast`, `ref_null`, `return_call_ref`, `table64`). Every count below is high; re-measure before
+trusting any of them (`-Dfailures=600`, diff the per-file summary against the previous run).
+
+⚠️ **R9 WAS FILED AT 85 AND MEASURED 71 — the standing "counts are stale" warning has now fired in
+the LOW direction too.** Every previous correction (R1 25→38, R2 35→44, R3 10→16, R5 23→1,291) was an
+UNDERCOUNT, which quietly trained the habit of reading the warning as "expect worse". R10 had closed
+some of R9's members as a side effect and nobody re-measured. **Stale is stale in both directions;
+the instruction is to re-measure, not to pad.**
 
 ⚠️ **THE FAILURE COUNT WENT UP AT R5 AND THAT IS THE PASS WORKING.** 143 → 216 while passes went
 61,429 → 62,333 and skips 2,407 → 1,429: R5 implemented `(module quote …)`, so 978 assertions that
@@ -215,9 +222,10 @@ are not defects and there is nothing to fix unless the scope changes:
 the two above, so the "101 by design / 92 actionable" split written on 2026-08-12 was off by two in
 both directions. Corrected here rather than propagated.
 
-**LIVE SPLIT after R10 (2026-08-13): 207 failures = 98 by design + 109 actionable** — R9 **85**,
-R7 **18**, legacy EH **2**, misc **4**. R10's residue (32) now sits in the SKIP column, not the
-failure one: `ref_null` 27 and `id` 5 are files whose first module still will not build.
+**LIVE SPLIT after R9 (2026-08-14): 133 failures = 98 by design + 35 actionable** — R7 **15**,
+legacy EH **2**, core singletons **18**. R10's residue is now half closed: `id` 5 went with R9 (the
+quoted-`$"…"` identifier form, forced into scope — see below), leaving `ref_null` 27 skipped behind
+its unbuildable first module, which needs the bottom-type lattice change.
 
 **The actionable items, most valuable first:**
 
@@ -232,14 +240,94 @@ failure one: `ref_null` 27 and `id` 5 are files whose first module still will no
 | **R7** 🟡 | threads | 15 → **18** | `proposals/threads/imports.wast` 13, `memory.wast` 5 (R5 unblocked 3 more). Mostly shared-memory import matching, plus **12 accept-invalids** — the only ones left outside core and the untargeted proposals, so R4's safety argument applies here. ⚠️ **R1 did NOT touch it** despite being "adjacent": those 13 are limits/`shared`-flag matching, not type identity. |
 | **R8** ⚠️ | **UTF-8 name validation is UNVERIFIED** | 0 failures | ✅ **CLOSED 2026-08-13 by R5 — it was the runner's gap, and the answer was "all 176 pass".** `utf8-invalid-encoding.wast` was 0/0/**176 skipped** because every assertion in it is an `assert_malformed (module quote …)`, and the runner could not build a quoted module. Implementing that form ran all 176 and they pass: UTF-8 name validation was genuinely correct, and had simply never been checked. **The question the item asked — "is the skip the runner's gap or ours?" — was the right one, and R5 answers it.** |
 | **R10** 🔴 | **first-module failures that BLACK OUT whole files** | 13 failures / ~420 skips | ✅ **FIXED 2026-08-13 — 416 assertions unblocked for +1.5 KB, the best ratio of the series.** Six causes; see below. Residue: `ref_null` 27 + `id` 5, both diagnosed. *(Original entry: )* **Opened 2026-08-13 (R5's residue). Highest value left, by a wide margin.** Nine core files fail on their FIRST module and take the whole file into `NoTarget`: `br_table.wast` **161 skipped** (a `TypeMismatch` on `(block (drop (i32.ctz (br_table 0 0 …))))` — br_table in a polymorphic position), `ref_test` **66**, `simd_lane` **51**, `ref_cast` **40**, `ref_null` **32** (`(ref.null exn)` — `abstractHeapCode` has no `exn` entry, a ONE-LINE gap), `br_on_cast`/`br_on_cast_fail` **25 each**, `extern` **16** (`extern.convert_any`/`any.convert_extern` have no mnemonic in the assembler although the decoder and interpreter both implement them — the producer/consumer pair again), `id` (exotic and quoted `$"…"` identifiers). ⚠️ **13 failures, ~420 assertions suppressed** — the R3/R5 shape for the third time: **a single-digit failure count next to a triple-digit skip count is a blackout.** |
-| **R9** 🟠 | **NEW — accept-invalid in the TEXT front end** | **85** | 🆕 **Opened 2026-08-13; this is R5's output.** The class R4 closed for the binary decoder, on the surface the corpus could not reach until `(module quote …)` ran. Groups: **35** type-use ordering (`(if (type $sig) (result i32) (param i32) …)` in `func`/`call_indirect`/`return_call_indirect`), **15** token separation (`(data"a")` needs whitespace between a keyword and a string — `token.wast`), **8** SIMD lane rules, and ~27 spread over `table`/`memory`/`type`/`global`/`id`/`start`/`struct`/`block`/`if`/`loop`/`obsolete-keywords`. Same safety argument as R4: `wasm_module_validate` is a shipped C-ABI entry point. |
+| **R9** 🟠 | **accept-invalid in the TEXT front end** | 85 → **71** | ✅ **FIXED 2026-08-14 — 70 of 71 closed, nine causes, and the item was OVER-counted for the first time in the series.** The one left is `anyfunc`, a deliberate recorded deviation (see below). *(Original entry: )* 🆕 **Opened 2026-08-13; this is R5's output.** The class R4 closed for the binary decoder, on the surface the corpus could not reach until `(module quote …)` ran. Groups: **35** type-use ordering (`(if (type $sig) (result i32) (param i32) …)` in `func`/`call_indirect`/`return_call_indirect`), **15** token separation (`(data"a")` needs whitespace between a keyword and a string — `token.wast`), **8** SIMD lane rules, and ~27 spread over `table`/`memory`/`type`/`global`/`id`/`start`/`struct`/`block`/`if`/`loop`/`obsolete-keywords`. Same safety argument as R4: `wasm_module_validate` is a shipped C-ABI entry point. |
 
-**Recommended order: ~~R1~~ → ~~R2~~ → ~~R3~~ → ~~R4~~ → ~~R5~~ → R10 → R9 → R7.** ~~R6 closed by
-R3~~, ~~R8 closed by R5~~.
+**Recommended order: ~~R1~~ → ~~R2~~ → ~~R3~~ → ~~R4~~ → ~~R5~~ → ~~R10~~ → ~~R9~~ → R7.** ~~R6
+closed by R3~~, ~~R8 closed by R5~~.
 
-**Recommended order after R10: R9 → R7.** R9 is 85 real defects but they are 85 separate refusals to
-write; R7 is 18 and self-contained. **The ordering rule this list keeps re-learning: rank by
-assertions unblocked, not by failures closed** — R10 proved it again, closing 416 for +1.5 KB.
+**Recommended order after R9: R7 (15, threads), then the 18 core singletons.** R7 is self-contained —
+shared-memory import matching plus 6 accept-invalids, the only ones left outside the untargeted
+proposals. The 18 singletons have no common cause yet and need triaging one by one; the biggest
+single prize is not in the failure column at all but in `ref_null.wast`'s **27 skipped**, which wants
+distinct bottom types in `types.zig` (`nullfuncref`/`nullexternref` are folded onto
+`funcref`/`externref`, losing the bottom-ness that lets them flow into a concrete `(ref null $t)`).
+**The ordering rule this list keeps re-learning: rank by assertions unblocked, not by failures
+closed** — R10 proved it again, closing 416 for +1.5 KB.
+
+### ✅ R9 IS DONE (2026-08-14) — 70 of 71 closed, nine causes, +3,584 bytes
+
+**Corpus 207 → 133 failures, 62,737 → 62,825 passing, 1,013 → 998 skipped.** No file gained a
+failure; fourteen went entirely clean — `block`, `call_indirect`, `func`, `id`, `if`, `loop`,
+`memory`, `return_call_indirect`, `simd_lane`, `start`, `struct`, `table`, `token`, `type` — and
+`global` 4 → 1, `proposals/threads/memory` 5 → 2. **Accept-invalid in core spec files is back to
+ZERO** except the one deliberate deviation below.
+
+*(The totals move by −1 overall, and that is arithmetic, not a lost assertion: a `(module …)` command
+that FAILS to build scores a failure, while one that succeeds scores nothing. `id.wast`'s first
+module now builds, so it stopped being counted at all.)*
+
+| | cause | count | what it was |
+| --- | --- | --- | --- |
+| C1 | **A type use was parsed in ANY order and any repetition** | **22** | §6.6.5 is `('(' 'type' x ')')? param* result*`, and §6.6.13 puts `local*` after all three. Five sites each had their own loop with no ordering at all, so `(func (result i32) (param i32) …)` assembled into an ordinary `[i32] -> [i32]` function. Now one `typeUseRank` + `typeUseOrder` pair, shared. |
+| C2 | **An inline signature beside `(type x)` was IGNORED, not checked** | **3** | §6.6.5 makes the inline form a *check* on `C.types[x]`. `(func (type $sig) (result i32) …)` with `$sig = [i32] -> [i32]` bound to `$sig` while its own text declared `[] -> [i32]` — a function with a parameter its source denied. |
+| C3 | **`(param $x …)` accepted where no local context exists** | **6** | An id binds a local, so it is legal only in a `func`, a `(type (func …))` and a tag. A block type and a `call_indirect` type use have none. Plus `(result $x i32)`, which is never legal anywhere. |
+| C4 | **No index space checked its identifiers for uniqueness** | **16** | §6.6.13. func/global/memory/table/local/struct-field, each silently keeping the last binding. |
+| C5 | **A string abutting another token lexed as two tokens** | **14** | §6.2.1 `reserved ::= (idchar \| string)+` — `(data"a")` is ONE reserved token, and no production accepts `reserved`. |
+| C6 | **A SIMD lane index went through the signed literal grammar** | **7** | `laneidx ::= u8`, a nat. `(i32x4.replace_lane +3 …)` assembled as lane 3. |
+| C7 | **`(start …)` could be written twice** | **1** | The second overwrote the first, so the module ran a start function its own source did not name first. |
+| C8 | **A bare `$` was an identifier** | **1** | `id ::= '$' idchar+ \| '$' string` — both alternatives require content. |
+| C9 | **`$"…"` quoted identifiers did not lex** | (R10 residue) | Forced into scope by C5 — see below. Closed `id.wast` entirely (0/2/5 → clean). |
+
+⚠️ **C2's rule already existed — for tags only, and had done since 2026-07-27.** `resolveTagSig`
+carried the exact comparison, with a comment citing the typeuse rule, while `func`,
+`call_indirect`, `return_call_indirect` and block types all ignored their inline forms. **This is
+R10's C1 again at one remove** (`extern.convert_any` implemented for const-exprs but not for
+function bodies): *a rule implemented for one of the places it applies reads, from the code, as
+implemented.* The fix was to lift the tag's private check into a shared `checkInlineTypeUse` and
+call it from all five sites — the same move as R3's `isRefType`/`shorthandRefType` merge.
+
+⚠️ **C4 is checked ONCE PER SPACE after parsing, not at each append site, and that is the whole
+point.** Every wasm index space is filled from two places — an import and a definition — and
+§6.6.13's rule spans both, so `(import "" "" (memory $foo 1))` next to `(memory $foo 1)` is the
+duplicate that a per-site check structurally cannot see. Six of the sixteen assertions are exactly
+that pair. **When a rule is about a namespace, check the namespace, not the writers.**
+
+⚠️ **C5 BROKE THE HARNESS, because the harness and the modules share one lexer.** Making a string
+abutting an idchar a `reserved` token turned `id.wast` from a scored file into a whole-file *runner
+error*: the `.wast` script itself contains `$"007"`, which under the new rule is `$` + string with no
+separator. So the fix for R9's token-separation group forced implementing `$"…"` quoted identifiers
+— R10's residue, filed as a separate item — in the same pass, and with it §6.2.1's `stringchar` rule
+(a RAW control byte in a string literal is malformed; `\t` is how that byte is spelled). Quoted ids
+normalise to `$` ++ the decoded bytes, so `(br $"007")` finds `block $007` with no change to any
+name lookup. **A stricter rule in a shared front end is also a stricter rule for everything that
+reads the tests.**
+
+⚠️ **A grammar rule drawn against the FOLDED syntax broke two modules in the FLAT one.** Rejecting a
+`(param …)`/`(result …)`/`(local …)` after a function's body starts is right — but in flat syntax
+`block`, `loop`, `if`, `select` and `call_indirect` are bare *atoms* and their type use is a
+SIBLING, not a child. Worse, it chains: `select (result i32) (result)` and
+`call_indirect (type $proc) (param) (result)` are both in the corpus. The first cut ("must follow an
+atom") cost `select.wast` and `stack.wast` a module each; the rule is now "carry the permission
+forward". **A text-format rule has two spellings to satisfy, and the flat one is where the
+sibling-vs-child distinction is visible at all.**
+
+⚠️ **`anyfunc` is the ONE R9 assertion deliberately left failing** (`obsolete-keywords.wast` L40).
+It is the pre-standard spelling of `funcref`, accepted on purpose since 2026-07-21 and recorded in
+`known-issues.md`; two real `.wat` files in the wasmtk corpus
+(`ArtOfWebAssembly_tests/Chapter3/table_export.wat`, `table_test.wat`) use it, so removing it would
+break input the project actually runs. Reversing a recorded compatibility decision is the owner's
+call, not a conformance-pass side effect. **Left failing and labelled, not quietly "fixed".**
+
+⚠️ **`annotations.wast` still errors out as a whole file** — it did before R9 too
+(`UnexpectedChar` → now `ReservedToken`), so it is not a regression, but the error moved. The file
+is the custom-annotations proposal (`(@a …)` with deliberately exotic tokens) and is untargeted.
+
+**Verification, and one trap worth keeping.** All eight new checks were confirmed by inverting the
+implementation and watching the specific test fail. ⚠️ **Two of the eight inversions produced no
+failing test because they did not COMPILE** — commenting out a check left a parameter unused, which
+Zig rejects, and a build that never ran looks identical to an inversion that no test caught. **An
+inversion has to be checked for compiling before its silence means anything.** (A third near-miss:
+the "which tests failed" grep missed a test whose *name* contains an apostrophe.)
 
 ### ✅ R10 IS DONE (2026-08-13) — 416 assertions unblocked, six causes, +1,536 bytes
 

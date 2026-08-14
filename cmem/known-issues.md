@@ -918,6 +918,16 @@ Measured against the real `.wat` corpus at `wasmtk/tests` (**493 files**): assem
   `(memory.size $nope)` ran against memory 0 — the sole silent acceptor among index spaces. Now: unknown
   name → `UnknownIdentifier`, non-zero index → `UnsupportedInstr`.
 - **`anyfunc`** (pre-standard spelling of `funcref`) accepted; assembles byte-identically.
+  ⚠️ **UPGRADED 2026-08-14 to a KNOWN, DELIBERATE spec deviation with a corpus assertion against
+  it.** `obsolete-keywords.wast` L40 (`(global $g anyfunc (ref.null func))`) asserts the module is
+  malformed, and wazmrt accepts it — the single R9 assertion left failing, and the only
+  accept-invalid remaining in any core spec file. It is kept because two real `.wat` inputs the
+  project actually runs use it (`ArtOfWebAssembly_tests/Chapter3/table_export.wat` and
+  `table_test.wat` in the wasmtk corpus), so removing it trades one conformance assertion for two
+  broken inputs. **Reversing this is an owner decision, not a conformance-pass side effect** — which
+  is why R9 left it failing and labelled rather than quietly "fixing" it. If the trade is ever
+  taken, the change is one entry in `stringToValType` plus `isRefType` in `wat.zig`, and the test
+  "anyfunc is accepted as the pre-standard spelling of funcref" has to be inverted with it.
 - **Legacy folded `try`/`catch` — assembler AND validator.** The interpreter has executed legacy
   (older-LLVM) EH since Phase 6.3, but the assembler had no text form for it (`(try (do …) (catch $t …)
   (catch_all …))` was `UnknownInstr`) and the VALIDATOR had no arms for `try_`/`catch_`/`catch_all`/

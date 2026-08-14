@@ -278,6 +278,15 @@ so there is no licence or NOTICE that has to travel with the artifact.
 > `wazmrt_wat_to_wasm()` if you would rather cache the binary; parsing text costs
 > more per module than decoding one, so the win is the edit-run loop.)
 >
+> The text front end holds `.wat` to the spec grammar, not just to what it can
+> make sense of: type uses are ordered (`(type …)`, then every `(param …)`, then
+> every `(result …)`), an inline signature written beside `(type $x)` must
+> reproduce that type, identifiers must be unique within an index space, and
+> tokens must be separated (`(data"a")` is rejected). If you have `.wat` that an
+> older wazmrt accepted and this one refuses, it is text the reference
+> implementation rejects too — with one deliberate exception, the pre-standard
+> `anyfunc` spelling of `funcref`, which stays accepted.
+>
 > **Host callbacks get a caller handle.** `wazmrt_caller_read`/`_write` read and
 > write *guest* memory from inside the callback, which is what essentially every
 > real host import needs.

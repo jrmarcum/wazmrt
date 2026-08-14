@@ -281,6 +281,33 @@ bad", that is not the same as "the code is correct"; go back to the spec, not to
 written and stale the moment R1 landed; they now say so explicitly rather than reading as current. —
 `roadmap.md`
 
+**Stale is stale in BOTH directions.** Five consecutive items were undercounts (R1 25→38, R2 35→44,
+R3 10→16, R5 23→1,291), which trained "as-triaged" to read as "expect worse". R9 was filed at 85 and
+measured 71, because R10 had closed some of its members as a side effect. The instruction is
+re-measure, not pad. — R9, `roadmap.md`
+
+**An inversion that does not COMPILE is indistinguishable from an inversion nothing caught.** Two of
+R9's eight test inversions reported no failing test because commenting out the check left a function
+parameter unused — a hard error in Zig — so the build never ran, and the "which tests failed" grep
+matched nothing either way. Assert the build succeeded before reading an inversion's silence. — R9,
+`testing.md`
+
+**A rule about a NAMESPACE belongs on the namespace, not on the writers.** Every wasm index space is
+filled from two places — an import and a definition — and the uniqueness rule spans both, so a
+per-append-site check structurally cannot see `(import "" "" (memory $foo 1))` beside
+`(memory $foo 1)`. One pass over each finished space caught all sixteen. — R9, `wat.zig`
+
+**When a front end is shared with the test harness, tightening it tightens the harness.** R9's
+`reserved`-token rule was correct for modules and turned an entire `.wast` file into a runner error,
+because the script and the modules inside it go through one lexer. Budget for that: the fix pulled a
+separately-filed item into the same pass. — R9, `text-toolchain.md`
+
+**A rule implemented for one of the places it applies reads, from the code, as implemented.** R10
+found `extern.convert_any` living only in const-exprs; R9 found the same shape one level up — the
+"an inline signature must match its `(type $x)`" check existed for tags alone, since 2026-07-27,
+while funcs, block types and both `call_indirect` forms silently ignored theirs. Grep for the
+sibling contexts before believing a rule is in force. — R9/R10, `roadmap.md`
+
 **A stated BENEFIT is a hypothesis about someone else's code** — verify it against the code, not the
 docs, before adopting anything. — `design-decisions.md`, the adoption checklist in
 `third_party/LICENSES.md`

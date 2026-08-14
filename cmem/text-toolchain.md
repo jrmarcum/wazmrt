@@ -190,6 +190,33 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
 
 ## Notes / invariants
 
+- ⚠️ **THE TEXT GRAMMAR IS A SPEC SURFACE, NOT A CONVENIENCE (R9, 2026-08-14).**
+  Until R9 the assembler treated `.wat` syntax as something to *accept* — the
+  five type-use sites each had their own loop with no ordering, no uniqueness
+  check on any index space, and no verification that an inline signature written
+  beside `(type $x)` matched it. 71 corpus assertions said otherwise, and the
+  argument is not tidiness: `wazmrt_module_new_wat` and `wazmrt_wat_to_wasm` are
+  shipped C-ABI entry points, so **an embedder's `.wat` gets exactly the checking
+  the assembler does and no more.** The rules now live in one place each —
+  `typeUseRank`/`typeUseOrder` (§6.6.5 ordering), `checkInlineTypeUse` (the
+  inline form is a CHECK on the named type), `checkUniqueNames` (§6.6.13,
+  per-namespace), `parseDecls(…, allow_id)` (a parameter id binds a local, so it
+  is legal only where locals exist) — and every site calls them.
+- ⚠️ **A text-format rule has TWO spellings to satisfy, and the flat one is where
+  the mistakes are (R9).** In folded syntax a block type is nested inside its
+  instruction's list; in flat syntax `block`/`loop`/`if`/`select`/`call_indirect`
+  are bare atoms and their type use is a SIBLING — which also CHAINS
+  (`select (result i32) (result)`, `call_indirect (type $proc) (param) (result)`,
+  both in the corpus). A rule written against the folded form alone cost
+  `select.wast` and `stack.wast` a module each before it was drawn right.
+- ⚠️ **The lexer is shared with the `.wast` HARNESS, so a stricter producer rule
+  is also a stricter harness rule (R9).** Enforcing §6.2.1's
+  `reserved ::= (idchar | string)+` (so `(data"a")` is one token that no
+  production accepts) turned `id.wast` into a whole-file *runner error*, because
+  the script itself writes `$"007"`. That forced `$"…"` quoted identifiers — a
+  separately-filed item — into the same pass. Quoted ids normalise to `$` ++ the
+  decoded bytes, so `(br $"007")` finds `block $007` and **no name lookup
+  anywhere had to learn the form exists**.
 - **Reuse, don't duplicate, the opcode table.** The assembler builds a
   name→`Op` map from `opcode.zig`; the encoder must stay in lockstep with the
   decoder (same authority).
