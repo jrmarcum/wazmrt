@@ -847,11 +847,12 @@ and **not** steady-state throughput; a JIT wins hot loops and this table cannot 
 2026-07-14 bench already recorded exactly that shape). The defensible claim stays *"wasmtime-class
 module compatibility, at a fraction of the footprint, faster on anything not precompiled."*
 
-⚠️ **And the honest caveat the table cannot show: these modules are 55–6,225 bytes.** Cranelift has
-almost nothing to compile, which is *why* the three wasmtime rows converge. On a large module the
-fast-start configurations should separate from the default and the absolute gap should widen — so
-this corpus, if anything, understates the advantage while proving the smaller claim cleanly. Adding
-a large module is the obvious next measurement.
+⚠️ **THAT CAVEAT WAS A PREDICTION AND IT IS NOW MEASURED FALSE — see the `start`-mode entry below.**
+The text here used to say the 55–6,225-byte corpus understated the advantage, and that "on a large
+module the fast-start configurations should separate from the default and the absolute gap should
+widen". Run against a **1.97 MB** module: nothing moves. Kept as written, struck through by the
+measurement, because a prediction that was recorded and then refuted is more useful than one quietly
+deleted.
 
 ⚠️ **A benchmark that mis-invokes a competitor reports that competitor as BROKEN.** The first run
 disqualified wasmer on `add(100, -1)`: the harness omitted the `--` separator, so `-1` parsed as a
@@ -859,9 +860,69 @@ flag. It looked exactly like a wrong answer. **Check a disqualification against 
 believing it** — the same discipline as an audit finding being a hypothesis. Verifying every result
 is still right: a benchmark that does not check its output is measuring the wrong thing.
 
-**wazero is absent from the table on purpose**: it is in wasmtk's cross-runtime list, but its CLI
-runs `_start` only and cannot invoke a named export, so it cannot participate in this comparison at
-all. Recorded so the absence reads as a fact about the tool, not an omission.
+**wazero is absent from the INVOKE table on purpose**: its CLI runs `_start` only and cannot invoke a
+named export. That is why `start` mode exists — see below, where it competes.
+
+### ✅ TRACK 3, SECOND CUT (2026-08-14) — `start` mode, a 210× size ladder, and a prediction refuted
+
+`zig build bakeoff -Dmode=start -Dcorpus=<dir>` runs WASI `_start` programs. It brings **wazero** in
+(its CLI can do nothing else) and **wasmrt**, the sibling competing for the same slot, and it is
+where LARGE modules live. No oracle is privileged: every runtime must produce the same stdout and a
+disagreement is *reported, not adjudicated*.
+
+| runtime | median ms | vs wazmrt |
+| --- | --- | --- |
+| **wazmrt** (Zig, interpreter) | **34.11** | — |
+| **wasmrt** (Rust, interpreter) | 35.79 | **1.05×** |
+| wazero (Go, compiler) | 68.56 | 2.01× |
+| wasmtime `-C compiler=winch` | 82.59 | 2.42× |
+| wasmtime default `opt-level=2` | 82.46 | 2.42× |
+| wasmtime `-O opt-level=0` | 84.34 | 2.47× |
+| wasmer | 86.43 | 2.53× |
+
+⚠️ **THE SIZE LADDER REFUTES THE PREDICTION THIS ROADMAP MADE.** The first cut said the small corpus
+understated the advantage and that a large module would separate the fast-start configs from the
+default. Measured across **9 KB → 1.97 MB, a 210× range**:
+
+| module | bytes | wazmrt | wt:winch | wt:O0 | wt:default | wazero |
+| --- | --- | --- | --- | --- | --- | --- |
+| string-formatting | 9,391 | 34.1 | 80.9 | 80.3 | 85.9 | 58.6 |
+| Phase38Combined | 11,147 | 37.0 | 85.1 | 82.2 | 82.5 | 58.1 |
+| fib-rs-opt | 44,838 | 33.4 | 78.7 | 84.3 | 80.7 | 68.6 |
+| **fib-rs-test** | **1,968,591** | **32.4** | **82.6** | **84.7** | **79.5** | **73.6** |
+
+**Nothing moves.** Cranelift compiles 2 MB inside the noise; the cost is fixed startup for everyone.
+So the honest claim is *narrower and more robust* than predicted: the advantage is **flat in module
+size up to 2 MB**, not growing with it. **A recorded prediction that the measurement refutes is worth
+more than one quietly deleted** — the earlier text is struck in place above.
+
+⚠️ **AND THE RATIO IS LOAD-DEPENDENT; THE DIFFERENCE IS NOT.** The first cut measured 5.3× on a quiet
+machine; these runs, on a loaded one, give 2.4×. Both are honest — but when a fixed per-process cost
+is shared by every entrant, inflating it compresses the *ratio* while leaving the *absolute gap*
+roughly intact (~29 ms then, ~48 ms here). **Quote the difference, or quote the ratio with the load
+conditions attached.**
+
+⚠️ **wasmrt TIES wazmrt** — 1.05× here, 1.02× in invoke mode. The two candidates for the runtime slot
+are equivalent on startup, so **startup is not the differentiator between them**; footprint is
+(wazmrt's DLL is 2.5× smaller, and 269 KB with Track 2c's flags). Worth knowing before any further
+startup work is justified on competitive grounds.
+
+⚠️ **A DIFFERENTIAL FINDING, and it is wasmtime that is alone.** On
+`27_string-formatting.wasm` the runtimes disagree by exactly one byte: the guest's source is
+`console.log(true); console.log(123);` and the correct output has a newline between them.
+
+| implementation | bytes | |
+| --- | --- | --- |
+| wazmrt (Zig) · wasmrt (Rust) · wazero (Go) · wasmer (Rust) · **V8** (node `node:wasi`) | 223 | `true\n123` |
+| **wasmtime 47.0.3** | **222** | `true123` |
+
+**Five independent implementations across four languages agree, including V8** — the reference
+engine, and the one **wasmtk actually runs on**. ⚠️ **The cause is NOT traced**, so this is a
+reproducible observation, not a diagnosis: something about that guest's `fd_write` sequence is
+handled differently by wasmtime. Worth checking into wasmtk (whose
+`dync_cross_runtime_tests.ts` runs output through wasmtime/wasmer/wazero — if it compares stdout
+exactly, it should already see this) and into wasmrt. **The differential check found this on its
+first run, which is the argument for having no privileged oracle.**
 
 ### ✅ TRACK 2c IS DONE (2026-08-14) — the embed artifact is optional-weight now
 

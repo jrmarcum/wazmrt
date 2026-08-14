@@ -357,6 +357,7 @@ pub fn build(b: *std.Build) void {
         bake.addFileArg(b.path("tools/bakeoff.mjs"));
         bake.addArg(corpus orelse "");
         bake.addArg(b.fmt("{d}", .{reps}));
+        bake.addArg(b.option([]const u8, "mode", "`invoke` (exported fn + .test.json) or `start` (WASI _start; brings wazero in and covers LARGE modules)") orelse "invoke");
         bake.has_side_effects = true; // it is a measurement; never serve a cached verdict
         // Needs the CLI built in the mode being measured — benchmarking a Debug
         // build would produce a number that flatters every competitor.

@@ -302,6 +302,23 @@ per-append-site check structurally cannot see `(import "" "" (memory $foo 1))` b
 because the script and the modules inside it go through one lexer. Budget for that: the fix pulled a
 separately-filed item into the same pass. — R9, `text-toolchain.md`
 
+**A RECORDED PREDICTION THAT THE MEASUREMENT REFUTES IS WORTH MORE THAN ONE QUIETLY DELETED.** The
+roadmap predicted a large module would widen wazmrt's startup lead over Cranelift. A 210× size ladder
+(9 KB → 1.97 MB) showed the opposite: nothing moves, so the advantage is FLAT in module size, not
+growing. The narrower claim is the more robust one. The struck text stays in place beside the
+measurement. — Track 3, `roadmap.md`
+
+**A RATIO CAN BE LOAD-DEPENDENT WHILE THE DIFFERENCE IS NOT.** The same benchmark gave 5.3× on a
+quiet machine and 2.4× on a loaded one, because a fixed per-process cost shared by every entrant
+inflates both sides and compresses the ratio — while the absolute gap stayed ~29–48 ms. Quote the
+difference, or quote the ratio with the load conditions attached. — Track 3, `roadmap.md`
+
+**A DIFFERENTIAL CHECK WITH NO PRIVILEGED ORACLE FINDS THINGS A GOLDEN FILE CANNOT.** The bake-off's
+`start` mode requires every runtime to agree rather than trusting one, and found a one-byte
+disagreement on its first run: five implementations including V8 against wasmtime 47.0.3. ⚠️ And the
+discipline continues past the finding — **the cause was not traced, so it is recorded as an
+observation, not a diagnosis**. — `tests/differential/README.md`
+
 **SEQUENTIAL A/B ON A LOADED MACHINE IS NOT A MEASUREMENT — INTERLEAVE, OR DO NOT COMPARE.** The
 type registry appeared to cost +40% startup (6.88 → 9.60 ms median) against a baseline taken an hour
 earlier. Three repeats with **no code change** then climbed 9.60 → 10.65 → 11.49 → 12.90: the box was
