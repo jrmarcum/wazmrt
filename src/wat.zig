@@ -1703,12 +1703,24 @@ fn heapTypeToValType(s: Sexpr, nullable: bool, type_names: []const ?[]const u8) 
         if (ti > V.max_concrete_index) return error.BadImmediate;
         return V.concreteRef(nullable, .@"struct", ti);
     }
-    const pair: ?[2]V = if (std.mem.eql(u8, atom, "func") or std.mem.eql(u8, atom, "funcref") or std.mem.eql(u8, atom, "nofunc"))
+    // ⚠️ Each hierarchy's BOTTOM is its own pair, not its top's. Folding
+    // `nofunc`/`noextern`/`noexn` onto func/extern/exn here made
+    // `(ref.null nofunc)` the same type as `(ref null func)` — which is wrong in
+    // the direction that matters, since only the bottom flows into a concrete
+    // `(ref null $t)`. The binary decoder was corrected in the same pass; these
+    // two are the producer/consumer pair for this type and must not drift.
+    const pair: ?[2]V = if (std.mem.eql(u8, atom, "func") or std.mem.eql(u8, atom, "funcref"))
         .{ .funcref, .funcref_nn }
-    else if (std.mem.eql(u8, atom, "extern") or std.mem.eql(u8, atom, "externref") or std.mem.eql(u8, atom, "noextern"))
+    else if (std.mem.eql(u8, atom, "extern") or std.mem.eql(u8, atom, "externref"))
         .{ .externref, .externref_nn }
-    else if (std.mem.eql(u8, atom, "exn") or std.mem.eql(u8, atom, "exnref") or std.mem.eql(u8, atom, "noexn"))
+    else if (std.mem.eql(u8, atom, "exn") or std.mem.eql(u8, atom, "exnref"))
         .{ .exnref, .exnref_nn }
+    else if (std.mem.eql(u8, atom, "nofunc") or std.mem.eql(u8, atom, "nullfuncref"))
+        .{ .nullfuncref, .nullfuncref_nn }
+    else if (std.mem.eql(u8, atom, "noextern") or std.mem.eql(u8, atom, "nullexternref"))
+        .{ .nullexternref, .nullexternref_nn }
+    else if (std.mem.eql(u8, atom, "noexn") or std.mem.eql(u8, atom, "nullexnref"))
+        .{ .nullexnref, .nullexnref_nn }
     else if (std.mem.eql(u8, atom, "any") or std.mem.eql(u8, atom, "anyref"))
         .{ .anyref, .anyref_nn }
     else if (std.mem.eql(u8, atom, "eq") or std.mem.eql(u8, atom, "eqref"))
@@ -1731,16 +1743,23 @@ fn stringToValType(atom: []const u8) ?V {
     const map = .{
         .{ "i32", V.i32 },             .{ "i64", V.i64 },             .{ "f32", V.f32 },
         .{ "f64", V.f64 },             .{ "v128", V.v128 },
-        .{ "funcref", V.funcref },     .{ "nullfuncref", V.funcref },
+        .{ "funcref", V.funcref },
         // `anyfunc` is the pre-standard spelling of `funcref` (MVP-era tools and
         // hand-written .wat still emit it, e.g. `(table N anyfunc)`).
         .{ "anyfunc", V.funcref },
-        .{ "externref", V.externref }, .{ "nullexternref", V.externref },
+        .{ "externref", V.externref },
         // The WasmGC `any` hierarchy — each shorthand its own value type.
         .{ "anyref", V.anyref },       .{ "eqref", V.eqref },
         .{ "i31ref", V.i31ref },       .{ "structref", V.structref },
-        .{ "arrayref", V.arrayref },   .{ "nullref", V.nullref },
-        .{ "exnref", V.exnref },       .{ "nullexnref", V.exnref },
+        .{ "arrayref", V.arrayref },
+        .{ "exnref", V.exnref },
+        // The four BOTTOMS. `nullfuncref`/`nullexternref`/`nullexnref` used to
+        // map to their family HEAD here, so the shorthand and the `(ref null
+        // nofunc)` long form named different types — and neither could reach a
+        // concrete `(ref null $t)`.
+        .{ "nullref", V.nullref },     .{ "nullfuncref", V.nullfuncref },
+        .{ "nullexternref", V.nullexternref },
+        .{ "nullexnref", V.nullexnref },
     };
     inline for (map) |m| {
         if (std.mem.eql(u8, atom, m[0])) return m[1];
@@ -2072,16 +2091,23 @@ fn emitFoldedTry(ctx: *Ctx, l: []const Sexpr) Error!void {
         if (d.len != 0 and eqAtom(d[0], "delegate")) return error.UnsupportedInstr;
     };
 
+    // §6.5.x (legacy EH): `(try (do …) (catch $t …)* (catch_all …)?)` — AT MOST
+    // ONE `catch_all`, and it is last. Unbounded, `(try (do) (catch_all)
+    // (catch_all))` emitted two `0x19` handlers into one try, which
+    // `legacy/try_catch.wast` pins as malformed.
+    var seen_catch_all = false;
     while (j < l.len) : (j += 1) {
         const cl = l[j].asList() orelse return error.BadImmediate;
         if (cl.len == 0) return error.BadImmediate;
         const ckw = cl[0].asAtom() orelse return error.BadImmediate;
+        if (seen_catch_all) return error.BadImmediate; // nothing may follow `catch_all`
         if (std.mem.eql(u8, ckw, "catch")) {
             if (cl.len < 2) return error.BadImmediate;
             try ctx.out.append(ctx.a, @intFromEnum(Op.catch_));
             try uleb(ctx.a, ctx.out, try resolveByName(ctx.tag_names, cl[1]));
             try emitSeq(ctx, cl[2..]);
         } else if (std.mem.eql(u8, ckw, "catch_all")) {
+            seen_catch_all = true;
             try ctx.out.append(ctx.a, @intFromEnum(Op.catch_all));
             try emitSeq(ctx, cl[1..]);
         } else return error.BadImmediate; // only catch/catch_all/delegate may follow `(do …)`
@@ -3010,6 +3036,17 @@ fn lookupOp(name: []const u8) ?Op {
     var buf: [64]u8 = undefined;
     if (name.len > buf.len) return null;
     for (name, 0..) |c, i| buf[i] = if (c == '.') '_' else c;
+    // ⚠️ **`Op` holds legacy-EH CLAUSE tags (`catch_all` = 0x19) as well as
+    // instructions, and this lookup cannot tell them apart — that is CORRECT and
+    // must stay.** In FLAT legacy syntax `try … catch_all … end` the clause IS a
+    // bare mnemonic in the instruction stream, so filtering it here breaks the
+    // form: a guard added for `(func (catch_all))` cost two corpus passes.
+    // Nothing is lost by allowing it, because `validate.zig`'s `.catch_,
+    // .catch_all` arm rejects a clause whose enclosing frame is not a
+    // `try_legacy`/`catch_legacy` — a stray `catch_all` is `MismatchedCatch`.
+    // **The rule lives in the validator, where both the text and the binary path
+    // reach it; a producer-side filter would have covered only one and broken a
+    // legal spelling.**
     return std.meta.stringToEnum(Op, buf[0..name.len]);
 }
 
@@ -6537,6 +6574,77 @@ test "a tail call's results must be the calling function's results" {
         try validate(a, &m);
         try std.testing.expectEqual(@as(i32, 7), interp.asI32(try assembleAndRun(ok, "f", &.{})));
     }
+}
+
+test "a legacy try takes at most one catch_all, and it comes last" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectError(error.BadImmediate, assemble(a, "(module (func (try (do) (catch_all) (catch_all))))"));
+    try std.testing.expectError(error.BadImmediate, assemble(a, "(module (tag $e) (func (try (do) (catch_all) (catch $e))))"));
+    // One catch_all, last, still assembles — with catches before it.
+    _ = try assemble(a, "(module (tag $e) (func (try (do) (catch $e) (catch_all))))");
+    // ⚠️ And a bare `catch_all` must stay ASSEMBLABLE: in flat legacy syntax the
+    // clause is a mnemonic in the instruction stream. Filtering it out of
+    // `lookupOp` broke that form. The rule that a clause needs an enclosing
+    // `try` belongs to the validator, which rejects this as `MismatchedCatch`
+    // and covers the binary path too.
+    var m = try Module.decode(a, try assemble(a, "(module (tag $e) (func (catch_all)))"));
+    try std.testing.expectError(error.MismatchedCatch, validate(a, &m));
+}
+
+test "each hierarchy's bottom is below its WHOLE hierarchy — and only its own" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const decls =
+        "(module (type $ft (func)) (type $st (struct (field i32)))" ++
+        " (global $null nullref (ref.null none))" ++
+        " (global $nullfunc nullfuncref (ref.null nofunc))" ++
+        " (global $nullexn nullexnref (ref.null noexn))" ++
+        " (global $nullextern nullexternref (ref.null noextern))";
+    // A bottom flows into the CONCRETE types of its own hierarchy — the property
+    // folding it onto the family head destroyed, and the whole of
+    // `ref_null.wast`'s second module.
+    for ([_][]const u8{
+        " (func (export \"f\") (result (ref null $ft)) (global.get $nullfunc)))",
+        " (func (export \"f\") (result (ref null $st)) (global.get $null)))",
+        // …and into its abstract supertypes, which already worked.
+        " (func (export \"f\") (result funcref) (global.get $nullfunc)))",
+        " (func (export \"f\") (result exnref) (global.get $nullexn)))",
+        " (func (export \"f\") (result externref) (global.get $nullextern)))",
+        " (func (export \"f\") (result anyref) (global.get $null)))",
+    }) |tail| {
+        var m = try Module.decode(a, try assemble(a, try std.fmt.allocPrint(a, "{s}{s}", .{ decls, tail })));
+        try validate(a, &m);
+    }
+    // ⚠️ The other direction is the one a flat `== .none` check got wrong: a
+    // bottom belongs to exactly ONE hierarchy. Each of these crosses families.
+    for ([_][]const u8{
+        " (func (export \"f\") (result (ref null $ft)) (global.get $null)))", // any-bottom → concrete func
+        " (func (export \"f\") (result (ref null $st)) (global.get $nullfunc)))", // func-bottom → concrete struct
+        " (func (export \"f\") (result externref) (global.get $nullfunc)))",
+        " (func (export \"f\") (result funcref) (global.get $nullextern)))",
+        " (func (export \"f\") (result anyref) (global.get $nullexn)))",
+    }) |tail| {
+        var m = try Module.decode(a, try assemble(a, try std.fmt.allocPrint(a, "{s}{s}", .{ decls, tail })));
+        try std.testing.expectError(error.TypeMismatch, validate(a, &m));
+    }
+    // A bottom is UNINHABITED except by null, so a real funcref does not test as
+    // one. (`headMatches` keeps saying no; `refHead` no longer folds the target.)
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(
+        "(module (elem declare func $f) (func $f)" ++
+            " (func (export \"g\") (result i32) (ref.test (ref nofunc) (ref.func $f))))",
+        "g",
+        &.{},
+    )));
+    // …while the funcref itself still tests as a funcref.
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(
+        "(module (elem declare func $f) (func $f)" ++
+            " (func (export \"g\") (result i32) (ref.test (ref func) (ref.func $f))))",
+        "g",
+        &.{},
+    )));
 }
 
 test "a tail call's results may be a SUBTYPE of the caller's, not only equal" {

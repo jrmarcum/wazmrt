@@ -1901,7 +1901,25 @@ fn subtypeOf(module: *const Module, sub: V, sup: V) bool {
     // / eqref / anyref); an abstract sub only satisfies a concrete sup when it is
     // the bottom `none`.
     if (sub.isConcrete()) return sub.refHeap().sub(sup.refHeap());
-    if (sup.isConcrete()) return sub.refHeap() == .none;
+    // An abstract sub satisfies a CONCRETE sup only when it is that hierarchy's
+    // bottom. `RefHeap.sub` cannot say this — concrete types are not `RefHeap`
+    // values — so the rule lives here, and the two halves agree by both keying
+    // off `top()`.
+    //
+    // ⚠️ This used to be `== .none` flat, i.e. the ANY hierarchy's bottom for
+    // every concrete target. With `nofunc` folded onto `funcref` that was
+    // consistent and wrong twice over: `nullfuncref` could not reach a
+    // `(ref null $funcType)` (`ref_null.wast`'s whole second module), and
+    // `nullref` — an `any`-family value — would have satisfied a concrete FUNC
+    // type if one had ever been asked for. A bottom belongs to exactly one
+    // hierarchy.
+    if (sup.isConcrete()) {
+        const bottom = sub.refHeap();
+        return switch (bottom) {
+            .none, .nofunc, .noextern, .noexn => bottom.top() == sup.refHeap().top(),
+            else => false,
+        };
+    }
     return sub.refHeap().sub(sup.refHeap());
 }
 

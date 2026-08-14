@@ -639,8 +639,14 @@ pub fn arrayField(self: *const Module, ti: u32) ?FieldType {
 /// index is out of range.
 pub fn refHead(self: *const Module, ht: opcode.HeapType) Error!types.ValType.RefHeap {
     return switch (ht) {
-        .func, .nofunc => .func,
-        .extern_, .noextern => .extern_,
+        .func => .func,
+        .extern_ => .extern_,
+        // Each bottom is its OWN head, not its hierarchy's top — folding them
+        // here made `ref.test (ref nofunc)` answer for any funcref, which
+        // `headMatches` then had to special-case back out.
+        .nofunc => .nofunc,
+        .noextern => .noextern,
+        .noexn => .noexn,
         .any => .any,
         .eq => .eq,
         .i31 => .i31,
@@ -729,8 +735,15 @@ fn readValType(r: *Reader, kinds: []const CompKind) Error!types.ValType {
     const b = try r.readByte();
     return switch (b) {
         0x7f, 0x7e, 0x7d, 0x7c, 0x7b => @enumFromInt(b), // i32 i64 f32 f64 v128
-        0x70, 0x73 => .funcref, // funcref, nullfuncref (nofunc) → func family head
-        0x6f, 0x72 => .externref, // externref, nullexternref (noextern)
+        0x70 => .funcref,
+        0x6f => .externref,
+        // ⚠️ `nullfuncref`/`nullexternref` used to fold onto the family HEAD
+        // (`0x70, 0x73 => .funcref`). A bottom is not its top: folded, it stops
+        // being below the hierarchy's CONCRETE types, so
+        // `(global $nullfunc nullfuncref …)` could not flow into a
+        // `(ref null $t)`. Each bottom is its own value type now.
+        0x73 => .nullfuncref,
+        0x72 => .nullexternref,
         // The WasmGC `any` internal hierarchy (full GC, P3): each abstract head is
         // its own value type, encoded by its real valtype byte.
         0x6e => .anyref,
@@ -747,17 +760,17 @@ fn readValType(r: *Reader, kinds: []const CompKind) Error!types.ValType {
         // `externref` — which the C ABI would then hand out as a host pointer
         // although it is an `exn_store` index.
         0x69 => .exnref,
-        // `nullexnref` — the bottom of the EXN hierarchy. Modelled as `exnref`,
-        // not as `nullref`.
+        // `nullexnref` — the bottom of the EXN hierarchy, its own type.
         //
-        // ⚠️ It was `nullref` (the any-hierarchy bottom) as a "closest modelled
+        // ⚠️ It was `nullref` (the ANY-hierarchy bottom) as a "closest modelled
         // type" approximation, and R10 made that inconsistency load-bearing: once
         // `(ref.null noexn)` decoded to the exn head, the two spellings of the
         // SAME type disagreed and `(global $nullexn nullexnref (ref.null noexn))`
-        // was a TypeMismatch against itself. Two encodings of one type must land
-        // on one value type; picking the wrong FAMILY is the error that shows up
-        // only when both spellings meet.
-        0x74 => .exnref,
+        // was a TypeMismatch against itself. R10 corrected the FAMILY by folding
+        // it onto `exnref`; this corrects the remaining half — a bottom is not
+        // its top. **Two encodings of one type must land on one value type, and
+        // that value type has to be the right one, not merely a consistent one.**
+        0x74 => .nullexnref,
         0x68 => .funcref_nn, // our synthetic non-null tags (assembler round-trip)
         0x67 => .externref_nn,
         0x66 => .anyref_nn,
@@ -801,17 +814,22 @@ fn readHeapTypeRef(r: *Reader, nullable: bool, kinds: []const CompKind) Error!ty
         return types.ValType.concreteRef(nullable, head, ti);
     }
     const both: [2]types.ValType = switch (ht) {
-        -0x10, -0x0d => .{ .funcref, .funcref_nn }, // func, nofunc
-        -0x11, -0x0e => .{ .externref, .externref_nn }, // extern, noextern
+        -0x10 => .{ .funcref, .funcref_nn }, // func
+        -0x11 => .{ .externref, .externref_nn }, // extern
         -0x12 => .{ .anyref, .anyref_nn }, // any
         -0x13 => .{ .eqref, .eqref_nn }, // eq
         -0x14 => .{ .i31ref, .i31ref_nn }, // i31
         -0x15 => .{ .structref, .structref_nn }, // struct
         -0x16 => .{ .arrayref, .arrayref_nn }, // array
+        -0x17 => .{ .exnref, .exnref_nn }, // exn (EH)
+        // The four bottoms, each its own type rather than folded onto its top —
+        // see `readValType` above. This reader and `readValType` must stay in
+        // step: they are the two spellings of the same heap type, and R10's
+        // `nullexnref` incident is what happens when they disagree.
         -0x0f => .{ .nullref, .nullref_nn }, // none
-        -0x17, -0x0c => .{ .exnref, .exnref_nn }, // exn / noexn (EH) — `noexn` is the
-        // bottom of the exn hierarchy and only null inhabits it, so it folds onto
-        // the `exn` head the same way `nofunc`/`noextern` fold above.
+        -0x0d => .{ .nullfuncref, .nullfuncref_nn }, // nofunc
+        -0x0e => .{ .nullexternref, .nullexternref_nn }, // noextern
+        -0x0c => .{ .nullexnref, .nullexnref_nn }, // noexn
         // An undefined heap-type code used to decode as `externref` ("other →
         // opaque"), so a malformed type was thereafter indistinguishable from a
         // real externref in validation, the C-ABI type objects, and the `.wast`

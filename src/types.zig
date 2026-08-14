@@ -59,7 +59,20 @@ pub const ValType = enum(u32) {
     structref = 0x6b,
     arrayref = 0x6a,
     exnref = 0x69, // (ref null exn) — exception references (EH proposal, Phase 6)
-    nullref = 0x71, // (ref null none) — bottom of the `any` hierarchy
+    // The four BOTTOM types, one per hierarchy. Only a null reference inhabits
+    // any of them, but each is a subtype of everything in its hierarchy —
+    // including the concrete types — which is the property that makes
+    // `(func (result (ref null $t)) (global.get $nullfunc))` valid.
+    //
+    // ⚠️ `nullfuncref`/`nullexternref`/`nullexnref` used to be FOLDED onto
+    // `funcref`/`externref`/`exnref` on the reasoning that "only null inhabits
+    // them, so the distinction is unobservable". It is observable exactly where
+    // it matters: folded onto the head, a bottom stops being below the concrete
+    // types and cannot flow into a `(ref null $t)`.
+    nullref = 0x71, // (ref null none)      — bottom of the `any` hierarchy
+    nullfuncref = 0x73, // (ref null nofunc)    — bottom of the `func` hierarchy
+    nullexternref = 0x72, // (ref null noextern)  — bottom of the `extern` hierarchy
+    nullexnref = 0x74, // (ref null noexn)     — bottom of the `exn` hierarchy
     // Non-nullable reference types (`(ref func)`/`(ref i31)`/…, function-references
     // + GC proposals). Synthetic internal tags in an otherwise-unused valtype-byte
     // range — our assembler/decoder round-trip them, and an external binary's
@@ -73,6 +86,12 @@ pub const ValType = enum(u32) {
     arrayref_nn = 0x59,
     nullref_nn = 0x58, // (ref none) — uninhabited but syntactically valid
     exnref_nn = 0x57, // (ref exn) — non-null exception reference
+    // The non-null bottoms — `(ref nofunc)` and friends. Uninhabited (not even
+    // null), but syntactically valid and needed so the nullable/non-null pair
+    // logic in `RefHeap.valType` is total.
+    nullfuncref_nn = 0x56,
+    nullexternref_nn = 0x55,
+    nullexnref_nn = 0x54,
     _,
 
     // --- Concrete typed-reference encoding (high bits of the u32) -------------
@@ -137,7 +156,9 @@ pub const ValType = enum(u32) {
         if (self.isConcrete()) return true;
         return switch (self) {
             .funcref, .externref, .anyref, .eqref, .i31ref, .structref, .arrayref, .exnref, .nullref => true,
+            .nullfuncref, .nullexternref, .nullexnref => true,
             .funcref_nn, .externref_nn, .anyref_nn, .eqref_nn, .i31ref_nn, .structref_nn, .arrayref_nn, .exnref_nn, .nullref_nn => true,
+            .nullfuncref_nn, .nullexternref_nn, .nullexnref_nn => true,
             else => false,
         };
     }
@@ -147,6 +168,7 @@ pub const ValType = enum(u32) {
         if (self.isConcrete()) return @intFromEnum(self) & nullable_bit == 0;
         return switch (self) {
             .funcref_nn, .externref_nn, .anyref_nn, .eqref_nn, .i31ref_nn, .structref_nn, .arrayref_nn, .exnref_nn, .nullref_nn => true,
+            .nullfuncref_nn, .nullexternref_nn, .nullexnref_nn => true,
             else => false,
         };
     }
@@ -166,6 +188,9 @@ pub const ValType = enum(u32) {
             .arrayref => .arrayref_nn,
             .exnref => .exnref_nn,
             .nullref => .nullref_nn,
+            .nullfuncref => .nullfuncref_nn,
+            .nullexternref => .nullexternref_nn,
+            .nullexnref => .nullexnref_nn,
             else => self,
         };
     }
@@ -183,6 +208,9 @@ pub const ValType = enum(u32) {
             .arrayref_nn => .arrayref,
             .exnref_nn => .exnref,
             .nullref_nn => .nullref,
+            .nullfuncref_nn => .nullfuncref,
+            .nullexternref_nn => .nullexternref,
+            .nullexnref_nn => .nullexnref,
             else => self,
         };
     }
@@ -199,6 +227,12 @@ pub const ValType = enum(u32) {
         array,
         none,
         exn, // exception references — its own hierarchy (EH proposal, Phase 6)
+        // The bottoms of the func / extern / exn hierarchies. `none` above is the
+        // `any` family's. Each is below EVERY type in its hierarchy, concrete
+        // types included — see `sub` and `validate.subtypeOf`.
+        nofunc,
+        noextern,
+        noexn,
 
         /// The value type for this heap head at the given nullability (the
         /// collapsed reference representation — concrete refs share their head).
@@ -213,6 +247,9 @@ pub const ValType = enum(u32) {
                 .array => if (is_nullable) .arrayref else .arrayref_nn,
                 .none => if (is_nullable) .nullref else .nullref_nn,
                 .exn => if (is_nullable) .exnref else .exnref_nn,
+                .nofunc => if (is_nullable) .nullfuncref else .nullfuncref_nn,
+                .noextern => if (is_nullable) .nullexternref else .nullexternref_nn,
+                .noexn => if (is_nullable) .nullexnref else .nullexnref_nn,
             };
         }
 
@@ -220,9 +257,9 @@ pub const ValType = enum(u32) {
         /// else `func` / `extern`.
         pub fn top(self: RefHeap) RefHeap {
             return switch (self) {
-                .func => .func,
-                .extern_ => .extern_,
-                .exn => .exn,
+                .func, .nofunc => .func,
+                .extern_, .noextern => .extern_,
+                .exn, .noexn => .exn,
                 else => .any,
             };
         }
@@ -236,7 +273,15 @@ pub const ValType = enum(u32) {
                 .none => b == .i31 or b == .@"struct" or b == .array or b == .eq or b == .any,
                 .i31, .@"struct", .array => b == .eq or b == .any,
                 .eq => b == .any,
-                else => false, // func/extern/any have no proper supertype here
+                // Each hierarchy's bottom is below its whole hierarchy. The
+                // CONCRETE types of a hierarchy are not `RefHeap` values, so
+                // `validate.subtypeOf` carries that half — the two must agree on
+                // which bottom belongs to which family, which is why `top()`
+                // above is the single place that says so.
+                .nofunc => b == .func,
+                .noextern => b == .extern_,
+                .noexn => b == .exn,
+                else => false, // the tops have no proper supertype here
             };
         }
     };
@@ -260,6 +305,9 @@ pub const ValType = enum(u32) {
             .arrayref, .arrayref_nn => .array,
             .exnref, .exnref_nn => .exn,
             .nullref, .nullref_nn => .none,
+            .nullfuncref, .nullfuncref_nn => .nofunc,
+            .nullexternref, .nullexternref_nn => .noextern,
+            .nullexnref, .nullexnref_nn => .noexn,
             else => unreachable,
         };
     }

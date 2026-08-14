@@ -202,6 +202,27 @@
 # still hands `wazmrt_val_t` externrefs to the guest untagged. See `known-issues.md`: the tag
 # closes the defect for the `.wast` runner and leaves the embedder surface for an owner decision.
 
-wazmrt.exe  957952
-wazmrt.lib  1021464
-wazmrt.dll  882176
+# RAISED 2026-08-14 (the BOTTOM-TYPE LATTICE + the legacy-EH clause rule — the last conformance
+# batch). Measured ReleaseSmall, Zig 0.16.0, x86_64-windows: `zig build dll` then a plain
+# `zig build`.
+#
+#   artifact      after batch     after this      share
+#   wazmrt.exe        957,952        958,976     +1,024
+#   wazmrt.lib      1,021,464      1,022,520     +1,056
+#   wazmrt.dll        882,176        882,688       +512
+#
+# Delta-vs-ceiling is delta-vs-parent (the previous entry set these to its measured values).
+#
+# What bought the bytes: three new `RefHeap` variants and six new `ValType` variants with their
+# `top()`/`sub()`/`valType()`/`refHeap()` arms, the decoder's four separate bottom mappings in
+# `readValType` and `readHeapTypeRef`, `subtypeOf`'s hierarchy-keyed concrete-target arm, the
+# assembler's three new shorthand pairs, and a one-flag `catch_all` clause rule. It bought 28
+# assertions (27 of them previously SKIPPED behind `ref_null.wast`'s unbuildable first module) and
+# took every CORE spec file to zero failures.
+#
+# The DLL moves for the first time in three entries: the lattice is decoder + validator +
+# interpreter code, all of which an embedder running a GC module executes.
+
+wazmrt.exe  958976
+wazmrt.lib  1022520
+wazmrt.dll  882688

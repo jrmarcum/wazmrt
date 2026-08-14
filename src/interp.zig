@@ -1612,7 +1612,7 @@ pub const Instance = struct {
             // (`none`, the `any`-hierarchy bottom, was already correct: `refHead`
             // maps it to `.none` and `RefHeap.sub(x, .none)` holds only for
             // `x == .none`.)
-            .nofunc, .noextern => return false,
+            .nofunc, .noextern, .noexn => return false,
             else => {
                 const th = self.module.refHead(target) catch return false;
                 return actual.sub(th);

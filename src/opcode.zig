@@ -375,6 +375,7 @@ pub const HeapType = union(enum) {
     nofunc,
     noextern,
     exn, // exception heap type (EH proposal, Phase 6)
+    noexn, // the bottom of the exn hierarchy — see `types.ValType.RefHeap`
     concrete: u32, // a type index
 };
 
@@ -987,12 +988,14 @@ pub fn readHeapType(r: *Reader) DecodeError!HeapType {
         -0x0d => .nofunc,
         -0x0e => .noextern,
         -0x17 => .exn, // 0x69
-        // `noexn` (0x74) — the bottom of the exn hierarchy. Folded onto the `exn`
-        // head, exactly as `nofunc`/`noextern` fold onto func/extern in
-        // `Module.readHeapTypeRef`: only null inhabits it, so the distinction is
-        // unobservable in this model. Without it `(ref.null noexn)` was
-        // undecodable and `ref_null.wast`'s second module died on it.
-        -0x0c => .exn,
+        // `noexn` (0x74) — the bottom of the exn hierarchy, its OWN head now.
+        // ⚠️ It used to fold onto `exn`, "because only null inhabits it, so the
+        // distinction is unobservable in this model". The distinction is not
+        // unobservable: a bottom type is a subtype of every type in its
+        // hierarchy — including the CONCRETE ones — which is exactly the property
+        // `ref_null.wast` tests and which folding erases. The same correction
+        // applies to `nofunc`/`noextern` below.
+        -0x0c => .noexn,
         else => error.UnsupportedOpcode,
     };
 }
