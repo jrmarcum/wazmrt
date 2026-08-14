@@ -939,6 +939,85 @@ Measured against the real `.wat` corpus at `wasmtk/tests` (**493 files**): assem
   ⚠️ **This is the R1 shape for the third time: the defect existed in both the interpreter and the
   C ABI, the corpus could only ever see the interpreter half, and fixing that half does not sweep
   the other.** Do not read "S1 closed 12 failures" as "the class is closed".
+
+  **↳ RESEARCH, 2026-08-14 — what the sibling projects do, read from their code, not assumed:**
+  - **`wasmtk` does not use `externref` AT ALL.** One mention in the whole repo (`src/utils.ts`), an
+    entry in a **binaryen type-ID table**, and `getTypeName` does not even map it — it falls through
+    to `"unknown"`. wasmtk runs wasm via `WebAssembly.instantiate` (V8) with i32 offsets into linear
+    memory through the bindgen codegen. **The primary consumer is indifferent to this decision.**
+  - **`wasmrt` has the IDENTICAL design** — `WASMRT_EXTERNREF = 5 /* likewise */` with the same
+    *"opaque to the host: pass it back unchanged"* wording, and `Value::from(v.of.ref_)`, a raw
+    pass-through. Its `ref_matches` is structurally identical to wazmrt's pre-S1 version: null →
+    nullable, `I31_TAG` → i31, else `store.gc_heap.get(idx)`. **No host tag.**
+  - ⚠️ **But `wasmrt` does not implement `any.convert_extern` / `extern.convert_any` at all** (empty
+    grep across `wasmrt-core`), so the collision is present in its DESIGN and not reachable in its
+    behaviour. **wazmrt did not introduce the flaw — R10 made the shared flaw reachable** by
+    implementing those two ops (they had existed only in const-exprs). wasmrt inherits the reachable
+    version the moment it implements them, which its "full browser-standard parity" scope requires.
+  - **No consumer needs externref today.** The `universalWasmLoader-*` family reads guest memory
+    through a caller handle (`wasmtime_caller_export_get` + `memory_data`) — i32 offsets, not
+    externrefs. `wasmrt/cmem/known-issues.md` already reasons this way about wazmrt's deferred
+    externref residual: *"likely moot: none of the loaders need them."*
+  - **Consequence for sequencing:** this is a TWO-PROJECT representation decision, not a wazmrt bug
+    fix. The `wasmrt_*` alias header exists so a consumer can A/B the engines by swapping a DLL, so
+    boxing in one and not the other makes the two surfaces differ semantically. Best taken in both
+    at once, and *before* wasmrt implements the convert ops — otherwise wasmrt ships the reachable
+    bug and the surfaces diverge under pressure rather than by design.
+
+- 🔴 **OPEN and RELATED — a GC reference crossing an INSTANCE boundary reads the wrong object.
+  Demonstrated 2026-08-14; same root cause as the entry above.**
+  **Surfaces when:** two linked instances pass a `structref`/`arrayref`/`anyref` between them — an
+  exported global, a shared `anyref` table, or a call parameter.
+  **What it is:** a GC reference value is a **bare index into the READER's per-instance
+  `gc_heap`** (`interp.zig` — `Instance.gc_heap`, by design, `design-decisions.md` §2b). It carries
+  no owner identity, so the reader indexes *its own* heap with a foreign index. Reproducer, run
+  through the `.wast` runner:
+
+  ```
+  (module $A (type $ta (struct (field i32)))
+    (global (export "g") anyref (struct.new $ta (i32.const 111))))
+  (register "A" $A)
+  (module $B (type $tb (struct (field i32)))
+    (global $fromA (import "A" "g") anyref)
+    (global $mine (mut anyref) (ref.null any))
+    (func (export "seed") (global.set $mine (struct.new $tb (i32.const 222))))
+    (func (export "readA") (result i32)
+      (struct.get $tb 0 (ref.cast (ref $tb) (global.get $fromA)))))
+  (assert_return (invoke $B "seed"))
+  (assert_return (invoke $B "readA") (i32.const 111))   ;; -> got 222
+  ```
+
+  ⚠️ **The `ref.cast` SUCCEEDS.** `refMatches` reads the object's type index out of the reader's own
+  heap entry and checks it against the reader's own `comp_types`, so it is self-consistent and
+  cannot notice the substitution. **A check that reads the same wrong table as the thing it checks
+  is not a check** — R2's C1 said this about `checkIndirectType` and funcrefs, in almost these
+  words. This is that bug for the `any` hierarchy.
+  **Severity, stated precisely:** *not* memory unsafety — both `gcObject` and `refMatches` bounds-check,
+  so an index past the reader's heap is a clean trap or a false `ref.test`. It is **reference
+  substitution**: the guest silently gets a different, validly-typed object. That breaks the GC
+  proposal's core guarantee (references are unforgeable and identity-preserving) across a module
+  boundary, and it is a *wrong answer*, which this codebase ranks above a crash.
+  **Why the corpus never caught it:** the spec suite crosses GC references between instances almost
+  nowhere, and `i31` — the one GC reference it does pass around — is TAGGED (bit 63) and therefore
+  immune. The failure needs a heap object, two instances, and the reader holding an object at the
+  same index.
+
+  ⚠️ **THESE TWO ENTRIES ARE ONE DESIGN ISSUE, and that is the useful framing.** wazmrt's
+  `any`-hierarchy value space is `null_ref` | i31 (bit 63) | *everything else*, and "everything
+  else" is a bare `usize` with no kind and no owner:
+
+  | value | tagged? | owner-scoped? | status |
+  | --- | --- | --- | --- |
+  | `i31` | yes (bit 63) | n/a (immediate) | fine |
+  | host `externref` | **since S1** (bit 62) | n/a | fixed in the runner; **raw at the C ABI** |
+  | GC heap object | **no** | **no** — per-instance index | **broken across instances** |
+  | `funcref` | n/a | **yes** — store slot, biased by 1 | fixed by R2 |
+
+  **R2 already solved this exact problem for funcrefs**: a reference value names an ENTITY, not an
+  index, and the entities live in an `interp.Store` shared by everything linked together
+  (`design-decisions.md`, invariant 1). GC objects never got the same treatment. **The principled
+  fix is one change, not two** — give `any`-hierarchy references the same owner-carrying encoding,
+  which subsumes the externref question because a host value then simply is not one of them.
 - **The LEGACY bare memory/table index in a segment** — `(data 0 (i32.const 10) "…")` and
   `(elem 0 (i32.const 1) $f $g)`, the pre-bulk-memory / pre-reference-types spellings of
   `(data (memory 0) …)` / `(elem (table 0) …)`. Accepted deliberately (R7, 2026-08-14), because the
