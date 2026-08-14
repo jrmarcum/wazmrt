@@ -13,6 +13,17 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   `linking.wast` hand out plausible wrong answers, with `call_indirect`'s type check reading the
   callee's type from the same wrong module so it agreed. Full account: `known-issues.md` →
   "Reference identity across a link".
+  ⚠️ **EXTENDED TO THE `any` HIERARCHY 2026-08-14 — and the delay is the lesson.** R2 wrote this
+  invariant and converted only `funcref`. **GC heap references kept "the value is the index"** for
+  another day, and had the identical defect: a `structref` crossing a module boundary indexed the
+  READER's per-instance `gc_heap`, so `ref.cast` succeeded and `struct.get` returned a different
+  object — with `refMatches` reading the type index out of that same wrong entry and therefore
+  agreeing, exactly as `call_indirect`'s check had. A GC reference is now
+  `gcRefValue(owner_slot, index)`, resolved through `Store.resolveGc`. **When an invariant is
+  written down, enumerate every value kind it governs in the same pass** — the reference value
+  space is `null_ref` | i31 (tagged) | host (tagged) | GC object (owner+index) | funcref
+  (owner+index), and three of those five were only made safe one at a time, each after its own
+  incident.
   Three consequences that are load-bearing and easy to undo by accident:
   - **Store slots are TOMBSTONED on `deinit`, never reused.** A stale funcref, or an arbitrary
     integer handed in through the C ABI, must resolve to a clean `error.UndefinedFunc` — never to a

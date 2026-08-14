@@ -302,6 +302,14 @@ per-append-site check structurally cannot see `(import "" "" (memory $foo 1))` b
 because the script and the modules inside it go through one lexer. Budget for that: the fix pulled a
 separately-filed item into the same pass. — R9, `text-toolchain.md`
 
+**WHEN AN INVARIANT IS WRITTEN DOWN, ENUMERATE EVERY VALUE KIND IT GOVERNS IN THE SAME PASS.** R2
+established "a reference value names an ENTITY, not an index" and converted `funcref` only. GC heap
+references kept the old encoding and had the identical cross-instance defect, found a day later —
+same shape, same blind check reading the same wrong table. The value space had five kinds; three
+were made safe one at a time, each after its own incident. **The generalisation is the same one as
+"THREE OF THE FOUR do X": write the table, then fix the row.** — the GC entity fix,
+`design-decisions.md`
+
 **A BENCHMARK THAT MIS-INVOKES A COMPETITOR REPORTS THAT COMPETITOR AS BROKEN.** The bake-off's first
 run disqualified wasmer for a wrong answer; the cause was a missing `--` in the harness, so a
 negative argument parsed as a flag. It was indistinguishable from a real defect. Check a

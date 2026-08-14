@@ -964,8 +964,21 @@ Measured against the real `.wat` corpus at `wasmtk/tests` (**493 files**): assem
     at once, and *before* wasmrt implements the convert ops — otherwise wasmrt ships the reachable
     bug and the surfaces diverge under pressure rather than by design.
 
-- 🔴 **OPEN and RELATED — a GC reference crossing an INSTANCE boundary reads the wrong object.
-  Demonstrated 2026-08-14; same root cause as the entry above.**
+- ✅ **FIXED 2026-08-14 — a GC reference crossing an INSTANCE boundary read the wrong object.**
+  A GC reference is now `gcRefValue(owner_slot, index)` — R2's entity model applied to the `any`
+  hierarchy — resolved through `Store.resolveGc` at every access. **+452 bytes** (lib), and the
+  corpus is byte-identical (62,889 / 104 / 951) because it barely crosses GC references between
+  instances, which is why nothing caught this for months. Regression tests:
+  `tests/gc_cross_instance_repro.wast` (9 assertions) and an in-repo `wast.zig` test, the latter
+  because the `.wast` corpus lives on removable media and cannot gate a commit.
+  ⚠️ **One deliberate residual, matching R2's `definedFuncType` precedent exactly:** the ABSTRACT
+  head travels correctly across instances (`struct`/`array`/`eq`/`any` are properties of the
+  object), but a CONCRETE `(ref $t)` target against a FOREIGN object returns false / traps rather
+  than comparing type indices that mean different things in the two modules (R1). The spec answer
+  for two structurally identical types is *succeed*; deciding it needs `typematch`, which needs an
+  allocator `refMatches` does not have on the cast hot path. **A false negative, loudly, instead of
+  a wrong cast quietly.** Pinned by the reproducer so it is a recorded choice, not a surprise.
+  *(Original report:)*
   **Surfaces when:** two linked instances pass a `structref`/`arrayref`/`anyref` between them — an
   exported global, a shared `anyref` table, or a call parameter.
   **What it is:** a GC reference value is a **bare index into the READER's per-instance

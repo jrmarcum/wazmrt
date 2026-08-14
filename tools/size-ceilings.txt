@@ -259,6 +259,18 @@
 # `root.wasi.…` reference fails there rather than silently rotting the flag. It already earned its
 # keep: `-Dwasi=false` did not compile until six use sites in `capi.zig` were guarded.
 
+# RAISED 2026-08-14 (GC references become owner-carrying — the R2 entity model applied to the `any`
+# hierarchy). exe unchanged 958,976; lib 1,022,520 -> 1,022,972 (+452); dll 882,688 -> 883,200 (+512,
+# i.e. the same +452 rounded up by PE alignment).
+#
+# +452 bytes to close a cross-instance WRONG-ANSWER defect: `Store.resolveGc`, a `GcAddr`, and the
+# owner-slot threading through `allocObject` and the const-expr allocator. The DLL moves because
+# `refMatches`/`gcObject` are on every embedder GC path.
+#
+# Note the fix REPLACES an encoding rather than adding a structure — a bare heap index became
+# (owner, index) in the same 64-bit slot — which is why it is 452 bytes and not a data-structure
+# rewrite. Same shape as R4 coming out smaller: the cheapest fixes change what a value MEANS.
+
 wazmrt.exe  958976
-wazmrt.lib  1022520
-wazmrt.dll  882688
+wazmrt.lib  1022972
+wazmrt.dll  883200

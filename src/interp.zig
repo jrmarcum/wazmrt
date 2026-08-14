@@ -351,6 +351,11 @@ pub const null_ref: Value = std.math.maxInt(u64);
 /// that instance's function index space. This is what a `funcref` denotes.
 pub const FuncAddr = struct { instance: *Instance, index: u32 };
 
+/// The address of a GC heap object: the instance that OWNS it plus the slot in
+/// that instance's heap. The twin of `FuncAddr`, and for the same reason — a
+/// reference value names an ENTITY, not an index into whoever is reading it.
+pub const GcAddr = struct { inst: *Instance, index: usize };
+
 /// The instance set a group of linked instances share, so a reference VALUE
 /// means the same thing to all of them.
 ///
@@ -411,6 +416,22 @@ pub const Store = struct {
         if (slot < self.instances.items.len) self.instances.items[slot] = null;
     }
 
+    /// Resolve a GC reference to the instance that OWNS the object and the
+    /// index within that instance's heap. Null when the value names no live
+    /// object — a dead instance (slots are tombstoned, never reused), an index
+    /// past the owner's heap, or an arbitrary integer off the unvalidated run
+    /// path. Every GC access goes through here, so a stale or forged reference
+    /// is a clean trap rather than a read of someone else's object.
+    pub fn resolveGc(self: *const Store, v: Value) ?GcAddr {
+        if (v == null_ref) return null;
+        const biased = v >> 32;
+        if (biased == 0 or biased > self.instances.items.len) return null;
+        const inst = self.instances.items[@intCast(biased - 1)] orelse return null;
+        const index: u32 = @truncate(v);
+        if (index >= inst.gc_heap.items.len) return null;
+        return .{ .inst = inst, .index = index };
+    }
+
     /// Resolve a funcref value, or null if it is not a live function address.
     pub fn resolve(self: *const Store, v: Value) ?FuncAddr {
         if (v == null_ref) return null;
@@ -430,6 +451,26 @@ pub const Store = struct {
 /// collides with `i31_tag` either.
 pub fn funcRefValue(store_slot: u32, func_index: u32) Value {
     return (@as(Value, store_slot) + 1) << 32 | @as(Value, func_index);
+}
+
+/// Build the reference value for GC heap object `obj_index` of the instance
+/// holding `store_slot` — **the same (owner, index) shape as a funcref**, in the
+/// `any` hierarchy instead of the `func` one. Validation keeps the two
+/// hierarchies apart (`refMatches` dispatches on the target's `top()` before it
+/// reads `v` at all), so one encoding serves both without ambiguity.
+///
+/// ⚠️ **A GC reference used to be a BARE INDEX into the reader's own
+/// `gc_heap`.** The heap is per-instance, so a reference crossing a module
+/// boundary indexed the *reader's* heap with the *writer's* index and silently
+/// produced a different object — `ref.cast` succeeding, `struct.get` returning
+/// the wrong value. `refMatches` could not catch it, because it read the type
+/// index out of that same wrong entry and checked it against the reader's own
+/// types: self-consistent, therefore blind. **R2 fixed exactly this for
+/// funcrefs and recorded the rule — a reference value names an ENTITY, not an
+/// index — but only funcrefs were converted.** This is that rule applied to the
+/// `any` hierarchy, which is where it should have gone at the same time.
+pub fn gcRefValue(store_slot: u32, obj_index: u32) Value {
+    return funcRefValue(store_slot, obj_index);
 }
 
 /// The identity of a tag DEFINED by the instance holding `store_slot`. Same
@@ -1540,25 +1581,33 @@ pub const Instance = struct {
     }
 
     /// Allocate a GC object of type `type_index` (`fields` arena-backed) and
-    /// return its reference value — an index into `gc_heap`. Object indices start
-    /// at 0 and stay small, so a heap reference (bit 63 clear) never collides
-    /// with the `null_ref` sentinel or a tagged i31 (bit 63 set).
+    /// return its reference value — `gcRefValue(owner, index)`, which names the
+    /// OWNING INSTANCE as well as the slot, so the reference keeps meaning after
+    /// it crosses a module boundary.
     fn allocObject(self: *Instance, type_index: u32, fields: []Value) Error!Value {
         const idx = self.gc_heap.items.len;
         if (idx >= self.max_gc_objects) return error.GcHeapExhausted;
         try self.gc_heap.append(self.gpa, .{ .type_index = type_index, .fields = fields });
-        return @intCast(idx);
+        return gcRefValue(self.store_slot, @intCast(idx));
+    }
+
+    /// The heap object a non-null GC reference names, with the instance that
+    /// owns it — resolved through the STORE, so a reference from another module
+    /// reaches its own object rather than whatever sits at that index here.
+    fn gcEntry(self: *Instance, ref: Value) Error!GcAddr {
+        if (ref == null_ref) return error.NullReference;
+        // `ref` is a raw stack value on the unvalidated run path — any integer, a
+        // tagged i31, or a host reference. `resolveGc` validates the owner slot
+        // and the index, so a forged value is a clean trap and never an
+        // arbitrary read/write.
+        const store = self.store;
+        return store.resolveGc(ref) orelse error.GcOutOfBounds;
     }
 
     /// The field/element slice of a non-null GC reference, or a trap on null.
     fn gcObject(self: *Instance, ref: Value) Error![]Value {
-        if (ref == null_ref) return error.NullReference;
-        // `ref` is a raw stack value on the unvalidated run path — it may be any
-        // integer (or a tagged i31). Bounds-check before indexing the heap, else
-        // `struct.set`/`array.set` is an arbitrary-write primitive.
-        const idx = std.math.cast(usize, ref) orelse return error.GcOutOfBounds;
-        if (idx >= self.gc_heap.items.len) return error.GcOutOfBounds;
-        return self.gc_heap.items[idx].fields;
+        const e = try self.gcEntry(ref);
+        return e.inst.gc_heap.items[e.index].fields;
     }
 
     /// Does GC reference value `v` match target reference type `rt`
@@ -1578,14 +1627,29 @@ pub const Instance = struct {
                 // heap-index path, which is the whole point: untagged, this value
                 // indexed `gc_heap` and a host reference read as a struct.
                 if (v & host_tag != 0) return self.headMatches(.any, null, rt.heap);
-                const idx = std.math.cast(usize, v) orelse return false; // wasm32-safe
-                if (idx >= self.gc_heap.items.len) return false; // defensive
-                const obj = self.gc_heap.items[idx];
-                const kind: types.ValType.RefHeap = switch (self.module.comp_types[obj.type_index].kind()) {
+                // Resolve the OWNER through the store — the object may belong to
+                // another instance, and its heap index means nothing here.
+                const e = self.store.resolveGc(v) orelse return false;
+                const obj = e.inst.gc_heap.items[e.index];
+                const kind: types.ValType.RefHeap = switch (e.inst.module.comp_types[obj.type_index].kind()) {
                     .@"struct" => .@"struct",
                     .array => .array,
                     .func => .func,
                 };
+                // ⚠️ **The ABSTRACT head travels; the CONCRETE type index does
+                // not.** `struct`/`array`/`eq`/`any` are properties of the
+                // object, so they answer correctly across instances. A concrete
+                // `(ref $t)` target compares type INDICES, and an index only
+                // means something inside the module that wrote it (R1) — so a
+                // foreign object is refused rather than judged against a number
+                // that means something else here.
+                //
+                // Exactly the trade R2 made for `definedFuncType`: deciding it
+                // properly needs `typematch`, which needs an allocator that
+                // `refMatches` does not have on the cast hot path. **A false
+                // negative, loudly, instead of a wrong cast quietly.** Recorded
+                // in `known-issues.md` with the funcref twin.
+                if (e.inst != self and rt.heap == .concrete) return false;
                 return self.headMatches(kind, obj.type_index, rt.heap);
             },
             .func => return self.headMatches(.func, self.definedFuncType(v), rt.heap),
@@ -4304,15 +4368,20 @@ fn evalConstGc(ctx: ConstCtx, r: *Reader, stack: *[16]Value, sp: *usize) Error!v
     const heap = ctx.gc_heap orelse return error.UnsupportedInstruction;
     const gpa = ctx.gpa orelse return error.UnsupportedInstruction;
 
-    // Allocate a heap object with `fields`; the reference value is its index,
-    // exactly as `Instance.allocObject` assigns it.
+    // Allocate a heap object with `fields`; the reference value names the owning
+    // instance and the slot, exactly as `Instance.allocObject` assigns it. The
+    // slot is already claimed when const-exprs run (`Store.register` happens
+    // before any reference value is built), so an object created during
+    // instantiation is indistinguishable from one created at run time — which is
+    // the property that keeps a global's initializer usable by an importer.
+    const owner_slot = ctx.store_slot orelse return error.UnsupportedInstruction;
     const alloc = struct {
-        fn f(h: *std.ArrayList(Instance.HeapObject), g: std.mem.Allocator, ti: u32, fields: []Value) Error!Value {
+        fn f(h: *std.ArrayList(Instance.HeapObject), g: std.mem.Allocator, slot: u32, ti: u32, fields: []Value) Error!Value {
             const idx = h.items.len;
             // A test helper with no Instance in hand, so it checks the default directly.
             if (idx >= default_max_gc_objects) return error.GcHeapExhausted;
             try h.append(g, .{ .type_index = ti, .fields = fields });
-            return @intCast(idx);
+            return gcRefValue(slot, @intCast(idx));
         }
     }.f;
 
@@ -4328,7 +4397,7 @@ fn evalConstGc(ctx: ConstCtx, r: *Reader, stack: *[16]Value, sp: *usize) Error!v
                 for (fs, 0..) |f, k| obj[k] = packField(f.storage, stack[base + k]);
                 sp.* = base;
             } else for (fs, 0..) |f, k| obj[k] = if (f.storage.unpacked().isRef()) null_ref else 0;
-            try pushConst(stack, sp, try alloc(heap, gpa, ti, obj));
+            try pushConst(stack, sp, try alloc(heap, gpa, owner_slot, ti, obj));
         },
         0x06, 0x07 => { // array.new / array.new_default
             const ti = try r.readVarU32();
@@ -4341,14 +4410,14 @@ fn evalConstGc(ctx: ConstCtx, r: *Reader, stack: *[16]Value, sp: *usize) Error!v
                 sp.* -= 2;
                 const obj = try arena.alloc(Value, len);
                 @memset(obj, init_v);
-                try pushConst(stack, sp, try alloc(heap, gpa, ti, obj));
+                try pushConst(stack, sp, try alloc(heap, gpa, owner_slot, ti, obj));
             } else {
                 if (sp.* < 1) return error.StackUnderflow;
                 const len = @as(u32, @bitCast(asI32(stack[sp.* - 1])));
                 sp.* -= 1;
                 const obj = try arena.alloc(Value, len);
                 @memset(obj, if (f.storage.unpacked().isRef()) null_ref else 0);
-                try pushConst(stack, sp, try alloc(heap, gpa, ti, obj));
+                try pushConst(stack, sp, try alloc(heap, gpa, owner_slot, ti, obj));
             }
         },
         0x08 => { // array.new_fixed <type> <n>
@@ -4360,7 +4429,7 @@ fn evalConstGc(ctx: ConstCtx, r: *Reader, stack: *[16]Value, sp: *usize) Error!v
             const base = std.math.sub(usize, sp.*, n) catch return error.StackUnderflow;
             for (0..n) |k| obj[k] = packField(f.storage, stack[base + k]);
             sp.* = base;
-            try pushConst(stack, sp, try alloc(heap, gpa, ti, obj));
+            try pushConst(stack, sp, try alloc(heap, gpa, owner_slot, ti, obj));
         },
         0x1c => { // ref.i31 — tag the low 31 bits, non-null (no allocation)
             if (sp.* < 1) return error.StackUnderflow;

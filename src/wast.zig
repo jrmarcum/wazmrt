@@ -1276,6 +1276,43 @@ test "runs assert_return and assert_trap over a module" {
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
 
+test "a GC reference crossing an instance boundary names its OWN object" {
+    // ⚠️ Before this, a GC reference was a bare index into the READER's
+    // per-instance `gc_heap`, so B read its own object at A's index: `ref.cast`
+    // SUCCEEDED and `struct.get` returned 222 instead of 111. `refMatches` could
+    // not notice — it took the type index from that same wrong entry and checked
+    // it against B's own types, so it was self-consistent and blind. R2 fixed
+    // exactly this for funcrefs ("a reference names an ENTITY, not an index");
+    // only funcrefs had been converted.
+    //
+    // Kept in-repo as well as in `tests/gc_cross_instance_repro.wast` because the
+    // `.wast` corpus lives on removable media and cannot gate a commit — and
+    // because the spec suite crosses GC references between instances almost
+    // nowhere, which is why nothing caught this for months.
+    const src =
+        \\(module $A (type $ta (struct (field i32)))
+        \\  (global (export "g") anyref (struct.new $ta (i32.const 111))))
+        \\(register "A" $A)
+        \\(module $B (type $tb (struct (field i32)))
+        \\  (global $fromA (import "A" "g") anyref)
+        \\  (global $mine (mut anyref) (ref.null any))
+        \\  (func (export "seed") (global.set $mine (struct.new $tb (i32.const 222))))
+        \\  (func (export "isStruct") (result i32) (ref.test (ref struct) (global.get $fromA)))
+        \\  (func (export "isArray") (result i32) (ref.test (ref array) (global.get $fromA)))
+        \\  (func (export "ownRead") (result i32)
+        \\    (struct.get $tb 0 (ref.cast (ref $tb) (global.get $mine))))
+        \\  (func (export "concreteTest") (result i32) (ref.test (ref $tb) (global.get $fromA))))
+        \\(assert_return (invoke $B "seed"))
+        \\(assert_return (invoke $B "ownRead") (i32.const 222))
+        \\(assert_return (invoke $B "isStruct") (i32.const 1))
+        \\(assert_return (invoke $B "isArray") (i32.const 0))
+        \\(assert_return (invoke $B "concreteTest") (i32.const 0))
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+    try std.testing.expectEqual(@as(usize, 5), s.passed);
+}
+
 test "L1: an import matches a memory/table's CURRENT size, not its declared minimum" {
     // §7.2's `mem_type`/`table_type` read the minimum off the live instance, so a
     // memory declared `(memory 1)` that has GROWN to 2 pages satisfies an
