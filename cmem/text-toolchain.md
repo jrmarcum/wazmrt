@@ -190,6 +190,17 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
 
 ## Notes / invariants
 
+- ⚠️ **TWO LEGACY SEGMENT SPELLINGS ARE ACCEPTED ON PURPOSE (R7, 2026-08-14).**
+  `(data 0 <offset> …)` and `(elem 0 <offset> …)` — a bare `memidx`/`tableidx`
+  where the modern grammar wants `(memory x)` / `(table x)`. The era-pinned
+  `proposals/threads` corpus writes them. **Gated so it cannot loosen anything
+  else: a bare index counts only when an offset form immediately FOLLOWS it** —
+  an offset is always a list and data bytes are always strings, so no modern
+  spelling can collide, and a passive `(elem 0 $f)` is untouched. ⚠️ The reason
+  this had to be *fixed* rather than merely rejected: unrecognised, the data form
+  did not fail — the index and its offset were both dropped and the segment came
+  out **ACTIVE in the source, PASSIVE in the binary**. The byte loop's silent
+  `else => {}` is what hid it; it rejects now.
 - ⚠️ **THE TEXT GRAMMAR IS A SPEC SURFACE, NOT A CONVENIENCE (R9, 2026-08-14).**
   Until R9 the assembler treated `.wat` syntax as something to *accept* — the
   five type-use sites each had their own loop with no ordering, no uniqueness

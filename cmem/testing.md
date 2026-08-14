@@ -81,9 +81,9 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
   validation**, which is strong evidence the type-checker is correct across real, deeply-nested
   control flow (not just the simple `wasm_mod` set).
 
-## 📊 CURRENT spec-testsuite score (measured 2026-08-14, after R1–R5 + R10 + R9)
+## 📊 CURRENT spec-testsuite score (measured 2026-08-14, after R1–R5 + R10 + R9 + R7)
 
-**284 files — 62,825 assertions passed / 133 failed / 998 skipped.** This is the number to quote;
+**284 files — 62,839 assertions passed / 126 failed / 988 skipped.** This is the number to quote;
 every snapshot below it is older and kept as history.
 
 ⚠️ **The failed count ROSE from 143 at R4 and that is an improvement.** R5 implemented
@@ -103,10 +103,23 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
 - **Failure messages carry the source LINE** of the `.wast` command that produced them (`L342: …`),
   added 2026-08-13 via `sexpr.parseAllWithLines`. Before that, matching 35 failures back to their
   assertions was hand work.
-- **133 is not 133 defects: 98 are BY DESIGN** (`custom-descriptors`, `custom-page-sizes`,
-  `wide-arithmetic` — proposals wazmrt does not target, refused honestly) and **35 actionable**,
-  itemised as the R-list in `roadmap.md`: **R7** 15 (threads), legacy EH 2, and 18 core singletons
-  with no common cause yet. R1–R5, R10 and R9 are done; R6 was closed by R3 and R8 by R5.
+- **126 is not 126 defects: 106 are BY DESIGN** and **20 actionable** — legacy EH 2 plus 18 core
+  singletons with no common cause yet, itemised as the R-list in `roadmap.md`. R1–R5, R10, R9 and R7
+  are done; R6 was closed by R3 and R8 by R5.
+- ⚠️ **"BY DESIGN" COVERS TWO OPPOSITE SITUATIONS — do not merge them.** 98 are *untargeted
+  proposals* (`custom-descriptors`, `custom-page-sizes`, `wide-arithmetic`), refused honestly because
+  wazmrt does not implement them. The other 8 are `proposals/threads`, a snapshot pinned to a spec
+  **before** multi-memory and multi-table: it fails because wazmrt *does* implement those and
+  therefore ACCEPTS modules the snapshot calls invalid. **A proposal directory asserts the rules of
+  its own era**, so a failure there can mean the runtime is ahead of the file. Decisive check: those
+  assertions appear nowhere in the main suite (`exports.wast` has them only as commented-out
+  `;; No multiple memories yet.` notes).
+- ✅ **R7 closed its 7 real failures for +438 bytes (2026-08-14), and NONE of them was a threads
+  defect.** ⚠️ **The item was named after its directory and triaged as if the directory were the
+  cause** — its entry blamed "shared-memory import matching", which had been correct since memory64
+  (`limitsFit` compares the `shared` flag); the runner simply had no `spectest.shared_memory` to
+  import. The other two causes were legacy TEXT spellings, `(data 0 <offset> …)` and
+  `(elem 0 <offset> …)`. **Read the failures, not the folder name.**
 - ✅ **R9 closed 70 of its 71** for +3,584 bytes (2026-08-14) — nine causes, fourteen files to zero,
   and **accept-invalid in core spec files is back to ZERO** but for one deliberate deviation
   (`anyfunc`, the pre-standard spelling of `funcref`: kept on purpose, two real `.wat` corpus files
@@ -155,11 +168,11 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
   *exactly* its ceiling; the file was two builds old. **An exactly-zero delta is a timestamp check
   waiting to happen.**
 
-**Unit tests: 615** (`zig build test --summary all`, 2026-08-14 after R9) — 611 pass / 4 skip from
-this repo's own `D:` cwd, **615/615 from an NTFS cwd**, which is the number to quote. R3 added 7,
-R4 4, R5 3, R10 5 and R9 6; each core test raises the printed total by two because the C-ABI target
-re-runs the core suite. `test-safe` 615/615, `test-security` 3/3 (NTFS cwd), size gate green at the
-R9 ceilings.
+**Unit tests: 617** (`zig build test --summary all`, 2026-08-14 after R7) — 613 pass / 4 skip from
+this repo's own `D:` cwd, **617/617 from an NTFS cwd**, which is the number to quote. R3 added 7,
+R4 4, R5 3, R10 5, R9 6 and R7 1; each core test raises the printed total by two because the C-ABI
+target re-runs the core suite. `test-safe` 617/617, `test-security` 3/3 (NTFS cwd), size gate green
+at the R7 ceilings.
 
 ⚠️ **R5's inversion check caught a test that tested the RULE but not that the rule is CONSULTED.**
 The literal-syntax test called `validIntLit`/`validFloatLit` directly, so disabling their *call

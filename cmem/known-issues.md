@@ -917,6 +917,17 @@ Measured against the real `.wat` corpus at `wasmtk/tests` (**493 files**): assem
 - **The memory-index immediate was emitted as 0 WITHOUT being read**, so `(memory.size 7)` and
   `(memory.size $nope)` ran against memory 0 — the sole silent acceptor among index spaces. Now: unknown
   name → `UnknownIdentifier`, non-zero index → `UnsupportedInstr`.
+- **The LEGACY bare memory/table index in a segment** — `(data 0 (i32.const 10) "…")` and
+  `(elem 0 (i32.const 1) $f $g)`, the pre-bulk-memory / pre-reference-types spellings of
+  `(data (memory 0) …)` / `(elem (table 0) …)`. Accepted deliberately (R7, 2026-08-14), because the
+  era-pinned `proposals/threads` corpus writes them and refusing would leave six assertions failing
+  either way. ⚠️ **Bounded so it cannot loosen anything else: a bare index is a memuse/tableuse ONLY
+  when an offset form immediately follows it.** An offset is always a list and data bytes are always
+  strings, so no modern spelling collides, and a passive `(elem 0 $f)` is untouched. ⚠️ **The reason
+  this had to be fixed rather than merely rejected: unrecognised, the data form did not fail — the
+  index and the offset were both dropped and the segment assembled ACTIVE-in-source /
+  PASSIVE-in-binary.** Same family as `anyfunc` below: a pre-standard spelling with an exact modern
+  equivalent, kept for real inputs.
 - **`anyfunc`** (pre-standard spelling of `funcref`) accepted; assembles byte-identically.
   ⚠️ **UPGRADED 2026-08-14 to a KNOWN, DELIBERATE spec deviation with a corpus assertion against
   it.** `obsolete-keywords.wast` L40 (`(global $g anyfunc (ref.null func))`) asserts the module is

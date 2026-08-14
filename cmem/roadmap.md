@@ -182,19 +182,27 @@ call-then-return, so the one property the proposal exists to provide (unbounded 
 **A feature can be present, tested, and green while failing at exactly the thing it is for.** Same
 family as the memory64 "COMPLETE" claim above.
 
-### 🎯 REVISED conformance list (2026-08-12) — the 275, now **133** after R1–R5 + R10 + R9
+### 🎯 REVISED conformance list (2026-08-12) — the 275, now **126** after R1–R5 + R10 + R9 + R7
 
 Successor to the T-list above, and built differently: every item below is grouped **by cause**, from a
 run with `-Dfailures=600` so all 275 failures were read, not just each file's first. The T-list was
 grouped by first-failure text and mislabelled three of its five items.
 
-⚠️ **The per-item counts below are as-triaged (275 total) and are NOT live.** R1–R5, R10 and R9 are
-done, R6 was closed by R3 and R8 by R5 — corpus is **133 failures / 62,825 passing / 998 skipped**
-(measured 2026-08-14, after R9). **LIVE SPLIT: 98 by design + 35 actionable** — R7 **15**, legacy EH
-**2**, and **18** core singletons (`br_on_cast`/`br_on_cast_fail` 2 each, `ref_test` 2, `imports4` 2,
+⚠️ **The per-item counts below are as-triaged (275 total) and are NOT live.** R1–R5, R10, R9 and R7
+are done, R6 was closed by R3 and R8 by R5 — corpus is **126 failures / 62,839 passing / 988
+skipped** (measured 2026-08-14, after R7). **LIVE SPLIT: 106 by design + 20 actionable** — legacy EH
+**2** and **18** core singletons (`br_on_cast`/`br_on_cast_fail` 2 each, `ref_test` 2, `imports4` 2,
 `table_grow` 2, plus one each in `call_indirect64`, `extern`, `global`, `obsolete-keywords`,
 `ref_cast`, `ref_null`, `return_call_ref`, `table64`). Every count below is high; re-measure before
 trusting any of them (`-Dfailures=600`, diff the per-file summary against the previous run).
+
+⚠️ **"By design" now has TWO flavours and they are not the same claim.** 98 are *untargeted
+proposals* (`custom-descriptors`, `custom-page-sizes`, `wide-arithmetic`) — refused honestly because
+wazmrt does not implement them. The other 8 are the opposite: `proposals/threads` is a snapshot
+pinned to a spec **before** multi-memory and multi-table, and it fails because wazmrt implements
+those proposals and therefore *accepts* modules the snapshot calls invalid. **A proposal directory
+asserts the rules of its own era, not today's** — so a failure there can mean the runtime is ahead of
+the file, and reading it as a defect costs real work (it cost R7 two days as an "actionable 8").
 
 ⚠️ **R9 WAS FILED AT 85 AND MEASURED 71 — the standing "counts are stale" warning has now fired in
 the LOW direction too.** Every previous correction (R1 25→38, R2 35→44, R3 10→16, R5 23→1,291) was an
@@ -222,10 +230,10 @@ are not defects and there is nothing to fix unless the scope changes:
 the two above, so the "101 by design / 92 actionable" split written on 2026-08-12 was off by two in
 both directions. Corrected here rather than propagated.
 
-**LIVE SPLIT after R9 (2026-08-14): 133 failures = 98 by design + 35 actionable** — R7 **15**,
-legacy EH **2**, core singletons **18**. R10's residue is now half closed: `id` 5 went with R9 (the
-quoted-`$"…"` identifier form, forced into scope — see below), leaving `ref_null` 27 skipped behind
-its unbuildable first module, which needs the bottom-type lattice change.
+**LIVE SPLIT after R7 (2026-08-14): 126 failures = 106 by design + 20 actionable** — legacy EH **2**,
+core singletons **18**. R10's residue is now half closed: `id` 5 went with R9 (the quoted-`$"…"`
+identifier form, forced into scope — see below), leaving `ref_null` 27 skipped behind its unbuildable
+first module, which needs the bottom-type lattice change.
 
 **The actionable items, most valuable first:**
 
@@ -237,7 +245,7 @@ its unbuildable first module, which needs the bottom-type lattice change.
 | **R4** 🟠 | **Accept-invalid in core files** | ~15 → **12** | ✅ **FIXED 2026-08-13 — five causes, and two of them ALSO caused false rejects.** Core accept-invalid is now **0**. See below. |
 | **R5** 🟡 | **Runner gaps, not wazmrt defects** | 41 → ~23 → **1,291** | ✅ **FIXED 2026-08-13 — and the item was undercounted by 50×.** `(module quote …)` alone was suppressing **1,291 assertions**. See below. |
 | **R6** 🟡 | GC type remainder + `i31` | 20 → 8 → **0** | ✅ **CLOSED 2026-08-13, and R3 closed it without aiming at it.** R1 took `type-subtyping`/`type-rec`; the last 8 were `i31.wast`, and they were not an i31 defect at all — the file uses `(elem $e i31ref …)` and the assembler's `isRefType` listed only `funcref`/`externref`, so the whole segment was misread as func indices. One shorthand-table fix, `i31.wast` 8 → 0. |
-| **R7** 🟡 | threads | 15 → **18** | `proposals/threads/imports.wast` 13, `memory.wast` 5 (R5 unblocked 3 more). Mostly shared-memory import matching, plus **12 accept-invalids** — the only ones left outside core and the untargeted proposals, so R4's safety argument applies here. ⚠️ **R1 did NOT touch it** despite being "adjacent": those 13 are limits/`shared`-flag matching, not type identity. |
+| **R7** 🟡 | threads | 18 → 15 → **7 real** | ✅ **FIXED 2026-08-14 — and NOT ONE of it was a threads defect.** Three causes, all outside the proposal; the other 8 are by design. See below. *(Original entry: )* `proposals/threads/imports.wast` 13, `memory.wast` 5 (R5 unblocked 3 more). Mostly shared-memory import matching, plus **12 accept-invalids** — the only ones left outside core and the untargeted proposals, so R4's safety argument applies here. ⚠️ **R1 did NOT touch it** despite being "adjacent": those 13 are limits/`shared`-flag matching, not type identity. |
 | **R8** ⚠️ | **UTF-8 name validation is UNVERIFIED** | 0 failures | ✅ **CLOSED 2026-08-13 by R5 — it was the runner's gap, and the answer was "all 176 pass".** `utf8-invalid-encoding.wast` was 0/0/**176 skipped** because every assertion in it is an `assert_malformed (module quote …)`, and the runner could not build a quoted module. Implementing that form ran all 176 and they pass: UTF-8 name validation was genuinely correct, and had simply never been checked. **The question the item asked — "is the skip the runner's gap or ours?" — was the right one, and R5 answers it.** |
 | **R10** 🔴 | **first-module failures that BLACK OUT whole files** | 13 failures / ~420 skips | ✅ **FIXED 2026-08-13 — 416 assertions unblocked for +1.5 KB, the best ratio of the series.** Six causes; see below. Residue: `ref_null` 27 + `id` 5, both diagnosed. *(Original entry: )* **Opened 2026-08-13 (R5's residue). Highest value left, by a wide margin.** Nine core files fail on their FIRST module and take the whole file into `NoTarget`: `br_table.wast` **161 skipped** (a `TypeMismatch` on `(block (drop (i32.ctz (br_table 0 0 …))))` — br_table in a polymorphic position), `ref_test` **66**, `simd_lane` **51**, `ref_cast` **40**, `ref_null` **32** (`(ref.null exn)` — `abstractHeapCode` has no `exn` entry, a ONE-LINE gap), `br_on_cast`/`br_on_cast_fail` **25 each**, `extern` **16** (`extern.convert_any`/`any.convert_extern` have no mnemonic in the assembler although the decoder and interpreter both implement them — the producer/consumer pair again), `id` (exotic and quoted `$"…"` identifiers). ⚠️ **13 failures, ~420 assertions suppressed** — the R3/R5 shape for the third time: **a single-digit failure count next to a triple-digit skip count is a blackout.** |
 | **R9** 🟠 | **accept-invalid in the TEXT front end** | 85 → **71** | ✅ **FIXED 2026-08-14 — 70 of 71 closed, nine causes, and the item was OVER-counted for the first time in the series.** The one left is `anyfunc`, a deliberate recorded deviation (see below). *(Original entry: )* 🆕 **Opened 2026-08-13; this is R5's output.** The class R4 closed for the binary decoder, on the surface the corpus could not reach until `(module quote …)` ran. Groups: **35** type-use ordering (`(if (type $sig) (result i32) (param i32) …)` in `func`/`call_indirect`/`return_call_indirect`), **15** token separation (`(data"a")` needs whitespace between a keyword and a string — `token.wast`), **8** SIMD lane rules, and ~27 spread over `table`/`memory`/`type`/`global`/`id`/`start`/`struct`/`block`/`if`/`loop`/`obsolete-keywords`. Same safety argument as R4: `wasm_module_validate` is a shipped C-ABI entry point. |
@@ -245,14 +253,53 @@ its unbuildable first module, which needs the bottom-type lattice change.
 **Recommended order: ~~R1~~ → ~~R2~~ → ~~R3~~ → ~~R4~~ → ~~R5~~ → ~~R10~~ → ~~R9~~ → R7.** ~~R6
 closed by R3~~, ~~R8 closed by R5~~.
 
-**Recommended order after R9: R7 (15, threads), then the 18 core singletons.** R7 is self-contained —
-shared-memory import matching plus 6 accept-invalids, the only ones left outside the untargeted
-proposals. The 18 singletons have no common cause yet and need triaging one by one; the biggest
-single prize is not in the failure column at all but in `ref_null.wast`'s **27 skipped**, which wants
-distinct bottom types in `types.zig` (`nullfuncref`/`nullexternref` are folded onto
-`funcref`/`externref`, losing the bottom-ness that lets them flow into a concrete `(ref null $t)`).
-**The ordering rule this list keeps re-learning: rank by assertions unblocked, not by failures
-closed** — R10 proved it again, closing 416 for +1.5 KB.
+**Recommended order after R9 and R7: the 18 core singletons.** They have no common cause yet and need
+triaging one by one; the biggest single prize is not in the failure column at all but in
+`ref_null.wast`'s **27 skipped**, which wants distinct bottom types in `types.zig`
+(`nullfuncref`/`nullexternref` are folded onto `funcref`/`externref`, losing the bottom-ness that lets
+them flow into a concrete `(ref null $t)`). **The ordering rule this list keeps re-learning: rank by
+assertions unblocked, not by failures closed** — R10 proved it again, closing 416 for +1.5 KB.
+
+### ✅ R7 IS DONE (2026-08-14) — and NOT ONE of its 15 was a threads defect
+
+**Corpus 133 → 126 failures, 62,825 → 62,839 passing, 998 → 988 skipped.**
+`proposals/threads/imports.wast` **91 passed / 13 failed / 10 skipped → 105 / 6 / 0** — every skip
+in the file unblocked. No other file moved in any direction. The 8 that remain are **by design**.
+
+⚠️ **THE ITEM WAS NAMED AFTER ITS DIRECTORY AND TRIAGED AS IF THE DIRECTORY WERE THE CAUSE.** R7 was
+"threads", so its entry said *"mostly shared-memory import matching, plus 12 accept-invalids"*. Both
+halves were wrong, and the atomics/threads implementation had **no defect at all**:
+
+| | cause | count | what it actually was |
+| --- | --- | --- | --- |
+| A1 | **the pre-bulk-memory `(data 0 <offset> …)` spelling** | 4 | The memuse used to be a bare `memidx`, not `(memory x)`. Unrecognised, the `0` fell through to the byte loop (which keeps only strings, and silently dropped it) — and the OFFSET went with it, so **an ACTIVE segment in the source assembled as a PASSIVE one**. `(i32.load (i32.const 10))` read 0 instead of the data. Not a rejection: a silently different module. |
+| A2 | **the pre-reference-types `(elem 0 <offset> …)` spelling** | 2 | Same shape for tables, but loud: `resolveByName` was handed the offset LIST as a function name → `BadImmediate`, killing two whole modules. |
+| A3 | **the runner had no `spectest.shared_memory` export** | 1 (+10 skips) | A HARNESS gap. **Shared-memory import matching was already correct** — `limitsFit` has compared the `shared` flag since memory64 — so the item's stated cause was code that had been right for weeks. There was simply nothing to import. |
+
+⚠️ **8 of the 15 are BY DESIGN and had been counted as actionable for two days.** The
+`proposals/threads` directory is a snapshot pinned to a spec *before multi-memory and multi-table*,
+so it asserts `(module (memory 0) (memory 0))` and
+`(module (table 10 funcref) (table 10 funcref))` are invalid — five "multiple memories" and three
+"multiple tables". wazmrt implements **both** proposals (multi-memory since Phase 7, multi-table
+since reference types), so accepting those modules is correct and refusing them would be a
+regression. Decisive check: **the assertions appear nowhere in the main testsuite** — `exports.wast`
+only carries them as commented-out `;; No multiple memories yet.` notes.
+
+⚠️ **A1 and A2 are the same legacy grammar, and only one of them failed loudly.** That is the whole
+reason A1 sat unnoticed while A2 was visible: a dropped token in a *list of strings* changes the
+segment's MODE and nothing complains, while the same dropped token in a *list of indices* reaches a
+resolver that errors. The data-segment byte loop's `else => {}` is now `else => return
+error.BadModuleField` — **the silent arm is what made the missing memuse invisible, not the missing
+memuse itself.**
+
+**Recognising the legacy forms is a deliberate, bounded leniency** — the `anyfunc` trade again, and
+gated so it cannot loosen anything else: a bare index counts as a memuse/tableuse **only when an
+offset form immediately follows it**. An offset is always a list and data bytes are always strings,
+so no modern spelling can collide, and a passive `(elem 0 $f)` — where the next item is a func id,
+not an offset — is untouched. Recorded in `known-issues.md` beside `anyfunc`.
+
+**Second consecutive OVER-count** (R9 85→71, R7 18→15→7 real). See the warning at the top of this
+list: stale is stale in both directions.
 
 ### ✅ R9 IS DONE (2026-08-14) — 70 of 71 closed, nine causes, +3,584 bytes
 

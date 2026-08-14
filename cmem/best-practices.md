@@ -302,6 +302,24 @@ per-append-site check structurally cannot see `(import "" "" (memory $foo 1))` b
 because the script and the modules inside it go through one lexer. Budget for that: the fix pulled a
 separately-filed item into the same pass. — R9, `text-toolchain.md`
 
+**An item named after a directory gets triaged as if the directory were the cause.** R7 was called
+"threads" and its entry blamed shared-memory import matching. Zero of its fifteen failures were a
+threads defect: the matching had been correct since memory64, the runner just had no
+`spectest.shared_memory` to import, and the rest were two legacy TEXT spellings and eight assertions
+that are by design. Read the failures, not the folder name. — R7, `roadmap.md`
+
+**A proposal directory asserts the rules of ITS OWN ERA, so a failure there can mean the runtime is
+ahead of the file.** `proposals/threads` is pinned to a spec before multi-memory and multi-table and
+therefore fails on wazmrt *accepting* modules it calls invalid. Eight such assertions were carried as
+actionable. The decisive check is whether the main suite makes the same assertion — it does not. —
+R7, `testing.md`
+
+**A dropped token in a list of STRINGS is silent; the same token in a list of INDICES is loud.** The
+identical legacy grammar gap hit `(data 0 …)` and `(elem 0 …)`. The elem one errored at a resolver
+and was obvious; the data one changed the segment's MODE — active in the source, passive in the
+binary — and nothing complained. The silent `else => {}` arm is what hid it, not the missing rule. —
+R7, `wat.zig`
+
 **A rule implemented for one of the places it applies reads, from the code, as implemented.** R10
 found `extern.convert_any` living only in const-exprs; R9 found the same shape one level up — the
 "an inline signature must match its `(type $x)`" check existed for tags alone, since 2026-07-27,
