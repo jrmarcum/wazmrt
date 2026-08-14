@@ -81,9 +81,9 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
   validation**, which is strong evidence the type-checker is correct across real, deeply-nested
   control flow (not just the simple `wasm_mod` set).
 
-## 📊 CURRENT spec-testsuite score (measured 2026-08-14, after R1–R5 + R10 + R9 + R7)
+## 📊 CURRENT spec-testsuite score (measured 2026-08-14 — the R-list is CLOSED)
 
-**284 files — 62,839 assertions passed / 126 failed / 988 skipped.** This is the number to quote;
+**284 files — 62,861 assertions passed / 106 failed / 978 skipped.** This is the number to quote;
 every snapshot below it is older and kept as history.
 
 ⚠️ **The failed count ROSE from 143 at R4 and that is an improvement.** R5 implemented
@@ -103,9 +103,20 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
 - **Failure messages carry the source LINE** of the `.wast` command that produced them (`L342: …`),
   added 2026-08-13 via `sexpr.parseAllWithLines`. Before that, matching 35 failures back to their
   assertions was hand work.
-- **126 is not 126 defects: 106 are BY DESIGN** and **20 actionable** — legacy EH 2 plus 18 core
-  singletons with no common cause yet, itemised as the R-list in `roadmap.md`. R1–R5, R10, R9 and R7
-  are done; R6 was closed by R3 and R8 by R5.
+- **106 is not 106 defects: 102 are BY DESIGN** and **4 actionable** — `ref_null` 1 (the bottom-type
+  lattice, hiding 27 skips), `legacy/try_catch` 1, `legacy/try_delegate` 1 (`delegate`, deliberately
+  refused), `obsolete-keywords` 1 (`anyfunc`, deliberate). **The R-list is CLOSED**: R1–R5, R7, R9,
+  R10 done, R6 closed by R3, R8 by R5, and the singleton batch took the last 22.
+- ⚠️ **THE 18 "CORE SINGLETONS" WERE SIX CAUSES, NOT 18** — worth remembering the next time a
+  remainder looks like an unstructured tail. The two big ones: a host `externref` and a GC heap
+  index shared one value space (12 failures, and `br_on_cast` on an internalized host reference
+  returned another object's FIELD — a forgery primitive), and an import matched a memory/table's
+  DECLARED minimum rather than its live size (4, two of them `UnresolvedImport` on a *different*
+  module that never registered behind the first error).
+- 🔴 **S1's other half is OPEN and the corpus cannot see it.** `capi.zig` still passes a host
+  `externref` through untagged, so an embedder handle of `2` internalizes to GC object #2. Filed in
+  `known-issues.md` as an owner decision (it changes what a `wazmrt_val_t` externref is). **This is
+  the R1 shape for the third time** — do not read a closed conformance count as a closed class.
 - ⚠️ **"BY DESIGN" COVERS TWO OPPOSITE SITUATIONS — do not merge them.** 98 are *untargeted
   proposals* (`custom-descriptors`, `custom-page-sizes`, `wide-arithmetic`), refused honestly because
   wazmrt does not implement them. The other 8 are `proposals/threads`, a snapshot pinned to a spec
@@ -168,11 +179,11 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
   *exactly* its ceiling; the file was two builds old. **An exactly-zero delta is a timestamp check
   waiting to happen.**
 
-**Unit tests: 617** (`zig build test --summary all`, 2026-08-14 after R7) — 613 pass / 4 skip from
-this repo's own `D:` cwd, **617/617 from an NTFS cwd**, which is the number to quote. R3 added 7,
-R4 4, R5 3, R10 5, R9 6 and R7 1; each core test raises the printed total by two because the C-ABI
-target re-runs the core suite. `test-safe` 617/617, `test-security` 3/3 (NTFS cwd), size gate green
-at the R7 ceilings.
+**Unit tests: 627** (`zig build test --summary all`, 2026-08-14 after the singleton batch) — 623 pass / 4 skip from
+this repo's own `D:` cwd, **627/627 from an NTFS cwd**, which is the number to quote. R3 added 7,
+R4 4, R5 3, R10 5, R9 6, R7 1 and the singleton batch 5; each core test raises the printed total by two because the C-ABI
+target re-runs the core suite. `test-safe` 627/627, `test-security` 3/3 (NTFS cwd), size gate green
+at the batch ceilings (+136 bytes of real code for 22 closed failures — five of the six causes REPLACE a rule rather than add one).
 
 ⚠️ **R5's inversion check caught a test that tested the RULE but not that the rule is CONSULTED.**
 The literal-syntax test called `validIntLit`/`validFloatLit` directly, so disabling their *call

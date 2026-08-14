@@ -917,6 +917,28 @@ Measured against the real `.wat` corpus at `wasmtk/tests` (**493 files**): assem
 - **The memory-index immediate was emitted as 0 WITHOUT being read**, so `(memory.size 7)` and
   `(memory.size $nope)` ran against memory 0 — the sole silent acceptor among index spaces. Now: unknown
   name → `UnknownIdentifier`, non-zero index → `UnsupportedInstr`.
+- 🔴 **OPEN — the C ABI hands a host `externref` to the guest UNTAGGED, so it can still be read as
+  a GC heap index. Needs an owner decision (found 2026-08-14, S1).**
+  **Surfaces when:** an embedder passes a `WAZMRT_EXTERNREF` value it invented (a small integer
+  handle, the natural choice) into a guest that does `any.convert_extern` and then
+  `ref.test`/`ref.cast`/`struct.get`.
+  **What it is:** the runtime's `any`-hierarchy value space is `null_ref` | i31 (bit 63) | **GC heap
+  index**. S1 added `interp.host_tag` (bit 62) and applies it in `wast.zig`'s `internExtern`, which
+  closed the whole class for the corpus — but `capi.zig`'s `valToSlots` still does
+  `.funcref, .externref => slots[0] = v.of.ref`, a raw pass-through, and `wazmrt.h` invites exactly
+  that (*"opaque to the host: pass it back unchanged"*). A host value of `2` therefore internalizes
+  to GC object #2. `gcObject` bounds-checks, so a LARGE value is a clean `GcOutOfBounds`; a small
+  one is inside the heap and `ref.cast` succeeds against a real object.
+  **Why it is not fixed here:** the fix is to BOX — intern the host's `u64` into a tagged handle on
+  the way in and unbox on the way out, which is invisible to a host that only passes values back
+  (the documented contract) and is what `internExtern` already does for the runner. But it changes
+  what a `wazmrt_val_t` externref *is*, needs a per-store intern pool with a cap (cf.
+  `max_gc_objects`), and must not break a host passing back a value the GUEST produced
+  (`extern.convert_any` of a struct) — that one has to round-trip as the same reference. **Changing
+  a shipped ABI's value model is an owner decision, not a conformance-pass side effect.**
+  ⚠️ **This is the R1 shape for the third time: the defect existed in both the interpreter and the
+  C ABI, the corpus could only ever see the interpreter half, and fixing that half does not sweep
+  the other.** Do not read "S1 closed 12 failures" as "the class is closed".
 - **The LEGACY bare memory/table index in a segment** — `(data 0 (i32.const 10) "…")` and
   `(elem 0 (i32.const 1) $f $g)`, the pre-bulk-memory / pre-reference-types spellings of
   `(data (memory 0) …)` / `(elem (table 0) …)`. Accepted deliberately (R7, 2026-08-14), because the

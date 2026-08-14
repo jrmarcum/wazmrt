@@ -302,6 +302,25 @@ per-append-site check structurally cannot see `(import "" "" (memory $foo 1))` b
 because the script and the modules inside it go through one lexer. Budget for that: the fix pulled a
 separately-filed item into the same pass. — R9, `text-toolchain.md`
 
+**TWO KINDS OF VALUE MUST NOT SHARE ONE ENCODING SPACE — and the one that bites is the one an
+outsider chooses.** A host `externref` was a bare small integer and so was a GC heap index;
+`any.convert_extern` is identity, so `ref.cast` read a host reference as `gc_heap[i]` and
+`struct.get` returned its fields. The runtime already tagged i31 (bit 63) and biased funcrefs by one
+"so slot 0 is not the integer 0 (which a host could plausibly hand us)" — the same reasoning,
+applied to two of three spaces. **When you tag one value kind to keep it distinct, enumerate all of
+them.** — S1, `interp.zig`
+
+**A remainder that looks like an unstructured tail is usually a handful of causes.** The 18 "core
+singletons" left after the R-list were SIX, and two of them accounted for 16. Triage before
+believing a count, and before deciding an item is not worth a pass. — the singleton batch,
+`roadmap.md`
+
+**One cause wears several failure messages, and some of them name a different subject.** L1's
+declared-vs-live import limit produced two `IncompatibleImportType` failures and two
+`UnresolvedImport` failures — the latter on *later modules* that could not link because the module
+that would have exported to them never registered. A failure list is not a cause list. — the
+singleton batch, `roadmap.md`
+
 **An item named after a directory gets triaged as if the directory were the cause.** R7 was called
 "threads" and its entry blamed shared-memory import matching. Zero of its fifteen failures were a
 threads defect: the matching had been correct since memory64, the runner just had no

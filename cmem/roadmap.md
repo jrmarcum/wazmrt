@@ -182,21 +182,21 @@ call-then-return, so the one property the proposal exists to provide (unbounded 
 **A feature can be present, tested, and green while failing at exactly the thing it is for.** Same
 family as the memory64 "COMPLETE" claim above.
 
-### 🎯 REVISED conformance list (2026-08-12) — the 275, now **126** after R1–R5 + R10 + R9 + R7
+### 🎯 REVISED conformance list (2026-08-12) — the 275, now **106**; the R-list is CLOSED
 
 Successor to the T-list above, and built differently: every item below is grouped **by cause**, from a
 run with `-Dfailures=600` so all 275 failures were read, not just each file's first. The T-list was
 grouped by first-failure text and mislabelled three of its five items.
 
-⚠️ **The per-item counts below are as-triaged (275 total) and are NOT live.** R1–R5, R10, R9 and R7
-are done, R6 was closed by R3 and R8 by R5 — corpus is **126 failures / 62,839 passing / 988
-skipped** (measured 2026-08-14, after R7). **LIVE SPLIT: 106 by design + 20 actionable** — legacy EH
-**2** and **18** core singletons (`br_on_cast`/`br_on_cast_fail` 2 each, `ref_test` 2, `imports4` 2,
-`table_grow` 2, plus one each in `call_indirect64`, `extern`, `global`, `obsolete-keywords`,
-`ref_cast`, `ref_null`, `return_call_ref`, `table64`). Every count below is high; re-measure before
-trusting any of them (`-Dfailures=600`, diff the per-file summary against the previous run).
+⚠️ **The per-item counts below are as-triaged (275 total) and are NOT live. THE WHOLE R-LIST IS
+CLOSED.** R1–R5, R7, R9 and R10 are done, R6 was closed by R3 and R8 by R5, and the singleton batch
+took the remainder — corpus is **106 failures / 62,861 passing / 978 skipped** (measured
+2026-08-14). **LIVE SPLIT: 102 by design + 4 actionable** — `ref_null` 1 (+27 skipped, the
+bottom-type lattice), `legacy/try_catch` 1, `legacy/try_delegate` 1 (`delegate`, deliberately
+refused), `obsolete-keywords` 1 (`anyfunc`, deliberate). Every count below is history; re-measure
+before trusting any of them (`-Dfailures=600`, diff the per-file summary against the previous run).
 
-⚠️ **"By design" now has TWO flavours and they are not the same claim.** 98 are *untargeted
+⚠️ **"By design" has TWO flavours and they are not the same claim.** 94 are *untargeted
 proposals* (`custom-descriptors`, `custom-page-sizes`, `wide-arithmetic`) — refused honestly because
 wazmrt does not implement them. The other 8 are the opposite: `proposals/threads` is a snapshot
 pinned to a spec **before** multi-memory and multi-table, and it fails because wazmrt implements
@@ -230,7 +230,7 @@ are not defects and there is nothing to fix unless the scope changes:
 the two above, so the "101 by design / 92 actionable" split written on 2026-08-12 was off by two in
 both directions. Corrected here rather than propagated.
 
-**LIVE SPLIT after R7 (2026-08-14): 126 failures = 106 by design + 20 actionable** — legacy EH **2**,
+**LIVE SPLIT after the singleton batch (2026-08-14): 106 failures = 102 by design + 4 actionable** — legacy EH **2**,
 core singletons **18**. R10's residue is now half closed: `id` 5 went with R9 (the quoted-`$"…"`
 identifier form, forced into scope — see below), leaving `ref_null` 27 skipped behind its unbuildable
 first module, which needs the bottom-type lattice change.
@@ -253,12 +253,51 @@ first module, which needs the bottom-type lattice change.
 **Recommended order: ~~R1~~ → ~~R2~~ → ~~R3~~ → ~~R4~~ → ~~R5~~ → ~~R10~~ → ~~R9~~ → R7.** ~~R6
 closed by R3~~, ~~R8 closed by R5~~.
 
-**Recommended order after R9 and R7: the 18 core singletons.** They have no common cause yet and need
-triaging one by one; the biggest single prize is not in the failure column at all but in
-`ref_null.wast`'s **27 skipped**, which wants distinct bottom types in `types.zig`
-(`nullfuncref`/`nullexternref` are folded onto `funcref`/`externref`, losing the bottom-ness that lets
-them flow into a concrete `(ref null $t)`). **The ordering rule this list keeps re-learning: rank by
-assertions unblocked, not by failures closed** — R10 proved it again, closing 416 for +1.5 KB.
+**The R-list is CLOSED.** The singleton batch below took the remainder from 18 to 4.
+
+### ✅ THE SINGLETON BATCH IS DONE (2026-08-14) — 22 failures, six causes, +136 bytes
+
+**Corpus 126 → 106 failures, 62,839 → 62,861 passing, 988 → 978 skipped.** Nine more files clean:
+`br_on_cast`, `br_on_cast_fail`, `extern`, `ref_cast`, `ref_test`, `imports4`, `table_grow`,
+`global`, `table64`, `call_indirect64`, `return_call_ref`. **The 18 "core singletons" were not 18
+causes — they were six**, which is why the previous entry's advice to "triage one by one" was worth
+following rather than acting on the count.
+
+| | cause | closed | what it was |
+| --- | --- | --- | --- |
+| **S1** 🔴 | **a host `externref` and a GC HEAP INDEX were the same value space** | **12** | A host reference was a bare small integer; `any.convert_extern` is identity; `refMatches` then read it as `gc_heap[i]`. `br_on_cast … (ref null struct)` on `any.convert_extern (ref.extern 0)` succeeded and handed back an unrelated object's FIELD. **A reference-forgery primitive reachable from ordinary spec input.** Fixed with `interp.host_tag` (bit 62), disjoint from `i31_tag` (63) and `null_ref`. Also closed 4 in `custom-descriptors`, which the triage had counted as by-design. |
+| **L1** 🟠 | **an import matched a memory/table's DECLARED minimum, not its live size** | **4** | §7.2's `mem_type`/`table_type` read the minimum off the instance, so a `(memory 1)` grown to 2 pages satisfies an `(import … (memory 2))`. Refusing it also stopped that module registering, so the next two failed as `UnresolvedImport` behind it — **one cause wearing four failure messages, two of them about a different module.** |
+| C3 | **tail-call results required EQUALITY, not subtyping** | 1 | §3.3.8 wants `[t2*] <: [t2'*]`. All three forms used `valTypesEqual`, which is reject-VALID for every widening return — `return_call_ref.wast`'s "More typing" module is built entirely from that idiom. |
+| C4 | **the table index type was consumed in only one of the two table forms** | 1 | `(table $t i64 funcref (elem …))` read `i64` as a shape, failed `isRefType`, then asked `parseU64("funcref")`. And once it assembled, the abbreviation's IMPLICIT offset was still `i32.const 0` against a 64-bit table. **The same guard-around-one-form shape as `call_indirect`'s table index and the flat `br_table`, for the third time.** |
+| C5 | **element EXPRESSIONS were bounded by the imported-global count** | 1 | §3.5.13 validates elem segments under the full context `C`; only `global*` uses the restricted `C'`. The segment OFFSET already used the full bound — **only the element expressions kept the old restriction**, so `(elem … (global.get $gf))` for a defined `$gf` was rejected. |
+| C6 | harness: no `spectest.shared_memory` (R7), no `spectest.table64`, no `ref.host` argument form | 3 | Runner gaps, not runtime defects — the R5/R8 shape again. |
+
+⚠️ **S1 IS ONLY HALF SWEPT, AND THE OTHER HALF IS THE SHIPPED C ABI.** `capi.zig` still does
+`.externref => slots[0] = v.of.ref`, a raw pass-through, and `wazmrt.h` invites it (*"opaque to the
+host: pass it back unchanged"*). A host handle of `2` still internalizes to GC object #2. **This is
+the R1 shape for the third time** — a defect in both the interpreter and the C ABI, with the corpus
+able to see only the interpreter half. The fix is to BOX host externrefs (intern in, unbox out, as
+`internExtern` already does), which changes what a `wazmrt_val_t` externref *is* and must keep a
+guest-produced reference round-tripping — **an owner decision on a shipped ABI**, filed in
+`known-issues.md` rather than taken here. Do not read "S1 closed 12 failures" as "the class is
+closed".
+
+**LIVE after this batch: 106 failures = 102 by design + 4 actionable** —
+`ref_null` 1 (+27 skipped), `legacy/try_catch` 1, `legacy/try_delegate` 1 (`delegate` is
+deliberately refused, recorded), `obsolete-keywords` 1 (`anyfunc`, deliberate).
+
+**Next, and it is the last real conformance item: the BOTTOM-TYPE LATTICE.** `ref_null.wast` is 1
+failure hiding **27 skipped assertions** — the largest single pool left, and the ordering rule says
+rank by those. `nullfuncref`/`nullexternref`/`nullexnref` are folded onto
+`funcref`/`externref`/`exnref`, which loses their bottom-ness, so
+`(func (result (ref null $t)) (global.get $nullfunc))` is a `TypeMismatch`. The change is wide and
+must be done as one piece: three new `RefHeap` variants with `top()`/`sub()` arms, six new `ValType`
+variants (nullable + non-null), `refHeap`/`valType`/`refHead` mappings, `subtypeOf`'s
+concrete-target arm (`nofunc <: (ref null $t)` for any func type `$t`), `shorthandRefType` in the
+assembler, and `refMatches` in the interpreter — where `headMatches` already returns `false` for
+`.nofunc`/`.noextern` on the VALUE path and must keep doing so, because only null inhabits them.
+⚠️ **Half-applying a subtyping rule is how accept-invalid holes ship** (R2's C3 stacked three
+defects behind one retracted finding); do it in one pass with the corpus as the arbiter.
 
 ### ✅ R7 IS DONE (2026-08-14) — and NOT ONE of its 15 was a threads defect
 
