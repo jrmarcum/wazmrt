@@ -9,7 +9,7 @@
 //! red. Ceilings are exact (no headroom), so growth must be accompanied by raising the number in the
 //! same commit, which puts every increase in the log with a reason.
 //!
-//! Usage: `size_gate <ceilings-file> <dir> [dir...]`
+//! Usage: `size_gate <ceilings-file> <optimize-mode> <features> <dir> [dir...]`
 //! Artifacts are looked up by base name in the given directories. A name listed in the ceilings file
 //! but absent from all of them is **skipped, not failed** — `zig build dll` is a separate step, so the
 //! shared library is legitimately missing from a plain `zig build`. But if NOTHING is found the gate
@@ -28,13 +28,15 @@ pub fn main(init: std.process.Init) !void {
     defer out.flush() catch {};
 
     const args = try init.minimal.args.toSlice(arena);
-    if (args.len < 4) {
+    if (args.len < 5) {
         try out.print("usage: size_gate <ceilings-file> <optimize-mode> <dir> [dir...]\n", .{});
         return error.BadUsage;
     }
     const ceilings_path = args[1];
     const mode = args[2];
-    const dirs = args[3..];
+    // "wat,wasi" for the full build; anything else is a Track 2c gated configuration.
+    const features = args[3];
+    const dirs = args[4..];
 
     // Ceilings describe the SHIPPING build. A Debug artifact is ~4x that, so without this check the
     // gate would go red for a meaningless reason and hand out the wrong advice ("raise the ceiling"),
@@ -43,6 +45,20 @@ pub fn main(init: std.process.Init) !void {
         try out.print("\n  size gate: built {s}, but the ceilings describe ReleaseSmall.\n", .{mode});
         try out.print("  Re-run as: zig build size -Doptimize=ReleaseSmall\n\n", .{});
         return error.WrongOptimizeMode;
+    }
+
+    // ⚠️ Same reasoning as the mode check, for the Track 2c feature flags — and
+    // this one was found the hard way. The gate measures whatever is sitting in
+    // `zig-out`, which carries no record of the FLAGS that produced it. After a
+    // `zig build dll -Dwat=false -Dwasi=false`, running the gate reported the
+    // DLL **607,232 bytes UNDER** its ceiling: a false win, and one that reads
+    // as an invitation to lower the number and mis-record the real size
+    // permanently. The ceilings describe the FULL build; refuse anything else.
+    if (!std.mem.eql(u8, features, "wat,wasi")) {
+        try out.print("\n  size gate: built with features '{s}', but the ceilings describe the FULL build.\n", .{features});
+        try out.print("  A gated artifact is legitimately smaller — grading it here would record the wrong ceiling.\n", .{});
+        try out.print("  Re-run as: zig build size -Doptimize=ReleaseSmall (no -Dwat/-Dwasi)\n\n", .{});
+        return error.GatedBuildNotComparable;
     }
 
     const text = Io.Dir.cwd().readFileAlloc(io, ceilings_path, arena, .limited(1 << 20)) catch |e| {

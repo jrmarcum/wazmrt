@@ -426,6 +426,9 @@ const InstanceSlot = struct {
     /// crash. Returns true when the error was really an exit, having recorded the code.
     fn tookExit(self: *InstanceSlot, err: anyerror) bool {
         if (err != error.HostTrap) return false;
+        // A `-Dwasi=false` build has no exits to take: no WASI host can be
+        // installed, so `self.wasi` is always null.
+        if (comptime !root.enable_wasi) return false;
         const w = self.wasi orelse return false;
         const code = w.wasi.exit_code orelse return false;
         // WASI's `proc_exit` takes a u32; the ABI reports int32_t, so 0xFFFFFFFF reads as -1 —
@@ -499,7 +502,7 @@ export fn wazmrt_store_delete(s: ?*Store) void {
         slot.inst.deinit();
         // Before the arena goes: `Wasi.deinit` closes the preopened directory handles it owns,
         // which are OS resources the arena knows nothing about.
-        if (slot.wasi) |w| w.wasi.deinit();
+        if (comptime root.enable_wasi) if (slot.wasi) |w| w.wasi.deinit();
         // Symmetric to `wazmrt_linker_delete`: drop the linker's reference to us first.
         if (slot.linker) |lk| {
             for (lk.slots.items, 0..) |cand, k| {
@@ -704,6 +707,23 @@ export fn wazmrt_module_delete(m: ?*CModule) void {
 // text costs more per module than decoding a binary, so a module run repeatedly is still better
 // assembled once and cached — which is what `wazmrt_wat_to_wasm` is for.
 
+/// The refusal a `-Dwat=false` build gives for every text entry point (Track 2c).
+///
+/// ⚠️ **Loud, not silent.** A gated-out feature that returns "success with
+/// nothing done" is the canonical fall-through failure this codebase refuses
+/// everywhere else: the embedder would get a NULL module, or a linker with no
+/// WASI in it, and discover the cause at run time in the guest. The message
+/// names the build flag, because the caller cannot see our build options and
+/// "unsupported" alone would send them looking in the wrong place.
+fn featureDisabled(
+    comptime fn_name: []const u8,
+    comptime what: []const u8,
+    comptime flag: []const u8,
+) ?*Error {
+    return errorf(fn_name ++ ": this build has " ++ what ++
+        " compiled out (-D" ++ flag ++ "=false); rebuild with -D" ++ flag ++ "=true", .{});
+}
+
 /// Assemble text to a binary the caller owns and frees with `wazmrt_bytes_delete`.
 export fn wazmrt_wat_to_wasm(
     text: ?[*]const u8,
@@ -711,6 +731,7 @@ export fn wazmrt_wat_to_wasm(
     out: ?*[*]u8,
     out_len: ?*usize,
 ) ?*Error {
+    if (comptime !root.enable_wat) return featureDisabled("wazmrt_wat_to_wasm", "the WAT text assembler", "wat");
     const src = (text orelse return errorf("wazmrt_wat_to_wasm: text is NULL", .{}))[0..len];
     const out_p = out orelse return errorf("wazmrt_wat_to_wasm: out is NULL", .{});
     const out_len_p = out_len orelse return errorf("wazmrt_wat_to_wasm: out_len is NULL", .{});
@@ -741,6 +762,7 @@ export fn wazmrt_module_new_wat(
     len: usize,
     out: ?**CModule,
 ) ?*Error {
+    if (comptime !root.enable_wat) return featureDisabled("wazmrt_module_new_wat", "the WAT text assembler", "wat");
     var bin: [*]u8 = undefined;
     var bin_len: usize = 0;
     if (wazmrt_wat_to_wasm(text, len, &bin, &bin_len)) |err| return err;
@@ -1331,6 +1353,7 @@ export fn wazmrt_wasi_config_preopen_dir(
 }
 
 export fn wazmrt_linker_define_wasi(l: ?*Linker, c: ?*const WasiConfig) ?*Error {
+    if (comptime !root.enable_wasi) return featureDisabled("wazmrt_linker_define_wasi", "the WASI preview-1 host", "wasi");
     const lk = l orelse return errorf("wazmrt_linker_define_wasi: linker is NULL", .{});
     const cfg = c orelse return errorf("wazmrt_linker_define_wasi: config is NULL", .{});
     if (lk.wasi) |*old| old.deinit();
@@ -1346,7 +1369,13 @@ export fn wazmrt_wasi_exit_code(l: ?*const Linker, out: ?*i32) bool {
 }
 
 /// Everything one instance's WASI host needs, all living in that instance's arena.
-const WasiState = struct {
+///
+/// Empty in a `-Dwasi=false` build so `InstanceSlot.wasi: ?*WasiState` still has
+/// a type, while every field that names `root.wasi.*` disappears with it. The
+/// pointer is then always null — `wazmrt_linker_define_wasi` refuses before one
+/// can be created — so the guarded use sites are unreachable as well as
+/// unanalyzed.
+const WasiState = if (!root.enable_wasi) struct {} else struct {
     wasi: root.wasi.Wasi,
     out_writer: std.Io.File.Writer,
     err_writer: std.Io.File.Writer,
@@ -1560,7 +1589,12 @@ fn resolveImports(
                 // WASI is backed by the runtime's own host, not by a linker entry. Checked
                 // first so an embedder cannot shadow a WASI syscall with a define_func of the
                 // same name and have the two silently disagree about which one runs.
-                if (lk.wasi != null and std.mem.eql(u8, im.module, "wasi_snapshot_preview1")) {
+                // `comptime root.enable_wasi and` — not just a run-time guard: it
+                // is what keeps `initWasi` UNREFERENCED in a `-Dwasi=false`
+                // build, which is what actually keeps `wasi.zig` out of the
+                // artifact. A run-time-only check would leave the whole host
+                // linked in and gate nothing.
+                if (comptime root.enable_wasi) if (lk.wasi != null and std.mem.eql(u8, im.module, "wasi_snapshot_preview1")) {
                     if (slot.wasi == null) {
                         slot.wasi = initWasi(lk.engine, &lk.wasi.?, sa) catch |err|
                             return errorf("wasi: {s}", .{@errorName(err)});
@@ -1568,7 +1602,7 @@ fn resolveImports(
                     funcs[fi] = slot.wasi.?.wasi.hostFunc(im.name);
                     fi += 1;
                     continue;
-                }
+                };
                 const def = lk.find(im.module, im.name) orelse {
                     // A namespace published by `define_instance`. Explicit definitions win, so
                     // this is only consulted after the table misses.
@@ -1732,7 +1766,7 @@ export fn wazmrt_linker_instantiate(
 
     imports.store = &store.refs;
     slot.inst.instantiateWithImports(sa, &cm.inner, imports) catch |err| {
-        if (slot.wasi) |w| w.wasi.deinit();
+        if (comptime root.enable_wasi) if (slot.wasi) |w| w.wasi.deinit();
         slot.arena.deinit();
         alloc.destroy(slot);
         return errorf("instantiate: {s}", .{@errorName(err)});
@@ -1740,7 +1774,7 @@ export fn wazmrt_linker_instantiate(
 
     // The guest's memory only exists once the instance does, and every WASI call that touches a
     // buffer needs it — so this must happen after init and before anything can run.
-    if (slot.wasi) |w| w.wasi.memory = slot.inst.memory0();
+    if (comptime root.enable_wasi) { if (slot.wasi) |w| { w.wasi.memory = slot.inst.memory0(); } }
 
     slot.inst.runStart() catch |err| {
         if (trap_out) |p| p.* = slot.takeTrap(err);
@@ -1753,7 +1787,7 @@ export fn wazmrt_linker_instantiate(
     slot.linker = lk;
     lk.slots.append(alloc, slot) catch {
         slot.inst.deinit();
-        if (slot.wasi) |w| w.wasi.deinit();
+        if (comptime root.enable_wasi) if (slot.wasi) |w| w.wasi.deinit();
         slot.arena.deinit();
         alloc.destroy(slot);
         return errorf("out of memory", .{});

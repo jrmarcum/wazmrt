@@ -223,6 +223,42 @@
 # The DLL moves for the first time in three entries: the lattice is decoder + validator +
 # interpreter code, all of which an embedder running a GC module executes.
 
+# TRACK 2c LANDED 2026-08-14 — comptime feature gating. The ceilings below are UNCHANGED, and that
+# is the result: with both features on the artifacts are byte-identical, so the gate costs nothing
+# when it is not used.
+#
+# ⚠️ **These ceilings describe the FULL build and the gate now REFUSES any other.** `zig-out` carries
+# no record of which flags produced what is in it, and running `zig build size` after a
+# `zig build dll -Dwat=false -Dwasi=false` reported the DLL **607,232 bytes UNDER** its ceiling — a
+# false win that reads as an invitation to lower the number and mis-record the real size for good.
+# `size_gate.zig` takes the feature string and errors on anything but `wat,wasi`, the same shape as
+# its existing ReleaseSmall check.
+#
+# Measured ReleaseSmall, Zig 0.16.0, x86_64-windows:
+#
+#   configuration              static lib     DLL          vs full
+#   (default: wat + wasi)       1,022,520     882,688            —
+#   -Dwat=false                   840,962     738,816       −16.3%
+#   -Dwasi=false                  502,178     419,840       −52.4%
+#   -Dwat=false -Dwasi=false      319,916     275,456       −68.8%
+#
+# 🎯 **862 KB → 269 KB for an embedder that needs neither**, which lands within ~47 KB of the
+# 227 KB the DLL measured before the wasm-c-api surface was replaced. That closes the question the
+# Track-1 entry above opened ("IT GOT BIGGER, NOT SMALLER"): the growth really was WAT + WASI + `Io`,
+# and it is now optional rather than structural.
+#
+# ⚠️ **WASI is the bigger half by 3×** — the roadmap named `-Dwat=false` first, and the measurement
+# says the opposite. `wasi.zig` drags in `std.Io`, file handling and `Io.Threaded`; the WAT assembler
+# is mostly its own code. Rank size levers by measurement, not by which one is easier to picture.
+#
+# The freestanding wasm build is UNCHANGED at 37,382 in all four configurations: `wasm_entry.zig`
+# never referenced either module, so both were already dead-stripped there. A gate that changes
+# nothing for an artifact is worth recording as such — it says the artifact was already clean.
+#
+# `zig build features` compiles the C ABI in all four combinations, so a future ungated
+# `root.wasi.…` reference fails there rather than silently rotting the flag. It already earned its
+# keep: `-Dwasi=false` did not compile until six use sites in `capi.zig` were guarded.
+
 wazmrt.exe  958976
 wazmrt.lib  1022520
 wazmrt.dll  882688

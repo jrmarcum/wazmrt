@@ -6,6 +6,28 @@
 
 const std = @import("std");
 
+/// Comptime feature gates (Track 2c). Supplied per ARTIFACT by `build.zig`, not
+/// globally: `-Dwat=false` / `-Dwasi=false` strip the WAT assembler and the WASI
+/// host from the **embed** artifacts (the C-ABI static lib, the DLL, the
+/// freestanding wasm), while the CLI and the test/conformance targets always
+/// build with both on.
+///
+/// ⚠️ **This is NOT a descope of `.wat`** (owner, 2026-08-11). Running text is a
+/// stated capability and the CLI keeps it unconditionally; the flag exists only
+/// so an embedder who never assembles text does not have to carry the assembler.
+/// The measured reason it exists at all: replacing the wasm-c-api surface took
+/// the DLL from 227 KB to 845 KB because the embed artifact now carries
+/// `wat.zig` + `sexpr.zig`, `wasi.zig` and an `Io`.
+///
+/// ⚠️ **A disabled feature is REJECTED LOUDLY, never silently ignored** — the
+/// canonical fall-through failure mode this codebase refuses elsewhere. See
+/// `capi.zig`'s `wazmrt_module_new_wat` / `wazmrt_wat_to_wasm` /
+/// `wazmrt_linker_define_wasi`, which return a real error explaining the build
+/// flag rather than a null module or a no-op linker.
+const config = @import("wazmrt_config");
+pub const enable_wat = config.enable_wat;
+pub const enable_wasi = config.enable_wasi;
+
 pub const types = @import("types.zig");
 pub const Reader = @import("Reader.zig");
 pub const Module = @import("Module.zig");
@@ -24,10 +46,14 @@ pub const typematch = @import("typematch.zig");
 /// Per-proposal gating: which WebAssembly proposals a module is allowed to use.
 pub const features = @import("features.zig");
 pub const Instance = interp.Instance;
-pub const sexpr = @import("sexpr.zig");
-pub const wat = @import("wat.zig");
-pub const wast = @import("wast.zig");
-pub const wasi = @import("wasi.zig");
+// The text toolchain is one unit: `wast` needs `wat`, `wat` needs `sexpr`.
+// Gating them to an empty struct rather than omitting the declaration keeps
+// `root.wat` a compile error about a MISSING DECL only where it is genuinely
+// used, and lets `capi.zig` test `root.enable_wat` without conditional imports.
+pub const sexpr = if (enable_wat) @import("sexpr.zig") else struct {};
+pub const wat = if (enable_wat) @import("wat.zig") else struct {};
+pub const wast = if (enable_wat) @import("wast.zig") else struct {};
+pub const wasi = if (enable_wasi) @import("wasi.zig") else struct {};
 pub const pin = @import("pin.zig");
 pub const sign = @import("sign.zig");
 
@@ -56,10 +82,16 @@ test {
     _ = opcode;
     _ = @import("validate.zig");
     _ = interp;
-    _ = sexpr;
-    _ = wat;
-    _ = wast;
     _ = pin;
     _ = sign;
-    _ = @import("fuzz.zig"); // malformed-input fuzz targets (see fuzz.zig)
+    // The text toolchain and its fuzz targets exist only in a `-Dwat` build. The
+    // test/conformance targets always set it, so this is never skipped in
+    // practice — the condition is here so a `-Dwat=false` build still compiles
+    // its own tests rather than failing on a missing decl.
+    if (enable_wat) {
+        _ = sexpr;
+        _ = wat;
+        _ = wast;
+        _ = @import("fuzz.zig"); // malformed-input fuzz targets (see fuzz.zig)
+    }
 }

@@ -302,6 +302,24 @@ per-append-site check structurally cannot see `(import "" "" (memory $foo 1))` b
 because the script and the modules inside it go through one lexer. Budget for that: the fix pulled a
 separately-filed item into the same pass. — R9, `text-toolchain.md`
 
+**RANK SIZE LEVERS BY MEASUREMENT, NOT BY WHICH ONE IS EASIER TO PICTURE.** Track 2c was written up
+naming `-Dwat=false` first for months; measured, WASI is the bigger half by 3× (−52% vs −16% of the
+DLL), because `wasi.zig` drags in `std.Io` and `Io.Threaded` while the assembler is mostly its own
+code. Same rule as ranking conformance items by assertions unblocked rather than failures closed. —
+Track 2c, `roadmap.md`
+
+**A COMPTIME GATE ROTS IN THE CONFIGURATION NOTHING COMPILES.** The default build cannot notice an
+ungated `root.wasi.…` reference, because the flag is only false somewhere nobody builds. `zig build
+features` compiles all four combinations for that reason, and caught six unguarded sites the first
+time it ran. And the guard has to be `if (comptime …)`: a run-time-only check leaves the gated code
+REFERENCED, so it links in and the flag gates nothing. — Track 2c, `build.zig`
+
+**A GATE THAT MEASURES "WHATEVER IS ON DISK" NEEDS TO KNOW WHAT PRODUCED IT.** `zig-out` has no
+record of build flags, so the size gate graded a feature-stripped DLL against the full build's
+ceiling and reported it 607 KB *under* — a false win that invites lowering the ceiling and
+mis-recording the real size for good. The gate now takes the feature string and refuses anything but
+the full configuration, exactly as it already did for the optimize mode. — Track 2c, `size_gate.zig`
+
 **A BOTTOM TYPE IS NOT ITS TOP, and folding it there is self-consistent right up to the moment
 something asks.** `nullfuncref` was folded onto `funcref` on the reasoning that "only null inhabits
 it, so the distinction is unobservable". It is observable exactly where it matters: a bottom sits

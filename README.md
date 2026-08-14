@@ -78,8 +78,33 @@ zig build dll                      # C-ABI shared library (for FFI: Deno, ctypes
 zig build capi-smoke               # build + run the C example (needs no external deps)
 zig build ffi-demo                 # build the DLL + run examples/deno_ffi_capi.mjs (needs deno)
 zig build size -Doptimize=ReleaseSmall   # fail if a shipped artifact grew past its ceiling
+zig build features                 # compile the C ABI in all four -Dwat/-Dwasi combinations
 zig build bench                    # interpreter microbenchmark (ReleaseFast)
 ```
+
+### Slimming the embedded library
+
+If you embed wazmrt over the C ABI and never assemble `.wat` or use WASI, compile
+them out. Both default to on; the flags affect **only** the C-ABI library, the
+DLL and the wasm build — the CLI always assembles text and always has WASI.
+
+```
+zig build dll -Doptimize=ReleaseSmall -Dwat=false -Dwasi=false
+```
+
+Measured (ReleaseSmall, x86_64-windows):
+
+| build | static lib | shared library |
+| --- | --- | --- |
+| default | 1,022,520 | 882,688 |
+| `-Dwat=false` | 840,962 | 738,816 |
+| `-Dwasi=false` | 502,178 | 419,840 |
+| both off | 319,916 | **275,456** |
+
+A compiled-out entry point does not fail quietly: `wazmrt_module_new_wat`,
+`wazmrt_wat_to_wasm` and `wazmrt_linker_define_wasi` return an error naming the
+flag to rebuild with. With both features on the artifacts are byte-identical to
+a build without the flags, so there is no cost to leaving them alone.
 
 Run `wazmrt --help` (`-h`) for the full list of run modes, WASI/verification
 flags, and subcommands, or `wazmrt --version` (`-v`) for the version and whether

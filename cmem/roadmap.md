@@ -821,12 +821,60 @@ failed to build — R2's 12 came from implementing `(module definition)`/`(modul
 `br_table.wast` is core spec and worth a look on its own — 161 unrun assertions in a control-flow
 instruction is a bigger blind spot than most of the failures above.
 
-### What is left after Track 1 (2026-08-11)
+### ✅ TRACK 2c IS DONE (2026-08-14) — the embed artifact is optional-weight now
 
-- **Track 2c — comptime feature gating (`-Dwat=false` / `-Dwasi=false`).** Promoted from optional to
-  necessary by the measured growth above. ⚠️ `.wat` is NOT being descoped (owner, 2026-08-11) — the
-  CLI keeps assembling text unconditionally; the question is only whether an *embedder* who never
-  assembles text must carry the assembler.
+**`-Dwat=false` / `-Dwasi=false` compile the WAT assembler / the WASI host out of the EMBED
+artifacts.** Measured ReleaseSmall:
+
+| configuration | static lib | DLL | vs full |
+| --- | --- | --- | --- |
+| default (wat + wasi) | 1,022,520 | **882,688** | — |
+| `-Dwat=false` | 840,962 | 738,816 | −16.3% |
+| `-Dwasi=false` | 502,178 | 419,840 | −52.4% |
+| both off | 319,916 | **275,456** | **−68.8%** |
+
+🎯 **862 KB → 269 KB for an embedder that needs neither** — within ~47 KB of the 227 KB the DLL
+measured *before* the wasm-c-api replacement. **That closes the question Track 1 opened.** The
+"IT GOT BIGGER, NOT SMALLER" entry above was right that the growth was WAT + WASI + `Io`; it is now
+optional rather than structural, and the strongest card in the consumer survey — *"replacing
+megabytes of per-triplet vendored SDK with a 222 KB self-owned library"* — is back within reach.
+
+⚠️ **WASI is the bigger half by 3×, and the roadmap named `-Dwat=false` FIRST.** `wasi.zig` drags in
+`std.Io`, file handling and `Io.Threaded`; the assembler is mostly its own code. **Rank size levers
+by measurement, not by which one is easier to picture** — the same rule as ranking conformance items
+by assertions unblocked.
+
+**With both features on the artifacts are BYTE-IDENTICAL**, so the gate costs nothing when unused.
+The freestanding wasm build is unchanged (37,382) in all four configurations: `wasm_entry.zig` never
+referenced either module, so both were already dead-stripped there.
+
+**How it is built, and the two things that matter:**
+
+1. **Two config modules, not one.** `-Dwat`/`-Dwasi` feed `embed_cfg`, used by the C-ABI static lib,
+   the DLL and the freestanding wasm; the CLI, tests and conformance runner take `full_cfg`, which
+   is hard-wired to both-on. ⚠️ A single global option would have silently descoped the CLI, and
+   **`.wat` is not being descoped** (owner, 2026-08-11) — running text is a stated CLI capability.
+2. **A disabled feature is REJECTED LOUDLY.** `wazmrt_module_new_wat`, `wazmrt_wat_to_wasm` and
+   `wazmrt_linker_define_wasi` return a real error naming the build flag
+   (*"this build has the WAT text assembler compiled out (-Dwat=false); rebuild with -Dwat=true"*),
+   never a NULL module or a no-op linker. The embedder cannot see our build options, so
+   "unsupported" alone would send them looking in the wrong place.
+
+**New gate: `zig build features`** compiles the C ABI in all four combinations. A comptime gate rots
+the moment someone adds an ungated `root.wasi.…` reference, and the default build cannot notice
+because the flag is only false in a configuration nothing else compiles. ⚠️ **It earned its keep
+immediately**: `-Dwasi=false` did not compile until six use sites in `capi.zig` were guarded — and
+the guards had to be `if (comptime root.enable_wasi)`, because a run-time-only check leaves
+`initWasi` REFERENCED and the whole host linked in, gating nothing.
+
+⚠️ **The size gate had a hole this exposed, now closed.** `zig-out` carries no record of the FLAGS
+that produced what is in it, so `zig build size` after a gated `dll` build graded the small artifact
+against the full build's ceiling and printed **607,232 bytes UNDER** — a false win, and one that
+reads as an invitation to lower the ceiling and mis-record the real size permanently. `size_gate.zig`
+now takes the feature string and refuses anything but `wat,wasi`, the same shape as its existing
+ReleaseSmall check. **A gate that measures "whatever is on disk" needs to know what produced it.**
+
+### What is left after Track 1 (2026-08-11)
 - **Track 3 — the bake-off harness.** wazmrt vs wasmrt vs wasmtime, on wasmtk's and rsxtk's real
   corpora, **with wasmtime in a FAST-START configuration** (`OptLevel::None`/Winch), never only
   `OptLevel::Speed`.
