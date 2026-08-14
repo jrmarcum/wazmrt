@@ -81,9 +81,9 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
   validation**, which is strong evidence the type-checker is correct across real, deeply-nested
   control flow (not just the simple `wasm_mod` set).
 
-## 📊 CURRENT spec-testsuite score (measured 2026-08-14 — the R-list is CLOSED)
+## 📊 CURRENT spec-testsuite score (2026-08-14) — EVERY CORE SPEC FILE IS AT ZERO
 
-**284 files — 62,861 assertions passed / 106 failed / 978 skipped.** This is the number to quote;
+**284 files — 62,889 assertions passed / 104 failed / 951 skipped.** This is the number to quote;
 every snapshot below it is older and kept as history.
 
 ⚠️ **The failed count ROSE from 143 at R4 and that is an improvement.** R5 implemented
@@ -103,10 +103,20 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
 - **Failure messages carry the source LINE** of the `.wast` command that produced them (`L342: …`),
   added 2026-08-13 via `sexpr.parseAllWithLines`. Before that, matching 35 failures back to their
   assertions was hand work.
-- **106 is not 106 defects: 102 are BY DESIGN** and **4 actionable** — `ref_null` 1 (the bottom-type
-  lattice, hiding 27 skips), `legacy/try_catch` 1, `legacy/try_delegate` 1 (`delegate`, deliberately
-  refused), `obsolete-keywords` 1 (`anyfunc`, deliberate). **The R-list is CLOSED**: R1–R5, R7, R9,
-  R10 done, R6 closed by R3, R8 by R5, and the singleton batch took the last 22.
+- 🏁 **104 is not 104 defects: 102 are BY DESIGN and the other 2 are RECORDED DELIBERATE
+  DEVIATIONS** — `anyfunc` and `delegate`. **Every core spec file is at zero failures and there are
+  no undiagnosed failures left.** R1–R5, R7, R9, R10 done, R6 closed by R3, R8 by R5, the singleton
+  batch took 22 and the bottom-type lattice the last 28 (27 of them SKIPS).
+- ⚠️ **READ ALL THREE TOTALS ON EVERY RUN — the per-file FAIL diff has a blind spot.** The legacy-EH
+  step turned two passes into SKIPS in a file that neither entered nor left the failure list, so the
+  per-file diff showed nothing; only `62,888 → 62,887 passed` and `951 → 953 skipped` revealed it.
+  **A file that trades passes for skips is invisible in a failure diff.** This is the concrete
+  incident the "quote all three or none" rule exists for.
+- ⚠️ **AND READ THE TOOL'S ACTUAL VERDICT LINE.** The same step added an unnecessary assembler
+  filter because `wazmrt <module>` prints `valid wasm v1, 4 section(s)` — a STRUCTURE header — three
+  lines above the real `validation: FAILED … MismatchedCatch`. The filter then broke the legal flat
+  `try … catch_all … end` spelling. *An audit finding is a hypothesis until the verdict line is
+  read.*
 - ⚠️ **THE 18 "CORE SINGLETONS" WERE SIX CAUSES, NOT 18** — worth remembering the next time a
   remainder looks like an unstructured tail. The two big ones: a host `externref` and a GC heap
   index shared one value space (12 failures, and `br_on_cast` on an internalized host reference
@@ -179,10 +189,10 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
   *exactly* its ceiling; the file was two builds old. **An exactly-zero delta is a timestamp check
   waiting to happen.**
 
-**Unit tests: 627** (`zig build test --summary all`, 2026-08-14 after the singleton batch) — 623 pass / 4 skip from
-this repo's own `D:` cwd, **627/627 from an NTFS cwd**, which is the number to quote. R3 added 7,
-R4 4, R5 3, R10 5, R9 6, R7 1 and the singleton batch 5; each core test raises the printed total by two because the C-ABI
-target re-runs the core suite. `test-safe` 627/627, `test-security` 3/3 (NTFS cwd), size gate green
+**Unit tests: 631** (`zig build test --summary all`, 2026-08-14, final) — 627 pass / 4 skip from
+this repo's own `D:` cwd, **631/631 from an NTFS cwd**, which is the number to quote. R3 added 7,
+R4 4, R5 3, R10 5, R9 6, R7 1, the singleton batch 5 and the lattice 2; each core test raises the printed total by two because the C-ABI
+target re-runs the core suite. `test-safe` 631/631, `test-security` 3/3 (NTFS cwd), size gate green
 at the batch ceilings (+136 bytes of real code for 22 closed failures — five of the six causes REPLACE a rule rather than add one).
 
 ⚠️ **R5's inversion check caught a test that tested the RULE but not that the rule is CONSULTED.**

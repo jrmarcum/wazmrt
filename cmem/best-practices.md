@@ -302,6 +302,30 @@ per-append-site check structurally cannot see `(import "" "" (memory $foo 1))` b
 because the script and the modules inside it go through one lexer. Budget for that: the fix pulled a
 separately-filed item into the same pass. — R9, `text-toolchain.md`
 
+**A BOTTOM TYPE IS NOT ITS TOP, and folding it there is self-consistent right up to the moment
+something asks.** `nullfuncref` was folded onto `funcref` on the reasoning that "only null inhabits
+it, so the distinction is unobservable". It is observable exactly where it matters: a bottom sits
+below its hierarchy's CONCRETE types, and the fold removes that. The companion check —
+`subtypeOf`'s concrete-target arm — was a flat `== .none`, which *with* the fold in place was
+consistent and wrong in two directions at once. **Two rules that must agree should key off one
+shared function** (here `top()`), never off two hand-written lists. — the lattice, `roadmap.md`
+
+**A FAILURE DIFF CANNOT SEE A PASS THAT BECAME A SKIP.** A per-file comparison of the failure list
+showed nothing while two passes silently turned into skips; only the three totals caught it. Read
+passed/failed/skipped together on every run — "quote all three or none" is a DETECTION rule, not
+just a reporting one. — the lattice, `testing.md`
+
+**READ THE TOOL'S VERDICT LINE, NOT THE HEADER ABOVE IT.** `wazmrt <module>` prints
+`valid wasm v1, N section(s)` — a statement about STRUCTURE — and then, several lines later,
+`validation: FAILED …`. Mistaking the first for the second produced a "fix" for a non-existent
+accept-invalid, which then broke a legal spelling. *An audit finding is a hypothesis* — and so is
+your reading of your own tool's output. — the lattice, `roadmap.md`
+
+**A CLAUSE RULE BELONGS IN THE VALIDATOR, NOT THE PRODUCER.** The validator is reached by both the
+text and the binary path; a filter in the assembler covers one of them and can break a legal
+spelling on it (`catch_all` is genuinely a mnemonic in flat legacy `try … catch_all … end`). — the
+lattice, `wat.zig`
+
 **TWO KINDS OF VALUE MUST NOT SHARE ONE ENCODING SPACE — and the one that bites is the one an
 outsider chooses.** A host `externref` was a bare small integer and so was a GC heap index;
 `any.convert_extern` is identity, so `ref.cast` read a host reference as `gc_heap[i]` and

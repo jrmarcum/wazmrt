@@ -182,19 +182,26 @@ call-then-return, so the one property the proposal exists to provide (unbounded 
 **A feature can be present, tested, and green while failing at exactly the thing it is for.** Same
 family as the memory64 "COMPLETE" claim above.
 
-### 🎯 REVISED conformance list (2026-08-12) — the 275, now **106**; the R-list is CLOSED
+### 🎯 REVISED conformance list (2026-08-12) — the 275, now **104**; EVERY CORE FILE IS CLEAN
 
 Successor to the T-list above, and built differently: every item below is grouped **by cause**, from a
 run with `-Dfailures=600` so all 275 failures were read, not just each file's first. The T-list was
 grouped by first-failure text and mislabelled three of its five items.
 
 ⚠️ **The per-item counts below are as-triaged (275 total) and are NOT live. THE WHOLE R-LIST IS
-CLOSED.** R1–R5, R7, R9 and R10 are done, R6 was closed by R3 and R8 by R5, and the singleton batch
-took the remainder — corpus is **106 failures / 62,861 passing / 978 skipped** (measured
-2026-08-14). **LIVE SPLIT: 102 by design + 4 actionable** — `ref_null` 1 (+27 skipped, the
-bottom-type lattice), `legacy/try_catch` 1, `legacy/try_delegate` 1 (`delegate`, deliberately
-refused), `obsolete-keywords` 1 (`anyfunc`, deliberate). Every count below is history; re-measure
-before trusting any of them (`-Dfailures=600`, diff the per-file summary against the previous run).
+CLOSED, AND SO IS EVERYTHING AFTER IT.** R1–R5, R7, R9 and R10 are done, R6 was closed by R3 and R8
+by R5, the singleton batch took the remainder, and the bottom-type lattice took the last of it —
+corpus is **104 failures / 62,889 passing / 951 skipped** (measured 2026-08-14).
+
+🏁 **EVERY CORE SPEC FILE IS AT ZERO FAILURES. LIVE SPLIT: 102 by design + 2 recorded deliberate
+deviations** — `anyfunc` (`obsolete-keywords.wast`, the pre-standard spelling of `funcref`, kept
+because two real `.wat` inputs use it) and `delegate` (`legacy/try_delegate.wast`, refused loudly
+because no oracle exists to route it). **There are no undiagnosed failures left**, which changes what
+this list is for: it is now a record, not a work queue. The remaining work is elsewhere — the OPEN
+C-ABI externref hole in `known-issues.md`, Track 2c, Track 3.
+
+Every count below is history; re-measure before trusting any of them (`-Dfailures=600`, and read
+**all three** totals — see the lattice entry on why the per-file FAIL diff alone missed a regression).
 
 ⚠️ **"By design" has TWO flavours and they are not the same claim.** 94 are *untargeted
 proposals* (`custom-descriptors`, `custom-page-sizes`, `wide-arithmetic`) — refused honestly because
@@ -230,7 +237,7 @@ are not defects and there is nothing to fix unless the scope changes:
 the two above, so the "101 by design / 92 actionable" split written on 2026-08-12 was off by two in
 both directions. Corrected here rather than propagated.
 
-**LIVE SPLIT after the singleton batch (2026-08-14): 106 failures = 102 by design + 4 actionable** — legacy EH **2**,
+**LIVE SPLIT (2026-08-14, final): 104 failures = 102 by design + 2 recorded deliberate deviations**  — `anyfunc` and `delegate`. Formerly legacy EH **2**,
 core singletons **18**. R10's residue is now half closed: `id` 5 went with R9 (the quoted-`$"…"`
 identifier form, forced into scope — see below), leaving `ref_null` 27 skipped behind its unbuildable
 first module, which needs the bottom-type lattice change.
@@ -286,7 +293,45 @@ closed".
 `ref_null` 1 (+27 skipped), `legacy/try_catch` 1, `legacy/try_delegate` 1 (`delegate` is
 deliberately refused, recorded), `obsolete-keywords` 1 (`anyfunc`, deliberate).
 
-**Next, and it is the last real conformance item: the BOTTOM-TYPE LATTICE.** `ref_null.wast` is 1
+### ✅ THE LATTICE IS DONE (2026-08-14) — and EVERY CORE SPEC FILE IS AT ZERO
+
+**Corpus 106 → 104 failures, 62,861 → 62,889 passing, 978 → 951 skipped.** `ref_null.wast` and
+`legacy/try_catch.wast` both clean. **104 = 102 by design + 2 recorded deliberate deviations
+(`anyfunc`, `delegate`). There are no undiagnosed failures left.**
+
+The bottom-type change landed as one piece, as planned: `nofunc`/`noextern`/`noexn` became their own
+`RefHeap` variants with `top()`/`sub()` arms; `nullfuncref`/`nullexternref`/`nullexnref` (+ their
+non-null twins) became their own `ValType`s; `readValType` and `readHeapTypeRef` stopped folding them
+onto their family heads; `subtypeOf`'s concrete-target arm became hierarchy-keyed; and the
+assembler's shorthand table and `heapTypeToValType` were corrected to match. **27 of the 28
+assertions it bought were SKIPS**, behind a first module that would not build — the ordering rule
+paying off one more time.
+
+⚠️ **`subtypeOf`'s concrete-target arm had been `sub.refHeap() == .none` — flat, for EVERY concrete
+target.** With `nofunc` folded onto `funcref` that was self-consistent and wrong twice: a
+`nullfuncref` could not reach a `(ref null $funcType)`, and a `nullref` — an *any*-family value —
+would have satisfied a concrete FUNC type if anything had ever asked. **A bottom belongs to exactly
+one hierarchy**, and the fix keys both halves (`RefHeap.sub` and this arm) off `top()` so they cannot
+drift.
+
+⚠️ **The legacy-EH item cost two corpus passes before it was right, and the mistake is instructive.**
+`(try (do) (catch_all) (catch_all))` is malformed (at most one `catch_all`, last) — a one-flag fix.
+But I also filtered `catch_all` out of `lookupOp`, on the belief that `(func (catch_all))` "assembled
+AND validated". **It does not: it assembles and then fails validation with `MismatchedCatch`.** I had
+read the CLI's `valid wasm v1, 4 section(s)` header — which reports STRUCTURE — as the verdict, three
+lines above the actual `validation: FAILED`. The filter was therefore unnecessary, and it broke the
+legal FLAT spelling where `catch_all` genuinely is a mnemonic in the instruction stream. Two things
+to keep: **an audit finding is a hypothesis until the tool's actual verdict line is read**, and **a
+clause rule belongs in the validator, which both the text and the binary path reach — a
+producer-side filter covers one path and can break a legal spelling on it.**
+
+⚠️ **The corpus caught it and the per-file FAIL diff did NOT.** Passes went 62,888 → 62,887 while
+skips went 951 → 953, and no file entered or left the failure list, because a file that turns passes
+into skips is invisible there. Only the TOTALS showed it. **Read all three numbers on every run** —
+this is the concrete instance the "quote all three or none" rule exists for.
+
+*(Historical note, superseded: the item was scoped here as )* **the last real conformance item: the
+BOTTOM-TYPE LATTICE.** `ref_null.wast` is 1
 failure hiding **27 skipped assertions** — the largest single pool left, and the ordering rule says
 rank by those. `nullfuncref`/`nullexternref`/`nullexnref` are folded onto
 `funcref`/`externref`/`exnref`, which loses their bottom-ness, so
