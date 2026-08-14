@@ -158,6 +158,29 @@
 # thousands of named functions and startup is a first-class metric here); `parseQuotedId` plus the
 # `reserved`/`stringchar` rules in the lexer; and `parseDecls`'s `allow_id` parameter.
 
-wazmrt.exe  956928
-wazmrt.lib  1020890
+# RAISED 2026-08-14 (R7 — threads: the legacy bare memory/table index). Measured ReleaseSmall,
+# Zig 0.16.0, x86_64-windows: `zig build dll` then a plain `zig build`.
+#
+#   artifact       after R9      after R7      R7's share
+#   wazmrt.exe      956,928       957,440            +512
+#   wazmrt.lib    1,020,890     1,021,328            +438
+#   wazmrt.dll      882,176       882,176              +0
+#
+# No worktree measurement was needed: R9 set these ceilings to its own measured values, so
+# delta-vs-ceiling and delta-vs-parent are the same number (the exact-ceiling policy's one useful
+# side effect — not a general licence to skip the check when the ceilings carry slack).
+#
+# ⚠️ **The +438 in the static lib is the REAL figure; the other two are that same code seen through
+# PE file alignment.** The `.lib` is unpadded, the `.exe` crossed a 512-byte boundary and rounded to
+# +512, and the `.dll`'s share landed inside padding it already had. The DLL was rebuilt in this same
+# run, so its zero is alignment, not the stale-artifact trap the R3 entry warns about — but that is
+# exactly why the note is here rather than left as an unexplained 0.
+#
+# What bought the bytes: two guarded branches recognising the pre-bulk-memory `(data 0 <offset> …)` /
+# pre-reference-types `(elem 0 <offset> …)` spellings, plus turning the data-segment byte loop's
+# silent `else => {}` into a rejection. Tiny, and it closed a segment that assembled ACTIVE in the
+# source and PASSIVE in the binary.
+
+wazmrt.exe  957440
+wazmrt.lib  1021328
 wazmrt.dll  882176

@@ -487,12 +487,30 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             }
             try data_names.append(a, dname);
             var seg_mem: u32 = 0;
-            if (di < items.len) if (items[di].asList()) |l| {
-                if (l.len >= 2 and eqAtom(l[0], "memory")) {
-                    seg_mem = try resolveByName(mem_names.items, l[1]);
+            if (di < items.len) {
+                if (items[di].asList()) |l| {
+                    if (l.len >= 2 and eqAtom(l[0], "memory")) {
+                        seg_mem = try resolveByName(mem_names.items, l[1]);
+                        di += 1;
+                    }
+                }
+                // ⚠️ **The LEGACY bare memory index — `(data 0 (i32.const 10) "…")`.**
+                // Before bulk-memory the memuse was a plain `memidx`, not
+                // `(memory x)`, and the era-pinned `proposals/threads` corpus
+                // still writes it. We recognised only the modern form, so the `0`
+                // fell through to the byte loop (which keeps strings and dropped
+                // it) and the OFFSET was then read as… nothing — **an active
+                // segment in the source came out PASSIVE in the binary**, and
+                // `(i32.load (i32.const 10))` read 0 instead of the data. Not a
+                // rejection: a silently DIFFERENT module, this codebase's worst
+                // failure mode. Unambiguous to recognise, because an offset is
+                // always a list and data bytes are always strings — only the
+                // legacy shape puts an index atom in front of a list here.
+                else if (isIndexAtom(items[di]) and di + 1 < items.len and items[di + 1].asList() != null) {
+                    seg_mem = try resolveByName(mem_names.items, items[di]);
                     di += 1;
                 }
-            };
+            }
             // The offset is any leading list (`(offset …)` or a folded const-expr
             // like `(i32.const N)` / `(global.get $g)` — even a malformed one, so
             // the validator can reject it); data bytes are always strings. Absent
@@ -505,7 +523,11 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             var bytes: List(u8) = .empty;
             for (items[di..]) |it| switch (it) {
                 .string => |sbytes| try bytes.appendSlice(a, sbytes),
-                else => {},
+                // Anything else here is not a data string and has no position in
+                // the grammar. Ignoring it is how the legacy memuse above went
+                // missing for so long — a dropped token is a module that does not
+                // match its source.
+                else => return error.BadModuleField,
             };
             try datas.append(a, .{ .mem_index = seg_mem, .offset_form = offset_form, .bytes = bytes.items });
         } else if (std.mem.eql(u8, kw, "table")) {
@@ -1314,6 +1336,17 @@ fn parseElem(a: std.mem.Allocator, items: []const Sexpr, elems: *List(ElemDef), 
         if (i < items.len and eqKw(items[i], "table")) {
             mode = .active;
             table_index = try resolveByName(table_names, try nth(try wantList(items[i]), 1));
+            i += 1;
+        } else if (i + 1 < items.len and isIndexAtom(items[i]) and isOffsetForm(items[i + 1])) {
+            // The LEGACY bare table index — `(elem 0 (i32.const 1) $f $g)`, the
+            // pre-reference-types spelling of `(elem (table 0) …)`, still written
+            // by the era-pinned `proposals/threads` corpus. Unrecognised, the `0`
+            // fell through to the func-index list and `resolveByName` was handed
+            // the OFFSET as a function name → `BadImmediate` on a whole module.
+            // Gated on an offset FOLLOWING it, so a passive `(elem 0 $f $g)` —
+            // where the next item is a func id, not an offset — is untouched.
+            mode = .active;
+            table_index = try resolveByName(table_names, items[i]);
             i += 1;
         }
         if (i < items.len and isOffsetForm(items[i])) {
@@ -6492,6 +6525,37 @@ test "a tail call's results must be the calling function's results" {
         try validate(a, &m);
         try std.testing.expectEqual(@as(i32, 7), interp.asI32(try assembleAndRun(ok, "f", &.{})));
     }
+}
+
+test "R7: the legacy bare memory/table index in data and elem segments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // `(data 0 <offset> …)` is the pre-bulk-memory spelling of
+    // `(data (memory 0) <offset> …)`. ⚠️ Unrecognised, it did not FAIL — the `0`
+    // was dropped and the offset with it, so the segment came out PASSIVE and the
+    // bytes were never written. Assert the VALUE, not that it assembles.
+    try std.testing.expectEqual(@as(i32, 16), interp.asI32(try assembleAndRun(
+        "(module (memory 1) (data 0 (i32.const 10) \"\\10\")" ++
+            " (func (export \"f\") (result i32) (i32.load (i32.const 10))))",
+        "f",
+        &.{},
+    )));
+    // `(elem 0 <offset> …)`, the same shape for tables — this one failed loudly
+    // (`resolveByName` was handed the offset list as a function name).
+    const elem_src =
+        "(module (type $t (func (result i32))) (table 3 funcref)" ++
+        " (elem 0 (i32.const 1) $f $g)" ++
+        " (func $f (result i32) (i32.const 11)) (func $g (result i32) (i32.const 22))" ++
+        " (func (export \"call\") (param i32) (result i32) (call_indirect (type $t) (local.get 0))))";
+    try std.testing.expectEqual(@as(i32, 11), interp.asI32(try assembleAndRun(elem_src, "call", &.{interp.i32Value(1)})));
+    try std.testing.expectEqual(@as(i32, 22), interp.asI32(try assembleAndRun(elem_src, "call", &.{interp.i32Value(2)})));
+    // The legacy form is recognised only when an OFFSET follows, so a passive
+    // segment whose first func index happens to be `0` is untouched.
+    _ = try assemble(a, "(module (func $f) (elem func 0 $f))");
+    // …and a stray token among the data strings is now refused rather than
+    // dropped, which is how the missing memuse above stayed invisible.
+    try std.testing.expectError(error.BadModuleField, assemble(a, "(module (memory 1) (data (i32.const 0) nonsense \"a\"))"));
 }
 
 test "R9: a type use is ORDERED — (type) then param* then result*" {

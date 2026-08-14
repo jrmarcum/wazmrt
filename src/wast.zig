@@ -127,9 +127,10 @@ pub fn runScript(gpa: std.mem.Allocator, src: []const u8) Error!Summary {
     // per-file arena did not help either. Deinit the instances explicitly.
     defer {
         for (r.instances.items) |inst| inst.deinit();
-        // The shared `spectest` memory is BORROWED by every importer, so no
-        // instance frees it — but its bytes are page-allocator owned too.
+        // The shared `spectest` memories are BORROWED by every importer, so no
+        // instance frees them — but their bytes are page-allocator owned too.
         if (r.spectest_memory) |m| interp.freeGuestMemory(m.bytes);
+        if (r.spectest_shared_memory) |m| interp.freeGuestMemory(m.bytes);
     }
     var lines: std.ArrayList(u32) = .empty;
     const forms = try sexpr.parseAllWithLines(r.a, src, &lines);
@@ -161,6 +162,11 @@ const Runner = struct {
     /// The standard `spectest` shared memory (1 page, max 2) and table (10
     /// funcref, max 20), created lazily and shared by every importer.
     spectest_memory: ?*interp.Instance.Memory = null,
+    /// `spectest.shared_memory` — the threads proposal's second memory export,
+    /// declared `shared`. A SEPARATE object from `spectest_memory`, because the
+    /// whole point of the three assertions that use it is that a shared and a
+    /// non-shared memory do NOT satisfy each other's import.
+    spectest_shared_memory: ?*interp.Instance.Memory = null,
     spectest_table: ?*interp.Instance.Table = null,
     /// Cells for the `spectest` constant globals, by name. See `spectestGlobalCell`.
     spectest_globals: std.StringHashMapUnmanaged(*interp.Instance.Global) = .{},
@@ -422,6 +428,14 @@ const Runner = struct {
             if (!limitsFit(.{ .min = 1, .max = 2 }, want.limits)) return error.IncompatibleImportType;
             return self.spectestMemory();
         }
+        // `spectest.shared_memory` (threads). `limitsFit` already compares the
+        // `shared` flag, so declaring it here is all three assertions:
+        // `(memory 1 2 shared)` links, `(memory 1 2)` against it does not, and
+        // `(memory 1 2 shared)` against plain `spectest.memory` does not either.
+        if (std.mem.eql(u8, module, "spectest") and std.mem.eql(u8, name, "shared_memory")) {
+            if (!limitsFit(.{ .min = 1, .max = 2, .shared = true }, want.limits)) return error.IncompatibleImportType;
+            return self.spectestSharedMemory();
+        }
         if (self.modules.get(module)) |inst| {
             for (inst.module.exports) |e| {
                 if (e.type == .memory and std.mem.eql(u8, e.name, name)) {
@@ -474,6 +488,17 @@ const Runner = struct {
         const m = try self.a.create(interp.Instance.Memory);
         m.* = .{ .bytes = buf, .max = 2 };
         self.spectest_memory = m;
+        return m;
+    }
+
+    /// `spectest.shared_memory` — same shape as `spectestMemory`, `shared` set.
+    /// Its `bytes` are page-allocator owned for the same `memory.grow` reason.
+    fn spectestSharedMemory(self: *Runner) !*interp.Instance.Memory {
+        if (self.spectest_shared_memory) |m| return m;
+        const buf = try interp.allocGuestMemory(interp.page_size);
+        const m = try self.a.create(interp.Instance.Memory);
+        m.* = .{ .bytes = buf, .max = 2, .shared = true };
+        self.spectest_shared_memory = m;
         return m;
     }
 
