@@ -173,8 +173,15 @@ const TableDef = struct { min: u64, max: ?u64, elem: V = .funcref, is64: bool = 
 const ElemDef = struct {
     mode: enum { active, passive, declarative },
     table_index: u32,
-    /// Offset const-expr form for active segments (null → implicit `i32.const 0`).
+    /// Offset const-expr form for active segments (null → an implicit zero).
     offset_form: ?Sexpr,
+    /// Index type of the target table, for the IMPLICIT offset only — a 64-bit
+    /// table's offset is `i64.const 0`, not `i32.const 0`. Only the
+    /// `(table i64 reftype (elem …))` abbreviation can reach this: every written
+    /// offset carries its own type. Emitting the i32 form against an i64 table
+    /// is a `TypeMismatch` at validation, which is what `call_indirect64.wast`
+    /// hit the moment the table itself started assembling.
+    is64: bool = false,
     elem_type: V,
     expr_form: bool,
     funcs: []const Sexpr,
@@ -1007,7 +1014,7 @@ fn encodeElementSection(a: std.mem.Allocator, elems: []const ElemDef, sigs: *Lis
         if (as_expr) flag |= 0b100;
         try s.append(a, flag);
         if (explicit_table) try uleb(a, &s, e.table_index);
-        if (e.mode == .active) try emitOffsetExpr(a, &s, sigs, type_names, global_names, func_names, e.offset_form);
+        if (e.mode == .active) try emitOffsetExpr(a, &s, sigs, type_names, global_names, func_names, e.offset_form, e.is64);
         // The leading kind byte: elemkind (0x00) for non-flag-0 func-index
         // variants, reftype for non-flag-4 const-expr variants.
         if (!as_expr and flag != 0) {
@@ -1046,12 +1053,12 @@ fn encodeDataSection(a: std.mem.Allocator, datas: []const DataSeg, sigs: *List(S
             try s.append(a, 0x01); // passive
         } else if (seg.mem_index == 0) {
             try s.append(a, 0x00); // active, memory 0
-            try emitOffsetExpr(a, &s, sigs, type_names, global_names, func_names, seg.offset_form);
+            try emitOffsetExpr(a, &s, sigs, type_names, global_names, func_names, seg.offset_form, false);
         } else {
             // active, explicit memory index (multi-memory)
             try s.append(a, 0x02);
             try uleb(a, &s, seg.mem_index);
-            try emitOffsetExpr(a, &s, sigs, type_names, global_names, func_names, seg.offset_form);
+            try emitOffsetExpr(a, &s, sigs, type_names, global_names, func_names, seg.offset_form, false);
         }
         try uleb(a, &s, seg.bytes.len);
         try s.appendSlice(a, seg.bytes);
@@ -1234,6 +1241,18 @@ fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef
     // here — the sibling of the guards `parseGlobal`/`parseElem`/the inline-import
     // branch already got. Unguarded this reads an adjacent `Sexpr` and switches on
     // a garbage union tag (UB in the shipped ReleaseFast build).
+    // §6.6.7 puts the optional index type `i32`/`i64` (table64) ahead of BOTH
+    // table forms — the limits form and the `reftype (elem …)` abbreviation.
+    // ⚠️ It was consumed only inside the limits branch below, so
+    // `(table $t i64 funcref (elem $f))` took the `i64` as a shape, failed
+    // `isRefType`, and then asked `parseU64("funcref")` → `BadImmediate` on the
+    // whole module. Same guard-around-one-form shape as the `call_indirect`
+    // table index and the flat `br_table`.
+    var is64 = false;
+    if (i < items.len and (eqAtom(items[i], "i64") or eqAtom(items[i], "i32"))) {
+        is64 = eqAtom(items[i], "i64");
+        i += 1;
+    }
     const shape = try nth(items, i);
     if (isRefType(shape)) {
         // (table reftype (elem …))
@@ -1244,33 +1263,24 @@ fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef
             // (`(elem $f $g)`) or const-expr forms (`(elem (ref.func $f) …)`).
             const inner = (try wantList(items[i]))[1..];
             const count: u32 = @intCast(inner.len);
-            try tables.append(a, .{ .min = count, .max = count, .elem = et });
+            try tables.append(a, .{ .min = count, .max = count, .elem = et, .is64 = is64 });
             if (inner.len != 0 and inner[0].asList() != null) {
-                try elems.append(a, .{ .mode = .active, .table_index = table_index, .offset_form = null, .elem_type = et, .expr_form = true, .funcs = &.{}, .exprs = inner });
+                try elems.append(a, .{ .mode = .active, .table_index = table_index, .offset_form = null, .is64 = is64, .elem_type = et, .expr_form = true, .funcs = &.{}, .exprs = inner });
             } else {
                 // The inline abbreviation inherits the TABLE's element type — it
                 // is shorthand for `(elem (i32.const 0) <tabletype> (ref.func $f) …)`,
                 // not for a funcref segment. Hard-coding `funcref` made every
                 // `(table (ref null $t) (elem $f))` reject its own initializer.
-                try elems.append(a, .{ .mode = .active, .table_index = table_index, .offset_form = null, .elem_type = et, .expr_form = false, .funcs = inner, .exprs = &.{} });
+                try elems.append(a, .{ .mode = .active, .table_index = table_index, .offset_form = null, .is64 = is64, .elem_type = et, .expr_form = false, .funcs = inner, .exprs = &.{} });
             }
             try elem_names.append(a, null);
         } else {
-            try tables.append(a, .{ .min = 0, .max = null, .elem = et });
+            try tables.append(a, .{ .min = 0, .max = null, .elem = et, .is64 = is64 });
         }
     } else {
-        // Optional index type `i64` (table64) / `i32`, ahead of the limits — the
-        // same position a memory takes it. Without this the `i64` fell through to
-        // `parseU64` as a non-number, which is the `BadImmediate` that made every
-        // 64-bit-table file in the suite fail to build.
-        var is64 = false;
-        var lim_shape = shape;
-        if (eqAtom(shape, "i64") or eqAtom(shape, "i32")) {
-            is64 = eqAtom(shape, "i64");
-            i += 1;
-            lim_shape = try nth(items, i);
-        }
-        const min = try parseU64(lim_shape);
+        // The index type (`i64` for table64) was already consumed above, in the
+        // one place that serves both table forms.
+        const min = try parseU64(shape);
         i += 1;
         var max: ?u64 = null;
         if (i < items.len and !isRefType(items[i])) {
@@ -1460,14 +1470,16 @@ fn parseImport(a: std.mem.Allocator, items: []const Sexpr, global_imports: *List
 /// Emit an active segment's offset const-expr + `end`. Unwraps `(offset …)`,
 /// accepts a folded const-expr (`(i32.const N)` / `(global.get $g)`), and emits
 /// an implicit `i32.const 0` when no offset form is present.
-fn emitOffsetExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, form: ?Sexpr) Error!void {
+fn emitOffsetExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, form: ?Sexpr, is64: bool) Error!void {
     if (form) |f| {
         if (f.asList()) |l| {
             if (l.len != 0 and eqAtom(l[0], "offset")) return emitConstExpr(a, out, sigs, type_names, global_names, func_names, l[1..]);
         }
         return emitConstExpr(a, out, sigs, type_names, global_names, func_names, &[_]Sexpr{f});
     }
-    try out.append(a, @intFromEnum(Op.i32_const));
+    // The IMPLICIT offset takes the target's index type — `i64.const 0` for a
+    // 64-bit table/memory. See `ElemDef.is64`.
+    try out.append(a, @intFromEnum(if (is64) Op.i64_const else Op.i32_const));
     try sleb(a, out, 0);
     try out.append(a, @intFromEnum(Op.end));
 }
@@ -6525,6 +6537,85 @@ test "a tail call's results must be the calling function's results" {
         try validate(a, &m);
         try std.testing.expectEqual(@as(i32, 7), interp.asI32(try assembleAndRun(ok, "f", &.{})));
     }
+}
+
+test "a tail call's results may be a SUBTYPE of the caller's, not only equal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // §3.3.8 wants `[t2*] <: [t2'*]`. Equality refused every widening return —
+    // a callee giving the non-null `(ref $t)` to a caller declaring the nullable
+    // `(ref null $t)`, or the more abstract `(ref func)`.
+    const ok =
+        "(module (type $t (func)) (type $t1 (func (result (ref $t))))" ++
+        " (elem declare func $f11)" ++
+        " (func $f11 (result (ref $t)) (return_call_ref $t1 (ref.func $f11)))" ++
+        " (func $f21 (result (ref null $t)) (return_call_ref $t1 (ref.func $f11)))" ++
+        " (func $f31 (result (ref func)) (return_call_ref $t1 (ref.func $f11))))";
+    var m = try Module.decode(a, try assemble(a, ok));
+    try validate(a, &m);
+    // …and it is subtyping, not "anything goes": i32 is not a subtype of i64.
+    var bad = try Module.decode(a, try assemble(a,
+        "(module (type $t (func (result i32))) (func $g (type $t) (i32.const 1))" ++
+            " (func (export \"f\") (result i64) (return_call $g)))"));
+    try std.testing.expectError(error.TypeMismatch, validate(a, &bad));
+}
+
+test "a 64-bit table takes its index type before EITHER table form" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // `(table $t i64 funcref (elem …))` — the index type was consumed only in the
+    // limits branch, so the `reftype (elem …)` abbreviation read `i64` as a shape
+    // and then asked `parseU64("funcref")`. And the abbreviation's IMPLICIT offset
+    // has to be `i64.const 0`: an i32 zero against an i64 table is a TypeMismatch,
+    // which is precisely what surfaced once the table itself assembled.
+    var m = try Module.decode(a, try assemble(a,
+        "(module (type $out (func (result i32))) (func $c (type $out) (i32.const 1))" ++
+            " (table $t64 i64 funcref (elem $c))" ++
+            " (func (call_indirect $t64 (type $out) (i64.const 0)) (drop)))"));
+    try validate(a, &m);
+    // The limits form keeps working, in both index types.
+    _ = try assemble(a, "(module (table i64 0 funcref))");
+    _ = try assemble(a, "(module (table i32 1 2 funcref))");
+}
+
+test "an element expression may name a DEFINED global, not only an imported one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // §3.5.13 validates elem segments under the full context C; only `global*`
+    // uses the restricted C'. Bounding element expressions by the imported-global
+    // count rejected this valid module — `global.wast`'s last one is built on it.
+    var m = try Module.decode(a, try assemble(a,
+        "(module (func $f) (global $gf funcref (ref.func $f))" ++
+            " (table $t 10 funcref) (elem (table $t) (i32.const 0) funcref (global.get $gf)))"));
+    try validate(a, &m);
+}
+
+test "S1: an internalized host reference is not a GC heap object" {
+    // ⚠️ A host `externref` used to be a bare small integer, and a GC reference
+    // is a bare small integer too — the same space. `any.convert_extern` is
+    // identity, so a host reference of 0 became GC heap object 0. Here that
+    // object is a struct, so `ref.test (ref struct)` answered 1 and a `ref.cast`
+    // would have handed the guest a reference to it: a forgery primitive built
+    // out of a value the HOST chose.
+    const src =
+        "(module (type $st (struct (field i32)))" ++
+        " (func (export \"is_struct\") (param $x externref) (result i32)" ++
+        "   (drop (struct.new $st (i32.const 6)))" ++ // becomes heap object 0
+        "   (ref.test (ref struct) (any.convert_extern (local.get $x))))" ++
+        " (func (export \"is_any\") (param $x externref) (result i32)" ++
+        "   (ref.test (ref any) (any.convert_extern (local.get $x))))" ++
+        " (func (export \"is_eq\") (param $x externref) (result i32)" ++
+        "   (ref.test (ref eq) (any.convert_extern (local.get $x)))))";
+    const host = interp.hostRefValue(0); // the payload that collided with heap[0]
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "is_struct", &.{host})));
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "is_eq", &.{host})));
+    // …but it IS in the `any` hierarchy: the GC hierarchy puts host values
+    // directly under `any`, so this must stay 1. Asserting only the negatives
+    // would pass against a value that matched nothing at all.
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(src, "is_any", &.{host})));
 }
 
 test "R7: the legacy bare memory/table index in data and elem segments" {

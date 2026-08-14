@@ -168,6 +168,8 @@ const Runner = struct {
     /// non-shared memory do NOT satisfy each other's import.
     spectest_shared_memory: ?*interp.Instance.Memory = null,
     spectest_table: ?*interp.Instance.Table = null,
+    /// `spectest.table64` — the table64 proposal's 64-bit twin of the above.
+    spectest_table64: ?*interp.Instance.Table = null,
     /// Cells for the `spectest` constant globals, by name. See `spectestGlobalCell`.
     spectest_globals: std.StringHashMapUnmanaged(*interp.Instance.Global) = .{},
     /// `(module definition $M …)` bodies, by `$M` — assembled but NOT
@@ -439,13 +441,27 @@ const Runner = struct {
         if (self.modules.get(module)) |inst| {
             for (inst.module.exports) |e| {
                 if (e.type == .memory and std.mem.eql(u8, e.name, name)) {
-                    if (!limitsFit(e.type.memory.limits, want.limits)) return error.IncompatibleImportType;
                     // The EXPORT names a specific memory index (multi-memory), not
                     // necessarily 0 — `memory0()` here linked every imported memory
                     // to the exporter's first one, so `memory.size $mem2` read the
                     // wrong memory.
                     if (e.index >= inst.memories.len) return error.UnresolvedImport;
-                    return inst.memories[e.index];
+                    const mem = inst.memories[e.index];
+                    // ⚠️ **The limits to match are the INSTANCE's, not the
+                    // module's.** §7.2's `mem_type(store, a)` reads the minimum
+                    // off the memory's CURRENT size (`|data| / 64Ki`), so a
+                    // memory declared `(memory 1)` that has since grown to 2
+                    // pages satisfies an `(import … (memory 2))`. Comparing the
+                    // DECLARED minimum refused it — and then the module that
+                    // would have exported it never registered, so the next two
+                    // modules failed as `UnresolvedImport` behind it.
+                    if (!limitsFit(.{
+                        .min = mem.bytes.len / interp.page_size,
+                        .max = mem.max,
+                        .shared = mem.shared,
+                        .is64 = mem.is64,
+                    }, want.limits)) return error.IncompatibleImportType;
+                    return mem;
                 }
             }
         }
@@ -457,13 +473,31 @@ const Runner = struct {
             if (want.element != .funcref or !limitsFit(.{ .min = 10, .max = 20 }, want.limits)) return error.IncompatibleImportType;
             return self.spectestTable();
         }
+        // `spectest.table64` — the table64 proposal's 64-bit twin. `limitsFit`
+        // already refuses a cross-width match (the index type is part of the
+        // type, not a detail of the limits), so one entry gives both directions.
+        if (std.mem.eql(u8, imp.module, "spectest") and std.mem.eql(u8, imp.name, "table64")) {
+            if (want.element != .funcref or !limitsFit(.{ .min = 10, .max = 20, .is64 = true }, want.limits)) return error.IncompatibleImportType;
+            return self.spectestTable64();
+        }
         if (self.modules.get(imp.module)) |inst| {
             for (inst.module.exports) |e| {
                 if (e.type == .table and std.mem.eql(u8, e.name, imp.name)) {
                     const tt = e.type.table;
                     if (!try tm.tableElemOk(inst.module, tt.element, m, want.element)) return error.IncompatibleImportType;
-                    if (!limitsFit(tt.limits, want.limits)) return error.IncompatibleImportType;
-                    if (e.index < inst.tables.len) return inst.tables[e.index];
+                    if (e.index >= inst.tables.len) continue;
+                    const tbl = inst.tables[e.index];
+                    // Same rule as memories: §7.2's `table_type(store, a)` takes
+                    // the minimum from the table's CURRENT length, so a table
+                    // grown past its declared minimum satisfies an import that
+                    // asks for the larger size. The element type still comes from
+                    // the declared type — growing does not change it.
+                    if (!limitsFit(.{
+                        .min = tbl.entries.len,
+                        .max = tbl.max,
+                        .is64 = tbl.is64,
+                    }, want.limits)) return error.IncompatibleImportType;
+                    return tbl;
                 }
             }
         }
@@ -500,6 +534,17 @@ const Runner = struct {
         m.* = .{ .bytes = buf, .max = 2, .shared = true };
         self.spectest_shared_memory = m;
         return m;
+    }
+
+    /// `spectest.table64` — same 10/20 funcref shape, 64-bit index type.
+    fn spectestTable64(self: *Runner) !*interp.Instance.Table {
+        if (self.spectest_table64) |t| return t;
+        const entries = try self.a.alloc(Value, 10);
+        @memset(entries, null_ref);
+        const t = try self.a.create(interp.Instance.Table);
+        t.* = .{ .entries = entries, .max = 20, .is64 = true, .store = self.store };
+        self.spectest_table64 = t;
+        return t;
     }
 
     fn spectestTable(self: *Runner) !*interp.Instance.Table {
@@ -689,11 +734,16 @@ const Runner = struct {
     /// Intern a host externref payload → its stack representation (a small index,
     /// never the `null_ref` sentinel). Equal payloads get the same value so an
     /// externref round-trips through the module and compares equal (#9).
+    /// ⚠️ The result is `interp.hostRefValue`-TAGGED, not a bare index. A bare
+    /// index is exactly a GC heap index, so `any.convert_extern` (identity) used
+    /// to hand `ref.test`/`ref.cast` a value that read as `gc_heap[i]` — a host
+    /// reference answering yes to `structref` and yielding another object's
+    /// fields. The tag keeps the two spaces disjoint.
     fn internExtern(self: *Runner, payload: u64) Error!Value {
-        for (self.extern_pool.items, 0..) |p, i| if (p == payload) return @intCast(i);
-        const idx: Value = @intCast(self.extern_pool.items.len);
+        for (self.extern_pool.items, 0..) |p, i| if (p == payload) return interp.hostRefValue(i);
+        const idx = self.extern_pool.items.len;
         try self.extern_pool.append(self.a, payload);
-        return idx;
+        return interp.hostRefValue(idx);
     }
 
     /// Parse a concrete value literal (for invoke arguments): `(TYPE.const literal)`
@@ -705,8 +755,15 @@ const Runner = struct {
         // `ref.null` carries an ignorable heaptype; `ref.func` payload is a func
         // index (used directly); `ref.extern` payload is a host value (interned).
         if (std.mem.eql(u8, kw, "ref.null")) return null_ref;
-        if (std.mem.eql(u8, kw, "ref.extern")) {
-            if (list.len < 2) return self.internExtern(0); // bare `(ref.extern)` — any non-null
+        // `ref.extern N` and `ref.host N` are the SAME value seen from the two
+        // hierarchies — `extern.convert_any`/`any.convert_extern` are identity —
+        // so they intern identically. `extern.wast` pins the pair directly:
+        // `(invoke "internalize" (ref.extern 1))` must equal `(ref.host 1)`, and
+        // `(invoke "externalize" (ref.host 2))` must equal `(ref.extern 2)`.
+        // `ref.host` was missing here, so that second assertion could not even
+        // build its ARGUMENT and reported `unexpected trap BadValue`.
+        if (std.mem.eql(u8, kw, "ref.extern") or std.mem.eql(u8, kw, "ref.host")) {
+            if (list.len < 2) return self.internExtern(0); // bare form — any non-null
             return self.internExtern(@bitCast(try parseInt(list[1].asAtom() orelse return error.BadValue)));
         }
         if (std.mem.eql(u8, kw, "ref.func")) {
@@ -731,7 +788,11 @@ const Runner = struct {
         // Reference matchers: `(ref.null …)` ⇒ null; a bare `(ref.func)` /
         // `(ref.extern)` ⇒ any non-null; with a payload ⇒ exact.
         if (std.mem.eql(u8, kw, "ref.null")) return got == null_ref;
-        if (std.mem.eql(u8, kw, "ref.extern")) {
+        // `ref.host N` is `ref.extern N` seen from the `any` side, so a payload
+        // makes it an EXACT match too — `(ref.host 1)` in `extern.wast` asserts
+        // the round trip preserved the identity, which "any non-null" would not
+        // have checked at all.
+        if (std.mem.eql(u8, kw, "ref.extern") or (std.mem.eql(u8, kw, "ref.host") and list.len >= 2)) {
             if (list.len < 2) return got != null_ref;
             return got == try self.internExtern(@bitCast(try parseInt(list[1].asAtom() orelse return error.BadValue)));
         }
@@ -1213,6 +1274,40 @@ test "runs assert_return and assert_trap over a module" {
     const s = try runScript(std.testing.allocator, src);
     try std.testing.expectEqual(@as(usize, 4), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "L1: an import matches a memory/table's CURRENT size, not its declared minimum" {
+    // §7.2's `mem_type`/`table_type` read the minimum off the live instance, so a
+    // memory declared `(memory 1)` that has GROWN to 2 pages satisfies an
+    // `(import … (memory 2))`. Comparing the declared minimum refused it — and
+    // then this module never registered either, so anything importing from it
+    // failed as `UnresolvedImport` behind the first error.
+    const src =
+        \\(module $M (memory (export "mem") 1) (table (export "tab") 1 funcref)
+        \\  (func (export "grow-mem") (result i32) (memory.grow (i32.const 1)))
+        \\  (func (export "grow-tab") (result i32) (table.grow (ref.null func) (i32.const 1))))
+        \\(register "grown" $M)
+        \\(assert_return (invoke $M "grow-mem") (i32.const 1))
+        \\(assert_return (invoke $M "grow-tab") (i32.const 1))
+        \\(module $N (memory (export "mem2") (import "grown" "mem") 2)
+        \\  (table (import "grown" "tab") 2 funcref)
+        \\  (func (export "size") (result i32) (memory.size)))
+        \\(register "grown2" $N)
+        \\(assert_return (invoke $N "size") (i32.const 2))
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+    try std.testing.expectEqual(@as(usize, 3), s.passed);
+    // …and the rule does not go the other way: asking for MORE than the current
+    // size is still incompatible.
+    const too_big =
+        \\(module $M (memory (export "mem") 1))
+        \\(register "g" $M)
+        \\(module (memory (import "g" "mem") 2))
+    ;
+    var s2 = try runScript(std.testing.allocator, too_big);
+    defer s2.deinit(std.testing.allocator); // failure messages are caller-owned
+    try std.testing.expectEqual(@as(usize, 1), s2.failed);
 }
 
 test "runner rejects malformed commands without indexing out of bounds" {

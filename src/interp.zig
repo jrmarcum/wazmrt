@@ -447,6 +447,35 @@ fn tagIdValue(store_slot: u32, tag_index: u32) u64 {
 /// is checked before this bit, so the two never confuse.
 const i31_tag: Value = @as(Value, 1) << 63;
 
+/// Tag bit marking a value slot as a HOST reference — an opaque value the
+/// embedder (or the `.wast` runner's `(ref.extern N)`) owns, which
+/// `any.convert_extern` brings into the `any` hierarchy.
+///
+/// ⚠️ **Without it the `extern` value space and the GC HEAP INDEX space were the
+/// same space.** A host externref was a small integer, `any.convert_extern` is
+/// identity, and `refMatches` then read that integer as `gc_heap[i]` — so
+/// `br_on_cast … (ref null struct)` on `any.convert_extern (ref.extern 0)`
+/// succeeded and `struct.get` returned an unrelated object's FIELD. That is a
+/// reference-forgery primitive of the same family as the 12th pass's
+/// family-head bug, reachable from ordinary spec-test input.
+///
+/// Bit 62, so it is disjoint from `i31_tag` (63) and from `null_ref` (all set),
+/// and `gcObject`'s bounds check turns any tagged value into a clean
+/// `GcOutOfBounds` rather than a heap read.
+pub const host_tag: Value = @as(Value, 1) << 62;
+
+/// Build the `externref`/host-reference value for an embedder payload. The
+/// payload is masked to 62 bits; callers hand it a small interned index, not an
+/// arbitrary host word (see `known-issues.md` on the C ABI's raw pass-through).
+pub fn hostRefValue(payload: u64) Value {
+    return host_tag | (payload & (host_tag - 1));
+}
+
+/// The payload of a host reference built by `hostRefValue`.
+pub fn hostRefPayload(v: Value) u64 {
+    return v & (host_tag - 1);
+}
+
 /// Stack slots a value type occupies: a `v128` is **two** `u64` slots (SIMD),
 /// every other type is one. Only v128 differs, so a module with no v128 keeps
 /// the "one value = one slot" model unchanged.
@@ -1542,6 +1571,13 @@ pub const Instance = struct {
         switch (target_head.top()) {
             .any => {
                 if (v & i31_tag != 0) return self.headMatches(.i31, null, rt.heap);
+                // A HOST reference internalized by `any.convert_extern`. Its head
+                // is `any` ITSELF — the GC hierarchy puts host values directly
+                // under `any`, below nothing — so it answers no to
+                // eq/i31/struct/array and yes only to `any`. Checked BEFORE the
+                // heap-index path, which is the whole point: untagged, this value
+                // indexed `gc_heap` and a host reference read as a struct.
+                if (v & host_tag != 0) return self.headMatches(.any, null, rt.heap);
                 const idx = std.math.cast(usize, v) orelse return false; // wasm32-safe
                 if (idx >= self.gc_heap.items.len) return false; // defensive
                 const obj = self.gc_heap.items[idx];

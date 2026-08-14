@@ -181,6 +181,27 @@
 # silent `else => {}` into a rejection. Tiny, and it closed a segment that assembled ACTIVE in the
 # source and PASSIVE in the binary.
 
-wazmrt.exe  957440
-wazmrt.lib  1021328
+# RAISED 2026-08-14 (the post-R-list singleton batch — S1/L1 and four smaller rules). Measured
+# ReleaseSmall, Zig 0.16.0, x86_64-windows: `zig build dll` then a plain `zig build`.
+#
+#   artifact       after R7     after batch     batch share
+#   wazmrt.exe      957,440       957,952            +512
+#   wazmrt.lib    1,021,328     1,021,464            +136
+#   wazmrt.dll      882,176       882,176              +0
+#
+# Delta-vs-ceiling is delta-vs-parent again: R7 set these to its own measured values.
+#
+# **+136 bytes of real code for 22 closed failures**, the best ratio since R10 — because five of the
+# six causes REPLACE a rule rather than add one: an equality check becomes a subtype check
+# (`resultsSubtype`), a declared limit becomes a live one, a validation bound becomes the wider
+# correct bound, an index-type parse moves up one level. Only `host_tag` and the `spectest.table64`
+# stub are genuinely new.
+#
+# The DLL is unchanged for the second entry running. That is alignment, not staleness (it was
+# rebuilt in this run) — but note that S1's `host_tag` IS in the DLL's code path, and the C ABI
+# still hands `wazmrt_val_t` externrefs to the guest untagged. See `known-issues.md`: the tag
+# closes the defect for the `.wast` runner and leaves the embedder surface for an owner decision.
+
+wazmrt.exe  957952
+wazmrt.lib  1021464
 wazmrt.dll  882176

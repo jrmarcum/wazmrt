@@ -217,7 +217,18 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
             if (module.funcType(fi) == null) return error.UndefinedFunc;
             if (fi < n_funcs) refs.set(fi); // a segment entry declares the function
         }
-        for (elem.exprs) |ex| try validateConstExpr(module, ex, elem.elem_type, n_imported_globals, &refs);
+        // ⚠️ **`all_globals`, not `n_imported_globals`.** §3.5.13 validates the
+        // element segments under the FULL context `C`; only `global*` uses the
+        // restricted `C'` that holds imported globals alone (line 202 above, where
+        // the bound is the global's own index so an initializer sees only PRIOR
+        // globals). Passing the restricted bound here rejected
+        // `(elem (table $t) … (global.get $gf))` for a DEFINED `$gf` — a valid
+        // module, and the whole of `global.wast`'s last module with it. The
+        // element expressions of an active segment are evaluated in
+        // `applyActiveSegments`, after every global is initialized, so the value
+        // is genuinely available. The segment OFFSET (line ~252) already used the
+        // full bound; only the element expressions kept the old restriction.
+        for (elem.exprs) |ex| try validateConstExpr(module, ex, elem.elem_type, all_globals, &refs);
         if (elem.mode == .active) {
             if (elem.table_index >= module.tables.len) return error.UndefinedTable;
             const tet = module.tables[elem.table_index].element;
@@ -1068,13 +1079,15 @@ const FuncValidator = struct {
                 try self.pushVals(ft.results);
             },
             // Tail calls (§3.3.8). The callee REPLACES this frame, so its results
-            // ARE this function's results — they must match exactly, and nothing
-            // after the instruction is reachable. `return_call_ref` already had
-            // this shape; these two are its plain and indirect siblings.
+            // become this function's results — they must be a SUBTYPE sequence of
+            // them (see `resultsSubtype`; this was an equality check, which is
+            // reject-valid for every widening return), and nothing after the
+            // instruction is reachable. `return_call_ref` already had this shape;
+            // these two are its plain and indirect siblings.
             .return_call => {
                 const ft = self.module.funcType(instr.imm.func) orelse return error.UndefinedFunc;
                 try self.popVals(ft.params);
-                if (!valTypesEqual(ft.results, self.results)) return error.TypeMismatch;
+                if (!resultsSubtype(self.module, ft.results, self.results)) return error.TypeMismatch;
                 self.setUnreachable();
             },
             .return_call_indirect => {
@@ -1084,7 +1097,7 @@ const FuncValidator = struct {
                 const ft = self.module.funcSig(ci.type_index) orelse return error.UndefinedType;
                 _ = try self.popExpect(self.tableAddrTy(ci.table)); // the callee index
                 try self.popVals(ft.params);
-                if (!valTypesEqual(ft.results, self.results)) return error.TypeMismatch;
+                if (!resultsSubtype(self.module, ft.results, self.results)) return error.TypeMismatch;
                 self.setUnreachable();
             },
             .call_indirect => {
@@ -1363,7 +1376,7 @@ const FuncValidator = struct {
                 const ft = self.module.funcSig(instr.imm.func) orelse return error.UndefinedType;
                 _ = try self.popExpect(V.concreteRef(true, .func, instr.imm.func));
                 try self.popVals(ft.params);
-                if (!valTypesEqual(ft.results, self.results)) return error.TypeMismatch;
+                if (!resultsSubtype(self.module, ft.results, self.results)) return error.TypeMismatch;
                 self.setUnreachable();
             },
             // GC: i31 references (full GC, P3). `ref.i31` boxes an i32 into a
@@ -1755,6 +1768,21 @@ const FuncValidator = struct {
 fn valTypesEqual(a: []const V, b: []const V) bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| if (x != y) return false;
+    return true;
+}
+
+/// §3.3.8: a tail call's callee results must be a SUBTYPE SEQUENCE of the
+/// caller's declared results — `[t2*] <: [t2'*]` — not equal to them.
+///
+/// ⚠️ All three tail-call forms used `valTypesEqual`, which is reject-VALID for
+/// every widening return: `(func (result (ref null $t)) (return_call_ref $t1 …))`
+/// where `$t1` returns the non-null `(ref $t)` is exactly the idiom
+/// `return_call_ref.wast`'s "More typing" module is built from, and equality
+/// refused six functions of it. Equality is not a conservative approximation of
+/// subtyping here — it is a different rule that rejects real code.
+fn resultsSubtype(module: *const Module, callee: []const V, caller: []const V) bool {
+    if (callee.len != caller.len) return false;
+    for (callee, caller) |x, y| if (!subtypeOf(module, x, y)) return false;
     return true;
 }
 
