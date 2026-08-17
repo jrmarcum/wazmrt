@@ -379,8 +379,12 @@ pub const HeapType = union(enum) {
     concrete: u32, // a type index
 };
 
-/// A reference type: a heap type plus nullability (`(ref null? ht)`).
-pub const RefType = struct { nullable: bool, heap: HeapType };
+/// A reference type: a heap type plus nullability (`(ref null? ht)`) and, for custom-descriptors,
+/// exactness (`(ref null? (exact $t))`).
+///
+/// ⚠️ `exact` is only ever true for a `.concrete` heap type — an abstract head names a family, so
+/// there is nothing for "exactly this" to bind to, and both readers reject the combination.
+pub const RefType = struct { nullable: bool, heap: HeapType, exact: bool = false };
 
 /// The `0xFC` sub-opcode for an internal saturating-truncation / bulk-memory /
 /// table-op tag, or null for a normal op.
@@ -703,7 +707,8 @@ fn readBlockType(r: *Reader) DecodeError!BlockType {
     const first = try r.peekByte();
     if (first == 0x63 or first == 0x64) {
         _ = try r.readByte();
-        return .{ .ref = .{ .nullable = first == 0x63, .heap = try readHeapType(r) } };
+        const he = try readHeapTypeExact(r);
+        return .{ .ref = .{ .nullable = first == 0x63, .heap = he.heap, .exact = he.exact } };
     }
     const v = try r.readVarS33();
     if (v >= 0) {
@@ -751,12 +756,12 @@ fn readGcField(r: *Reader) DecodeError!Imm {
 fn readBrCast(r: *Reader) DecodeError!Imm {
     const flags = try r.readByte();
     const label = try r.readVarU32();
-    const src_ht = try readHeapType(r);
-    const dst_ht = try readHeapType(r);
+    const src_ht = try readHeapTypeExact(r);
+    const dst_ht = try readHeapTypeExact(r);
     return .{ .br_cast = .{
         .label = label,
-        .src = .{ .nullable = flags & 0b01 != 0, .heap = src_ht },
-        .dst = .{ .nullable = flags & 0b10 != 0, .heap = dst_ht },
+        .src = .{ .nullable = flags & 0b01 != 0, .heap = src_ht.heap, .exact = src_ht.exact },
+        .dst = .{ .nullable = flags & 0b10 != 0, .heap = dst_ht.heap, .exact = dst_ht.exact },
     } };
 }
 
@@ -970,8 +975,43 @@ fn readTryTable(r: *Reader, a: std.mem.Allocator) (DecodeError || std.mem.Alloca
 
 /// Read a heap type (§ GC binary format): a non-negative `s33` is a concrete
 /// type index; negative values are the abstract heap-type codes.
+/// Read a heap type, reporting whether it carried the custom-descriptors `exact` prefix.
+///
+/// 🔑 **`readHeapType` and this must stay in step with `wat.zig`'s emitter.** The assembler writes
+/// `0x62` before the heap-type code for an exact cast target; a reader that does not know the byte
+/// treats it as a malformed opcode and the module fails to DECODE — which is what happened for one
+/// build of this change, and is the producer/consumer pair this codebase has been bitten by five
+/// times. The regression is silent in the failure column: the affected modules simply stop
+/// building, so their assertions become SKIPS rather than failures.
+pub fn readHeapTypeExact(r: *Reader) DecodeError!struct { heap: HeapType, exact: bool } {
+    const first = try r.readVarS33();
+    if (first == -0x1e) { // 0x62 — the `exact` former
+        const inner = try readHeapType(r);
+        // Concrete only; `(ref (exact any))` and friends are malformed.
+        if (inner != .concrete) return error.BadValType;
+        return .{ .heap = inner, .exact = true };
+    }
+    return .{ .heap = try heapTypeFromCode(first), .exact = false };
+}
+
 pub fn readHeapType(r: *Reader) DecodeError!HeapType {
-    const v = try r.readVarS33(); // s33
+    return heapTypeFromCode(try r.readVarS33());
+}
+
+/// A `ref.test`/`ref.cast` target: nullability (from the sub-opcode) plus an exactness-aware heap
+/// type.
+///
+/// ⚠️ **The four cast sub-opcodes read their target here and NOT through `readHeapType`.** They
+/// were the sites that still dropped the `exact` prefix after the type/valtype readers had been
+/// taught it, so `ref.test (ref (exact $super))` answered **1** for a subtype — type confusion,
+/// and invisible to the conformance score because the corpus files involved were already failing
+/// for other reasons. Found only by the by-construction wrong-answer test.
+fn readRefTypeExact(r: *Reader, nullable: bool) DecodeError!RefType {
+    const he = try readHeapTypeExact(r);
+    return .{ .nullable = nullable, .heap = he.heap, .exact = he.exact };
+}
+
+fn heapTypeFromCode(v: i64) DecodeError!HeapType {
     if (v >= 0) {
         if (v > std.math.maxInt(u32)) return error.UnsupportedOpcode; // guard the @intCast
         return .{ .concrete = @intCast(v) };
@@ -1056,10 +1096,10 @@ pub fn decodeBodyTracked(
                 0x0d => .{ .op = .array_get_u, .imm = .{ .gc_type = try r.readVarU32() } },
                 0x0e => .{ .op = .array_set, .imm = .{ .gc_type = try r.readVarU32() } },
                 0x0f => .{ .op = .array_len, .imm = .none },
-                0x14 => .{ .op = .ref_test, .imm = .{ .ref_cast = .{ .nullable = false, .heap = try readHeapType(&r) } } },
-                0x15 => .{ .op = .ref_test, .imm = .{ .ref_cast = .{ .nullable = true, .heap = try readHeapType(&r) } } },
-                0x16 => .{ .op = .ref_cast, .imm = .{ .ref_cast = .{ .nullable = false, .heap = try readHeapType(&r) } } },
-                0x17 => .{ .op = .ref_cast, .imm = .{ .ref_cast = .{ .nullable = true, .heap = try readHeapType(&r) } } },
+                0x14 => .{ .op = .ref_test, .imm = .{ .ref_cast = try readRefTypeExact(&r, false) } },
+                0x15 => .{ .op = .ref_test, .imm = .{ .ref_cast = try readRefTypeExact(&r, true) } },
+                0x16 => .{ .op = .ref_cast, .imm = .{ .ref_cast = try readRefTypeExact(&r, false) } },
+                0x17 => .{ .op = .ref_cast, .imm = .{ .ref_cast = try readRefTypeExact(&r, true) } },
                 0x18 => .{ .op = .br_on_cast, .imm = try readBrCast(&r) },
                 0x19 => .{ .op = .br_on_cast_fail, .imm = try readBrCast(&r) },
                 0x1c => .{ .op = .ref_i31, .imm = .none },

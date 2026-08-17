@@ -99,7 +99,13 @@ pub const ValType = enum(u32) {
     const nullable_bit: u32 = 0x4000_0000;
     const kind_shift: u5 = 28;
     const kind_mask: u32 = 0x3 << kind_shift;
-    const index_mask: u32 = 0x0fff_ffff; // 28 bits — up to ~268M types
+    /// `(ref (exact $t))` — custom-descriptors. **Stolen from the top of the index field**, which
+    /// is why `index_mask` is 27 bits and not 28: bits 31/30/29-28 were all spoken for, so the
+    /// only room was the index's headroom. The cost is halving the largest expressible type index
+    /// from ~268M to ~134M, which no real module approaches and which
+    /// `max_concrete_index` keeps enforceable.
+    const exact_bit: u32 = 0x0800_0000;
+    const index_mask: u32 = 0x07ff_ffff; // 27 bits — up to ~134M types
 
     /// Largest type index a concrete `(ref $t)` can carry. `concreteRef` masks
     /// with `index_mask`, so anything above this **silently truncates** — and a
@@ -112,6 +118,18 @@ pub const ValType = enum(u32) {
     /// Build a concrete typed reference `(ref null? $ti)` for family `kind`
     /// (must be `.func`/`.@"struct"`/`.array`).
     pub fn concreteRef(is_nullable: bool, kind: RefHeap, ti: u32) ValType {
+        return concreteRefEx(is_nullable, kind, ti, false);
+    }
+
+    /// As `concreteRef`, plus the custom-descriptors `exact` flag.
+    ///
+    /// Kept as a separate entry point rather than a fourth parameter on `concreteRef` because
+    /// **31 existing call sites all mean "inexact"**, and threading a `false` through every one of
+    /// them would be noise that hides the handful of sites where exactness is a real decision.
+    /// ⚠️ That is the opposite call from the feature-set rule (*a defaulted policy is a policy
+    /// nobody reviewed*) and for the opposite reason: inexact is not a policy, it is what a plain
+    /// `(ref $t)` MEANS. The two sites that construct exact refs say so explicitly.
+    pub fn concreteRefEx(is_nullable: bool, kind: RefHeap, ti: u32, is_exact: bool) ValType {
         const k: u32 = switch (kind) {
             .func => 0,
             .@"struct" => 1,
@@ -120,8 +138,21 @@ pub const ValType = enum(u32) {
         };
         return @enumFromInt(concrete_bit |
             (if (is_nullable) nullable_bit else 0) |
+            (if (is_exact) exact_bit else 0) |
             (k << kind_shift) |
             (ti & index_mask));
+    }
+
+    /// True if this is an EXACT concrete reference: `(ref (exact $t))` admits `$t` and nothing
+    /// else, where a plain `(ref $t)` admits every subtype of `$t`.
+    ///
+    /// 🔒 **The soundness hinge of the whole descriptors proposal.** Answering "yes, a subtype
+    /// fits" where the spec demands exact is type confusion — the guest receives a value of a type
+    /// it proved it did not have. Meaningless (and false) for non-concrete types, which is why it
+    /// guards on `isConcrete` rather than testing the bit alone: an abstract valtype's byte may
+    /// happen to have bit 27 set.
+    pub fn isExact(self: ValType) bool {
+        return self.isConcrete() and (@intFromEnum(self) & exact_bit != 0);
     }
 
     /// True if this is a concrete typed reference (carries a type index).
@@ -138,8 +169,12 @@ pub const ValType = enum(u32) {
     /// marker, nullability and family bits. Two concrete refs are the same type
     /// only if these agree *and* their indices name the same type — `(ref $t)` and
     /// `(ref null $t)` are distinct, so the index alone never settles it.
+    /// ⚠️ **`exact_bit` is included, and must be.** This is what decides whether two concrete refs
+    /// are the SAME type, and `(ref (exact $t))` is not `(ref $t)` — omitting the bit here would
+    /// make them compare equal everywhere identity is asked, which is the type-confusion direction
+    /// rather than the merely-wrong-answer one.
     pub fn flagBits(self: ValType) u32 {
-        return @intFromEnum(self) & (concrete_bit | nullable_bit | kind_mask);
+        return @intFromEnum(self) & (concrete_bit | nullable_bit | exact_bit | kind_mask);
     }
 
     /// True only for the defined value types (rejects garbage `@enumFromInt`).

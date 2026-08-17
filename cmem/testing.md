@@ -83,7 +83,7 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
 
 ## 📊 CURRENT spec-testsuite score (2026-08-17) — EVERY CORE SPEC FILE IS AT ZERO
 
-**284 files — 63,248 assertions passed / 79 failed / 604 skipped**, and `zig build conformance -Dbaseline=tools/conformance-baseline.txt` reports **0 regressions**. This is the number to quote;
+**284 files — 63,344 assertions passed / 53 failed / 515 skipped**, and `zig build conformance -Dbaseline=tools/conformance-baseline.txt` reports **0 regressions**. This is the number to quote;
 every snapshot below it is older and kept as history. *(Superseded same day: 63,190 / 81 / 673, then 62,898 / 81 / 965.)*
 
 **Deliberate spec deviations: ZERO** (the last, `anyfunc`, closed 2026-08-17). **ALL 79 remaining

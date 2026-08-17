@@ -1910,8 +1910,27 @@ fn subtypeOf(module: *const Module, sub: V, sup: V) bool {
     if (sup.isNonNullRef() and !sub.isNonNullRef()) return false;
     // Concrete → concrete: walk the declared supertype chain (the collapsed
     // heads alone would wrongly accept any two structs / any two arrays).
-    if (sub.isConcrete() and sup.isConcrete())
+    if (sub.isConcrete() and sup.isConcrete()) {
+        // 🔒 **EXACTNESS — the soundness hinge of custom-descriptors.**
+        //
+        // `(ref (exact $t))` denotes `$t` and NOTHING BELOW IT. So:
+        //   • an exact SUPER admits only an exact sub of the same type — accepting a subtype here
+        //     is type confusion, the guest receiving a value of a type it proved it did not have;
+        //   • an exact SUB satisfies an inexact super normally, because "exactly $t" is a
+        //     strictly stronger claim than "$t or below". That asymmetry is the whole point, and
+        //     getting it backwards would reject valid modules instead — the safe direction, but
+        //     still wrong.
+        if (sup.isExact()) {
+            if (!sub.isExact()) return false;
+            // Identity, not subtyping. Index equality settles it within a module; the mutual-
+            // subtype fallback covers two indices the module canonicalises to one type, since
+            // wasm types are structural and `$a <: $b <: $a` means they ARE the same type.
+            const a = sub.concreteIndex();
+            const b = sup.concreteIndex();
+            return a == b or (module.isSubtype(a, b) and module.isSubtype(b, a));
+        }
         return module.isSubtype(sub.concreteIndex(), sup.concreteIndex());
+    }
     // Abstract sup (or abstract sub): compare on the family hierarchy. A concrete
     // sub matches an abstract sup by its family head (`(ref $struct)` <: structref
     // / eqref / anyref); an abstract sub only satisfies a concrete sup when it is

@@ -1833,14 +1833,14 @@ pub const Instance = struct {
         const target_head = self.module.refHead(rt.heap) catch return false;
         switch (target_head.top()) {
             .any => {
-                if (v & i31_tag != 0) return self.headMatches(.i31, null, rt.heap);
+                if (v & i31_tag != 0) return self.headMatches(.i31, null, rt.heap, rt.exact);
                 // A HOST reference internalized by `any.convert_extern`. Its head
                 // is `any` ITSELF — the GC hierarchy puts host values directly
                 // under `any`, below nothing — so it answers no to
                 // eq/i31/struct/array and yes only to `any`. Checked BEFORE the
                 // heap-index path, which is the whole point: untagged, this value
                 // indexed `gc_heap` and a host reference read as a struct.
-                if (v & host_tag != 0) return self.headMatches(.any, null, rt.heap);
+                if (v & host_tag != 0) return self.headMatches(.any, null, rt.heap, rt.exact);
                 // Resolve the OWNER through the store — the object may belong to
                 // another instance, and its heap index means nothing here.
                 const e = self.store.resolveGc(v) orelse return false;
@@ -1869,19 +1869,32 @@ pub const Instance = struct {
                     if (obj.type_index >= e.inst.canon_ids.len) return false;
                     return self.store.canon.isSub(e.inst.canon_ids[obj.type_index], self.canon_ids[want_local]);
                 }
-                return self.headMatches(kind, obj.type_index, rt.heap);
+                return self.headMatches(kind, obj.type_index, rt.heap, rt.exact);
             },
-            .func => return self.headMatches(.func, self.definedFuncType(v), rt.heap),
-            else => return self.headMatches(.extern_, null, rt.heap),
+            .func => return self.headMatches(.func, self.definedFuncType(v), rt.heap, rt.exact),
+            else => return self.headMatches(.extern_, null, rt.heap, rt.exact),
         }
     }
 
     /// Match a value's actual heap head (`actual`, and concrete type index
     /// `actual_ti` when known) against a target heap type — abstract targets use
     /// the hierarchy relation, concrete targets the declared subtype chain.
-    fn headMatches(self: *Instance, actual: types.ValType.RefHeap, actual_ti: ?u32, target: opcode.HeapType) bool {
+    fn headMatches(self: *Instance, actual: types.ValType.RefHeap, actual_ti: ?u32, target: opcode.HeapType, exact: bool) bool {
         switch (target) {
-            .concrete => |t| return actual_ti != null and self.module.isSubtype(actual_ti.?, t),
+            .concrete => |t| {
+                const ti = actual_ti orelse return false;
+                // 🔒 **EXACT CAST — the wrong answer here is TYPE CONFUSION, not a wrong number.**
+                // `ref.cast (ref (exact $t))` must succeed only for a value whose type IS `$t`.
+                // Answering yes for a SUBTYPE hands the guest a value of a type it just proved it
+                // did not have — the same shape as the host-externref/GC-index collision and the
+                // cross-instance object substitution, both of which passed the whole corpus.
+                //
+                // Identity, not subtyping: index equality, with a mutual-subtype fallback for two
+                // indices the module canonicalises to one type (wasm types are structural, so
+                // `$a <: $b <: $a` means they are the same type).
+                if (exact) return ti == t or (self.module.isSubtype(ti, t) and self.module.isSubtype(t, ti));
+                return self.module.isSubtype(ti, t);
+            },
             // `nofunc`/`noextern` are the UNINHABITED bottoms of the func/extern
             // hierarchies: only a null reference has those types, and `refMatches`
             // has already answered for null (`v == null_ref` → `rt.nullable`). So

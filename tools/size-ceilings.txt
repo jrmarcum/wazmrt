@@ -461,6 +461,27 @@
 # our assembler and back in through our decoder, which accepts both encodings. **A gate can be
 # perfectly green and structurally blind.** wasmtime caught it in one command.
 
-wazmrt.exe  969216
-wazmrt.lib  1032908
-wazmrt.dll  890880
+# RAISED 2026-08-17 (TRACK D1 — the `exact` reference-type former). Reference configuration.
+#
+#   artifact       before         after       share
+#   wazmrt.exe    969,216       970,752     +1,536
+#   wazmrt.lib  1,032,908     1,034,976     +2,068
+#   wazmrt.dll    892,416 <- 890,880        +1,536
+#
+# 2,068 bytes (unpadded lib) for D1: `exact_bit` + `concreteRefEx`/`isExact`, the 0x62 former in
+# both readers and both emitters, `(exact $t)` in value-type and cast-target text position, and
+# the exactness arms in `subtypeOf` and `headMatches`.
+#
+# Closed 26 failures and 89 skips — 115 assertions. Corpus 63,248 -> 63,344 passed,
+# 79 -> 53 failed, 604 -> 515 skipped, 0 regressions.
+#
+# 🔒 The wrong-answer test earned its keep immediately and is the reason to keep writing them:
+# after `subtypeOf` and `headMatches` both had their exactness arms, `ref.test (ref (exact
+# $super))` STILL answered 1 for a subtype, because the four `ref.test`/`ref.cast` sub-opcodes
+# read their target through a path that dropped the 0x62 prefix. **The conformance score could not
+# see it** — the files involved were already failing for other reasons — so an assertion count
+# would have called D1 done with live type confusion in it.
+
+wazmrt.exe  970752
+wazmrt.lib  1034976
+wazmrt.dll  892416

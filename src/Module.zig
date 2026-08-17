@@ -822,13 +822,42 @@ fn readValType(r: *Reader, kinds: []const CompKind) Error!types.ValType {
 /// `arrayref`) using the pre-scanned `kinds`. Negative encodings are the
 /// abstract heap types. `nullable` picks the nullable vs non-null variant.
 fn readHeapTypeRef(r: *Reader, nullable: bool, kinds: []const CompKind) Error!types.ValType {
+    return readHeapTypeRefEx(r, nullable, kinds, false);
+}
+
+/// `exact_seen` guards against `0x62 0x62 …`: `exact` is a heap-type FORMER, not a modifier that
+/// stacks, so a repeated prefix is malformed rather than idempotent. (Same shape as the
+/// descriptor clause, whose own spec test asserts "cannot have multiple descriptor clauses".)
+fn readHeapTypeRefEx(r: *Reader, nullable: bool, kinds: []const CompKind, exact_seen: bool) Error!types.ValType {
     const ht = try r.readVarS33(); // s33 (≤5 bytes, [-2^32, 2^32-1])
+    // 0x62 reads as the s33 −0x1e: the custom-descriptors `exact` prefix, followed by the heap
+    // type it applies to.
+    //
+    // ⚠️ **This byte was, until 2026-08-17, what OUR OWN assembler wrote for `(ref i31)`** — a
+    // synthetic internal tag squatting on what has since become real spec syntax. wasmtime named
+    // the collision exactly ("unexpected exact type") when it rejected our output. The emitter is
+    // fixed; the note stays because it is the reason this arm could not have been added earlier.
+    if (ht == -0x1e) {
+        if (exact_seen) return error.BadValType;
+        const inner = try readHeapTypeRefEx(r, nullable, kinds, true);
+        // `exact` applies only to CONCRETE types. `(ref (exact any))` and friends are malformed —
+        // an abstract head has no single type to be exact about.
+        if (!inner.isConcrete()) return error.BadValType;
+        return types.ValType.concreteRefEx(nullable, inner.refHeap(), inner.concreteIndex(), true);
+    }
     if (ht >= 0) {
         // A non-negative s33 is always ≤ 2^32-1, so the cast is safe; the guard is
         // a belt-and-suspenders backstop kept in case `readVarS33` ever changes.
         if (ht > std.math.maxInt(u32)) return error.IndexOutOfRange;
         const ti: u32 = @intCast(ht);
         if (ti >= kinds.len) return error.IndexOutOfRange;
+        // ⚠️ `concreteRef` MASKS with `index_mask`, so an index above it silently truncates — and
+        // a large index can truncate to a small VALID one, which is type confusion rather than a
+        // wrong number. The bound is enforced here rather than left to `kinds.len` because
+        // `index_mask` narrowed from 28 to 27 bits when `exact` took bit 27: the two limits are
+        // now independent, and the type-count one is no longer the tighter of the pair by
+        // construction.
+        if (ti > types.ValType.max_concrete_index) return error.IndexOutOfRange;
         const head: types.ValType.RefHeap = switch (kinds[ti]) {
             .func => .func,
             .@"struct" => .@"struct",

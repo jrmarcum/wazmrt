@@ -1736,6 +1736,22 @@ fn obsoleteValType(atom: []const u8) ?[]const u8 {
 /// placeholder — the assembler only emits its index; the decoder re-derives the
 /// family via its kind pre-scan.)
 fn heapTypeToValType(s: Sexpr, nullable: bool, type_names: []const ?[]const u8) Error!V {
+    // `(exact $t)` — custom-descriptors. A heap-type FORMER wrapping a concrete type, so it is a
+    // LIST here where every other heap type is an atom.
+    //
+    // 🔒 **`exact` applies only to CONCRETE types.** `(ref (exact any))`, `(exact eq)`,
+    // `(exact i31)` … are each an `assert_malformed` in `exact.wast`: an abstract head names a
+    // family, not one type, so "exactly this" has nothing to bind to. Refused here rather than
+    // silently dropped — dropping the `exact` would produce a module that VALIDATES with weaker
+    // typing than its source asked for, which is the direction that ends in type confusion.
+    if (s.asList()) |l| {
+        if (l.len == 2 and eqAtom(l[0], "exact")) {
+            const inner = try heapTypeToValType(l[1], nullable, type_names);
+            if (!inner.isConcrete()) return error.BadValType;
+            return V.concreteRefEx(nullable, inner.refHeap(), inner.concreteIndex(), true);
+        }
+        return error.BadValType;
+    }
     const atom = s.asAtom() orelse return error.BadValType;
     // A `$name` or a bare numeric index is a concrete type reference.
     if ((atom.len != 0 and atom[0] == '$') or (atom.len != 0 and std.ascii.isDigit(atom[0]))) {
@@ -2468,7 +2484,7 @@ fn emitOpcode(ctx: *Ctx, op: Op) Error!void {
 
 /// A parsed `ref.test`/`ref.cast` target: nullability + the heap-type `s33`
 /// code to emit (negative = abstract head, non-negative = a type index).
-const RefTypeTarget = struct { nullable: bool, code: i64 };
+const RefTypeTarget = struct { nullable: bool, code: i64, exact: bool = false };
 
 /// Parse a `ref.test`/`ref.cast` target reference type: a shorthand atom
 /// (`anyref`/`structref`/…) or a `(ref null? ht)` list whose heap type is an
@@ -2478,10 +2494,20 @@ fn parseRefTypeTarget(ctx: *Ctx, s: Sexpr) Error!RefTypeTarget {
     const l = s.asList() orelse return error.BadValType;
     if (l.len < 2 or !eqAtom(l[0], "ref")) return error.BadValType;
     const nullable = l.len >= 3 and eqAtom(l[1], "null");
-    const ht = l[l.len - 1];
+    var ht = l[l.len - 1];
+    // `(ref null? (exact $t))` — custom-descriptors. Concrete types only: an abstract head names
+    // a family, so there is nothing for "exactly this" to bind to, and `exact.wast` asserts each
+    // such spelling malformed.
+    var exact = false;
+    if (ht.asList()) |inner| {
+        if (inner.len != 2 or !eqAtom(inner[0], "exact")) return error.BadValType;
+        exact = true;
+        ht = inner[1];
+        if (ht.asAtom()) |a2| if (abstractHeapCode(a2) != null) return error.BadValType;
+    }
     const atom = ht.asAtom() orelse return error.BadValType;
-    if (abstractHeapCode(atom)) |c| return .{ .nullable = nullable, .code = c };
-    return .{ .nullable = nullable, .code = @intCast(try resolveType(ctx.type_names, ht)) };
+    if (abstractHeapCode(atom)) |c| return .{ .nullable = nullable, .code = c, .exact = exact };
+    return .{ .nullable = nullable, .code = @intCast(try resolveType(ctx.type_names, ht)), .exact = exact };
 }
 
 /// The `s33` heap-type code for an abstract heap-type atom, or null.
@@ -2524,6 +2550,8 @@ fn emitRefCast(ctx: *Ctx, op: Op, t: RefTypeTarget) Error!void {
         else => unreachable,
     };
     try ctx.out.append(ctx.a, sub);
+    // `exact` is a heap-type FORMER: its 0x62 precedes the heap-type code it applies to.
+    if (t.exact) try ctx.out.append(ctx.a, 0x62);
     try sleb(ctx.a, ctx.out, t.code);
 }
 
@@ -2536,7 +2564,9 @@ fn emitBrCast(ctx: *Ctx, op: Op, label: u32, src: RefTypeTarget, dst: RefTypeTar
     const flags: u8 = (@as(u8, @intFromBool(src.nullable))) | (@as(u8, @intFromBool(dst.nullable)) << 1);
     try ctx.out.append(ctx.a, flags);
     try uleb(ctx.a, ctx.out, label);
+    if (src.exact) try ctx.out.append(ctx.a, 0x62);
     try sleb(ctx.a, ctx.out, src.code);
+    if (dst.exact) try ctx.out.append(ctx.a, 0x62);
     try sleb(ctx.a, ctx.out, dst.code);
 }
 
@@ -3705,6 +3735,9 @@ fn internSig(a: std.mem.Allocator, sigs: *List(Sig), params: []const V, results:
 fn emitValType(a: std.mem.Allocator, out: *List(u8), v: V) Error!void {
     if (v.isConcrete()) {
         try out.append(a, if (v.isNonNullRef()) 0x64 else 0x63);
+        // `exact` is a heap-type FORMER, so its 0x62 goes between the ref prefix and the index —
+        // `(ref (exact $t))` is `64 62 <ti>`, never `62 64 <ti>`.
+        if (v.isExact()) try out.append(a, 0x62);
         try sleb(a, out, v.concreteIndex());
     } else if (v.isNonNullRef()) {
         try out.append(a, 0x64);
@@ -6505,6 +6538,63 @@ test "a (memory …) field may not carry unconsumed trailing forms" {
     _ = try assemble(a, "(module (memory i64 1 2))");
     _ = try assemble(a, "(module (memory $m (export \"m\") 1 2))");
     _ = try assemble(a, "(module (memory (data \"abc\")))");
+}
+
+test "D1 soundness: an EXACT cast refuses a subtype — the type-confusion arm" {
+    // 🔒 Built by CONSTRUCTION, not by assertion count. The two soundness defects this branch
+    // already found (host-externref/GC-index collision; cross-instance object substitution) both
+    // passed the entire corpus and were found by writing the wrong-answer case down. `(ref (exact
+    // $super))` must reject a `$sub` value — saying yes would hand the guest a value of a type it
+    // proved it did not have.
+    const src =
+        \\(module
+        \\  (type $super (sub (struct)))
+        \\  (type $sub (sub $super (struct)))
+        \\  (func (export "sub_vs_exact_super") (result i32)
+        \\    (ref.test (ref (exact $super)) (struct.new $sub)))
+        \\  (func (export "sub_vs_inexact_super") (result i32)
+        \\    (ref.test (ref $super) (struct.new $sub)))
+        \\  (func (export "super_vs_exact_super") (result i32)
+        \\    (ref.test (ref (exact $super)) (struct.new $super))))
+    ;
+    // The load-bearing one: a SUBTYPE must NOT satisfy an exact supertype.
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "sub_vs_exact_super", &.{})));
+    // ...while the ordinary subtype rule is untouched — proving the check is exactness and not a
+    // blanket refusal, which would pass the line above for entirely the wrong reason.
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(src, "sub_vs_inexact_super", &.{})));
+    // ...and an exact match still succeeds, so the rule is not simply "exact never matches".
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(src, "super_vs_exact_super", &.{})));
+}
+
+test "D1: `(ref (exact $t))` is a DISTINCT type from `(ref $t)`, and round-trips" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The two must not be the same value type — `flagBits` carries `exact_bit` for exactly this
+    // reason. If they collapsed, every identity check downstream would silently accept one for
+    // the other.
+    const exact_t = V.concreteRefEx(false, .@"struct", 3, true);
+    const plain_t = V.concreteRef(false, .@"struct", 3);
+    try std.testing.expect(exact_t != plain_t);
+    try std.testing.expect(exact_t.isExact() and !plain_t.isExact());
+    try std.testing.expect(exact_t.concreteIndex() == 3 and plain_t.concreteIndex() == 3);
+    // Nullability must not disturb exactness (it is a separate bit, set/cleared independently).
+    try std.testing.expect(exact_t.nullable().isExact());
+
+    // Binary round trip: `(ref (exact $t))` is `0x64 0x62 <ti>` — the former sits BETWEEN the ref
+    // prefix and the index. Asserting the bytes, per the emit-invalid lesson.
+    const bin = try assemble(a, "(module (type $s (struct)) (type $t (struct (field (ref (exact $s))))))");
+    try std.testing.expect(std.mem.indexOf(u8, bin, &[_]u8{ 0x64, 0x62, 0x00 }) != null);
+    var m = try Module.decode(a, bin);
+    defer m.deinit();
+    try std.testing.expect(m.comp_types[1].@"struct"[0].storage.val.isExact());
+
+    // `exact` binds only to CONCRETE types; the abstract heads are malformed.
+    for ([_][]const u8{ "any", "eq", "i31", "struct", "array", "func", "none" }) |h| {
+        const bad = try std.fmt.allocPrint(a, "(module (type $t (struct (field (ref (exact {s}))))))", .{h});
+        try std.testing.expectError(error.BadValType, assemble(a, bad));
+    }
 }
 
 test "a non-null abstract ref emits `0x64 heaptype`, NOT its internal tag byte" {
