@@ -38,6 +38,14 @@ pub const Feature = enum(u8) {
     gc = 12,
     exceptions = 13,
     tail_call = 14,
+    /// ⚠️ **NOT a wasm proposal name — deliberately finer-grained than the spec's own grouping.**
+    /// Multiple tables arrived *inside* `reference_types`, so the spec has no separate switch for
+    /// them. wazmrt needs one because gating on `reference_types` would also disable `funcref`,
+    /// which `proposals/threads/imports.wast` legitimately uses in the very modules whose
+    /// "multiple tables" assertions we need to honour. The split exists so a snapshot can be run
+    /// **at its own era**; it is not a claim that the spec factors the proposals this way.
+    /// Layered on `reference_types` — see `incoherent`.
+    multi_table = 15,
 
     pub fn name(self: Feature) []const u8 {
         return @tagName(self);
@@ -71,6 +79,9 @@ pub const Set = struct {
         if (self.has(.gc) and !self.has(.function_references)) return .{ .gc, .function_references };
         if (self.has(.function_references) and !self.has(.reference_types)) return .{ .function_references, .reference_types };
         if (self.has(.exceptions) and !self.has(.reference_types)) return .{ .exceptions, .reference_types };
+        // Multiple tables shipped as part of reference-types, so allowing them while refusing
+        // that proposal describes no wasm version that ever existed.
+        if (self.has(.multi_table) and !self.has(.reference_types)) return .{ .multi_table, .reference_types };
         return null;
     }
 };
@@ -190,6 +201,10 @@ pub fn firstViolation(gpa: std.mem.Allocator, module: *const Module, fs: Set) !?
     }
 
     // --- tables and globals --------------------------------------------------------------
+    // ⚠️ `module.tables` is the whole INDEX SPACE — imported tables first, then defined — so this
+    // one test covers all three spellings the spec asserts on (import+import, import+defined,
+    // defined+defined). Counting only defined tables would pass two of the three.
+    if (module.tables.len > 1) require(fs, .multi_table, &found) catch return found;
     for (module.tables) |t| require(fs, valTypeFeature(t.element), &found) catch return found;
     for (module.globals) |g| require(fs, valTypeFeature(g.content), &found) catch return found;
 

@@ -83,14 +83,44 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
 
 ## 📊 CURRENT spec-testsuite score (2026-08-17) — EVERY CORE SPEC FILE IS AT ZERO
 
-**284 files — 62,890 assertions passed / 89 failed / 965 skipped**, and `zig build conformance -Dbaseline=tools/conformance-baseline.txt` reports **0 regressions**. This is the number to quote;
+**284 files — 62,898 assertions passed / 81 failed / 965 skipped**, and `zig build conformance -Dbaseline=tools/conformance-baseline.txt` reports **0 regressions**. This is the number to quote;
 every snapshot below it is older and kept as history.
 
-**Deliberate spec deviations: ZERO** (the last, `anyfunc`, closed 2026-08-17). The 89 are 81
-untargeted-proposal refusals + 8 era-pinned `proposals/threads` assertions, both scoped for
-implementation as `roadmap.md` → PROPOSED TRACKS F / P / D. ⚠️ **Verified from a `C:` COPY of the
-tree** — `zig build` cannot run from this repo's own cwd; see `INDEX.md`'s environment blocker.
-*(Superseded: 2026-08-14's 62,889 / 90 / 965.)*
+**Deliberate spec deviations: ZERO** (the last, `anyfunc`, closed 2026-08-17). **ALL 81 remaining
+failures are untargeted-proposal refusals** — custom-descriptors (79) and custom-page-sizes (2),
+i.e. `roadmap.md`'s Tracks D and P. The 8 era-pinned `proposals/threads` assertions **CLOSED
+2026-08-17 (F3+F4)**: the runner now judges a proposal directory by its own era's feature set, so
+they pass rather than being excused in the baseline. *(Superseded: 62,890 / 89 / 965 and
+2026-08-14's 62,889 / 90 / 965.)*
+
+### 🔍 WHAT THE 965 SKIPS ACTUALLY ARE (measured 2026-08-17 — only TWO THIRDS are missing features)
+
+Measured by instrumenting every skip site, because "skipped" had never been broken down and the
+number was being read as one thing when it is two:
+
+| group | count | what it is |
+| --- | --- | --- |
+| untargeted-proposal directories | **639** | genuinely missing features — custom-descriptors, custom-page-sizes, wide-arithmetic. Closing Tracks D and P collects these. |
+| **CORE files already at ZERO failures** | **326** | **NOT missing features.** ~302 are `assert_invalid`/`assert_malformed` where **wazmrt ALREADY REJECTS the module correctly** but the error name is on the deliberately-conservative `isOurLimitation` list, so a right answer is banked as a skip instead of a pass. |
+
+Attribution of the core 326: **244 `UnknownInstr`, 51 `UnsupportedOpcode`, 4 `UnknownIdentifier`,
+3 `UnsupportedInstr`** (all via `assertRejected`), 13 `NoTarget`, 1 module-build skip.
+
+🎯 **The decisive example:** `load.wast` asserts `(func … (i32.load32 (local.get 0)))` is malformed.
+**`i32.load32` is not a wasm instruction at all** — that IS the malformation the test is checking.
+wazmrt answers `UnknownInstr`, which is exactly right, and scores a SKIP.
+
+⚠️ **DO NOT "fix" this by deleting `UnknownInstr` from `isOurLimitation`.** That list is
+conservative on purpose and the conservatism is load-bearing: the same error also means "our
+assembler has a gap", and banking those as passes is precisely the green-washing R5 removed.
+**The principled fix is to make the ASSEMBLER distinguish the two**, which is only now possible
+because every targeted proposal is implemented: a mnemonic that exists in no proposal → a real
+malformed verdict; a mnemonic that exists but is unimplemented → our gap. **An error name that
+conflates "this input is bad" with "we are incomplete" cannot be scored correctly by any caller** —
+the fix belongs where the distinction is known, not in the scoring table.
+
+*(Worth ~300 assertions and it is a SCORING fix, not a feature — so it is cheaper than either
+remaining track and independent of both.)*
 
 ⚠️ **The failed count ROSE from 143 at R4 and that is an improvement.** R5 implemented
 `(module quote …)`, which had been suppressing 978 assertions; 904 of them pass, 73 fail. Passing

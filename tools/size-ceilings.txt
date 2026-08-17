@@ -355,6 +355,32 @@
 # are already stable. Recorded so the next pass does not spend an afternoon attributing +152 bytes
 # to a change that did not cause them. (This one nearly ate a ceiling raise.)
 
-wazmrt.exe  964608
-wazmrt.lib  1029730
-wazmrt.dll  888832
+# RAISED/LOWERED 2026-08-17 (F3 + F4 — the `multi_table` feature and the wast era-policy table;
+# closes the last 8 conformance failures). Measured in the REFERENCE configuration described in
+# the gate-hole note above: a C: copy of the tree with its own default `.zig-cache`.
+#
+#   artifact       before         after       share
+#   wazmrt.exe    964,608       966,656     +2,048
+#   wazmrt.lib  1,029,730     1,029,688        -42
+#   wazmrt.dll    888,832       888,320       -512
+#
+# ⚠️ **THE EXE MOVES AND THE DLL DOES NOT — that asymmetry is the whole story, and it is the
+# REVERSE of the usual one.** `features.firstViolation` was previously unreachable from the CLI:
+# only `capi.zig` called it, so the entire feature walk lived in the embed artifacts and not in
+# `wazmrt.exe`. Wiring the gate into `wast.zig` (so a proposal directory is judged at its own era)
+# links that walk into the CLI for the first time. The DLL already carried every byte of it.
+#
+# The two DECREASES are one change: `capi.Feature.valid()` stopped hardcoding `<= 13` and now
+# derives its bound from `features.count`. That literal was also a live defect — it made
+# `set_feature(TAIL_CALL, …)` a no-op that returned false while `all_features(false)` disabled the
+# same proposal. Lowered rather than left as headroom, per the policy at the top of this file.
+#
+# What bought the exe's bytes: `features.Feature.multi_table` with its index-space table count and
+# its `incoherent` rule, `wast.featuresForPath` (the era policy table), `Runner.validateEra` — the
+# single validation entry point both the positive and negative paths now share — and the
+# `firstViolation` walk itself becoming CLI-reachable. 8 assertions closed for +2,048 bytes in the
+# artifact that does conformance, and -512 in the one embedders ship.
+
+wazmrt.exe  966656
+wazmrt.lib  1029688
+wazmrt.dll  888320

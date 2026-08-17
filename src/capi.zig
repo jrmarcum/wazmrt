@@ -158,6 +158,14 @@ export fn wazmrt_trap_frame(
 // ---------------------------------------------------------------------------------------
 
 /// Mirrors `wazmrt_feature_t`.
+///
+/// ⚠️ **THIS ENUM DRIFTED FROM `features.Feature` ONCE AND SHIPPED THAT WAY — see the comptime pin
+/// below.** It stopped at `exceptions = 13` with `valid()` hardcoding `<= 13`, while `features.zig`
+/// had `tail_call = 14` and `wazmrt.h` DECLARED `WAZMRT_FEATURE_TAIL_CALL = 14`. The result was a
+/// toggle the header advertised that silently did nothing: `set_feature(TAIL_CALL, false)` returned
+/// false and changed nothing, while `all_features(false)` — which counts with `features.count` —
+/// *did* disable it. **Three spellings of one list, and the two that were written by hand were the
+/// two that were wrong.**
 const Feature = enum(c_int) {
     sign_extension = 0,
     saturating_float_to_int = 1,
@@ -173,12 +181,42 @@ const Feature = enum(c_int) {
     function_references = 11,
     gc = 12,
     exceptions = 13,
+    tail_call = 14,
+    multi_table = 15,
     _,
 
+    /// Bound DERIVED from `features.count`, never written out again: the literal that used to sit
+    /// here is precisely what went stale.
     fn valid(self: Feature) bool {
-        return @intFromEnum(self) >= 0 and @intFromEnum(self) <= 13;
+        return @intFromEnum(self) >= 0 and @intFromEnum(self) < root.features.count;
     }
 };
+
+// ⚠️ COVERAGE PIN — the same device `features.zig` uses on `opcode.Op`, for the same reason. A
+// proposal added to `features.Feature` must be added HERE and to `wazmrt_feature_t` in
+// `include/wazmrt.h`, or the C ABI silently offers fewer switches than the engine enforces.
+// Names are compared, not just the count: two lists of equal length can still disagree, and a
+// value mismatch would make `@enumFromInt` below cast to the WRONG proposal — gating one feature
+// while the embedder asked for another.
+//
+// If this fires: add the member here, add `WAZMRT_FEATURE_<NAME> = <n>` to the header, and check
+// whether the new proposal belongs in `Set.incoherent`. Do NOT just bump a number.
+comptime {
+    const ours = @typeInfo(Feature).@"enum".fields;
+    const theirs = @typeInfo(root.features.Feature).@"enum".fields;
+    if (ours.len != theirs.len) @compileError(std.fmt.comptimePrint(
+        "capi.Feature has {d} members, features.Feature has {d}. The C ABI must offer exactly the " ++
+            "proposals the engine gates, and `include/wazmrt.h` must match both.",
+        .{ ours.len, theirs.len },
+    ));
+    for (ours, theirs) |a, b| {
+        if (!std.mem.eql(u8, a.name, b.name) or a.value != b.value) @compileError(std.fmt.comptimePrint(
+            "capi.Feature.{s} = {d} does not match features.Feature.{s} = {d}. A mismatch makes " ++
+                "@enumFromInt gate a DIFFERENT proposal than the embedder selected.",
+            .{ a.name, a.value, b.name, b.value },
+        ));
+    }
+}
 
 /// A template `wazmrt_engine_new_with_config` copies. The embedder keeps ownership.
 ///
@@ -3015,6 +3053,64 @@ test "gating: NO false positives on a plain module" {
     var res = [_]Val{.{ .kind = .i32, .of = .{ .i32 = 0 } }};
     try testing.expect(wazmrt_func_call(s, f, &args, 2, &res, 1, &trap) == null);
     try testing.expectEqual(@as(i32, 5), res[0].of.i32);
+}
+
+/// `(module (table 1 funcref) (table 1 funcref))` — two tables is the whole of `multi_table`.
+const two_table_module = [_]u8{
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x04, 0x07, 0x02, 0x70, 0x00, 0x01, 0x70, 0x00, 0x01,
+};
+
+test "gating: multi_table refuses two tables while KEEPING funcref" {
+    const e = engineWithout(.multi_table);
+    defer wazmrt_engine_delete(e);
+
+    var m: *CModule = undefined;
+    const err = wazmrt_module_new(e, &two_table_module, two_table_module.len, &m);
+    defer wazmrt_error_delete(err);
+    try testing.expect(err != null);
+    try testing.expect(std.mem.indexOf(u8, std.mem.span(wazmrt_error_message(err).?), "multi_table") != null);
+    try testing.expect(!wazmrt_module_validate(e, &two_table_module, two_table_module.len));
+
+    // 🔑 THE POINT OF A SEPARATE FLAG. A ONE-table module still loads, so `funcref` and the table
+    // machinery survive — gating this on `reference_types` instead would have refused this too,
+    // and with it most of `proposals/threads/imports.wast`.
+    const one_table_module = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x04, 0x04, 0x01, 0x70, 0x00, 0x01,
+    };
+    var m2: *CModule = undefined;
+    try testing.expect(wazmrt_module_new(e, &one_table_module, one_table_module.len, &m2) == null);
+    wazmrt_module_delete(m2);
+
+    // And with the flag on, the same two-table bytes are fine — so the refusal is the gate.
+    const on = wazmrt_engine_new().?;
+    defer wazmrt_engine_delete(on);
+    var m3: *CModule = undefined;
+    try testing.expect(wazmrt_module_new(on, &two_table_module, two_table_module.len, &m3) == null);
+    wazmrt_module_delete(m3);
+}
+
+test "config: EVERY feature the header declares is actually settable" {
+    // ⚠️ REGRESSION TEST FOR A SHIPPED DEFECT. `capi.Feature` stopped at `exceptions = 13` with
+    // `valid()` hardcoding `<= 13`, so `set_feature(TAIL_CALL, …)` returned false and changed
+    // nothing while `all_features(false)` — which counts with `features.count` — disabled it.
+    // The header advertised a switch that did not exist.
+    //
+    // Loops over the whole enum rather than naming members: a test that listed them by hand
+    // would have had exactly the same blind spot as the code it is checking.
+    const cfg = wazmrt_config_new().?;
+    defer wazmrt_config_delete(cfg);
+    for (0..root.features.count) |i| {
+        const f: Feature = @enumFromInt(@as(c_int, @intCast(i)));
+        try testing.expect(wazmrt_config_set_feature(cfg, f, false));
+        var got = true;
+        try testing.expect(wazmrt_config_get_feature(cfg, f, &got));
+        try testing.expect(!got);
+    }
+    // One past the end is still refused, so the bound moved rather than vanishing.
+    const past: Feature = @enumFromInt(@as(c_int, root.features.count));
+    try testing.expect(!wazmrt_config_set_feature(cfg, past, false));
 }
 
 test "config: features round-trip, and an incoherent set is refused" {

@@ -23,6 +23,7 @@ const Module = @import("Module.zig");
 const interp = @import("interp.zig");
 const typematch = @import("typematch.zig");
 const validate = @import("validate.zig").validate;
+const features = @import("features.zig");
 
 const V = types.ValType;
 const Value = interp.Value;
@@ -111,8 +112,47 @@ pub const Summary = struct {
 /// that a hostile script cannot exhaust memory.
 pub const max_recorded_failures = 512;
 
+/// The feature set a spec-testsuite file must be judged under, chosen by the PROPOSAL DIRECTORY
+/// it lives in.
+///
+/// 🔑 **A proposal directory asserts the rules of its OWN ERA.** `proposals/threads/` is a snapshot
+/// taken before multi-memory and multi-table existed, so it contains
+/// `(assert_invalid … "multiple memories")` and `(assert_invalid … "multiple tables")`. wazmrt
+/// implements both proposals and therefore ACCEPTS those modules — the file is not wrong and
+/// neither are we; **the runtime is ahead of the file**. Running the snapshot with its own era's
+/// feature set is what a conformance runner is supposed to do, and it is what makes those 8
+/// assertions pass *for the right reason* rather than by being special-cased.
+///
+/// ⚠️ **This is a POLICY, so it is a table and not a heuristic.** Anything not listed runs
+/// unrestricted — a directory must be opted IN to a narrower era, because the failure mode of
+/// guessing is silently running some other file's assertions against the wrong language.
+///
+/// ⚠️ `null` (no path — an inline source, as in this file's own tests) means unrestricted. That is
+/// deliberate rather than defaulted: a string literal in a test has no era to belong to.
+pub fn featuresForPath(path: ?[]const u8) features.Set {
+    var fs: features.Set = .{}; // everything on
+    const p = path orelse return fs;
+    // Match on either separator: the corpus is walked with native paths on Windows.
+    if (containsPathSegment(p, "proposals/threads") or containsPathSegment(p, "proposals\\threads")) {
+        // The threads proposal predates BOTH. Nothing else is turned off: the files use
+        // `funcref`, atomics and shared memories, all of which must keep working — which is why
+        // `multi_table` exists as its own switch instead of gating on `reference_types`.
+        fs.set(.multi_memory, false);
+        fs.set(.multi_table, false);
+    }
+    return fs;
+}
+
+fn containsPathSegment(haystack: []const u8, needle: []const u8) bool {
+    return std.mem.indexOf(u8, haystack, needle) != null;
+}
+
 /// Parse and run a whole `.wast` source, returning pass/fail counts.
-pub fn runScript(gpa: std.mem.Allocator, src: []const u8) Error!Summary {
+///
+/// `path` is the file the source came from, used ONLY to pick the era feature set
+/// (`featuresForPath`); pass `null` for an inline source. It is a required parameter rather than a
+/// defaulted one on purpose — **a defaulted policy is a policy nobody reviewed.**
+pub fn runScript(gpa: std.mem.Allocator, src: []const u8, path: ?[]const u8) Error!Summary {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     // One store for the whole script: every module a `.wast` file builds can be
@@ -120,7 +160,12 @@ pub fn runScript(gpa: std.mem.Allocator, src: []const u8) Error!Summary {
     // a reference value means.
     var store: interp.Store = .init(gpa);
     defer store.deinit();
-    var r: Runner = .{ .a = arena.allocator(), .msg_a = gpa, .store = &store };
+    var r: Runner = .{
+        .a = arena.allocator(),
+        .msg_a = gpa,
+        .store = &store,
+        .features = featuresForPath(path),
+    };
     // Guest linear memory is PAGE-ALLOCATOR owned, so the arena above does NOT
     // reclaim it — every `(memory N)` in every module, plus every `memory.grow`,
     // leaked for the life of the process, and `tools/conformance.zig`'s careful
@@ -150,6 +195,9 @@ const Runner = struct {
     msg_a: std.mem.Allocator,
     /// The store shared by every instance this script builds. See `interp.Store`.
     store: *interp.Store,
+    /// The era this script's assertions are judged under — see `featuresForPath`. No default:
+    /// `runScript` sets it from the path so there is exactly ONE place the policy is decided.
+    features: features.Set,
     /// Every instance built by this script, so their page-allocator memories can
     /// be released (the runner arena cannot reclaim those). See `runScript`.
     instances: std.ArrayList(*interp.Instance) = .empty,
@@ -313,6 +361,21 @@ const Runner = struct {
         return self.instantiateBinary(try self.moduleBinary(form));
     }
 
+    /// Validate under this script's era feature set (`featuresForPath`).
+    ///
+    /// 🔑 **The ONLY validation entry point in this file.** Both the positive path
+    /// (`instantiateBinary`) and the negative one (`tryBuild`) call it, because the two must answer
+    /// the SAME question — `capi.zig` states the rule for the C ABI and it holds just as hard here:
+    /// a runner whose `assert_invalid` path gates while its `(module …)` path does not would report
+    /// a module both valid and invalid within one file.
+    ///
+    /// ⚠️ The gate runs BEFORE type validation, so the refusal names the proposal rather than
+    /// surfacing as some type error deep inside a feature this era never had.
+    fn validateEra(self: *Runner, m: *const Module) !void {
+        if (try features.firstViolation(self.a, m, self.features)) |_| return error.DisabledProposal;
+        try validate(self.a, m);
+    }
+
     /// Decode, validate, link and instantiate a module binary. Shared by
     /// `(module …)` and `(module instance …)`, which differ only in where the
     /// bytes come from — each call builds a FRESH instance, so two instances of
@@ -320,7 +383,7 @@ const Runner = struct {
     fn instantiateBinary(self: *Runner, bin: []const u8) !*interp.Instance {
         const m = try self.a.create(Module);
         m.* = try Module.decode(self.a, bin);
-        try validate(self.a, m);
+        try self.validateEra(m);
         // Allocated first, then instantiated IN PLACE: the instance's address is
         // baked into every funcref its element segments and global initializers
         // create, so it cannot be built somewhere else and moved here.
@@ -949,11 +1012,15 @@ const Runner = struct {
     }
 
     /// Decode + validate a module form without instantiating or recording it.
+    ///
+    /// Goes through `validateEra` so an `assert_invalid` in a proposal directory is judged by that
+    /// directory's era — the reason the threads snapshot's "multiple memories"/"multiple tables"
+    /// assertions pass rather than being written off as deviations.
     fn tryBuild(self: *Runner, form: []const Sexpr) !void {
         const bin = try self.moduleBinary(form);
         const m = try self.a.create(Module);
         m.* = try Module.decode(self.a, bin);
-        try validate(self.a, m);
+        try self.validateEra(m);
     }
 
     /// `assert_unlinkable (module …) "reason"` — the module is valid but must fail
@@ -1286,7 +1353,7 @@ test "runs assert_return and assert_trap over a module" {
         \\(assert_return (invoke "div" (i32.const 9) (i32.const 3)) (i32.const 3))
         \\(assert_trap (invoke "div" (i32.const 1) (i32.const 0)) "integer divide by zero")
     ;
-    const s = try runScript(std.testing.allocator, src);
+    const s = try runScript(std.testing.allocator, src, null);
     try std.testing.expectEqual(@as(usize, 4), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
@@ -1331,7 +1398,7 @@ test "a GC reference crossing an instance boundary names its OWN object" {
         \\(assert_return (invoke $B "concreteTest") (i32.const 1))
         \\(assert_return (invoke $B "concreteRead") (i32.const 111))
     ;
-    const s = try runScript(std.testing.allocator, src);
+    const s = try runScript(std.testing.allocator, src, null);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
     try std.testing.expectEqual(@as(usize, 6), s.passed);
 
@@ -1364,7 +1431,7 @@ test "a GC reference crossing an instance boundary names its OWN object" {
         \\  (func (export "isBase") (result i32) (ref.test (ref $base2) (global.get $fromC))))
         \\(assert_return (invoke $D "isBase") (i32.const 1))
     ;
-    const s2 = try runScript(std.testing.allocator, negative);
+    const s2 = try runScript(std.testing.allocator, negative, null);
     try std.testing.expectEqual(@as(usize, 0), s2.failed);
     try std.testing.expectEqual(@as(usize, 3), s2.passed);
 }
@@ -1388,7 +1455,7 @@ test "L1: an import matches a memory/table's CURRENT size, not its declared mini
         \\(register "grown2" $N)
         \\(assert_return (invoke $N "size") (i32.const 2))
     ;
-    const s = try runScript(std.testing.allocator, src);
+    const s = try runScript(std.testing.allocator, src, null);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
     try std.testing.expectEqual(@as(usize, 3), s.passed);
     // …and the rule does not go the other way: asking for MORE than the current
@@ -1398,7 +1465,7 @@ test "L1: an import matches a memory/table's CURRENT size, not its declared mini
         \\(register "g" $M)
         \\(module (memory (import "g" "mem") 2))
     ;
-    var s2 = try runScript(std.testing.allocator, too_big);
+    var s2 = try runScript(std.testing.allocator, too_big, null);
     defer s2.deinit(std.testing.allocator); // failure messages are caller-owned
     try std.testing.expectEqual(@as(usize, 1), s2.failed);
 }
@@ -1425,7 +1492,7 @@ test "runner rejects malformed commands without indexing out of bounds" {
     for (cases) |src| {
         // Either outcome (error or a recorded failure) is fine; the point is that
         // no path indexes out of bounds.
-        var s = runScript(std.testing.allocator, src) catch continue;
+        var s = runScript(std.testing.allocator, src, null) catch continue;
         s.deinit(std.testing.allocator);
     }
 }
@@ -1460,7 +1527,7 @@ test "non-null refs: subtyping + uninitialized-local rejection (P2.5)" {
         \\    (local.get $x)))
         \\(assert_return (invoke "ok" (ref.extern 7)) (ref.extern 7))
     ;
-    const s = try runScript(std.testing.allocator, ok);
+    const s = try runScript(std.testing.allocator, ok, null);
     try std.testing.expectEqual(@as(usize, 1), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
@@ -1485,7 +1552,7 @@ test "call_ref / return_call_ref / ref.as_non_null (P2)" {
         \\(assert_return (invoke "tail" (i32.const 7)) (i32.const 49))
         \\(assert_trap (invoke "trap") "null reference")
     ;
-    const s = try runScript(std.testing.allocator, src);
+    const s = try runScript(std.testing.allocator, src, null);
     try std.testing.expectEqual(@as(usize, 4), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
@@ -1505,7 +1572,7 @@ test "typed/GC reference value types are accepted (P1)" {
         \\(assert_return (invoke "i") (ref.null i31))
         \\(assert_return (invoke "isnull" (ref.null extern)) (i32.const 1))
     ;
-    const s = try runScript(std.testing.allocator, src);
+    const s = try runScript(std.testing.allocator, src, null);
     try std.testing.expectEqual(@as(usize, 3), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
@@ -1523,7 +1590,7 @@ test "invoke / get by module name + register $id" {
     ;
     // A named `$A`/`$B` invoke targets that module; the bare `call-a` invoke uses
     // the current (last-built) module, which imports A's `f` via `(register …)`.
-    const s = try runScript(std.testing.allocator, src);
+    const s = try runScript(std.testing.allocator, src, null);
     try std.testing.expectEqual(@as(usize, 4), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
@@ -1533,7 +1600,7 @@ test "detects a wrong expected result" {
         \\(module (func (export "one") (result i32) (i32.const 1)))
         \\(assert_return (invoke "one") (i32.const 2))
     ;
-    var s = try runScript(std.testing.allocator, src);
+    var s = try runScript(std.testing.allocator, src, null);
     defer s.deinit(std.testing.allocator); // failure messages are caller-owned
     try std.testing.expectEqual(@as(usize, 0), s.passed);
     try std.testing.expectEqual(@as(usize, 1), s.failed);
@@ -1550,7 +1617,7 @@ test "float results incl. nan:canonical" {
         \\(assert_return (invoke "fadd" (f64.const 1.5) (f64.const 2.25)) (f64.const 3.75))
         \\(assert_return (invoke "fnan") (f64.const nan:canonical))
     ;
-    const s = try runScript(std.testing.allocator, src);
+    const s = try runScript(std.testing.allocator, src, null);
     try std.testing.expectEqual(@as(usize, 2), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
@@ -1567,7 +1634,7 @@ test "externref payload equal to the null sentinel is not null (#9)" {
         \\(assert_return (invoke "isnull" (ref.null extern)) (i32.const 1))
         \\(assert_return (invoke "roundtrip" (ref.extern 0xFFFFFFFFFFFFFFFF)) (ref.extern 0xFFFFFFFFFFFFFFFF))
     ;
-    const s = try runScript(std.testing.allocator, src);
+    const s = try runScript(std.testing.allocator, src, null);
     try std.testing.expectEqual(@as(usize, 3), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
@@ -1583,7 +1650,7 @@ test "runs a (module binary …) command" {
         \\  "\0a\06\01\04\00\41\07\0b")       ;; code: i32.const 7 end
         \\(assert_return (invoke "sev") (i32.const 7))
     ;
-    const s = try runScript(std.testing.allocator, src);
+    const s = try runScript(std.testing.allocator, src, null);
     try std.testing.expectEqual(@as(usize, 1), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
@@ -1606,7 +1673,7 @@ test "wast runner: abstract GC ref matchers ((ref.struct)/(ref.i31)) don't abort
         \\(assert_return (invoke "mki31") (ref.i31))
         \\(assert_return (invoke "n") (i32.const 42))
     ;
-    const s = try runScript(std.testing.allocator, src);
+    const s = try runScript(std.testing.allocator, src, null);
     try std.testing.expectEqual(@as(usize, 3), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
@@ -1625,7 +1692,78 @@ test "exception handling: assert_return on a caught exn, assert_trap on an uncau
         \\(assert_return (invoke "caught") (i32.const 88))
         \\(assert_trap (invoke "uncaught") "uncaught exception")
     ;
-    const s = try runScript(std.testing.allocator, src);
+    const s = try runScript(std.testing.allocator, src, null);
+    try std.testing.expectEqual(@as(usize, 2), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+// ---------------------------------------------------------------------------------------
+// Era feature sets (F3/F4) — see `featuresForPath`.
+//
+// ⚠️ These live here rather than only in the corpus because **the `.wast` corpus is on removable
+// media and cannot gate a commit** (the same reason the GC cross-instance fix carries an in-repo
+// test). A corpus-only proof of this behaviour would be unverifiable on a fresh clone.
+// ---------------------------------------------------------------------------------------
+
+test "era policy: the threads snapshot loses multi-memory and multi-table, and NOTHING else" {
+    const threads = featuresForPath("testsuite/proposals/threads/imports.wast");
+    try std.testing.expect(!threads.has(.multi_memory));
+    try std.testing.expect(!threads.has(.multi_table));
+    // The rest of the era must survive. `funcref` (reference_types) is the load-bearing one:
+    // gating multiple tables via `reference_types` would have broken the very files this policy
+    // exists to fix, which is why `multi_table` is its own switch.
+    try std.testing.expect(threads.has(.reference_types));
+    try std.testing.expect(threads.has(.threads));
+    try std.testing.expect(threads.has(.bulk_memory));
+    // A coherent set, so it describes a wasm version that actually existed.
+    try std.testing.expect(threads.incoherent() == null);
+
+    // Windows separators reach here from the corpus walker.
+    const win = featuresForPath("testsuite\\proposals\\threads\\memory.wast");
+    try std.testing.expect(!win.has(.multi_table));
+
+    // ⚠️ THE OPT-IN HALF: everything not listed runs unrestricted. A policy that leaked into
+    // other directories would silently judge them by the wrong language.
+    try std.testing.expect(featuresForPath("testsuite/memory.wast").all());
+    try std.testing.expect(featuresForPath("testsuite/proposals/gc/struct.wast").all());
+    try std.testing.expect(featuresForPath(null).all());
+}
+
+test "era policy: threads-era assertions pass, and the SAME modules are accepted without it" {
+    // The two shapes the snapshot asserts invalid. Under its era both must be REFUSED.
+    const src =
+        \\(assert_invalid (module (memory 0) (memory 0)) "multiple memories")
+        \\(assert_invalid (module (table 10 funcref) (table 10 funcref)) "multiple tables")
+    ;
+    var era = try runScript(std.testing.allocator, src, "proposals/threads/imports.wast");
+    defer era.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), era.passed);
+    try std.testing.expectEqual(@as(usize, 0), era.failed);
+    try std.testing.expectEqual(@as(usize, 0), era.skipped);
+
+    // 🔒 THE INVERSION, and it is the whole point: with no era policy the very same assertions
+    // FAIL, because wazmrt implements both proposals and rightly accepts those modules. If this
+    // half ever passes too, the gate has stopped gating and the test above is proving nothing.
+    var unrestricted = try runScript(std.testing.allocator, src, null);
+    defer unrestricted.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), unrestricted.passed);
+    try std.testing.expectEqual(@as(usize, 2), unrestricted.failed);
+}
+
+test "era policy: a positive threads module still runs under the narrowed set" {
+    // The regression the roadmap flagged: turning features off can cost PASSES elsewhere in the
+    // same file. A single memory, a single table, funcref and atomics must all still work.
+    const src =
+        \\(module (memory 1 1 shared) (table 2 funcref)
+        \\  (func $f (result i32) (i32.const 7))
+        \\  (elem (i32.const 0) $f)
+        \\  (func (export "call") (result i32) (call_indirect (result i32) (i32.const 0)))
+        \\  (func (export "at") (result i32) (i32.atomic.load (i32.const 0))))
+        \\(assert_return (invoke "call") (i32.const 7))
+        \\(assert_return (invoke "at") (i32.const 0))
+    ;
+    var s = try runScript(std.testing.allocator, src, "proposals/threads/atomic.wast");
+    defer s.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
@@ -1638,7 +1776,7 @@ test "atomics: a misaligned access traps; a naturally aligned one does not" {
         \\(assert_return (invoke "aligned") (i32.const 0))
         \\(assert_trap (invoke "misaligned") "unaligned atomic")
     ;
-    const s = try runScript(std.testing.allocator, src);
+    const s = try runScript(std.testing.allocator, src, null);
     try std.testing.expectEqual(@as(usize, 2), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
@@ -1657,7 +1795,7 @@ test "atomics: wait/notify semantics; wait requires shared memory" {
         \\(assert_return (invoke "notify") (i32.const 0))
         \\(assert_return (invoke "wait32") (i32.const 1))
     ;
-    const s = try runScript(std.testing.allocator, shared);
+    const s = try runScript(std.testing.allocator, shared, null);
     try std.testing.expectEqual(@as(usize, 2), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 
@@ -1667,7 +1805,7 @@ test "atomics: wait/notify semantics; wait requires shared memory" {
         \\  (func (export "w") (result i32) (memory.atomic.wait32 (i32.const 0) (i32.const 0) (i64.const 0))))
         \\(assert_trap (invoke "w") "expected shared memory")
     ;
-    const s2 = try runScript(std.testing.allocator, nonshared);
+    const s2 = try runScript(std.testing.allocator, nonshared, null);
     try std.testing.expectEqual(@as(usize, 1), s2.passed);
     try std.testing.expectEqual(@as(usize, 0), s2.failed);
 }
@@ -1690,7 +1828,7 @@ test "unbounded recursion traps CallStackExhausted instead of overflowing the ho
         \\(assert_exhaustion (invoke "runaway") "call stack exhausted")
         \\(assert_exhaustion (invoke "mutual") "call stack exhausted")
     ;
-    const s = try runScript(std.testing.allocator, src);
+    const s = try runScript(std.testing.allocator, src, null);
     try std.testing.expectEqual(@as(usize, 2), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
@@ -1719,7 +1857,7 @@ test "exception handling: an exception crossing a module boundary is catchable b
         \\    (local.get $r)))
         \\(assert_return (invoke "go") (i32.const 0))
     ;
-    const s = try runScript(std.testing.allocator, src);
+    const s = try runScript(std.testing.allocator, src, null);
     try std.testing.expectEqual(@as(usize, 1), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
@@ -1735,7 +1873,7 @@ test "v128 among multiple results keeps the other results aligned" {
         \\(assert_return (invoke "g")
         \\  (i32.const 11) (v128.const i32x4 1 2 3 4) (i32.const 22))
     ;
-    const s = try runScript(std.testing.allocator, src);
+    const s = try runScript(std.testing.allocator, src, null);
     try std.testing.expectEqual(@as(usize, 1), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
@@ -1769,7 +1907,7 @@ test "a rejected module cannot leave entries in another module's table" {
         \\  "out of bounds table access")
         \\(assert_trap (invoke $A "at" (i32.const 2)) "uninitialized element")
     ;
-    const s = try runScript(std.testing.allocator, src);
+    const s = try runScript(std.testing.allocator, src, null);
     try std.testing.expectEqual(@as(usize, 2), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
@@ -1805,7 +1943,7 @@ test "a funcref in a shared table names its own instance, not the caller's index
         \\(assert_return (invoke $B "bt" (i32.const 0)) (i32.const 22))
         \\(assert_return (invoke $B "bt" (i32.const 1)) (i32.const 11))
     ;
-    const s = try runScript(std.testing.allocator, src);
+    const s = try runScript(std.testing.allocator, src, null);
     try std.testing.expectEqual(@as(usize, 4), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
@@ -1828,7 +1966,7 @@ test "instantiation is generative: two instances of one definition share nothing
         \\(assert_return (get $I1 "g") (i32.const 2))
         \\(assert_return (get $I2 "g") (i32.const 1))
     ;
-    const s = try runScript(std.testing.allocator, src);
+    const s = try runScript(std.testing.allocator, src, null);
     try std.testing.expectEqual(@as(usize, 5), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
@@ -1854,7 +1992,7 @@ test "importing one tag twice yields ONE identity, so a throw matches either nam
         \\    (return (i32.const 1))))
         \\(assert_return (invoke $B "f") (i32.const 1))
     ;
-    const s = try runScript(std.testing.allocator, src);
+    const s = try runScript(std.testing.allocator, src, null);
     try std.testing.expectEqual(@as(usize, 1), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
@@ -1885,7 +2023,7 @@ test "an element segment's type must be a SUBTYPE of its table's, not the same f
         \\  (table 1 funcref)
         \\  (elem (i32.const 0) func 0))
     ;
-    const s = try runScript(std.testing.allocator, src);
+    const s = try runScript(std.testing.allocator, src, null);
     try std.testing.expectEqual(@as(usize, 1), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
@@ -1918,7 +2056,7 @@ test "element segments applied before a failed data segment persist AND stay cal
         \\  "out of bounds memory access")
         \\(assert_return (invoke $A "at" (i32.const 7)) (i32.const 7))
     ;
-    const s = try runScript(std.testing.allocator, src);
+    const s = try runScript(std.testing.allocator, src, null);
     try std.testing.expectEqual(@as(usize, 2), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
@@ -1943,7 +2081,7 @@ test "an imported mutable global is SHARED, not copied at instantiation" {
         \\(assert_return (get $B "g") (i32.const 241))
         \\(assert_return (invoke $B "get") (i32.const 241))
     ;
-    const s = try runScript(std.testing.allocator, src);
+    const s = try runScript(std.testing.allocator, src, null);
     try std.testing.expectEqual(@as(usize, 4), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
@@ -1969,7 +2107,7 @@ test "a funcref crossing a module boundary in a global keeps its identity" {
         \\    (call_indirect (type $r) (i32.const 0))))
         \\(assert_return (invoke $N "call") (i32.const 42))
     ;
-    const s = try runScript(std.testing.allocator, src);
+    const s = try runScript(std.testing.allocator, src, null);
     try std.testing.expectEqual(@as(usize, 1), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
@@ -1988,7 +2126,7 @@ test "assert_invalid/malformed does not count OUR limitations as passes" {
     //     quoted text while the property being tested did not change.
     {
         const src = "(assert_malformed (module quote \"(func (some.bogus.instruction))\") \"unexpected token\")";
-        const s = try runScript(gpa, src);
+        const s = try runScript(gpa, src, null);
         try std.testing.expectEqual(@as(usize, 0), s.passed);
         try std.testing.expectEqual(@as(usize, 0), s.failed);
         try std.testing.expectEqual(@as(usize, 1), s.skipped);
@@ -1999,7 +2137,7 @@ test "assert_invalid/malformed does not count OUR limitations as passes" {
     //      skip, and 1,291 assertions across the suite went with it.
     {
         const src = "(assert_malformed (module quote \"(func (i32.const 0x100000000) drop)\") \"constant out of range\")";
-        const s = try runScript(gpa, src);
+        const s = try runScript(gpa, src, null);
         try std.testing.expectEqual(@as(usize, 1), s.passed);
         try std.testing.expectEqual(@as(usize, 0), s.failed);
         try std.testing.expectEqual(@as(usize, 0), s.skipped);
@@ -2008,16 +2146,16 @@ test "assert_invalid/malformed does not count OUR limitations as passes" {
     // (a3) A quoted module that is VALID must build — the wrapping has to accept
     //      both a bare field sequence and a complete `(module …)` form.
     {
-        const s = try runScript(gpa, "(module quote \"(func (export \\\"f\\\"))\")");
+        const s = try runScript(gpa, "(module quote \"(func (export \\\"f\\\"))\")", null);
         try std.testing.expectEqual(@as(usize, 0), s.failed);
-        const s2 = try runScript(gpa, "(module quote \"(module (func (export \\\"f\\\")))\")");
+        const s2 = try runScript(gpa, "(module quote \"(module (func (export \\\"f\\\")))\")", null);
         try std.testing.expectEqual(@as(usize, 0), s2.failed);
     }
 
     // (b) an unknown mnemonic is an ASSEMBLER gap, not evidence of invalidity.
     {
         const src = "(assert_invalid (module (func (result i32) (some.bogus.instruction))) \"type mismatch\")";
-        const s = try runScript(gpa, src);
+        const s = try runScript(gpa, src, null);
         try std.testing.expectEqual(@as(usize, 0), s.passed);
         try std.testing.expectEqual(@as(usize, 1), s.skipped);
     }
@@ -2026,7 +2164,7 @@ test "assert_invalid/malformed does not count OUR limitations as passes" {
     //     real rejections into skips.
     {
         const src = "(assert_invalid (module (func (result i32) (i64.const 1))) \"type mismatch\")";
-        const s = try runScript(gpa, src);
+        const s = try runScript(gpa, src, null);
         try std.testing.expectEqual(@as(usize, 1), s.passed);
         try std.testing.expectEqual(@as(usize, 0), s.skipped);
     }
@@ -2044,7 +2182,7 @@ test "(either …) accepts any listed alternative, and still rejects a non-alter
             \\(module (func (export "f") (result i32) (i32.const 7)))
             \\(assert_return (invoke "f") (either (i32.const 5) (i32.const 7)))
         ;
-        var s = try runScript(gpa, src);
+        var s = try runScript(gpa, src, null);
         defer s.deinit(gpa);
         try std.testing.expectEqual(@as(usize, 1), s.passed);
         try std.testing.expectEqual(@as(usize, 0), s.failed);
@@ -2056,7 +2194,7 @@ test "(either …) accepts any listed alternative, and still rejects a non-alter
             \\(module (func (export "f") (result i32) (i32.const 7)))
             \\(assert_return (invoke "f") (either (i32.const 5) (i32.const 6)))
         ;
-        var s = try runScript(gpa, src);
+        var s = try runScript(gpa, src, null);
         defer s.deinit(gpa);
         try std.testing.expectEqual(@as(usize, 0), s.passed);
         try std.testing.expectEqual(@as(usize, 1), s.failed);
@@ -2069,7 +2207,7 @@ test "(either …) accepts any listed alternative, and still rejects a non-alter
             \\(assert_return (invoke "f")
             \\  (either (v128.const i32x4 9 9 9 9) (v128.const i32x4 1 2 3 4)))
         ;
-        var s = try runScript(gpa, src);
+        var s = try runScript(gpa, src, null);
         defer s.deinit(gpa);
         try std.testing.expectEqual(@as(usize, 1), s.passed);
         try std.testing.expectEqual(@as(usize, 0), s.failed);

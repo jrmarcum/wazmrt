@@ -211,9 +211,14 @@ typedef enum {
  * rather than quietly repairing it — silently enabling a dependency would accept modules you
  * meant to refuse. The layering is noted per entry below.
  *
- * There is deliberately NO tail-call entry: `return_call` / `return_call_indirect` are not
- * in wazmrt's implemented set, so a toggle for them would gate nothing. `return_call_ref`
- * belongs to function-references and is covered by that flag.
+ * `return_call_ref` belongs to function-references and is covered by that flag, not by
+ * WAZMRT_FEATURE_TAIL_CALL.
+ *
+ * ⚠️ The text here previously read "there is deliberately NO tail-call entry" while the enum
+ * below declared one. It was the comment that was wrong, and the mismatch was load-bearing:
+ * the implementation had also stopped at EXCEPTIONS, so `wazmrt_config_set_feature` REJECTED
+ * WAZMRT_FEATURE_TAIL_CALL while `wazmrt_config_all_features` disabled it. Fixed 2026-08-17;
+ * the three lists are now tied together by a compile-time check.
  */
 typedef enum {
     WAZMRT_FEATURE_SIGN_EXTENSION            = 0,
@@ -230,7 +235,11 @@ typedef enum {
     WAZMRT_FEATURE_FUNCTION_REFERENCES       = 11,  /* requires REFERENCE_TYPES     */
     WAZMRT_FEATURE_GC                        = 12,  /* requires FUNCTION_REFERENCES */
     WAZMRT_FEATURE_EXCEPTIONS                = 13,  /* requires REFERENCE_TYPES     */
-    WAZMRT_FEATURE_TAIL_CALL                 = 14
+    WAZMRT_FEATURE_TAIL_CALL                 = 14,
+    /* NOT a wasm proposal name. Multiple tables shipped inside reference-types, so the spec has
+     * no separate switch for them; wazmrt splits them out so a pre-reference-types snapshot can
+     * be run at its own era without also losing `funcref`. Requires REFERENCE_TYPES. */
+    WAZMRT_FEATURE_MULTI_TABLE               = 15
 } wazmrt_feature_t;
 
 wazmrt_config_t *wazmrt_config_new(void);

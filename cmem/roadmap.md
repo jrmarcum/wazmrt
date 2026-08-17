@@ -1218,39 +1218,85 @@ the 89 and treating it as uniform would rank the tracks wrong.**
 **Recommended order: F → P → D.** F is the security item; P is small and proves the limits plumbing;
 D is the largest feature since GC.
 
-### Track F — feature ENFORCEMENT (clears the 8; the actual security work)
+### Track F — feature ENFORCEMENT (clears the 8)
 
-**The blocker, stated precisely:** `validate(gpa, *const Module)` takes no feature set.
-`features.zig`'s `require(fs, …)` walk only *computes* the first feature a module needs that a set
-lacks, for `zig build features` to report. **Nothing enforces anything.** So features today are
-DESCRIPTIVE, and the word "supported" in this repo means "implemented", never "permitted".
+🚨 **CORRECTED 2026-08-17 — F1, F2a AND F2b ARE ALREADY SHIPPED. The blocker statement below was
+FALSE when written, and this file contradicted itself two sections up:** the change-series table
+marks step **2e-b — "per-instance ceilings + real per-proposal gating (`src/features.zig`)" ✅**,
+landed 2026-08-11. It was scoped again on 2026-08-17 as if it did not exist. Verified in the code,
+not assumed:
 
-- **F1 — thread `features.Set` through validation.** `validate(gpa, module)` →
-  `validate(gpa, module, fs)`, ~15 call sites (`wast.zig`, `main.zig`, `capi.zig`, `typematch.zig`,
-  `sign.zig`, `fuzz.zig`, `validate.zig`'s own tests). ⚠️ **Pass the default EXPLICITLY at each site
-  rather than defaulting the parameter** — a defaulted policy is a policy nobody reviewed, which is
-  exactly how the `isOurLimitation` call site diverged and produced 14 mis-scored failures. Cost:
-  mechanical, low risk.
-- **F2a — module-level enforcement.** Wire the existing walk in as a rejection
-  (`error.FeatureDisabled`, naming the feature). Unblocks the 8. Small.
-- **F2b — per-INSTRUCTION enforcement** in `FuncValidator.step`, via the existing `opcodeFeature`
-  mapping. This is the half that actually shrinks the accepted language; F2a alone only gates module
-  structure. ⚠️ Watch the size gate AND the startup benchmark — this lands in the body validator's
-  hot loop. ⚠️ **Soundness: the check belongs in VALIDATE, not in the interpreter.** A feature gate
-  enforced only at execute is not a gate — the module already passed validation, and any future
-  compiled path would bypass it.
-- **F3 — a new `multi_table` Feature.** Multiple tables arrived with `reference_types`, but gating
-  on `reference_types` would also disable the `funcref` that `proposals/threads/imports.wast`
-  legitimately uses. So it needs its own flag. ⚠️ **This deliberately departs from the spec's own
-  proposal grouping** and must be documented as such: it exists so a snapshot can be run at its era.
-  Tiny.
-- **F4 — a directory → feature-set policy table in `wast.zig`.** `proposals/threads/` → all features
-  minus `multi_memory`, minus `multi_table`. This is what makes the 8 pass **for the right reason**:
-  a proposal directory asserts the rules of its own era, and running it with that era's feature set
-  is what a conformance runner is supposed to do. ⚠️ **The risk is regression, not the fix**:
-  `imports.wast` and `memory.wast` have many PASSING assertions today, and turning features off
-  could break them. Measure per-file, not on totals — *a file that trades passes for skips is
-  invisible in a failure diff.*
+| scoped as missing | actual state |
+| --- | --- |
+| "an embedder cannot restrict the feature set" | `wazmrt_config_set_feature` / `get_feature` / `all_features` — **in the shipped ABI-2 header** |
+| "nothing enforces anything" | hard rejection in **both** module entry points (`wazmrt_module_new`, `wazmrt_module_validate`), naming the feature |
+| F2a — module-level enforcement | `firstViolation` gates types, memories, tables, globals, tags, imports |
+| F2b — per-INSTRUCTION enforcement | `firstViolation` decodes every body and gates per instruction, **including the relaxed-SIMD sub-opcode split** |
+| coverage may rot | compiler-enforced `Op`-count pin (248) — a new opcode fails the build |
+| — | 4 passing gating tests, incl. **NO false positives on a plain MVP module with everything off** |
+
+⚠️ **So the security framing at the top of this section is wrong too: the embedder hole is CLOSED.**
+"An embedder who wants MVP + bulk-memory only cannot have it" — they can, and could since
+2026-08-11. Track F is therefore **not** the security work; it is conformance work plus a CLI gap.
+
+🎓 **The lesson, and it is the inverse of the memory64/GC-P3 pair: those recorded work as DONE that
+was not, this recorded work as TODO that already was.** Same root cause — a status line written
+from an argument rather than from the code. **Before scoping a track, grep for the thing you are
+about to build.** *(Original blocker text, preserved as the record:)* ~~`validate(gpa, *const
+Module)` takes no feature set; `features.zig`'s `require(fs, …)` walk only computes the first
+feature a module needs, for `zig build features` to report. Nothing enforces anything, so features
+today are DESCRIPTIVE.~~ *(The walk is not merely computed — it is wired as a rejection.)*
+
+**What genuinely remains in Track F:**
+
+- **F1r — the gate sits BESIDE `validate`, not inside it.** Every caller performs the two-step
+  (`firstViolation` then `validate`) by hand, and only `capi.zig` does. ⚠️ **This is the "THREE OF
+  THE FOUR do X" shape** `design-decisions.md` names: a future entry point that calls `validate`
+  alone inherits no gate and nothing fails. Folding the check into `validate` — or into the existing
+  `will_execute` guard, where the run-path validation decision already lives — is the durable fix.
+  `validate(gpa, module)` → `validate(gpa, module, fs)` is ~84 call sites, not the ~15 estimated
+  here (62 are `wat.zig` tests). ⚠️ **Zig FORCES F1 and an enforcement arm to land together** — an
+  unused parameter is a compile error, which is also why R9's inversions must be checked for a
+  successful build.
+- **F5-CLI — the CLI never gates at all.** `main.zig` has no `--features` and never calls
+  `firstViolation`, so the C-ABI embedder can restrict the accepted language and a CLI user cannot.
+  This is the real remaining half of F5; the **C-ABI setter it asks for already exists**.
+- ✅ **F3 — DONE 2026-08-17. `features.Feature.multi_table`.** Gates on `module.tables.len > 1` —
+  the whole INDEX SPACE, imports first, which is what covers all three spellings the spec asserts
+  on (import+import, import+defined, defined+defined); counting only *defined* tables would have
+  passed two of the three. Layered on `reference_types` in `Set.incoherent`. ⚠️ **It deliberately
+  departs from the spec's proposal grouping** — multiple tables shipped *inside* reference-types —
+  and is documented as such at the enum, in `wazmrt.h`, and in a test that asserts a ONE-table
+  module still loads with the flag off (gating on `reference_types` instead would have refused most
+  of `imports.wast`, the very file this exists to fix).
+- ✅ **F4 — DONE 2026-08-17. `wast.featuresForPath`,** an opt-in directory → feature-set table.
+  `proposals/threads/` → everything minus `multi_memory` minus `multi_table`; anything unlisted runs
+  unrestricted, because the failure mode of guessing is judging some other file by the wrong
+  language. `runScript` gained a required `path: ?[]const u8` (no default — *a defaulted policy is a
+  policy nobody reviewed*); the ~45 inline-source tests pass `null` explicitly.
+  🔑 **Both the positive path (`instantiateBinary`) and the negative one (`tryBuild`) now go through
+  ONE `Runner.validateEra`** — a runner whose `assert_invalid` path gates while its `(module …)`
+  path does not would call one module both valid and invalid inside a single file. That is
+  `capi.zig`'s stated rule, and it applies here identically.
+  **Result: the 8 closed, and the feared regression did not happen — 62,890 → 62,898 passed,
+  89 → 81 failed, 965 → 965 SKIPPED.** The skip column is the one that mattered: *a file that trades
+  passes for skips is invisible in a failure diff*, so all three totals were read, per the rule.
+  Baseline group 2 is now empty.
+  🎓 **And the lesson these 8 actually taught: a well-argued baseline entry is still an entry.**
+  They carried the best reasoning in that file — "the runtime is ahead of the file", which is TRUE —
+  and the argument justified the score so well that nobody asked whether the RUNNER could simply be
+  told which era to judge by. **An explanation for a failure is not the same as a decision to keep
+  it.** Re-read baseline group 1 with that in mind.
+- 🐛 **Found while doing F3 — a shipped C-ABI defect, fixed here.** `capi.Feature` stopped at
+  `exceptions = 13` and `valid()` hardcoded `<= 13`, while `features.zig` had `tail_call = 14` and
+  `wazmrt.h` **declared** `WAZMRT_FEATURE_TAIL_CALL = 14`. So `wazmrt_config_set_feature(TAIL_CALL,
+  false)` returned false and did nothing, while `wazmrt_config_all_features(false)` — which counts
+  with `features.count` — *did* disable it: **the header advertised a switch that silently was not
+  there, and the two spellings written by hand were the two that were wrong.** Now `valid()` derives
+  its bound from `features.count`, and a **comptime pin compares `capi.Feature` against
+  `features.Feature` name-by-name and value-by-value** (both arms verified to fire). The test loops
+  over the enum rather than naming members — a hand-written list would have had the same blind spot
+  as the code it checks.
 - **F5 — surface the set.** CLI `--features=…`, and a C-ABI setter on the engine/store. ⚠️ **Must
   compose with Track 2c's COMPTIME gating** (`-Dwat` / `-Dwasi`): a runtime feature set can only
   ever be a SUBSET of what was compiled in, and that precedence rule needs one statement and one

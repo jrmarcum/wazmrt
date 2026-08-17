@@ -101,7 +101,9 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
         // hash-what-you-execute property `verifyGate` has for a module.
         if (!(try verifyGate(arena, io, out, bytes, path, args[2..]))) return exit_failure;
 
-        const s = wazmrt.wast.runScript(arena, bytes) catch |e| {
+        // `path` is passed for the ERA POLICY, not for I/O: a script under `proposals/threads/`
+        // is judged by that snapshot's feature set. See `wast.featuresForPath`.
+        const s = wazmrt.wast.runScript(arena, bytes, path) catch |e| {
             try out.print("error: cannot run '{s}': {s}\n", .{ path, @errorName(e) });
             return exit_failure;
         };

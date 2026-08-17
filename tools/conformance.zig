@@ -126,7 +126,9 @@ pub fn main(init: std.process.Init) !void {
             regressions += 1; // an unreadable file is never an acceptable baseline
             continue;
         };
-        const s = wazmrt.wast.runScript(a, bytes) catch |e| {
+        // `ent.path` is walk-relative (`proposals/threads/imports.wast`), which is exactly the
+        // granularity the era policy keys on — see `wast.featuresForPath`.
+        const s = wazmrt.wast.runScript(a, bytes, ent.path) catch |e| {
             try observed.append(arena, .{ .path = try arena.dupe(u8, ent.path), .runner_error = true, .failures = 0 });
             bad_files += 1;
             if (exp.runner_error) {
