@@ -282,6 +282,26 @@ evidence a module is invalid. `assert_invalid`, `assert_trap` and `assert_unlink
 
 ## 5. Recording what you found
 
+**A REFUSAL is not a hole — rank security work by what the gap PERMITS, not by the size of the
+failing number.** Asked to close "the last 89 for security reasons", the honest split ran the other
+way from the count: the 81 untargeted-proposal assertions are modules wazmrt *rejects*, and a module
+that will not run cannot do harm, so implementing those proposals **adds** attack surface rather than
+removing it. The real gap was invisible in the score — `validate()` takes no feature set, so no
+embedder can run a restricted subset of the language — and it surfaced only from the 8 assertions
+that looked like the *least* alarming group. **A conformance total counts disagreements, not
+exposure; they are different axes and a big number on one says nothing about the other.** Say so
+when scoping, then build what was asked. — Tracks F/P/D scoping, 2026-08-17
+
+**When you implement a feature the project has already been burned by, name the prior bug in the
+plan, not in the postmortem.** Track D's scope carries the two soundness defects this branch already
+found (host-externref/GC-index collision; cross-instance GC object substitution) as explicit
+checkpoints on D1 and D3, because descriptors re-create the exact conditions for both: a cast that
+admits a subtype where the spec demands exact is type confusion, and a descriptor stored as a type
+INDEX rather than an ENTITY is the same cross-instance bug a third time. ⚠️ **The cross-instance
+defect passed the entire corpus before it was found by construction** — so those checkpoints demand
+targeted wrong-answer tests, not an assertion count. **A green suite is evidence about the tests, not
+about the code.** — Tracks F/P/D scoping, 2026-08-17
+
 **A finding can be well-argued, land a real check, and still be INVENTING a requirement.** R10 deleted
 a `br_table` cross-label subtype check whose reasoning was sound — `popVals` genuinely cannot catch a
 mismatch on a polymorphic stack — and whose conclusion was wrong, because on a polymorphic stack

@@ -1191,6 +1191,130 @@ symmetry.
 compatibility, at a fraction of the footprint, faster on anything not precompiled."** An unqualified
 "faster than wasmtime" dies to one hot-loop benchmark.
 
+## 🎯 PROPOSED — closing the last 89 (scoped 2026-08-17, owner asked for "no holes left open")
+
+**Read this framing before costing the work, because the security argument is NOT uniform across
+the 89 and treating it as uniform would rank the tracks wrong.**
+
+- ⚠️ **The 81 untargeted-proposal assertions are NOT a security hole today.** wazmrt REFUSES those
+  modules. Refusal is the safe direction — a module that will not run cannot do harm. **Implementing
+  them ADDS attack surface rather than closing a gap.** That is a legitimate thing to want (it is
+  completeness, and it is the stated goal), but the honest security framing is *"we choose to
+  support more language, and the risk now lives in our implementation of it"* — which is why every
+  increment below carries an explicit soundness checkpoint instead of an assertion count alone.
+- ⚠️ **The 8 threads assertions are not accept-invalid in the dangerous sense either** — wazmrt is
+  correct and the file is old. **But a real security gap hides behind them:** there is no way to run
+  wazmrt with a RESTRICTED feature set. `validate()` takes no features, so an embedder who wants
+  "MVP + bulk-memory only" — a smaller accepted language, a smaller TCB, less of our own code
+  reachable by untrusted input — cannot have it. **That is the genuine "hole", and Track F closes
+  it.** The 8 assertions are a side effect of the fix, not its purpose.
+- 🎯 **Therefore: F before D.** Track F is the one that makes Track D's new attack surface OPTIONAL.
+  Landing descriptors first would mean every embedder carries them with no way to decline.
+
+**Recommended order: F → P → D.** F is the security item; P is small and proves the limits plumbing;
+D is the largest feature since GC.
+
+### Track F — feature ENFORCEMENT (clears the 8; the actual security work)
+
+**The blocker, stated precisely:** `validate(gpa, *const Module)` takes no feature set.
+`features.zig`'s `require(fs, …)` walk only *computes* the first feature a module needs that a set
+lacks, for `zig build features` to report. **Nothing enforces anything.** So features today are
+DESCRIPTIVE, and the word "supported" in this repo means "implemented", never "permitted".
+
+- **F1 — thread `features.Set` through validation.** `validate(gpa, module)` →
+  `validate(gpa, module, fs)`, ~15 call sites (`wast.zig`, `main.zig`, `capi.zig`, `typematch.zig`,
+  `sign.zig`, `fuzz.zig`, `validate.zig`'s own tests). ⚠️ **Pass the default EXPLICITLY at each site
+  rather than defaulting the parameter** — a defaulted policy is a policy nobody reviewed, which is
+  exactly how the `isOurLimitation` call site diverged and produced 14 mis-scored failures. Cost:
+  mechanical, low risk.
+- **F2a — module-level enforcement.** Wire the existing walk in as a rejection
+  (`error.FeatureDisabled`, naming the feature). Unblocks the 8. Small.
+- **F2b — per-INSTRUCTION enforcement** in `FuncValidator.step`, via the existing `opcodeFeature`
+  mapping. This is the half that actually shrinks the accepted language; F2a alone only gates module
+  structure. ⚠️ Watch the size gate AND the startup benchmark — this lands in the body validator's
+  hot loop. ⚠️ **Soundness: the check belongs in VALIDATE, not in the interpreter.** A feature gate
+  enforced only at execute is not a gate — the module already passed validation, and any future
+  compiled path would bypass it.
+- **F3 — a new `multi_table` Feature.** Multiple tables arrived with `reference_types`, but gating
+  on `reference_types` would also disable the `funcref` that `proposals/threads/imports.wast`
+  legitimately uses. So it needs its own flag. ⚠️ **This deliberately departs from the spec's own
+  proposal grouping** and must be documented as such: it exists so a snapshot can be run at its era.
+  Tiny.
+- **F4 — a directory → feature-set policy table in `wast.zig`.** `proposals/threads/` → all features
+  minus `multi_memory`, minus `multi_table`. This is what makes the 8 pass **for the right reason**:
+  a proposal directory asserts the rules of its own era, and running it with that era's feature set
+  is what a conformance runner is supposed to do. ⚠️ **The risk is regression, not the fix**:
+  `imports.wast` and `memory.wast` have many PASSING assertions today, and turning features off
+  could break them. Measure per-file, not on totals — *a file that trades passes for skips is
+  invisible in a failure diff.*
+- **F5 — surface the set.** CLI `--features=…`, and a C-ABI setter on the engine/store. ⚠️ **Must
+  compose with Track 2c's COMPTIME gating** (`-Dwat` / `-Dwasi`): a runtime feature set can only
+  ever be a SUBSET of what was compiled in, and that precedence rule needs one statement and one
+  test. Extend `zig build features` to cover the combinations, as it already does for the build
+  flags — it earned its keep once by catching six ungated `capi.zig` sites.
+
+⚠️ **Every enforcement arm needs an inversion test** — comment the check out, watch a test fail,
+restore. **And assert the BUILD SUCCEEDED before reading an inversion's silence**: two of R9's eight
+inversions reported no failing test because commenting the check out left a Zig parameter unused.
+
+### Track P — custom-page-sizes (2 assertions, 1 file). Small, and the one with a memory-safety edge
+
+A memory declares its own page size — `(memory 1 (pagesize 1))`, byte-granular instead of the fixed
+64 KiB. Already recognised and refused by name (`UnsupportedProposal`), so the parse site exists.
+
+- **P1** — the page size in the limits flag byte (encoded as log2), decoder + the existing `wat.zig`
+  `(pagesize N)` site.
+- **P2** — validation of the field itself; limits arithmetic must not overflow.
+- **P3** — instantiate, **every bounds check**, `memory.grow`, `memory.size`. 🔒 **THIS IS THE
+  SECURITY ITEM IN TRACK P.** `memory.size` returns PAGES, `memory.grow` takes PAGES, and every
+  bounds check compares against `pages × page_size`. **A single site left holding the hardcoded
+  65536 is a memory-safety hole, not a conformance miss.** Deliverable: enumerate every use of that
+  constant and convert or justify each one, in the commit message.
+- **P4** — memory64 interaction: `page_size × page_count` must not overflow the 64-bit index space.
+  wazmrt has been bitten here before; the overflow-safe memory64 bounds work is the precedent.
+- **Verify** beyond the 2 assertions: a 1-byte-page memory must reject an out-of-bounds access at
+  BYTE granularity. The assertions alone would not catch a bounds check that silently kept 64 KiB.
+
+### Track D — custom-descriptors (79 assertions, 13 files). The largest feature since GC
+
+Descriptors make a struct type's runtime description a first-class value, which in turn makes casts
+EXACT. It extends GC, which wazmrt ships — an extension of a shipped proposal, not a new subsystem.
+**D1 gates everything else; do not reorder.**
+
+- **D1 — the `(exact $t)` reference-type former. THE HARD ONE.** ⚠️ Exact refs change **SUBTYPING**,
+  not just parsing: `(ref (exact $t))` is **NOT** satisfied by a subtype of `$t`. So `subtypeOf`,
+  `refMatches`, `headMatches` and the `TypeRegistry` canonicaliser all change together.
+  🔒 **SOUNDNESS CHECKPOINT — the strongest security argument in this whole scope.** A `refMatches`
+  that answers "yes" to a subtype where the spec demands exact is **type confusion**: the guest gets
+  a value of a type it proved it did not have. That is the same shape as BOTH soundness defects
+  already found on this branch (the host-externref/GC-index collision, and cross-instance GC object
+  substitution). **Every cast arm needs a targeted WRONG-ANSWER test, not an assertion count** — the
+  cross-instance defect passed the whole corpus before it was found by construction, not by score.
+  Carries `exact.wast` (17), `exact-func-import` (5), `exact-casts` (3), `array_new_exact` (1).
+- **D2 — `(descriptor $d)` / `(describes $s)` on struct types.** Type-section syntax + binary form.
+  ⚠️ **Rec-group interning must include the descriptor links in the structural key** — otherwise two
+  structurally-identical-but-differently-described types canonicalise together, which is a
+  cross-module wrong answer of exactly the kind the store-wide `TypeRegistry` was built to fix.
+  `TypeRegistry.groupKey` / `appendField` change here. Carries `descriptors.wast` (21),
+  `binary-descriptors` (2).
+- **D3 — allocation and descriptor read: `struct.new_desc` (8), `ref.get_desc` (7).**
+  ⚠️ **The descriptor a value carries must name an ENTITY, not a type index** — R2's model applies
+  directly, and cross-instance `ref.get_desc` must resolve through the store. This is the third time
+  that lesson would apply; if it is missed again it will be the same bug a third time.
+- **D4 — the descriptor casts:** `br_on_cast_desc_eq` (5), `br_on_cast_desc_eq_fail` (5),
+  `ref_cast_desc_eq` (3), `br_on_cast` (1), `br_on_cast_fail` (1).
+- **D5 — `array.new_exact`** (1).
+
+**Cost:** expect the largest ceiling raises on the roadmap since the GC batches — D1 alone is
+comparable to the bottom-type lattice (+1 KB for 9 variants) or larger, and it touches decoder,
+validator and interpreter, so the DLL moves too. Budget a raise per increment; do not batch them,
+because a batched raise cannot be attributed.
+
+**Cross-track verification:** the differential harness in `tests/differential/` already exists and
+should be pointed at every D increment. ⚠️ **There is no privileged oracle** — when wazmrt and a
+reference disagree, that is a question, not a verdict; the open wasmtime 222-vs-223-byte differential
+is the standing reminder.
+
 ## Status (2026-07-27) — every targeted wasm proposal implemented (memory64 was the last)
 
 *(Sections below are dated as written. The **2026-07-27** state supersedes all earlier test counts and
@@ -2005,7 +2129,9 @@ changing that code.
 
 ## Parking lot / open questions
 
-- **SCOPED, NOT TAKEN (2026-08-17): per-directory feature policy in the `.wast` runner** — the only
+- **SUPERSEDED 2026-08-17 — promoted to Track F** at the top of this file after the owner asked for
+  "no holes left open". Kept here because the DIAGNOSIS below is the part worth re-reading; Track F
+  is the plan built on it. Per-directory feature policy in the `.wast` runner is the only
   way to clear the last 8 baseline entries (`proposals/threads`, 6 in `imports.wast` + 2 in
   `memory.wast`). Those files assert `(module (memory 0) (memory 0))` and
   `(module (table 10 funcref) (table 10 funcref))` are INVALID, because that snapshot predates
