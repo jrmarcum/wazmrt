@@ -322,8 +322,10 @@
 # ten bytes rather than a rule's worth. Same shape as R4: the cheapest changes alter what a token
 # MEANS rather than adding machinery.
 #
-# ⚠️ Measured on a COPY of the tree on C:, not in the repo on D: — that volume was throwing
-# event-51 paging errors and `zig build` could not run there at all. See `best-practices.md` §2.
+# ⚠️ Measured on a COPY of the tree on C:, not in the repo on D: — `zig build` could not run there
+# at all. CORRECTED 2026-08-17: the cause is a DAMAGED exFAT FILESYSTEM on that USB volume
+# (`Get-Volume D` → "Full Repair Needed"), not the "event-51 paging errors" this note first claimed
+# and not antivirus; the physical disk reports Healthy. See `INDEX.md` and `best-practices.md` §2.
 
 wazmrt.exe  964608
 wazmrt.lib  1029730

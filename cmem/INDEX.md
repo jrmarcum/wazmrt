@@ -12,25 +12,41 @@ and revised without wading through one giant file. Keep files small and single-t
 ## 🚨 ENVIRONMENT BLOCKER (2026-08-17) — `zig build` CANNOT RUN from this repo on D:
 
 **If a build fails with a bare `error: Unexpected` — no step, no path, and `--verbose` adds
-nothing — it is NOT your change.** The `D:` volume this repo lives on is throwing hardware errors
-(Windows System log, event ID 51, "error detected on device \Device\Harddisk1\DR3 during a paging
-operation"). It corrupted zig's `.zig-cache` (even `zig build --help` failed until the cache was
-moved aside) **and** git's commit-graph, in the same hour.
+nothing — it is NOT your change.** Confirmed by stashing the one edited file and rebuilding
+UNMODIFIED HEAD, which reproduced it exactly.
 
-**Workaround used on 2026-08-17, and it works:** copy the tree to `C:` and build there —
+**CAUSE: the `D:` FILESYSTEM needs repair.** `Get-Volume -DriveLetter D` reports
+**`HealthStatus: Warning`, `OperationalStatus: Full Repair Needed`**. This repo lives on a **PNY
+USB 3.2 flash drive formatted exFAT** — the same removable volume `known-issues.md` already notes
+for `test-security` ("run from an NTFS cwd", because exFAT has no symlinks). The damage explains
+both corrupted caches seen that day: zig's `.zig-cache` (even `zig build --help` failed until it was
+moved aside) and git's commit-graph.
+
+**FIX: repair the volume.** `Repair-Volume -DriveLetter D -Scan`, then `chkdsk D: /f` from an
+elevated prompt. Builds DID run from D: through 2026-08-04 (cache timestamps), so this is a
+regression in the volume, not a permanent property of exFAT.
+
+**Workaround until then — copy the tree to `C:` and build there:**
 
 ```
 robocopy . <C:\path> /E /XD .git .zig-cache zig-out
 ```
 
-`zig build test` / `conformance` / `size` all pass from the copy. Everything committed that day was
-verified that way, including the size ceilings.
+`zig build test` / `conformance` / `size` all pass from the copy. Everything committed on
+2026-08-17 was verified that way, including the size ceilings.
 
-⚠️ **Clearing the caches FEELS like a fix and is not** — both are regenerable, so clearing them moves
-the symptom off the cause. **Back up and `chkdsk` before trusting the volume.** A full backup of the
-repo including `.git` was verified readable on 2026-08-17. **Confirm the drive is healthy before
-reading any build result from D: as evidence of anything.** See `best-practices.md` §2 for the
-diagnosis method — the decisive step was rebuilding UNMODIFIED HEAD, which reproduced it.
+⚠️ **Clearing the caches FEELS like a fix and is not** — both are regenerable, so clearing them
+moves the symptom off the cause.
+
+⚠️ **TWO WRONG DIAGNOSES WERE PUBLISHED BEFORE THIS ONE — the commit messages of `e507d1c`,
+`ed05905`, `458bc96` and `46a0bdb` all say "hardware errors" and name event ID 51. THAT IS WRONG
+and cannot be edited out of pushed history; this section supersedes it.** The event-51 "paging
+operation" entries are real but are **a single stale burst from 8/10, a week before the failures**,
+and the PHYSICAL disk reports `Healthy` — likely the interrupted write that damaged the filesystem
+in the first place, which is the classic failure mode for removable media. Antivirus was the second
+wrong guess: Defender is **stopped** on this machine (Datto EDR is the active agent) and logged
+nothing during a probe build. **Identify the LAYER — physical disk vs filesystem vs OS vs
+application — before naming a cause.** See `best-practices.md` §2.
 
 ---
 

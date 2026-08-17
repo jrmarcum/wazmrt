@@ -91,16 +91,39 @@ been green hours earlier, reproduced it exactly. That single check reclassified 
 investigation from "what did I break" to "what broke around me". **A one-command falsification is
 worth more than any amount of reading the diff you already believe in.**
 
-**Two unrelated tools reporting corruption in one directory is a STORAGE finding, not two bugs.**
-Same incident: zig's `.zig-cache` was unreadable (`zig build --help` failed until it was moved
-aside) *and* git warned `unable to find all commit-graph files`. Two independent caches, one
-directory, same hour. The Windows System log then had six `disk`/event-51 "error was detected on
-device … during a paging operation" entries for that volume. Confirmed by copying the tree to the
-other drive, where `zig build test` exited 0 immediately. ⚠️ **Both caches were REGENERABLE, so
-clearing them felt like a fix and was not** — it moved the symptom without touching the cause.
-**Correlate the failures you were not looking for; the second one is what names the cause.** And
-when a build tool's error text has no step and no path, suspect the environment before the source.
-— `anyfunc` closure, 2026-08-17
+**Two unrelated tools reporting corruption in one directory is a STORAGE finding, not two bugs — but
+"storage" is three layers, and naming the wrong one sends the fix to the wrong place.** Same
+incident: zig's `.zig-cache` was unreadable (`zig build --help` failed until it was moved aside)
+*and* git warned `unable to find all commit-graph files`. Two independent caches, one directory,
+same hour. Copying the tree to the other drive and watching `zig build test` exit 0 confirmed it was
+environmental. ⚠️ **Both caches were REGENERABLE, so clearing them felt like a fix and was not** — it
+moved the symptom without touching the cause.
+
+⚠️ **Then the cause was misnamed TWICE, and both errors are instructive:**
+
+1. **"Failing hardware."** Drawn from six `disk`/event-51 "error detected on device … during a
+   paging operation" entries — **without checking their timestamps.** All six were a single burst
+   from a week earlier; **zero** coincided with the failures. `Get-PhysicalDisk` reported the disk
+   `Healthy`. **An event log entry is evidence of something that happened, not of something that is
+   happening — read the clock before drawing the arrow.**
+2. **"Antivirus"** (the owner's hypothesis, and worth testing rather than accepting). Refuted:
+   Defender is *stopped* on that machine, `Get-MpPreference` fails `0x800106ba`, the active agent is
+   Datto EDR, and a probe build produced **no AV events at all**.
+
+**The actual cause was one query away the whole time:** `Get-Volume -DriveLetter D` →
+`HealthStatus: Warning`, `OperationalStatus: Full Repair Needed`. A damaged **exFAT filesystem on a
+USB flash drive** — physical disk fine, volume not. **Identify the LAYER (physical disk → volume →
+OS → application) before naming a cause; each one has its own health query, and the cheapest of them
+was never run.**
+
+🔻 **And this project's OWN memory already recorded the relevant fact** — `known-issues.md` and
+`roadmap.md` both say "`D:` is exFAT" and explain the `test-security` "run from an NTFS cwd" note.
+It was even visible in the `INDEX.md` row being read that same session. **Search cmem for the
+environment before diagnosing the environment.** Two wrong causes shipped in four commit messages
+because a five-second grep came after the conclusion instead of before it.
+
+When a build tool's error text has no step and no path, suspect the environment before the
+source — but then find out WHICH environment. — `anyfunc` closure, 2026-08-17
 
 **A defect classified by its error message can be a shadow of a defect three layers up.** T5 was filed
 as "oversized limits refused at the wrong stage"; it was not a defect at all, but a symptom of the WAT
