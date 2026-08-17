@@ -83,7 +83,7 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
 
 ## 📊 CURRENT spec-testsuite score (2026-08-14) — EVERY CORE SPEC FILE IS AT ZERO
 
-**284 files — 62,889 assertions passed / 104 failed / 951 skipped.** This is the number to quote;
+**284 files — 62,889 assertions passed / 90 failed / 965 skipped**, and `zig build conformance -Dbaseline=tools/conformance-baseline.txt` reports **0 regressions**. This is the number to quote;
 every snapshot below it is older and kept as history.
 
 ⚠️ **The failed count ROSE from 143 at R4 and that is an improvement.** R5 implemented
@@ -103,7 +103,7 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
 - **Failure messages carry the source LINE** of the `.wast` command that produced them (`L342: …`),
   added 2026-08-13 via `sexpr.parseAllWithLines`. Before that, matching 35 failures back to their
   assertions was hand work.
-- 🏁 **104 is not 104 defects: 102 are BY DESIGN and the other 2 are RECORDED DELIBERATE
+- 🏁 **90 is not 90 defects — it is 89 non-defects and ONE deliberate deviation.** ⚠️ **14 of the previous 104 were a SCORING BUG**, not a result: a bare `(module …)` that failed to build called `fail()` without consulting `isOurLimitation`, so `UnsupportedProposal`/`UnknownInstr`/`UnsupportedInstr` — our own gaps, scored as SKIPS on every assertion path — were reported as defects here. Fixed 2026-08-14; `delegate` was one of them, so it was never a deviation, just a mis-scored gap. **The remaining 90: 81 untargeted proposals + 8 era-pinned `proposals/threads` + 1 `anyfunc`.** ⚠️ **A by-design refusal is NOT a pass** — banking our own gaps as passes is the green-washing `isOurLimitation` was written after — so they are recorded in `tools/conformance-baseline.txt`, every line with a reason, and the step gates on REGRESSIONS. *(Superseded:)* 104 is not 104 defects: 102 are BY DESIGN and the other 2 are RECORDED DELIBERATE
   DEVIATIONS** — `anyfunc` and `delegate`. **Every core spec file is at zero failures and there are
   no undiagnosed failures left.** R1–R5, R7, R9, R10 done, R6 closed by R3, R8 by R5, the singleton
   batch took 22 and the bottom-type lattice the last 28 (27 of them SKIPS).

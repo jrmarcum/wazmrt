@@ -316,6 +316,20 @@ a comment's subject read as a field name. **Each was cheap to check and expensiv
 When a claim will leave this repo — a commit message, a cross-project report, a number in a README —
 verify it against the artifact, not against something that talks about the artifact.
 
+**SCORE THE SAME ERROR THE SAME WAY ON EVERY PATH.** `isOurLimitation` decided that a gap of ours is
+a SKIP, not a pass — but the bare `(module …)` arm never called it, so the identical error was a skip
+on an assertion path and a *defect* on that one. 14 of a reported 104 "failures" were that
+inconsistency. **A classification rule that one call site does not consult is a rule with an
+exception nobody wrote down.** — the scoring fix, `wast.zig`
+
+**"BY DESIGN" IS NOT "PASS", AND IT IS NOT "FAIL" EITHER.** A module we cannot build because we do
+not implement its proposal proves nothing about correctness — calling it a pass is the green-washing
+`isOurLimitation` exists to prevent — but calling it a failure overstates the defect count by an
+order of magnitude. It is a refusal, and it belongs in an EXPLAINED baseline that gates on
+regressions. ⚠️ **A baseline is only honest if every line carries a reason**; otherwise it is a way to
+make a red number green, and adding a line to pass the build is the failure mode it invites. —
+`tools/conformance-baseline.txt`
+
 **A BENCHMARK WHOSE FLOOR IS LARGER THAN ITS SIGNAL MEASURES THE FLOOR.** The end-to-end CLI harness
 put wazmrt 2.4× ahead of wasmtime. With process spawn excluded, the engines differ by **20–55×**. A
 ~30 ms floor did not add noise to a sub-millisecond quantity — it *hid the entire effect*, and it

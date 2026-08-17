@@ -215,6 +215,21 @@ const Runner = struct {
             };
             self.current = self.buildModule(list) catch |e| {
                 self.current = null;
+                // ⚠️ **The same error was a SKIP on every assertion path and a
+                // FAILURE here**, because this arm never consulted
+                // `isOurLimitation`. So a module using a proposal wazmrt does
+                // not target — `UnsupportedProposal`, `UnknownInstr` — was
+                // reported as a defect, and 14 of the corpus's 104 "failures"
+                // were that inconsistency rather than anything wrong.
+                //
+                // A gap is not a defect and it is not a pass either: banking it
+                // as a pass is the green-washing `isOurLimitation`'s comment was
+                // written after. It is a SKIP, scored the same way here as
+                // everywhere else.
+                if (isOurLimitation(e)) {
+                    self.summary.skipped += 1;
+                    return;
+                }
                 self.fail("module failed to build: {s}", .{@errorName(e)});
                 return;
             };

@@ -193,7 +193,7 @@ CLOSED, AND SO IS EVERYTHING AFTER IT.** R1–R5, R7, R9 and R10 are done, R6 wa
 by R5, the singleton batch took the remainder, and the bottom-type lattice took the last of it —
 corpus is **104 failures / 62,889 passing / 951 skipped** (measured 2026-08-14).
 
-🏁 **EVERY CORE SPEC FILE IS AT ZERO FAILURES. LIVE SPLIT: 102 by design + 2 recorded deliberate
+🏁 **EVERY CORE SPEC FILE IS AT ZERO FAILURES.** Corpus **90 failures / 62,889 passing / 965 skipped**, and the baseline gate reports **0 regressions**. ⚠️ **14 of the previously-reported 104 were a SCORING BUG** — a bare `(module …)` build failure never consulted `isOurLimitation`, so our own gaps were counted as defects here while scoring as skips everywhere else. **LIVE SPLIT: 89 non-defects + exactly ONE deliberate deviation (`anyfunc`)** — `delegate` was a mis-scored gap, never a deviation. *(Superseded:)* LIVE SPLIT: 102 by design + 2 recorded deliberate
 deviations** — `anyfunc` (`obsolete-keywords.wast`, the pre-standard spelling of `funcref`, kept
 because two real `.wat` inputs use it) and `delegate` (`legacy/try_delegate.wast`, refused loudly
 because no oracle exists to route it). **There are no undiagnosed failures left**, which changes what
