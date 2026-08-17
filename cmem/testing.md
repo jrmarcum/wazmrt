@@ -172,8 +172,10 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
 - **Failure messages carry the source LINE** of the `.wast` command that produced them (`L342: …`),
   added 2026-08-13 via `sexpr.parseAllWithLines`. Before that, matching 35 failures back to their
   assertions was hand work.
-- 🏁 **89 failures, and NONE of them is a defect or a deviation (2026-08-17).** The count went
-  104 → 90 → 89 in two steps, and neither step was a bug fix in the runtime:
+- 🏁 **81 failures, and NONE of them is a defect or a deviation (2026-08-17 end of day).** The count
+  went 104 → 90 → 89 → 81, and **not one of those steps was a bug fix in the runtime** — three were
+  scoring corrections and one (89 → 81) was teaching the runner to judge a proposal directory at its
+  own era. *(The 104 → 89 history below was written when 89 was live.)*
   ⚠️ **14 of the 104 were a SCORING BUG**, not a result — a bare `(module …)` that failed to build
   called `fail()` without consulting `isOurLimitation`, so `UnsupportedProposal`/`UnknownInstr`/
   `UnsupportedInstr` — our own gaps, scored as SKIPS on every assertion path — were reported as
@@ -279,10 +281,14 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
   *exactly* its ceiling; the file was two builds old. **An exactly-zero delta is a timestamp check
   waiting to happen.**
 
-**Unit tests: 633/633** (`zig build test --summary all`, measured 2026-08-17 from a `C:` copy —
-`zig build` cannot run from this repo's cwd; see `INDEX.md`'s environment blocker).
-*(Superseded: 631, labelled "final" on 2026-08-14. Below is that entry, kept for its D:-vs-NTFS
-detail, which still applies.)* **Unit tests: 631** (2026-08-14) — 627 pass / 4 skip from
+**Unit tests: 643/643** (`zig build test --summary all`, 2026-08-17 end of day, from an NTFS cwd —
+`test-safe` 643/643, `test-security` 3/3). The day's additions: F3+F4 added 5 (era policy ×3,
+multi_table gating, the every-feature-settable regression test) and the skip-scoring split added 1.
+⚠️ **From this repo's own `D:` cwd the same run reads 639/643 (4 skipped)** — `std.testing.tmpDir`
+scratches under `.zig-cache/tmp` relative to the CWD, which exFAT cannot give symlinks, and
+redirecting the zig cache does NOT reach it. Quote NTFS numbers.
+*(Superseded: 633 earlier the same day; 631, labelled "final" on 2026-08-14. Below is that entry,
+kept for its D:-vs-NTFS detail, which still applies.)* **Unit tests: 631** (2026-08-14) — 627 pass / 4 skip from
 this repo's own `D:` cwd, **631/631 from an NTFS cwd** — the D:-vs-NTFS split is the part that still
 applies; the 631 itself is superseded by the 633 above. R3 added 7,
 R4 4, R5 3, R10 5, R9 6, R7 1, the singleton batch 5 and the lattice 2; each core test raises the printed total by two because the C-ABI

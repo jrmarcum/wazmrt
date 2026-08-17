@@ -70,9 +70,9 @@ zig build wasi-gate                # compile Zig+C wasm32-wasi programs, run the
                                    #   add -Drust-gate=true to also cross-check a rustc build
 zig build conformance -Dtestsuite=<dir> -Dbaseline=tools/conformance-baseline.txt
                                    # run the spec testsuite; gates on REGRESSIONS vs an
-                                   # explained baseline (89 non-defects, 0 deliberate deviations:
-                                   # 81 untargeted proposals wazmrt refuses + 8 assertions from a
-                                   # threads snapshot older than multi-memory/multi-table)
+                                   # explained baseline (81 non-defects, 0 deliberate deviations:
+                                   # untargeted proposals wazmrt refuses — custom-descriptors
+                                   # and custom-page-sizes)
                                    #   -Dbaseline=<file>        gate on regressions, not zero failures
                                    #   -Dwrite-baseline=true    generate that baseline from today's run
                                    #   -Dfailures=N             list up to N failures per file (default 1)
@@ -408,6 +408,16 @@ have trapped, so check both. Beyond the above the ABI covers WASI preview 1
 (`wazmrt_linker_define_wasi` with preopens, args, env and the `proc_exit` code),
 host functions, raw linear-memory access, exported globals, trap backtraces with
 function names, and per-engine resource ceilings and proposal restrictions.
+
+**Proposal restrictions gate for real.** `wazmrt_config_set_feature(cfg,
+WAZMRT_FEATURE_*, false)` makes a module using that proposal *invalid*: it is
+refused wholly by both `wazmrt_module_new` and `wazmrt_module_validate`, before
+anything executes, with an error naming the proposal. Types are checked as well
+as code, so a `v128` parameter needs SIMD even if no SIMD instruction runs. Use
+it to shrink the language you accept — and with it the amount of wazmrt an
+untrusted module can reach. A proposal layered on another must be disabled with
+it (turning off SIMD while relaxed-SIMD stays on is reported, not silently
+repaired).
 
 **Concurrency comes from multiple engines.** An engine and everything reachable
 from it is single-threaded; if your host uses async/await, tasks or threads, give
