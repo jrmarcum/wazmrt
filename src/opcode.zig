@@ -912,7 +912,7 @@ fn decodeSimd(r: *Reader, sub: u32) DecodeError!Instr {
         0x54...0x5b => { // v128.load/store lane: memarg + a lane index
             s.mem = try readMemArg(r);
             s.lane = try r.readByte();
-            if (s.lane >= simdLaneCount(sub)) return error.UnsupportedOpcode;
+            if (s.lane >= simdLaneCount(sub)) return error.BadLaneIndex;
         },
         0x0c, 0x0d => { // v128.const / i8x16.shuffle: 16 immediate bytes (LE)
             var v: u128 = 0;
@@ -925,14 +925,14 @@ fn decodeSimd(r: *Reader, sub: u32) DecodeError!Instr {
                 // the missed sibling, and an out-of-range index silently produced
                 // 0. `v128.const` (0x0c) has no such constraint — its bytes are
                 // literal data.
-                if (sub == 0x0d and b >= 32) return error.UnsupportedOpcode;
+                if (sub == 0x0d and b >= 32) return error.BadLaneIndex;
                 v |= @as(u128, b) << (@as(u7, i) * 8);
             }
             s.bytes = v;
         },
         0x15...0x22 => { // extract_lane / replace_lane
             s.lane = try r.readByte();
-            if (s.lane >= simdLaneCount(sub)) return error.UnsupportedOpcode;
+            if (s.lane >= simdLaneCount(sub)) return error.BadLaneIndex;
         },
         // An undefined `0xFD` sub-opcode used to decode AND validate, trapping
         // only at execution — so `wasm_module_validate` lied to the embedder, and

@@ -995,7 +995,15 @@ const Runner = struct {
         return switch (e) {
             error.BadCommand, // e.g. `(module quote …)`, not implemented
             error.NotAModule,
-            error.UnknownInstr, // the assembler doesn't know this mnemonic
+            // ⚠️ `error.UnknownInstr` USED TO BE ON THIS LIST and was removed 2026-08-17. It meant
+            // "the assembler doesn't know this mnemonic", which conflated two opposite things:
+            // a mnemonic that exists in NO proposal (a genuine malformation — a verdict we may
+            // give) and one from a proposal we do not target (our gap). `wat.zig`'s
+            // `untargetedProposalMnemonic` now splits them at the point where the difference is
+            // actually known, routing our gaps to `UnsupportedInstr` below. Conflating them cost
+            // ~244 correct rejections in CORE files, banked as skips — `load.wast` asserts
+            // `(i32.load32 …)` is malformed, which it is: that mnemonic exists in no wasm
+            // proposal, and answering "unknown" was answering CORRECTLY.
             error.UnsupportedInstr,
             // Recognised syntax from a proposal we do not target (`pagesize`).
             // The module may be valid under that proposal, so refusing it is our
@@ -2120,16 +2128,36 @@ test "assert_invalid/malformed does not count OUR limitations as passes" {
     // verdicts; this was the arm that didn't.
     const gpa = std.testing.allocator;
 
-    // (a) A limitation reached THROUGH `(module quote …)` must still skip. The
-    //     original case here used `(module quote …)` itself as the example of an
-    //     unimplemented form; R5 implemented it, so the example moved inside the
-    //     quoted text while the property being tested did not change.
+    // (a) A limitation reached THROUGH `(module quote …)` must still skip.
+    //
+    //     ⚠️ **THE EXAMPLE HAS NOW MOVED TWICE, AND THE PROPERTY HAS NOT CHANGED EITHER TIME.**
+    //     It began as `(module quote …)` itself (R5 implemented the form). It then became
+    //     `some.bogus.instruction` — which 2026-08-17 showed was never an instance of this
+    //     property at all: a mnemonic in NO proposal is a genuine malformation, and refusing it
+    //     is a verdict we are entitled to give, not a gap. The example is now a REAL instruction
+    //     from a proposal wazmrt does not target (`i64.add128`, wide-arithmetic), which is what
+    //     "our limitation" actually means. See `wat.untargetedProposalMnemonic`.
+    //
+    //     🎓 When a test fails after a change, ask whether its EXAMPLE still demonstrates its
+    //     PROPERTY. Twice now the answer was no, and twice the property was fine.
     {
-        const src = "(assert_malformed (module quote \"(func (some.bogus.instruction))\") \"unexpected token\")";
+        const src = "(assert_malformed (module quote \"(func (i64.add128))\") \"unexpected token\")";
         const s = try runScript(gpa, src, null);
         try std.testing.expectEqual(@as(usize, 0), s.passed);
         try std.testing.expectEqual(@as(usize, 0), s.failed);
         try std.testing.expectEqual(@as(usize, 1), s.skipped);
+    }
+
+    // (a1) The other half of that split, and the reason it was worth making: a mnemonic that
+    //      exists in no wasm proposal IS a malformation, so refusing it is a PASS. This is the
+    //      case that used to be example (a) — ~292 assertions across the corpus were being
+    //      banked as skips on the strength of our own ignorance.
+    {
+        const src = "(assert_malformed (module quote \"(func (some.bogus.instruction))\") \"unexpected token\")";
+        const s = try runScript(gpa, src, null);
+        try std.testing.expectEqual(@as(usize, 1), s.passed);
+        try std.testing.expectEqual(@as(usize, 0), s.failed);
+        try std.testing.expectEqual(@as(usize, 0), s.skipped);
     }
 
     // (a2) …and a quoted module that is GENUINELY malformed must now pass, which
@@ -2152,12 +2180,26 @@ test "assert_invalid/malformed does not count OUR limitations as passes" {
         try std.testing.expectEqual(@as(usize, 0), s2.failed);
     }
 
-    // (b) an unknown mnemonic is an ASSEMBLER gap, not evidence of invalidity.
+    // (b) A mnemonic from an UNTARGETED PROPOSAL is an assembler gap, not evidence of invalidity —
+    //     the same property as (a), reached through a direct `(module …)` rather than a quoted
+    //     one, because the two paths score independently. Example updated 2026-08-17 for the
+    //     reason given at (a): `some.bogus.instruction` was never an instance of this property.
     {
-        const src = "(assert_invalid (module (func (result i32) (some.bogus.instruction))) \"type mismatch\")";
+        const src = "(assert_invalid (module (func (result i32) (i64.add128))) \"type mismatch\")";
         const s = try runScript(gpa, src, null);
         try std.testing.expectEqual(@as(usize, 0), s.passed);
         try std.testing.expectEqual(@as(usize, 1), s.skipped);
+    }
+
+    // (b1) …and the same shape with a mnemonic that exists in no proposal is a real rejection.
+    //      Kept beside (b) so the two are read together: the ONLY difference between them is
+    //      whether the mnemonic is a real wasm instruction, which is precisely the distinction
+    //      `untargetedProposalMnemonic` exists to draw.
+    {
+        const src = "(assert_invalid (module (func (result i32) (some.bogus.instruction))) \"type mismatch\")";
+        const s = try runScript(gpa, src, null);
+        try std.testing.expectEqual(@as(usize, 1), s.passed);
+        try std.testing.expectEqual(@as(usize, 0), s.skipped);
     }
 
     // (c) a genuinely ill-typed module must still PASS — the fix must not turn

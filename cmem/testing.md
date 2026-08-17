@@ -83,8 +83,8 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
 
 ## 📊 CURRENT spec-testsuite score (2026-08-17) — EVERY CORE SPEC FILE IS AT ZERO
 
-**284 files — 62,898 assertions passed / 81 failed / 965 skipped**, and `zig build conformance -Dbaseline=tools/conformance-baseline.txt` reports **0 regressions**. This is the number to quote;
-every snapshot below it is older and kept as history.
+**284 files — 63,190 assertions passed / 81 failed / 673 skipped**, and `zig build conformance -Dbaseline=tools/conformance-baseline.txt` reports **0 regressions**. This is the number to quote;
+every snapshot below it is older and kept as history. *(Superseded same day: 62,898 / 81 / 965.)*
 
 **Deliberate spec deviations: ZERO** (the last, `anyfunc`, closed 2026-08-17). **ALL 81 remaining
 failures are untargeted-proposal refusals** — custom-descriptors (79) and custom-page-sizes (2),
@@ -93,7 +93,40 @@ i.e. `roadmap.md`'s Tracks D and P. The 8 era-pinned `proposals/threads` asserti
 they pass rather than being excused in the baseline. *(Superseded: 62,890 / 89 / 965 and
 2026-08-14's 62,889 / 90 / 965.)*
 
-### 🔍 WHAT THE 965 SKIPS ACTUALLY ARE (measured 2026-08-17 — only TWO THIRDS are missing features)
+### ✅ THE CORE THIRD OF THE SKIPS IS CLOSED (2026-08-17) — 292 of them, and not one was a feature
+
+**965 → 673 skipped, 62,898 → 63,190 passed, failures unchanged at 81, total conserved at 63,944.**
+Every one of the 292 was a rejection wazmrt was **already making correctly** and scoring as a skip,
+because the error name could not say whether the module was bad or wazmrt was incomplete. Three
+changes, all in that one seam:
+
+1. **`DecodeError.BadLaneIndex`**, split out of `UnsupportedOpcode` at the three SIMD lane-range
+   checks. A lane index is checked against a bound wazmrt knows exactly, so out-of-range can only
+   mean the module is wrong. (`simd_lane.wast` 51 skips → 11.)
+2. **`wat.untargetedProposalMnemonic`** — a 14-entry table of REAL instructions from proposals
+   wazmrt does not target (custom-descriptors, wide-arithmetic). A `lookupOp` miss ON the table is
+   our gap (`UnsupportedInstr`, skip); a miss OFF it is a mnemonic that exists in no proposal, i.e.
+   a genuine malformation (`UnknownInstr`, now a verdict). `UnknownInstr` was removed from
+   `isOurLimitation`.
+3. **`lookupOp("catch")`** now resolves to `Op.catch_`. The underscore exists only because `catch`
+   is a Zig keyword, so `stringToEnum` could not find it while `catch_all` resolved normally —
+   **two spellings of one clause graded differently for the identical malformation.**
+
+🔒 **THE SAFETY PROPERTY, and re-check it if that table ever changes: skips in the untargeted
+proposal directories are EXACTLY unchanged at 639** (461 custom-descriptors + 109 wide-arithmetic
++ 69 custom-page-sizes). All 292 came from CORE files. **An omission in that table is a FALSE PASS,
+not a missed one** — the dangerous direction — so the invariant to watch is that those directories
+never gain passes.
+
+🎓 **Two lessons, both about tests rather than code.** (a) The `catch` bug was invisible because
+its sibling worked: **when a workaround renames one member of a set, check the whole set.**
+(b) R5's own green-washing regression test FAILED on this change, and it was right to — its
+example was `some.bogus.instruction`, which was never an instance of "our limitation" at all. The
+example has now moved twice while the property never changed. **When a test fails after a change,
+ask whether its EXAMPLE still demonstrates its PROPERTY**; twice the answer was no and twice the
+property was fine.
+
+### 🔍 WHAT THE SKIPS WERE BEFORE THAT (measured 2026-08-17 — the analysis that led to the fix)
 
 Measured by instrumenting every skip site, because "skipped" had never been broken down and the
 number was being read as one thing when it is two:

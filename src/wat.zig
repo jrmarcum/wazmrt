@@ -1878,7 +1878,7 @@ fn emitFoldedOne(ctx: *Ctx, l: []const Sexpr, i: usize) Error!usize {
         _ = try emitAtomic(ctx, sub, l, 1, true);
         return i + 1;
     }
-    const op = lookupOp(kw) orelse return error.UnknownInstr;
+    const op = lookupOp(kw) orelse return if (untargetedProposalMnemonic(kw)) error.UnsupportedInstr else error.UnknownInstr;
     switch (op) {
         .block, .loop => try emitFoldedBlock(ctx, op, l),
         .try_table => try emitTryTable(ctx, l),
@@ -2189,7 +2189,7 @@ fn closingLabelId(ctx: *Ctx, items: []const Sexpr, j: usize) Error!usize {
 fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Error!usize {
     if (lookupSimd(name)) |sd| return emitSimd(ctx, sd, items, i + 1, false);
     if (lookupAtomic(name)) |sub| return emitAtomic(ctx, sub, items, i + 1, false);
-    const op = lookupOp(name) orelse return error.UnknownInstr;
+    const op = lookupOp(name) orelse return if (untargetedProposalMnemonic(name)) error.UnsupportedInstr else error.UnknownInstr;
     switch (op) {
         .block, .loop, .@"if" => {
             try ctx.out.append(ctx.a, @intFromEnum(op));
@@ -3067,7 +3067,50 @@ fn lookupOp(name: []const u8) ?Op {
     // **The rule lives in the validator, where both the text and the binary path
     // reach it; a producer-side filter would have covered only one and broken a
     // legal spelling.**
+    // ⚠️ `Op.catch_` carries a trailing underscore only because `catch` is a Zig keyword, so
+    // `stringToEnum` cannot find it by its wasm spelling — while its sibling `catch_all` resolves
+    // fine. That asymmetry was invisible but real: a stray `catch_all` in the instruction stream
+    // resolved and was then rejected by the validator (`MismatchedCatch`, a genuine verdict),
+    // whereas a stray `catch` came back `UnknownInstr` and scored as OUR gap. **Two spellings of
+    // one clause were graded differently for the identical malformation.** The comment above says
+    // clause tags must resolve here; this is the half that did not.
+    if (std.mem.eql(u8, name, "catch")) return .catch_;
     return std.meta.stringToEnum(Op, buf[0..name.len]);
+}
+
+/// Mnemonics that are REAL wasm instructions from a proposal wazmrt does not target.
+///
+/// 🔑 **This list is what separates "your module is malformed" from "wazmrt is incomplete", and
+/// the whole scoring of `assert_malformed`/`assert_invalid` hangs off it.** A miss in `lookupOp`
+/// that is on this list is OUR gap (`UnsupportedInstr` → the runner skips, honestly). A miss that
+/// is NOT on this list is a mnemonic that exists in no proposal at all, which is a genuine
+/// malformation and a verdict we are entitled to give (`UnknownInstr` → the runner counts it).
+///
+/// ⚠️ **AN OMISSION HERE IS A FALSE PASS, NOT A MISSED ONE** — the dangerous direction. If a real
+/// instruction is left off, an `assert_malformed` that uses it is scored as a pass on the strength
+/// of our own ignorance, which is exactly the green-washing `isOurLimitation` was written to stop.
+/// **So add to it whenever a proposal is left untargeted, and prefer over-inclusion.** The
+/// regression guard is `tools/conformance-baseline.txt`: the untargeted proposal files must keep
+/// SKIPPING their negative assertions, so a pass-count jump there means something is missing here.
+///
+/// Verified complete against the corpus by instrumenting `lookupOp`'s miss path and running all
+/// 284 files: the untargeted directories produce exactly the descriptor and wide-arithmetic names
+/// below, and every other unknown mnemonic in the suite is a deliberate malformation.
+fn untargetedProposalMnemonic(name: []const u8) bool {
+    const known = [_][]const u8{
+        // custom-descriptors (Track D). Includes forms the corpus does not currently reach —
+        // those files fail earlier, at the `(descriptor …)` type syntax — because this list must
+        // describe the PROPOSAL, not today's first point of failure.
+        "ref.get_desc",     "ref.cast_desc",           "ref.cast_desc_eq",
+        "struct.new_desc",  "struct.new_default_desc", "br_on_cast_desc",
+        "br_on_cast_desc_eq", "br_on_cast_desc_fail",  "br_on_cast_desc_eq_fail",
+        "array.new_exact",
+        // wide-arithmetic.
+        "i64.add128",       "i64.sub128",              "i64.mul_wide_s",
+        "i64.mul_wide_u",
+    };
+    for (known) |k| if (std.mem.eql(u8, name, k)) return true;
+    return false;
 }
 
 fn resolveLocal(ctx: *Ctx, s: Sexpr) Error!u32 {
@@ -4005,9 +4048,46 @@ test "SIMD audit regressions (sub_sat_u / nearest / i64x2 all_true+bitmask / dem
     }
     // An out-of-range lane index is rejected at DECODE (memory-safety guard): the
     // interp indexes a fixed [2]u64 by it, so lane 5 would be an OOB access.
-    try std.testing.expectError(error.UnsupportedOpcode, assembleAndRun(
+    //
+    // ⚠️ The error is `BadLaneIndex`, not `UnsupportedOpcode` — split 2026-08-17. A lane index is
+    // checked against a bound wazmrt knows exactly, so out-of-range can ONLY mean the module is
+    // wrong; reporting it as "unsupported opcode" made ~51 correct rejections score as skips
+    // rather than passes. The memory-safety property this line guards is unchanged.
+    try std.testing.expectError(error.BadLaneIndex, assembleAndRun(
         \\(module (func (export "f") (result i64) (i64x2.extract_lane 5 (v128.const i64x2 1 2))))
     , "f", &.{}));
+}
+
+test "mnemonic lookup: `catch` resolves like `catch_all`, and gaps are told from malformations" {
+    // (1) THE ASYMMETRY FIX. `Op.catch_` carries its underscore only because `catch` is a Zig
+    //     keyword, so `stringToEnum` could not find it by its wasm spelling while `catch_all`
+    //     resolved normally. Both are legacy-EH clause tags and both must resolve here — the
+    //     validator, not this lookup, decides whether a clause is in a legal position.
+    try std.testing.expectEqual(Op.catch_, lookupOp("catch").?);
+    try std.testing.expectEqual(Op.catch_all, lookupOp("catch_all").?);
+
+    // (2) The split that scoring depends on. A real instruction from a proposal wazmrt does not
+    //     target is OUR gap; a mnemonic that exists in no proposal is a malformation.
+    try std.testing.expect(untargetedProposalMnemonic("i64.add128"));
+    try std.testing.expect(untargetedProposalMnemonic("ref.get_desc"));
+    try std.testing.expect(untargetedProposalMnemonic("struct.new_desc"));
+    try std.testing.expect(!untargetedProposalMnemonic("some.bogus.instruction"));
+    // ⚠️ The cases that actually bit: real-looking near-misses the spec suite constructs on
+    // purpose. `i32.load32` does not exist (only `i64.load32_s/u`); `pmin`/`ceil` are float ops,
+    // so an integer shape is nonsense; `v8x16.shuffle` and `get_local` are pre-standard spellings
+    // the current text format does not accept. Every one of these is a malformation we may judge.
+    for ([_][]const u8{
+        "i32.load32", "i64.load64",   "i8x16.pmin",     "i16x8.ceil",
+        "v8x16.shuffle", "get_local", "current_memory", "i32x4.load32x2_s",
+    }) |m| {
+        try std.testing.expect(lookupOp(m) == null);
+        try std.testing.expect(!untargetedProposalMnemonic(m));
+    }
+
+    // (3) And none of the untargeted names accidentally resolves — if one ever did, the entry
+    //     above would be dead weight silently claiming to gate something.
+    try std.testing.expect(lookupOp("i64.add128") == null);
+    try std.testing.expect(lookupOp("ref.get_desc") == null);
 }
 
 test "br_table label types need only agree in ARITY, and only in polymorphic code" {

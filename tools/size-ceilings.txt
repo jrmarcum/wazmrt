@@ -381,6 +381,35 @@
 # `firstViolation` walk itself becoming CLI-reachable. 8 assertions closed for +2,048 bytes in the
 # artifact that does conformance, and -512 in the one embedders ship.
 
-wazmrt.exe  966656
-wazmrt.lib  1029688
-wazmrt.dll  888320
+# RAISED 2026-08-17 (the SKIP-SCORING split — telling "your input is bad" from "we are
+# incomplete"). Measured in the REFERENCE configuration (C: copy, its own default `.zig-cache`).
+#
+#   artifact       before         after       share
+#   wazmrt.exe    966,656       967,680     +1,024
+#   wazmrt.lib  1,029,688     1,030,716     +1,028
+#   wazmrt.dll    888,320       889,344     +1,024
+#
+# All three move by the same ~1,028 bytes (the .lib is the unpadded truth; the two PE files round
+# it to 1,024), because every byte of this lands in the decoder and the assembler — code all three
+# artifacts carry.
+#
+# What bought them: `DecodeError.BadLaneIndex` split out of `UnsupportedOpcode` at the three SIMD
+# lane-range checks; `wat.untargetedProposalMnemonic`, a 14-entry table of REAL instructions from
+# proposals wazmrt does not target (custom-descriptors, wide-arithmetic); and a one-line fix in
+# `lookupOp` so `catch` resolves to `Op.catch_` the way `catch_all` always did.
+#
+# 🎯 **It bought 292 assertions — the best bytes-per-assertion on this list by an order of
+# magnitude — and NOT ONE of them is a new feature.** Corpus 62,898 -> 63,190 passed,
+# 965 -> 673 skipped, failures unchanged at 81, total conserved at 63,944. Those were rejections
+# wazmrt was ALREADY making correctly and scoring as skips because the error name could not say
+# whether the module was bad or wazmrt was incomplete.
+#
+# ⚠️ The safety property that made this legitimate, and the one to re-check if the table changes:
+# **skips in the untargeted-proposal directories are EXACTLY unchanged at 639** (461
+# custom-descriptors + 109 wide-arithmetic + 69 custom-page-sizes). Every one of the 292 came from
+# a CORE file. Had the table missed a real instruction, those directories would have gained passes
+# on the strength of our own ignorance — which is the failure this whole split exists to avoid.
+
+wazmrt.exe  967680
+wazmrt.lib  1030716
+wazmrt.dll  889344

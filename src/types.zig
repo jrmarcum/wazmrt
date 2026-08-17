@@ -373,5 +373,25 @@ pub const DecodeError = error{
     ///
     /// Also returned for a **raw byte in `0xD7`–`0xFA`**: those are internal `Op`
     /// tags for prefixed ops, never valid single-byte encodings (see `opcode.zig`).
+    ///
+    /// ⚠️ **THIS ERROR IS AMBIGUOUS ON PURPOSE and the ambiguity is scored against us.**
+    /// It cannot distinguish "this byte is not a valid encoding" from "wazmrt does not implement
+    /// this yet", so `wast.zig`'s `isOurLimitation` must treat it as OUR gap — which means a
+    /// module we rejected *correctly* is banked as a SKIP rather than a pass. **Anything that is
+    /// unambiguously bad INPUT deserves its own error rather than this one**; see `BadLaneIndex`.
     UnsupportedOpcode,
+    /// A SIMD lane index was out of range for its instruction: `i8x16.extract_lane 16`,
+    /// `i8x16.shuffle` with a byte ≥ 32, or a `v128.load/store_lane` lane past the vector's
+    /// lane count.
+    ///
+    /// 🔑 **Split out of `UnsupportedOpcode` 2026-08-17, and the split is the whole point.** A
+    /// lane index is checked against a bound wazmrt knows exactly, so "out of range" can only
+    /// ever mean the MODULE is wrong — there is no reading under which it means wazmrt is
+    /// incomplete. Reporting it as `UnsupportedOpcode` made ~51 correct rejections in
+    /// `simd_lane.wast` and friends score as skips instead of passes.
+    ///
+    /// **The general rule this encodes: an error name that conflates "your input is bad" with
+    /// "we are incomplete" cannot be scored correctly by ANY caller.** The distinction is known
+    /// here and nowhere upstream, so it has to be made here.
+    BadLaneIndex,
 };
