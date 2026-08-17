@@ -1197,7 +1197,23 @@ symmetry.
 compatibility, at a fraction of the footprint, faster on anything not precompiled."** An unqualified
 "faster than wasmtime" dies to one hot-loop benchmark.
 
-## 🎯 PROPOSED — closing the last 89 (scoped 2026-08-17, owner asked for "no holes left open")
+## ✅ CLOSED — "the last 89" (scoped 2026-08-17, owner asked for "no holes left open")
+
+> 🏁 **ALL 89 ARE CLOSED, same day.** Tracks **P** (custom-page-sizes) and **D** (custom-descriptors,
+> D1–D5) both shipped, F3+F4 cleared the era-pinned 8, and the final pass closed the last two
+> defects. **The corpus is at 0 failures / 63,732 passing / 144 skipped across all 284 files.**
+>
+> 🎯 **What is left of this section is Track F's remainder — F5-CLI and F5 — and it is the ONLY
+> open work here.** Read the Track F entry below; two of its own notes are stale in F's favour and
+> are corrected there.
+>
+> ⚠️ **The recommended order was F → P → D and the work went P → D → (F).** That was the owner's
+> call and it cost nothing, because the premise for "F first" turned out to be false: F's security
+> argument had already been closed on 2026-08-11 (see the correction below). **The ordering
+> rationale was written from the argument, not from the code — the same root cause as the two
+> mis-stated statuses this file already records.**
+>
+> *(The framing below is preserved as written, because its ranking argument is the instructive part.)*
 
 **Read this framing before costing the work, because the security argument is NOT uniform across
 the 89 and treating it as uniform would rank the tracks wrong.**
@@ -1220,7 +1236,7 @@ the 89 and treating it as uniform would rank the tracks wrong.**
 **Recommended order: F → P → D.** F is the security item; P is small and proves the limits plumbing;
 D is the largest feature since GC.
 
-### Track F — feature ENFORCEMENT (clears the 8)
+### 🎯 Track F — feature ENFORCEMENT. **THE ONLY OPEN TRACK. Hand this to a fresh session.**
 
 🚨 **CORRECTED 2026-08-17 — F1, F2a AND F2b ARE ALREADY SHIPPED. The blocker statement below was
 FALSE when written, and this file contradicted itself two sections up:** the change-series table
@@ -1234,7 +1250,7 @@ not assumed:
 | "nothing enforces anything" | hard rejection in **both** module entry points (`wazmrt_module_new`, `wazmrt_module_validate`), naming the feature |
 | F2a — module-level enforcement | `firstViolation` gates types, memories, tables, globals, tags, imports |
 | F2b — per-INSTRUCTION enforcement | `firstViolation` decodes every body and gates per instruction, **including the relaxed-SIMD sub-opcode split** |
-| coverage may rot | compiler-enforced `Op`-count pin (248) — a new opcode fails the build |
+| coverage may rot | compiler-enforced `Op`-count pin (**254** as of D4) — a new opcode fails the build |
 | — | 4 passing gating tests, incl. **NO false positives on a plain MVP module with everything off** |
 
 ⚠️ **So the security framing at the top of this section is wrong too: the embedder hole is CLOSED.**
@@ -1251,15 +1267,48 @@ today are DESCRIPTIVE.~~ *(The walk is not merely computed — it is wired as a 
 
 **What genuinely remains in Track F:**
 
+> 🆕 **UPDATED 2026-08-17 after Tracks D3/D4 — TWO of the notes below are now stale, both in F's
+> favour. Read this before costing F1r.**
+>
+> **(a) F1r's "~84 call sites" is no longer true — the threading is DONE.** D4 needed an era-aware
+> validator for a different reason (custom-descriptors RETYPES `br_on_cast`, so the same module is
+> `assert_invalid` in the core suite and valid in the proposal snapshot) and added
+> **`validate.validateWith(gpa, module, era: features.Set)`**, with `validate(gpa, module)`
+> delegating to it as `.{}` (all features). The feature set already reaches `FuncValidator.era`.
+> **F1r's remaining work is therefore not plumbing — it is deciding whether `firstViolation` should
+> move INSIDE `validateWith`**, which is a policy question about one call, not 84 edits. The
+> `.wast` runner is already the proof it works: `Runner.validateEra` calls `firstViolation` then
+> `validateWith(self.features)`.
+>
+> **(b) There is a NEW, partially-enforced feature and it is F's to finish.**
+> `features.Feature.custom_descriptors` (added by D4) gates the six D3/D4 **instructions** and the
+> `br_on_cast` typing rule — but **NOT the type-level formers** `(exact $t)`, `(descriptor $d)`,
+> `(describes $s)`, because `features.check` walks instructions and those live in the TYPE SECTION.
+> A module that uses only the type syntax is still accepted with the bit off. The code says so at
+> the enum and in `wazmrt.h`. ⚠️ **This is the first feature bit in the file that is knowingly
+> partial** — closing it needs a type-section pass in `firstViolation`, which is F-shaped work and
+> would also be the natural home for gating `exact` refs.
+>
+> ⚠️ **And one genuinely new hazard for F5's CLI surface:** `custom_descriptors` is the first
+> feature whose ABSENCE changes the typing of an instruction that exists either way. A CLI
+> `--features` that turns it off must therefore change what `br_on_cast` ACCEPTS, not merely which
+> instructions are permitted. Any test for F5 that only checks "instruction refused" will miss it.
+
 - **F1r — the gate sits BESIDE `validate`, not inside it.** Every caller performs the two-step
   (`firstViolation` then `validate`) by hand, and only `capi.zig` does. ⚠️ **This is the "THREE OF
   THE FOUR do X" shape** `design-decisions.md` names: a future entry point that calls `validate`
   alone inherits no gate and nothing fails. Folding the check into `validate` — or into the existing
   `will_execute` guard, where the run-path validation decision already lives — is the durable fix.
-  `validate(gpa, module)` → `validate(gpa, module, fs)` is ~84 call sites, not the ~15 estimated
-  here (62 are `wat.zig` tests). ⚠️ **Zig FORCES F1 and an enforcement arm to land together** — an
+  ~~`validate(gpa, module)` → `validate(gpa, module, fs)` is ~84 call sites, not the ~15 estimated
+  here (62 are `wat.zig` tests).~~ 🆕 **SUPERSEDED 2026-08-17 (D4): the 84 sites are ZERO.**
+  `validateWith(gpa, module, era)` exists and `validate` delegates to it with the all-features
+  default, so the parameter never had to reach the call sites at all — **an overload plus a
+  delegating wrapper cost one function, not eighty-four edits.** ⚠️ The estimate was not wrong when
+  written; it assumed the only shape was changing the existing signature. **Before costing a
+  threading job, check whether a wrapper makes the callers irrelevant.**
+  ⚠️ **Zig FORCES F1 and an enforcement arm to land together** — an
   unused parameter is a compile error, which is also why R9's inversions must be checked for a
-  successful build.
+  successful build. *(D4 hit this twice more; it is now three passes running.)*
 - **F5-CLI — the CLI never gates at all.** `main.zig` has no `--features` and never calls
   `firstViolation`, so the C-ABI embedder can restrict the accepted language and a CLI user cannot.
   This is the real remaining half of F5; the **C-ABI setter it asks for already exists**.

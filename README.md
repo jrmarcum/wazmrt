@@ -34,9 +34,10 @@ compliance process, and for the ledger of any reused code.
 > (`.wat` → wasm) and a **WAST script runner** (`wazmrt file.wast`) that runs the
 > official WebAssembly spec testsuite (positive assertions plus
 > `assert_invalid`/`assert_malformed`/`assert_trap`/`assert_unlinkable`, and the
-> `(module definition …)`/`(module instance …)` script forms) — e.g.
-> `table_init` 729/0, `table_copy` 1649/0, `imports` 128/0, `call_ref` 31/0,
-> `start` 10/0. Failures are reported with the **source line** of the assertion
+> `(module definition …)`/`(module instance …)` script forms) — **284 files,
+> 63,732 assertions passing, ZERO failing** as of 2026-08-17, covering every
+> proposal wazmrt targets up to and including WasmGC's **custom-descriptors**
+> (`(exact $t)`, descriptors, and the descriptor casts). Failures are reported with the **source line** of the assertion
 > that produced them. It runs a module's **start function** at instantiation, embeds
 > through a
 > small **native C ABI** (instantiate/call, host functions with a caller handle,

@@ -487,6 +487,32 @@ the wrong lesson to learn from a false alarm. **Delete the remote ref first**, s
 comparison against `HEAD` becomes the meaningful one and the guard still protects you. — the
 post-Track-D branch cleanup
 
+**A diagnosis written from the failing ASSERTION is the smaller half of the truth; write it from the
+FEATURE.** The baseline entry for `exact-func-import.wast` said "the linker reads the declared
+import type instead of the defining one" — accurate, reproduced from the one failing line, and
+about a third of the item. What was actually missing was the whole feature: EXACT function imports
+had no encoding at all (descriptor kind `0x20` unknown to assembler, decoder and linker) and
+`(exact <typeuse>)` was not parsed, so the assembler manufactured an implicit type. **The file's
+`assert_unlinkable` PASSED on that**, because a manufactured type matches nothing — a false pass
+produced by dropping the very feature under test. The failing assertion pointed at the last
+symptom, not at the hole. — the final conformance pass, `known-issues.md`
+
+**A trailing-element grammar must be CHECKED FOR LENGTH, not indexed from the end.** Three separate
+parsers took `l[l.len - 1]` and ignored everything between: an imported global's type (so no
+imported global could have a REFERENCE type at all, since reference-types shipped), a `(type …)`
+body (so anything after the composite type vanished), and `(ref …)` itself (so `(ref exact 0)` — the
+`exact` former without its parens — silently compiled as the inexact `(ref 0)`). Every one fails in
+the same direction: **a module that VALIDATES with weaker typing than its source asked for.** Three
+instances in one session is a pattern, not a coincidence; grep for `len - 1` before adding a fourth.
+— D3 and the final conformance pass, `known-issues.md`
+
+**Before costing a "thread this parameter everywhere" job, check whether a WRAPPER makes the callers
+irrelevant.** F1r was costed at ~84 call sites for `validate(gpa, module)` → `validate(gpa, module,
+fs)`. D4 needed exactly that threading and it cost **zero** call-site edits: `validateWith(gpa,
+module, era)` takes the parameter and `validate` delegates to it with the default. The estimate was
+not wrong when written — it assumed the only shape was changing the existing signature. — F1r/D4,
+`roadmap.md`
+
 ## 5. Recording what you found
 
 **"Update the project memory" means AUDIT for stale live claims, not edit the files you happened to

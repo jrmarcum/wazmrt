@@ -144,12 +144,22 @@ needed a *toolchain* DLL (`libunwind.dll`) while every dev-box test passed, and 
   **memory64** (i64 addresses, per-memory index type, i64 size/grow — decode+validate+execute+assemble)
   are all done. **Phases 1–8 complete** — WASI, CLI ergonomics + conformance, pin verification, exception
   handling, **multi-memory (Phase 7)**, **complete SIMD/v128 (Phase 8)**, and the **Ed25519 signature**
-  path (`keygen`/`sign`/`--root-key`, deny-unsigned-when-armed). **The runtime runs the official spec
-  testsuite** (59.7k assertions passing) plus the threads `atomic.wast` suite (302/0) and the memory64 dir
-  (100% on address64/align64/memory_trap64/memory_grow64/memory_redundancy64), and assembles ~490 of a
-  real-world `.wat` corpus. **Every wasm proposal wazmrt targets is now implemented** (memory64, completed
-  2026-07-27, was the last); what remains is one upstream Zig limitation and out-of-scope `.wast`
-  module-linking harness commands — see `known-issues.md` and `roadmap.md`.
+  path (`keygen`/`sign`/`--root-key`, deny-unsigned-when-armed). 🆕 **custom-page-sizes** (Track P) and
+  **custom-descriptors** (Track D — `(exact $t)`, `(descriptor $d)`/`(describes $s)`,
+  `struct.new_desc`, `ref.get_desc`, `ref.cast_desc_eq`, `br_on_cast_desc_eq`) both landed
+  2026-08-17. 🏁 **The runtime runs the official spec testsuite at ZERO FAILURES** — 284 files,
+  **63,732 assertions passing / 0 failed / 144 skipped** — plus the threads `atomic.wast` suite
+  (302/0) and the memory64 dir (100%), and assembles ~490 of a real-world `.wat` corpus.
+  **Every wasm proposal wazmrt targets is implemented.**
+  ⚠️ **CORRECTED 2026-08-17 — the previous two claims here were both stale and are kept as the
+  record:** ~~"Every wasm proposal wazmrt targets is now implemented (memory64, completed
+  2026-07-27, was the last)"~~ — memory64 was NOT the last; the target list then grew
+  custom-page-sizes and custom-descriptors, and a claim of completeness is only ever about the
+  target list of its own date. ~~"what remains is … out-of-scope `.wast` module-linking harness
+  commands"~~ — `module definition` / `module instance` were implemented 2026-08-13 (R2) and are
+  what the cross-instance descriptor tests depend on.
+  **What genuinely remains: the three STANDING DELTAS** (see `known-issues.md`) and **Track F's
+  remainder** (see `roadmap.md`).
 - **Text toolchain (working).** `sexpr.zig` + `wat.zig` (WAT→wasm binary) + `wast.zig` (WAST script
   runner) — `wazmrt <file.wast>` **runs the official spec testsuite** (thousands of assertions pass; see
   `testing.md`). The runner executes `assert_return`/`assert_trap`/`assert_exhaustion` *and*
