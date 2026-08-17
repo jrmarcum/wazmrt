@@ -29,12 +29,16 @@
 #        `br_on_cast_desc_fail`, `array.new_exact`. Depends on GC, which wazmrt
 #        has — this is an extension of a shipped proposal, not a new subsystem.
 #
-#      custom-page-sizes — 2 assertions in 1 file. A memory declares its page
-#        size: `(memory 1 (pagesize 1))`, for 1-byte pages on tiny targets
-#        instead of the fixed 64 KiB. Small and self-contained: a limits field
-#        threaded through decode/validate/instantiate and into every bounds
-#        check and `memory.grow`. Already recognised and refused by name
-#        (`UnsupportedProposal`), which is why it scores as a skip elsewhere.
+#      custom-page-sizes — ✅ IMPLEMENTED 2026-08-17, group entry removed. All
+#        four files are now 0 failed / 0 SKIPPED (61 assertions passing, up from
+#        5 passed / 2 failed / 69 skipped).
+#
+#        ⚠️ **It was carried here as "2 assertions" and it was worth 69 skips** —
+#        the failure column undercounted it by 35x, because a module the
+#        assembler could not build sends every assertion targeting it into
+#        `NoTarget`. That is the third time this list has re-learned to rank by
+#        ASSERTIONS UNBLOCKED rather than failures closed (R3, R5, and now P).
+#        **Read the skip column beside the failure count before sizing an item.**
 #
 #   2. ERA-PINNED SNAPSHOT (proposals/threads) — CLOSED 2026-08-17, 0 assertions.
 #      ✅ This group is EMPTY and its two lines are gone from the list below.
@@ -85,5 +89,4 @@
 3 proposals\custom-descriptors\ref_cast_desc_eq.wast
 7 proposals\custom-descriptors\ref_get_desc.wast
 8 proposals\custom-descriptors\struct_new_desc.wast
-2 proposals\custom-page-sizes\custom-page-sizes.wast
 error annotations.wast

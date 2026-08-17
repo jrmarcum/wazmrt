@@ -954,7 +954,19 @@ pub const Instance = struct {
     /// never owned: a panic in a safety build, silent corruption in ReleaseFast.
     /// (Cross-allocator guest memory has been a bug here three separate times;
     /// every in-repo caller is correct, but the invariant lives on the type now.)
-    pub const Memory = struct { bytes: []u8, max: ?u64, shared: bool = false, is64: bool = false };
+    pub const Memory = struct {
+        bytes: []u8,
+        max: ?u64,
+        shared: bool = false,
+        is64: bool = false,
+        /// Bytes per page (custom-page-sizes): 65536 normally, 1 for a byte-granular memory.
+        ///
+        /// 🔑 **Only the pages↔bytes CONVERSIONS consult this — never a bounds check.** Every
+        /// load, store and bulk op compares against `bytes.len` directly, so they are correct for
+        /// any page size without knowing it. That is why this proposal is a conversion change
+        /// rather than a memory-safety audit: the dangerous sites were already byte-based.
+        page_size: u64 = 65536,
+    };
 
     /// Memory index 0, or null if the module has no memory. The WASI host and the
     /// C ABI speak the conventional single memory through this.
@@ -1384,7 +1396,11 @@ pub const Instance = struct {
                 // build) `min * page_size` would overflow, so multiply with an
                 // overflow check → clean OOM (harmless on 64-bit: 2^32 × 2^16 fits).
                 const min_pages = std.math.cast(usize, mt.limits.min) orelse return error.MemoryLimitExceeded;
-                const nbytes = std.math.mul(usize, min_pages, page_size) catch return error.OutOfMemory;
+                // The memory's OWN page size, not the 64 KiB constant — `(memory 3 (pagesize 1))`
+                // is three BYTES. P4: still overflow-checked, and now more necessary, since
+                // `min_pages` may reach 2^32 with 1-byte pages where it was capped at 2^16.
+                const ps = std.math.cast(usize, mt.limits.pageSize()) orelse return error.MemoryLimitExceeded;
+                const nbytes = std.math.mul(usize, min_pages, ps) catch return error.OutOfMemory;
                 // Budget across ALL defined memories, not per memory — otherwise
                 // multi-memory trivially multiplies past the ceiling.
                 total_memory_bytes = std.math.add(usize, total_memory_bytes, nbytes) catch return error.MemoryLimitExceeded;
@@ -1395,7 +1411,7 @@ pub const Instance = struct {
                     freeGuestMemory(buf);
                     return e;
                 };
-                mem_obj.* = .{ .bytes = buf, .max = mt.limits.max, .shared = mt.limits.shared, .is64 = mt.limits.is64 };
+                mem_obj.* = .{ .bytes = buf, .max = mt.limits.max, .shared = mt.limits.shared, .is64 = mt.limits.is64, .page_size = mt.limits.pageSize() };
                 memories[i] = mem_obj;
                 built = i + 1;
             }
@@ -3520,17 +3536,26 @@ const Frame = struct {
         // memory64: the delta and the result page count are i64.
         const delta: u64 = if (m.is64) @bitCast(self.popI64()) else @as(u32, @bitCast(self.popI32()));
         const old = m.bytes;
-        const old_pages: u64 = old.len / page_size;
-        // Architectural cap: 2^16 pages for a 32-bit memory, 2^48 for a 64-bit
-        // one — so an unvalidated `m.max` can't authorize an oversized grow.
-        // `memory.grow` reports failure as -1 (of the memory's index type), a
-        // clean refusal rather than a trap.
-        const cap: u64 = if (m.is64) 0x1_0000_0000_0000 else 65536;
+        const old_pages: u64 = old.len / m.page_size;
+        // Architectural cap, in the memory's OWN pages: the byte size must fit the index space,
+        // so it is 2^32 / page_size for a 32-bit memory and 2^64 / page_size for a 64-bit one —
+        // an unvalidated `m.max` then cannot authorize an oversized grow. `memory.grow` reports
+        // failure as -1 (of the memory's index type), a clean refusal rather than a trap.
+        //
+        // ⚠️ **This was the constant `65536` with the division already performed** — correct only
+        // for 64 KiB pages. With 1-byte pages a 32-bit memory legitimately grows to 2^32 pages,
+        // and the old constant would have refused at 65536 bytes. 🔒 P4: the 64-bit/1-byte case
+        // wants 2^64, which does not fit u64, so it saturates — every u64 count is legal there.
+        const addr_bits: u16 = if (m.is64) 64 else 32;
+        const cap_shift: u16 = addr_bits - @as(u16, @intCast(std.math.log2_int(u64, m.page_size)));
+        const cap: u64 = if (cap_shift >= 64) std.math.maxInt(u64) else @as(u64, 1) << @intCast(cap_shift);
         const limit: u64 = @min(m.max orelse cap, cap);
         const new_pages = std.math.add(u64, old_pages, delta) catch return self.growFail(m.is64);
         if (new_pages > limit) return self.growFail(m.is64);
         const np = std.math.cast(usize, new_pages) orelse return self.growFail(m.is64);
-        const nbytes = std.math.mul(usize, np, page_size) catch return self.growFail(m.is64);
+        // Overflow-checked: `pages × page_size` is exactly P4's concern, and it is real here
+        // because `np` may now be up to 2^32 rather than 2^16.
+        const nbytes = std.math.mul(usize, np, std.math.cast(usize, m.page_size) orelse return self.growFail(m.is64)) catch return self.growFail(m.is64);
         // Same budget instantiation enforces: else a module with a small minimum
         // could just grow past the ceiling.
         if (nbytes > self.inst.max_memory_bytes) return self.growFail(m.is64);
@@ -3554,7 +3579,8 @@ const Frame = struct {
             .memory_size => {
                 if (instr.imm.mem_index >= self.inst.memories.len) return error.NoMemory;
                 const m = self.inst.memories[instr.imm.mem_index];
-                const pages = m.bytes.len / page_size;
+                // In the memory's OWN page size: a 1-byte-page memory reports its byte count.
+                const pages = m.bytes.len / m.page_size;
                 // memory64: the page count is i64, not i32.
                 return if (m.is64) self.pushI64(@intCast(pages)) else self.pushI32(@intCast(pages));
             },

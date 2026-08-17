@@ -410,6 +410,38 @@
 # a CORE file. Had the table missed a real instruction, those directories would have gained passes
 # on the strength of our own ignorance — which is the failure this whole split exists to avoid.
 
-wazmrt.exe  967680
-wazmrt.lib  1030716
-wazmrt.dll  889344
+# RAISED 2026-08-17 (TRACK P — custom-page-sizes implemented). Measured in the REFERENCE
+# configuration (C: copy, its own default `.zig-cache`).
+#
+#   artifact       before         after       share
+#   wazmrt.exe    967,680       969,216     +1,536
+#   wazmrt.lib  1,030,716     1,032,734     +2,018
+#   wazmrt.dll    889,344       890,880     +1,536
+#
+# 2,018 bytes (the unpadded lib is the true figure) for a whole proposal, and it closed 2 failures
+# plus 69 SKIPS — all four `proposals/custom-page-sizes/` files are now 0 failed / 0 skipped, 61
+# assertions passing where 5 passed before.
+#
+# ⚠️ **The item was carried in the baseline as "2 assertions" and was worth 69 skips — a 35x
+# undercount**, because a module the assembler cannot build sends every assertion targeting it
+# into `NoTarget`. Third time this has been re-learned (R3, R5, P).
+#
+# What bought the bytes: `Limits.page_size_log2` + `pageSize()`; the limits flag's bit 3 and its
+# trailing log2 field in both the decoder and the assembler; `Memory.page_size` threaded through
+# instantiate / `memory.size` / `memory.grow`; page-size-scaled ceilings in `validate` and in the
+# grow cap (both were the constant `65536` with the division already performed); `pageSizeLog2`
+# and the `(pagesize N)` parse in all three memory forms — including the inline-data form, whose
+# absence was the entire 2-failure symptom; and page size as part of import type matching.
+#
+# 🔒 **The memory-safety item (P3) turned out to be far smaller than scoped, and the reason is
+# worth recording: EVERY BOUNDS CHECK WAS ALREADY BYTE-BASED.** `memRange`, `load` and `store`
+# compare against `bytes.len`, never against `pages × page_size`, so they were correct for any
+# page size without knowing it. The page size only ever appears at pages↔bytes CONVERSIONS. The
+# scoped fear — "a single site left holding the hardcoded 65536 is a memory-safety hole" — was
+# structurally prevented; what the constant actually caused was two WRONG-ANSWER bugs (a grow cap
+# and an import-matching limit), not an overrun. **Enumerating the constant was still the right
+# move; it just found a different class than expected.**
+
+wazmrt.exe  969216
+wazmrt.lib  1032734
+wazmrt.dll  890880

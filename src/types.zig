@@ -380,6 +380,11 @@ pub const DecodeError = error{
     /// module we rejected *correctly* is banked as a SKIP rather than a pass. **Anything that is
     /// unambiguously bad INPUT deserves its own error rather than this one**; see `BadLaneIndex`.
     UnsupportedOpcode,
+    /// A memory declared a page size that is not 1 or 65536 (custom-page-sizes). The proposal
+    /// admits exactly those two — **not every power of two**, which is the trap: `(pagesize 2)`
+    /// through `(pagesize 32768)` are all invalid, and a check written as "is a power of two"
+    /// would accept fourteen modules the spec rejects.
+    InvalidPageSize,
     /// A SIMD lane index was out of range for its instruction: `i8x16.extract_lane 16`,
     /// `i8x16.shuffle` with a byte ≥ 32, or a `v128.load/store_lane` lane past the vector's
     /// lane count.

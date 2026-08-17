@@ -269,9 +269,25 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
     // at run time (instantiation clamps and the `--max-memory` budget refuses),
     // but the validator is a C-ABI entry point and should say so itself.
     for (module.memories) |mt| {
-        // Page-count ceiling: 2^16 for a 32-bit memory, 2^48 for a 64-bit one
-        // (memory64). A shared memory must declare a max (§ threads).
-        const ceiling: u64 = if (mt.limits.is64) 0x1_0000_0000_0000 else 0x1_0000;
+        // Page size (custom-page-sizes §3.2.5): exactly 1 or 65536, i.e. log2 of 0 or 16.
+        // ⚠️ **NOT "any power of two"** — the encoding is already a log2, so every value looks
+        // like a power of two by construction; `(pagesize 2)`…`(pagesize 32768)` are all invalid
+        // and a power-of-two test would accept all fourteen. Checked before the ceiling below,
+        // which divides by this value.
+        if (mt.limits.page_size_log2 != 0 and mt.limits.page_size_log2 != 16) return error.InvalidPageSize;
+        // Page-count ceiling: the memory's BYTE size must fit its index space, so the ceiling is
+        // 2^32 / page_size for a 32-bit memory and 2^48 pages' worth for a 64-bit one.
+        // ⚠️ **This used to be the constant 0x1_0000 (= 2^32 / 65536) with the division already
+        // done.** With a 1-byte page a 32-bit memory may legitimately declare 2^32 pages, so
+        // leaving it constant would have rejected the proposal's own valid modules — the
+        // "hardcoded 65536" class, in the one place it is spelled as its quotient instead.
+        const addr_bits: u16 = if (mt.limits.is64) 64 else 32;
+        const shift: u16 = addr_bits - mt.limits.page_size_log2; // 64, 48, 32 or 16
+        // ⚠️ A 64-bit memory with 1-byte pages wants a ceiling of 2^64, which does NOT fit in
+        // u64 — the shift would be UB and the comparison meaningless. Saturate instead: every
+        // u64 page count is legal there, which is exactly what "2^64 bytes of address space"
+        // means. (P4's overflow concern, met at the point it actually arises.)
+        const ceiling: u64 = if (shift >= 64) std.math.maxInt(u64) else @as(u64, 1) << @intCast(shift);
         if (mt.limits.min > ceiling) return error.InvalidLimits;
         if (mt.limits.max) |mx| {
             if (mx > ceiling or mt.limits.min > mx) return error.InvalidLimits;

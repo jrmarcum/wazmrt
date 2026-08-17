@@ -85,7 +85,30 @@ pub const CompType = union(enum) {
 ///
 /// `min`/`max` are PAGE counts. A 64-bit memory may declare up to 2^48 pages, so
 /// the counts are kept as u64 (a 32-bit memory still fits ≤ 2^16).
-pub const Limits = struct { min: u64, max: ?u64, shared: bool = false, is64: bool = false };
+pub const Limits = struct {
+    min: u64,
+    max: ?u64,
+    shared: bool = false,
+    is64: bool = false,
+    /// log2 of the memory's PAGE SIZE (custom-page-sizes proposal). Only 0 (1-byte pages) and
+    /// 16 (the standard 64 KiB) are valid; `validate` rejects everything else.
+    ///
+    /// ⚠️ **Defaulted to 16 deliberately, and this is the one place a default is right:** every
+    /// existing construction site — tables, imports, the assembler, the spectest stubs, dozens of
+    /// tests — means "the standard page size", and making them all say so would be noise that
+    /// obscures the handful of sites that genuinely vary. Contrast the FEATURE-SET rule, where a
+    /// defaulted policy is a policy nobody reviewed: this is a fact about wasm, not a policy.
+    ///
+    /// 🔑 **It is always 16 for TABLES** — a table has no page size — and `readTableType` rejects
+    /// the flag bit outright rather than ignoring it.
+    page_size_log2: u8 = 16,
+
+    /// Bytes per page. Kept as a method so no caller re-derives `1 << log2` and gets the shift
+    /// width wrong; returns u64 because `pageSize() * min` must be computed in 64 bits.
+    pub fn pageSize(self: Limits) u64 {
+        return @as(u64, 1) << @intCast(self.page_size_log2);
+    }
+};
 
 /// `init_expr` is the table's explicit initializer (§5.5.6's `0x40 0x00 tt e`
 /// form, function-references): every slot starts as that value instead of null.
@@ -868,20 +891,39 @@ fn readName(a: std.mem.Allocator, r: *Reader) Error![]const u8 {
     return dst;
 }
 
-fn readLimits(r: *Reader) Error!Limits {
+/// `allow_page_size` says whether the custom-page-sizes flag bit is legal in this position:
+/// true for memories, false for tables, which are counted in elements and have no page size.
+///
+/// ⚠️ **It is a PARAMETER rather than a check on the decoded value, because those are not the same
+/// question.** `page_size_log2` defaults to 16, so an explicitly-encoded `pagesize 65536` on a
+/// table is indistinguishable after the fact from no flag at all — a caller inspecting the result
+/// would accept a module no other runtime does. The bit's PRESENCE is only knowable here.
+fn readLimits(r: *Reader, comptime allow_page_size: bool) Error!Limits {
     const flag = try r.readByte();
-    // bit 0 = has max, bit 1 = shared (threads), bit 2 = i64 index (memory64).
-    if (flag > 0x07) return error.MalformedFlag;
+    // bit 0 = has max, bit 1 = shared (threads), bit 2 = i64 index (memory64),
+    // bit 3 = custom page size (custom-page-sizes), which appends a log2 field AFTER min/max.
+    if (flag > 0x0f) return error.MalformedFlag;
     const is64 = flag & 0x04 != 0;
     // A 32-bit memory's min/max are u32; a 64-bit memory's are u64.
     const min: u64 = if (is64) try r.readVarU64() else try r.readVarU32();
     const max: ?u64 = if (flag & 0x01 != 0) (if (is64) try r.readVarU64() else try r.readVarU32()) else null;
-    return .{ .min = min, .max = max, .shared = flag & 0x02 != 0, .is64 = is64 };
+    // ⚠️ ORDER MATTERS: the page-size field trails min/max, so it must be read last. Reading it
+    // with the flag byte would silently mis-frame every following field.
+    // The VALUE is not checked here — `validate` owns "is this a legal page size", so a bad one
+    // is an invalid module with a named error rather than a decode failure.
+    const ps_log2: u8 = if (flag & 0x08 != 0) blk: {
+        if (!allow_page_size) return error.MalformedFlag; // tables: see the doc comment
+        const v = try r.readVarU32();
+        // Bound only what the u8 must hold; §3 legality (0 or 16) is the validator's call.
+        if (v > 64) return error.InvalidPageSize;
+        break :blk @intCast(v);
+    } else 16;
+    return .{ .min = min, .max = max, .shared = flag & 0x02 != 0, .is64 = is64, .page_size_log2 = ps_log2 };
 }
 
 fn readTableType(r: *Reader, kinds: []const CompKind) Error!TableType {
     const element = try readValType(r, kinds);
-    const limits = try readLimits(r);
+    const limits = try readLimits(r, false);
     // A table may be 64-bit (memory64 proposal, "table64" half — the index type
     // sits in the same limits-flag bit as a memory's). It may never be SHARED:
     // the threads proposal defines shared memories only.
@@ -1310,7 +1352,7 @@ fn decodeImportSection(d: *Decoder, r: *Reader) Error![]const Import {
                 break :blk .{ .table = tt };
             },
             .memory => blk: {
-                const mt: MemoryType = .{ .limits = try readLimits(r) };
+                const mt: MemoryType = .{ .limits = try readLimits(r, true) };
                 try d.mem_space.append(d.a, mt);
                 break :blk .{ .memory = mt };
             },
@@ -1384,7 +1426,7 @@ fn decodeTableSection(d: *Decoder, r: *Reader) Error!void {
 
 fn decodeMemorySection(d: *Decoder, r: *Reader) Error!void {
     var count = try r.readVarU32();
-    while (count > 0) : (count -= 1) try d.mem_space.append(d.a, .{ .limits = try readLimits(r) });
+    while (count > 0) : (count -= 1) try d.mem_space.append(d.a, .{ .limits = try readLimits(r, true) });
 }
 
 fn decodeGlobalSection(d: *Decoder, r: *Reader) Error!void {

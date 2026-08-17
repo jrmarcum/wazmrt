@@ -48,6 +48,12 @@ pub const Error = sexpr.Error || error{
     UnknownIdentifier,
     BadImmediate,
     UnsupportedInstr,
+    /// `(pagesize N)` where N is not a power of two, so no log2 encoding exists — MALFORMED text.
+    /// ⚠️ Distinct from the validator's `InvalidPageSize` for an encodable-but-illegal size like
+    /// `(pagesize 2)`: that module assembles fine and is then *invalid*. The spec suite asserts
+    /// both and expects different stages, so the two must not be merged. **And it must stay OFF
+    /// `wast.isOurLimitation`** — refusing a non-power-of-two is a verdict, not a gap.
+    InvalidPageSize,
     /// An `import` (top-level or inline) after a func/table/memory/global
     /// definition — malformed: imports must precede all definitions (§6.6.13).
     ImportAfterDefinition,
@@ -199,7 +205,7 @@ const GlobalDef = struct { valtype: V, mutable: bool, init: []const Sexpr };
 /// An imported global (`(global (import "m" "n") type)`).
 const ImportedGlobal = struct { module: []const u8, name: []const u8, valtype: V, mutable: bool };
 const ImportedTable = struct { module: []const u8, name: []const u8, min: u64, max: ?u64, elem: V, is64: bool = false };
-const ImportedMemory = struct { module: []const u8, name: []const u8, min: u64, max: ?u64, shared: bool = false, is64: bool = false };
+const ImportedMemory = struct { module: []const u8, name: []const u8, min: u64, max: ?u64, shared: bool = false, is64: bool = false, page_size_log2: u8 = 16 };
 const ImportedTag = struct { module: []const u8, name: []const u8, sig: u32 };
 
 /// Assemble the first `(module …)` form found in `src`.
@@ -273,7 +279,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // Defined memories (multi-memory). Each `(memory …)` appends here; the memory
     // section emits them in order. Imported memories take the low indices, so
     // `mem_names` (below) spans BOTH — imports first, definitions after.
-    var memories: List(struct { min: u64, max: ?u64, shared: bool = false, is64: bool = false }) = .empty;
+    var memories: List(struct { min: u64, max: ?u64, shared: bool = false, is64: bool = false, page_size_log2: u8 = 16 }) = .empty;
     // Memory names, index-aligned with the memory INDEX space (imported memories
     // first, then defined). Lets a `$name` resolve everywhere it can appear:
     // `(export "m" (memory $x))`, `(i32.load $x …)`, `memory.size $x`,
@@ -459,17 +465,36 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 mi += 1;
                 const lim = try parseMemLimits(items, &mi, this_is64, this_type_seen);
                 try checkMemTail(items, mi);
-                try mem_imports.append(a, .{ .module = (try strAt(imp, 1)), .name = (try strAt(imp, 2)), .min = lim.min, .max = lim.max, .shared = lim.shared, .is64 = lim.is64 });
-            } else if (mi < items.len and eqKw(items[mi], "data")) {
-                // (memory (data "…")) — size the memory to the bytes and append an
+                try mem_imports.append(a, .{ .module = (try strAt(imp, 1)), .name = (try strAt(imp, 2)), .min = lim.min, .max = lim.max, .shared = lim.shared, .is64 = lim.is64, .page_size_log2 = lim.page_size_log2 });
+            } else if (mi < items.len and (eqKw(items[mi], "data") or
+                (items[mi].asList() != null and items[mi].asList().?.len == 2 and
+                    eqAtom(items[mi].asList().?[0], "pagesize") and mi + 1 < items.len and eqKw(items[mi + 1], "data"))))
+            {
+                // (memory (pagesize N)? (data "…")) — size the memory to the bytes and append an
                 // active data segment at offset 0 targeting THIS memory.
+                //
+                // ⚠️ **`(pagesize N)` PRECEDES `data` in this form**, which is why it cannot be
+                // left to `parseMemLimits`: there are no min/max for that to parse, so the form
+                // fell through to the limits branch and died on `parseU64` of a list —
+                // `BadImmediate`, the 2 failures this proposal was scored at. Note the shape of
+                // that miss: `(pagesize …)` was already refused by name in every OTHER memory
+                // position, so the gap was one syntactic position, not the feature.
+                var ps_log2: u8 = 16;
+                if (!eqKw(items[mi], "data")) {
+                    ps_log2 = try pageSizeLog2(try parseU64(items[mi].asList().?[1]));
+                    mi += 1;
+                }
                 var bytes: List(u8) = .empty;
                 for ((try wantList(items[mi]))[1..]) |it| switch (it) {
                     .string => |sbytes| try bytes.appendSlice(a, sbytes),
                     else => {},
                 };
-                const pages: u64 = @intCast((bytes.items.len + 65535) / 65536);
-                try memories.append(a, .{ .min = pages, .max = pages, .is64 = this_is64 });
+                // Round UP to whole pages IN THIS MEMORY'S PAGE SIZE. With 1-byte pages that is
+                // the byte count exactly (`(data "xyz")` → 3), which is what makes `memory.size`
+                // answer 3 rather than 1.
+                const ps: u64 = @as(u64, 1) << @intCast(ps_log2);
+                const pages: u64 = (@as(u64, bytes.items.len) + ps - 1) / ps;
+                try memories.append(a, .{ .min = pages, .max = pages, .is64 = this_is64, .page_size_log2 = ps_log2 });
                 const off = try a.alloc(Sexpr, 2);
                 // The active-data offset takes the memory's index type.
                 off[0] = .{ .atom = if (this_is64) "i64.const" else "i32.const" };
@@ -484,7 +509,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 // (threads) follows the limits and requires a max.
                 const lim = try parseMemLimits(items, &mi, this_is64, this_type_seen);
                 try checkMemTail(items, mi);
-                try memories.append(a, .{ .min = lim.min, .max = lim.max, .shared = lim.shared, .is64 = lim.is64 });
+                try memories.append(a, .{ .min = lim.min, .max = lim.max, .shared = lim.shared, .is64 = lim.is64, .page_size_log2 = lim.page_size_log2 });
             }
             try mem_names.append(a, this_name);
         } else if (std.mem.eql(u8, kw, "data")) {
@@ -618,7 +643,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                     mi2 += 1;
                 }
                 const lim = try parseMemLimits(desc, &mi2, false, false);
-                try mem_imports.append(a, .{ .module = (try strAt(items, 1)), .name = (try strAt(items, 2)), .min = lim.min, .max = lim.max, .shared = lim.shared, .is64 = lim.is64 });
+                try mem_imports.append(a, .{ .module = (try strAt(items, 1)), .name = (try strAt(items, 2)), .min = lim.min, .max = lim.max, .shared = lim.shared, .is64 = lim.is64, .page_size_log2 = lim.page_size_log2 });
                 try mem_names.append(a, mname);
             } else if (std.mem.eql(u8, dkw, "tag")) {
                 // (import "m" "n" (tag $id? (type $t) | (param …)*)) — imported tags
@@ -843,7 +868,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 try nameBytes(a, &s, t.name);
                 try s.append(a, 0x01); // table import
                 try emitValType(a, &s, t.elem); // element reftype
-                try emitLimits(a, &s, t.min, t.max, false, t.is64);
+                try emitLimits(a, &s, t.min, t.max, false, t.is64, 16);
                 ci[1] += 1;
             },
             .mem => {
@@ -851,7 +876,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 try nameBytes(a, &s, m.module);
                 try nameBytes(a, &s, m.name);
                 try s.append(a, 0x02); // memory import
-                try emitLimits(a, &s, m.min, m.max, m.shared, m.is64);
+                try emitLimits(a, &s, m.min, m.max, m.shared, m.is64, m.page_size_log2);
                 ci[2] += 1;
             },
             .global => {
@@ -890,7 +915,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     if (memories.items.len != 0) {
         var s: List(u8) = .empty;
         try uleb(a, &s, memories.items.len);
-        for (memories.items) |m| try emitLimits(a, &s, m.min, m.max, m.shared, m.is64);
+        for (memories.items) |m| try emitLimits(a, &s, m.min, m.max, m.shared, m.is64, m.page_size_log2);
         try emitSection(a, &out, 5, s.items);
     }
     // Tag section (13) — exception tags. Ordered after memory (5) and before
@@ -982,7 +1007,7 @@ fn encodeTableSection(a: std.mem.Allocator, tables: []const TableDef, sigs: *Lis
     for (tables) |t| {
         if (t.init != null) try s.appendSlice(a, &.{ 0x40, 0x00 }); // form + reserved byte
         try emitValType(a, &s, t.elem); // element reftype
-        try emitLimits(a, &s, t.min, t.max, false, t.is64);
+        try emitLimits(a, &s, t.min, t.max, false, t.is64, 16);
         if (t.init) |init_expr| {
             try emitConstExpr(a, &s, sigs, type_names, global_names, func_names, &[_]Sexpr{init_expr});
         }
@@ -3153,7 +3178,19 @@ fn parseU64(s: Sexpr) Error!u64 {
     return std.fmt.parseInt(u64, atom, 0) catch error.BadImmediate;
 }
 
-const MemLimits = struct { min: u64, max: ?u64 = null, shared: bool = false, is64: bool = false };
+const MemLimits = struct { min: u64, max: ?u64 = null, shared: bool = false, is64: bool = false, page_size_log2: u8 = 16 };
+
+/// `(pagesize N)` → log2(N), for the limits flag's custom-page-size field.
+///
+/// ⚠️ **Rejects a non-power-of-two here, but NOT "is it 1 or 65536" — that is the VALIDATOR's
+/// call.** The split matters: an unencodable value (`pagesize 3`) is *malformed* text, while an
+/// encodable-but-illegal one (`pagesize 2`) is a well-formed module that is *invalid*. The spec
+/// suite asserts both, with different expectations, so collapsing them here would answer one of
+/// them for the wrong reason.
+fn pageSizeLog2(n: u64) Error!u8 {
+    if (n == 0 or (n & (n - 1)) != 0) return error.InvalidPageSize;
+    return @intCast(std.math.log2_int(u64, n));
+}
 
 /// Parse a memory `memtype` tail from `items[mi.*..]`: an optional index type
 /// (`i64`/`i32`) — which canonically sits HERE, after any inline export/import
@@ -3204,7 +3241,15 @@ fn parseMemLimits(items: []const Sexpr, mi: *usize, is64_seen: bool, type_seen: 
     }
     const shared = mi.* < items.len and eqAtom(items[mi.*], "shared");
     if (shared) mi.* += 1;
-    return .{ .min = min, .max = max, .shared = shared, .is64 = is64 };
+    // `(pagesize N)` trails the limits, after `shared`.
+    var ps_log2: u8 = 16;
+    if (mi.* < items.len) if (items[mi.*].asList()) |l| {
+        if (l.len == 2 and eqAtom(l[0], "pagesize")) {
+            ps_log2 = try pageSizeLog2(try parseU64(l[1]));
+            mi.* += 1;
+        }
+    };
+    return .{ .min = min, .max = max, .shared = shared, .is64 = is64, .page_size_log2 = ps_log2 };
 }
 
 // --- Strict numeric-literal syntax (§6.3.1) ---------------------------------
@@ -3664,15 +3709,28 @@ fn nameBytes(a: std.mem.Allocator, out: *List(u8), name: []const u8) Error!void 
     try out.appendSlice(a, name);
 }
 
-/// Emit a `limits` (§5.3.7): flag byte (0x01 if a max is present) then min[, max].
-fn emitLimits(a: std.mem.Allocator, out: *List(u8), min: u64, max: ?u64, shared: bool, is64: bool) Error!void {
-    // Flag bits: 0 = has max, 1 = shared (threads), 2 = i64 index (memory64).
+/// Emit a `limits` (§5.3.7): flag byte (0x01 if a max is present) then min[, max][, pagesize].
+///
+/// `page_size_log2` is 16 for every caller that has no page size to express — tables included,
+/// which may not carry the bit at all (`Module.readLimits` rejects it there). 16 is therefore
+/// spelled as "the default", never emitted: the flag bit is set only for a NON-default size, so a
+/// module that says nothing about page size round-trips byte-identically to what it was before
+/// this proposal existed.
+fn emitLimits(a: std.mem.Allocator, out: *List(u8), min: u64, max: ?u64, shared: bool, is64: bool, page_size_log2: u8) Error!void {
+    // Flag bits: 0 = has max, 1 = shared (threads), 2 = i64 index (memory64),
+    // 3 = custom page size (custom-page-sizes).
+    const custom_ps = page_size_log2 != 16;
     const flag: u8 = (if (max != null) @as(u8, 0x01) else 0) |
         (if (shared) @as(u8, 0x02) else 0) |
-        (if (is64) @as(u8, 0x04) else 0);
+        (if (is64) @as(u8, 0x04) else 0) |
+        (if (custom_ps) @as(u8, 0x08) else 0);
     try out.append(a, flag);
     try uleb(a, out, min);
     if (max) |mx| try uleb(a, out, mx);
+    // ⚠️ AFTER min/max — the decoder reads it last, and the two must agree or every following
+    // field is mis-framed. Our assembler is not an oracle for our decoder, so this ordering is
+    // pinned by a round-trip test rather than by these two comments matching.
+    if (custom_ps) try uleb(a, out, page_size_log2);
 }
 
 fn emitSection(a: std.mem.Allocator, out: *List(u8), id: u8, payload: []const u8) Error!void {
@@ -6386,14 +6444,29 @@ test "a (memory …) field may not carry unconsumed trailing forms" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // `(pagesize N)` is custom-page-sizes syntax wazmrt does not implement. It
-    // used to be DROPPED: `(memory 0 (pagesize 1))` assembled into an ordinary
-    // 64 KiB-page memory that then disagreed with its own source — the reason
-    // `custom-page-sizes.wast`'s `memory.grow` answered −1. A distinct error
-    // keeps it a SKIP in the conformance runner rather than a claimed pass.
-    try std.testing.expectError(error.UnsupportedProposal, assemble(a, "(module (memory 0 (pagesize 1)))"));
-    try std.testing.expectError(error.UnsupportedProposal, assemble(a, "(module (memory 0 (pagesize 3)))"));
-    try std.testing.expectError(error.UnsupportedProposal, assemble(a, "(module (memory (import \"m\" \"n\") 0 (pagesize 1)))"));
+    // ⚠️ **`(pagesize N)` IS IMPLEMENTED as of 2026-08-17 — this block used to assert
+    // `UnsupportedProposal` for all three.** Its history is worth keeping, because it moved
+    // through every wrong answer in turn: first the form was silently DROPPED (`(memory 0
+    // (pagesize 1))` assembled into an ordinary 64 KiB memory that disagreed with its own source
+    // — the reason `custom-page-sizes.wast`'s `memory.grow` answered −1), then it was refused by
+    // name so the runner scored it a skip rather than a claimed pass, and now it assembles.
+    // **Each step was correct when made; only the last one is a feature.**
+    _ = try assemble(a, "(module (memory 0 (pagesize 1)))");
+    _ = try assemble(a, "(module (memory 0 (pagesize 65536)))");
+    _ = try assemble(a, "(module (memory (import \"m\" \"n\") 0 (pagesize 1)))");
+    _ = try assemble(a, "(module (memory (pagesize 1) (data \"xyz\")))");
+
+    // A non-power-of-two has no log2 encoding, so it is MALFORMED text and dies here...
+    try std.testing.expectError(error.InvalidPageSize, assemble(a, "(module (memory 0 (pagesize 3)))"));
+    try std.testing.expectError(error.InvalidPageSize, assemble(a, "(module (memory 0 (pagesize 0)))"));
+    // ...whereas an encodable-but-illegal size assembles and is rejected by the VALIDATOR. Two
+    // different stages, asserted separately by the spec suite, so the assembler must not
+    // short-circuit the second: `(pagesize 2)` is a well-formed module that is invalid.
+    {
+        var m = try Module.decode(a, try assemble(a, "(module (memory 0 (pagesize 2)))"));
+        defer m.deinit();
+        try std.testing.expectError(error.InvalidPageSize, validate(a, &m));
+    }
 
     // The hole was lists specifically — a trailing ATOM already failed, because
     // `parseU64` chokes on it. Anything unrecognised must now be refused.
@@ -6406,6 +6479,46 @@ test "a (memory …) field may not carry unconsumed trailing forms" {
     _ = try assemble(a, "(module (memory i64 1 2))");
     _ = try assemble(a, "(module (memory $m (export \"m\") 1 2))");
     _ = try assemble(a, "(module (memory (data \"abc\")))");
+}
+
+test "custom page sizes: the limits flag round-trips, and BYTE-granular bounds actually hold" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // (1) ROUND TRIP. The log2 field trails min/max, and the assembler and decoder each state
+    //     that ordering in a comment — which is exactly the situation the project's own rule
+    //     warns about, since two comments agreeing is not two implementations agreeing. Decode
+    //     what we emit and read the value back.
+    {
+        var m = try Module.decode(a, try assemble(a, "(module (memory 2 4 (pagesize 1)))"));
+        defer m.deinit();
+        try std.testing.expectEqual(@as(u8, 0), m.memories[0].limits.page_size_log2);
+        try std.testing.expectEqual(@as(u64, 2), m.memories[0].limits.min);
+        try std.testing.expectEqual(@as(u64, 4), m.memories[0].limits.max.?);
+    }
+    // The DEFAULT must not set the bit, so a module that says nothing about page size encodes
+    // exactly as it did before this proposal existed.
+    {
+        const with = try assemble(a, "(module (memory 1 (pagesize 65536)))");
+        const without = try assemble(a, "(module (memory 1))");
+        try std.testing.expectEqualSlices(u8, without, with);
+    }
+
+    // (2) 🔒 THE SECURITY PROPERTY, and the reason P3 was scoped as a memory-safety item: a
+    //     1-byte-page memory must refuse an out-of-bounds access at BYTE granularity. The spec
+    //     assertions alone would NOT catch a bounds check that silently kept 64 KiB — a memory
+    //     of 3 one-byte pages that was really 3 × 64 KiB would pass every positive test in the
+    //     file and quietly allow 65,533 bytes of overrun.
+    const src =
+        \\(module (memory (pagesize 1) (data "xyz"))
+        \\  (func (export "size") (result i32) memory.size)
+        \\  (func (export "load") (param i32) (result i32) (i32.load8_u (local.get 0))))
+    ;
+    try std.testing.expectEqual(@as(i32, 3), interp.asI32(try assembleAndRun(src, "size", &.{})));
+    try std.testing.expectEqual(@as(i32, 'z'), interp.asI32(try assembleAndRun(src, "load", &.{interp.i32Value(2)})));
+    // One byte past the end traps. If the page size had stayed 65536 this would READ ZERO.
+    try std.testing.expectError(error.MemoryOutOfBounds, assembleAndRun(src, "load", &.{interp.i32Value(3)}));
 }
 
 test "the assembler emits a data-count section for any module with data segments" {

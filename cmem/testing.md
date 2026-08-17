@@ -83,12 +83,23 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
 
 ## 📊 CURRENT spec-testsuite score (2026-08-17) — EVERY CORE SPEC FILE IS AT ZERO
 
-**284 files — 63,190 assertions passed / 81 failed / 673 skipped**, and `zig build conformance -Dbaseline=tools/conformance-baseline.txt` reports **0 regressions**. This is the number to quote;
-every snapshot below it is older and kept as history. *(Superseded same day: 62,898 / 81 / 965.)*
+**284 files — 63,248 assertions passed / 79 failed / 604 skipped**, and `zig build conformance -Dbaseline=tools/conformance-baseline.txt` reports **0 regressions**. This is the number to quote;
+every snapshot below it is older and kept as history. *(Superseded same day: 63,190 / 81 / 673, then 62,898 / 81 / 965.)*
 
-**Deliberate spec deviations: ZERO** (the last, `anyfunc`, closed 2026-08-17). **ALL 81 remaining
-failures are untargeted-proposal refusals** — custom-descriptors (79) and custom-page-sizes (2),
-i.e. `roadmap.md`'s Tracks D and P. The 8 era-pinned `proposals/threads` assertions **CLOSED
+**Deliberate spec deviations: ZERO** (the last, `anyfunc`, closed 2026-08-17). **ALL 79 remaining
+failures are custom-descriptors** — `roadmap.md`'s Track D, the only untargeted proposal left.
+✅ **Track P (custom-page-sizes) is DONE 2026-08-17**: all four files 0 failed / 0 skipped, 61
+assertions passing where 5 passed / 2 failed / 69 skipped. ⚠️ **It was carried in the baseline as
+"2 assertions" and was worth 69 SKIPS — a 35× undercount**, because a module the assembler cannot
+build sends every assertion targeting it into `NoTarget`. Third time this has been re-learned
+(R3, R5, P): *rank by assertions unblocked, not failures closed.*
+🔒 **P3 was scoped as a memory-safety item and turned out not to be one, for a reason worth
+keeping: every bounds check was ALREADY byte-based.** `memRange`/`load`/`store` compare against
+`bytes.len`, never `pages × page_size`, so they were correct for any page size without knowing it;
+the constant only appears at pages↔bytes conversions. What the hardcoded 65536 actually caused was
+two WRONG-ANSWER bugs (the grow cap, and import type matching reporting every memory as
+64 KiB-paged) — not an overrun. **Enumerating the constant was still right; it just found a
+different class than the scope predicted.** The 8 era-pinned `proposals/threads` assertions **CLOSED
 2026-08-17 (F3+F4)**: the runner now judges a proposal directory by its own era's feature set, so
 they pass rather than being excused in the baseline. *(Superseded: 62,890 / 89 / 965 and
 2026-08-14's 62,889 / 90 / 965.)*
@@ -281,10 +292,10 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
   *exactly* its ceiling; the file was two builds old. **An exactly-zero delta is a timestamp check
   waiting to happen.**
 
-**Unit tests: 643/643** (`zig build test --summary all`, 2026-08-17 end of day, from an NTFS cwd —
-`test-safe` 643/643, `test-security` 3/3). The day's additions: F3+F4 added 5 (era policy ×3,
+**Unit tests: 645/645** (`zig build test --summary all`, 2026-08-17 end of day, from an NTFS cwd —
+`test-safe` 645/645, `test-security` 3/3). The day's additions: F3+F4 added 5 (era policy ×3,
 multi_table gating, the every-feature-settable regression test) and the skip-scoring split added 1.
-⚠️ **From this repo's own `D:` cwd the same run reads 639/643 (4 skipped)** — `std.testing.tmpDir`
+⚠️ **From this repo's own `D:` cwd the same run reads 641/645 (4 skipped)** — `std.testing.tmpDir`
 scratches under `.zig-cache/tmp` relative to the CWD, which exFAT cannot give symlinks, and
 redirecting the zig cache does NOT reach it. Quote NTFS numbers.
 *(Superseded: 633 earlier the same day; 631, labelled "final" on 2026-08-14. Below is that entry,

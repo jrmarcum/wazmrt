@@ -533,11 +533,18 @@ const Runner = struct {
                     // DECLARED minimum refused it — and then the module that
                     // would have exported it never registered, so the next two
                     // modules failed as `UnresolvedImport` behind it.
+                    // ⚠️ **`mem.page_size`, NOT the 64 KiB constant** — §7.2's `|data| / page_size`
+                    // is in the memory's OWN pages, and the page size is part of the type that
+                    // `limitsFit` compares. Built from the constant, this reported every memory
+                    // as 64 KiB-paged: a 1-byte-paged export then failed to satisfy its matching
+                    // import (both directions of the spec's link test were wrong at once, one
+                    // refusing a legal link and one accepting an illegal one).
                     if (!limitsFit(.{
-                        .min = mem.bytes.len / interp.page_size,
+                        .min = mem.bytes.len / mem.page_size,
                         .max = mem.max,
                         .shared = mem.shared,
                         .is64 = mem.is64,
+                        .page_size_log2 = @intCast(std.math.log2_int(u64, mem.page_size)),
                     }, want.limits)) return error.IncompatibleImportType;
                     return mem;
                 }
@@ -1136,6 +1143,12 @@ fn limitsFit(provided: Module.Limits, required: Module.Limits) bool {
     // object with operands of the wrong type.
     if (provided.is64 != required.is64) return false;
     if (provided.shared != required.shared) return false;
+    // PAGE SIZE is part of the type for the same reason the index type is, and the failure mode
+    // is worse: `min`/`max` are counted IN pages, so two memories with different page sizes have
+    // limits that are not even commensurable — comparing their numbers below would be comparing
+    // bytes to 64 KiB blocks. Exact equality, not a subtype relation: a 1-byte-page memory does
+    // not "satisfy" a 64 KiB-page import at any size. (§4.5.3, custom-page-sizes.)
+    if (provided.page_size_log2 != required.page_size_log2) return false;
     if (provided.min < required.min) return false;
     if (required.max) |rmax| {
         const pmax = provided.max orelse return false;
