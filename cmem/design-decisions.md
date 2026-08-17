@@ -576,8 +576,8 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
     **Removing a workaround can pay for the rule that made it unnecessary**, and a win left
     unrecorded is headroom for the next unnoticed drift.
     **Live sizes (2026-08-17 end of day, ReleaseSmall, Zig 0.16.0, x86_64-windows):** exe
-    **978,944**, static lib **1,046,958**, dll **900,608** — all three verified in one run
-    (Track D4: +2,560 / +4,946 / +2,560; D3 before it: +3,584 / +4,058 / +3,072; D2: +2,048 / +2,978 / +2,560).
+    **978,944**, static lib **1,046,522**, dll **900,608** — all three verified in one run
+    (the final conformance pass LOWERED the lib −436; Track D4: +2,560 / +4,946 / +2,560; D3 before it: +3,584 / +4,058 / +3,072; D2: +2,048 / +2,978 / +2,560).
     ⚠️ **Measure in the REFERENCE CONFIGURATION** (a `C:` copy with its own default `.zig-cache`):
     the static lib embeds object/source paths, so one unchanged commit reads anywhere in
     1,029,730–1,029,922 depending on WHERE it was built, while the PE files hide the same

@@ -83,27 +83,35 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
 
 ## 📊 CURRENT spec-testsuite score (2026-08-17) — EVERY CORE SPEC FILE IS AT ZERO
 
-**284 files — 63,731 assertions passed / 2 failed / 144 skipped**, and `zig build conformance -Dbaseline=tools/conformance-baseline.txt` reports **0 regressions**. This is the number to quote;
-every snapshot below it is older and kept as history. *(Superseded same day: 63,391 / 4 / 497, then 63,315 / 16 / 578, then 63,344 / 53 / 515, then 63,190 / 81 / 673, then 62,898 / 81 / 965.)*
+**284 files — 63,732 assertions passed / 0 FAILED / 144 skipped**, and `zig build conformance -Dbaseline=tools/conformance-baseline.txt` reports **0 regressions**. This is the number to quote;
+every snapshot below it is older and kept as history. *(Superseded same day: 63,731 / 2 / 144, then 63,391 / 4 / 497, then 63,315 / 16 / 578, then 63,344 / 53 / 515, then 63,190 / 81 / 673, then 62,898 / 81 / 965.)*
 
 ✅ **EVERY TARGETED PROPOSAL NOW SHIPS. Track D (custom-descriptors) is COMPLETE — D1 through D5,
 all on 2026-08-17** — and Track P before it. ⚠️ **NOT "no untargeted proposal left"** — `custom-annotations` still is one (`annotations.wast`, a runner-lex gap, baseline group 1). What closed is the last untargeted proposal that the corpus scored as FAILURES.
 
-**Deliberate spec deviations: ZERO** (the last, `anyfunc`, closed 2026-08-17). ⚠️ **But the 2
-remaining failures are the FIRST baseline entries that are wazmrt DEFECTS**, not proposals we
-refuse — the baseline gained a group 4 for them, and its old blanket claim ("NONE of them is a
-wazmrt defect") no longer holds:
-- `exact-func-import.wast` (1) — LINK-TIME import matching reads the DECLARED import type where D3
-  taught the RUN-time path to read the defining one. The linker needs `interp.definingFunc`'s walk.
-- `exact.wast` (1) — `(ref exact 0)` without parens around the former must be malformed; the
-  assembler takes it.
-
-Both are cheap and diagnosed. **A line in group 4 is a debt, not an explanation** — if that group
-grows, ask why defects are being recorded instead of fixed.
+**Deliberate spec deviations: ZERO** (the last, `anyfunc`, closed 2026-08-17). ✅ **And baseline
+group 4 — "diagnosed gaps in SHIPPED functionality", the first entries that were wazmrt DEFECTS
+rather than proposals we refuse — was closed the same day it was created.** It had said plainly
+that *a line here is a debt, not an explanation*; asked what was left to fix, the answer was to fix
+them rather than explain them again.
+- `exact-func-import.wast` — ⚠️ **the entry UNDER-DESCRIBED its own item, and that is the lesson.**
+  It said the linker needed `definingFunc`'s import-chain walk, which was true; the larger half was
+  that EXACT function imports had no encoding at all. Descriptor kind `0x20` was unknown to the
+  assembler, decoder and linker, and `(exact <typeuse>)` was not parsed — so the assembler
+  manufactured an implicit type, and the file's `assert_unlinkable` PASSED because a manufactured
+  type matches nothing. **A false pass produced by dropping the very feature under test.**
+  ⚠️ `exact` wraps a WHOLE typeuse (`(exact (param i32) (result i64))` is legal), not just
+  `(type $t)` — writing it the narrow way refused the file's first module.
+  🎓 **A diagnosis written from the failing ASSERTION rather than from the FEATURE will be the
+  smaller half of the truth.**
+- `exact.wast` — `(ref exact 0)`, the former without its parens, was silently dropped because
+  `parseValType` indexed the heap type from the END of the list. **Third instance of that one
+  pattern in a single session** (`parseImport`'s global type and `parseTypeBody` were the others):
+  *a trailing-element grammar must be CHECKED FOR LENGTH, not indexed from the end.*
 
 ⚠️ **D2, D3 AND D4 EACH MOVED THE GRAND TOTAL DOWN WHILE CLOSING FAILURES, AND EVERY TIME THAT WAS
 CORRECT — read this before diffing.** D2: 63,344/53/515 → 63,315/16/578. D3: → 63,391/4/497.
-D4: → 63,731/2/144 (+340 passes, −2 failures, **−353 skips**, −15 total).
+D4: → 63,731/2/144 (+340 passes, −2 failures, **−353 skips**, −15 total). Final pass: → 63,732/0/144.
 - Passes lost to a **FALSE-PASS collapse**: those modules had been assembling with a clause
   silently DROPPED, so their assertions ran against a module the file did not write. Assembled
   correctly they are refused at the next unimplemented instruction → a skip. Third instance now
@@ -318,8 +326,8 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
   *exactly* its ceiling; the file was two builds old. **An exactly-zero delta is a timestamp check
   waiting to happen.**
 
-**Unit tests: 709/709** (`zig build test --summary all`, 2026-08-17 end of day, from an NTFS cwd —
-`test-safe` 709/709, `test-security` 3/3). The day's additions: F3+F4 added 5 (era policy ×3,
+**Unit tests: 715/715** (`zig build test --summary all`, 2026-08-17 end of day, from an NTFS cwd —
+`test-safe` 715/715, `test-security` 3/3). The day's additions: F3+F4 added 5 (era policy ×3,
 multi_table gating, the every-feature-settable regression test), the skip-scoring split added 1,
 and **Track D2 added 8** — the three type-identity keys (`canonicalizeTypes`, `interp.groupKey`,
 `typematch.eqMember`) each with a wrong-answer test and a control arm, the emitted BYTES, the
@@ -330,8 +338,8 @@ answer wrong), exactness propagation in `ref.get_desc` both ways, the exact desc
 allocator/type agreement on both validator paths, the emitted BYTES for all three opcodes, the
 distinct `NullDescriptor` trap, the cross-instance EXACT cast, the funcref import-chain walk, and
 regression tests for the three shipped defects D3 uncovered.
-*(Superseded: 691, 667 and 651 earlier the same day.)*
-⚠️ **From this repo's own `D:` cwd the same run reads 705/709 (4 skipped)** — `std.testing.tmpDir`
+*(Superseded: 709, 691, 667 and 651 earlier the same day.)*
+⚠️ **From this repo's own `D:` cwd the same run reads 711/715 (4 skipped)** — `std.testing.tmpDir`
 scratches under `.zig-cache/tmp` relative to the CWD, which exFAT cannot give symlinks, and
 redirecting the zig cache does NOT reach it. Quote NTFS numbers.
 *(Superseded: 633 earlier the same day; 631, labelled "final" on 2026-08-14. Below is that entry,

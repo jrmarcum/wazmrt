@@ -358,6 +358,13 @@ pub const ExternKind = enum(u8) {
     memory = 0x02,
     global = 0x03,
     tag = 0x04, // exception tag (EH proposal)
+    /// custom-descriptors: a function import whose type is EXACT — the importer
+    /// demands that type itself, not a subtype. A distinct DESCRIPTOR KIND rather
+    /// than a flag on `func`, which is how the proposal encodes it.
+    /// ⚠️ Valid in an IMPORT only: `exact-func-import.wast` asserts `0x20` in an
+    /// EXPORT is "malformed export kind", and the export decoder must keep
+    /// falling through to its `else`.
+    exact_func = 0x20,
     _,
 };
 

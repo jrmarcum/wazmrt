@@ -154,6 +154,10 @@ pub const Import = struct {
     /// supertype chain and the finality flag — everything that makes two types
     /// the same type (§4.5.3). See `typematch.zig`.
     type_index: ?u32 = null,
+    /// custom-descriptors: this FUNC import demanded an EXACT type (descriptor
+    /// kind `0x20`), so a subtype of `type_index` does not satisfy it — the link
+    /// needs type equality. False for every other import kind.
+    exact: bool = false,
 };
 
 pub const Export = struct {
@@ -1462,13 +1466,18 @@ fn decodeImportSection(d: *Decoder, r: *Reader) Error![]const Import {
         imp.name = try readName(d.a, r);
         const kind: types.ExternKind = @enumFromInt(try r.readByte());
         imp.type_index = null;
+        imp.exact = false;
         imp.type = switch (kind) {
-            .func => blk: {
+            // custom-descriptors adds `0x20` — an EXACT function import. Same
+            // payload as `0x00`, and it occupies the same index space; the only
+            // difference is what the LINK is allowed to accept for it.
+            .func, .exact_func => blk: {
                 const ti = try r.readVarU32();
                 const ft = try funcTypeAt(d, ti);
                 try d.func_space.append(d.a, ft);
                 try d.func_type_space.append(d.a, ti);
                 imp.type_index = ti;
+                imp.exact = kind == .exact_func;
                 break :blk .{ .func = ft };
             },
             .table => blk: {

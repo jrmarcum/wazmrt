@@ -553,6 +553,30 @@
 # feature bit, and a feature bit needs the C ABI. There was no cheaper way to make both files
 # right.
 
+# LOWERED 2026-08-17 (the last two conformance defects — corpus is now at ZERO FAILURES).
+#
+#   artifact       before         after       share
+#   wazmrt.exe    978,944       978,944           0
+#   wazmrt.lib  1,046,958     1,046,522        -436
+#   wazmrt.dll    900,608       900,608           0
+#
+# ✅ A pass that ADDED a feature came out SMALLER, and the reason is the same one R4 recorded:
+# removing a workaround can pay for the rule that made it unnecessary. The `(ref …)` length check
+# replaced an index-from-the-end, and `definingFuncAt` was EXTRACTED from `definingFunc` rather
+# than copied — one walk, two callers, so the linker's version costs nothing.
+#
+# Lowered rather than left with headroom, per the policy at the top of this file: a ceiling is
+# exact, and a win that is not recorded is headroom for the next unnoticed drift.
+#
+# What shipped: `(ref …)` takes EXACTLY one heap type (`(ref exact 0)` was silently dropping the
+# former); EXACT function imports end to end — descriptor kind `0x20` in the assembler, decoder
+# and linker, `(exact <typeuse>)` in the text (it wraps a WHOLE typeuse, not just `(type $t)`),
+# and link-time type EQUALITY instead of subtyping; and the linker resolving an export through
+# import chains to its DEFINING instance before reading its type.
+#
+# Corpus 63,731/2/144 -> **63,732 passed / 0 FAILED / 144 skipped**. The only remaining baseline
+# entry is `annotations.wast`, a runner-lex gap on an untargeted proposal.
+
 wazmrt.exe  978944
-wazmrt.lib  1046958
+wazmrt.lib  1046522
 wazmrt.dll  900608

@@ -7,13 +7,16 @@
 #
 # ⚠️ A BASELINE IS ONLY HONEST IF EVERY LINE HAS A REASON. Otherwise it is a
 # way to make a red number green. Every entry below falls into one of three
-# groups. ⚠️ **Groups 1–3 were "not a wazmrt defect"; group 4, added 2026-08-17,
-# is not** — with custom-descriptors implemented there is no untargeted proposal
-# left to attribute its 2 entries to, and they are recorded as the debts they are:
+# groups. ✅ **ALL FOUR GROUPS ARE NOW EMPTY.** The corpus is at **ZERO FAILURES**
+# across all 284 files, and the single remaining line is `annotations.wast` — a
+# runner-LEX gap on the untargeted custom-annotations proposal, which is a runner
+# error rather than a failure. The groups below are kept as the record of what was
+# closed and why; each closure is more instructive than the entry it replaced:
 #
 #   1. UNTARGETED PROPOSALS — **NONE. This group is EMPTY.** custom-descriptors
 #      is fully implemented as of 2026-08-17 (D1–D5), so there is no longer any
-#      proposal wazmrt refuses. The 2 remaining lines are group 4 below.
+#      proposal wazmrt refuses — except `custom-annotations`, whose one line is
+#      the last entry in this file (a runner-lex gap, not a failure).
 #
 #      Kept for the record, because the shape of the closure is the useful part:
 #
@@ -102,32 +105,34 @@
 #      names the modern spelling — the compatibility hint survives, the
 #      deviation does not. Those two corpus files need `funcref`.
 #
-#   4. DIAGNOSED GAPS IN SHIPPED FUNCTIONALITY — 2 assertions, and this group is
-#      NEW (2026-08-17, D4). ⚠️ **Read this before adding to it.** Groups 1–3 all
-#      said "not a wazmrt defect". These two ARE wazmrt defects: small, isolated,
-#      and each with its cause written down. That is a weaker claim than this file
-#      used to make, and the honest one — with custom-descriptors implemented,
-#      there is no untargeted proposal left to attribute them to.
+#   4. DIAGNOSED GAPS IN SHIPPED FUNCTIONALITY — ✅ **BOTH CLOSED 2026-08-17,
+#      the same day the group was created. This group is EMPTY.**
 #
-#      `exact-func-import.wast` (1) — LINK-TIME import matching reads the DECLARED
-#        import type rather than the defining function's, so importing
-#        `(func (exact (type $sub)))` from a module that re-exported it inexactly
-#        is refused. D3 fixed the RUN-time half of exactly this defect
-#        (`interp.definingFunc` walks the import chain); the linker needs the same
-#        walk. Cheap, and the fix already exists three files away.
-#      `exact.wast` (1) — one accept-invalid at L92: `(ref exact 0)` without parens
-#        around the `exact` former must be malformed, and the assembler takes it.
+#      It existed for about an hour and is kept because of what it demonstrated.
+#      D4 had to invent it: groups 1–3 all said "not a wazmrt defect", and with
+#      custom-descriptors implemented there was no untargeted proposal left to
+#      attribute two real defects to. The entry said plainly that **a line here is
+#      a debt, not an explanation** — and then, asked "what is left to fix", the
+#      answer was to fix them rather than to explain them again.
 #
-#      ⚠️ **A line here is a debt, not an explanation.** Group 1's entries were
-#      permanently reasonable ("we do not implement that proposal"); these are not.
-#      If this group grows, the question to ask is why defects are being recorded
-#      instead of fixed.
+#      `exact-func-import.wast` (1) — ⚠️ **the entry UNDER-DESCRIBED its own item.**
+#        It said the linker needed `definingFunc`'s walk, and it did — but the
+#        larger half was that EXACT function imports had no encoding at all:
+#        descriptor kind `0x20` was unknown to the assembler, decoder and linker,
+#        and `(exact <typeuse>)` was not parsed, so the assembler manufactured an
+#        implicit type and the file's `assert_unlinkable` PASSED because a
+#        manufactured type matches nothing. **A false pass produced by dropping
+#        the very feature under test.** A diagnosis written from the failing
+#        assertion, not from the feature.
+#      `exact.wast` (1) — `(ref exact 0)`: the `exact` former without its parens
+#        was silently dropped, because `parseValType` indexed the heap type from
+#        the END of the list. Third instance of that pattern in one session.
+#
+#      **Corpus: 0 FAILURES across all 284 files.**
 #
 # `error annotations.wast` is the custom-annotations proposal: deliberately
 # exotic tokens the runner cannot lex. Untargeted — the last member of group 1.
 #
 # ⚠️ Adding a line here to make the build green is the failure mode this file
 # invites. A new entry needs a group above, or it is a defect being hidden.
-1 proposals\custom-descriptors\exact-func-import.wast
-1 proposals\custom-descriptors\exact.wast
 error annotations.wast

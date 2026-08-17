@@ -453,8 +453,28 @@ const Runner = struct {
                     // different things on each side — rejecting good links and, worse,
                     // accepting bad ones whenever two unrelated types happened to sit
                     // at the same index. See `typematch.zig`.
-                    const got_ti = inst.module.funcTypeIndex(e.index) orelse return error.IncompatibleImportType;
-                    if (!try tm.funcImportOk(inst.module, got_ti, m, want_ti)) return error.IncompatibleImportType;
+                    // ⚠️ **Resolve to the DEFINING instance before reading the type.**
+                    // An export may be a function the exporter itself IMPORTED, and an
+                    // import may legally name a SUPERTYPE — so the re-exporter's declared
+                    // type is not the function's type. Reading it there refused
+                    // `(func (exact (type $sub)))` imported from a module that had taken
+                    // the same function inexactly as `$super`, which is
+                    // `exact-func-import.wast`'s last assertion. D3 fixed the RUN-time
+                    // half of this defect; `definingFuncAt` is that walk, shared rather
+                    // than copied.
+                    //
+                    // A NATIVE host function has no defining wasm module, so it falls back
+                    // to what the exporter declared — which is all that exists for it.
+                    const site = interp.Instance.definingFuncAt(inst, e.index);
+                    const src_mod = if (site) |s| s.inst.module else inst.module;
+                    const src_idx = if (site) |s| s.index else e.index;
+                    const got_ti = src_mod.funcTypeIndex(src_idx) orelse return error.IncompatibleImportType;
+                    // An EXACT import demands the type itself; a plain one accepts a subtype.
+                    const ok = if (imp.exact)
+                        try tm.funcImportExactOk(src_mod, got_ti, m, want_ti)
+                    else
+                        try tm.funcImportOk(src_mod, got_ti, m, want_ti);
+                    if (!ok) return error.IncompatibleImportType;
                     return .{ .wasm = .{ .instance = inst, .func_index = e.index } };
                 }
             }
@@ -2609,6 +2629,61 @@ test "D4 soundness: a `_desc_eq` cast across instances compares the RIGHT object
         \\(assert_trap (invoke $Q "other") "descriptor cast failure")
     ;
     const s = try runScript(std.testing.allocator, src, null);
+    try std.testing.expectEqual(@as(usize, 2), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "an EXACT function import demands the type itself, through a re-export chain" {
+    // 🔒 Two rules that only meet at LINK time, and the corpus is the only other place they are
+    // checked — so an inversion of either was silent in `zig build test` until this existed.
+    //
+    // (1) An exact import demands the type ITSELF: `$C.f` really is a `$sub`, so importing it as
+    //     `(exact (type $super))` must be UNLINKABLE even though `$sub <: $super`. This is
+    //     `(ref (exact $t))`'s subtyping rule at the module boundary.
+    // (2) A function's type is its DEFINITION's, not the type an importer declared for it. `$D`
+    //     takes `$C.f` inexactly as `$super` and re-exports it; importing THAT as
+    //     `(exact (type $sub))` must still link, because the function is a `$sub` whatever `$D`
+    //     called it. D3 fixed the run-time half; `definingFuncAt` is the same walk, shared.
+    const src =
+        \\(module $C
+        \\  (type $super (sub (func)))
+        \\  (type $sub (sub $super (func)))
+        \\  (func (export "f") (type $sub))
+        \\  (func (export "g") (type $super)))
+        \\(register "C")
+        \\(module $D
+        \\  (type $super (sub (func)))
+        \\  (import "C" "f" (func (type $super)))
+        \\  (export "f" (func 0)))
+        \\(register "D")
+        \\(assert_unlinkable
+        \\  (module
+        \\    (type $super (sub (func)))
+        \\    (type $sub (sub $super (func)))
+        \\    (import "C" "f" (func (exact (type $super)))))
+        \\  "incompatible import type")
+        \\(assert_unlinkable
+        \\  (module
+        \\    (type $super (sub (func)))
+        \\    (type $sub (sub $super (func)))
+        \\    (import "C" "g" (func (exact (type $sub)))))
+        \\  "incompatible import type")
+        \\(module
+        \\  (type $super (sub (func)))
+        \\  (type $sub (sub $super (func)))
+        \\  (import "C" "f" (func (exact (type $sub)))))
+        \\(module
+        \\  (type $super (sub (func)))
+        \\  (type $sub (sub $super (func)))
+        \\  (import "D" "f" (func (exact (type $sub)))))
+        \\(module
+        \\  (type $super (sub (func)))
+        \\  (import "D" "f" (func (type $super))))
+    ;
+    const s = try runScript(std.testing.allocator, src, null);
+    // The two `assert_unlinkable`s are the exactness rule in both directions (a subtype offered
+    // for an exact super, and a supertype offered for an exact sub); the three modules that must
+    // BUILD are the control — without them "always refuse" would pass the first two.
     try std.testing.expectEqual(@as(usize, 2), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }

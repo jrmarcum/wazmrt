@@ -70,9 +70,9 @@ zig build wasi-gate                # compile Zig+C wasm32-wasi programs, run the
                                    #   add -Drust-gate=true to also cross-check a rustc build
 zig build conformance -Dtestsuite=<dir> -Dbaseline=tools/conformance-baseline.txt
                                    # run the spec testsuite; gates on REGRESSIONS vs an
-                                   # explained baseline (2 entries, 0 deliberate deviations —
-                                   # every targeted proposal now ships, so both are small
-                                   # diagnosed defects rather than refusals)
+                                   # explained baseline — now ZERO FAILURES across all 284
+                                   # files; its one line is annotations.wast, a runner-lex
+                                   # gap on the untargeted custom-annotations proposal
                                    #   -Dbaseline=<file>        gate on regressions, not zero failures
                                    #   -Dwrite-baseline=true    generate that baseline from today's run
                                    #   -Dfailures=N             list up to N failures per file (default 1)

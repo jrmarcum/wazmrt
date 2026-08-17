@@ -2025,10 +2025,28 @@ pub const Instance = struct {
     /// compare, so a concrete cast on it answers no rather than guessing. The hop
     /// count is bounded because a cyclic import graph must terminate here rather
     /// than hang, on the same principle as `isSubtype`'s guarded walk.
-    fn definingFunc(self: *Instance, fref: Value) ?struct { inst: *Instance, index: u32 } {
+    fn definingFunc(self: *Instance, fref: Value) ?FuncSite {
         const ad = self.store.resolve(fref) orelse return null;
-        var inst = ad.instance;
-        var index = ad.index;
+        return definingFuncAt(ad.instance, ad.index);
+    }
+
+    /// An instance plus a function index WITHIN it.
+    pub const FuncSite = struct { inst: *Instance, index: u32 };
+
+    /// The same walk as `definingFunc`, starting from an (instance, index) pair
+    /// rather than from a funcref value.
+    ///
+    /// 🔑 **`wast.zig`'s LINKER calls this too, and that shared call is the
+    /// point.** D3 fixed the run-time half of "a function's dynamic type is its
+    /// DEFINITION's, not the type the importer declared for it"; the link-time
+    /// half had the identical defect — importing `(func (exact (type $sub)))`
+    /// from a module that re-exported it inexactly was refused, because the
+    /// linker read the RE-EXPORTER's declared type. A second copy of this walk
+    /// would be a second place to be incomplete, which is the rule that made the
+    /// `0xFB` sub-opcode table a single function.
+    pub fn definingFuncAt(inst0: *Instance, index0: u32) ?FuncSite {
+        var inst = inst0;
+        var index = index0;
         var hops: usize = 0;
         while (index < inst.imported_funcs) : (hops += 1) {
             if (hops > max_import_hops) return null;
@@ -2038,6 +2056,9 @@ pub const Instance = struct {
                     inst = w.instance;
                     index = w.func_index;
                 },
+                // A NATIVE host function has no wasm type index to report. The
+                // caller must fall back to whatever the importer declared — that
+                // is all that exists for it.
                 .native, .native_env => return null,
             }
         }

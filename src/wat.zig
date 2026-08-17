@@ -123,6 +123,10 @@ const Func = struct {
     exports: List([]const u8) = .empty,
     /// `(type $t)` reference, if the function declares its type by index.
     type_ref: ?Sexpr = null,
+    /// custom-descriptors: the typeuse was written `(exact (type $t))`, so an
+    /// IMPORT of this function demands that exact type. Meaningless on a defined
+    /// function — only the import descriptor has an encoding for it (`0x20`).
+    type_exact: bool = false,
     /// Inline import (`(func $id (import "m" "n") typeuse)`) — no body.
     import: ?struct { module: []const u8, name: []const u8 } = null,
     /// Body instruction forms (everything after the param/result/local headers).
@@ -131,7 +135,7 @@ const Func = struct {
 
 /// An imported function (top-level `(import "m" "n" (func …))` or inline
 /// `(func (import "m" "n") …)`); its type is `type_ref` or the inline sig.
-const ImportedFunc = struct { module: []const u8, name: []const u8, type_ref: ?Sexpr, params: []const V, results: []const V };
+const ImportedFunc = struct { module: []const u8, name: []const u8, type_ref: ?Sexpr, params: []const V, results: []const V, exact: bool = false };
 
 const ExportDef = struct { name: []const u8, kind: u8, index: u32 };
 /// A parsed data segment: `offset_form == null` is passive; otherwise active
@@ -360,7 +364,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             const idx: u32 = @intCast(func_names.items.len); // func-space index (imports first)
             for (f.exports.items) |name| try exports.append(a, .{ .name = name, .kind = 0, .index = idx });
             if (f.import) |m| {
-                try func_imports.append(a, .{ .module = m.module, .name = m.name, .type_ref = f.type_ref, .params = f.params.items, .results = f.results.items });
+                try func_imports.append(a, .{ .module = m.module, .name = m.name, .type_ref = f.type_ref, .params = f.params.items, .results = f.results.items, .exact = f.type_exact });
             } else {
                 try funcs.append(a, f);
             }
@@ -606,7 +610,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             const dkw = try wantAtom(try nth(desc, 0));
             if (std.mem.eql(u8, dkw, "func")) {
                 const f = try parseFunc(a, desc, type_names.items); // reuse: parses $id + typeuse
-                try func_imports.append(a, .{ .module = (try strAt(items, 1)), .name = (try strAt(items, 2)), .type_ref = f.type_ref, .params = f.params.items, .results = f.results.items });
+                try func_imports.append(a, .{ .module = (try strAt(items, 1)), .name = (try strAt(items, 2)), .type_ref = f.type_ref, .params = f.params.items, .results = f.results.items, .exact = f.type_exact });
                 try func_names.append(a, f.name);
             } else if (std.mem.eql(u8, dkw, "table")) {
                 // (import "m" "n" (table $id? min max? reftype)) — imported tables
@@ -869,7 +873,8 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 const fi = func_imports.items[ci[0]];
                 try nameBytes(a, &s, fi.module);
                 try nameBytes(a, &s, fi.name);
-                try s.append(a, 0x00); // func import
+                // custom-descriptors: `0x20` is the EXACT function import descriptor.
+                try s.append(a, if (fi.exact) 0x20 else 0x00);
                 try uleb(a, &s, func_import_type.items[ci[0]]); // type index
                 ci[0] += 1;
             },
@@ -1648,6 +1653,38 @@ fn parseFunc(a: std.mem.Allocator, form: []const Sexpr, type_names: []const ?[]c
             try f.exports.append(a, (try strAt(list, 1)));
         } else if (std.mem.eql(u8, kw, "import")) {
             f.import = .{ .module = (try strAt(list, 1)), .name = (try strAt(list, 2)) }; // (import "m" "n")
+        } else if (std.mem.eql(u8, kw, "exact")) {
+            // custom-descriptors: `(exact (type $t))` — an EXACT typeuse. Only an
+            // IMPORT descriptor can encode it (`0x20`); elsewhere it is accepted
+            // here and simply carries no encoding, which is what the type-section
+            // `exact` former already does for value types.
+            //
+            // 🐛 Before this arm, `exact` was not a typeuse keyword, so the loop
+            // treated it as the start of the BODY: `f.type_ref` stayed null and an
+            // implicit `() -> ()` type was interned instead. The import then linked
+            // against a freshly-made type rather than `$t` — and `exact-func-import`'s
+            // `assert_unlinkable` PASSED on that, because a manufactured type
+            // matches nothing. **A false pass produced by dropping the very feature
+            // under test.**
+            // ⚠️ `exact` wraps a WHOLE TYPEUSE, not just `(type $t)`:
+            // `(exact (param i32) (result i64))` is legal and the corpus uses it.
+            // So each element is dispatched by the same rank table as at the outer
+            // level — writing this to accept only `(type …)` refused the very first
+            // module in `exact-func-import.wast`.
+            if (list.len < 2) return error.BadModuleField;
+            for (list[1..]) |part| {
+                const pk = part.keyword() orelse return error.BadModuleField;
+                const rank = typeUseRank(pk) orelse return error.BadModuleField;
+                const pl = try wantList(part);
+                try typeUseOrder(&seen, rank);
+                switch (rank) {
+                    1 => f.type_ref = try nth(pl, 1),
+                    2 => try parseDecls(a, pl, &f.params, &f.local_names, type_names, true),
+                    3 => try parseDecls(a, pl, &f.results, null, type_names, false),
+                    else => return error.BadModuleField, // `(local …)` is not part of a typeuse
+                }
+            }
+            f.type_exact = true;
         } else if (typeUseRank(kw)) |rank| {
             try typeUseOrder(&seen, rank);
             switch (rank) {
@@ -1785,6 +1822,20 @@ fn parseValType(s: Sexpr, type_names: []const ?[]const u8) Error!V {
     if (s.asList()) |l| {
         if (l.len >= 2 and eqAtom(l[0], "ref")) {
             const nullable = l.len >= 3 and eqAtom(l[1], "null");
+            // §6.6.3: `reftype ::= '(' 'ref' 'null'? heaptype ')'` — EXACTLY one heap type, and
+            // `null` is the only thing that may precede it.
+            //
+            // 🐛 This took `l[l.len - 1]` and ignored everything between, so `(ref exact 0)` —
+            // the `exact` former written WITHOUT its parens — silently dropped the `exact` and
+            // compiled as the inexact `(ref 0)`. `exact.wast` asserts it malformed ("Must have
+            // parens"), and the direction of the bug is the dangerous one: a module that
+            // validates with WEAKER typing than its source asked for, which is where type
+            // confusion starts.
+            //
+            // ⚠️ Third instance of one pattern this session — `parseImport`'s global type and
+            // `parseTypeBody` both took the last element and ignored the rest. **A trailing-element
+            // grammar must be CHECKED for length, not indexed from the end.**
+            if (l.len != @as(usize, if (nullable) 3 else 2)) return error.BadValType;
             return heapTypeToValType(l[l.len - 1], nullable, type_names);
         }
         return error.BadValType;
@@ -8151,5 +8202,86 @@ test "D4: a `_desc_eq` cast needs a target that HAS a descriptor, and is not con
         var m = try Module.decode(a, try assemble(a, c.src));
         defer m.deinit();
         try std.testing.expectError(c.want, validate(a, &m));
+    }
+}
+
+test "a `(ref …)` type takes EXACTLY one heap type — no silent extra elements" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // 🐛 `parseValType` took `l[l.len - 1]` and ignored everything between, so `(ref exact 0)` —
+    // the `exact` former written WITHOUT its parens — silently dropped the `exact` and compiled
+    // as the inexact `(ref 0)`. `exact.wast` asserts it malformed ("Must have parens"), and the
+    // direction is the dangerous one: a module that VALIDATES with weaker typing than its source
+    // asked for. ⚠️ Third instance of one pattern in a single session — `parseImport`'s global
+    // type and `parseTypeBody` both indexed from the end too. **A trailing-element grammar must
+    // be CHECKED FOR LENGTH, not indexed from the end.**
+    for ([_][]const u8{
+        "(module (type (struct (field (ref exact 0)))))", // the former without parens
+        "(module (type $t (struct)) (type (struct (field (ref null null $t)))))", // `null` twice
+        "(module (type $t (struct)) (type (struct (field (ref $t $t)))))", // two heap types
+    }) |src| try std.testing.expectError(error.BadValType, assemble(a, src));
+
+    // Every legal spelling must still parse — otherwise the guard above is just a refusal.
+    for ([_][]const u8{
+        "(module (type $t (struct)) (type (struct (field (ref $t)))))",
+        "(module (type $t (struct)) (type (struct (field (ref null $t)))))",
+        "(module (type $t (struct)) (type (struct (field (ref (exact $t))))))",
+        "(module (type $t (struct)) (type (struct (field (ref null (exact $t))))))",
+        "(module (func (param (ref null func)) (result (ref func)) (unreachable)))",
+    }) |src| {
+        var m = try Module.decode(a, try assemble(a, src));
+        defer m.deinit();
+        try validate(a, &m);
+    }
+}
+
+test "an EXACT function import is descriptor kind 0x20, and only in an import" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // ⚠️ **ASSERTS THE BYTES**, and this one could not be checked any other way: `0x20` is the
+    // whole difference between an exact and an inexact function import, and our own decoder would
+    // round-trip either happily. `exact-func-import.wast` pins it in a hand-written binary module.
+    {
+        const bin = try assemble(a, "(module (type $f (func)) (import \"m\" \"n\" (func (exact (type $f)))))");
+        // import section: name "m", name "n", kind 0x20, typeidx 0
+        try std.testing.expect(std.mem.indexOf(u8, bin, &[_]u8{ 0x01, 'm', 0x01, 'n', 0x20, 0x00 }) != null);
+        var m = try Module.decode(a, bin);
+        defer m.deinit();
+        try std.testing.expect(m.imports[0].exact);
+        try std.testing.expectEqual(@as(?u32, 0), m.imports[0].type_index);
+    }
+    // ...and the inexact spelling still writes 0x00 and comes back NOT exact, or the flag would
+    // be meaningless.
+    {
+        const bin = try assemble(a, "(module (type $f (func)) (import \"m\" \"n\" (func (type $f))))");
+        try std.testing.expect(std.mem.indexOf(u8, bin, &[_]u8{ 0x01, 'm', 0x01, 'n', 0x00, 0x00 }) != null);
+        var m = try Module.decode(a, bin);
+        defer m.deinit();
+        try std.testing.expect(!m.imports[0].exact);
+    }
+    // `exact` wraps a WHOLE TYPEUSE, not just `(type $t)` — writing it to accept only the latter
+    // refused the FIRST module of `exact-func-import.wast`.
+    for ([_][]const u8{
+        "(module (import \"m\" \"n\" (func (exact (param i32) (result i64)))))",
+        "(module (type $f (func)) (func $g (import \"m\" \"n\") (exact (type $f))))",
+    }) |src| {
+        var m = try Module.decode(a, try assemble(a, src));
+        defer m.deinit();
+        try std.testing.expect(m.imports[0].exact);
+    }
+    // 🔒 `0x20` is an IMPORT descriptor only. In an EXPORT it is "malformed export kind" — the
+    // export decoder must keep falling through to its `else`, which adding a named `ExternKind`
+    // variant could quietly have changed.
+    {
+        var out: List(u8) = .empty;
+        try out.appendSlice(a, &.{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 });
+        try out.appendSlice(a, &.{ 0x01, 0x04, 0x01, 0x60, 0x00, 0x00 }); // type: (func)
+        try out.appendSlice(a, &.{ 0x03, 0x02, 0x01, 0x00 }); // func section: one func, type 0
+        try out.appendSlice(a, &.{ 0x07, 0x04, 0x01, 0x00, 0x20, 0x00 }); // export "" kind 0x20 idx 0
+        try std.testing.expectError(error.UnknownExternKind, Module.decode(a, out.items));
     }
 }

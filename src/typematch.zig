@@ -245,6 +245,20 @@ pub const Ctx = struct {
         return self.typeSub(pm, pi, rm, ri);
     }
 
+    /// 🔒 custom-descriptors: an EXACT function import (descriptor kind `0x20`)
+    /// demands the type ITSELF, so a subtype does not satisfy it.
+    ///
+    /// This is the link-time twin of `(ref (exact $t))`'s subtyping rule, and it
+    /// exists for the same reason: the importer has declared it will treat the
+    /// function as exactly `$t`, and handing it a `$sub` is the type confusion
+    /// D1 closed for casts. `exact-func-import.wast` states both halves — the
+    /// exact SUPERtype import must be unlinkable against a `$sub` function,
+    /// while the exact `$sub` import must link even when the exporter took the
+    /// same function inexactly.
+    pub fn funcImportExactOk(self: *Ctx, pm: *const Module, pi: u32, rm: *const Module, ri: u32) Error!bool {
+        return self.typeEq(pm, pi, rm, ri);
+    }
+
     /// Global matching: an immutable global is covariant in its content type, a
     /// mutable one is INVARIANT — it is written through the import as well as
     /// read, so widening in either direction is unsound.
