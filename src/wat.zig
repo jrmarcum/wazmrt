@@ -1589,7 +1589,7 @@ fn emitOffsetExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), type_n
     }
     // The IMPLICIT offset takes the target's index type — `i64.const 0` for a
     // 64-bit table/memory. See `ElemDef.is64`.
-    try out.append(a, @intFromEnum(if (is64) Op.i64_const else Op.i32_const));
+    try out.append(a, opcode.wireByte(if (is64) Op.i64_const else Op.i32_const).?);
     try sleb(a, out, 0);
     try out.append(a, @intFromEnum(Op.end));
 }
@@ -2016,14 +2016,14 @@ fn emitFoldedOne(ctx: *Ctx, l: []const Sexpr, i: usize) Error!usize {
             if (l.len != 2) return error.BadImmediate; // exactly one heap-type immediate, no operands
             try emitInstr(ctx, op, l[1..2]);
         },
-        .ref_test, .ref_cast => {
+        .ref_test, .ref_cast, .ref_cast_desc_eq => {
             if (l.len < 2) return error.BadImmediate;
             const rt = try parseRefTypeTarget(ctx, l[1]);
             var j: usize = 2;
             while (j < l.len) j = try emitOne(ctx, l, j); // operand(s)
             try emitRefCast(ctx, op, rt);
         },
-        .br_on_cast, .br_on_cast_fail => {
+        .br_on_cast, .br_on_cast_fail, .br_on_cast_desc_eq, .br_on_cast_desc_eq_fail => {
             if (l.len < 4) return error.BadImmediate;
             const label = try resolveLabel(ctx, l[1]);
             const t1 = try parseRefTypeTarget(ctx, l[2]);
@@ -2092,7 +2092,7 @@ fn isTypeUse(s: Sexpr) bool {
 /// `op` is `call_indirect` or its tail-call twin `return_call_indirect` — the
 /// immediates are identical, only the opcode byte differs.
 fn emitCallIndirect(ctx: *Ctx, op: Op, type_index: u32, table: u32) Error!void {
-    try ctx.out.append(ctx.a, @intFromEnum(op));
+    try ctx.out.append(ctx.a, opcode.wireByte(op) orelse return error.UnsupportedInstr);
     try uleb(ctx.a, ctx.out, type_index);
     try uleb(ctx.a, ctx.out, table);
 }
@@ -2132,7 +2132,7 @@ fn emitFoldedPlain(ctx: *Ctx, op: Op, l: []const Sexpr) Error!void {
 
 /// `(block|loop $label? blocktype? instr*)`
 fn emitFoldedBlock(ctx: *Ctx, op: Op, l: []const Sexpr) Error!void {
-    try ctx.out.append(ctx.a, @intFromEnum(op));
+    try ctx.out.append(ctx.a, opcode.wireByte(op) orelse return error.UnsupportedInstr);
     var j: usize = 1;
     const label = parseOptLabel(l, &j);
     try emitBlockTypeSig(ctx, try parseBlockTypeSig(ctx, l, &j));
@@ -2318,7 +2318,7 @@ fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Erro
     const op = lookupOp(name) orelse return if (untargetedProposalMnemonic(name)) error.UnsupportedInstr else error.UnknownInstr;
     switch (op) {
         .block, .loop, .@"if" => {
-            try ctx.out.append(ctx.a, @intFromEnum(op));
+            try ctx.out.append(ctx.a, opcode.wireByte(op) orelse return error.UnsupportedInstr);
             var j = i + 1;
             const label = parseOptLabel(items, &j);
             try emitBlockTypeSig(ctx, try parseBlockTypeSig(ctx, items, &j));
@@ -2330,7 +2330,7 @@ fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Erro
             // resolved in the ENCLOSING label scope, so they are emitted before the
             // try_table's own label is pushed — see `emitTryTable` for why. The
             // body instructions follow and the eventual `end` pops the label.
-            try ctx.out.append(ctx.a, @intFromEnum(op));
+            try ctx.out.append(ctx.a, opcode.wireByte(op) orelse return error.UnsupportedInstr);
             var j = i + 1;
             const label = parseOptLabel(items, &j);
             const bt = try parseBlockTypeSig(ctx, items, &j);
@@ -2386,12 +2386,12 @@ fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Erro
             try emitCallIndirect(ctx, op, ann.idx, ann.table);
             return ann.next;
         },
-        .ref_test, .ref_cast => {
+        .ref_test, .ref_cast, .ref_cast_desc_eq => {
             if (i + 1 >= items.len) return error.BadImmediate;
             try emitRefCast(ctx, op, try parseRefTypeTarget(ctx, items[i + 1]));
             return i + 2;
         },
-        .br_on_cast, .br_on_cast_fail => {
+        .br_on_cast, .br_on_cast_fail, .br_on_cast_desc_eq, .br_on_cast_desc_eq_fail => {
             if (i + 3 >= items.len) return error.BadImmediate;
             const label = try resolveLabel(ctx, items[i + 1]);
             const t1 = try parseRefTypeTarget(ctx, items[i + 2]);
@@ -2563,7 +2563,7 @@ fn emitOpcode(ctx: *Ctx, op: Op) Error!void {
         try ctx.out.append(ctx.a, 0xfb);
         try uleb(ctx.a, ctx.out, sub);
     } else {
-        try ctx.out.append(ctx.a, @intFromEnum(op));
+        try ctx.out.append(ctx.a, opcode.wireByte(op) orelse return error.UnsupportedInstr);
     }
 }
 
@@ -2632,6 +2632,7 @@ fn emitRefCast(ctx: *Ctx, op: Op, t: RefTypeTarget) Error!void {
     const sub: u8 = switch (op) {
         .ref_test => if (t.nullable) 0x15 else 0x14,
         .ref_cast => if (t.nullable) 0x17 else 0x16,
+        .ref_cast_desc_eq => if (t.nullable) 0x24 else 0x23, // custom-descriptors (D4)
         else => unreachable,
     };
     try ctx.out.append(ctx.a, sub);
@@ -2645,7 +2646,13 @@ fn emitRefCast(ctx: *Ctx, op: Op, t: RefTypeTarget) Error!void {
 /// types as `s33`.
 fn emitBrCast(ctx: *Ctx, op: Op, label: u32, src: RefTypeTarget, dst: RefTypeTarget) Error!void {
     try ctx.out.append(ctx.a, 0xfb);
-    try ctx.out.append(ctx.a, if (op == .br_on_cast) 0x18 else 0x19);
+    try ctx.out.append(ctx.a, @as(u8, switch (op) {
+        .br_on_cast => 0x18,
+        .br_on_cast_fail => 0x19,
+        .br_on_cast_desc_eq => 0x25, // custom-descriptors (D4)
+        .br_on_cast_desc_eq_fail => 0x26,
+        else => unreachable,
+    }));
     const flags: u8 = (@as(u8, @intFromBool(src.nullable))) | (@as(u8, @intFromBool(dst.nullable)) << 1);
     try ctx.out.append(ctx.a, flags);
     try uleb(ctx.a, ctx.out, label);
@@ -3259,8 +3266,12 @@ fn untargetedProposalMnemonic(name: []const u8) bool {
         // `ref.get_desc` were removed 2026-08-17 (D3): they are IMPLEMENTED, so `lookupOp`
         // resolves them and this list is never consulted for them. Leaving a stale name here is
         // not merely dead — it is a claim that we still refuse the instruction.
-        "ref.cast_desc",      "ref.cast_desc_eq",       "br_on_cast_desc",
-        "br_on_cast_desc_eq", "br_on_cast_desc_fail",   "br_on_cast_desc_eq_fail",
+        // ⚠️ Only the spellings the proposal defines but wazmrt does NOT implement remain.
+        // D3 removed `ref.get_desc`/`struct.new_desc`/`struct.new_default_desc`; D4 removed
+        // `ref.cast_desc_eq`/`br_on_cast_desc_eq`/`br_on_cast_desc_eq_fail`. What is left are
+        // the `_desc` (non-`_eq`) forms and `array.new_exact`, which the proposal's own test
+        // suite never exercises — they stay because this list must describe the PROPOSAL.
+        "ref.cast_desc", "br_on_cast_desc", "br_on_cast_desc_fail",
         "array.new_exact",
         // wide-arithmetic.
         "i64.add128",       "i64.sub128",              "i64.mul_wide_s",
@@ -4288,13 +4299,13 @@ test "mnemonic lookup: `catch` resolves like `catch_all`, and gaps are told from
     // (2) The split that scoring depends on. A real instruction from a proposal wazmrt does not
     //     target is OUR gap; a mnemonic that exists in no proposal is a malformation.
     try std.testing.expect(untargetedProposalMnemonic("i64.add128"));
-    try std.testing.expect(untargetedProposalMnemonic("br_on_cast_desc_eq"));
+    try std.testing.expect(untargetedProposalMnemonic("br_on_cast_desc"));
     try std.testing.expect(!untargetedProposalMnemonic("some.bogus.instruction"));
     // (3) …and the OTHER direction, which is the one that goes stale. An IMPLEMENTED instruction
     //     must resolve in `lookupOp` and must NOT be on the untargeted list — a name left behind
     //     there claims we still refuse it, and would route a genuine malformation involving it to
-    //     "our gap" (a skip) instead of a verdict. Track D3 implemented these three.
-    for ([_][]const u8{ "ref.get_desc", "struct.new_desc", "struct.new_default_desc" }) |m| {
+    //     "our gap" (a skip) instead of a verdict. Tracks D3 and D4 implemented these six.
+    for ([_][]const u8{ "ref.get_desc", "struct.new_desc", "struct.new_default_desc", "ref.cast_desc_eq", "br_on_cast_desc_eq", "br_on_cast_desc_eq_fail" }) |m| {
         try std.testing.expect(lookupOp(m) != null);
         try std.testing.expect(!untargetedProposalMnemonic(m));
     }
@@ -4315,7 +4326,7 @@ test "mnemonic lookup: `catch` resolves like `catch_all`, and gaps are told from
     //     for names that HAVE been implemented, is (3) above; `ref.get_desc` moved from here
     //     to there when D3 landed it.
     try std.testing.expect(lookupOp("i64.add128") == null);
-    try std.testing.expect(lookupOp("br_on_cast_desc_eq") == null);
+    try std.testing.expect(lookupOp("br_on_cast_desc") == null);
 }
 
 test "br_table label types need only agree in ARITY, and only in polymorphic code" {
@@ -7951,5 +7962,194 @@ test "D3 regression: an imported global may have a REFERENCE type" {
         var m = try Module.decode(a, try assemble(a, "(module (import \"a\" \"b\" (global $g (ref null func))))"));
         defer m.deinit();
         try std.testing.expect(!m.globals[0].mutable);
+    }
+}
+
+test "D4: the descriptor casts assemble to the BYTES the proposal assigns" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // ⚠️ **ASSERTS THE BYTES.** None of these four encodings appears anywhere in the corpus —
+    // every D4 test module is TEXT — so a wrong sub-opcode would round-trip through our own
+    // decoder perfectly and be rejected by every other runtime. The values come from binaryen's
+    // table, the same source D3's three came from and which wasmtime confirmed by name.
+    const types_ = "(rec (type $a (descriptor $b) (struct)) (type $b (describes $a) (struct)))";
+    {
+        // `ref.cast_desc_eq`: 0x23 non-null, 0x24 nullable — the pair collapses to one internal
+        // tag, exactly as `ref.cast`'s 0x16/0x17 does.
+        const nn = try std.fmt.allocPrint(a,
+            "(module {s} (func (param (ref null any) (ref (exact $b))) (result anyref) (ref.cast_desc_eq (ref $a) (local.get 0) (local.get 1))))",
+            .{types_});
+        try std.testing.expect(std.mem.indexOf(u8, try assemble(a, nn), &[_]u8{ 0xfb, 0x23, 0x00 }) != null);
+        const nul = try std.fmt.allocPrint(a,
+            "(module {s} (func (param (ref null any) (ref (exact $b))) (result anyref) (ref.cast_desc_eq (ref null $a) (local.get 0) (local.get 1))))",
+            .{types_});
+        try std.testing.expect(std.mem.indexOf(u8, try assemble(a, nul), &[_]u8{ 0xfb, 0x24, 0x00 }) != null);
+    }
+    {
+        // `br_on_cast_desc_eq` 0x25 / `_fail` 0x26, each followed by the same flags+label+src+dst
+        // shape `br_on_cast` uses. Flags 0b01 = src nullable, dst non-null; label 0.
+        for ([_]struct { m: []const u8, sub: u8 }{
+            .{ .m = "br_on_cast_desc_eq", .sub = 0x25 },
+            .{ .m = "br_on_cast_desc_eq_fail", .sub = 0x26 },
+        }) |c| {
+            const src = try std.fmt.allocPrint(a,
+                \\(module {s} (func (param (ref null any) (ref (exact $b))) (result i32)
+                \\  (block (result anyref)
+                \\    ({s} 0 anyref (ref $a) (local.get 0) (local.get 1))
+                \\    (return (i32.const 0)))
+                \\  (return (i32.const 1))))
+            , .{ types_, c.m });
+            const bin = try assemble(a, src);
+            try std.testing.expect(std.mem.indexOf(u8, bin, &[_]u8{ 0xfb, c.sub, 0x01, 0x00 }) != null);
+            var m = try Module.decode(a, bin);
+            defer m.deinit();
+            try validate(a, &m);
+        }
+    }
+}
+
+test "D4 soundness: the descriptor operand's exactness MIRRORS the cast target's" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // 🔒 An EXACT cast asks "is this value exactly `$a`, described by exactly this object?" — so
+    // an inexact descriptor operand would let some `$d <: $b` be supplied and the runtime
+    // identity check would be comparing against something the static type never promised. An
+    // INEXACT cast is content with a subtype's descriptor because it is equally content with a
+    // subtype's value. Both directions are pinned; a check that simply always demanded exactness
+    // would pass the rejections below and fail the acceptances.
+    const types_ =
+        \\(rec
+        \\  (type $a (sub (descriptor $b) (struct)))
+        \\  (type $b (sub (describes $a) (struct)))
+        \\  (type $c (sub $a (descriptor $d) (struct)))
+        \\  (type $d (sub $b (describes $c) (struct))))
+    ;
+    // ACCEPTED — an inexact target takes an inexact descriptor, and a subtype's descriptor too.
+    for ([_][]const u8{
+        "(param (ref null any) (ref null $b)) (result anyref) (ref.cast_desc_eq (ref null $a) (local.get 0) (local.get 1))",
+        "(param (ref null any) (ref $d)) (result anyref) (ref.cast_desc_eq (ref null $a) (local.get 0) (local.get 1))",
+        "(param (ref null any) (ref null (exact $d))) (result anyref) (ref.cast_desc_eq (ref null $a) (local.get 0) (local.get 1))",
+        // ...and an exact target takes the exact descriptor of exactly that type.
+        "(param (ref null any) (ref (exact $b))) (result anyref) (ref.cast_desc_eq (ref (exact $a)) (local.get 0) (local.get 1))",
+        "(param (ref null any) (ref null (exact $b))) (result anyref) (ref.cast_desc_eq (ref null (exact $a)) (local.get 0) (local.get 1))",
+    }) |body| {
+        const src = try std.fmt.allocPrint(a, "(module {s} (func {s}))", .{ types_, body });
+        var m = try Module.decode(a, try assemble(a, src));
+        defer m.deinit();
+        try validate(a, &m);
+    }
+
+    // REJECTED — every way the descriptor can fail to be what an exact cast promised.
+    for ([_][]const u8{
+        // Inexact descriptor for an exact cast.
+        "(param (ref null any) (ref $b)) (result anyref) (ref.cast_desc_eq (ref (exact $a)) (local.get 0) (local.get 1))",
+        // ...even when it is a NULL of the inexact type, which a nullability-only check misses.
+        "(param (ref null any)) (result anyref) (ref.cast_desc_eq (ref (exact $a)) (local.get 0) (ref.null $b))",
+        // An exact reference to a SUBTYPE of the descriptor does not cut it either.
+        "(param (ref null any) (ref (exact $d))) (result anyref) (ref.cast_desc_eq (ref (exact $a)) (local.get 0) (local.get 1))",
+        // A descriptor of the wrong shape entirely.
+        "(param (ref null any) (ref null struct)) (result anyref) (ref.cast_desc_eq (ref $a) (local.get 0) (local.get 1))",
+        // And the VALUE must share a hierarchy with the target, as for a plain `ref.cast`.
+        "(param (ref null func) (ref $b)) (result anyref) (ref.cast_desc_eq (ref $a) (local.get 0) (local.get 1))",
+    }) |body| {
+        const src = try std.fmt.allocPrint(a, "(module {s} (func {s}))", .{ types_, body });
+        var m = try Module.decode(a, try assemble(a, src));
+        defer m.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(a, &m));
+    }
+}
+
+test "D4: the branch direction is visible in the CARRIED TYPE, not just at run time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // ⚠️ **An inversion showed the runtime tests could not see this.** Swapping which of the two
+    // spellings "fires on a match" changes the VALIDATOR's carried type — `dst` for `_eq`, the
+    // source-minus-dst difference for `_eq_fail` — and a block typed `anyref` accepts either, so
+    // every execution test still passed. Typing the block as exactly `(ref $a)` makes the two
+    // shapes distinguishable: only `_eq` may carry the destination type to the label.
+    const types_ = "(rec (type $a (descriptor $b) (struct)) (type $b (describes $a) (struct)))";
+    {
+        const src = try std.fmt.allocPrint(a,
+            \\(module {s} (func (param (ref null any) (ref (exact $b))) (result anyref)
+            \\  (block (result (ref $a))
+            \\    (br_on_cast_desc_eq 0 anyref (ref $a) (local.get 0) (local.get 1))
+            \\    (unreachable))))
+        , .{types_});
+        var m = try Module.decode(a, try assemble(a, src));
+        defer m.deinit();
+        try validate(a, &m);
+    }
+    // ...and the `_fail` spelling must NOT be able to carry it: on a miss the value is whatever
+    // did not cast, which is not a `(ref $a)`.
+    {
+        const src = try std.fmt.allocPrint(a,
+            \\(module {s} (func (param (ref null any) (ref (exact $b))) (result anyref)
+            \\  (block (result (ref $a))
+            \\    (br_on_cast_desc_eq_fail 0 anyref (ref $a) (local.get 0) (local.get 1))
+            \\    (unreachable))))
+        , .{types_});
+        var m = try Module.decode(a, try assemble(a, src));
+        defer m.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(a, &m));
+    }
+}
+
+test "D4: the branch form consumes its descriptor operand" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // ⚠️ **A second inversion the runtime tests were blind to.** If the branch arm forgets to pop
+    // the descriptor, it pops the DESCRIPTOR as the ref operand instead — and a descriptor is a
+    // struct, so it satisfies an `anyref` source type and the module still type-checks, leaving
+    // the real value stranded on the stack. Every earlier test ended its block with `return`,
+    // which is stack-polymorphic and swallows the leftover. This one balances the stack exactly,
+    // so an unconsumed operand is a `end`-arity failure.
+    const types_ = "(rec (type $a (descriptor $b) (struct)) (type $b (describes $a) (struct)))";
+    for ([_][]const u8{ "br_on_cast_desc_eq", "br_on_cast_desc_eq_fail" }) |m| {
+        const src = try std.fmt.allocPrint(a,
+            \\(module {s} (func (param (ref null any) (ref (exact $b))) (result i32)
+            \\  (block (result anyref)
+            \\    ({s} 0 anyref (ref $a) (local.get 0) (local.get 1))
+            \\    (drop)
+            \\    (ref.null none))
+            \\  (drop)
+            \\  (i32.const 1)))
+        , .{ types_, m });
+        var mod = try Module.decode(a, try assemble(a, src));
+        defer mod.deinit();
+        try validate(a, &mod);
+    }
+}
+
+test "D4: a `_desc_eq` cast needs a target that HAS a descriptor, and is not constant" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    for ([_]struct { src: []const u8, want: anyerror }{
+        // An ABSTRACT head has no descriptor — "type any does not have a descriptor". This is the
+        // arm that would be vacuously true if the target were not required to be concrete.
+        .{ .src = "(module (func (result anyref) (ref.cast_desc_eq (ref any) (unreachable))))", .want = error.InvalidDescriptor },
+        .{ .src = "(module (func (result nullref) (ref.cast_desc_eq (ref null none) (unreachable))))", .want = error.InvalidDescriptor },
+        // A plain struct has none either.
+        .{ .src = "(module (type $a (struct)) (func (result anyref) (ref.cast_desc_eq (ref $a) (unreachable))))", .want = error.InvalidDescriptor },
+        // Nor does a DESCRIPTOR that is not itself described.
+        .{ .src = "(module (rec (type $a (descriptor $b) (struct)) (type $b (describes $a) (struct))) (func (result anyref) (ref.cast_desc_eq (ref $b) (unreachable))))", .want = error.InvalidDescriptor },
+        // "unknown type" — the index is bounds-checked before the link is read, so the report
+        // names the real problem instead of blaming a missing descriptor.
+        .{ .src = "(module (func (result anyref) (ref.cast_desc_eq (ref 1) (unreachable))))", .want = error.UndefinedType },
+        // A cast reads the heap, so it cannot appear in a constant expression.
+        .{ .src = "(module (rec (type $a (descriptor $b) (struct)) (type $b (describes $a) (struct))) (global (ref $a) (ref.cast_desc_eq (ref null $a) (ref.null none) (ref.null none))))", .want = error.ConstantExpressionRequired },
+    }) |c| {
+        var m = try Module.decode(a, try assemble(a, c.src));
+        defer m.deinit();
+        try std.testing.expectError(c.want, validate(a, &m));
     }
 }

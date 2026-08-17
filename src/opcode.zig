@@ -30,7 +30,7 @@ const DecodeError = types.DecodeError;
 
 /// Every core-MVP opcode, keyed by its binary byte (§5.4). Non-exhaustive so an
 /// unrecognized byte decodes to a value that `decodeBody` rejects.
-pub const Op = enum(u8) {
+pub const Op = enum(u16) {
     // Control
     @"unreachable" = 0x00,
     nop = 0x01,
@@ -350,22 +350,32 @@ pub const Op = enum(u8) {
     struct_get_u = 0xf7, // 0xFB 0x04 (packed)
     struct_set = 0xf8, // 0xFB 0x05: [(ref null $t) t'] -> []
 
-    // custom-descriptors (Track D3). ⚠️ **These three tags sit in the LOW byte
-    // range (`0x1d`/`0x1e`/`0x27`) — the last unassigned single-byte values —
-    // because `0xd7..0xfa` is full.** That makes them exactly the hazard the
-    // raw-byte guard in `decodeBody` exists for, and the reason each is listed
-    // there and in the internal-tag rejection test: `immediateKind` gives them
-    // `.gc_type`, a kind real ops also have, so an unguarded raw `0x1d` byte
-    // would decode AND EXECUTE as `struct.new_desc`. That accept-invalid has
-    // been shipped twice already (R3's `0xc5..0xcc`, R10's `0x16`/`0x17`).
+    // --- custom-descriptors (Tracks D3/D4) -----------------------------------
     //
-    // 🔒 **ONE unassigned byte is left. Track D4 needs three more tags, so it
-    // must widen `Op` to `enum(u16)` and move every internal tag above `0xff`
-    // FIRST** — at which point no raw byte can name one and the guard collapses
-    // to nothing. Doing that here would have made D3's size delta unattributable.
-    struct_new_desc = 0x1d, // 0xFB 0x20: [t'* (ref null (exact $d))] -> [(ref (exact $t))]
-    struct_new_default_desc = 0x1e, // 0xFB 0x21: [(ref null (exact $d))] -> [(ref (exact $t))]
-    ref_get_desc = 0x27, // 0xFB 0x22: [(ref null $t)] -> [(ref exact? $d)]
+    // 🔑 **THESE TAGS LIVE ABOVE `0xff`, AND THAT IS THE POINT.** `Op` is
+    // `enum(u16)` (widened by D4), so `@enumFromInt(b0)` on a wire BYTE can never
+    // produce one of them — no raw-byte guard is needed, or even possible. Every
+    // tag below `0x100` is a pre-widening one, kept where it is only because
+    // `immediateKind`/`simpleSig` switch on those literal values; those still
+    // depend on `decodeBody`'s guard, which has been wrong three times (R3's
+    // `0xc5..0xcc`, R10's `0x16`/`0x17`, and a fourth arm D3 added then removed
+    // as redundant). **Add new internal tags HERE, never below `0x100`.**
+    //
+    // D3 originally took `0x1d`/`0x1e`/`0x27` — the last three unassigned bytes —
+    // and D4 needed three more, which is what forced the widening.
+    struct_new_desc = 0x100, // 0xFB 0x20: [t'* (ref null (exact $d))] -> [(ref (exact $t))]
+    struct_new_default_desc = 0x101, // 0xFB 0x21: [(ref null (exact $d))] -> [(ref (exact $t))]
+    ref_get_desc = 0x102, // 0xFB 0x22: [(ref null $t)] -> [(ref exact? $d)]
+    /// 0xFB 0x23 (non-null) / 0x24 (null) — the two encodings collapse to one tag,
+    /// distinguished by the decoded `RefType.nullable`, exactly as `ref_cast` does.
+    /// `[(ref null? any) (ref null? $d)] -> [ref]`: casts only when the value's
+    /// DESCRIPTOR is the very object supplied, not merely one of the right type.
+    ref_cast_desc_eq = 0x103,
+    /// 0xFB 0x25 / 0x26 — `br_on_cast` and its `_fail` twin plus a descriptor
+    /// operand: a label, source & destination ref types, and the same identity
+    /// comparison `ref_cast_desc_eq` makes.
+    br_on_cast_desc_eq = 0x104,
+    br_on_cast_desc_eq_fail = 0x105,
 
     // GC casts (0xFB prefix). ref.test/ref.cast carry a target reference type
     // (nullability + heap type); the null/non-null encodings collapse to one
@@ -429,6 +439,25 @@ pub fn fcSubOpcode(op: Op) ?u8 {
     };
 }
 
+/// The single WIRE byte of a real one-byte opcode, or null if `op` is an
+/// INTERNAL TAG that has no one-byte form.
+///
+/// 🔑 **`Op` is `enum(u16)` and every internal tag added from Track D4 onward
+/// lives above `0xff`.** Those ops are written as a prefix byte plus a
+/// sub-opcode (`fcSubOpcode` / `gcSubOpcode`), never as themselves, so asking
+/// for their wire byte is a bug rather than a truncation. Returning `?u8` makes
+/// that a checked question at the one site that asks it with a runtime `op`;
+/// a bare `@intFromEnum` would have silently kept the low 8 bits.
+///
+/// ⚠️ Tags that predate the widening (`0x16`/`0x17`, `0xc5..0xcf`, `0xd7..0xfa`)
+/// still sit INSIDE the byte range and still answer here — they are guarded
+/// instead by `decodeBody`'s raw-byte check, which is exactly the machinery the
+/// widening exists to stop needing. Do not add new tags below `0x100`.
+pub fn wireByte(op: Op) ?u8 {
+    const v = @intFromEnum(op);
+    return if (v <= 0xff) @intCast(v) else null;
+}
+
 /// The `0xFB` sub-opcode for an internal GC-op tag, or null for a normal op.
 pub fn gcSubOpcode(op: Op) ?u8 {
     return switch (op) {
@@ -459,6 +488,9 @@ pub fn gcSubOpcode(op: Op) ?u8 {
         .ref_cast => 0x16, // non-null form; the null form (0x17) is chosen at emit
         .br_on_cast => 0x18,
         .br_on_cast_fail => 0x19,
+        .ref_cast_desc_eq => 0x23, // non-null form; the null form (0x24) is chosen at emit
+        .br_on_cast_desc_eq => 0x25,
+        .br_on_cast_desc_eq_fail => 0x26,
         .ref_i31 => 0x1c,
         .i31_get_s => 0x1d,
         .i31_get_u => 0x1e,
@@ -697,9 +729,9 @@ pub fn immediateKind(op: Op) ImmKind {
         // the extern↔any bridge (`0x16`/`0x17`, rejected as raw bytes below).
         0xf0, 0xf1, 0xf2, 0xed, 0x16, 0x17 => .none,
         // GC ops with a single type index (`array.fill` = 0xDF included), plus
-        // custom-descriptors' `struct.new_desc`/`struct.new_default_desc`/`ref.get_desc`
-        // (`0x1d`/`0x1e`/`0x27` — low-range tags, rejected as raw bytes below).
-        0xe6, 0xe7, 0xe9, 0xea, 0xeb, 0xec, 0xf3, 0xf4, 0xdf, 0x1d, 0x1e, 0x27 => .gc_type,
+        // custom-descriptors' `struct.new_desc`/`struct.new_default_desc`/
+        // `ref.get_desc` — `0x100`+, so no wire byte can name them.
+        0xe6, 0xe7, 0xe9, 0xea, 0xeb, 0xec, 0xf3, 0xf4, 0xdf, 0x100, 0x101, 0x102 => .gc_type,
         // GC struct ops with a type index + field index.
         0xf5, 0xf6, 0xf7, 0xf8 => .gc_field,
         // array.new_fixed: type index + element count.
@@ -711,9 +743,9 @@ pub fn immediateKind(op: Op) ImmKind {
         // array.copy: destination + source array type indices.
         0xcd => .gc_array_copy,
         // ref.test / ref.cast: a target reference type.
-        0xee, 0xef => .ref_cast,
+        0xee, 0xef, 0x103 => .ref_cast, // + custom-descriptors `ref.cast_desc_eq`
         // br_on_cast / br_on_cast_fail: a label + source & destination ref types.
-        0xf9, 0xfa => .br_cast,
+        0xf9, 0xfa, 0x104, 0x105 => .br_cast, // + the `_desc_eq` pair
         else => .unsupported,
     };
 }
@@ -1134,6 +1166,13 @@ pub fn decodeBodyTracked(
                 0x17 => .{ .op = .ref_cast, .imm = .{ .ref_cast = try readRefTypeExact(&r, true) } },
                 0x18 => .{ .op = .br_on_cast, .imm = try readBrCast(&r) },
                 0x19 => .{ .op = .br_on_cast_fail, .imm = try readBrCast(&r) },
+                // custom-descriptors (D4). The `_desc_eq` casts mirror their plain
+                // twins byte for byte and add a DESCRIPTOR operand on the stack —
+                // nothing extra in the immediate, so the readers are shared.
+                0x23 => .{ .op = .ref_cast_desc_eq, .imm = .{ .ref_cast = try readRefTypeExact(&r, false) } },
+                0x24 => .{ .op = .ref_cast_desc_eq, .imm = .{ .ref_cast = try readRefTypeExact(&r, true) } },
+                0x25 => .{ .op = .br_on_cast_desc_eq, .imm = try readBrCast(&r) },
+                0x26 => .{ .op = .br_on_cast_desc_eq_fail, .imm = try readBrCast(&r) },
                 0x1c => .{ .op = .ref_i31, .imm = .none },
                 0x1d => .{ .op = .i31_get_s, .imm = .none },
                 0x1e => .{ .op = .i31_get_u, .imm = .none },
@@ -1217,16 +1256,15 @@ pub fn decodeBodyTracked(
         // Their `immediateKind` is `.none`, which is reachable from real ops, so
         // without this arm a raw `0x16` byte would decode and EXECUTE as
         // `extern.convert_any` — the accept-invalid R3 closed for `0xc5..0xcc`.
-        // ⚠️ **D3's three tags (`0x1d`/`0x1e`/`0x27`) are deliberately NOT listed
-        // here, and an inversion is why.** They were added to this condition
-        // first; removing them again failed no test. Their `immediateKind` is
-        // `.gc_type`, and the kind switch below refuses every `.gc_type` byte
-        // outright — no real single-byte op carries a GC type index. That is
-        // precisely the property the kind guard LACKS for `.none`/`.table` tags,
-        // which is why those need the byte arms and these do not. A redundant
-        // guard carrying a false reason ("a kind real ops have") is how the next
-        // reader learns the wrong rule, so it is gone and the test below pins the
-        // behaviour instead.
+        // 🔑 **THIS CONDITION IS FROZEN — it lists the tags that predate the D4
+        // widening, and no tag added after it can ever need an entry.** `Op` is
+        // `enum(u16)` with every new internal tag at `0x100`+, and `b0` is a
+        // BYTE, so `@enumFromInt(b0)` below cannot name one: the whole class of
+        // bug this guard exists for is closed by construction rather than by
+        // enumeration. It has been got wrong three times (R3's `0xc5..0xcc`,
+        // R10's `0x16`/`0x17`, and a fourth arm D3 added then removed once an
+        // inversion showed the immediate-kind switch already covered it).
+        // **Adding a tag below `0x100` re-opens it. Do not.**
         if (b0 == 0x16 or b0 == 0x17 or
             (b0 >= 0xc5 and b0 <= 0xcf) or (b0 >= 0xd7 and b0 <= 0xfa)) return error.UnsupportedOpcode;
         const op: Op = @enumFromInt(b0);
@@ -1389,14 +1427,14 @@ test "rejects raw internal-tag bytes that are not real single-byte opcodes" {
         0xc5, 0xc8, 0xcc, // saturating-truncation range: low, middle, high
         0xcd, 0xce, 0xcf, // array.copy / array.init_data / array.init_elem
         0xdd, 0xde, 0xdf, // array.new_data / array.new_elem / array.fill
-        // D3: the custom-descriptors tags, and the FIRST internal tags in the LOW
-        // range. These are caught by the `.gc_type` arm of the immediate-kind
-        // switch rather than by a byte range — no real single-byte op carries a
-        // GC type index — so they are listed here to PIN that, not because a byte
-        // guard covers them. If a later change ever gives one of them an
-        // immediate kind a real op shares, this line starts failing and the byte
-        // guard becomes necessary; that is the whole point of listing them.
-        0x1d, 0x1e, 0x27, // struct.new_desc / struct.new_default_desc / ref.get_desc
+        // `0x1d`/`0x1e`/`0x27` were D3's custom-descriptors tags and are UNASSIGNED
+        // again since D4 widened `Op` and moved them to `0x100`+. They stay in
+        // this list because the property being pinned is about the BYTE, not the
+        // tag: no unassigned wire byte may decode as anything. They now fail via
+        // `immediateKind`'s `.unsupported`, where before they failed via
+        // `.gc_type` — a different route to the same verdict, and the reason to
+        // keep asserting it rather than assume it.
+        0x1d, 0x1e, 0x27,
     };
     for (tags) |b| {
         const body = [_]u8{b};

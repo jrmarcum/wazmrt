@@ -23,6 +23,7 @@ const Module = @import("Module.zig");
 const interp = @import("interp.zig");
 const typematch = @import("typematch.zig");
 const validate = @import("validate.zig").validate;
+const validateWith = @import("validate.zig").validateWith;
 const features = @import("features.zig");
 
 const V = types.ValType;
@@ -133,6 +134,16 @@ pub fn featuresForPath(path: ?[]const u8) features.Set {
     var fs: features.Set = .{}; // everything on
     const p = path orelse return fs;
     // Match on either separator: the corpus is walked with native paths on Windows.
+    //
+    // ⚠️ **custom-descriptors RETYPES `br_on_cast`, so it is off everywhere except its own
+    // directory — and this is the FIRST era entry that turns a feature off for the corpus at
+    // large rather than for one snapshot.** It has to be: the era that LACKS this proposal is
+    // the merged spec, i.e. every other file. The core `br_on_cast.wast` asserts
+    // `br_on_cast 0 eqref anyref` INVALID and the proposal's copy of the same file compiles it
+    // as VALID; both are right about their own era, and only the path tells them apart.
+    if (!containsPathSegment(p, "proposals/custom-descriptors") and
+        !containsPathSegment(p, "proposals\\custom-descriptors"))
+        fs.set(.custom_descriptors, false);
     if (containsPathSegment(p, "proposals/threads") or containsPathSegment(p, "proposals\\threads")) {
         // The threads proposal predates BOTH. Nothing else is turned off: the files use
         // `funcref`, atomics and shared memories, all of which must keep working — which is why
@@ -373,7 +384,7 @@ const Runner = struct {
     /// surfacing as some type error deep inside a feature this era never had.
     fn validateEra(self: *Runner, m: *const Module) !void {
         if (try features.firstViolation(self.a, m, self.features)) |_| return error.DisabledProposal;
-        try validate(self.a, m);
+        try validateWith(self.a, m, self.features);
     }
 
     /// Decode, validate, link and instantiate a module binary. Shared by
@@ -1095,6 +1106,7 @@ fn isRuntimeTrap(e: anyerror) bool {
         error.IndirectTypeMismatch,
         error.NullReference,
         error.NullDescriptor, // "null descriptor reference" (custom-descriptors)
+        error.DescriptorCastFailure, // "descriptor cast failure" (custom-descriptors)
         error.GcOutOfBounds,
         error.CastFailure,
         error.HostTrap,
@@ -1744,11 +1756,48 @@ test "era policy: the threads snapshot loses multi-memory and multi-table, and N
     const win = featuresForPath("testsuite\\proposals\\threads\\memory.wast");
     try std.testing.expect(!win.has(.multi_table));
 
-    // ⚠️ THE OPT-IN HALF: everything not listed runs unrestricted. A policy that leaked into
-    // other directories would silently judge them by the wrong language.
-    try std.testing.expect(featuresForPath("testsuite/memory.wast").all());
-    try std.testing.expect(featuresForPath("testsuite/proposals/gc/struct.wast").all());
+    // ⚠️ THE OPT-IN HALF, **and D4 had to qualify it.** The rule was "everything not listed runs
+    // unrestricted", so a policy could not leak into directories it knows nothing about. That
+    // still holds for every proposal whose era is a RESTRICTION of the merged spec — but
+    // custom-descriptors is not one: it RETYPES `br_on_cast`, so the era that lacks it is the
+    // merged spec itself, i.e. every other file. It is therefore opt-IN by directory, the only
+    // entry that is. Everything else about those paths is still unrestricted.
+    const core = featuresForPath("testsuite/memory.wast");
+    try std.testing.expect(!core.has(.custom_descriptors));
+    try std.testing.expect(core.incoherent() == null); // still a set that describes a real wasm
+    for (0..features.count) |i| {
+        const f: features.Feature = @enumFromInt(i);
+        if (f == .custom_descriptors) continue;
+        try std.testing.expect(core.has(f)); // nothing else leaked
+    }
+    // ...and the proposal's own directory is the one place it IS on.
+    const cd = featuresForPath("testsuite/proposals/custom-descriptors/br_on_cast.wast");
+    try std.testing.expect(cd.all());
+    try std.testing.expect(featuresForPath("testsuite\\proposals\\custom-descriptors\\exact.wast").all());
+    // A sibling proposal snapshot predates it, so it stays off there too.
+    try std.testing.expect(!featuresForPath("testsuite/proposals/gc/struct.wast").has(.custom_descriptors));
+    // An INLINE source has no era to belong to and keeps the permissive default — the unit tests
+    // in this repo depend on it, and `runScript`'s required `path` is what makes that deliberate.
     try std.testing.expect(featuresForPath(null).all());
+}
+
+test "era policy: custom-descriptors RETYPES br_on_cast, so the same module is judged both ways" {
+    // 🔒 **The conflict, written down as a test rather than left to the corpus.** The core
+    // testsuite and the proposal snapshot contain the SAME module with opposite verdicts:
+    // `br_on_cast 0 eqref anyref` is an upcast, which the GC rule forbids (`rt2 <: rt1`) and
+    // custom-descriptors permits (only a shared top type). No single answer satisfies both, so
+    // the era decides — and both directions are pinned here, because a rule that is only ever
+    // exercised one way is a rule nobody has checked.
+    const src = "(module (func (result anyref) (br_on_cast 0 eqref anyref (unreachable))))";
+    const relaxed = try runScript(std.testing.allocator, src, "proposals/custom-descriptors/br_on_cast.wast");
+    try std.testing.expectEqual(@as(usize, 0), relaxed.failed);
+
+    // Under the merged-spec era the identical text must be REFUSED. `assert_invalid` is how the
+    // core file states it, so that is how it is stated here.
+    const negative = "(assert_invalid (module (func (result anyref) (br_on_cast 0 eqref anyref (unreachable)))) \"type mismatch\")";
+    const strict = try runScript(std.testing.allocator, negative, "br_on_cast.wast");
+    try std.testing.expectEqual(@as(usize, 1), strict.passed);
+    try std.testing.expectEqual(@as(usize, 0), strict.failed);
 }
 
 test "era policy: threads-era assertions pass, and the SAME modules are accepted without it" {
@@ -2433,5 +2482,133 @@ test "D3: a funcref's dynamic type is its DEFINITION's, through a chain of re-ex
     // The third is the control: `$g` really IS only a `$super`, so the exact-`$sub` test must
     // still answer 0. Without it the first two would pass under "always say yes".
     try std.testing.expectEqual(@as(usize, 3), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "D4 soundness: `_desc_eq` compares OBJECT IDENTITY, not descriptor type" {
+    // 🔒 **THE LOAD-BEARING D4 TEST.** `$b1` and `$b2` are two allocations of the SAME descriptor
+    // type, so every type-level question about them answers identically — canonical id, subtype
+    // chain, exactness, all equal. An implementation that compared TYPES here would satisfy every
+    // shape assertion in `ref_cast_desc_eq.wast` and still be a different instruction from the one
+    // the proposal defines: it would be `ref.cast`. Only asking "is it THIS object" separates
+    // them, so that is what is written down.
+    const src =
+        \\(module
+        \\  (rec
+        \\    (type $a (descriptor $b) (struct))
+        \\    (type $b (describes $a) (struct)))
+        \\  (global $b1 (ref (exact $b)) (struct.new $b))
+        \\  (global $b2 (ref (exact $b)) (struct.new $b))
+        \\  (global $a1 (ref (exact $a)) (struct.new_desc $a (global.get $b1)))
+        \\  (func (export "hit") (result anyref)
+        \\    (ref.cast_desc_eq (ref $a) (global.get $a1) (global.get $b1)))
+        \\  (func (export "miss") (result anyref)
+        \\    (ref.cast_desc_eq (ref $a) (global.get $a1) (global.get $b2)))
+        \\  (func (export "br-hit") (result i32)
+        \\    (block (result anyref)
+        \\      (br_on_cast_desc_eq 0 anyref (ref $a) (global.get $a1) (global.get $b1))
+        \\      (return (i32.const 0)))
+        \\    (return (i32.const 1)))
+        \\  (func (export "br-miss") (result i32)
+        \\    (block (result anyref)
+        \\      (br_on_cast_desc_eq 0 anyref (ref $a) (global.get $a1) (global.get $b2))
+        \\      (return (i32.const 0)))
+        \\    (return (i32.const 1)))
+        \\  (func (export "br-fail-hit") (result i32)
+        \\    (block (result anyref)
+        \\      (br_on_cast_desc_eq_fail 0 anyref (ref $a) (global.get $a1) (global.get $b1))
+        \\      (return (i32.const 0)))
+        \\    (return (i32.const 1)))
+        \\  (func (export "br-fail-miss") (result i32)
+        \\    (block (result anyref)
+        \\      (br_on_cast_desc_eq_fail 0 anyref (ref $a) (global.get $a1) (global.get $b2))
+        \\      (return (i32.const 0)))
+        \\    (return (i32.const 1))))
+        \\(assert_return (invoke "hit") (ref.struct))
+        \\(assert_trap (invoke "miss") "descriptor cast failure")
+        \\(assert_return (invoke "br-hit") (i32.const 1))
+        \\(assert_return (invoke "br-miss") (i32.const 0))
+        \\(assert_return (invoke "br-fail-hit") (i32.const 0))
+        \\(assert_return (invoke "br-fail-miss") (i32.const 1))
+    ;
+    const s = try runScript(std.testing.allocator, src, null);
+    // `hit` vs `miss` is the identity question. The four `br-*` arms then pin the BRANCH
+    // DIRECTION for both spellings — `_eq` fires on a match, `_eq_fail` on a miss — which one arm
+    // apiece could not: a swapped pair passes any single-direction check.
+    try std.testing.expectEqual(@as(usize, 6), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "D4: a null descriptor traps BEFORE anything about the value is considered" {
+    // ⚠️ **The ORDER is the rule.** The target is nullable and the value is null, so a naive
+    // implementation returns null and never looks at the descriptor — the spec says trap. Getting
+    // this backwards turns a trap into a successful cast, which is the failure direction that
+    // matters. `ref_cast_desc_eq.wast` states it as `self-nullable-null-null`.
+    const src =
+        \\(module
+        \\  (rec
+        \\    (type $a (descriptor $b) (struct))
+        \\    (type $b (describes $a) (struct)))
+        \\  (global $null-a (ref null (exact $a)) (ref.null none))
+        \\  (global $null-b (ref null (exact $b)) (ref.null none))
+        \\  (global $b1 (ref (exact $b)) (struct.new $b))
+        \\  (func (export "null-value-null-desc") (result anyref)
+        \\    (ref.cast_desc_eq (ref null $a) (global.get $null-a) (global.get $null-b)))
+        \\  (func (export "null-value-good-desc") (result anyref)
+        \\    (ref.cast_desc_eq (ref null $a) (global.get $null-a) (global.get $b1)))
+        \\  (func (export "null-value-nonnull-target") (result anyref)
+        \\    (ref.cast_desc_eq (ref $a) (global.get $null-a) (global.get $b1)))
+        \\  (func (export "br-null-desc") (result i32)
+        \\    (block (result anyref)
+        \\      (br_on_cast_desc_eq 0 anyref (ref $a) (global.get $null-a) (global.get $null-b))
+        \\      (return (i32.const 0)))
+        \\    (return (i32.const 1))))
+        \\(assert_trap (invoke "null-value-null-desc") "null descriptor reference")
+        \\(assert_return (invoke "null-value-good-desc") (ref.null none))
+        \\(assert_trap (invoke "null-value-nonnull-target") "descriptor cast failure")
+        \\(assert_trap (invoke "br-null-desc") "null descriptor reference")
+    ;
+    const s = try runScript(std.testing.allocator, src, null);
+    // The middle case is the control: with a REAL descriptor, a null value against a nullable
+    // target returns null rather than trapping — so the first trap is about the descriptor, not
+    // about nulls in general.
+    try std.testing.expectEqual(@as(usize, 4), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "D4 soundness: a `_desc_eq` cast across instances compares the RIGHT object" {
+    // 🔒 Same shape as D3's cross-instance test, one layer up: the descriptor now arrives from
+    // another instance AND the value being cast does too. `gcEntry` resolves through the store,
+    // so the comparison is between two store-wide values — but only a test with two INSTANCES OF
+    // ONE DEFINITION can show it, because their type indices are identical and every type-level
+    // check passes either way.
+    const src =
+        \\(module definition $M
+        \\  (rec
+        \\    (type $a (descriptor $b) (struct))
+        \\    (type $b (describes $a) (struct)))
+        \\  (global $b1 (export "b") (ref (exact $b)) (struct.new $b))
+        \\  (func (export "make") (result (ref (exact $a)))
+        \\    (struct.new_desc $a (global.get $b1))))
+        \\(module instance $I1 $M)
+        \\(module instance $I2 $M)
+        \\(register "I1" $I1)
+        \\(register "I2" $I2)
+        \\(module $Q
+        \\  (rec
+        \\    (type $a (descriptor $b) (struct))
+        \\    (type $b (describes $a) (struct)))
+        \\  (import "I1" "make" (func $m1 (result (ref (exact $a)))))
+        \\  (import "I1" "b" (global $d1 (ref (exact $b))))
+        \\  (import "I2" "b" (global $d2 (ref (exact $b))))
+        \\  (func (export "own") (result anyref)
+        \\    (ref.cast_desc_eq (ref $a) (call $m1) (global.get $d1)))
+        \\  (func (export "other") (result anyref)
+        \\    (ref.cast_desc_eq (ref $a) (call $m1) (global.get $d2))))
+        \\(assert_return (invoke $Q "own") (ref.struct))
+        \\(assert_trap (invoke $Q "other") "descriptor cast failure")
+    ;
+    const s = try runScript(std.testing.allocator, src, null);
+    try std.testing.expectEqual(@as(usize, 2), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }

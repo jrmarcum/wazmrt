@@ -271,6 +271,12 @@ pub const Error = Module.Error || error{
     /// A null reference where a non-null one is required (`call_ref` /
     /// `ref.as_non_null` on null).
     NullReference,
+    /// A `*_desc_eq` cast failed: the value did not have the target type, or its
+    /// descriptor was not the object supplied ("descriptor cast failure",
+    /// custom-descriptors). Distinct from `CastFailure` because the two answer
+    /// different questions — one about a TYPE, one about an object IDENTITY — and
+    /// a shared tag would hide which of them a report is about.
+    DescriptorCastFailure,
     /// `struct.new_desc` was given a null descriptor, or `ref.get_desc` a null
     /// reference (custom-descriptors, "null descriptor reference"). Kept
     /// SEPARATE from `NullReference` because the two are different guest
@@ -1965,6 +1971,44 @@ pub const Instance = struct {
         }
     }
 
+    /// custom-descriptors (D4): does `v` match `rt` **and** carry exactly the
+    /// descriptor object `desc`?
+    ///
+    /// 🔒 **IDENTITY, not type equality — that is the entire point of `_desc_eq`.**
+    /// Two descriptors of the same type are different values, and a cast against
+    /// one must fail for the other; comparing types here would make the
+    /// instruction indistinguishable from a plain `ref.cast` and silently admit
+    /// every value of the right shape. `ref_cast_desc_eq.wast` pins it with
+    /// `$b1`/`$b2`, two structurally identical descriptors.
+    ///
+    /// ⚠️ **A null DESCRIPTOR traps before anything else is looked at** — before
+    /// the value's own null-ness, and even when the cast target is nullable. The
+    /// spec orders it that way (`self-nullable-null-null` traps rather than
+    /// returning null), and getting the order wrong turns a trap into a
+    /// successful cast to null.
+    ///
+    /// A null VALUE then matches iff the target is nullable, exactly as
+    /// `refMatches` has it — the difference is only that a null carries no
+    /// descriptor to compare, so it never reaches the identity check.
+    fn descEqMatches(self: *Instance, v: Value, desc: Value, rt: opcode.RefType) Error!bool {
+        if (desc == null_ref) return error.NullDescriptor;
+        if (v == null_ref) return rt.nullable;
+        // ⚠️ **An inversion reports this line as CAUGHT BY NOTHING, and the reason is worth
+        // keeping rather than deleting the line.** For a VALIDATED module the identity check
+        // below subsumes it: a descriptor object belongs to exactly one described object, so
+        // matching descriptors implies matching types, and the validator has already forced the
+        // operand to be the descriptor of the target type. It is not redundant on the UNVALIDATED
+        // run path — a hand-built or forged module can pair any value with any descriptor, and
+        // this is what keeps such a cast a clean `false` rather than a type-confused success.
+        // Same standing as the `hardening` tests: defence for inputs the validator never saw.
+        if (!self.refMatches(v, rt)) return false;
+        // Resolved through the STORE, so a value from another instance compares
+        // its OWN descriptor. `descriptor` is `null_ref` for an object of a type
+        // with no descriptor, which cannot equal a non-null `desc`.
+        const e = self.gcEntry(v) catch return false;
+        return e.inst.gc_heap.items[e.index].descriptor == desc;
+    }
+
     /// Follow a funcref through any chain of IMPORTS to the instance that
     /// actually DEFINES the function, and its index there.
     ///
@@ -2853,6 +2897,21 @@ const Frame = struct {
                 .br_on_cast_fail => {
                     const v = try self.peek();
                     pc = if (!self.inst.refMatches(v, instr.imm.br_cast.dst)) try self.branch(instr.imm.br_cast.label) else pc + 1;
+                },
+
+                // --- custom-descriptors (D4): the identity casts -----------------
+                .ref_cast_desc_eq => {
+                    const desc = self.pop(); // the descriptor is on top
+                    const v = try self.peek();
+                    if (!try self.inst.descEqMatches(v, desc, instr.imm.ref_cast)) return error.DescriptorCastFailure;
+                    pc += 1; // the value stays, now carrying the target type
+                },
+                .br_on_cast_desc_eq, .br_on_cast_desc_eq_fail => {
+                    const desc = self.pop();
+                    const v = try self.peek();
+                    const hit = try self.inst.descEqMatches(v, desc, instr.imm.br_cast.dst);
+                    const take = if (instr.op == .br_on_cast_desc_eq) hit else !hit;
+                    pc = if (take) try self.branch(instr.imm.br_cast.label) else pc + 1;
                 },
 
                 // --- Structured control flow ---

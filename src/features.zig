@@ -46,6 +46,23 @@ pub const Feature = enum(u8) {
     /// **at its own era**; it is not a claim that the spec factors the proposals this way.
     /// Layered on `reference_types` — see `incoherent`.
     multi_table = 15,
+    /// custom-descriptors. ⚠️ **This bit exists because the proposal CHANGES THE
+    /// TYPING OF AN EXISTING INSTRUCTION, not merely because it adds new ones.**
+    /// Under it, `br_on_cast`'s `rt2 <: rt1` requirement is relaxed to "`rt1` and
+    /// `rt2` share a top type" — so the very same module is `assert_invalid` in
+    /// the core testsuite and VALID in `proposals/custom-descriptors/`. There is
+    /// no single answer that satisfies both files, which is exactly the situation
+    /// `wast.featuresForPath` was built for (F4, `proposals/threads`).
+    ///
+    /// ⚠️ **Partially enforced, and say so plainly:** this gates the six D3/D4
+    /// INSTRUCTIONS and the `br_on_cast` rule. It does NOT gate the type-level
+    /// formers — `(exact $t)`, `(descriptor $d)`, `(describes $s)` — because
+    /// `check` walks instructions and those appear in the type section. A module
+    /// using only the type syntax is still accepted with this bit off. Closing
+    /// that needs a type-section pass, which belongs with F5.
+    ///
+    /// Layered on `gc` — see `incoherent`.
+    custom_descriptors = 16,
 
     pub fn name(self: Feature) []const u8 {
         return @tagName(self);
@@ -82,6 +99,8 @@ pub const Set = struct {
         // Multiple tables shipped as part of reference-types, so allowing them while refusing
         // that proposal describes no wasm version that ever existed.
         if (self.has(.multi_table) and !self.has(.reference_types)) return .{ .multi_table, .reference_types };
+        // custom-descriptors extends GC; enabling it alone describes no wasm version.
+        if (self.has(.custom_descriptors) and !self.has(.gc)) return .{ .custom_descriptors, .gc };
         return null;
     }
 };
@@ -123,16 +142,17 @@ fn opFeature(op: opcode.Op) ?Feature {
         .array_new_data, .array_new_elem, .array_fill, .array_copy, .array_init_data, .array_init_elem,
         .extern_convert_any, .any_convert_extern,
         .ref_test, .ref_cast, .br_on_cast, .br_on_cast_fail,
-        // custom-descriptors (Track D3) is filed under `.gc` DELIBERATELY, and it
-        // is under-strict: there is no `custom_descriptors` bit, so a host that
-        // enables GC gets these three too. That matches how D1's `(exact $t)`
-        // machinery was gated and it is the closest TRUE statement available —
-        // these instructions genuinely require GC. Splitting them out needs a new
-        // `Feature` variant, which ripples into `capi.Feature` and `wazmrt.h`
-        // under their comptime pin; that belongs with F5 (surface the set), not
-        // here, where it would make D3's size delta unattributable.
-        .struct_new_desc, .struct_new_default_desc, .ref_get_desc,
         => .gc,
+
+        // custom-descriptors (Tracks D3/D4). ⚠️ D3 filed these under `.gc` because
+        // no `custom_descriptors` bit existed; D4 had to add one anyway — the
+        // proposal RETYPES `br_on_cast`, and a typing rule cannot be filed under
+        // the proposal it modifies. Now that the bit exists, the instructions
+        // belong to it: "requires GC" was the closest true statement available,
+        // not the accurate one.
+        .struct_new_desc, .struct_new_default_desc, .ref_get_desc,
+        .ref_cast_desc_eq, .br_on_cast_desc_eq, .br_on_cast_desc_eq_fail,
+        => .custom_descriptors,
 
         // Exception handling, both encodings.
         .throw, .throw_ref, .try_table, .try_, .catch_, .catch_all, .rethrow, .delegate => .exceptions,
@@ -245,16 +265,16 @@ pub fn firstViolation(gpa: std.mem.Allocator, module: *const Module, fs: Set) !?
 // confirm it really is MVP core), and only then update the number.
 comptime {
     const n = @typeInfo(opcode.Op).@"enum".fields.len;
-    if (n != 251) @compileError(std.fmt.comptimePrint(
-        "opcode.Op has {d} members, features.zig was written against 251. A new opcode must be " ++
+    if (n != 254) @compileError(std.fmt.comptimePrint(
+        "opcode.Op has {d} members, features.zig was written against 254. A new opcode must be " ++
             "classified in opFeature() before this number is updated — an unclassified opcode " ++
             "silently passes every proposal gate.",
         .{n},
     ));
 }
 
-// The classification behind that 251, recorded so the next person can re-check it cheaply rather
-// than re-deriving it: 79 opcodes are mapped to a proposal in `opFeature`, and the remaining 172
+// The classification behind that 254, recorded so the next person can re-check it cheaply rather
+// than re-deriving it: 82 opcodes are mapped to a proposal in `opFeature`, and the remaining 172
 // are WebAssembly 1.0 core — control flow, numerics, comparisons, loads/stores, locals/globals,
 // `select`, `drop`, `nop`, `memory.size`/`grow`.
 //

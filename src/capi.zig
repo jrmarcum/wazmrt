@@ -183,6 +183,7 @@ const Feature = enum(c_int) {
     exceptions = 13,
     tail_call = 14,
     multi_table = 15,
+    custom_descriptors = 16,
     _,
 
     /// Bound DERIVED from `features.count`, never written out again: the literal that used to sit

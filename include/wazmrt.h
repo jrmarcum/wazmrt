@@ -239,7 +239,12 @@ typedef enum {
     /* NOT a wasm proposal name. Multiple tables shipped inside reference-types, so the spec has
      * no separate switch for them; wazmrt splits them out so a pre-reference-types snapshot can
      * be run at its own era without also losing `funcref`. Requires REFERENCE_TYPES. */
-    WAZMRT_FEATURE_MULTI_TABLE               = 15
+    WAZMRT_FEATURE_MULTI_TABLE               = 15,
+    /* custom-descriptors. ⚠️ Unlike every other entry, disabling this changes the TYPING of an
+     * instruction that exists either way: `br_on_cast` requires a downcast without it and only a
+     * shared top type with it. Gates the six descriptor instructions; does NOT gate the type-level
+     * `(exact $t)` / `(descriptor $d)` / `(describes $s)` syntax. Requires GC. */
+    WAZMRT_FEATURE_CUSTOM_DESCRIPTORS        = 16
 } wazmrt_feature_t;
 
 wazmrt_config_t *wazmrt_config_new(void);

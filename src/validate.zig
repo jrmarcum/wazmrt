@@ -24,6 +24,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const Module = @import("Module.zig");
 const opcode = @import("opcode.zig");
+const features = @import("features.zig");
 const Reader = @import("Reader.zig");
 
 const V = types.ValType;
@@ -163,6 +164,19 @@ pub fn lastFailureSite() FailureSite {
 
 /// Validate an entire module. Returns on the first error.
 pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
+    return validateWith(gpa, module, .{});
+}
+
+/// `validate`, judged by a specific proposal ERA.
+///
+/// ⚠️ **A feature set is not only a filter on which instructions may appear — it
+/// can change what an EXISTING instruction means.** custom-descriptors relaxes
+/// `br_on_cast`s `rt2 <: rt1` requirement, so the identical module is
+/// `assert_invalid` in the core testsuite and VALID in the proposal snapshot.
+/// `validate` keeps the all-features default (wazmrts policy); the `.wast`
+/// runner calls this with `featuresForPath`s answer so each file is judged by
+/// its own era, which is the machinery F4 built for `proposals/threads`.
+pub fn validateWith(gpa: std.mem.Allocator, module: *const Module, era: features.Set) Error!void {
     // Cleared on ENTRY, not on success: a module-level failure below must report "no location"
     // rather than inherit the previous module's.
     site = .{};
@@ -370,7 +384,7 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
     const imported = module.importedFuncCount();
     for (module.functions, module.code, 0..) |type_index, code, n| {
         const ft = module.funcSig(type_index) orelse return error.UndefinedType;
-        validateFunction(arena.allocator(), module, ft, code, null, &refs) catch |e| {
+        validateFunction(arena.allocator(), module, ft, code, null, &refs, era) catch |e| {
             // Locate the failure for the diagnostic. `validateFunction` leaves `site.pc_hint` at the
             // instruction it stopped on; mapping that to a byte offset costs a re-decode of this one
             // body, which is fine because it happens **only on failure** — the same cold-path trick
@@ -567,7 +581,7 @@ fn validateConstExpr(module: *const Module, expr: []const u8, expected: V, self_
     if (sp != 1 or !subtypeOf(module, stack[0], expected)) return error.TypeMismatch;
 }
 
-fn validateFunction(a: std.mem.Allocator, module: *const Module, ft: Module.FuncType, code: Module.Code, widths: ?[]u8, refs: ?*const std.DynamicBitSetUnmanaged) Error!void {
+fn validateFunction(a: std.mem.Allocator, module: *const Module, ft: Module.FuncType, code: Module.Code, widths: ?[]u8, refs: ?*const std.DynamicBitSetUnmanaged, era: features.Set) Error!void {
     // locals = parameters ++ declared locals (expanded from run-length form).
     var locals: std.ArrayList(V) = .empty;
     try locals.appendSlice(a, ft.params);
@@ -591,7 +605,7 @@ fn validateFunction(a: std.mem.Allocator, module: *const Module, ft: Module.Func
     const local_init = try a.alloc(bool, locals.items.len);
     for (local_init, locals.items, 0..) |*init, t, i| init.* = i < n_params or !t.isNonNullRef();
 
-    var v: FuncValidator = .{ .a = a, .module = module, .refs = refs, .locals = locals.items, .results = ft.results, .local_init = local_init, .widths = widths, .body_len = instrs.len };
+    var v: FuncValidator = .{ .a = a, .module = module, .refs = refs, .locals = locals.items, .results = ft.results, .local_init = local_init, .widths = widths, .body_len = instrs.len, .era = era };
     // The whole body is an implicit block of type [] -> results; its trailing
     // `end` closes this frame.
     try v.pushCtrl(.block, empty, ft.results);
@@ -641,7 +655,11 @@ pub fn dropSelectWidths(a: std.mem.Allocator, module: *const Module, ft: Module.
     // `refs` is null: this is a LOWERING pass, not a verdict — the caller has
     // already validated (or will), and a C.refs rejection here would only
     // truncate the width table it is trying to fill in.
-    validateFunction(a, module, ft, code, widths, null) catch |e| {
+    // The era is the all-features default here on purpose: this pass fills in a
+    // width table for an ALREADY-validated body, so it must not re-litigate which
+    // proposal the module belongs to — the permissive set can only ever accept
+    // what the real verdict already accepted.
+    validateFunction(a, module, ft, code, widths, null, .{}) catch |e| {
         if (e == error.OutOfMemory) return error.OutOfMemory;
     };
     return widths;
@@ -670,6 +688,10 @@ const FuncValidator = struct {
     /// Declared function references (C.refs). Null in lowering-only passes,
     /// where a C.refs verdict is not wanted.
     refs: ?*const std.DynamicBitSetUnmanaged,
+    /// The proposal ERA this body is judged by. Not merely a filter on which
+    /// instructions may appear: custom-descriptors RETYPES `br_on_cast`, so the
+    /// answer to "is this module valid" genuinely depends on it.
+    era: features.Set,
     locals: []const V,
     results: []const V,
     /// Whether each local is currently known-initialized (params + defaultable
@@ -699,6 +721,32 @@ const FuncValidator = struct {
 
     fn pushValT(self: *FuncValidator, t: V) Error!void {
         try self.vals.append(self.a, .{ .val = t });
+    }
+
+    /// custom-descriptors (D4): the type the DESCRIPTOR operand of a `*_desc_eq`
+    /// cast must have, given the cast's target reference type.
+    ///
+    /// The target must name a CONCRETE type that HAS a descriptor — an abstract
+    /// head (`any`, `none`, …) has none and neither does a plain struct, so
+    /// `ref.cast_desc_eq (ref any)` is invalid rather than vacuously true.
+    ///
+    /// 🔒 **The operand's exactness MIRRORS the target's.** An exact cast asks "is
+    /// this value exactly `$t`, described by exactly this object?", so an inexact
+    /// descriptor operand would let some `$d2 <: $d` be supplied and the runtime
+    /// identity check would then be comparing against something the static type
+    /// never promised. An INEXACT cast is content with a subtype's descriptor,
+    /// because it is equally content with a subtype's value.
+    /// `ref_cast_desc_eq.wast` asserts both directions — including the case where
+    /// the descriptor is a NULL of the inexact type, which a nullability-only
+    /// check would wave through.
+    fn descOperandType(self: *FuncValidator, rt: opcode.RefType) Error!V {
+        const ti = switch (rt.heap) {
+            .concrete => |t| t,
+            else => return error.InvalidDescriptor, // "type any does not have a descriptor"
+        };
+        if (ti >= self.module.comp_types.len) return error.UndefinedType;
+        const d = self.module.descriptorOf(ti) orelse return error.InvalidDescriptor;
+        return V.concreteRefEx(true, .@"struct", d, rt.exact);
     }
 
     /// 🔒 custom-descriptors: a type that declares a `(descriptor $d)` may only be
@@ -1708,16 +1756,43 @@ const FuncValidator = struct {
                 _ = try self.popExpect((try refTypeValType(self.module, instr.imm.ref_cast)).refHeap().top().valType(true));
                 try self.pushValT(try refTypeValType(self.module, instr.imm.ref_cast));
             },
+            // custom-descriptors (D4): `ref.cast_desc_eq` is `ref.cast` plus a
+            // DESCRIPTOR operand, and it succeeds only when the value's descriptor
+            // is that very object. The descriptor is pushed last, so it pops first.
+            .ref_cast_desc_eq => {
+                _ = try self.popExpect(try self.descOperandType(instr.imm.ref_cast));
+                _ = try self.popExpect((try refTypeValType(self.module, instr.imm.ref_cast)).refHeap().top().valType(true));
+                try self.pushValT(try refTypeValType(self.module, instr.imm.ref_cast));
+            },
 
             // GC cast-branches. The label carries `[t* rt]` (the ref plus a prefix
             // `t*`); the operand is `[t* src]`. `br_on_cast` branches when the ref
             // matches `dst` (passing it as `dst`) and falls through otherwise;
             // `br_on_cast_fail` is the mirror. `dst` must be a subtype of `src`.
-            .br_on_cast, .br_on_cast_fail => {
+            .br_on_cast, .br_on_cast_fail, .br_on_cast_desc_eq, .br_on_cast_desc_eq_fail => {
                 const bc = instr.imm.br_cast;
+                const fires_on_match = instr.op == .br_on_cast or instr.op == .br_on_cast_desc_eq;
+                // The `_desc_eq` pair takes a DESCRIPTOR operand above the ref, so
+                // it is popped before anything else — including before the label's
+                // prefix types, exactly as the ref itself is.
+                const with_desc = instr.op == .br_on_cast_desc_eq or instr.op == .br_on_cast_desc_eq_fail;
+                if (with_desc) _ = try self.popExpect(try self.descOperandType(bc.dst));
                 const src_vt = try refTypeValType(self.module, bc.src);
                 const dst_vt = try refTypeValType(self.module, bc.dst);
-                if (!subtypeOf(self.module, dst_vt, src_vt)) return error.TypeMismatch; // a downcast
+                // ⚠️ **THE ONE PLACE A PROPOSAL RETYPES AN EXISTING INSTRUCTION,
+                // and the reason `custom_descriptors` had to become a Feature.**
+                // The GC rule is `rt2 <: rt1` — the branch must be a DOWNCAST.
+                // custom-descriptors relaxes it to "same top type", because with
+                // `exact` types a legitimate target need not be a subtype of the
+                // source (`(ref (exact $t))` is not below `(ref $t)`'s siblings).
+                // The corpus states the conflict outright: `br_on_cast 0 eqref
+                // anyref` is `assert_invalid` in the CORE `br_on_cast.wast` and a
+                // VALID module in `proposals/custom-descriptors/br_on_cast.wast`.
+                // There is no single answer, so each file is judged by its era —
+                // exactly what F4 built `featuresForPath` for.
+                if (self.era.has(.custom_descriptors)) {
+                    if (dst_vt.refHeap().top() != src_vt.refHeap().top()) return error.TypeMismatch; // cross-hierarchy
+                } else if (!subtypeOf(self.module, dst_vt, src_vt)) return error.TypeMismatch; // a downcast
                 const lt = try self.labelTypesAt(bc.label); // [t* carried]
                 if (lt.len == 0) return error.TypeMismatch;
                 // `rt1 \ rt2` — the source type MINUS what the cast would have
@@ -1735,7 +1810,7 @@ const FuncValidator = struct {
                 // that need it — so `null-diff`, the test named for exactly this,
                 // was rejected: it branches `(ref null any)` into a label typed
                 // `(ref any)`.
-                const carried = if (instr.op == .br_on_cast) dst_vt else diff;
+                const carried = if (fires_on_match) dst_vt else diff;
                 if (!subtypeOf(self.module, carried, lt[lt.len - 1])) return error.TypeMismatch;
                 const prefix = lt[0 .. lt.len - 1]; // t*
                 _ = try self.popExpect(src_vt); // the ref operand (top)
@@ -1747,7 +1822,7 @@ const FuncValidator = struct {
                 // NULLABLE, a null would have branched, so the fall-through ref is
                 // non-null — pushing `src_vt` unchanged over-approximated and
                 // rejected valid code that feeds it to a `(ref …)` parameter.
-                try self.pushValT(if (instr.op == .br_on_cast) diff else dst_vt);
+                try self.pushValT(if (fires_on_match) diff else dst_vt);
             },
 
             // GC: the extern↔any bridge. Both are representation-preserving and

@@ -83,24 +83,27 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
 
 ## 📊 CURRENT spec-testsuite score (2026-08-17) — EVERY CORE SPEC FILE IS AT ZERO
 
-**284 files — 63,391 assertions passed / 4 failed / 497 skipped**, and `zig build conformance -Dbaseline=tools/conformance-baseline.txt` reports **0 regressions**. This is the number to quote;
-every snapshot below it is older and kept as history. *(Superseded same day: 63,315 / 16 / 578, then 63,344 / 53 / 515, then 63,190 / 81 / 673, then 62,898 / 81 / 965.)*
+**284 files — 63,731 assertions passed / 2 failed / 144 skipped**, and `zig build conformance -Dbaseline=tools/conformance-baseline.txt` reports **0 regressions**. This is the number to quote;
+every snapshot below it is older and kept as history. *(Superseded same day: 63,391 / 4 / 497, then 63,315 / 16 / 578, then 63,344 / 53 / 515, then 63,190 / 81 / 673, then 62,898 / 81 / 965.)*
 
-**Deliberate spec deviations: ZERO** (the last, `anyfunc`, closed 2026-08-17). **ALL 4 remaining
-failures are custom-descriptors** — `roadmap.md`'s Track D, the only untargeted proposal left.
-**D1, D2, D3 and D5 are all DONE**; only **D4, the descriptor casts**, remains, plus one
-well-diagnosed assertion each in `exact-func-import.wast` (link-time import matching) and
-`exact.wast`. **Next: D4** — see the roadmap, and note its stated prerequisite (widen `Op` to
-`enum(u16)`; one internal tag byte is left).
+✅ **EVERY TARGETED PROPOSAL NOW SHIPS. Track D (custom-descriptors) is COMPLETE — D1 through D5,
+all on 2026-08-17** — and Track P before it. There is no untargeted proposal left.
 
-⚠️ **RANK D4 BY THE SKIP COLUMN.** Its two failures are one each in `br_on_cast.wast` and
-`br_on_cast_fail.wast`; the real size is the **353 skips** in `br_on_cast_desc_eq.wast` (122),
-`br_on_cast_desc_eq_fail.wast` (122) and `ref_cast_desc_eq.wast` (109) — all at ZERO failures
-because their modules do not build. Sixth restatement of R3/R5/P.
+**Deliberate spec deviations: ZERO** (the last, `anyfunc`, closed 2026-08-17). ⚠️ **But the 2
+remaining failures are the FIRST baseline entries that are wazmrt DEFECTS**, not proposals we
+refuse — the baseline gained a group 4 for them, and its old blanket claim ("NONE of them is a
+wazmrt defect") no longer holds:
+- `exact-func-import.wast` (1) — LINK-TIME import matching reads the DECLARED import type where D3
+  taught the RUN-time path to read the defining one. The linker needs `interp.definingFunc`'s walk.
+- `exact.wast` (1) — `(ref exact 0)` without parens around the former must be malformed; the
+  assembler takes it.
 
-⚠️ **D2 AND D3 BOTH MOVED PASSES AND THE GRAND TOTAL DOWN, AND BOTH TIMES THAT WAS CORRECT — read
-this before diffing.** D2: 63,344/53/515 → 63,315/16/578. D3: 63,315/16/578 → 63,391/4/497
-(+76 passes, −12 failures, −81 skips, **−16 total**).
+Both are cheap and diagnosed. **A line in group 4 is a debt, not an explanation** — if that group
+grows, ask why defects are being recorded instead of fixed.
+
+⚠️ **D2, D3 AND D4 EACH MOVED THE GRAND TOTAL DOWN WHILE CLOSING FAILURES, AND EVERY TIME THAT WAS
+CORRECT — read this before diffing.** D2: 63,344/53/515 → 63,315/16/578. D3: → 63,391/4/497.
+D4: → 63,731/2/144 (+340 passes, −2 failures, **−353 skips**, −15 total).
 - Passes lost to a **FALSE-PASS collapse**: those modules had been assembling with a clause
   silently DROPPED, so their assertions ran against a module the file did not write. Assembled
   correctly they are refused at the next unimplemented instruction → a skip. Third instance now
@@ -114,7 +117,7 @@ this before diffing.** D2: 63,344/53/515 → 63,315/16/578. D3: 63,315/16/578 �
 assertions passing where 5 passed / 2 failed / 69 skipped. ⚠️ **It was carried in the baseline as
 "2 assertions" and was worth 69 SKIPS — a 35× undercount**, because a module the assembler cannot
 build sends every assertion targeting it into `NoTarget`. Third time this has been re-learned
-(R3, R5, P): *rank by assertions unblocked, not failures closed.* **D2 is the fifth instance** —
+(R3, R5, P): *rank by assertions unblocked, not failures closed.* **D2 was the fifth instance and D4 the sixth: D4 was carried as TWO failures and was worth 353 SKIPS** —
 23 nominal assertions, 63 skips moved — so rank D3/D4 by the 578-skip pool, not the 16 failures.
 🔒 **P3 was scoped as a memory-safety item and turned out not to be one, for a reason worth
 keeping: every bounds check was ALREADY byte-based.** `memRange`/`load`/`store` compare against
@@ -315,8 +318,8 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
   *exactly* its ceiling; the file was two builds old. **An exactly-zero delta is a timestamp check
   waiting to happen.**
 
-**Unit tests: 691/691** (`zig build test --summary all`, 2026-08-17 end of day, from an NTFS cwd —
-`test-safe` 691/691, `test-security` 3/3). The day's additions: F3+F4 added 5 (era policy ×3,
+**Unit tests: 709/709** (`zig build test --summary all`, 2026-08-17 end of day, from an NTFS cwd —
+`test-safe` 709/709, `test-security` 3/3). The day's additions: F3+F4 added 5 (era policy ×3,
 multi_table gating, the every-feature-settable regression test), the skip-scoring split added 1,
 and **Track D2 added 8** — the three type-identity keys (`canonicalizeTypes`, `interp.groupKey`,
 `typematch.eqMember`) each with a wrong-answer test and a control arm, the emitted BYTES, the
@@ -327,8 +330,8 @@ answer wrong), exactness propagation in `ref.get_desc` both ways, the exact desc
 allocator/type agreement on both validator paths, the emitted BYTES for all three opcodes, the
 distinct `NullDescriptor` trap, the cross-instance EXACT cast, the funcref import-chain walk, and
 regression tests for the three shipped defects D3 uncovered.
-*(Superseded: 667 and 651 earlier the same day.)*
-⚠️ **From this repo's own `D:` cwd the same run reads 687/691 (4 skipped)** — `std.testing.tmpDir`
+*(Superseded: 691, 667 and 651 earlier the same day.)*
+⚠️ **From this repo's own `D:` cwd the same run reads 705/709 (4 skipped)** — `std.testing.tmpDir`
 scratches under `.zig-cache/tmp` relative to the CWD, which exFAT cannot give symlinks, and
 redirecting the zig cache does NOT reach it. Quote NTFS numbers.
 *(Superseded: 633 earlier the same day; 631, labelled "final" on 2026-08-14. Below is that entry,

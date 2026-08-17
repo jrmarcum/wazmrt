@@ -529,6 +529,30 @@
 # `refMatches`'s cross-instance arm ignored `rt.exact`, so an exact cast accepted a subtype across
 # a module boundary — D1's type confusion in the one path D1's tests could not reach.
 
-wazmrt.exe  976384
-wazmrt.lib  1042012
-wazmrt.dll  898048
+# RAISED 2026-08-17 (TRACK D4 — the descriptor casts, and the `Op` widening it required).
+# Reference configuration.
+#
+#   artifact       before         after       share
+#   wazmrt.exe    976,384       978,944     +2,560
+#   wazmrt.lib  1,042,012     1,046,958     +4,946
+#   wazmrt.dll    898,048       900,608     +2,560
+#
+# 4,946 bytes (unpadded lib) for: `ref.cast_desc_eq` + `br_on_cast_desc_eq`/`_fail` through
+# decode/validate/emit/interpret, `descEqMatches`, a `custom_descriptors` Feature threaded into
+# `capi.zig` and `wazmrt.h`, the era feature-set plumbed through `validateWith` into
+# `FuncValidator`, and `Op` widened to `enum(u16)` so internal tags can live above `0xff`.
+#
+# Corpus 63,391 -> 63,731 passed, 4 -> 2 failed, 497 -> 144 skipped, 0 regressions. Every
+# custom-descriptors file is now clean except one assertion each in `exact-func-import.wast`
+# (link-time import matching) and `exact.wast`. **353 skips closed** — which is what the roadmap
+# said to size D4 by, and why its two nominal failures were never the number that mattered.
+#
+# ⚠️ A quarter of this is not D4's instructions at all: `custom_descriptors` had to become a real
+# `Feature` because the proposal RETYPES `br_on_cast`, so the identical module is `assert_invalid`
+# in the core testsuite and VALID in the proposal snapshot. That needs an era, an era needs a
+# feature bit, and a feature bit needs the C ABI. There was no cheaper way to make both files
+# right.
+
+wazmrt.exe  978944
+wazmrt.lib  1046958
+wazmrt.dll  900608

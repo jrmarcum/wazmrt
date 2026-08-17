@@ -193,7 +193,7 @@ CLOSED, AND SO IS EVERYTHING AFTER IT.** R1–R5, R7, R9 and R10 are done, R6 wa
 by R5, the singleton batch took the remainder, and the bottom-type lattice took the last of it —
 corpus is **104 failures / 62,889 passing / 951 skipped** (measured 2026-08-14).
 
-🏁 **EVERY CORE SPEC FILE IS AT ZERO FAILURES.** Corpus **4 failures / 63,391 passing / 497 skipped** (2026-08-17 end of day), and the baseline gate reports **0 regressions**. **LIVE SPLIT: ALL 4 are non-defects; deliberate deviations are ZERO** — every one is custom-descriptors, i.e. Track D, of which **D1, D2, D3 and D5 now ship, leaving only D4 (the descriptor casts)** — TRACK P IS DONE (custom-page-sizes implemented 2026-08-17: 4 files, 0 failed, 0 skipped). ⚠️ **Rank D4 by the 353 SKIPS behind its 2 failures**, not by the failures. ⚠️ D2 and D3 each dropped the pass and grand-total columns for correct reasons; see testing.md before reading that as a regression. *(Superseded: 16 failures / 63,315 passing / 578 skipped; 53 / 63,344 / 515.)* The 8 era-pinned `proposals/threads` assertions CLOSED via F3+F4, and the skip total fell 965 → 673 via the skip-scoring split; both same day. *(Superseded: 89 failures / 62,890 passing / 965 skipped.)* ⚠️ **14 of the previously-reported 104 were a SCORING BUG** — a bare `(module …)` build failure never consulted `isOurLimitation`, so our own gaps were counted as defects here while scoring as skips everywhere else. `delegate` was one of them, never a deviation; `anyfunc`, the last real one, was closed 2026-08-17. *(Superseded:)* 90 failures / 62,889 passing; 89 non-defects + ONE deliberate deviation; LIVE SPLIT: 102 by design + 2 recorded deliberate
+🏁 **EVERY CORE SPEC FILE IS AT ZERO FAILURES, AND SO IS EVERY PROPOSAL FILE BUT TWO.** Corpus **2 failures / 63,731 passing / 144 skipped** (2026-08-17 end of day), 0 regressions. ✅ **TRACK D (custom-descriptors) IS COMPLETE — D1–D5 all ship**, and TRACK P before it. ⚠️ **The 2 are the FIRST baseline entries that are wazmrt defects rather than untargeted proposals** (new group 4: link-time exact import matching, and one assembler accept-invalid) — deliberate deviations are still ZERO. ⚠️ D2/D3/D4 each dropped the pass and grand-total columns for correct reasons; see testing.md before reading that as a regression. *(Superseded: 4 / 63,391 / 497; 16 / 63,315 / 578; 53 / 63,344 / 515.)* The 8 era-pinned `proposals/threads` assertions CLOSED via F3+F4, and the skip total fell 965 → 673 via the skip-scoring split; both same day. *(Superseded: 89 failures / 62,890 passing / 965 skipped.)* ⚠️ **14 of the previously-reported 104 were a SCORING BUG** — a bare `(module …)` build failure never consulted `isOurLimitation`, so our own gaps were counted as defects here while scoring as skips everywhere else. `delegate` was one of them, never a deviation; `anyfunc`, the last real one, was closed 2026-08-17. *(Superseded:)* 90 failures / 62,889 passing; 89 non-defects + ONE deliberate deviation; LIVE SPLIT: 102 by design + 2 recorded deliberate
 deviations** — `anyfunc` (`obsolete-keywords.wast`, the pre-standard spelling of `funcref`, kept
 because two real `.wat` inputs use it) and `delegate` (`legacy/try_delegate.wast`, refused loudly
 because no oracle exists to route it). **There are no undiagnosed failures left**, which changes what
@@ -1326,7 +1326,7 @@ A memory declares its own page size — `(memory 1 (pagesize 1))`, byte-granular
 - **Verify** beyond the 2 assertions: a 1-byte-page memory must reject an out-of-bounds access at
   BYTE granularity. The assertions alone would not catch a bounds check that silently kept 64 KiB.
 
-### Track D — custom-descriptors (79 assertions, 13 files). The largest feature since GC
+### ✅ Track D — custom-descriptors. **COMPLETE 2026-08-17 (D1–D5).** The largest feature since GC
 
 Descriptors make a struct type's runtime description a first-class value, which in turn makes casts
 EXACT. It extends GC, which wazmrt ships — an extension of a shipped proposal, not a new subsystem.
@@ -1489,21 +1489,51 @@ EXACT. It extends GC, which wazmrt ships — an extension of a shipped proposal,
   all: it asserts that **every GC allocation produces an EXACT reference**, which is one argument
   per allocator once `struct.new`'s result is exact — and D3 needed that anyway, because
   `(global (ref (exact $d)) (struct.new $d))` appears throughout `struct_new_desc.wast`.
-- 🎯 **D4 — NEXT, and the LAST of Track D. The descriptor casts:** `ref.cast_desc_eq`
-  (`0xFB 0x23`, null variant `0x24`) and `br_on_cast_desc_eq`/`_fail` (`0x25`/`0x26`) — opcodes
-  from binaryen's table, the same source D3's three came from and which wasmtime confirmed.
-  ⚠️ **DO THE `Op` → `enum(u16)` WIDENING FIRST** (see D3's note): three tags are needed and one
-  byte is free.
-  ⚠️ **Rank it by SKIPS, not failures.** Its two failures are one each in `br_on_cast.wast` and
-  `br_on_cast_fail.wast`; the real size is the **353 skips** in `br_on_cast_desc_eq.wast` (122),
-  `br_on_cast_desc_eq_fail.wast` (122) and `ref_cast_desc_eq.wast` (109), all at ZERO failures
-  because their modules do not build. Sixth restatement of the R3/R5/P lesson.
-  **What D3 leaves ready:** `canonMatches` is the cross-instance comparison with exactness already
-  honoured, `HeapObject.descriptor` is the value to compare, and `ref.get_desc`'s exactness
-  propagation is the rule the `_desc_eq` casts will need in mirror form.
-  **Also still open, and NOT D4:** `exact-func-import.wast`'s last failure — link-time import
-  matching reads the DECLARED type where D3 taught the RUN-time path to read the defining one.
-  The linker needs `definingFunc`'s walk. One assertion, well diagnosed, cheap.
+- ✅ **D4 — DONE 2026-08-17. TRACK D IS COMPLETE.** `ref.cast_desc_eq` (`0xFB 0x23`, null variant
+  `0x24`) and `br_on_cast_desc_eq`/`_fail` (`0x25`/`0x26`). All three files **0 failed / 0
+  skipped**, and `br_on_cast.wast`/`br_on_cast_fail.wast` closed with them.
+  **It was carried as TWO failures and was worth 353 SKIPS.** The instruction to rank it by skips
+  was right; sixth instance of R3/R5/P.
+  🔒 **The load-bearing rule is IDENTITY, not type equality.** `$b1` and `$b2`, two allocations of
+  one descriptor type, answer every type-level question identically — canonical id, subtype chain,
+  exactness. An implementation that compared TYPES would satisfy every shape assertion in
+  `ref_cast_desc_eq.wast` and still be `ref.cast` wearing a different name. Written by
+  construction, with the cross-instance variant on top.
+  ⚠️ **The null descriptor traps FIRST — before the value's own null-ness, and even when the
+  target is nullable.** Get the order wrong and a trap becomes a successful cast to null.
+  🆕 **D4 had to add a `custom_descriptors` FEATURE, and the reason is new to this project: the
+  proposal RETYPES AN EXISTING INSTRUCTION.** `br_on_cast` requires a downcast (`rt2 <: rt1`) in
+  the merged spec and only a shared top type under custom-descriptors — so `br_on_cast 0 eqref
+  anyref` is `assert_invalid` in the CORE `br_on_cast.wast` and a VALID module in the proposal's
+  copy of the same file. No single answer satisfies both. `wast.featuresForPath` now judges each
+  by its era, which is F4's machinery used **in the other direction for the first time**: this is
+  the one entry that is opt-IN by directory, because the era that LACKS the proposal is the merged
+  spec, i.e. every other file. The bit is threaded into validation through a new `validateWith`,
+  and reaches `capi.Feature` and `wazmrt.h` under their comptime pin.
+  ⚠️ **Partially enforced, and the code says so:** the bit gates the six D3/D4 INSTRUCTIONS and
+  the `br_on_cast` rule, but NOT the type-level formers (`(exact $t)`, `(descriptor $d)`,
+  `(describes $s)`) — `features.check` walks instructions and those live in the type section.
+  Closing that needs a type-section pass, which belongs with F5.
+  🔧 **The `Op` → `enum(u16)` widening happened here, as D3 said it must.** Only the NEW tags moved
+  above `0xff` (`0x100`+); the pre-existing ones keep their byte values because `immediateKind` and
+  `simpleSig` switch on those literals. That is enough to close the class: `@enumFromInt(b0)` on a
+  wire byte can no longer name a new tag, so `decodeBody`'s raw-byte guard is now FROZEN — it lists
+  the pre-widening tags and nothing added later can need an entry. Five sites went through a new
+  `opcode.wireByte(op) ?u8` instead of a bare `@intFromEnum`, which turns "this op has a one-byte
+  encoding" into a checked question rather than a silent truncation.
+  ⚠️ **Inversion note worth keeping:** `descEqMatches`'s type check reports as caught by nothing,
+  and that is correct rather than a missing test — for a VALIDATED module the identity check
+  subsumes it (a descriptor object belongs to exactly one described object). It stays as defence
+  for the UNVALIDATED run path, same standing as the `hardening` tests, and the code says so.
+  Two other inversions were silent until the tests were sharpened: the branch DIRECTION is only
+  visible in the carried TYPE (a block typed `anyref` accepts either shape), and a forgotten
+  descriptor pop is invisible when the block ends in a stack-polymorphic `return`.
+- **Still open, and NOT part of Track D** — the two remaining corpus failures, now baseline
+  group 4 ("diagnosed gaps in shipped functionality", a group that did not exist before):
+  `exact-func-import.wast` (1) — LINK-TIME import matching reads the DECLARED import type where
+  D3 taught the RUN-time path to read the defining one; the linker needs `interp.definingFunc`'s
+  walk. `exact.wast` (1) — `(ref exact 0)` without parens around the former must be malformed and
+  the assembler takes it. Both cheap, both diagnosed.
 
 **Cost:** expect the largest ceiling raises on the roadmap since the GC batches — D1 alone is
 comparable to the bottom-type lattice (+1 KB for 9 variants) or larger, and it touches decoder,
