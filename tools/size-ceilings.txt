@@ -327,6 +327,34 @@
 # (`Get-Volume D` → "Full Repair Needed"), not the "event-51 paging errors" this note first claimed
 # and not antivirus; the physical disk reports Healthy. See `INDEX.md` and `best-practices.md` §2.
 
+# ⚠️ GATE HOLE FOUND 2026-08-17 — `wazmrt.lib`'s BYTE SIZE DEPENDS ON WHERE YOU BUILD, so the lib
+# ceiling is only reproducible under the conditions it was measured in. HEAD (c367f2f, clean tree)
+# measures, with no code change whatsoever:
+#
+#   build location / local cache dir                         wazmrt.lib     delta
+#   C: copy of the tree, default .zig-cache beside it         1,029,730          0   <- the ceiling
+#   D: repo, cache C:\...\scratchpad\zcache                   1,029,882       +152
+#   D: repo, cache C:\...\scratchpad\zc2-a-much-much-...      1,029,922       +192
+#   D: repo, cache C:\zig-cache\wazmrt                        1,029,738         +8
+#
+# The static `.lib` is an UNPADDED archive that embeds object-file and source paths, so the source
+# tree's path and the cache path both land in the bytes. `wazmrt.exe` and `wazmrt.dll` measured
+# EXACTLY at ceiling in every one of these configurations — they are PE files whose alignment
+# padding absorbs the difference, which is the same three-way pattern the R7 and `anyfunc` entries
+# above describe from the other direction.
+#
+# 🎯 **Consequence: a lib delta under ~1 KB is NOT evidence of code growth until you have re-measured
+# in the reference configuration.** Reproduce the ceiling before charging bytes to a change —
+# otherwise this gate hands out false OVERs (and, worse, false UNDERs that invite lowering a
+# ceiling to a number the next machine cannot hit). This is the third hole of the same family in
+# this file: the stale-artifact trap (R3) and the -Dwat=false false win (Track 2c) are the others,
+# and the shared rule is **a gate that measures whatever is on disk must know what produced it** —
+# here, "what produced it" includes WHERE.
+#
+# Not fixed in code: making the archive path-independent is a zig/linker concern, and the exe+dll
+# are already stable. Recorded so the next pass does not spend an afternoon attributing +152 bytes
+# to a change that did not cause them. (This one nearly ate a ceiling raise.)
+
 wazmrt.exe  964608
 wazmrt.lib  1029730
 wazmrt.dll  888832

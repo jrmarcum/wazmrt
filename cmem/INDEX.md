@@ -9,44 +9,66 @@ and revised without wading through one giant file. Keep files small and single-t
 
 ---
 
-## 🚨 ENVIRONMENT BLOCKER (2026-08-17) — `zig build` CANNOT RUN from this repo on D:
+## ✅ RESOLVED 2026-08-17 (afternoon) — builds run from D: again. THE FIX IS ONE ENV VAR.
 
-**If a build fails with a bare `error: Unexpected` — no step, no path, and `--verbose` adds
-nothing — it is NOT your change.** Confirmed by stashing the one edited file and rebuilding
-UNMODIFIED HEAD, which reproduced it exactly.
-
-**CAUSE: the `D:` FILESYSTEM needs repair.** `Get-Volume -DriveLetter D` reports
-**`HealthStatus: Warning`, `OperationalStatus: Full Repair Needed`**. This repo lives on a **PNY
-USB 3.2 flash drive formatted exFAT** — the same removable volume `known-issues.md` already notes
-for `test-security` ("run from an NTFS cwd", because exFAT has no symlinks). The damage explains
-both corrupted caches seen that day: zig's `.zig-cache` (even `zig build --help` failed until it was
-moved aside) and git's commit-graph.
-
-**FIX: repair the volume.** `Repair-Volume -DriveLetter D -Scan`, then `chkdsk D: /f` from an
-elevated prompt. Builds DID run from D: through 2026-08-04 (cache timestamps), so this is a
-regression in the volume, not a permanent property of exFAT.
-
-**Workaround until then — copy the tree to `C:` and build there:**
+**Set the zig LOCAL CACHE to an NTFS path and build normally from this repo's own cwd:**
 
 ```
-robocopy . <C:\path> /E /XD .git .zig-cache zig-out
+ZIG_LOCAL_CACHE_DIR=C:\zig-cache\wazmrt        # or: zig build --cache-dir C:\zig-cache\wazmrt
 ```
 
-`zig build test` / `conformance` / `size` all pass from the copy. Everything committed on
-2026-08-17 was verified that way, including the size ceilings.
+Verified this way from `D:\…\wazmrt` directly: `zig build`, `dll`, `size` (all three ceilings
+EXACT), `test` and `test-safe` (633 tests), `features` — all green, repeatedly, in one cache.
+**No tree copy is needed any more.**
 
-⚠️ **Clearing the caches FEELS like a fix and is not** — both are regenerable, so clearing them
-moves the symptom off the cause.
+### ⚠️ THIS IS THE **FOURTH** DIAGNOSIS OF ONE SYMPTOM, AND THE THIRD ONE WAS ALSO WRONG
 
-⚠️ **TWO WRONG DIAGNOSES WERE PUBLISHED BEFORE THIS ONE — the commit messages of `e507d1c`,
-`ed05905`, `458bc96` and `46a0bdb` all say "hardware errors" and name event ID 51. THAT IS WRONG
-and cannot be edited out of pushed history; this section supersedes it.** The event-51 "paging
-operation" entries are real but are **a single stale burst from 8/10, a week before the failures**,
-and the PHYSICAL disk reports `Healthy` — likely the interrupted write that damaged the filesystem
-in the first place, which is the classic failure mode for removable media. Antivirus was the second
-wrong guess: Defender is **stopped** on this machine (Datto EDR is the active agent) and logged
-nothing during a probe build. **Identify the LAYER — physical disk vs filesystem vs OS vs
-application — before naming a cause.** See `best-practices.md` §2.
+The bare `error: Unexpected` was blamed on, in order: **hardware/event-51** (commits `e507d1c`,
+`ed05905`, `458bc96`, `46a0bdb` — wrong, unretractable from pushed history), **antivirus** (wrong;
+Defender is stopped), and then **a damaged exFAT filesystem** (the section this replaces).
+
+**The third one was wrong too, and it was the most convincing.** The volume genuinely reported
+`Full Repair Needed`, the repair genuinely fixed it (`Get-Volume D` now reports `Healthy` / `OK`),
+**and the build still failed exactly as before.** A real, independently-confirmable defect sat at
+the wrong layer and absorbed the blame.
+
+**The ACTUAL cause, isolated by experiment 2026-08-17:** a **`.zig-cache` living on this exFAT
+volume works for exactly ONE build and is then permanently poisoned** — the *second* invocation
+fails with `error: Unexpected`, **even when it is the byte-identical command**, and every later
+build fails until the cache is deleted. Nothing about the source tree, the repo, or the volume's
+health is involved: reads from D: are fine, and a *fresh* cache always builds once.
+
+Proof, each step re-run from a wiped cache:
+
+| experiment | result |
+| --- | --- |
+| minimal `zig init` project, cache on D: | ✅ builds — **not exFAT-inherent, not a zig-vs-exFAT rule** |
+| minimal DLL project, cache on D: | ✅ builds — **not a DLL-step rule either** |
+| wazmrt, fresh cache on D:, 1st build | ✅ |
+| wazmrt, **same command, 2nd build** | ❌ `error: Unexpected` |
+| wazmrt, any command after that failure | ❌ until `rm -rf .zig-cache` |
+| wazmrt, cache on **NTFS**, many builds + configs | ✅ all green |
+
+🎓 **The lesson, and it is the one `best-practices.md` §2 already states — this incident is its
+fourth and most expensive instance: FINDING A REAL DEFECT AT A LAYER IS NOT EVIDENCE THAT IT CAUSES
+YOUR SYMPTOM.** The filesystem really was damaged; repairing it was worth doing; it was not the
+cause. The step that finally worked was **varying one thing at a time** (cache location, project
+size, build step) instead of reasoning about which layer looked guiltiest. ⚠️ **"Clearing the cache
+feels like a fix and is not" — the previous section's warning — was itself backwards.** Clearing
+the cache *is* the fix for one build; the cache LOCATION is the fix for all of them.
+
+### Still true, and unchanged by any of this — `test-security` needs an NTFS **cwd**
+
+`std.testing.tmpDir` scratches under `.zig-cache/tmp` **relative to the CWD**, which is *not* the
+configured cache dir — so redirecting the cache does **not** help it. From D: the suite still reads
+**629/633 (4 skipped)** and `test-security` **1 pass / 2 fail**; from an NTFS cwd it is **633/633**
+and `test-security` 3/3. That is an exFAT property (no reparse points), not a defect:
+
+```
+cd C:\ntfs\dir && zig build --build-file D:\…\wazmrt\build.zig test-security
+```
+
+⚠️ **Quote NTFS numbers.** A D:-cwd run's skips are evidence about the FILESYSTEM, not the sandbox.
 
 ---
 

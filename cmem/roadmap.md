@@ -197,8 +197,11 @@ corpus is **104 failures / 62,889 passing / 951 skipped** (measured 2026-08-14).
 deviations** — `anyfunc` (`obsolete-keywords.wast`, the pre-standard spelling of `funcref`, kept
 because two real `.wat` inputs use it) and `delegate` (`legacy/try_delegate.wast`, refused loudly
 because no oracle exists to route it). **There are no undiagnosed failures left**, which changes what
-this list is for: it is now a record, not a work queue. The remaining work is elsewhere — the OPEN
-C-ABI externref hole in `known-issues.md`, Track 2c, Track 3.
+this list is for: it is now a record, not a work queue. The remaining work is elsewhere — Track 3's
+residual and the PROPOSED Tracks F / P / D at the top of this file. *(Corrected 2026-08-17: this
+line also named "the OPEN C-ABI externref hole" and Track 2c. **Both are CLOSED** — references cross
+the C ABI as checked handles since 2026-08-14 (`known-issues.md`), and Track 2c landed the same day.
+`-Dgc=false`-style PER-PROPOSAL comptime gating was never part of 2c and is still open.)*
 
 Every count below is history; re-measure before trusting any of them (`-Dfailures=600`, and read
 **all three** totals — see the lattice entry on why the per-file FAIL diff alone missed a regression).
