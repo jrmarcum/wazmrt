@@ -35,6 +35,296 @@
 # text should not have to carry the assembler. `-Dwat=false` / `-Dwasi=false` build flags are the
 # recorded compromise; until they exist, every FFI consumer pays for both.
 
-wazmrt.exe  911872
-wazmrt.lib  973600
-wazmrt.dll  845312
+# RAISED 2026-08-13 (R2). Measured ReleaseSmall, Zig 0.16.0, x86_64-windows, static lib from a
+# PLAIN `zig build` (never after `zig build dll`).
+#
+#   artifact     ceiling was    at 3dd41a0 (pre-R2)    after R2      R2's share
+#   wazmrt.exe       911,872               933,888      939,008          +5,120
+#   wazmrt.lib       973,600               998,228      999,296          +1,068
+#   wazmrt.dll       845,312               864,768      864,768               0
+#
+# ⚠️ MOST OF THIS OVERSHOOT IS NOT R2's. The ceilings were ALREADY breached at 3dd41a0 — exe
+# +22,016, lib +24,628, dll +19,456 — by the R1/typematch commits of 2026-08-12, which grew the
+# artifacts without running `zig build size`. R2 is charged +5,120 exe / +1,068 lib / +0 dll, and
+# the rest is drift that this gate was built to catch and did not, because nothing RAN it. The
+# gate works; the workflow around it did not. **A gate only gates the commits that run it** — the
+# lesson is the same shape as "a goal with no gate is a preference", one level up.
+#
+# What bought R2's bytes: `interp.Store` (funcref resolution + the orphan list), `Instance.Global`
+# as a shared cell, per-instance `tag_ids`, the §5.5.6 typed-table decode path, and `wast.zig`'s
+# `module definition`/`instance` commands. The DLL is byte-identical because none of it is
+# reachable from the C ABI surface's own code paths — it is all in code the DLL already carried.
+
+# RAISED 2026-08-13 (R3 — the six GC array bulk ops). Measured ReleaseSmall, Zig 0.16.0,
+# x86_64-windows, static lib from a PLAIN `zig build` (never after `zig build dll`).
+#
+#   artifact     ceiling was    at 6291038 (pre-R3)    after R3      R3's share
+#   wazmrt.exe       939,008               939,008      945,152          +6,144
+#   wazmrt.lib       999,296               999,186    1,007,444          +8,258
+#   wazmrt.dll       864,768               864,768      871,936          +7,168
+#
+# ✅ Unlike R2, ALL of this overshoot is R3's: the pre-R3 commit measures at (exe, dll) or just
+# under (lib, −110) its ceiling, so nothing was inherited. That is what the previous entry's
+# workflow lesson bought — HEAD was measured in a worktree before the ceilings were touched, not
+# assumed.
+#
+# ⚠️ The DLL is +7,168 here, and the R2 entry above recorded +0. That is not drift — it is the
+# first entry whose code the C ABI actually reaches: `array.new_data`/`new_elem`/`fill`/`copy`/
+# `init_data`/`init_elem` are decoder, validator AND interpreter arms, all of which any embedder
+# running a GC module executes. R2's Store/linking work was reachable only from paths the DLL
+# already carried, which is why it cost nothing there.
+#
+# What bought the bytes: six `Op` tags with three new `Imm` shapes (`gc_data`/`gc_elem`/
+# `gc_array_copy`) threaded through `decodeBody`, `immediateKind`, `emitInstr`, `checkStaticIndices`,
+# `FuncValidator.step` and the interpreter dispatch switch — plus `fieldByteSize`/`fieldFromBytes`
+# for the little-endian data-segment decode. Six instructions across six files is the honest price
+# of a proposal piece that was missing rather than merely unoptimised.
+
+# LOWERED 2026-08-13 (R4 — the accept-invalid class). Measured ReleaseSmall, Zig 0.16.0,
+# x86_64-windows, static lib from a PLAIN `zig build` (re-run AFTER `zig build dll`, which
+# overwrites `wazmrt.lib` with the DLL's 20 KB import library — that trap fired during this pass).
+#
+#   artifact       after R3      after R4      R4's share
+#   wazmrt.exe      945,152       944,640            -512
+#   wazmrt.lib    1,007,444     1,007,328            -116
+#   wazmrt.dll      871,936       871,424            -512
+#
+# ✅ A pass that ADDED five validation rules came out SMALLER, and the reason is worth keeping:
+# R4 deleted two workarounds that cost more than the rules do. `(table N reftype initexpr)` no
+# longer synthesizes N copies of the initializer as an element segment (it emits §5.5.6's `0x40`
+# form, one expression), which also retired the `max_table_init_copies` cap that existed only to
+# bound that amplification; and a single-concrete-ref block type no longer interns a function
+# signature. **Removing a workaround can pay for the rule that made it unnecessary.**
+#
+# Lowered rather than left with headroom, per the policy at the top of this file: a ceiling is
+# exact, and a win that is not recorded is headroom for the next unnoticed drift.
+
+# RAISED 2026-08-13 (R5 — the runner gap, and the literal class it exposed). Measured
+# ReleaseSmall, Zig 0.16.0, x86_64-windows, static lib from a PLAIN `zig build` re-run after
+# `zig build dll`.
+#
+#   artifact       after R4      after R5      R5's share
+#   wazmrt.exe      944,640       951,808          +7,168
+#   wazmrt.lib    1,007,328     1,014,058          +6,730
+#   wazmrt.dll      871,424       876,544          +5,120
+#
+# All of it is R5's, and this is the one case where no worktree measurement was needed: the
+# previous commit set these ceilings TO its own measured values, so delta-vs-ceiling and
+# delta-vs-parent are the same number. (That is a property of the exact-ceiling policy, not a
+# general licence to skip the check — attribute first whenever the ceilings carry any slack.)
+#
+# What bought the bytes: `(module quote …)` in the WAST runner (assemble module text at run time,
+# plus the field-vs-module wrapping), `assert_exception`, and — the bulk of it — the strict
+# numeric-literal grammar in `wat.zig`: `validIntLit`/`validFloatLit`/`scanDigits`/`parseIntLitN`,
+# which replace `std.fmt.parseInt`/`parseFloat` as the ARBITER of what is a wasm literal. Those
+# functions are pure syntax and cost real bytes; they also close ~146 accept-invalid assertions
+# that nothing could reach before.
+
+# RAISED 2026-08-13 (R10 — the blockers that blacked out whole files). Measured ReleaseSmall,
+# Zig 0.16.0, x86_64-windows, static lib from a PLAIN `zig build` re-run after `zig build dll`.
+#
+#   artifact       after R5      after R10     R10's share
+#   wazmrt.exe      951,808       953,344          +1,536
+#   wazmrt.lib    1,014,058     1,016,766          +2,708
+#   wazmrt.dll      876,544       878,592          +2,048
+#
+# The smallest raise of the series, and it bought 416 unblocked assertions — most of R10 was
+# CORRECTING rules rather than adding them (`br_table`'s cross-label check was deleted outright, as
+# the spec has no such rule). What did add bytes: two new `Op` tags for `extern.convert_any` /
+# `any.convert_extern` with their decode/validate/execute arms, `popPushVals`, and
+# `closingLabelId`.
+
+# RAISED 2026-08-14 (R9 — the accept-invalid class in the TEXT front end). Measured ReleaseSmall,
+# Zig 0.16.0, x86_64-windows: `zig build dll` then a plain `zig build`, the same sequence on both
+# sides so the static lib is the real one and not the DLL's import library.
+#
+#   artifact     at 6a9dc9b (pre-R9)     after R9      R9's share
+#   wazmrt.exe              953,344       956,928          +3,584
+#   wazmrt.lib            1,016,760     1,020,890          +4,130
+#   wazmrt.dll              878,592       882,176          +3,584
+#
+# ✅ All of it is R9's: the pre-R9 commit measures EXACTLY at its exe/dll ceilings and 6 bytes under
+# the lib one, verified in a worktree before these numbers were touched. No inherited drift.
+#
+# ⚠️ The DLL moves by the same +3,584 as the exe, and that is the point of the pass rather than an
+# accident: `wazmrt_module_new_wat` and `wazmrt_wat_to_wasm` are shipped C-ABI entry points, so the
+# text front end IS embed weight. Every rule R9 adds is one an embedder's `.wat` input now gets
+# checked against — which is the whole safety argument for doing the item at all.
+#
+# What bought the bytes, and note that four of the nine causes cost almost nothing because they
+# DELETE leniency rather than add machinery: `typeUseOrder` + `typeUseRank` + `checkInlineTypeUse`
+# threaded through the five type-use sites; `checkUniqueNames` (a `StringHashMapUnmanaged` over each
+# index space, chosen over the obvious O(n²) scan because a binaryen module carries tens of
+# thousands of named functions and startup is a first-class metric here); `parseQuotedId` plus the
+# `reserved`/`stringchar` rules in the lexer; and `parseDecls`'s `allow_id` parameter.
+
+# RAISED 2026-08-14 (R7 — threads: the legacy bare memory/table index). Measured ReleaseSmall,
+# Zig 0.16.0, x86_64-windows: `zig build dll` then a plain `zig build`.
+#
+#   artifact       after R9      after R7      R7's share
+#   wazmrt.exe      956,928       957,440            +512
+#   wazmrt.lib    1,020,890     1,021,328            +438
+#   wazmrt.dll      882,176       882,176              +0
+#
+# No worktree measurement was needed: R9 set these ceilings to its own measured values, so
+# delta-vs-ceiling and delta-vs-parent are the same number (the exact-ceiling policy's one useful
+# side effect — not a general licence to skip the check when the ceilings carry slack).
+#
+# ⚠️ **The +438 in the static lib is the REAL figure; the other two are that same code seen through
+# PE file alignment.** The `.lib` is unpadded, the `.exe` crossed a 512-byte boundary and rounded to
+# +512, and the `.dll`'s share landed inside padding it already had. The DLL was rebuilt in this same
+# run, so its zero is alignment, not the stale-artifact trap the R3 entry warns about — but that is
+# exactly why the note is here rather than left as an unexplained 0.
+#
+# What bought the bytes: two guarded branches recognising the pre-bulk-memory `(data 0 <offset> …)` /
+# pre-reference-types `(elem 0 <offset> …)` spellings, plus turning the data-segment byte loop's
+# silent `else => {}` into a rejection. Tiny, and it closed a segment that assembled ACTIVE in the
+# source and PASSIVE in the binary.
+
+# RAISED 2026-08-14 (the post-R-list singleton batch — S1/L1 and four smaller rules). Measured
+# ReleaseSmall, Zig 0.16.0, x86_64-windows: `zig build dll` then a plain `zig build`.
+#
+#   artifact       after R7     after batch     batch share
+#   wazmrt.exe      957,440       957,952            +512
+#   wazmrt.lib    1,021,328     1,021,464            +136
+#   wazmrt.dll      882,176       882,176              +0
+#
+# Delta-vs-ceiling is delta-vs-parent again: R7 set these to its own measured values.
+#
+# **+136 bytes of real code for 22 closed failures**, the best ratio since R10 — because five of the
+# six causes REPLACE a rule rather than add one: an equality check becomes a subtype check
+# (`resultsSubtype`), a declared limit becomes a live one, a validation bound becomes the wider
+# correct bound, an index-type parse moves up one level. Only `host_tag` and the `spectest.table64`
+# stub are genuinely new.
+#
+# The DLL is unchanged for the second entry running. That is alignment, not staleness (it was
+# rebuilt in this run) — but note that S1's `host_tag` IS in the DLL's code path, and the C ABI
+# still hands `wazmrt_val_t` externrefs to the guest untagged. See `known-issues.md`: the tag
+# closes the defect for the `.wast` runner and leaves the embedder surface for an owner decision.
+
+# RAISED 2026-08-14 (the BOTTOM-TYPE LATTICE + the legacy-EH clause rule — the last conformance
+# batch). Measured ReleaseSmall, Zig 0.16.0, x86_64-windows: `zig build dll` then a plain
+# `zig build`.
+#
+#   artifact      after batch     after this      share
+#   wazmrt.exe        957,952        958,976     +1,024
+#   wazmrt.lib      1,021,464      1,022,520     +1,056
+#   wazmrt.dll        882,176        882,688       +512
+#
+# Delta-vs-ceiling is delta-vs-parent (the previous entry set these to its measured values).
+#
+# What bought the bytes: three new `RefHeap` variants and six new `ValType` variants with their
+# `top()`/`sub()`/`valType()`/`refHeap()` arms, the decoder's four separate bottom mappings in
+# `readValType` and `readHeapTypeRef`, `subtypeOf`'s hierarchy-keyed concrete-target arm, the
+# assembler's three new shorthand pairs, and a one-flag `catch_all` clause rule. It bought 28
+# assertions (27 of them previously SKIPPED behind `ref_null.wast`'s unbuildable first module) and
+# took every CORE spec file to zero failures.
+#
+# The DLL moves for the first time in three entries: the lattice is decoder + validator +
+# interpreter code, all of which an embedder running a GC module executes.
+
+# TRACK 2c LANDED 2026-08-14 — comptime feature gating. The ceilings below are UNCHANGED, and that
+# is the result: with both features on the artifacts are byte-identical, so the gate costs nothing
+# when it is not used.
+#
+# ⚠️ **These ceilings describe the FULL build and the gate now REFUSES any other.** `zig-out` carries
+# no record of which flags produced what is in it, and running `zig build size` after a
+# `zig build dll -Dwat=false -Dwasi=false` reported the DLL **607,232 bytes UNDER** its ceiling — a
+# false win that reads as an invitation to lower the number and mis-record the real size for good.
+# `size_gate.zig` takes the feature string and errors on anything but `wat,wasi`, the same shape as
+# its existing ReleaseSmall check.
+#
+# Measured ReleaseSmall, Zig 0.16.0, x86_64-windows:
+#
+#   configuration              static lib     DLL          vs full
+#   (default: wat + wasi)       1,022,520     882,688            —
+#   -Dwat=false                   840,962     738,816       −16.3%
+#   -Dwasi=false                  502,178     419,840       −52.4%
+#   -Dwat=false -Dwasi=false      319,916     275,456       −68.8%
+#
+# 🎯 **862 KB → 269 KB for an embedder that needs neither**, which lands within ~47 KB of the
+# 227 KB the DLL measured before the wasm-c-api surface was replaced. That closes the question the
+# Track-1 entry above opened ("IT GOT BIGGER, NOT SMALLER"): the growth really was WAT + WASI + `Io`,
+# and it is now optional rather than structural.
+#
+# ⚠️ **WASI is the bigger half by 3×** — the roadmap named `-Dwat=false` first, and the measurement
+# says the opposite. `wasi.zig` drags in `std.Io`, file handling and `Io.Threaded`; the WAT assembler
+# is mostly its own code. Rank size levers by measurement, not by which one is easier to picture.
+#
+# The freestanding wasm build is UNCHANGED at 37,382 in all four configurations: `wasm_entry.zig`
+# never referenced either module, so both were already dead-stripped there. A gate that changes
+# nothing for an artifact is worth recording as such — it says the artifact was already clean.
+#
+# `zig build features` compiles the C ABI in all four combinations, so a future ungated
+# `root.wasi.…` reference fails there rather than silently rotting the flag. It already earned its
+# keep: `-Dwasi=false` did not compile until six use sites in `capi.zig` were guarded.
+
+# RAISED 2026-08-14 (GC references become owner-carrying — the R2 entity model applied to the `any`
+# hierarchy). exe unchanged 958,976; lib 1,022,520 -> 1,022,972 (+452); dll 882,688 -> 883,200 (+512,
+# i.e. the same +452 rounded up by PE alignment).
+#
+# +452 bytes to close a cross-instance WRONG-ANSWER defect: `Store.resolveGc`, a `GcAddr`, and the
+# owner-slot threading through `allocObject` and the const-expr allocator. The DLL moves because
+# `refMatches`/`gcObject` are on every embedder GC path.
+#
+# Note the fix REPLACES an encoding rather than adding a structure — a bare heap index became
+# (owner, index) in the same 64-bit slot — which is why it is 452 bytes and not a data-structure
+# rewrite. Same shape as R4 coming out smaller: the cheapest fixes change what a value MEANS.
+
+# RAISED 2026-08-14 (store-wide TYPE REGISTRY — cross-module concrete casts answer correctly).
+#
+#   artifact       before        after      share
+#   wazmrt.exe    958,976      964,608     +5,632
+#   wazmrt.lib  1,022,972    1,028,892     +5,920
+#   wazmrt.dll    883,200      887,808     +4,608
+#
+# What bought them: `TypeRegistry` (a content-addressed rec-group intern table + a canonical
+# supertype forest), the structural key builder (`groupKey`/`appendValType`/`appendField`), and
+# `Instance.canon_ids`. It turns a cross-module `ref.test`/`ref.cast (ref $t)` from a REFUSAL into
+# the correct answer, and moves the structural work off the cast path to instantiation.
+#
+# ⚠️ **STARTUP COST: NONE MEASURABLE — and the first measurement said +40%.** Sequential runs
+# showed 6.88 -> 9.60 ms median, which looked like a clear regression. It was machine drift: three
+# repeats climbed 9.60 -> 10.65 -> 11.49 -> 12.90 with no code change at all. An INTERLEAVED A/B of
+# two binaries in one session (60 alternating pairs) put the delta at **+0.01 ms median / -0.07 ms
+# min** — nothing. **Sequential A/B on a loaded box is not a measurement**; it nearly reversed a
+# correct design decision. Interleave, or do not compare.
+
+# RAISED 2026-08-14 (C-ABI reference BOXING — the last hole in the value-handle model).
+#
+#   artifact       before        after      share
+#   wazmrt.exe    964,608      964,608         +0
+#   wazmrt.lib  1,028,892    1,029,720       +828
+#   wazmrt.dll    887,808      888,832     +1,024
+#
+# The exe is unchanged: the CLI never crosses a reference through the C ABI. The cost lands
+# exactly where the feature does, which is the shape a per-surface change should have.
+#
+# What bought them: `Store.ext_refs` (an interned box table with a cap), `boxRef`/`unboxRef`, the
+# `InstanceSlot.store` back-pointer, and `wazmrt_ref_is_valid`. It closes the one value kind that
+# was still handed to embedders as the interpreter's RAW encoding while instances, funcs,
+# memories and globals had been checked handles since ABI 2.
+
+# RAISED 2026-08-17 (`anyfunc` REFUSED — the last deliberate spec deviation closed).
+#
+#   artifact       before        after      share
+#   wazmrt.exe    964,608      964,608         +0
+#   wazmrt.lib  1,029,720    1,029,730        +10
+#   wazmrt.dll    888,832      888,832         +0
+#
+# **+10 bytes, the smallest raise in this file's history**, and the honest figure: the static lib is
+# unpadded, while the exe and DLL absorbed the same 10 bytes inside PE alignment they already had
+# (the R7 entry documents this same three-way pattern from the other direction). Rebuilt in this
+# run, so the two zeros are alignment, not the stale-artifact trap.
+#
+# What bought them: `obsoleteValType` (one string compare) and the `ObsoleteKeyword` error name.
+# It REMOVED a `stringToValType` entry and added a rejection — which is why a conformance fix costs
+# ten bytes rather than a rule's worth. Same shape as R4: the cheapest changes alter what a token
+# MEANS rather than adding machinery.
+#
+# ⚠️ Measured on a COPY of the tree on C:, not in the repo on D: — that volume was throwing
+# event-51 paging errors and `zig build` could not run there at all. See `best-practices.md` §2.
+
+wazmrt.exe  964608
+wazmrt.lib  1029730
+wazmrt.dll  888832

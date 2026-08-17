@@ -37,6 +37,7 @@ pub const Feature = enum(u8) {
     function_references = 11,
     gc = 12,
     exceptions = 13,
+    tail_call = 14,
 
     pub fn name(self: Feature) []const u8 {
         return @tagName(self);
@@ -99,11 +100,17 @@ fn opFeature(op: opcode.Op) ?Feature {
         // Typed function references.
         .call_ref, .return_call_ref, .ref_as_non_null, .br_on_null, .br_on_non_null => .function_references,
 
+        // Tail calls. `return_call_ref` above belongs to function-references, not
+        // here — it arrived with that proposal and is gated with its siblings.
+        .return_call, .return_call_indirect => .tail_call,
+
         // WasmGC: i31, struct, array, equality and the casts.
         .ref_eq, .ref_i31, .i31_get_s, .i31_get_u,
         .struct_new, .struct_new_default, .struct_get, .struct_get_s, .struct_get_u, .struct_set,
         .array_new, .array_new_default, .array_new_fixed, .array_get, .array_get_s, .array_get_u,
         .array_set, .array_len,
+        .array_new_data, .array_new_elem, .array_fill, .array_copy, .array_init_data, .array_init_elem,
+        .extern_convert_any, .any_convert_extern,
         .ref_test, .ref_cast, .br_on_cast, .br_on_cast_fail,
         => .gc,
 
@@ -214,18 +221,23 @@ pub fn firstViolation(gpa: std.mem.Allocator, module: *const Module, fs: Set) !?
 // confirm it really is MVP core), and only then update the number.
 comptime {
     const n = @typeInfo(opcode.Op).@"enum".fields.len;
-    if (n != 238) @compileError(std.fmt.comptimePrint(
-        "opcode.Op has {d} members, features.zig was written against 238. A new opcode must be " ++
+    if (n != 248) @compileError(std.fmt.comptimePrint(
+        "opcode.Op has {d} members, features.zig was written against 248. A new opcode must be " ++
             "classified in opFeature() before this number is updated — an unclassified opcode " ++
             "silently passes every proposal gate.",
         .{n},
     ));
 }
 
-// The classification behind that 238, recorded so the next person can re-check it cheaply rather
-// than re-deriving it: 66 opcodes are mapped to a proposal in `opFeature`, and the remaining 172
+// The classification behind that 248, recorded so the next person can re-check it cheaply rather
+// than re-deriving it: 76 opcodes are mapped to a proposal in `opFeature`, and the remaining 172
 // are WebAssembly 1.0 core — control flow, numerics, comparisons, loads/stores, locals/globals,
 // `select`, `drop`, `nop`, `memory.size`/`grow`.
+//
+// ⚠️ The prose here read "that 238 … 66 opcodes" while the pin above said 240; both halves of a
+// note like this go stale independently, and only the pin is compiler-checked. R3 (2026-08-13)
+// added the six array bulk ops — 68 → 74 mapped, 240 → 246 total — and the core count is
+// unchanged at 172, which is the arithmetic that says the six really did land in `.gc`.
 //
 // ⚠️ Four of those 172 are spelled `@"unreachable"`, `@"if"`, `@"else"` and `@"return"` because
 // they collide with Zig keywords. A grep for `^    [a-z_]` misses all four — which is exactly how

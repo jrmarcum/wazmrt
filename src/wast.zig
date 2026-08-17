@@ -21,6 +21,7 @@ const wat = @import("wat.zig");
 const types = @import("types.zig");
 const Module = @import("Module.zig");
 const interp = @import("interp.zig");
+const typematch = @import("typematch.zig");
 const validate = @import("validate.zig").validate;
 
 const V = types.ValType;
@@ -39,6 +40,41 @@ fn nth(items: []const Sexpr, i: usize) Error!Sexpr {
     return if (i < items.len) items[i] else error.BadCommand;
 }
 /// A form as a string literal (an action/register name), or `error.BadCommand`.
+/// A `(module quote …)` payload is EITHER a complete `(module …)` form or a bare
+/// sequence of module fields (`"(func …)" "(global …)"`) — the spec's text format
+/// allows both, and the corpus uses both, sometimes with the opening `(module`
+/// split across string pieces. Wrap only when the text does not already open one.
+///
+/// The test is deliberately syntactic and cheap: skip whitespace and comments,
+/// then look for `(module` followed by a delimiter. Getting it wrong is safe in
+/// one direction only — wrapping an already-complete module yields
+/// `(module (module …))`, which fails to assemble and would score a malformed
+/// module as correctly rejected **for the wrong reason**, the false-pass shape
+/// R4 hit with `StackUnderflow`. Hence the explicit delimiter check rather than
+/// a bare `startsWith`.
+fn wrapModuleText(a: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var i: usize = 0;
+    while (i < text.len) {
+        switch (text[i]) {
+            ' ', '\t', '\r', '\n' => i += 1,
+            ';' => { // `;;` line comment — a quoted module may lead with one
+                if (i + 1 >= text.len or text[i + 1] != ';') break;
+                while (i < text.len and text[i] != '\n') i += 1;
+            },
+            else => break,
+        }
+    }
+    const rest = text[i..];
+    const kw = "(module";
+    const already = std.mem.startsWith(u8, rest, kw) and
+        (rest.len == kw.len or switch (rest[kw.len]) {
+            ' ', '\t', '\r', '\n', '(', ')', ';', '$' => true,
+            else => false,
+        });
+    if (already) return text;
+    return std.fmt.allocPrint(a, "(module {s})", .{text});
+}
+
 fn asStr(s: Sexpr) Error![]const u8 {
     return switch (s) {
         .string => |x| x,
@@ -51,26 +87,57 @@ pub const Summary = struct {
     failed: usize = 0,
     /// Commands the MVP does not handle yet (assert_invalid, register, …).
     skipped: usize = 0,
-    /// Description of the first failure, for debugging.
+    /// Description of the first failure, for debugging. Aliases `failures[0]`.
     first_failure: ?[]const u8 = null,
+    /// Every failure (up to `max_recorded_failures`), in order.
+    ///
+    /// ⚠️ **Owned by the CALLER's allocator, released by `deinit`.** These used
+    /// to come from `runScript`'s internal arena, which `runScript` then freed on
+    /// the way out — so both readers (`main.zig`, `tools/conformance.zig`)
+    /// printed freed memory and only looked correct because the page allocator
+    /// had not reused the pages yet.
+    failures: std.ArrayList([]const u8) = .empty,
+
+    /// Release the failure messages. Safe to call when there were none.
+    pub fn deinit(self: *Summary, gpa: std.mem.Allocator) void {
+        for (self.failures.items) |m| gpa.free(m);
+        self.failures.deinit(gpa);
+        self.first_failure = null;
+    }
 };
+
+/// Cap on per-file failure messages retained by `Summary.failures`. High enough
+/// that no file in the spec suite is truncated (the worst is ~100), low enough
+/// that a hostile script cannot exhaust memory.
+pub const max_recorded_failures = 512;
 
 /// Parse and run a whole `.wast` source, returning pass/fail counts.
 pub fn runScript(gpa: std.mem.Allocator, src: []const u8) Error!Summary {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    var r: Runner = .{ .a = arena.allocator() };
+    // One store for the whole script: every module a `.wast` file builds can be
+    // `register`ed and imported by a later one, so they all have to agree on what
+    // a reference value means.
+    var store: interp.Store = .init(gpa);
+    defer store.deinit();
+    var r: Runner = .{ .a = arena.allocator(), .msg_a = gpa, .store = &store };
     // Guest linear memory is PAGE-ALLOCATOR owned, so the arena above does NOT
     // reclaim it — every `(memory N)` in every module, plus every `memory.grow`,
     // leaked for the life of the process, and `tools/conformance.zig`'s careful
     // per-file arena did not help either. Deinit the instances explicitly.
     defer {
         for (r.instances.items) |inst| inst.deinit();
-        // The shared `spectest` memory is BORROWED by every importer, so no
-        // instance frees it — but its bytes are page-allocator owned too.
+        // The shared `spectest` memories are BORROWED by every importer, so no
+        // instance frees them — but their bytes are page-allocator owned too.
         if (r.spectest_memory) |m| interp.freeGuestMemory(m.bytes);
+        if (r.spectest_shared_memory) |m| interp.freeGuestMemory(m.bytes);
     }
-    for (try sexpr.parseAll(r.a, src)) |cmd| try r.command(cmd);
+    var lines: std.ArrayList(u32) = .empty;
+    const forms = try sexpr.parseAllWithLines(r.a, src, &lines);
+    for (forms, 0..) |cmd, i| {
+        r.line = lines.items[i];
+        try r.command(cmd);
+    }
     return r.summary;
 }
 
@@ -78,6 +145,11 @@ const HostFunc = interp.Instance.HostFunc;
 
 const Runner = struct {
     a: std.mem.Allocator,
+    /// Allocator for failure messages ONLY — the caller's, not the arena's, so
+    /// the messages survive `runScript`. See `Summary.failures`.
+    msg_a: std.mem.Allocator,
+    /// The store shared by every instance this script builds. See `interp.Store`.
+    store: *interp.Store,
     /// Every instance built by this script, so their page-allocator memories can
     /// be released (the runner arena cannot reclaim those). See `runScript`.
     instances: std.ArrayList(*interp.Instance) = .empty,
@@ -90,26 +162,74 @@ const Runner = struct {
     /// The standard `spectest` shared memory (1 page, max 2) and table (10
     /// funcref, max 20), created lazily and shared by every importer.
     spectest_memory: ?*interp.Instance.Memory = null,
+    /// `spectest.shared_memory` — the threads proposal's second memory export,
+    /// declared `shared`. A SEPARATE object from `spectest_memory`, because the
+    /// whole point of the three assertions that use it is that a shared and a
+    /// non-shared memory do NOT satisfy each other's import.
+    spectest_shared_memory: ?*interp.Instance.Memory = null,
     spectest_table: ?*interp.Instance.Table = null,
+    /// `spectest.table64` — the table64 proposal's 64-bit twin of the above.
+    spectest_table64: ?*interp.Instance.Table = null,
+    /// Cells for the `spectest` constant globals, by name. See `spectestGlobalCell`.
+    spectest_globals: std.StringHashMapUnmanaged(*interp.Instance.Global) = .{},
+    /// `(module definition $M …)` bodies, by `$M` — assembled but NOT
+    /// instantiated, so `(module instance $I $M)` can build fresh instances.
+    definitions: std.StringHashMapUnmanaged([]const u8) = .{},
     /// Interned host externref payloads. A `(ref.extern N)` value is represented
     /// on the value stack as its *index* here (a small integer, never the
     /// `null_ref` = maxInt sentinel), so an externref of any payload — including
     /// one equal to the sentinel — is never misclassified as null (#9).
     extern_pool: std.ArrayList(u64) = .empty,
+    /// 1-based source line of the top-level command being run, prefixed onto
+    /// every failure message so a failure names the assertion that produced it.
+    line: u32 = 0,
     summary: Summary = .{},
 
     fn fail(self: *Runner, comptime fmt: []const u8, args: anytype) void {
         self.summary.failed += 1;
-        if (self.summary.first_failure == null)
-            self.summary.first_failure = std.fmt.allocPrint(self.a, fmt, args) catch "out of memory";
+        if (self.summary.failures.items.len >= max_recorded_failures) return;
+        // `msg_a`, not `a`: the arena dies with `runScript`, and these outlive it.
+        const msg = std.fmt.allocPrint(self.msg_a, "L{d}: " ++ fmt, .{self.line} ++ args) catch return;
+        if (self.summary.first_failure == null) self.summary.first_failure = msg;
+        // Keep EVERY failure, not just the first. Reporting one per file made
+        // 25 distinct decoder defects in `binary.wast` look like one, and sent
+        // the 2026-08-11 triage to the wrong cause on three of its five items —
+        // the first failure names a symptom, and the ones behind it are what say
+        // WHICH symptom. `failed` still counts past the cap.
+        self.summary.failures.append(self.msg_a, msg) catch {};
     }
 
     fn command(self: *Runner, cmd: Sexpr) Error!void {
         const kw = cmd.keyword() orelse return error.BadCommand;
         if (std.mem.eql(u8, kw, "module")) {
             const list = cmd.asList().?;
+            // `(module definition $M …)` DEFINES without instantiating, and
+            // `(module instance $I $M)` instantiates a definition — the pair
+            // `instance.wast` uses to check that instantiation is generative
+            // (two instances of one definition must not share state). Neither was
+            // implemented, so that whole file scored 0 passed / 8 failed / 12
+            // skipped: every failure was the harness, not the runtime.
+            if (list.len > 1) if (list[1].asAtom()) |k2| {
+                if (std.mem.eql(u8, k2, "definition")) return self.moduleDefinition(list);
+                if (std.mem.eql(u8, k2, "instance")) return self.moduleInstance(list);
+            };
             self.current = self.buildModule(list) catch |e| {
                 self.current = null;
+                // ⚠️ **The same error was a SKIP on every assertion path and a
+                // FAILURE here**, because this arm never consulted
+                // `isOurLimitation`. So a module using a proposal wazmrt does
+                // not target — `UnsupportedProposal`, `UnknownInstr` — was
+                // reported as a defect, and 14 of the corpus's 104 "failures"
+                // were that inconsistency rather than anything wrong.
+                //
+                // A gap is not a defect and it is not a pass either: banking it
+                // as a pass is the green-washing `isOurLimitation`'s comment was
+                // written after. It is a SKIP, scored the same way here as
+                // everywhere else.
+                if (isOurLimitation(e)) {
+                    self.summary.skipped += 1;
+                    return;
+                }
                 self.fail("module failed to build: {s}", .{@errorName(e)});
                 return;
             };
@@ -122,6 +242,8 @@ const Runner = struct {
             try self.assertTrap(cmd.asList().?);
         } else if (std.mem.eql(u8, kw, "assert_exhaustion")) {
             try self.assertExhaustion(cmd.asList().?);
+        } else if (std.mem.eql(u8, kw, "assert_exception")) {
+            try self.assertException(cmd.asList().?);
         } else if (std.mem.eql(u8, kw, "assert_invalid") or std.mem.eql(u8, kw, "assert_malformed")) {
             try self.assertRejected(cmd.asList().?);
         } else if (std.mem.eql(u8, kw, "assert_unlinkable")) {
@@ -139,13 +261,71 @@ const Runner = struct {
         }
     }
 
+    /// `(module definition $M <fields>)` — assemble and remember, WITHOUT
+    /// instantiating. It does not become `current`: a definition is not an
+    /// instance, and treating it as one is what makes "instantiation is
+    /// generative" untestable.
+    fn moduleDefinition(self: *Runner, list: []const Sexpr) Error!void {
+        // Re-shape to a plain `(module <fields>)` for the assembler: drop the
+        // `definition` keyword and the `$M`, keep everything after.
+        var i: usize = 2;
+        const name: ?[]const u8 = if (i < list.len and isId(list[i])) blk: {
+            defer i += 1;
+            break :blk list[i].atom;
+        } else null;
+        var form: std.ArrayList(Sexpr) = .empty;
+        try form.append(self.a, list[0]); // "module"
+        try form.appendSlice(self.a, list[i..]);
+        const bin = self.moduleBinary(form.items) catch |e| {
+            self.fail("module definition failed to assemble: {s}", .{@errorName(e)});
+            return;
+        };
+        if (name) |n| try self.definitions.put(self.a, n, bin);
+    }
+
+    /// `(module instance $I $M)` — instantiate the definition named `$M` afresh.
+    /// Each call allocates its own globals/tables/memories, which is precisely
+    /// the property `instance.wast` is checking.
+    fn moduleInstance(self: *Runner, list: []const Sexpr) Error!void {
+        var i: usize = 2;
+        const name: ?[]const u8 = if (i < list.len and isId(list[i])) blk: {
+            defer i += 1;
+            break :blk list[i].atom;
+        } else null;
+        const def_id = if (i < list.len and isId(list[i])) list[i].atom else {
+            self.fail("module instance: no definition named", .{});
+            return;
+        };
+        const bin = self.definitions.get(def_id) orelse {
+            self.fail("module instance: no definition '{s}'", .{def_id});
+            return;
+        };
+        const inst = self.instantiateBinary(bin) catch |e| {
+            self.current = null;
+            self.fail("module failed to build: {s}", .{@errorName(e)});
+            return;
+        };
+        self.current = inst;
+        if (name) |n| try self.module_names.put(self.a, n, inst);
+    }
+
     fn buildModule(self: *Runner, form: []const Sexpr) !*interp.Instance {
-        const bin = try self.moduleBinary(form);
+        return self.instantiateBinary(try self.moduleBinary(form));
+    }
+
+    /// Decode, validate, link and instantiate a module binary. Shared by
+    /// `(module …)` and `(module instance …)`, which differ only in where the
+    /// bytes come from — each call builds a FRESH instance, so two instances of
+    /// one definition share nothing.
+    fn instantiateBinary(self: *Runner, bin: []const u8) !*interp.Instance {
         const m = try self.a.create(Module);
         m.* = try Module.decode(self.a, bin);
         try validate(self.a, m);
+        // Allocated first, then instantiated IN PLACE: the instance's address is
+        // baked into every funcref its element segments and global initializers
+        // create, so it cannot be built somewhere else and moved here.
         const inst = try self.a.create(interp.Instance);
-        inst.* = try interp.Instance.initWithImports(self.a, m, try self.resolveImports(m));
+        try inst.instantiateWithImports(self.a, m, try self.resolveImports(m));
         // Register before `runStart`: even if the start function traps, the
         // instance already owns page-allocator memory that must be released.
         try self.instances.append(self.a, inst);
@@ -159,31 +339,48 @@ const Runner = struct {
     /// a type mismatch → `IncompatibleImportType` (both = "unlinkable").
     fn resolveImports(self: *Runner, m: *const Module) !interp.Instance.Imports {
         var fs: std.ArrayList(HostFunc) = .empty;
-        var gs: std.ArrayList(Value) = .empty;
+        var gs: std.ArrayList(*interp.Instance.Global) = .empty;
         var ms: std.ArrayList(*interp.Instance.Memory) = .empty;
         var ts: std.ArrayList(*interp.Instance.Table) = .empty;
+        var tgs: std.ArrayList(u64) = .empty;
+        // One matcher per link: its memo is keyed by module pointer, and every
+        // module it names is alive for exactly this long.
+        var tm: typematch.Ctx = .init(self.a);
+        defer tm.deinit();
         for (m.imports) |imp| switch (imp.type) {
-            .func => |want| try fs.append(self.a, try self.resolveFuncImport(imp.module, imp.name, want)),
-            .global => |want| try gs.append(self.a, try self.resolveGlobalImport(imp.module, imp.name, want)),
+            .func => try fs.append(self.a, try self.resolveFuncImport(&tm, m, imp)),
+            .global => |want| try gs.append(self.a, try self.resolveGlobalImport(&tm, m, imp, want)),
             .memory => |want| try ms.append(self.a, try self.resolveMemoryImport(imp.module, imp.name, want)),
-            .table => |want| try ts.append(self.a, try self.resolveTableImport(imp.module, imp.name, want)),
-            // An imported tag needs no host backing — it is just a local tag
-            // identity in this module's tag index space (EH proposal).
-            .tag => {},
+            .table => |want| try ts.append(self.a, try self.resolveTableImport(&tm, m, imp, want)),
+            // An imported tag needs no host backing — it is just a local identity
+            // in this module's tag index space (EH proposal) — but its TYPE still
+            // has to match the provider's, and that went unchecked entirely. A tag
+            // carries the payload of every exception thrown with it, so a
+            // mismatched link hands the catcher values it will read as the wrong
+            // types.
+            .tag => try tgs.append(self.a, try self.resolveTagImport(&tm, m, imp)),
         };
-        return .{ .funcs = fs.items, .globals = gs.items, .memories = ms.items, .tables = ts.items };
+        return .{ .funcs = fs.items, .globals = gs.items, .memories = ms.items, .tables = ts.items, .tags = tgs.items, .store = self.store };
     }
 
-    fn resolveFuncImport(self: *Runner, module: []const u8, name: []const u8, want: Module.FuncType) !HostFunc {
-        if (std.mem.eql(u8, module, "spectest")) {
-            const got = spectestFuncType(name) orelse return error.UnresolvedImport;
-            if (!funcTypeEq(got, want)) return error.IncompatibleImportType;
+    fn resolveFuncImport(self: *Runner, tm: *typematch.Ctx, m: *const Module, imp: Module.Import) !HostFunc {
+        if (std.mem.eql(u8, imp.module, "spectest")) {
+            const got = spectestFuncType(imp.name) orelse return error.UnresolvedImport;
+            if (!abstractFuncTypeEq(got, imp.type.func)) return error.IncompatibleImportType;
             return .{ .native = spectestNoop };
         }
-        if (self.modules.get(module)) |inst| {
+        const want_ti = imp.type_index orelse return error.IncompatibleImportType;
+        if (self.modules.get(imp.module)) |inst| {
             for (inst.module.exports) |e| {
-                if (e.type == .func and std.mem.eql(u8, e.name, name)) {
-                    if (!funcTypeEq(e.type.func, want)) return error.IncompatibleImportType;
+                if (e.type == .func and std.mem.eql(u8, e.name, imp.name)) {
+                    // Match by TYPE INDEX in each module, not by the two expanded
+                    // signatures: a `(ref $t)` inside a signature is a module-local
+                    // index, so comparing the signatures compared numbers that mean
+                    // different things on each side — rejecting good links and, worse,
+                    // accepting bad ones whenever two unrelated types happened to sit
+                    // at the same index. See `typematch.zig`.
+                    const got_ti = inst.module.funcTypeIndex(e.index) orelse return error.IncompatibleImportType;
+                    if (!try tm.funcImportOk(inst.module, got_ti, m, want_ti)) return error.IncompatibleImportType;
                     return .{ .wasm = .{ .instance = inst, .func_index = e.index } };
                 }
             }
@@ -191,17 +388,39 @@ const Runner = struct {
         return error.UnresolvedImport;
     }
 
-    fn resolveGlobalImport(self: *Runner, module: []const u8, name: []const u8, want: Module.GlobalType) !Value {
-        if (std.mem.eql(u8, module, "spectest")) {
-            const gt = spectestGlobalType(name) orelse return error.UnresolvedImport;
-            if (gt.content != want.content or gt.mutable != want.mutable) return error.IncompatibleImportType;
-            return spectestGlobal(module, name).?;
-        }
-        if (self.modules.get(module)) |inst| {
+    /// Tag imports match by type EQUIVALENCE, not subtyping: a tag names the exact
+    /// payload shape both sides must agree on, and there is no variance that keeps
+    /// a throw and its catch reading the same values.
+    ///
+    /// Returns the provider's tag IDENTITY, which the importer adopts. It used to
+    /// return nothing — a tag import was "just a local identity in this module's
+    /// tag index space" — so importing one tag twice produced two identities that
+    /// did not match each other, and an exception thrown with one was not caught
+    /// by a handler naming the other (`instance.wast`).
+    fn resolveTagImport(self: *Runner, tm: *typematch.Ctx, m: *const Module, imp: Module.Import) !u64 {
+        const want_ti = imp.type_index orelse return error.IncompatibleImportType;
+        if (self.modules.get(imp.module)) |inst| {
             for (inst.module.exports) |e| {
-                if (e.type == .global and std.mem.eql(u8, e.name, name)) {
-                    const gt = e.type.global;
-                    if (gt.content != want.content or gt.mutable != want.mutable) return error.IncompatibleImportType;
+                if (e.type == .tag and std.mem.eql(u8, e.name, imp.name)) {
+                    const got_ti = inst.module.tagTypeIndex(e.index) orelse return error.IncompatibleImportType;
+                    if (!try tm.tagImportOk(inst.module, got_ti, m, want_ti)) return error.IncompatibleImportType;
+                    return inst.tagId(e.index);
+                }
+            }
+        }
+        return error.UnresolvedImport;
+    }
+
+    fn resolveGlobalImport(self: *Runner, tm: *typematch.Ctx, m: *const Module, imp: Module.Import, want: Module.GlobalType) !*interp.Instance.Global {
+        if (std.mem.eql(u8, imp.module, "spectest")) {
+            const gt = spectestGlobalType(imp.name) orelse return error.UnresolvedImport;
+            if (gt.content != want.content or gt.mutable != want.mutable) return error.IncompatibleImportType;
+            return self.spectestGlobalCell(imp.name, spectestGlobal(imp.module, imp.name).?);
+        }
+        if (self.modules.get(imp.module)) |inst| {
+            for (inst.module.exports) |e| {
+                if (e.type == .global and std.mem.eql(u8, e.name, imp.name)) {
+                    if (!try tm.globalImportOk(inst.module, e.type.global, m, want)) return error.IncompatibleImportType;
                     return inst.globals[e.index];
                 }
             }
@@ -209,38 +428,91 @@ const Runner = struct {
         return error.UnresolvedImport;
     }
 
+    /// A cell holding a `spectest` global's constant value. An imported global is
+    /// a borrowed CELL now, not a copied value, so the runner has to own storage
+    /// for the host-side constants that lives as long as any importer. They are
+    /// immutable, so one cell per name is shared.
+    fn spectestGlobalCell(self: *Runner, name: []const u8, v: Value) !*interp.Instance.Global {
+        if (self.spectest_globals.get(name)) |g| return g;
+        const g = try self.a.create(interp.Instance.Global);
+        g.* = .{ .value = v };
+        try self.spectest_globals.put(self.a, name, g);
+        return g;
+    }
+
     fn resolveMemoryImport(self: *Runner, module: []const u8, name: []const u8, want: Module.MemoryType) !*interp.Instance.Memory {
         if (std.mem.eql(u8, module, "spectest") and std.mem.eql(u8, name, "memory")) {
             if (!limitsFit(.{ .min = 1, .max = 2 }, want.limits)) return error.IncompatibleImportType;
             return self.spectestMemory();
         }
+        // `spectest.shared_memory` (threads). `limitsFit` already compares the
+        // `shared` flag, so declaring it here is all three assertions:
+        // `(memory 1 2 shared)` links, `(memory 1 2)` against it does not, and
+        // `(memory 1 2 shared)` against plain `spectest.memory` does not either.
+        if (std.mem.eql(u8, module, "spectest") and std.mem.eql(u8, name, "shared_memory")) {
+            if (!limitsFit(.{ .min = 1, .max = 2, .shared = true }, want.limits)) return error.IncompatibleImportType;
+            return self.spectestSharedMemory();
+        }
         if (self.modules.get(module)) |inst| {
             for (inst.module.exports) |e| {
                 if (e.type == .memory and std.mem.eql(u8, e.name, name)) {
-                    if (!limitsFit(e.type.memory.limits, want.limits)) return error.IncompatibleImportType;
                     // The EXPORT names a specific memory index (multi-memory), not
                     // necessarily 0 — `memory0()` here linked every imported memory
                     // to the exporter's first one, so `memory.size $mem2` read the
                     // wrong memory.
                     if (e.index >= inst.memories.len) return error.UnresolvedImport;
-                    return inst.memories[e.index];
+                    const mem = inst.memories[e.index];
+                    // ⚠️ **The limits to match are the INSTANCE's, not the
+                    // module's.** §7.2's `mem_type(store, a)` reads the minimum
+                    // off the memory's CURRENT size (`|data| / 64Ki`), so a
+                    // memory declared `(memory 1)` that has since grown to 2
+                    // pages satisfies an `(import … (memory 2))`. Comparing the
+                    // DECLARED minimum refused it — and then the module that
+                    // would have exported it never registered, so the next two
+                    // modules failed as `UnresolvedImport` behind it.
+                    if (!limitsFit(.{
+                        .min = mem.bytes.len / interp.page_size,
+                        .max = mem.max,
+                        .shared = mem.shared,
+                        .is64 = mem.is64,
+                    }, want.limits)) return error.IncompatibleImportType;
+                    return mem;
                 }
             }
         }
         return error.UnresolvedImport;
     }
 
-    fn resolveTableImport(self: *Runner, module: []const u8, name: []const u8, want: Module.TableType) !*interp.Instance.Table {
-        if (std.mem.eql(u8, module, "spectest") and std.mem.eql(u8, name, "table")) {
+    fn resolveTableImport(self: *Runner, tm: *typematch.Ctx, m: *const Module, imp: Module.Import, want: Module.TableType) !*interp.Instance.Table {
+        if (std.mem.eql(u8, imp.module, "spectest") and std.mem.eql(u8, imp.name, "table")) {
             if (want.element != .funcref or !limitsFit(.{ .min = 10, .max = 20 }, want.limits)) return error.IncompatibleImportType;
             return self.spectestTable();
         }
-        if (self.modules.get(module)) |inst| {
+        // `spectest.table64` — the table64 proposal's 64-bit twin. `limitsFit`
+        // already refuses a cross-width match (the index type is part of the
+        // type, not a detail of the limits), so one entry gives both directions.
+        if (std.mem.eql(u8, imp.module, "spectest") and std.mem.eql(u8, imp.name, "table64")) {
+            if (want.element != .funcref or !limitsFit(.{ .min = 10, .max = 20, .is64 = true }, want.limits)) return error.IncompatibleImportType;
+            return self.spectestTable64();
+        }
+        if (self.modules.get(imp.module)) |inst| {
             for (inst.module.exports) |e| {
-                if (e.type == .table and std.mem.eql(u8, e.name, name)) {
+                if (e.type == .table and std.mem.eql(u8, e.name, imp.name)) {
                     const tt = e.type.table;
-                    if (tt.element != want.element or !limitsFit(tt.limits, want.limits)) return error.IncompatibleImportType;
-                    if (e.index < inst.tables.len) return inst.tables[e.index];
+                    if (!try tm.tableElemOk(inst.module, tt.element, m, want.element)) return error.IncompatibleImportType;
+                    if (e.index >= inst.tables.len) continue;
+                    const tbl = inst.tables[e.index];
+                    // Same rule as memories: §7.2's `table_type(store, a)` takes
+                    // the minimum from the table's CURRENT length, so a table
+                    // grown past its declared minimum satisfies an import that
+                    // asks for the larger size. The element type still comes from
+                    // the declared type — growing does not change it.
+                    if (!limitsFit(.{
+                        .min = tbl.entries.len,
+                        .max = tbl.max,
+                        .is64 = tbl.is64,
+                    }, want.limits)) return error.IncompatibleImportType;
+                    return tbl;
                 }
             }
         }
@@ -268,12 +540,34 @@ const Runner = struct {
         return m;
     }
 
+    /// `spectest.shared_memory` — same shape as `spectestMemory`, `shared` set.
+    /// Its `bytes` are page-allocator owned for the same `memory.grow` reason.
+    fn spectestSharedMemory(self: *Runner) !*interp.Instance.Memory {
+        if (self.spectest_shared_memory) |m| return m;
+        const buf = try interp.allocGuestMemory(interp.page_size);
+        const m = try self.a.create(interp.Instance.Memory);
+        m.* = .{ .bytes = buf, .max = 2, .shared = true };
+        self.spectest_shared_memory = m;
+        return m;
+    }
+
+    /// `spectest.table64` — same 10/20 funcref shape, 64-bit index type.
+    fn spectestTable64(self: *Runner) !*interp.Instance.Table {
+        if (self.spectest_table64) |t| return t;
+        const entries = try self.a.alloc(Value, 10);
+        @memset(entries, null_ref);
+        const t = try self.a.create(interp.Instance.Table);
+        t.* = .{ .entries = entries, .max = 20, .is64 = true, .store = self.store };
+        self.spectest_table64 = t;
+        return t;
+    }
+
     fn spectestTable(self: *Runner) !*interp.Instance.Table {
         if (self.spectest_table) |t| return t;
         const entries = try self.a.alloc(Value, 10); // 10 funcref
         @memset(entries, null_ref);
         const t = try self.a.create(interp.Instance.Table);
-        t.* = .{ .entries = entries, .max = 20 };
+        t.* = .{ .entries = entries, .max = 20, .store = self.store };
         self.spectest_table = t;
         return t;
     }
@@ -291,7 +585,34 @@ const Runner = struct {
                     };
                     return bytes.items;
                 }
-                return error.BadCommand; // (module quote …) not supported yet
+                // `(module quote "…" …)` — the module given as SOURCE TEXT, in one
+                // or more string literals. The lexer has already resolved escapes
+                // to bytes, so `"\80"` really is byte 0x80 here; that is the whole
+                // point for the UTF-8 corpus, whose names must reach the decoder
+                // with their invalid bytes intact.
+                //
+                // ⚠️ **This single `BadCommand` was suppressing 1,291 assertions**
+                // — more than half of every skip in the suite — because a `quote`
+                // module is how the spec tests anything about *text*: malformed
+                // literals, bad tokens, invalid names. `utf8-invalid-encoding.wast`
+                // is 176 of them, which is why UTF-8 name validation could be
+                // recorded as fixed and be checked by nothing (R8).
+                if (std.mem.eql(u8, kw, "quote")) {
+                    var text: std.ArrayList(u8) = .empty;
+                    for (form[i + 1 ..]) |it| switch (it) {
+                        // Pieces are separate source lines. A newline (not a space)
+                        // is the safe join: a piece may end in a line comment, and
+                        // `";; …" "(func)"` concatenated on one line would swallow
+                        // the next piece.
+                        .string => |s| {
+                            try text.appendSlice(self.a, s);
+                            try text.append(self.a, '\n');
+                        },
+                        else => {},
+                    };
+                    return wat.assemble(self.a, try wrapModuleText(self.a, text.items));
+                }
+                return error.BadCommand;
             }
         }
         return wat.assembleModule(self.a, form);
@@ -347,7 +668,7 @@ const Runner = struct {
         for (inst.module.exports) |e| {
             if (e.type == .global and std.mem.eql(u8, e.name, name)) {
                 const v = try self.a.alloc(Value, 1);
-                v[0] = inst.globals[e.index];
+                v[0] = inst.globals[e.index].value;
                 return v;
             }
         }
@@ -369,28 +690,54 @@ const Runner = struct {
         // pushes low then high). Comparing form count to slot count directly
         // reported "arity 2 != expected 1" for every SIMD assertion in the
         // testsuite, which is why none of them had ever actually run.
+        // An `(either …)` wrapper contributes the slots of its alternatives, which
+        // all share one type — so measure the shape from the first alternative.
         var want_slots: usize = 0;
-        for (expected) |exp_form| want_slots += if (isV128Form(exp_form)) 2 else 1;
+        for (expected) |exp_form| {
+            const alts = eitherAlts(exp_form);
+            want_slots += if (isV128Form(if (alts.len != 0) alts[0] else exp_form)) 2 else 1;
+        }
         if (results.len != want_slots) {
             self.fail("assert_return: arity {d} != expected {d}", .{ results.len, want_slots });
             return;
         }
         const action_name: []const u8 = actionName(form[1]);
         var ri: usize = 0;
+        var solo: [1]Sexpr = undefined; // backing for the not-an-`either` case
         for (expected) |exp_form| {
-            if (isV128Form(exp_form)) {
+            var alts = eitherAlts(exp_form);
+            if (alts.len == 0) {
+                solo[0] = exp_form;
+                alts = solo[0..1];
+            }
+            // Any alternative matching is a pass — that is what `either` means.
+            if (isV128Form(alts[0])) {
                 const lo = results[ri];
                 const hi = results[ri + 1];
                 ri += 2;
                 const got: u128 = (@as(u128, hi) << 64) | lo;
-                if (!try v128Matches(got, exp_form.asList().?)) {
+                var ok = false;
+                for (alts) |alt| {
+                    if (try v128Matches(got, alt.asList() orelse continue)) {
+                        ok = true;
+                        break;
+                    }
+                }
+                if (!ok) {
                     self.fail("assert_return \"{s}\": v128 mismatch (got 0x{x})", .{ action_name, got });
                     return;
                 }
             } else {
                 const got = results[ri];
                 ri += 1;
-                if (!try self.matches(got, exp_form)) {
+                var ok = false;
+                for (alts) |alt| {
+                    if (try self.matches(got, alt)) {
+                        ok = true;
+                        break;
+                    }
+                }
+                if (!ok) {
                     self.fail("assert_return \"{s}\": result mismatch (got 0x{x})", .{ action_name, got });
                     return;
                 }
@@ -402,11 +749,16 @@ const Runner = struct {
     /// Intern a host externref payload → its stack representation (a small index,
     /// never the `null_ref` sentinel). Equal payloads get the same value so an
     /// externref round-trips through the module and compares equal (#9).
+    /// ⚠️ The result is `interp.hostRefValue`-TAGGED, not a bare index. A bare
+    /// index is exactly a GC heap index, so `any.convert_extern` (identity) used
+    /// to hand `ref.test`/`ref.cast` a value that read as `gc_heap[i]` — a host
+    /// reference answering yes to `structref` and yielding another object's
+    /// fields. The tag keeps the two spaces disjoint.
     fn internExtern(self: *Runner, payload: u64) Error!Value {
-        for (self.extern_pool.items, 0..) |p, i| if (p == payload) return @intCast(i);
-        const idx: Value = @intCast(self.extern_pool.items.len);
+        for (self.extern_pool.items, 0..) |p, i| if (p == payload) return interp.hostRefValue(i);
+        const idx = self.extern_pool.items.len;
         try self.extern_pool.append(self.a, payload);
-        return idx;
+        return interp.hostRefValue(idx);
     }
 
     /// Parse a concrete value literal (for invoke arguments): `(TYPE.const literal)`
@@ -418,8 +770,15 @@ const Runner = struct {
         // `ref.null` carries an ignorable heaptype; `ref.func` payload is a func
         // index (used directly); `ref.extern` payload is a host value (interned).
         if (std.mem.eql(u8, kw, "ref.null")) return null_ref;
-        if (std.mem.eql(u8, kw, "ref.extern")) {
-            if (list.len < 2) return self.internExtern(0); // bare `(ref.extern)` — any non-null
+        // `ref.extern N` and `ref.host N` are the SAME value seen from the two
+        // hierarchies — `extern.convert_any`/`any.convert_extern` are identity —
+        // so they intern identically. `extern.wast` pins the pair directly:
+        // `(invoke "internalize" (ref.extern 1))` must equal `(ref.host 1)`, and
+        // `(invoke "externalize" (ref.host 2))` must equal `(ref.extern 2)`.
+        // `ref.host` was missing here, so that second assertion could not even
+        // build its ARGUMENT and reported `unexpected trap BadValue`.
+        if (std.mem.eql(u8, kw, "ref.extern") or std.mem.eql(u8, kw, "ref.host")) {
+            if (list.len < 2) return self.internExtern(0); // bare form — any non-null
             return self.internExtern(@bitCast(try parseInt(list[1].asAtom() orelse return error.BadValue)));
         }
         if (std.mem.eql(u8, kw, "ref.func")) {
@@ -444,7 +803,11 @@ const Runner = struct {
         // Reference matchers: `(ref.null …)` ⇒ null; a bare `(ref.func)` /
         // `(ref.extern)` ⇒ any non-null; with a payload ⇒ exact.
         if (std.mem.eql(u8, kw, "ref.null")) return got == null_ref;
-        if (std.mem.eql(u8, kw, "ref.extern")) {
+        // `ref.host N` is `ref.extern N` seen from the `any` side, so a payload
+        // makes it an EXACT match too — `(ref.host 1)` in `extern.wast` asserts
+        // the round trip preserved the identity, which "any non-null" would not
+        // have checked at all.
+        if (std.mem.eql(u8, kw, "ref.extern") or (std.mem.eql(u8, kw, "ref.host") and list.len >= 2)) {
             if (list.len < 2) return got != null_ref;
             return got == try self.internExtern(@bitCast(try parseInt(list[1].asAtom() orelse return error.BadValue)));
         }
@@ -493,6 +856,30 @@ const Runner = struct {
             // bug (UnsupportedInstruction, UndefinedFunc, a decode/assemble error)
             // must NOT be green-washed as the expected trap.
             if (e == error.NoTarget) self.summary.skipped += 1 else if (isRuntimeTrap(e)) self.summary.passed += 1 else self.fail("assert_trap: non-trap error {s}", .{@errorName(e)});
+        }
+    }
+
+    /// `assert_exception (invoke …)` — the action must terminate with an UNCAUGHT
+    /// exception (EH proposal). Distinct from `assert_trap`: any runtime trap
+    /// satisfies that, but only `UncaughtException` satisfies this, so a module
+    /// that traps for an unrelated reason is a failure and not a pass.
+    ///
+    /// ⚠️ 41 of these were being skipped as an unknown command keyword — in
+    /// `throw.wast`, `throw_ref.wast`, `try_table.wast` and the three legacy EH
+    /// files, i.e. exactly the assertions that check exceptions actually ESCAPE.
+    /// The EH implementation was carrying that property untested.
+    fn assertException(self: *Runner, form: []const Sexpr) Error!void {
+        if (form.len < 2) return self.fail("assert_exception: missing action", .{});
+        if (self.runAction(form[1])) |_| {
+            self.fail("assert_exception: expected an exception, got a result", .{});
+        } else |e| {
+            if (e == error.NoTarget) {
+                self.summary.skipped += 1;
+            } else if (e == error.UncaughtException) {
+                self.summary.passed += 1;
+            } else {
+                self.fail("assert_exception: got {s}", .{@errorName(e)});
+            }
         }
     }
 
@@ -547,6 +934,11 @@ const Runner = struct {
             error.NotAModule,
             error.UnknownInstr, // the assembler doesn't know this mnemonic
             error.UnsupportedInstr,
+            // Recognised syntax from a proposal we do not target (`pagesize`).
+            // The module may be valid under that proposal, so refusing it is our
+            // gap — banking these as passes is exactly the green-washing the
+            // comment above describes.
+            error.UnsupportedProposal,
             error.UnknownIdentifier,
             error.UnsupportedOpcode, // ambiguous → treat as ours
             error.UnsupportedInstruction,
@@ -577,8 +969,20 @@ const Runner = struct {
         };
         if (self.buildModule(inner)) |_| {
             self.fail("assert_unlinkable: module linked (should be rejected)", .{});
-        } else |e| {
-            if (isLinkError(e)) self.summary.passed += 1 else self.fail("assert_unlinkable: non-link error {s}", .{@errorName(e)});
+        } else |e| if (isLinkError(e)) {
+            self.summary.passed += 1;
+        } else if (isOurLimitation(e)) {
+            // We never got as far as linking, so we have no verdict to give.
+            // `assertRejected` already drew this line; this arm did not, and
+            // charged our own gaps as conformance failures — `memory_max.wast`
+            // reported two where one was simply `(pagesize …)`, syntax we refuse
+            // by design. NOTE the order: `isLinkError` is asked FIRST and this
+            // list stays narrow, so a real wrong-STAGE rejection (T5's
+            // `InvalidLimits` at decode where the spec wants a link failure)
+            // still lands in `fail` below where it belongs.
+            self.summary.skipped += 1;
+        } else {
+            self.fail("assert_unlinkable: non-link error {s}", .{@errorName(e)});
         }
     }
 };
@@ -630,10 +1034,17 @@ const null_ref: Value = std.math.maxInt(u64);
 
 // --- Import linking: type compatibility ------------------------------------
 
-fn funcTypeEq(a: Module.FuncType, b: Module.FuncType) bool {
-    return valTypesEq(a.params, b.params) and valTypesEq(a.results, b.results);
+/// Function-type equality by RAW value type, valid only where neither side can
+/// contain a concrete `(ref $t)` — i.e. the `spectest` host signatures below,
+/// which are numeric throughout and belong to no module.
+///
+/// Everything else goes through `typematch.zig`. A concrete reference carries a
+/// module-local type index, so raw comparison across a module boundary compares
+/// two unrelated numbering schemes.
+fn abstractFuncTypeEq(a: Module.FuncType, b: Module.FuncType) bool {
+    return abstractValTypesEq(a.params, b.params) and abstractValTypesEq(a.results, b.results);
 }
-fn valTypesEq(a: []const types.ValType, b: []const types.ValType) bool {
+fn abstractValTypesEq(a: []const types.ValType, b: []const types.ValType) bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| if (x != y) return false;
     return true;
@@ -642,6 +1053,14 @@ fn valTypesEq(a: []const types.ValType, b: []const types.ValType) bool {
 /// provided.min ≥ required.min and, if required is bounded, provided is bounded
 /// no higher (§4.5.3 limits matching).
 fn limitsFit(provided: Module.Limits, required: Module.Limits) bool {
+    // The INDEX TYPE is part of the type, not a detail of the limits: a 32-bit
+    // table/memory cannot satisfy a 64-bit import or vice versa, because every
+    // index operand changes width. We compared only min/max, so all eight
+    // cross-width imports in `memory64-imports.wast` linked when the spec
+    // requires them unlinkable — and the importer would then have driven the
+    // object with operands of the wrong type.
+    if (provided.is64 != required.is64) return false;
+    if (provided.shared != required.shared) return false;
     if (provided.min < required.min) return false;
     if (required.max) |rmax| {
         const pmax = provided.max orelse return false;
@@ -700,6 +1119,27 @@ fn v128Shape(kw: []const u8) ?struct { lanes: usize, width: usize, float: bool }
 
 /// True if `form` is a `(v128.const <shape> <lane>…)` literal — which occupies
 /// **two** result slots, unlike every other value form.
+/// The alternatives an expected-result form admits, or empty if it is not an
+/// `(either …)`.
+///
+/// `(either e1 e2 …)` is how the spec suite writes a result the standard leaves
+/// **implementation-defined** — the relaxed-SIMD instructions, where fused vs
+/// unfused multiply-add, NaN propagation and the sign of zero in `min`/`max` are
+/// all permitted to differ. Any listed alternative is a CORRECT answer.
+///
+/// We did not parse it, so `assert_return` counted the wrapper as one expected
+/// value and reported `arity 4 != expected 1` — 32 assertions across six relaxed
+/// SIMD files, none of which had ever actually compared anything. That is the
+/// mirror of green-washing: our own gap charged as a wazmrt failure, and it
+/// hides whether those instructions are right or wrong.
+fn eitherAlts(form: Sexpr) []const Sexpr {
+    const list = form.asList() orelse return &.{};
+    if (list.len < 2) return &.{};
+    const kw = list[0].asAtom() orelse return &.{};
+    if (!std.mem.eql(u8, kw, "either")) return &.{};
+    return list[1..];
+}
+
 fn isV128Form(form: Sexpr) bool {
     const list = form.asList() orelse return false;
     if (list.len < 2) return false;
@@ -851,6 +1291,118 @@ test "runs assert_return and assert_trap over a module" {
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
 
+test "a GC reference crossing an instance boundary names its OWN object" {
+    // ⚠️ Before this, a GC reference was a bare index into the READER's
+    // per-instance `gc_heap`, so B read its own object at A's index: `ref.cast`
+    // SUCCEEDED and `struct.get` returned 222 instead of 111. `refMatches` could
+    // not notice — it took the type index from that same wrong entry and checked
+    // it against B's own types, so it was self-consistent and blind. R2 fixed
+    // exactly this for funcrefs ("a reference names an ENTITY, not an index");
+    // only funcrefs had been converted.
+    //
+    // The concrete cross-module cast answers CORRECTLY (111, not a refusal)
+    // because the store-wide `TypeRegistry` interns both modules' rec groups at
+    // instantiation: `$ta` and `$tb` are structurally identical, so they land on
+    // one canonical id and the comparison is an integer compare.
+    //
+    // Kept in-repo as well as in `tests/gc_cross_instance_repro.wast` because the
+    // `.wast` corpus lives on removable media and cannot gate a commit — and
+    // because the spec suite crosses GC references between instances almost
+    // nowhere, which is why nothing caught this for months.
+    const src =
+        \\(module $A (type $ta (struct (field i32)))
+        \\  (global (export "g") anyref (struct.new $ta (i32.const 111))))
+        \\(register "A" $A)
+        \\(module $B (type $tb (struct (field i32)))
+        \\  (global $fromA (import "A" "g") anyref)
+        \\  (global $mine (mut anyref) (ref.null any))
+        \\  (func (export "seed") (global.set $mine (struct.new $tb (i32.const 222))))
+        \\  (func (export "isStruct") (result i32) (ref.test (ref struct) (global.get $fromA)))
+        \\  (func (export "isArray") (result i32) (ref.test (ref array) (global.get $fromA)))
+        \\  (func (export "ownRead") (result i32)
+        \\    (struct.get $tb 0 (ref.cast (ref $tb) (global.get $mine))))
+        \\  (func (export "concreteTest") (result i32) (ref.test (ref $tb) (global.get $fromA)))
+        \\  (func (export "concreteRead") (result i32)
+        \\    (struct.get $tb 0 (ref.cast (ref $tb) (global.get $fromA)))))
+        \\(assert_return (invoke $B "seed"))
+        \\(assert_return (invoke $B "ownRead") (i32.const 222))
+        \\(assert_return (invoke $B "isStruct") (i32.const 1))
+        \\(assert_return (invoke $B "isArray") (i32.const 0))
+        \\(assert_return (invoke $B "concreteTest") (i32.const 1))
+        \\(assert_return (invoke $B "concreteRead") (i32.const 111))
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+    try std.testing.expectEqual(@as(usize, 6), s.passed);
+
+    // ⚠️ The registry must still REFUSE a structurally different type, or it has
+    // replaced a false negative with a false POSITIVE — R1's failure mode, and
+    // the dangerous direction. A's object is `(struct i32)`; B's index 0 is a
+    // `(struct i64)` and its index 1 is the match, so the two answers must
+    // differ. (This is the shape that catches wasmrt today: it reads A's type
+    // index against B's table and answers 1 / 0 — both wrong.)
+    const negative =
+        \\(module $A (type $ta (struct (field i32)))
+        \\  (global (export "g") anyref (struct.new $ta (i32.const 111))))
+        \\(register "A" $A)
+        \\(module $B
+        \\  (type $b0 (struct (field i64)))
+        \\  (type $b1 (struct (field i32)))
+        \\  (global $fromA (import "A" "g") anyref)
+        \\  (func (export "wrong") (result i32) (ref.test (ref $b0) (global.get $fromA)))
+        \\  (func (export "right") (result i32) (ref.test (ref $b1) (global.get $fromA))))
+        \\(assert_return (invoke $B "wrong") (i32.const 0))
+        \\(assert_return (invoke $B "right") (i32.const 1))
+        \\(module $C
+        \\  (type $base (sub (struct (field i32))))
+        \\  (type $derived (sub $base (struct (field i32) (field i32))))
+        \\  (global (export "d") anyref (struct.new $derived (i32.const 7) (i32.const 8))))
+        \\(register "C" $C)
+        \\(module $D
+        \\  (type $base2 (sub (struct (field i32))))
+        \\  (global $fromC (import "C" "d") anyref)
+        \\  (func (export "isBase") (result i32) (ref.test (ref $base2) (global.get $fromC))))
+        \\(assert_return (invoke $D "isBase") (i32.const 1))
+    ;
+    const s2 = try runScript(std.testing.allocator, negative);
+    try std.testing.expectEqual(@as(usize, 0), s2.failed);
+    try std.testing.expectEqual(@as(usize, 3), s2.passed);
+}
+
+test "L1: an import matches a memory/table's CURRENT size, not its declared minimum" {
+    // §7.2's `mem_type`/`table_type` read the minimum off the live instance, so a
+    // memory declared `(memory 1)` that has GROWN to 2 pages satisfies an
+    // `(import … (memory 2))`. Comparing the declared minimum refused it — and
+    // then this module never registered either, so anything importing from it
+    // failed as `UnresolvedImport` behind the first error.
+    const src =
+        \\(module $M (memory (export "mem") 1) (table (export "tab") 1 funcref)
+        \\  (func (export "grow-mem") (result i32) (memory.grow (i32.const 1)))
+        \\  (func (export "grow-tab") (result i32) (table.grow (ref.null func) (i32.const 1))))
+        \\(register "grown" $M)
+        \\(assert_return (invoke $M "grow-mem") (i32.const 1))
+        \\(assert_return (invoke $M "grow-tab") (i32.const 1))
+        \\(module $N (memory (export "mem2") (import "grown" "mem") 2)
+        \\  (table (import "grown" "tab") 2 funcref)
+        \\  (func (export "size") (result i32) (memory.size)))
+        \\(register "grown2" $N)
+        \\(assert_return (invoke $N "size") (i32.const 2))
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+    try std.testing.expectEqual(@as(usize, 3), s.passed);
+    // …and the rule does not go the other way: asking for MORE than the current
+    // size is still incompatible.
+    const too_big =
+        \\(module $M (memory (export "mem") 1))
+        \\(register "g" $M)
+        \\(module (memory (import "g" "mem") 2))
+    ;
+    var s2 = try runScript(std.testing.allocator, too_big);
+    defer s2.deinit(std.testing.allocator); // failure messages are caller-owned
+    try std.testing.expectEqual(@as(usize, 1), s2.failed);
+}
+
 test "runner rejects malformed commands without indexing out of bounds" {
     // Each is shape-malformed: the runner must error or record a failure, never
     // index a parsed s-expression past its end / deref a wrong-union `.string`
@@ -873,7 +1425,8 @@ test "runner rejects malformed commands without indexing out of bounds" {
     for (cases) |src| {
         // Either outcome (error or a recorded failure) is fine; the point is that
         // no path indexes out of bounds.
-        _ = runScript(std.testing.allocator, src) catch {};
+        var s = runScript(std.testing.allocator, src) catch continue;
+        s.deinit(std.testing.allocator);
     }
 }
 
@@ -980,9 +1533,13 @@ test "detects a wrong expected result" {
         \\(module (func (export "one") (result i32) (i32.const 1)))
         \\(assert_return (invoke "one") (i32.const 2))
     ;
-    const s = try runScript(std.testing.allocator, src);
+    var s = try runScript(std.testing.allocator, src);
+    defer s.deinit(std.testing.allocator); // failure messages are caller-owned
     try std.testing.expectEqual(@as(usize, 0), s.passed);
     try std.testing.expectEqual(@as(usize, 1), s.failed);
+    // The message must be READABLE here — it used to point into an arena
+    // `runScript` had already freed, so both callers printed freed memory.
+    try std.testing.expect(std.mem.indexOf(u8, s.first_failure.?, "one") != null);
 }
 
 test "float results incl. nan:canonical" {
@@ -1217,6 +1774,206 @@ test "a rejected module cannot leave entries in another module's table" {
     try std.testing.expectEqual(@as(usize, 0), s.failed);
 }
 
+test "a funcref in a shared table names its own instance, not the caller's index" {
+    // A funcref used to be a bare function index, resolved against whatever
+    // instance was executing `call_indirect`. $B writes its `$b` (index 1 in
+    // $B: the imported `$a` takes index 0) into $A's table at slot 0. Reading
+    // that slot from $A then dispatched to *$A's* function 1 — `at`, the very
+    // function doing the reading — instead of $B's `$b`.
+    //
+    // The old answer was not an error, it was 11: plausible, self-consistent,
+    // and wrong. Both directions are asserted, because the defect was symmetric
+    // — each instance saw its own function through the other's entry.
+    const src =
+        \\(module $A
+        \\  (type $r (func (result i32)))
+        \\  (table (export "t") 2 funcref)
+        \\  (func (export "a") (type $r) (i32.const 11))
+        \\  (func (export "at") (param i32) (result i32)
+        \\    (call_indirect (type $r) (local.get 0))))
+        \\(register "A" $A)
+        \\(module $B
+        \\  (type $r (func (result i32)))
+        \\  (func $a (import "A" "a") (type $r))
+        \\  (table (import "A" "t") 2 funcref)
+        \\  (func $b (type $r) (i32.const 22))
+        \\  (elem (i32.const 0) $b $a)
+        \\  (func (export "bt") (param i32) (result i32)
+        \\    (call_indirect (type $r) (local.get 0))))
+        \\(assert_return (invoke $A "at" (i32.const 0)) (i32.const 22))
+        \\(assert_return (invoke $A "at" (i32.const 1)) (i32.const 11))
+        \\(assert_return (invoke $B "bt" (i32.const 0)) (i32.const 22))
+        \\(assert_return (invoke $B "bt" (i32.const 1)) (i32.const 11))
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 4), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "instantiation is generative: two instances of one definition share nothing" {
+    // `(module definition …)` / `(module instance …)` — the pair `instance.wast`
+    // uses. Neither was implemented, so the file scored 0 passed / 8 failed / 12
+    // skipped and the property went unchecked entirely.
+    const src =
+        \\(module definition $M
+        \\  (global (export "g") (mut i32) (i32.const 0))
+        \\  (func (export "bump") (result i32)
+        \\    (global.set 0 (i32.add (global.get 0) (i32.const 1)))
+        \\    (global.get 0)))
+        \\(module instance $I1 $M)
+        \\(module instance $I2 $M)
+        \\(assert_return (invoke $I1 "bump") (i32.const 1))
+        \\(assert_return (invoke $I1 "bump") (i32.const 2))
+        \\(assert_return (invoke $I2 "bump") (i32.const 1))
+        \\(assert_return (get $I1 "g") (i32.const 2))
+        \\(assert_return (get $I2 "g") (i32.const 1))
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 5), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "importing one tag twice yields ONE identity, so a throw matches either name" {
+    // A tag import used to carry no identity at all — it was "just a local index
+    // in this module's tag space" — so importing `A.t` as both $t1 and $t2 gave
+    // two indices that never compared equal. `throw $t2` then fell past
+    // `catch $t1` into `catch_all`. An exception routed to the wrong handler:
+    // the same class as a funcref resolving to the wrong function.
+    const src =
+        \\(module $A (tag (export "t")))
+        \\(register "A" $A)
+        \\(module $B
+        \\  (tag $t1 (import "A" "t"))
+        \\  (tag $t2 (import "A" "t"))
+        \\  (func (export "f") (result i32)
+        \\    (block $on_t1
+        \\      (block $other
+        \\        (try_table (catch $t1 $on_t1) (catch_all $other) (throw $t2))
+        \\        (unreachable))
+        \\      (return (i32.const 0)))
+        \\    (return (i32.const 1))))
+        \\(assert_return (invoke $B "f") (i32.const 1))
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 1), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "an element segment's type must be a SUBTYPE of its table's, not the same family" {
+    // §3.5.11. The check normalized nullability away, so a nullable `funcref`
+    // segment was accepted into a `(ref func)` table — putting nulls in a table
+    // whose type promises there are none. A 10th-pass audit raised this and the
+    // finding was RETRACTED on a mistaken reading of `ValType.nullable()`; the
+    // reading was indeed mistaken and the rule was still wrong.
+    //
+    // The second module is the other direction and must stay VALID: a funcidx
+    // segment has type `(ref func)` (§5.5.12 forms 0-3), which is a subtype of
+    // both table types.
+    const src =
+        \\(assert_invalid
+        \\  (module
+        \\    (func)
+        \\    (table 1 (ref func) (ref.func 0))
+        \\    (elem (i32.const 0) funcref (ref.func 0)))
+        \\  "type mismatch")
+        \\(module
+        \\  (func)
+        \\  (table 1 (ref func) (ref.func 0))
+        \\  (elem (i32.const 0) func 0))
+        \\(module
+        \\  (func)
+        \\  (table 1 funcref)
+        \\  (elem (i32.const 0) func 0))
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 1), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "element segments applied before a failed data segment persist AND stay callable" {
+    // §4.5.5 runs element inits before data inits, and entries already written
+    // into an imported table survive a later trap. Two defects stacked here:
+    //
+    //  1. data segments were applied FIRST, so the out-of-bounds data below
+    //     aborted before the element segment ran and slot 7 stayed empty;
+    //  2. even once it ran, the funcref it wrote named an instance that
+    //     instantiation then threw away, so the call resolved to nothing.
+    //
+    // Both have to be fixed for this to pass, and the second is why the store
+    // keeps a failed instance alive rather than tearing it down.
+    const src =
+        \\(module $A
+        \\  (type $r (func (result i32)))
+        \\  (table (export "t") 10 funcref)
+        \\  (func (export "at") (param i32) (result i32)
+        \\    (call_indirect (type $r) (local.get 0))))
+        \\(register "A" $A)
+        \\(assert_trap
+        \\  (module
+        \\    (table (import "A" "t") 10 funcref)
+        \\    (func $f (result i32) (i32.const 7))
+        \\    (elem (i32.const 7) $f)
+        \\    (memory 1)
+        \\    (data (i32.const 0x10000) "d"))
+        \\  "out of bounds memory access")
+        \\(assert_return (invoke $A "at" (i32.const 7)) (i32.const 7))
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 2), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "an imported mutable global is SHARED, not copied at instantiation" {
+    // Imported globals were copied by value, so a `(mut i32)` import was a
+    // snapshot taken at link time. $B re-exports $A's global; $A then writes 241
+    // through its own setter, and the read through $B still returned the old
+    // 142 — `linking.wast`'s `Mg.mut_glob`. The value was stale, not garbage,
+    // which is why it never looked like a bug from inside $B.
+    const src =
+        \\(module $A
+        \\  (global (export "g") (mut i32) (i32.const 142))
+        \\  (func (export "set") (param i32) (global.set 0 (local.get 0))))
+        \\(register "A" $A)
+        \\(module $B
+        \\  (global $g (import "A" "g") (mut i32))
+        \\  (export "g" (global $g))
+        \\  (func (export "get") (result i32) (global.get $g)))
+        \\(assert_return (get $B "g") (i32.const 142))
+        \\(assert_return (invoke $A "set" (i32.const 241)))
+        \\(assert_return (get $B "g") (i32.const 241))
+        \\(assert_return (invoke $B "get") (i32.const 241))
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 4), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "a funcref crossing a module boundary in a global keeps its identity" {
+    // The same defect reached through a `funcref` GLOBAL rather than a table:
+    // $M exports `(ref.func 0)`, and the importer drops it into its own table.
+    // Resolving that value locally selected the importer's own function 0 —
+    // which here is the caller itself, so the corpus saw it as unbounded
+    // recursion (`elem.wast`'s `call_imported_elem`, CallStackExhausted) rather
+    // than as a wrong value. Same bug, unrecognisable symptom.
+    const src =
+        \\(module $M
+        \\  (func (result i32) (i32.const 42))
+        \\  (global (export "f") funcref (ref.func 0)))
+        \\(register "M" $M)
+        \\(module $N
+        \\  (import "M" "f" (global funcref))
+        \\  (type $r (func (result i32)))
+        \\  (table 1 funcref)
+        \\  (elem (offset (i32.const 0)) funcref (global.get 0))
+        \\  (func (export "call") (type $r)
+        \\    (call_indirect (type $r) (i32.const 0))))
+        \\(assert_return (invoke $N "call") (i32.const 42))
+    ;
+    const s = try runScript(std.testing.allocator, src);
+    try std.testing.expectEqual(@as(usize, 1), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
 test "assert_invalid/malformed does not count OUR limitations as passes" {
     // `assertRejected` used to score ANY error as a pass, so a module we simply
     // could not BUILD — an unimplemented command form, or a mnemonic our
@@ -1225,13 +1982,36 @@ test "assert_invalid/malformed does not count OUR limitations as passes" {
     // verdicts; this was the arm that didn't.
     const gpa = std.testing.allocator;
 
-    // (a) `(module quote …)` is unimplemented -> BadCommand -> must SKIP.
+    // (a) A limitation reached THROUGH `(module quote …)` must still skip. The
+    //     original case here used `(module quote …)` itself as the example of an
+    //     unimplemented form; R5 implemented it, so the example moved inside the
+    //     quoted text while the property being tested did not change.
     {
-        const src = "(assert_malformed (module quote \"not wasm\") \"unexpected token\")";
+        const src = "(assert_malformed (module quote \"(func (some.bogus.instruction))\") \"unexpected token\")";
         const s = try runScript(gpa, src);
         try std.testing.expectEqual(@as(usize, 0), s.passed);
         try std.testing.expectEqual(@as(usize, 0), s.failed);
         try std.testing.expectEqual(@as(usize, 1), s.skipped);
+    }
+
+    // (a2) …and a quoted module that is GENUINELY malformed must now pass, which
+    //      is the whole point of implementing the form. Before R5 this scored as a
+    //      skip, and 1,291 assertions across the suite went with it.
+    {
+        const src = "(assert_malformed (module quote \"(func (i32.const 0x100000000) drop)\") \"constant out of range\")";
+        const s = try runScript(gpa, src);
+        try std.testing.expectEqual(@as(usize, 1), s.passed);
+        try std.testing.expectEqual(@as(usize, 0), s.failed);
+        try std.testing.expectEqual(@as(usize, 0), s.skipped);
+    }
+
+    // (a3) A quoted module that is VALID must build — the wrapping has to accept
+    //      both a bare field sequence and a complete `(module …)` form.
+    {
+        const s = try runScript(gpa, "(module quote \"(func (export \\\"f\\\"))\")");
+        try std.testing.expectEqual(@as(usize, 0), s.failed);
+        const s2 = try runScript(gpa, "(module quote \"(module (func (export \\\"f\\\")))\")");
+        try std.testing.expectEqual(@as(usize, 0), s2.failed);
     }
 
     // (b) an unknown mnemonic is an ASSEMBLER gap, not evidence of invalidity.
@@ -1249,5 +2029,49 @@ test "assert_invalid/malformed does not count OUR limitations as passes" {
         const s = try runScript(gpa, src);
         try std.testing.expectEqual(@as(usize, 1), s.passed);
         try std.testing.expectEqual(@as(usize, 0), s.skipped);
+    }
+}
+
+test "(either …) accepts any listed alternative, and still rejects a non-alternative" {
+    const gpa = std.testing.allocator;
+    // Relaxed-SIMD results are implementation-defined, so the suite lists every
+    // permitted answer. We could not parse the wrapper and counted it as one
+    // expected value — `arity 1 != expected 1` never even got that far; the real
+    // report was `arity 4 != expected 1` for f32x4. 32 assertions across six
+    // files had therefore never compared anything.
+    {
+        const src =
+            \\(module (func (export "f") (result i32) (i32.const 7)))
+            \\(assert_return (invoke "f") (either (i32.const 5) (i32.const 7)))
+        ;
+        var s = try runScript(gpa, src);
+        defer s.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 1), s.passed);
+        try std.testing.expectEqual(@as(usize, 0), s.failed);
+    }
+    // A value in NO alternative must still fail — the wrapper widens the set of
+    // right answers, it does not stop checking.
+    {
+        const src =
+            \\(module (func (export "f") (result i32) (i32.const 7)))
+            \\(assert_return (invoke "f") (either (i32.const 5) (i32.const 6)))
+        ;
+        var s = try runScript(gpa, src);
+        defer s.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 0), s.passed);
+        try std.testing.expectEqual(@as(usize, 1), s.failed);
+    }
+    // v128 alternatives occupy TWO result slots each; the arity must come from
+    // an alternative's shape, not from the wrapper.
+    {
+        const src =
+            \\(module (func (export "f") (result v128) (v128.const i32x4 1 2 3 4)))
+            \\(assert_return (invoke "f")
+            \\  (either (v128.const i32x4 9 9 9 9) (v128.const i32x4 1 2 3 4)))
+        ;
+        var s = try runScript(gpa, src);
+        defer s.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 1), s.passed);
+        try std.testing.expectEqual(@as(usize, 0), s.failed);
     }
 }

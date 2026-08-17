@@ -81,6 +81,157 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
   validation**, which is strong evidence the type-checker is correct across real, deeply-nested
   control flow (not just the simple `wasm_mod` set).
 
+## 📊 CURRENT spec-testsuite score (2026-08-14) — EVERY CORE SPEC FILE IS AT ZERO
+
+**284 files — 62,889 assertions passed / 90 failed / 965 skipped**, and `zig build conformance -Dbaseline=tools/conformance-baseline.txt` reports **0 regressions**. This is the number to quote;
+every snapshot below it is older and kept as history.
+
+⚠️ **The failed count ROSE from 143 at R4 and that is an improvement.** R5 implemented
+`(module quote …)`, which had been suppressing 978 assertions; 904 of them pass, 73 fail. Passing
+went 61,429 → 62,333 and skipped 2,407 → 1,429. **Quote all three numbers or none** — the failure
+count alone can be improved by running less, which is exactly the state R5 found.
+
+Reproduce exactly:
+
+```
+zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
+  -Dtestsuite=<wasmtk>/tests/module/wasm_wast/testsuite-main
+```
+
+- **`-Dfailures=600` is not optional for triage.** With the default (1) each file reports only its
+  first failure, and *that text names a symptom* — it mislabelled three of the T-list's five items.
+- **Failure messages carry the source LINE** of the `.wast` command that produced them (`L342: …`),
+  added 2026-08-13 via `sexpr.parseAllWithLines`. Before that, matching 35 failures back to their
+  assertions was hand work.
+- 🏁 **89 failures, and NONE of them is a defect or a deviation (2026-08-17).** The count went
+  104 → 90 → 89 in two steps, and neither step was a bug fix in the runtime:
+  ⚠️ **14 of the 104 were a SCORING BUG**, not a result — a bare `(module …)` that failed to build
+  called `fail()` without consulting `isOurLimitation`, so `UnsupportedProposal`/`UnknownInstr`/
+  `UnsupportedInstr` — our own gaps, scored as SKIPS on every assertion path — were reported as
+  defects here. Fixed 2026-08-14; `delegate` was one of them, so it was **never a deviation**, just a
+  mis-scored gap. Then `anyfunc` was closed 2026-08-17 (see `known-issues.md`), taking the last
+  deliberate deviation with it. **The remaining 89: 81 untargeted proposals + 8 era-pinned
+  `proposals/threads`. Deliberate deviations: ZERO.** ⚠️ **A by-design refusal is NOT a pass** —
+  banking our own gaps as passes is the green-washing `isOurLimitation` was written after — so they
+  are recorded in `tools/conformance-baseline.txt`, every line with a reason, and the step gates on
+  REGRESSIONS. *(Superseded:)* 104 is not 104 defects: 102 are BY DESIGN and the other 2 are RECORDED DELIBERATE
+  DEVIATIONS** — `anyfunc` and `delegate`. **Every core spec file is at zero failures and there are
+  no undiagnosed failures left.** R1–R5, R7, R9, R10 done, R6 closed by R3, R8 by R5, the singleton
+  batch took 22 and the bottom-type lattice the last 28 (27 of them SKIPS).
+- ⚠️ **READ ALL THREE TOTALS ON EVERY RUN — the per-file FAIL diff has a blind spot.** The legacy-EH
+  step turned two passes into SKIPS in a file that neither entered nor left the failure list, so the
+  per-file diff showed nothing; only `62,888 → 62,887 passed` and `951 → 953 skipped` revealed it.
+  **A file that trades passes for skips is invisible in a failure diff.** This is the concrete
+  incident the "quote all three or none" rule exists for.
+- ⚠️ **AND READ THE TOOL'S ACTUAL VERDICT LINE.** The same step added an unnecessary assembler
+  filter because `wazmrt <module>` prints `valid wasm v1, 4 section(s)` — a STRUCTURE header — three
+  lines above the real `validation: FAILED … MismatchedCatch`. The filter then broke the legal flat
+  `try … catch_all … end` spelling. *An audit finding is a hypothesis until the verdict line is
+  read.*
+- ⚠️ **THE 18 "CORE SINGLETONS" WERE SIX CAUSES, NOT 18** — worth remembering the next time a
+  remainder looks like an unstructured tail. The two big ones: a host `externref` and a GC heap
+  index shared one value space (12 failures, and `br_on_cast` on an internalized host reference
+  returned another object's FIELD — a forgery primitive), and an import matched a memory/table's
+  DECLARED minimum rather than its live size (4, two of them `UnresolvedImport` on a *different*
+  module that never registered behind the first error).
+- 🔴 **S1's other half is OPEN and the corpus cannot see it.** `capi.zig` still passes a host
+  `externref` through untagged, so an embedder handle of `2` internalizes to GC object #2. Filed in
+  `known-issues.md` as an owner decision (it changes what a `wazmrt_val_t` externref is). **This is
+  the R1 shape for the third time** — do not read a closed conformance count as a closed class.
+- ⚠️ **"BY DESIGN" COVERS TWO OPPOSITE SITUATIONS — do not merge them.** 98 are *untargeted
+  proposals* (`custom-descriptors`, `custom-page-sizes`, `wide-arithmetic`), refused honestly because
+  wazmrt does not implement them. The other 8 are `proposals/threads`, a snapshot pinned to a spec
+  **before** multi-memory and multi-table: it fails because wazmrt *does* implement those and
+  therefore ACCEPTS modules the snapshot calls invalid. **A proposal directory asserts the rules of
+  its own era**, so a failure there can mean the runtime is ahead of the file. Decisive check: those
+  assertions appear nowhere in the main suite (`exports.wast` has them only as commented-out
+  `;; No multiple memories yet.` notes).
+- ✅ **R7 closed its 7 real failures for +438 bytes (2026-08-14), and NONE of them was a threads
+  defect.** ⚠️ **The item was named after its directory and triaged as if the directory were the
+  cause** — its entry blamed "shared-memory import matching", which had been correct since memory64
+  (`limitsFit` compares the `shared` flag); the runner simply had no `spectest.shared_memory` to
+  import. The other two causes were legacy TEXT spellings, `(data 0 <offset> …)` and
+  `(elem 0 <offset> …)`. **Read the failures, not the folder name.**
+- ✅ **R9 closed 70 of its 71** for +3,584 bytes (2026-08-14) — nine causes, fourteen files to zero,
+  and **accept-invalid in core spec files is back to ZERO** but for one deliberate deviation
+  (`anyfunc`, the pre-standard spelling of `funcref`, kept on purpose for two real `.wat` corpus
+  files). **The 71st closed 2026-08-17** when the owner took that trade: accept-invalid in core spec
+  files is now unconditionally zero. ⚠️ **R9 was filed at 85 and measured 71 — the first
+  OVER-count of the series.** Every prior correction ran the other way, which had quietly trained
+  the warning below to read as "expect worse". **Stale is stale in both directions.**
+- ⚠️ **AN INVERSION THAT DOES NOT COMPILE LOOKS EXACTLY LIKE AN INVERSION NOTHING CAUGHT.** Two of
+  R9's eight inversion checks reported no failing test because commenting the check out left a Zig
+  function parameter unused — a compile error — and the grep for failing test names matched nothing
+  either way. **Assert the build succeeded before reading an inversion's silence as a result.**
+  (Same run, smaller trap: that grep also missed a test whose *name* contains an apostrophe.)
+- ✅ **R10 closed 416 of those for +1,536 bytes** — the best ratio in the series, and the clearest
+  demonstration of the rule: **rank remaining work by assertions unblocked, not by failures closed.**
+  Its residue is 32 assertions still behind two unbuildable first modules (`ref_null` 27, `id` 5),
+  both diagnosed in `roadmap.md`.
+- ⚠️ **Two of R10's six causes were rules we INVENTED**, not rules we missed — `br_table`'s
+  cross-label subtype check came from an audit finding with sound reasoning and a wrong conclusion,
+  and its unit test had to be inverted along with the code. **When a check you added is what the
+  corpus trips over, suspect the check.**
+- ⚠️ **"ACCEPT-INVALID IN CORE SPEC FILES IS ZERO" (recorded at R4) IS NO LONGER TRUE, and it was
+  true when written.** R4 closed every accept-invalid the corpus could *see*. R5 implemented
+  `(module quote …)`, the corpus gained sight of the TEXT front-end, and 88 more appeared in core
+  files — the same class, one layer up. **A conformance number says nothing about a surface the
+  corpus does not reach, and "the corpus reaches it" is itself a claim that can silently be false.**
+  The guard is still one grep — `grep "should be rejected"` over a `-Dfailures=600` run — but read it
+  next to the skip count, or it only measures the part of the runtime the runner can currently drive.
+- ⚠️ **1,429 SKIPPED IS NOT 1,429 PASSED**, and the largest pool is core spec: `br_table.wast` alone
+  has **161** unrun assertions. Any headline figure that ignores skips is an upper bound.
+- ⚠️ **READ THE SKIP COLUMN WHEN TRIAGING, NOT JUST THE FAILURE COLUMN.** R3 was triaged at ~10
+  failures and scored 16 — but a module that fails to build sends every assertion targeting it into
+  `NoTarget`, so those 16 were suppressing **225 assertions**. `array_fill.wast` read
+  `0 passed, 1 failed, 29 skipped`: one failure, and *nothing in the file ever ran*. Failures fell
+  36 while real runs rose 225. **A single-digit failure count next to a double-digit skip count is a
+  blackout, not a small defect.**
+- ⚠️⚠️ **AND AN ITEM WHOSE SYMPTOM IS A SKIP WILL BE UNDERCOUNTED BY ANY AMOUNT.** R5 was filed at
+  "~23" from the failure column; the real figure was **1,291**, because an unimplemented command form
+  produces no failures at all — only skips, which were never itemised per reason. R8 was a *subset*
+  of it (176 of the same skip) and was filed as a separate item because it was counted in a different
+  column. **The runner reports a skip TOTAL with no breakdown; that is why both numbers were wrong.**
+  Until it reports reasons, `grep -c "(module quote" <corpus>` and its siblings are the only way to
+  size a runner gap.
+- ⚠️ **Run `zig build size -Doptimize=ReleaseSmall` in the same session.** Nothing invokes it
+  automatically and the ceilings drifted 22–25 KB between 2026-08-11 and 2026-08-13 because of that.
+  ⚠️ **And run `zig build dll -Doptimize=ReleaseSmall` too** — plain `zig build` does not produce the
+  DLL, so the gate grades whatever stale one is in `zig-out`. R3's first run showed the DLL at
+  *exactly* its ceiling; the file was two builds old. **An exactly-zero delta is a timestamp check
+  waiting to happen.**
+
+**Unit tests: 631** (`zig build test --summary all`, 2026-08-14, final) — 627 pass / 4 skip from
+this repo's own `D:` cwd, **631/631 from an NTFS cwd**, which is the number to quote. R3 added 7,
+R4 4, R5 3, R10 5, R9 6, R7 1, the singleton batch 5 and the lattice 2; each core test raises the printed total by two because the C-ABI
+target re-runs the core suite. `test-safe` 631/631, `test-security` 3/3 (NTFS cwd), size gate green
+at the batch ceilings (+136 bytes of real code for 22 closed failures — five of the six causes REPLACE a rule rather than add one).
+
+⚠️ **R5's inversion check caught a test that tested the RULE but not that the rule is CONSULTED.**
+The literal-syntax test called `validIntLit`/`validFloatLit` directly, so disabling their *call
+sites* left it green while the assembler happily took `0xff__ffff` again. The fix was to assert the
+same cases through `assemble`. **When a predicate and its wiring are separate, invert the wiring, not
+just the predicate** — otherwise the test proves the function works and nothing about the product.
+
+⚠️ **R4 also had to CHANGE seven existing tests, and that is the interesting part.** Four hand-built
+EH fixtures in `interp.zig` and two WAT tests encoded the try_table catch-label off-by-one, and the
+`C.refs` test asserted outright that the start function declares a `ref.func`. They passed for years
+because the code they tested made the same mistake. **When a fix breaks existing tests, decide which
+of the two encodes the rule — check the spec and the external corpus, not the test count.** Here the
+corpus settled it in both directions: the five target files went clean and nothing else regressed.
+
+⚠️ **Three of R3's tests were confirmed to FAIL before being kept** — the rule that a new test which
+has never failed has not been shown to test anything. Each inversion was applied to the *implementation*
+and the specific test watched to fail: the byte-width scaling removed from `array.new_data` (caught),
+`array.copy`'s memmove reduced to a forward copy (caught, "expected 3, found 1"), and the
+packed-storage comparison disabled in `array.copy` validation (caught — the module then validated
+clean). The GC array ops are covered in-repo rather than only by the corpus because the `.wast` suite
+lives on removable media and cannot gate a commit.
+
+**Windows/this box:** run one `zig build` at a time, and pass `--cache-dir`/`--global-cache-dir` on
+`C:` — a `D:` cache fails with `error: Unexpected`. `zig build test-security` must be run from an
+NTFS cwd (`D:` is exFAT, no symlinks).
+
 ## Spec-testsuite conformance — first REAL measurement (2026-07-21, 13th pass)
 
 **Score: 57 827 passed / 752 failed / 4 507 skipped, over 258 files** (upstream `WebAssembly/spec`,
@@ -111,7 +262,8 @@ Two harness facts worth keeping:
 The reported assembler-feature gaps were then closed across two batches (see known-issues, "Assembler
 gaps" and "Open items 1–7"): inline `(export …)` on a tag, forward-referenced exports,
 `(export "mem" (memory $name))`, flat `br_table`, data-segment names, the discarded memory-index
-immediate, `anyfunc`, named struct fields, legacy folded `try`/`catch`, **GC const-exprs**,
+immediate, `anyfunc` (accepted then; **REFUSED since 2026-08-17**), named struct fields, legacy
+folded `try`/`catch`, **GC const-exprs**,
 **multi-memory text**, and **the whole atomics family**. **Score after the memory64 batch (Item 3,
 2026-07-27): 59,705 passed / 394 failed** over the 258 core files (up from 58,639 — the overflow-safe
 memory64 bounds lifted base-suite edge cases), plus the **threads `atomic.wast` suite at 302/0**, the
@@ -195,7 +347,7 @@ regressions).
 Added `ref.null`/`ref.is_null`/`ref.func` (`0xD0`–`0xD2`) end to end, `(ref null? func|extern)` value
 types in the assembler, and reference value literals in the WAST runner (`(ref.null …)`,
 `(ref.extern N)`, `(ref.func)` = any-non-null / with-index = exact). Null references use a
-`maxInt(u64)` sentinel on the value stack; a funcref value is its function index. Also made
+`maxInt(u64)` sentinel on the value stack; a funcref value is its function index (⚠️ **SUPERSEDED 2026-08-13, R2: a funcref is `(store_slot+1)<<32 | func_index`** — the bare index named a different function in every other instance). Also made
 `call_indirect` skip an optional explicit table id (`call_indirect $t (type …)`) — consumed but not
 encoded (single-table). **Remaining gaps are now two distinct features, not reference types:**
 `call_indirect.wast`'s last failure and `local_tee.wast` need **multi-table** support (multiple
@@ -216,7 +368,7 @@ element segments, imported globals — the next features), while `elem`/`stack` 
 unchanged.
 
 **Update 2026-07-09 — imported globals + extended-const init expressions:** `global.wast` 0 →
-**62 passed, 1 failed**. `Instance.initWithImports` fills imported-global slots from host-supplied
+**62 passed, 1 failed**. `Instance.initWithImports` (⚠️ renamed `instantiateWithImports` 2026-08-13) fills imported-global slots from host-supplied
 values (imports occupy the head of the global index space); the WAST runner backs the standard
 `spectest` globals (`global_i32`/`i64` = 666, `global_f32`/`f64` = 666.6); the assembler parses
 `(global (import "m" "n") type)` and emits an **import section (2)**; `ref.null`/`ref.func` are accepted
@@ -230,7 +382,7 @@ regressions** (HEAD-baselined: `data` 0/13 and `memory`'s slowness are pre-exist
 `table_set.wast` 0 → **18/0**. Added `table.get`/`table.set` (`0x25`/`0x26`) across
 opcode/interp/validator (typed by the table's element type), and refactored interp tables from `[]u32`
 (funcref indices) to `[]Value` slots so **funcref and externref tables share one representation**
-(`null_ref` = uninitialized; a funcref is its function index; an externref is its host value). The
+(`null_ref` = uninitialized; a funcref is its function index — ⚠️ **SUPERSEDED 2026-08-13, R2: it names an instance too**; an externref is its host value). The
 assembler parses `externref`/`(ref …)` table element types + emits the correct element byte, and emits
 `table.get`/`.set` (optional explicit table id, default 0). No regressions.
 

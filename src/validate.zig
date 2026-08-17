@@ -90,6 +90,19 @@ pub const Error = Module.Error || error{
     UndefinedElem,
     /// A `memory.init`/`data.drop` data-segment index out of range.
     UndefinedData,
+    /// A `(type $s (sub $t …))` whose declared supertype is not a real one —
+    /// `$t` is final, a different composite kind, or structurally incompatible
+    /// (§3.3.9). Left unchecked, `isSubtype` believes it and `ref.cast` succeeds
+    /// on a value that does not have the target type.
+    InvalidSubtype,
+    /// A legacy `rethrow l` whose label is not a `catch`/`catch_all` block.
+    /// Nothing else binds a caught exception, so there is nothing to re-raise.
+    InvalidRethrowLabel,
+    /// `memory.init`/`data.drop` appeared in a module with no data-count section.
+    /// §5.5.16 makes that section mandatory once either instruction is used —
+    /// a single-pass decoder has to know the segment count before the code
+    /// section, so its absence is malformed even though the indices resolve.
+    DataCountRequired,
     /// A struct/array field index out of range for its type (GC).
     UndefinedField,
     /// A `struct.set`/`array.set` on an immutable field (GC).
@@ -151,11 +164,27 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
 
     if (module.functions.len != module.code.len) return error.CountMismatch;
 
+    // Every DECLARED supertype must actually be one (§3.3.9). This has to run
+    // before anything consults `isSubtype`, which simply trusts the chain — so
+    // an unchecked declaration turns `ref.cast` into a lie the interpreter then
+    // acts on.
+    for (module.supertypes, 0..) |maybe_sup, i| if (maybe_sup) |sup|
+        if (!declaredSubtypeOk(module, @intCast(i), sup)) return error.InvalidSubtype;
+
     // C.refs (§3.4.10, "undeclared function reference"): `ref.func x` inside a
     // FUNCTION BODY is well-typed only if `x` also occurs somewhere *outside*
-    // the code section — a global initializer, an element segment, an export,
-    // or the start function. That rule is why `(elem declare func $f)` exists:
-    // it is the way to admit a reference to a function nothing else mentions.
+    // the code section — a global initializer, an element segment, or an export.
+    // That rule is why `(elem declare func $f)` exists: it is the way to admit a
+    // reference to a function nothing else mentions.
+    //
+    // ⚠️ **The START function does NOT declare one**, and both this code and the
+    // comment above it used to say it did. §3.5.1 builds `C.refs` from
+    // `funcidx(module with funcs = ε with start = ε)` — the start index is
+    // explicitly erased along with the function section, precisely so that
+    // "the module runs it" does not double as "the module may take its address".
+    // `ref_func.wast` pins it: `(module (start $f) (func $f (drop (ref.func $f))))`
+    // is invalid, and we accepted it. A rule written into a comment is not
+    // evidence the rule exists.
     //
     // Populated below as the module-level structures are walked, then consulted
     // by the body validator's `.ref_func` arm. Sized over the whole function
@@ -164,7 +193,6 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
     var refs = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_funcs);
     defer refs.deinit(gpa);
     for (module.exports) |e| if (e.type.kind() == .func and e.index < n_funcs) refs.set(e.index);
-    if (module.start) |si| if (si < n_funcs) refs.set(si);
 
     // Global init const-exprs: each must be a constant expression producing
     // exactly the declared type. Defined globals occupy the tail of the space.
@@ -189,19 +217,39 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
             if (module.funcType(fi) == null) return error.UndefinedFunc;
             if (fi < n_funcs) refs.set(fi); // a segment entry declares the function
         }
-        for (elem.exprs) |ex| try validateConstExpr(module, ex, elem.elem_type, n_imported_globals, &refs);
+        // ⚠️ **`all_globals`, not `n_imported_globals`.** §3.5.13 validates the
+        // element segments under the FULL context `C`; only `global*` uses the
+        // restricted `C'` that holds imported globals alone (line 202 above, where
+        // the bound is the global's own index so an initializer sees only PRIOR
+        // globals). Passing the restricted bound here rejected
+        // `(elem (table $t) … (global.get $gf))` for a DEFINED `$gf` — a valid
+        // module, and the whole of `global.wast`'s last module with it. The
+        // element expressions of an active segment are evaluated in
+        // `applyActiveSegments`, after every global is initialized, so the value
+        // is genuinely available. The segment OFFSET (line ~252) already used the
+        // full bound; only the element expressions kept the old restriction.
+        for (elem.exprs) |ex| try validateConstExpr(module, ex, elem.elem_type, all_globals, &refs);
         if (elem.mode == .active) {
             if (elem.table_index >= module.tables.len) return error.UndefinedTable;
             const tet = module.tables[elem.table_index].element;
-            // Family match (nullable-normalized) — non-nullability isn't enforced
-            // on segment application, and the flag-4 binary form can't carry it.
-            // NOTE (2026-07-20): `ValType.nullable()` returns the *nullable form
-            // of the type*, not a bool, so this compares heap types with
-            // nullability normalized away — which is correct. A 10th-pass audit
-            // reported it as an accept-invalid bug on the assumption that
-            // `nullable()` was a predicate; verified false. Don't "fix" it again.
-            if (elem.elem_type.nullable() != tet.nullable()) return error.TypeMismatch;
-            try validateConstExpr(module, elem.offset_expr, .i32, all_globals, null);
+            // §3.5.11: the segment's element type must be a SUBTYPE of the
+            // table's — the same rule `table.init` already used below.
+            //
+            // ⚠️ This was a nullability-normalized EQUALITY check. A 10th-pass
+            // audit called it an accept-invalid bug on the theory that
+            // `ValType.nullable()` was a predicate; that theory was wrong and the
+            // finding was retracted with a "don't fix it again" note. The
+            // mechanism was indeed as the retraction described — and the RULE was
+            // still wrong. Normalizing nullability away accepts a `funcref`
+            // segment into a `(ref func)` table, which `elem.wast` requires to be
+            // rejected: it would put nulls in a table whose type promises none.
+            // A retraction that only checks the reasoning does not re-check the
+            // requirement.
+            if (!subtypeOf(module, elem.elem_type, tet)) return error.TypeMismatch;
+            // The active-elem offset has the target TABLE's index type, exactly
+            // as an active-data offset takes its memory's (table64).
+            const off_ty: V = if (module.tables[elem.table_index].limits.is64) .i64 else .i32;
+            try validateConstExpr(module, elem.offset_expr, off_ty, all_globals, null);
         }
     }
 
@@ -230,8 +278,31 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
         } else if (mt.limits.shared) return error.InvalidLimits;
     }
     for (module.tables) |tt| {
+        // Entry-count ceiling: 2^32-1 for a 32-bit table, 2^64-1 for a 64-bit one
+        // (table64) — which every u64 satisfies, so only the 32-bit case bounds.
+        if (!tt.limits.is64) {
+            if (tt.limits.min > 0xffff_ffff) return error.InvalidLimits;
+            if (tt.limits.max) |mx| if (mx > 0xffff_ffff) return error.InvalidLimits;
+        }
         if (tt.limits.max) |mx| {
             if (tt.limits.min > mx) return error.InvalidLimits;
+        }
+        // §3.2.4 + function-references: a table's element type must be
+        // DEFAULTABLE, unless the table supplies an explicit initializer
+        // (§5.5.6's `0x40` form). A non-nullable reference has no default value,
+        // so `(table 0 (ref func))` describes a table whose slots cannot be given
+        // a starting state — and the size does not save it: `table.grow` would
+        // still have to invent one, which is why even a 0-length table is invalid.
+        //
+        // ⚠️ Neither half of this existed. The rule was unchecked here, AND the
+        // initializer that exempts a table from it was never validated at all: a
+        // `0x40`-form table could name any const-expr of any type and only the
+        // INTERPRETER would find out, at instantiation. `table.wast` pins six
+        // modules on the first half.
+        if (tt.init_expr) |ie| {
+            try validateConstExpr(module, ie, tt.element, n_imported_globals, &refs);
+        } else if (tt.element.isNonNullRef()) {
+            return error.TypeMismatch;
         }
     }
 
@@ -239,8 +310,17 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
     // this at its use site but the TAG SECTION ITSELF was never walked, so a
     // module declaring `(tag (type $ft))` with a result-producing `$ft`
     // validated — and could be exported or imported.
-    for (module.tags) |ti| {
-        const ft = module.funcSig(ti) orelse return error.UndefinedType;
+    //
+    // ⚠️ `module.tags` is the DEFINED tags only — imported tags lead the index
+    // space and are not in that slice — so the fix above checked exactly half the
+    // tags and `(import "" "" (tag (result i32)))` still validated. Walk the whole
+    // index space through `tagType`, which is the accessor that knows the layout.
+    // Same shape as the ref-identity work: **when a space has imported and defined
+    // halves, a loop over the defined slice is not a loop over the space.**
+    const n_tags = module.importedTagCount() + module.tags.len;
+    var ti: u32 = 0;
+    while (ti < n_tags) : (ti += 1) {
+        const ft = module.tagType(ti) orelse return error.UndefinedType;
         if (ft.results.len != 0) return error.InvalidTag;
     }
 
@@ -608,6 +688,28 @@ const FuncValidator = struct {
             _ = try self.popExpect(ts[i]);
         }
     }
+
+    /// `push_opds(pop_opds(ts))` — check that `ts` is on the stack and put back
+    /// **exactly what was there**, which on a polymorphic stack is `unknown` (⊥)
+    /// rather than the declared type. `popVals` + `pushVals` is NOT the same
+    /// operation: it substitutes concrete types for ⊥ and so makes a later probe
+    /// of the same slots fail. Used by `br_table`, which probes every label in
+    /// turn. Falls back to the declared types beyond a small fixed arity, where
+    /// nothing polymorphic can be involved in practice.
+    fn popPushVals(self: *FuncValidator, ts: []const V) Error!void {
+        var buf: [8]StackType = undefined;
+        if (ts.len > buf.len) {
+            try self.popVals(ts);
+            try self.pushVals(ts);
+            return;
+        }
+        var i = ts.len;
+        while (i > 0) {
+            i -= 1;
+            buf[i] = try self.popExpect(ts[i]);
+        }
+        for (buf[0..ts.len]) |st| try self.pushVal(st);
+    }
     /// Pop a value that must be a reference type (or polymorphic `unknown`).
     /// A linear memory must exist AND the instruction's memory index must be in
     /// range. The second half matters for multi-memory: checking only
@@ -617,10 +719,32 @@ const FuncValidator = struct {
         if (index >= self.module.memories.len) return error.MissingMemory;
     }
 
+    /// A function body naming a DATA index requires the data-count section
+    /// (§5.5.13), whatever the instruction — the section exists so the code
+    /// section can be validated before the data section is read. `memory.init`
+    /// and `data.drop` inlined this pair of checks; `array.new_data` /
+    /// `array.init_data` are data-index references too and need exactly the same
+    /// rule, so it lives in one place now rather than in four copies.
+    fn requireDataSegment(self: *FuncValidator, index: u32) Error!void {
+        if (self.module.data_count == null) return error.DataCountRequired;
+        if (index >= self.module.data.len) return error.UndefinedData;
+    }
+
     /// The address/count value type of memory `index` — `i64` for a memory64
     /// memory, else `i32`. Callers `requireMemory` first, so the index is valid.
     fn memAddrTy(self: *FuncValidator, index: u32) V {
         return if (self.module.memories[index].limits.is64) .i64 else .i32;
+    }
+
+    /// The INDEX type of a table: `i64` for a 64-bit table (the table64 half of
+    /// memory64), else `i32`. Every table index, length and count operand takes
+    /// this type — they were all hard-coded `.i32`, which is why a 64-bit table
+    /// could not be used even once it decoded.
+    ///
+    /// Callers bounds-check the index first (`tableElemType`), except where noted.
+    fn tableAddrTy(self: *FuncValidator, index: u32) V {
+        if (index >= self.module.tables.len) return .i32; // unreachable after the check
+        return if (self.module.tables[index].limits.is64) .i64 else .i32;
     }
 
     /// A memarg offset is decoded as `u64` (memory64), but on a 32-bit memory it
@@ -704,6 +828,15 @@ const FuncValidator = struct {
                 const ft = self.module.funcSig(i) orelse return error.UndefinedType;
                 break :blk .{ .pop = ft.params, .push = ft.results };
             },
+            // A single `(ref null? ht)` result. `refTypeValType` resolves a
+            // concrete index to its family head and — the point of this arm —
+            // fails `UndefinedType` when the index names no type at all, which is
+            // the "unknown type" `ref.wast` asks for.
+            .ref => |rt| blk: {
+                const r = try self.a.alloc(V, 1);
+                r[0] = try refTypeValType(self.module, rt);
+                break :blk .{ .pop = empty, .push = r };
+            },
         };
     }
 
@@ -723,14 +856,22 @@ const FuncValidator = struct {
                 const ft = self.module.tagType(c.tag) orelse return error.UndefinedTag;
                 try self.matchTypes(ft.params, lt);
             },
+            // ⚠️ The exception reference a `_ref` clause materializes is `(ref exn)`
+            // — NON-NULL. Checking it as the nullable `exnref` made the handler's
+            // pushed type weaker than it really is, so a label declaring
+            // `(ref exn)` was rejected: nullable does not satisfy a non-null
+            // expectation. `try_table.wast`'s `catch_ref1`/`catch_all_ref1` are
+            // exactly that module. The nullable-label case still passes, because
+            // `(ref exn) <: (ref null exn)` — the fix only widens what is accepted,
+            // in the direction the spec already required.
             .catch_ref => {
                 const ft = self.module.tagType(c.tag) orelse return error.UndefinedTag;
                 if (lt.len != ft.params.len + 1) return error.TypeMismatch;
                 try self.matchTypes(ft.params, lt[0..ft.params.len]);
-                if (!subtypeOf(self.module, .exnref, lt[lt.len - 1])) return error.TypeMismatch;
+                if (!subtypeOf(self.module, .exnref_nn, lt[lt.len - 1])) return error.TypeMismatch;
             },
             .catch_all => if (lt.len != 0) return error.TypeMismatch,
-            .catch_all_ref => if (lt.len != 1 or !subtypeOf(self.module, .exnref, lt[0])) return error.TypeMismatch,
+            .catch_all_ref => if (lt.len != 1 or !subtypeOf(self.module, .exnref_nn, lt[0])) return error.TypeMismatch,
         }
     }
 
@@ -761,15 +902,30 @@ const FuncValidator = struct {
             .try_table => {
                 const tt = instr.imm.try_table;
                 const s = try self.blockSig(tt.block_type);
-                try self.popVals(s.pop);
-                try self.pushCtrl(.try_table, s.pop, s.push);
-                // Each catch's target label must accept exactly the values the
-                // handler pushes: the tag's params, plus an `exnref` for `_ref`.
-                // Label indices are resolved with the try_table frame on top.
+                // ⚠️ **Catch labels resolve in the ENCLOSING context, NOT with the
+                // try_table's own frame pushed** (EH proposal §3.4: the catches are
+                // checked in `C`, only the body in `C, labels [t2*]`). This ran
+                // AFTER `pushCtrl`, so every catch label was off by one frame —
+                // and it failed in both directions at once:
+                //
+                //   (func (result exnref) (try_table (catch 0 0)) (unreachable))
+                //     — label 0 is the FUNCTION's block `[exnref]`, so a plain
+                //       `catch` delivering `[]` is a type mismatch. We resolved it
+                //       to the try_table's own empty block and ACCEPTED it.
+                //   (func (result exnref) (try_table (catch_ref $e 0) …))
+                //     — the same label is `[exnref]`, which `catch_ref` fits
+                //       exactly. We resolved it to `[]` and REJECTED a valid module.
+                //
+                // One off-by-one frame, an accept-invalid and a false reject in the
+                // same file. `wat.zig`'s `emitCatchClauses` had the mirror error, so
+                // a `$name` catch target resolved to the same wrong depth and the
+                // two halves agreed — the producer/consumer blind spot again.
                 for (tt.catches) |c| {
                     const lt = try self.labelTypesAt(c.label);
                     try self.checkCatch(c, lt);
                 }
+                try self.popVals(s.pop);
+                try self.pushCtrl(.try_table, s.pop, s.push);
             },
             .throw => {
                 const ft = self.module.tagType(instr.imm.tag) orelse return error.UndefinedTag;
@@ -821,9 +977,20 @@ const FuncValidator = struct {
                 return error.UnsupportedOpcode;
             },
             .rethrow => {
-                // Re-raise the exception caught `l` levels out. `l` must resolve,
-                // and control transfers, so the rest of the block is dead.
-                _ = try self.labelTypesAt(instr.imm.label);
+                // Re-raise the exception caught `l` levels out. `l` must resolve
+                // AND must name a `catch`/`catch_all` block — there is no caught
+                // exception at any other kind of label, so `(func (rethrow 0))`
+                // and `(func (block (rethrow 0)))` are invalid, not merely odd.
+                //
+                // We checked only that the label resolved, so both were ACCEPTED
+                // (`rethrow.wast`, "invalid rethrow label"). At run time
+                // `handler_exn` was then whatever the enclosing frame happened to
+                // leave there — a wrong exception re-raised, or a trap, decided by
+                // unrelated code. Same accept-invalid class as T1, in a feature we
+                // do implement.
+                if (instr.imm.label >= self.ctrls.items.len) return error.UnknownLabel;
+                const target = self.ctrls.items[self.ctrls.items.len - 1 - instr.imm.label];
+                if (target.kind != .catch_legacy) return error.InvalidRethrowLabel;
                 self.setUnreachable();
             },
             .throw_ref => {
@@ -865,18 +1032,38 @@ const FuncValidator = struct {
                 for (instr.imm.br_table.labels) |l| {
                     const lt = try self.labelTypesAt(l);
                     if (lt.len != default_lt.len) return error.TypeMismatch;
-                    // #2f: every target label must be type-compatible with the
-                    // default, not merely equal in arity. `popVals` catches a
-                    // mismatch in reachable code but NOT in stack-polymorphic
-                    // (post-`unreachable`) code, where the operand stack is
-                    // `unknown`. `subtypeOf` both ways rejects only genuinely
-                    // incompatible pairs (under single inheritance no common
-                    // operand type exists), so it never rejects a valid
-                    // subtyped `br_table`.
-                    for (lt, default_lt) |a, b|
-                        if (!subtypeOf(self.module, a, b) and !subtypeOf(self.module, b, a)) return error.TypeMismatch;
-                    try self.popVals(lt);
-                    try self.pushVals(lt);
+                    // ⚠️ **A "#2f" pairwise subtype check between each label and
+                    // the default used to live here, and the spec has no such
+                    // rule.** §3.3.5.9 asks for a single `[t*]` that is a subtype
+                    // of every label's type; after `unreachable` the operand stack
+                    // supplies ⊥, which is a subtype of anything, so labels that
+                    // are pairwise incompatible are still jointly satisfiable.
+                    // `br_table.wast` names the case `meet-bottom`:
+                    //
+                    //     (block (result f64) (block (result f32)
+                    //       (unreachable) (br_table 0 1 1 (i32.const 1))))
+                    //
+                    // f32 and f64 have no common supertype and the module is
+                    // VALID. The check's own comment claimed it "never rejects a
+                    // valid subtyped `br_table`"; it rejected this one and took the
+                    // other **161 assertions in the file** into `NoTarget`.
+                    //
+                    // It was redundant in the other direction too: in REACHABLE
+                    // code the pop/push below already catches a genuine mismatch,
+                    // because the first label leaves a concrete type the next
+                    // label's pop must satisfy. The algorithm below is the
+                    // Appendix's, unmodified — arity equality plus
+                    // `push_opds(pop_opds(label_types(l)))` — and arity is the only
+                    // cross-label rule there is: one `[t*]` cannot have two lengths.
+                    // ⚠️ Push back WHAT WAS POPPED, not the label's declared types.
+                    // `popVals(lt); pushVals(lt);` looks like a non-destructive
+                    // probe and is not: on a polymorphic stack `popVals` consumes
+                    // `unknown` (⊥) entries while `pushVals` puts CONCRETE ones
+                    // back, so checking label 0 of `meet-bottom` left a real `f32`
+                    // where ⊥ had been, and checking label 1 then failed
+                    // "expected f64, found f32". §Appendix's algorithm is
+                    // `push_opds(pop_opds(…))` — the popped entries, ⊥ and all.
+                    try self.popPushVals(lt);
                 }
                 try self.popVals(default_lt);
                 self.setUnreachable();
@@ -891,6 +1078,28 @@ const FuncValidator = struct {
                 try self.popVals(ft.params);
                 try self.pushVals(ft.results);
             },
+            // Tail calls (§3.3.8). The callee REPLACES this frame, so its results
+            // become this function's results — they must be a SUBTYPE sequence of
+            // them (see `resultsSubtype`; this was an equality check, which is
+            // reject-valid for every widening return), and nothing after the
+            // instruction is reachable. `return_call_ref` already had this shape;
+            // these two are its plain and indirect siblings.
+            .return_call => {
+                const ft = self.module.funcType(instr.imm.func) orelse return error.UndefinedFunc;
+                try self.popVals(ft.params);
+                if (!resultsSubtype(self.module, ft.results, self.results)) return error.TypeMismatch;
+                self.setUnreachable();
+            },
+            .return_call_indirect => {
+                const ci = instr.imm.call_indirect;
+                if (ci.table >= self.module.tables.len) return error.UndefinedTable;
+                if (!subtypeOf(self.module, self.module.tables[ci.table].element, .funcref)) return error.TypeMismatch;
+                const ft = self.module.funcSig(ci.type_index) orelse return error.UndefinedType;
+                _ = try self.popExpect(self.tableAddrTy(ci.table)); // the callee index
+                try self.popVals(ft.params);
+                if (!resultsSubtype(self.module, ft.results, self.results)) return error.TypeMismatch;
+                self.setUnreachable();
+            },
             .call_indirect => {
                 const ci = instr.imm.call_indirect;
                 if (ci.table >= self.module.tables.len) return error.UndefinedTable;
@@ -899,7 +1108,7 @@ const FuncValidator = struct {
                 // `(table 1 (ref func))` is valid and was rejected.
                 if (!subtypeOf(self.module, self.module.tables[ci.table].element, .funcref)) return error.TypeMismatch;
                 const ft = self.module.funcSig(ci.type_index) orelse return error.UndefinedType;
-                _ = try self.popExpect(.i32);
+                _ = try self.popExpect(self.tableAddrTy(ci.table)); // the callee index
                 try self.popVals(ft.params);
                 try self.pushVals(ft.results);
             },
@@ -1026,29 +1235,31 @@ const FuncValidator = struct {
 
             .table_get => {
                 const et = try self.tableElemType(instr.imm.table);
-                _ = try self.popExpect(.i32);
+                _ = try self.popExpect(self.tableAddrTy(instr.imm.table));
                 try self.pushValT(et);
             },
             .table_set => {
                 const et = try self.tableElemType(instr.imm.table);
                 _ = try self.popExpect(et);
-                _ = try self.popExpect(.i32);
+                _ = try self.popExpect(self.tableAddrTy(instr.imm.table));
             },
             .table_size => {
                 _ = try self.tableElemType(instr.imm.table); // bounds-check the index
-                try self.pushValT(.i32);
+                try self.pushValT(self.tableAddrTy(instr.imm.table));
             },
             .table_grow => {
                 const et = try self.tableElemType(instr.imm.table);
-                _ = try self.popExpect(.i32); // delta
+                const at = self.tableAddrTy(instr.imm.table);
+                _ = try self.popExpect(at); // delta
                 _ = try self.popExpect(et); // init value
-                try self.pushValT(.i32);
+                try self.pushValT(at); // previous size
             },
             .table_fill => {
                 const et = try self.tableElemType(instr.imm.table);
-                _ = try self.popExpect(.i32); // n
+                const at = self.tableAddrTy(instr.imm.table);
+                _ = try self.popExpect(at); // n
                 _ = try self.popExpect(et); // value
-                _ = try self.popExpect(.i32); // dst
+                _ = try self.popExpect(at); // dst
             },
             .table_init => {
                 const tet = try self.tableElemType(instr.imm.table_init.table);
@@ -1057,9 +1268,11 @@ const FuncValidator = struct {
                 // equal to it — an `(elem (ref func) …)` into a `funcref` table is
                 // valid and was rejected.
                 if (!subtypeOf(self.module, self.module.elements[instr.imm.table_init.elem].elem_type, tet)) return error.TypeMismatch;
+                // `src` and `n` index the ELEMENT SEGMENT, which is always 32-bit;
+                // only `dst` takes the destination table's index type.
                 _ = try self.popExpect(.i32); // n
                 _ = try self.popExpect(.i32); // src
-                _ = try self.popExpect(.i32); // dst
+                _ = try self.popExpect(self.tableAddrTy(instr.imm.table_init.table)); // dst
             },
             .elem_drop => {
                 if (instr.imm.elem >= self.module.elements.len) return error.UndefinedElem;
@@ -1103,22 +1316,25 @@ const FuncValidator = struct {
                 // differs by build mode. `data_drop` below is correct; its
                 // immediate really is `.data`.
                 try self.requireMemory(instr.imm.mem_init.mem);
-                if (instr.imm.mem_init.data >= self.module.data.len) return error.UndefinedData;
+                try self.requireDataSegment(instr.imm.mem_init.data);
                 _ = try self.popExpect(.i32); // n (count into the data segment — i32)
                 _ = try self.popExpect(.i32); // src (offset into the segment — i32)
                 _ = try self.popExpect(self.memAddrTy(instr.imm.mem_init.mem)); // dst address (memory64: i64)
             },
-            .data_drop => {
-                if (instr.imm.data >= self.module.data.len) return error.UndefinedData;
-            },
+            .data_drop => try self.requireDataSegment(instr.imm.data),
             .table_copy => {
                 const dt = try self.tableElemType(instr.imm.table_copy.dst);
                 const st = try self.tableElemType(instr.imm.table_copy.src);
                 // Same rule as table.init: src <: dst, not equality.
                 if (!subtypeOf(self.module, st, dt)) return error.TypeMismatch;
-                _ = try self.popExpect(.i32); // n
-                _ = try self.popExpect(.i32); // src
-                _ = try self.popExpect(.i32); // dst
+                // Each table contributes its own index type, and `n` takes the
+                // SMALLER of the two — same rule as `memory.copy`.
+                const dat = self.tableAddrTy(instr.imm.table_copy.dst);
+                const sat = self.tableAddrTy(instr.imm.table_copy.src);
+                const nt: V = if (dat == .i64 and sat == .i64) .i64 else .i32;
+                _ = try self.popExpect(nt); // n
+                _ = try self.popExpect(sat); // src
+                _ = try self.popExpect(dat); // dst
             },
 
             .ref_null => try self.pushValT(try refTypeValType(self.module, .{ .nullable = true, .heap = instr.imm.ref_type })),
@@ -1160,7 +1376,7 @@ const FuncValidator = struct {
                 const ft = self.module.funcSig(instr.imm.func) orelse return error.UndefinedType;
                 _ = try self.popExpect(V.concreteRef(true, .func, instr.imm.func));
                 try self.popVals(ft.params);
-                if (!valTypesEqual(ft.results, self.results)) return error.TypeMismatch;
+                if (!resultsSubtype(self.module, ft.results, self.results)) return error.TypeMismatch;
                 self.setUnreachable();
             },
             // GC: i31 references (full GC, P3). `ref.i31` boxes an i32 into a
@@ -1270,6 +1486,95 @@ const FuncValidator = struct {
                 try self.pushValT(.i32);
             },
 
+            // GC: the array BULK ops. All six were missing until R3 (2026-08-13).
+            //
+            // `array.new_data $t $d : [i32 i32] -> [(ref $t)]` — the operands are a
+            // byte OFFSET into the data segment and an element COUNT. §3.3.7: the
+            // element type must be numeric/vector/packed; a REFERENCE element has
+            // no byte encoding, so a data segment cannot initialise one.
+            .array_new_data => {
+                const gd = instr.imm.gc_data;
+                const f = self.module.arrayField(gd.type_index) orelse return error.UndefinedType;
+                if (f.storage.unpacked().isRef()) return error.TypeMismatch;
+                try self.requireDataSegment(gd.data);
+                _ = try self.popExpect(.i32); // size (in elements)
+                _ = try self.popExpect(.i32); // offset (in bytes, into the segment)
+                try self.pushValT(V.concreteRef(false, .array, gd.type_index));
+            },
+            // `array.new_elem $t $e : [i32 i32] -> [(ref $t)]` — the mirror over an
+            // ELEMENT segment, so the element type must be a reference the segment
+            // can produce: `elem_type <: t'`, the same subtyping rule `table.init`
+            // uses (R2's C3 — family equality here would reject a valid module).
+            .array_new_elem => {
+                const ge = instr.imm.gc_elem;
+                const f = self.module.arrayField(ge.type_index) orelse return error.UndefinedType;
+                if (ge.elem >= self.module.elements.len) return error.UndefinedElem;
+                if (!subtypeOf(self.module, self.module.elements[ge.elem].elem_type, f.storage.unpacked())) return error.TypeMismatch;
+                _ = try self.popExpect(.i32); // size (in elements)
+                _ = try self.popExpect(.i32); // offset (in elements, into the segment)
+                try self.pushValT(V.concreteRef(false, .array, ge.type_index));
+            },
+            // `array.fill $t : [(ref null $t) i32 t' i32] -> []` (array, index,
+            // value, count). Writes, so the element must be mutable.
+            .array_fill => {
+                const f = self.module.arrayField(instr.imm.gc_type) orelse return error.UndefinedType;
+                if (!f.mutable) return error.ImmutableField;
+                _ = try self.popExpect(.i32); // count
+                _ = try self.popExpect(f.storage.unpacked()); // value
+                _ = try self.popExpect(.i32); // index
+                _ = try self.popExpect(V.concreteRef(true, .array, instr.imm.gc_type));
+            },
+            // `array.copy $t1 $t2 : [(ref null $t1) i32 (ref null $t2) i32 i32] -> []`
+            // (dst, dst_off, src, src_off, len). The destination must be mutable and
+            // the source element type a subtype of the destination's — the packed
+            // widths therefore agree, which is what lets the interpreter copy the
+            // stored `Value`s directly.
+            .array_copy => {
+                const ac = instr.imm.gc_array_copy;
+                const df = self.module.arrayField(ac.dst) orelse return error.UndefinedType;
+                const sf = self.module.arrayField(ac.src) orelse return error.UndefinedType;
+                if (!df.mutable) return error.ImmutableField;
+                // Packed storage is not a value type, so `unpacked()` alone would
+                // call `(array i8)` and `(array i32)` compatible — both project i32.
+                // Compare the STORAGE forms first, then the value types.
+                if (df.storage.isPacked() or sf.storage.isPacked()) {
+                    if (!std.meta.eql(df.storage, sf.storage)) return error.TypeMismatch;
+                } else if (!subtypeOf(self.module, sf.storage.unpacked(), df.storage.unpacked())) {
+                    return error.TypeMismatch;
+                }
+                _ = try self.popExpect(.i32); // len
+                _ = try self.popExpect(.i32); // src offset
+                _ = try self.popExpect(V.concreteRef(true, .array, ac.src));
+                _ = try self.popExpect(.i32); // dst offset
+                _ = try self.popExpect(V.concreteRef(true, .array, ac.dst));
+            },
+            // `array.init_data $t $d : [(ref null $t) i32 i32 i32] -> []`
+            // (array, dst_off, src_byte_off, len). Same element-type restriction as
+            // `array.new_data`, plus mutability because it writes in place.
+            .array_init_data => {
+                const gd = instr.imm.gc_data;
+                const f = self.module.arrayField(gd.type_index) orelse return error.UndefinedType;
+                if (!f.mutable) return error.ImmutableField;
+                if (f.storage.unpacked().isRef()) return error.TypeMismatch;
+                try self.requireDataSegment(gd.data);
+                _ = try self.popExpect(.i32); // len
+                _ = try self.popExpect(.i32); // src offset (bytes)
+                _ = try self.popExpect(.i32); // dst offset (elements)
+                _ = try self.popExpect(V.concreteRef(true, .array, gd.type_index));
+            },
+            // `array.init_elem $t $e : [(ref null $t) i32 i32 i32] -> []`.
+            .array_init_elem => {
+                const ge = instr.imm.gc_elem;
+                const f = self.module.arrayField(ge.type_index) orelse return error.UndefinedType;
+                if (!f.mutable) return error.ImmutableField;
+                if (ge.elem >= self.module.elements.len) return error.UndefinedElem;
+                if (!subtypeOf(self.module, self.module.elements[ge.elem].elem_type, f.storage.unpacked())) return error.TypeMismatch;
+                _ = try self.popExpect(.i32); // len
+                _ = try self.popExpect(.i32); // src offset (elements)
+                _ = try self.popExpect(.i32); // dst offset (elements)
+                _ = try self.popExpect(V.concreteRef(true, .array, ge.type_index));
+            },
+
             // GC casts. `ref.test` consumes a reference and yields i32; `ref.cast`
             // passes the reference through with the target's (collapsed) type,
             // trapping at runtime on a failed cast.
@@ -1297,9 +1602,22 @@ const FuncValidator = struct {
                 if (!subtypeOf(self.module, dst_vt, src_vt)) return error.TypeMismatch; // a downcast
                 const lt = try self.labelTypesAt(bc.label); // [t* carried]
                 if (lt.len == 0) return error.TypeMismatch;
+                // `rt1 \ rt2` — the source type MINUS what the cast would have
+                // caught. When the target is NULLABLE a null matches it, so a
+                // value that fails the cast is non-null and the difference loses
+                // nullability.
+                const diff = if (dst_vt.isNonNullRef()) src_vt else src_vt.nonNull();
                 // The type carried to the label: `dst` for br_on_cast (the branch
-                // fires on a match), `src` for br_on_cast_fail (fires on a miss).
-                const carried = if (instr.op == .br_on_cast) dst_vt else src_vt;
+                // fires on a match), the DIFFERENCE for br_on_cast_fail (fires on
+                // a miss).
+                //
+                // ⚠️ This used plain `src_vt` for the fail form. The subtraction
+                // was already implemented eleven lines below for br_on_cast's
+                // FALL-THROUGH — the same rule, applied on one of the two paths
+                // that need it — so `null-diff`, the test named for exactly this,
+                // was rejected: it branches `(ref null any)` into a label typed
+                // `(ref any)`.
+                const carried = if (instr.op == .br_on_cast) dst_vt else diff;
                 if (!subtypeOf(self.module, carried, lt[lt.len - 1])) return error.TypeMismatch;
                 const prefix = lt[0 .. lt.len - 1]; // t*
                 _ = try self.popExpect(src_vt); // the ref operand (top)
@@ -1311,10 +1629,21 @@ const FuncValidator = struct {
                 // NULLABLE, a null would have branched, so the fall-through ref is
                 // non-null — pushing `src_vt` unchanged over-approximated and
                 // rejected valid code that feeds it to a `(ref …)` parameter.
-                try self.pushValT(if (instr.op == .br_on_cast)
-                    (if (dst_vt.isNonNullRef()) src_vt else src_vt.nonNull())
-                else
-                    dst_vt);
+                try self.pushValT(if (instr.op == .br_on_cast) diff else dst_vt);
+            },
+
+            // GC: the extern↔any bridge. Both are representation-preserving and
+            // NULLABILITY-PRESERVING: `extern.convert_any` takes `(ref null? any)`
+            // to `(ref null? extern)` and `any.convert_extern` the reverse, with
+            // the null-ness carried across. Mirrors the const-expr arms, which
+            // were the only place these existed until R10.
+            .extern_convert_any => switch (try self.popRef()) {
+                .val => |v| try self.pushValT(if (v.isNonNullRef()) .externref_nn else .externref),
+                .unknown => try self.pushVal(.unknown),
+            },
+            .any_convert_extern => switch (try self.popRef()) {
+                .val => |v| try self.pushValT(if (v.isNonNullRef()) .anyref_nn else .anyref),
+                .unknown => try self.pushVal(.unknown),
             },
 
             // Spec: `[(ref null ht)] -> [(ref ht)]` — the op EXISTS to remove
@@ -1352,16 +1681,27 @@ const FuncValidator = struct {
                 // reject-valid, not a safety issue.
                 const lt = try self.labelTypesAt(instr.imm.label);
                 if (lt.len == 0 or !lt[lt.len - 1].isRef()) return error.TypeMismatch;
-                try self.popVals(lt);
-                try self.pushVals(lt);
-                // The operand is the nullable form of what the label expects; in
-                // unreachable code it is `.unknown` and matches anything.
+                // ⚠️ Pop the OPERAND first, and check only `t*` against the stack.
+                // The label's last type is the NON-NULL `(ref ht)`; the operand is
+                // its nullable counterpart `(ref null ht)`. Popping `lt` wholesale
+                // therefore asked the stack for `(ref any)` where `anyref` sits —
+                // "expected anyref_nn, found anyref" — and rejected the canonical
+                // idiom this instruction exists for:
+                //
+                //     (block $l (result (ref any))
+                //       (br_on_non_null $l (table.get …)) (return …))
+                //
+                // It cost the first module of `br_on_non_null.wast` AND of
+                // `br_on_cast_fail.wast`, i.e. 33 assertions across two files.
                 const r = try self.popRef();
                 switch (r) {
                     .val => |v| if (!subtypeOf(self.module, v, lt[lt.len - 1].nullable()))
                         return error.TypeMismatch,
                     .unknown => {},
                 }
+                const prefix = lt[0 .. lt.len - 1];
+                try self.popVals(prefix);
+                try self.pushVals(prefix);
             },
 
             .local_get => {
@@ -1431,6 +1771,21 @@ fn valTypesEqual(a: []const V, b: []const V) bool {
     return true;
 }
 
+/// §3.3.8: a tail call's callee results must be a SUBTYPE SEQUENCE of the
+/// caller's declared results — `[t2*] <: [t2'*]` — not equal to them.
+///
+/// ⚠️ All three tail-call forms used `valTypesEqual`, which is reject-VALID for
+/// every widening return: `(func (result (ref null $t)) (return_call_ref $t1 …))`
+/// where `$t1` returns the non-null `(ref $t)` is exactly the idiom
+/// `return_call_ref.wast`'s "More typing" module is built from, and equality
+/// refused six functions of it. Equality is not a conservative approximation of
+/// subtyping here — it is a different rule that rejects real code.
+fn resultsSubtype(module: *const Module, callee: []const V, caller: []const V) bool {
+    if (callee.len != caller.len) return false;
+    for (callee, caller) |x, y| if (!subtypeOf(module, x, y)) return false;
+    return true;
+}
+
 /// Is `sub` a subtype of `sup` (for operand matching)? Identical types match.
 /// Reference subtyping follows the WasmGC hierarchy on the heap type
 /// (`RefHeap.sub`: i31/struct/array <: eq <: any; `none` the bottom; func/extern
@@ -1453,6 +1808,85 @@ fn refTypeValType(module: *const Module, rt: opcode.RefType) Error!V {
     };
 }
 
+/// §3.3.9 — is a DECLARED supertype relation legitimate? `(type $s (sub $t …))`
+/// only type-checks if `$s`'s structure *matches* `$t`'s.
+///
+/// ⚠️ **We never checked this at all.** The decoder recorded `supertypes[i]` and
+/// the validator trusted it, so a module could declare any type the supertype of
+/// any other and `isSubtype`'s chain walk would then agree — `(array i32)` under
+/// `(array i64)`, a struct under a func, `(func)` under `(func (param i32))`.
+/// Nineteen of `type-subtyping.wast`'s accept-invalid failures, and every one of
+/// them makes `ref.cast`/`br_on_cast` unsound: the cast succeeds and the
+/// interpreter then reads the value at a type it does not have.
+fn declaredSubtypeOk(module: *const Module, sub_i: u32, sup_i: u32) bool {
+    if (sup_i >= module.comp_types.len or sub_i >= module.comp_types.len) return false;
+    // A final type is closed: nothing may name it as a supertype.
+    if (module.isFinal(sup_i)) return false;
+    const sub = module.comp_types[sub_i];
+    const sup = module.comp_types[sup_i];
+    return switch (sup) {
+        // Function: params CONTRAVARIANT, results COVARIANT, arities equal.
+        .func => |f_sup| switch (sub) {
+            .func => |f_sub| blk: {
+                if (f_sub.params.len != f_sup.params.len) break :blk false;
+                if (f_sub.results.len != f_sup.results.len) break :blk false;
+                for (f_sup.params, f_sub.params) |p_sup, p_sub|
+                    if (!subtypeOf(module, p_sup, p_sub)) break :blk false; // note the order
+                for (f_sub.results, f_sup.results) |r_sub, r_sup|
+                    if (!subtypeOf(module, r_sub, r_sup)) break :blk false;
+                break :blk true;
+            },
+            else => false, // kind mismatch: a struct/array is never a func subtype
+        },
+        // Struct: the subtype may ADD fields at the end, but every inherited
+        // field must still match positionally.
+        .@"struct" => |fs_sup| switch (sub) {
+            .@"struct" => |fs_sub| blk: {
+                if (fs_sub.len < fs_sup.len) break :blk false;
+                for (fs_sup, fs_sub[0..fs_sup.len]) |f_sup, f_sub|
+                    if (!fieldMatches(module, f_sub, f_sup)) break :blk false;
+                break :blk true;
+            },
+            else => false,
+        },
+        .array => |f_sup| switch (sub) {
+            .array => |f_sub| fieldMatches(module, f_sub, f_sup),
+            else => false,
+        },
+    };
+}
+
+/// §3.3.8 field matching. A MUTABLE field is INVARIANT — it is both read and
+/// written through the supertype, so widening it either way is unsound. An
+/// immutable field is covariant, and cannot be re-opened as mutable.
+fn fieldMatches(module: *const Module, sub: Module.FieldType, sup: Module.FieldType) bool {
+    if (sub.mutable != sup.mutable) return false;
+    if (sup.mutable) return storageEql(module, sub.storage, sup.storage);
+    return storageSubtypeOf(module, sub.storage, sup.storage);
+}
+
+/// Storage-type IDENTITY (the invariant, mutable-field case).
+///
+/// Goes through `Module.valTypeEq` rather than `==` for the same reason
+/// everything else in this pass does: a concrete `(ref $t)` carries a type index,
+/// and two indices naming isomorphic rec groups are ONE type. Raw `==` rejected a
+/// valid `(sub $parent (struct (field (mut (ref $t2)))))` whenever the parent
+/// spelled the same field type through a different index.
+fn storageEql(module: *const Module, a: Module.StorageType, b: Module.StorageType) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .val => |v| module.valTypeEq(v, b.val),
+        .i8, .i16 => true,
+    };
+}
+
+/// Packed storage types (`i8`/`i16`) relate only to themselves — `i8` is not a
+/// subtype of `i16` or of `i32`, despite all three unpacking to `i32`.
+fn storageSubtypeOf(module: *const Module, sub: Module.StorageType, sup: Module.StorageType) bool {
+    if (sub == .val and sup == .val) return subtypeOf(module, sub.val, sup.val);
+    return storageEql(module, sub, sup);
+}
+
 fn subtypeOf(module: *const Module, sub: V, sup: V) bool {
     if (sub == sup) return true;
     if (!sub.isRef() or !sup.isRef()) return false;
@@ -1467,7 +1901,25 @@ fn subtypeOf(module: *const Module, sub: V, sup: V) bool {
     // / eqref / anyref); an abstract sub only satisfies a concrete sup when it is
     // the bottom `none`.
     if (sub.isConcrete()) return sub.refHeap().sub(sup.refHeap());
-    if (sup.isConcrete()) return sub.refHeap() == .none;
+    // An abstract sub satisfies a CONCRETE sup only when it is that hierarchy's
+    // bottom. `RefHeap.sub` cannot say this — concrete types are not `RefHeap`
+    // values — so the rule lives here, and the two halves agree by both keying
+    // off `top()`.
+    //
+    // ⚠️ This used to be `== .none` flat, i.e. the ANY hierarchy's bottom for
+    // every concrete target. With `nofunc` folded onto `funcref` that was
+    // consistent and wrong twice over: `nullfuncref` could not reach a
+    // `(ref null $funcType)` (`ref_null.wast`'s whole second module), and
+    // `nullref` — an `any`-family value — would have satisfied a concrete FUNC
+    // type if one had ever been asked for. A bottom belongs to exactly one
+    // hierarchy.
+    if (sup.isConcrete()) {
+        const bottom = sub.refHeap();
+        return switch (bottom) {
+            .none, .nofunc, .noextern, .noexn => bottom.top() == sup.refHeap().top(),
+            else => false,
+        };
+    }
     return sub.refHeap().sub(sup.refHeap());
 }
 
@@ -1633,11 +2085,50 @@ test "validates a well-typed add function" {
         types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
         [_]u8{ 0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f } ++
         [_]u8{ 0x03, 0x02, 0x01, 0x00 } ++
-        [_]u8{ 0x0a, 0x0b, 0x01, 0x09, 0x01, 0x01, 0x7f, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b } ++
-        [_]u8{ 0x07, 0x07, 0x01, 0x03, 'a', 'd', 'd', 0x00, 0x00 };
+        [_]u8{ 0x07, 0x07, 0x01, 0x03, 'a', 'd', 'd', 0x00, 0x00 } ++
+        [_]u8{ 0x0a, 0x0b, 0x01, 0x09, 0x01, 0x01, 0x7f, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b };
     var m = try Module.decode(std.testing.allocator, &bytes);
     defer m.deinit();
     try validate(std.testing.allocator, &m);
+}
+
+test "rejects memory.init/data.drop with no data-count section (§5.5.16)" {
+    // A module with a memory, one passive data segment and a body that uses it,
+    // but NO data-count section. Every index resolves — `data.len` is 1 — so
+    // nothing downstream noticed; §5.5.16 still requires the section, because a
+    // single-pass decoder must know the segment count before the code section.
+    //
+    // The mirror-image half of this gap lived in the ASSEMBLER, which emitted
+    // the section never: fixing only the check here turned ~96 previously
+    // passing corpus assertions red. Both halves are needed, and each one hid
+    // the other.
+    const with_count = [_]u8{ 0x0c, 0x01, 0x01 }; // data_count: 1 segment
+    const rest =
+        types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+        [_]u8{ 0x01, 0x04, 0x01, 0x60, 0x00, 0x00 } ++ // type: () -> ()
+        [_]u8{ 0x03, 0x02, 0x01, 0x00 } ++ // one func of type 0
+        [_]u8{ 0x05, 0x03, 0x01, 0x00, 0x01 }; // memory: min 1 page
+    // code(14) = count(1) + size(1) + body(12); body(12) = locals(1) + three
+    // `i32.const 0`(2 each) + `memory.init 0 0`(4) + end(1).
+    const tail =
+        [_]u8{ 0x0a, 0x0e, 0x01, 0x0c, 0x00, 0x41, 0x00, 0x41, 0x00, 0x41, 0x00, 0xfc, 0x08, 0x00, 0x00, 0x0b } ++
+        // data(4) = count(1) + flags(1) + len(1) + "a"(1): one passive segment.
+        [_]u8{ 0x0b, 0x04, 0x01, 0x01, 0x01, 0x61 };
+
+    {
+        const bytes = rest ++ tail;
+        var m = try Module.decode(std.testing.allocator, &bytes);
+        defer m.deinit();
+        try std.testing.expectError(error.DataCountRequired, validate(std.testing.allocator, &m));
+    }
+    // The same module WITH the section must validate — the check must key on the
+    // section's presence, not on `data.len`, which is 1 either way.
+    {
+        const bytes = rest ++ with_count ++ tail;
+        var m = try Module.decode(std.testing.allocator, &bytes);
+        defer m.deinit();
+        try validate(std.testing.allocator, &m);
+    }
 }
 
 test "rejects a stack underflow (i32.add with no operands)" {
@@ -1808,11 +2299,17 @@ test "validator: ref.func in a body requires the function to be declared (C.refs
     const cases = [_]struct { src: []const u8, ok: bool }{
         // Nothing outside the code section mentions $f -> undeclared.
         .{ .src = "(module (func $f) (func (export \"g\") (result funcref) (ref.func $f)))", .ok = false },
-        // Each of the four declaring positions in turn.
+        // Each of the three declaring positions in turn.
         .{ .src = "(module (func $f) (elem declare func $f) (func (export \"g\") (result funcref) (ref.func $f)))", .ok = true },
         .{ .src = "(module (func $f) (export \"f\" (func $f)) (func (export \"g\") (result funcref) (ref.func $f)))", .ok = true },
         .{ .src = "(module (func $f) (global funcref (ref.func $f)) (func (export \"g\") (result funcref) (ref.func $f)))", .ok = true },
-        .{ .src = "(module (func $f) (start $f) (func (export \"g\") (result funcref) (ref.func $f)))", .ok = true },
+        // ⚠️ The START function is NOT one of them, and this case asserted that it
+        // was until R4 (2026-08-13) — the test encoded the same wrong rule as the
+        // code and the comment above it ("four declaring positions"), so all three
+        // agreed and none of them was evidence. §3.5.1 erases `start` alongside the
+        // function section when building `C.refs`; `ref_func.wast` requires this
+        // module rejected.
+        .{ .src = "(module (func $f) (start $f) (func (export \"g\") (result funcref) (ref.func $f)))", .ok = false },
         // An ACTIVE segment declares it just as well as a declarative one.
         .{ .src = "(module (func $f) (table 1 funcref) (elem (i32.const 0) $f) (func (export \"g\") (result funcref) (ref.func $f)))", .ok = true },
     };

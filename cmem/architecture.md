@@ -36,8 +36,16 @@ bytes ──► DECODE ──► VALIDATE ──► INSTANTIATE ──► EXECUT
   reference), and **load/store** (alignment ≤ natural, memory must exist). **Verified:** thousands of
   positive-conformance assertions pass and the negative `assert_invalid`/`assert_malformed` suites now
   run with ~zero over-acceptance — see `testing.md`.
-- **INSTANTIATE / EXECUTE** (`interp.zig`) — first slice done. `Instance.init` prepares each defined
-  function (decodes body → IR once, precomputes matching `end`/`else` for every `block`/`loop`/`if`).
+- **INSTANTIATE / EXECUTE** (`interp.zig`) — first slice done. `Instance.instantiate` /
+  `instantiateWithImports` prepare each defined function (decode body → IR once, precompute matching
+  `end`/`else` for every `block`/`loop`/`if`). ⚠️ **They take a DESTINATION POINTER and do not return
+  an `Instance`** (renamed from `init`/`initWithImports` in R2, 2026-08-13): an instance's address is
+  part of its identity — every `funcref` it creates names it, and element segments create funcrefs
+  before instantiation returns — so it cannot be built somewhere else and moved. Instantiation splits
+  into `allocate` (§4.5.4) and `applyActiveSegments` (§4.5.5); an instance whose segment init traps
+  stays alive, adopted by its `Store`, because entries it already wrote into an imported table must
+  keep working. **Reference values live in an `interp.Store`** shared by every linked instance — see
+  `known-issues.md` → "Reference identity across a link".
   `Instance.invoke(name, args)` runs the switch interpreter (Option A): untyped `u64` value slots, a
   per-call label stack, a branch that carries block/loop arity and resets the stack. **Implemented:**
   i32/i64 **and f32/f64** arithmetic/comparison/bitwise, all conversions (incl. trapping float→int,
@@ -46,7 +54,9 @@ bytes ──► DECODE ──► VALIDATE ──► INSTANTIATE ──► EXECUT
   flow with multi-value/type-index block types, direct `call` and **`call_indirect` over multiple
   tables**, **reference types** (`ref.null`/`ref.is_null`/`ref.func`, funcref/externref values), the
   **reference-type table ops** (`table.get`/`.set`/`.size`/`.grow`/`.fill`; tables are `[]Value` slots
-  so funcref + externref share one representation), **linear memory** (allocate min pages + active
+  so funcref + externref share one representation — ⚠️ a funcref slot holds
+  `(store_slot+1)<<32 | func_index`, **not** a bare function index, so a table shared across a link
+  means the same thing to every sharer), **linear memory** (allocate min pages + active
   data-segment init; load/store all widths, `memory.size`/`grow`), element segments (func-index +
   const-expr forms), **imported functions** (`HostFunc`: a cross-module `wasm` call runs in the
   exporting instance, or a `native` host fn), and traps (`unreachable`, div-by-zero, overflow,
@@ -232,9 +242,12 @@ table → borrowed shared object** (`interp.Imports.globals`/`memories`/`tables`
 `Instance.Memory` — growing an *exported* memory reallocs the interp's shared bytes, so the running module
 observes it. **Verified from C** (`zig build c-smoke`): read/write an exported global, `store` into memory
 then read it back via `wasm_memory_data`, and `wasm_memory_grow`. **Deferred:** `wasm_table_get`/`_set`/
-`_grow` (need a `wasm_ref_t` funcref/externref object model); a *shared mutable* imported global (the
+`_grow` (need a `wasm_ref_t` funcref/externref object model); ~~a *shared mutable* imported global (the
 interpreter value-copies imported globals rather than sharing a pointer, so post-instantiation
-`wasm_global_set` on the host global doesn't reach the instance); type `_copy` constructors; module
+`wasm_global_set` on the host global doesn't reach the instance)~~ — ⚠️ **the interpreter limitation
+behind that one is GONE as of 2026-08-13 (R2): `Instance.Global` is a shared cell and imported
+globals are borrowed, so the ABI-2 `define_instance` path now shares mutable globals for real**;
+type `_copy` constructors; module
 sharable-ref extras. An undefined symbol in a static lib only errors if a consumer references it, so
 partial implementation is honest and safe.
 

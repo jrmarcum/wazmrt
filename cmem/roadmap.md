@@ -134,32 +134,954 @@ turning every host import into a `Deno.UnsafeCallback` (a JS↔native hop per ca
 re-introduces the boundary cost the vision claims to remove — measure it, do not assume it**), and
 reading guest memory via `Deno.UnsafePointerView`. No amount of wazmrt-side ABI work substitutes for it.
 
-### 🎯 Spec-conformance fix list (2026-08-11) — 62 defects, details in `known-issues.md`
+### 🎯 Spec-conformance fix list (2026-08-11) — ✅ CLOSED 2026-08-12. Details in `known-issues.md`
 
 From the full `tests/module/` run. ⚠️ **Every HIGH item is wazmrt being TOO PERMISSIVE** — the
 opposite of the failure mode most of the audit passes hunted, and in a corner nobody had run before.
 
-| | defect | assertions |
-| --- | --- | --- |
-| **T1** 🔴 | **Accept-invalid** — 43 malformed modules ACCEPTED (`custom-descriptors/binary` 25, `custom-page-sizes-invalid` 18). Suspect an ignored reserved bit in the memory-limits flag + unknown type-section forms | 43 |
-| **T2** 🔴 | A custom-page-size module accepted **then mis-executed** — `memory.grow` → −1. Silent wrong answer; likely free once T1 lands | 12 |
-| **T3** 🟠 | **legacy `rethrow` traps where it must return** — a real bug in an IMPLEMENTED feature | 3 |
-| **T4** 🟠 | a legacy `try`/`catch` encoding not decoded (`UnknownInstr`) | 2 |
-| **T5** 🟡 | oversized limits refused at the wrong STAGE (decode, not link) | 2 |
+**Every row below is RESOLVED — nothing here needs work.** T5 is marked "not a defect", which means
+*investigated and found not to exist*, not *left undone*: its two files pass and its class has zero
+instances corpus-wide. (An earlier revision used a bare ❌ for that, which reads as "failed". Say it
+in words.)
 
-**Start with T1**: those files are almost entirely *negative* assertions, so this is not a failure to
-run something — it is building modules whose encodings are malformed. The decoder already rejects
-*some* reserved limits flags; **sweep for the sibling**, the lesson that has now paid off four times.
+| | defect | assertions | outcome |
+| --- | --- | --- | --- |
+| **T1** 🔴 | **Accept-invalid** — malformed modules ACCEPTED | 43 → **68** | ✅ FIXED 2026-08-12 |
+| **T2** 🔴 | A custom-page-size module accepted **then mis-executed** — `memory.grow` → −1 | 12 | ✅ RESOLVED — dissolved by T1 |
+| **T3** 🟠 | **legacy `rethrow`** — a stale workaround + an accept-invalid | 3 | ✅ FIXED 2026-08-12 |
+| **T4** 🟠 | ~~a legacy `try`/`catch` encoding not decoded~~ — actually the **tail-call proposal** | 2 | ✅ IMPLEMENTED 2026-08-12 |
+| **T5** 🟡 | oversized limits refused at the wrong STAGE (decode, not link) | 2 | ✅ RESOLVED — **was not a defect**; see below |
+
+**T1 was bigger than the triage said, and the guess about its cause was wrong.** Corpus
+**525 → 455 failures**, 86 → 82 files, zero regressions. Details in `known-issues.md`; the headline is
+that the *main* `testsuite-main/binary.wast` carried **the same 25 failures** as the
+`custom-descriptors` copy, so this was a **core-spec** defect that the proposal-dir framing hid. The
+suspected cause (a reserved limits-flag bit) was **not** it — `readLimits` already rejected `flag >
+0x07`. Four separate gaps, each hiding the next:
+section **order/uniqueness** unchecked (16) · section **size** unchecked (7) · **data-count section
+required** unenforced (2) · the **WAT assembler silently dropping trailing `(memory …)` forms** (18).
+
+⚠️ **T5 was never a defect — strike it.** All four assertions in `memory_max.wast` use `(pagesize …)`.
+The "wrong stage" was wazmrt *dropping* the pagesize and building `(memory 0xFFFF_FFFF (pagesize 1))`
+as a **default**-page-size memory, which legitimately overflows → `InvalidLimits` at decode. It was a
+symptom of T1's fourth gap, and both files went clean when that was fixed. **A defect classified by
+its error message can be a shadow of a defect three layers up.**
+
+⚠️ **THREE OF THE FIVE ITEMS WERE MISLABELLED** — T1's location (core spec, not a proposal dir), T5's
+existence (a symptom of T1), and T4's subject (tail calls, not EH). The triage classified 164 failures
+by each file's **first-failure text**, and that text names a symptom. Corpus **525 → 452 failures**.
+
+**The whole list is closed.** T1/T3 fixed, T2/T5 dissolved, T4 implemented (the tail-call proposal —
+`return_call`/`return_call_indirect`, opcodes `0x12`/`0x13`, plus `return_call_ref` rebuilt as a REAL
+tail call). Session total: **525 → 275 corpus failures**, 60,568 → 61,115 passing, zero regressions at
+any step.
+
+⚠️ **`return_call_ref` is the cautionary tale of the whole series.** It was recorded as shipped with
+function-references, and it passed every shallow assertion — but it was implemented as
+call-then-return, so the one property the proposal exists to provide (unbounded depth) was absent.
+**A feature can be present, tested, and green while failing at exactly the thing it is for.** Same
+family as the memory64 "COMPLETE" claim above.
+
+### 🎯 REVISED conformance list (2026-08-12) — the 275, now **104**; EVERY CORE FILE IS CLEAN
+
+Successor to the T-list above, and built differently: every item below is grouped **by cause**, from a
+run with `-Dfailures=600` so all 275 failures were read, not just each file's first. The T-list was
+grouped by first-failure text and mislabelled three of its five items.
+
+⚠️ **The per-item counts below are as-triaged (275 total) and are NOT live. THE WHOLE R-LIST IS
+CLOSED, AND SO IS EVERYTHING AFTER IT.** R1–R5, R7, R9 and R10 are done, R6 was closed by R3 and R8
+by R5, the singleton batch took the remainder, and the bottom-type lattice took the last of it —
+corpus is **104 failures / 62,889 passing / 951 skipped** (measured 2026-08-14).
+
+🏁 **EVERY CORE SPEC FILE IS AT ZERO FAILURES.** Corpus **90 failures / 62,889 passing / 965 skipped**, and the baseline gate reports **0 regressions**. ⚠️ **14 of the previously-reported 104 were a SCORING BUG** — a bare `(module …)` build failure never consulted `isOurLimitation`, so our own gaps were counted as defects here while scoring as skips everywhere else. **LIVE SPLIT: 89 non-defects + exactly ONE deliberate deviation (`anyfunc`)** — `delegate` was a mis-scored gap, never a deviation. *(Superseded:)* LIVE SPLIT: 102 by design + 2 recorded deliberate
+deviations** — `anyfunc` (`obsolete-keywords.wast`, the pre-standard spelling of `funcref`, kept
+because two real `.wat` inputs use it) and `delegate` (`legacy/try_delegate.wast`, refused loudly
+because no oracle exists to route it). **There are no undiagnosed failures left**, which changes what
+this list is for: it is now a record, not a work queue. The remaining work is elsewhere — the OPEN
+C-ABI externref hole in `known-issues.md`, Track 2c, Track 3.
+
+Every count below is history; re-measure before trusting any of them (`-Dfailures=600`, and read
+**all three** totals — see the lattice entry on why the per-file FAIL diff alone missed a regression).
+
+⚠️ **"By design" has TWO flavours and they are not the same claim.** 94 are *untargeted
+proposals* (`custom-descriptors`, `custom-page-sizes`, `wide-arithmetic`) — refused honestly because
+wazmrt does not implement them. The other 8 are the opposite: `proposals/threads` is a snapshot
+pinned to a spec **before** multi-memory and multi-table, and it fails because wazmrt implements
+those proposals and therefore *accepts* modules the snapshot calls invalid. **A proposal directory
+asserts the rules of its own era, not today's** — so a failure there can mean the runtime is ahead of
+the file, and reading it as a defect costs real work (it cost R7 two days as an "actionable 8").
+
+⚠️ **R9 WAS FILED AT 85 AND MEASURED 71 — the standing "counts are stale" warning has now fired in
+the LOW direction too.** Every previous correction (R1 25→38, R2 35→44, R3 10→16, R5 23→1,291) was an
+UNDERCOUNT, which quietly trained the habit of reading the warning as "expect worse". R10 had closed
+some of R9's members as a side effect and nobody re-measured. **Stale is stale in both directions;
+the instruction is to re-measure, not to pad.**
+
+⚠️ **THE FAILURE COUNT WENT UP AT R5 AND THAT IS THE PASS WORKING.** 143 → 216 while passes went
+61,429 → 62,333 and skips 2,407 → 1,429: R5 implemented `(module quote …)`, so 978 assertions that
+had never executed started to, and 904 of them pass. **Judge a conformance pass by what it RUNS, not
+by the failure total** — and check that no file lost passes (join the per-file counts; R5 did, and
+none had). A pass that only ever drives the red number down is a pass that can be gamed by skipping
+more.
+
+**Of the current 216, by design** — proposals wazmrt does not target, refused honestly. They
+are not defects and there is nothing to fix unless the scope changes:
+
+| | area | failures (live, after R5) | note |
+| --- | --- | --- | --- |
+| — | `custom-descriptors` | 90 → 88 → 82 → **84** | untargeted proposal; exact refs + descriptors. R5 unblocked more of it than it fixed, hence the rise |
+| — | `custom-page-sizes` | **12** | untargeted; refused as `UnsupportedProposal` (scored as SKIPS, not passes) |
+| — | `wide-arithmetic` | **2** | untargeted; was miscounted as actionable until R3 |
+
+⚠️ **`wide-arithmetic` 2 was counted as ACTIONABLE and is not** — it is an untargeted proposal like
+the two above, so the "101 by design / 92 actionable" split written on 2026-08-12 was off by two in
+both directions. Corrected here rather than propagated.
+
+**LIVE SPLIT (2026-08-14, final): 104 failures = 102 by design + 2 recorded deliberate deviations**  — `anyfunc` and `delegate`. Formerly legacy EH **2**,
+core singletons **18**. R10's residue is now half closed: `id` 5 went with R9 (the quoted-`$"…"`
+identifier form, forced into scope — see below), leaving `ref_null` 27 skipped behind its unbuildable
+first module, which needs the bottom-type lattice change.
+
+**The actionable items, most valuable first:**
+
+| | item | failures | why it matters |
+| --- | --- | --- | --- |
+| **R1** 🔴 | **Cross-module type identity** | 25 | ✅ **FIXED 2026-08-12 — and it was 38, not 25.** See below. |
+| **R2** 🔴 | **elem / linking / instance** | 42 → 35 | ✅ **FIXED 2026-08-13 — five causes, and 44 failures, not 35.** All five files CLEAN. See below. |
+| **R3** 🟠 | **GC array bulk ops MISSING** | ~10 → **16** | ✅ **FIXED 2026-08-13 — SIX ops missing, not four, and the cost was in SKIPS, not failures.** See below. |
+| **R4** 🟠 | **Accept-invalid in core files** | ~15 → **12** | ✅ **FIXED 2026-08-13 — five causes, and two of them ALSO caused false rejects.** Core accept-invalid is now **0**. See below. |
+| **R5** 🟡 | **Runner gaps, not wazmrt defects** | 41 → ~23 → **1,291** | ✅ **FIXED 2026-08-13 — and the item was undercounted by 50×.** `(module quote …)` alone was suppressing **1,291 assertions**. See below. |
+| **R6** 🟡 | GC type remainder + `i31` | 20 → 8 → **0** | ✅ **CLOSED 2026-08-13, and R3 closed it without aiming at it.** R1 took `type-subtyping`/`type-rec`; the last 8 were `i31.wast`, and they were not an i31 defect at all — the file uses `(elem $e i31ref …)` and the assembler's `isRefType` listed only `funcref`/`externref`, so the whole segment was misread as func indices. One shorthand-table fix, `i31.wast` 8 → 0. |
+| **R7** 🟡 | threads | 18 → 15 → **7 real** | ✅ **FIXED 2026-08-14 — and NOT ONE of it was a threads defect.** Three causes, all outside the proposal; the other 8 are by design. See below. *(Original entry: )* `proposals/threads/imports.wast` 13, `memory.wast` 5 (R5 unblocked 3 more). Mostly shared-memory import matching, plus **12 accept-invalids** — the only ones left outside core and the untargeted proposals, so R4's safety argument applies here. ⚠️ **R1 did NOT touch it** despite being "adjacent": those 13 are limits/`shared`-flag matching, not type identity. |
+| **R8** ⚠️ | **UTF-8 name validation is UNVERIFIED** | 0 failures | ✅ **CLOSED 2026-08-13 by R5 — it was the runner's gap, and the answer was "all 176 pass".** `utf8-invalid-encoding.wast` was 0/0/**176 skipped** because every assertion in it is an `assert_malformed (module quote …)`, and the runner could not build a quoted module. Implementing that form ran all 176 and they pass: UTF-8 name validation was genuinely correct, and had simply never been checked. **The question the item asked — "is the skip the runner's gap or ours?" — was the right one, and R5 answers it.** |
+| **R10** 🔴 | **first-module failures that BLACK OUT whole files** | 13 failures / ~420 skips | ✅ **FIXED 2026-08-13 — 416 assertions unblocked for +1.5 KB, the best ratio of the series.** Six causes; see below. Residue: `ref_null` 27 + `id` 5, both diagnosed. *(Original entry: )* **Opened 2026-08-13 (R5's residue). Highest value left, by a wide margin.** Nine core files fail on their FIRST module and take the whole file into `NoTarget`: `br_table.wast` **161 skipped** (a `TypeMismatch` on `(block (drop (i32.ctz (br_table 0 0 …))))` — br_table in a polymorphic position), `ref_test` **66**, `simd_lane` **51**, `ref_cast` **40**, `ref_null` **32** (`(ref.null exn)` — `abstractHeapCode` has no `exn` entry, a ONE-LINE gap), `br_on_cast`/`br_on_cast_fail` **25 each**, `extern` **16** (`extern.convert_any`/`any.convert_extern` have no mnemonic in the assembler although the decoder and interpreter both implement them — the producer/consumer pair again), `id` (exotic and quoted `$"…"` identifiers). ⚠️ **13 failures, ~420 assertions suppressed** — the R3/R5 shape for the third time: **a single-digit failure count next to a triple-digit skip count is a blackout.** |
+| **R9** 🟠 | **accept-invalid in the TEXT front end** | 85 → **71** | ✅ **FIXED 2026-08-14 — 70 of 71 closed, nine causes, and the item was OVER-counted for the first time in the series.** The one left is `anyfunc`, a deliberate recorded deviation (see below). *(Original entry: )* 🆕 **Opened 2026-08-13; this is R5's output.** The class R4 closed for the binary decoder, on the surface the corpus could not reach until `(module quote …)` ran. Groups: **35** type-use ordering (`(if (type $sig) (result i32) (param i32) …)` in `func`/`call_indirect`/`return_call_indirect`), **15** token separation (`(data"a")` needs whitespace between a keyword and a string — `token.wast`), **8** SIMD lane rules, and ~27 spread over `table`/`memory`/`type`/`global`/`id`/`start`/`struct`/`block`/`if`/`loop`/`obsolete-keywords`. Same safety argument as R4: `wasm_module_validate` is a shipped C-ABI entry point. |
+
+**Recommended order: ~~R1~~ → ~~R2~~ → ~~R3~~ → ~~R4~~ → ~~R5~~ → ~~R10~~ → ~~R9~~ → R7.** ~~R6
+closed by R3~~, ~~R8 closed by R5~~.
+
+**The R-list is CLOSED.** The singleton batch below took the remainder from 18 to 4.
+
+### ✅ THE SINGLETON BATCH IS DONE (2026-08-14) — 22 failures, six causes, +136 bytes
+
+**Corpus 126 → 106 failures, 62,839 → 62,861 passing, 988 → 978 skipped.** Nine more files clean:
+`br_on_cast`, `br_on_cast_fail`, `extern`, `ref_cast`, `ref_test`, `imports4`, `table_grow`,
+`global`, `table64`, `call_indirect64`, `return_call_ref`. **The 18 "core singletons" were not 18
+causes — they were six**, which is why the previous entry's advice to "triage one by one" was worth
+following rather than acting on the count.
+
+| | cause | closed | what it was |
+| --- | --- | --- | --- |
+| **S1** 🔴 | **a host `externref` and a GC HEAP INDEX were the same value space** | **12** | A host reference was a bare small integer; `any.convert_extern` is identity; `refMatches` then read it as `gc_heap[i]`. `br_on_cast … (ref null struct)` on `any.convert_extern (ref.extern 0)` succeeded and handed back an unrelated object's FIELD. **A reference-forgery primitive reachable from ordinary spec input.** Fixed with `interp.host_tag` (bit 62), disjoint from `i31_tag` (63) and `null_ref`. Also closed 4 in `custom-descriptors`, which the triage had counted as by-design. |
+| **L1** 🟠 | **an import matched a memory/table's DECLARED minimum, not its live size** | **4** | §7.2's `mem_type`/`table_type` read the minimum off the instance, so a `(memory 1)` grown to 2 pages satisfies an `(import … (memory 2))`. Refusing it also stopped that module registering, so the next two failed as `UnresolvedImport` behind it — **one cause wearing four failure messages, two of them about a different module.** |
+| C3 | **tail-call results required EQUALITY, not subtyping** | 1 | §3.3.8 wants `[t2*] <: [t2'*]`. All three forms used `valTypesEqual`, which is reject-VALID for every widening return — `return_call_ref.wast`'s "More typing" module is built entirely from that idiom. |
+| C4 | **the table index type was consumed in only one of the two table forms** | 1 | `(table $t i64 funcref (elem …))` read `i64` as a shape, failed `isRefType`, then asked `parseU64("funcref")`. And once it assembled, the abbreviation's IMPLICIT offset was still `i32.const 0` against a 64-bit table. **The same guard-around-one-form shape as `call_indirect`'s table index and the flat `br_table`, for the third time.** |
+| C5 | **element EXPRESSIONS were bounded by the imported-global count** | 1 | §3.5.13 validates elem segments under the full context `C`; only `global*` uses the restricted `C'`. The segment OFFSET already used the full bound — **only the element expressions kept the old restriction**, so `(elem … (global.get $gf))` for a defined `$gf` was rejected. |
+| C6 | harness: no `spectest.shared_memory` (R7), no `spectest.table64`, no `ref.host` argument form | 3 | Runner gaps, not runtime defects — the R5/R8 shape again. |
+
+⚠️ **S1 IS ONLY HALF SWEPT, AND THE OTHER HALF IS THE SHIPPED C ABI.** `capi.zig` still does
+`.externref => slots[0] = v.of.ref`, a raw pass-through, and `wazmrt.h` invites it (*"opaque to the
+host: pass it back unchanged"*). A host handle of `2` still internalizes to GC object #2. **This is
+the R1 shape for the third time** — a defect in both the interpreter and the C ABI, with the corpus
+able to see only the interpreter half. The fix is to BOX host externrefs (intern in, unbox out, as
+`internExtern` already does), which changes what a `wazmrt_val_t` externref *is* and must keep a
+guest-produced reference round-tripping — **an owner decision on a shipped ABI**, filed in
+`known-issues.md` rather than taken here. Do not read "S1 closed 12 failures" as "the class is
+closed".
+
+**LIVE after this batch: 106 failures = 102 by design + 4 actionable** —
+`ref_null` 1 (+27 skipped), `legacy/try_catch` 1, `legacy/try_delegate` 1 (`delegate` is
+deliberately refused, recorded), `obsolete-keywords` 1 (`anyfunc`, deliberate).
+
+### ✅ THE LATTICE IS DONE (2026-08-14) — and EVERY CORE SPEC FILE IS AT ZERO
+
+**Corpus 106 → 104 failures, 62,861 → 62,889 passing, 978 → 951 skipped.** `ref_null.wast` and
+`legacy/try_catch.wast` both clean. **104 = 102 by design + 2 recorded deliberate deviations
+(`anyfunc`, `delegate`). There are no undiagnosed failures left.**
+
+The bottom-type change landed as one piece, as planned: `nofunc`/`noextern`/`noexn` became their own
+`RefHeap` variants with `top()`/`sub()` arms; `nullfuncref`/`nullexternref`/`nullexnref` (+ their
+non-null twins) became their own `ValType`s; `readValType` and `readHeapTypeRef` stopped folding them
+onto their family heads; `subtypeOf`'s concrete-target arm became hierarchy-keyed; and the
+assembler's shorthand table and `heapTypeToValType` were corrected to match. **27 of the 28
+assertions it bought were SKIPS**, behind a first module that would not build — the ordering rule
+paying off one more time.
+
+⚠️ **`subtypeOf`'s concrete-target arm had been `sub.refHeap() == .none` — flat, for EVERY concrete
+target.** With `nofunc` folded onto `funcref` that was self-consistent and wrong twice: a
+`nullfuncref` could not reach a `(ref null $funcType)`, and a `nullref` — an *any*-family value —
+would have satisfied a concrete FUNC type if anything had ever asked. **A bottom belongs to exactly
+one hierarchy**, and the fix keys both halves (`RefHeap.sub` and this arm) off `top()` so they cannot
+drift.
+
+⚠️ **The legacy-EH item cost two corpus passes before it was right, and the mistake is instructive.**
+`(try (do) (catch_all) (catch_all))` is malformed (at most one `catch_all`, last) — a one-flag fix.
+But I also filtered `catch_all` out of `lookupOp`, on the belief that `(func (catch_all))` "assembled
+AND validated". **It does not: it assembles and then fails validation with `MismatchedCatch`.** I had
+read the CLI's `valid wasm v1, 4 section(s)` header — which reports STRUCTURE — as the verdict, three
+lines above the actual `validation: FAILED`. The filter was therefore unnecessary, and it broke the
+legal FLAT spelling where `catch_all` genuinely is a mnemonic in the instruction stream. Two things
+to keep: **an audit finding is a hypothesis until the tool's actual verdict line is read**, and **a
+clause rule belongs in the validator, which both the text and the binary path reach — a
+producer-side filter covers one path and can break a legal spelling on it.**
+
+⚠️ **The corpus caught it and the per-file FAIL diff did NOT.** Passes went 62,888 → 62,887 while
+skips went 951 → 953, and no file entered or left the failure list, because a file that turns passes
+into skips is invisible there. Only the TOTALS showed it. **Read all three numbers on every run** —
+this is the concrete instance the "quote all three or none" rule exists for.
+
+*(Historical note, superseded: the item was scoped here as )* **the last real conformance item: the
+BOTTOM-TYPE LATTICE.** `ref_null.wast` is 1
+failure hiding **27 skipped assertions** — the largest single pool left, and the ordering rule says
+rank by those. `nullfuncref`/`nullexternref`/`nullexnref` are folded onto
+`funcref`/`externref`/`exnref`, which loses their bottom-ness, so
+`(func (result (ref null $t)) (global.get $nullfunc))` is a `TypeMismatch`. The change is wide and
+must be done as one piece: three new `RefHeap` variants with `top()`/`sub()` arms, six new `ValType`
+variants (nullable + non-null), `refHeap`/`valType`/`refHead` mappings, `subtypeOf`'s
+concrete-target arm (`nofunc <: (ref null $t)` for any func type `$t`), `shorthandRefType` in the
+assembler, and `refMatches` in the interpreter — where `headMatches` already returns `false` for
+`.nofunc`/`.noextern` on the VALUE path and must keep doing so, because only null inhabits them.
+⚠️ **Half-applying a subtyping rule is how accept-invalid holes ship** (R2's C3 stacked three
+defects behind one retracted finding); do it in one pass with the corpus as the arbiter.
+
+### ✅ R7 IS DONE (2026-08-14) — and NOT ONE of its 15 was a threads defect
+
+**Corpus 133 → 126 failures, 62,825 → 62,839 passing, 998 → 988 skipped.**
+`proposals/threads/imports.wast` **91 passed / 13 failed / 10 skipped → 105 / 6 / 0** — every skip
+in the file unblocked. No other file moved in any direction. The 8 that remain are **by design**.
+
+⚠️ **THE ITEM WAS NAMED AFTER ITS DIRECTORY AND TRIAGED AS IF THE DIRECTORY WERE THE CAUSE.** R7 was
+"threads", so its entry said *"mostly shared-memory import matching, plus 12 accept-invalids"*. Both
+halves were wrong, and the atomics/threads implementation had **no defect at all**:
+
+| | cause | count | what it actually was |
+| --- | --- | --- | --- |
+| A1 | **the pre-bulk-memory `(data 0 <offset> …)` spelling** | 4 | The memuse used to be a bare `memidx`, not `(memory x)`. Unrecognised, the `0` fell through to the byte loop (which keeps only strings, and silently dropped it) — and the OFFSET went with it, so **an ACTIVE segment in the source assembled as a PASSIVE one**. `(i32.load (i32.const 10))` read 0 instead of the data. Not a rejection: a silently different module. |
+| A2 | **the pre-reference-types `(elem 0 <offset> …)` spelling** | 2 | Same shape for tables, but loud: `resolveByName` was handed the offset LIST as a function name → `BadImmediate`, killing two whole modules. |
+| A3 | **the runner had no `spectest.shared_memory` export** | 1 (+10 skips) | A HARNESS gap. **Shared-memory import matching was already correct** — `limitsFit` has compared the `shared` flag since memory64 — so the item's stated cause was code that had been right for weeks. There was simply nothing to import. |
+
+⚠️ **8 of the 15 are BY DESIGN and had been counted as actionable for two days.** The
+`proposals/threads` directory is a snapshot pinned to a spec *before multi-memory and multi-table*,
+so it asserts `(module (memory 0) (memory 0))` and
+`(module (table 10 funcref) (table 10 funcref))` are invalid — five "multiple memories" and three
+"multiple tables". wazmrt implements **both** proposals (multi-memory since Phase 7, multi-table
+since reference types), so accepting those modules is correct and refusing them would be a
+regression. Decisive check: **the assertions appear nowhere in the main testsuite** — `exports.wast`
+only carries them as commented-out `;; No multiple memories yet.` notes.
+
+⚠️ **A1 and A2 are the same legacy grammar, and only one of them failed loudly.** That is the whole
+reason A1 sat unnoticed while A2 was visible: a dropped token in a *list of strings* changes the
+segment's MODE and nothing complains, while the same dropped token in a *list of indices* reaches a
+resolver that errors. The data-segment byte loop's `else => {}` is now `else => return
+error.BadModuleField` — **the silent arm is what made the missing memuse invisible, not the missing
+memuse itself.**
+
+**Recognising the legacy forms is a deliberate, bounded leniency** — the `anyfunc` trade again, and
+gated so it cannot loosen anything else: a bare index counts as a memuse/tableuse **only when an
+offset form immediately follows it**. An offset is always a list and data bytes are always strings,
+so no modern spelling can collide, and a passive `(elem 0 $f)` — where the next item is a func id,
+not an offset — is untouched. Recorded in `known-issues.md` beside `anyfunc`.
+
+**Second consecutive OVER-count** (R9 85→71, R7 18→15→7 real). See the warning at the top of this
+list: stale is stale in both directions.
+
+### ✅ R9 IS DONE (2026-08-14) — 70 of 71 closed, nine causes, +3,584 bytes
+
+**Corpus 207 → 133 failures, 62,737 → 62,825 passing, 1,013 → 998 skipped.** No file gained a
+failure; fourteen went entirely clean — `block`, `call_indirect`, `func`, `id`, `if`, `loop`,
+`memory`, `return_call_indirect`, `simd_lane`, `start`, `struct`, `table`, `token`, `type` — and
+`global` 4 → 1, `proposals/threads/memory` 5 → 2. **Accept-invalid in core spec files is back to
+ZERO** except the one deliberate deviation below.
+
+*(The totals move by −1 overall, and that is arithmetic, not a lost assertion: a `(module …)` command
+that FAILS to build scores a failure, while one that succeeds scores nothing. `id.wast`'s first
+module now builds, so it stopped being counted at all.)*
+
+| | cause | count | what it was |
+| --- | --- | --- | --- |
+| C1 | **A type use was parsed in ANY order and any repetition** | **22** | §6.6.5 is `('(' 'type' x ')')? param* result*`, and §6.6.13 puts `local*` after all three. Five sites each had their own loop with no ordering at all, so `(func (result i32) (param i32) …)` assembled into an ordinary `[i32] -> [i32]` function. Now one `typeUseRank` + `typeUseOrder` pair, shared. |
+| C2 | **An inline signature beside `(type x)` was IGNORED, not checked** | **3** | §6.6.5 makes the inline form a *check* on `C.types[x]`. `(func (type $sig) (result i32) …)` with `$sig = [i32] -> [i32]` bound to `$sig` while its own text declared `[] -> [i32]` — a function with a parameter its source denied. |
+| C3 | **`(param $x …)` accepted where no local context exists** | **6** | An id binds a local, so it is legal only in a `func`, a `(type (func …))` and a tag. A block type and a `call_indirect` type use have none. Plus `(result $x i32)`, which is never legal anywhere. |
+| C4 | **No index space checked its identifiers for uniqueness** | **16** | §6.6.13. func/global/memory/table/local/struct-field, each silently keeping the last binding. |
+| C5 | **A string abutting another token lexed as two tokens** | **14** | §6.2.1 `reserved ::= (idchar \| string)+` — `(data"a")` is ONE reserved token, and no production accepts `reserved`. |
+| C6 | **A SIMD lane index went through the signed literal grammar** | **7** | `laneidx ::= u8`, a nat. `(i32x4.replace_lane +3 …)` assembled as lane 3. |
+| C7 | **`(start …)` could be written twice** | **1** | The second overwrote the first, so the module ran a start function its own source did not name first. |
+| C8 | **A bare `$` was an identifier** | **1** | `id ::= '$' idchar+ \| '$' string` — both alternatives require content. |
+| C9 | **`$"…"` quoted identifiers did not lex** | (R10 residue) | Forced into scope by C5 — see below. Closed `id.wast` entirely (0/2/5 → clean). |
+
+⚠️ **C2's rule already existed — for tags only, and had done since 2026-07-27.** `resolveTagSig`
+carried the exact comparison, with a comment citing the typeuse rule, while `func`,
+`call_indirect`, `return_call_indirect` and block types all ignored their inline forms. **This is
+R10's C1 again at one remove** (`extern.convert_any` implemented for const-exprs but not for
+function bodies): *a rule implemented for one of the places it applies reads, from the code, as
+implemented.* The fix was to lift the tag's private check into a shared `checkInlineTypeUse` and
+call it from all five sites — the same move as R3's `isRefType`/`shorthandRefType` merge.
+
+⚠️ **C4 is checked ONCE PER SPACE after parsing, not at each append site, and that is the whole
+point.** Every wasm index space is filled from two places — an import and a definition — and
+§6.6.13's rule spans both, so `(import "" "" (memory $foo 1))` next to `(memory $foo 1)` is the
+duplicate that a per-site check structurally cannot see. Six of the sixteen assertions are exactly
+that pair. **When a rule is about a namespace, check the namespace, not the writers.**
+
+⚠️ **C5 BROKE THE HARNESS, because the harness and the modules share one lexer.** Making a string
+abutting an idchar a `reserved` token turned `id.wast` from a scored file into a whole-file *runner
+error*: the `.wast` script itself contains `$"007"`, which under the new rule is `$` + string with no
+separator. So the fix for R9's token-separation group forced implementing `$"…"` quoted identifiers
+— R10's residue, filed as a separate item — in the same pass, and with it §6.2.1's `stringchar` rule
+(a RAW control byte in a string literal is malformed; `\t` is how that byte is spelled). Quoted ids
+normalise to `$` ++ the decoded bytes, so `(br $"007")` finds `block $007` with no change to any
+name lookup. **A stricter rule in a shared front end is also a stricter rule for everything that
+reads the tests.**
+
+⚠️ **A grammar rule drawn against the FOLDED syntax broke two modules in the FLAT one.** Rejecting a
+`(param …)`/`(result …)`/`(local …)` after a function's body starts is right — but in flat syntax
+`block`, `loop`, `if`, `select` and `call_indirect` are bare *atoms* and their type use is a
+SIBLING, not a child. Worse, it chains: `select (result i32) (result)` and
+`call_indirect (type $proc) (param) (result)` are both in the corpus. The first cut ("must follow an
+atom") cost `select.wast` and `stack.wast` a module each; the rule is now "carry the permission
+forward". **A text-format rule has two spellings to satisfy, and the flat one is where the
+sibling-vs-child distinction is visible at all.**
+
+⚠️ **`anyfunc` is the ONE R9 assertion deliberately left failing** (`obsolete-keywords.wast` L40).
+It is the pre-standard spelling of `funcref`, accepted on purpose since 2026-07-21 and recorded in
+`known-issues.md`; two real `.wat` files in the wasmtk corpus
+(`ArtOfWebAssembly_tests/Chapter3/table_export.wat`, `table_test.wat`) use it, so removing it would
+break input the project actually runs. Reversing a recorded compatibility decision is the owner's
+call, not a conformance-pass side effect. **Left failing and labelled, not quietly "fixed".**
+
+⚠️ **`annotations.wast` still errors out as a whole file** — it did before R9 too
+(`UnexpectedChar` → now `ReservedToken`), so it is not a regression, but the error moved. The file
+is the custom-annotations proposal (`(@a …)` with deliberately exotic tokens) and is untargeted.
+
+**Verification, and one trap worth keeping.** All eight new checks were confirmed by inverting the
+implementation and watching the specific test fail. ⚠️ **Two of the eight inversions produced no
+failing test because they did not COMPILE** — commenting out a check left a parameter unused, which
+Zig rejects, and a build that never ran looks identical to an inversion that no test caught. **An
+inversion has to be checked for compiling before its silence means anything.** (A third near-miss:
+the "which tests failed" grep missed a test whose *name* contains an apostrophe.)
+
+### ✅ R10 IS DONE (2026-08-13) — 416 assertions unblocked, six causes, +1,536 bytes
+
+**Corpus 216 → 207 failures, 62,333 → 62,737 passing, 1,429 → 1,013 skipped.** No file lost a pass.
+The failure count barely moved and 404 more assertions PASS — which is the whole point of the item:
+these were files nobody could run, not files that were failing.
+
+| | cause | unblocked | what it was |
+| --- | --- | --- | --- |
+| C1 | **`extern.convert_any` / `any.convert_extern` existed only in const-exprs** | **172** | `validateConstExpr` and `evalConstExpr` implemented them; there was no `Op`, so a FUNCTION BODY using one was `UnknownInstr`. Opened `ref_test`, `ref_cast`, `br_on_cast`, `br_on_cast_fail`, `extern`. **A feature implemented for one of its two contexts reads as implemented.** |
+| C2 | **`br_table` carried a cross-label rule the spec does not have** | **161** | A "#2f" audit finding added a pairwise subtype check between each label and the default. §3.3.5.9 wants one `[t*]` that is a subtype of every label; after `unreachable` the stack supplies ⊥, so pairwise-incompatible labels are jointly satisfiable. `br_table.wast` names the case `meet-bottom`. **Deleted, not narrowed** — the pops already catch real mismatches in reachable code. |
+| C3 | **`popVals` + `pushVals` is not `push_opds(pop_opds(…))`** | (with C2) | The probe substituted CONCRETE types for the ⊥ it popped, so checking label 0 poisoned label 1's check. Now `popPushVals` puts back exactly what it took. |
+| C4 | **flat `else $l` / `end $l` unconsumed** | **5** | §6.5.2's label repetition. The id was assembled as the next instruction → `UnknownInstr` naming a label, killing `stack.wast`. Now consumed *and checked*, which is the only reason the form exists. |
+| C5 | **`br_on_non_null` popped the label's types wholesale** | **33** | The label's last type is `(ref ht)`; the operand is `(ref null ht)`. Popping `lt` asked the stack for the non-null form and rejected the canonical idiom. Two files. |
+| C6 | **`br_on_cast_fail` carried `src`, not `src \ dst`** | **25** | With a nullable dst a null takes the fall-through, so the branch value is non-null. The subtraction was already written eleven lines below for br_on_cast's fall-through — **the same rule applied to one of the two paths that need it.** |
+
+⚠️ **Two of the six were rules we INVENTED, not rules we missed.** C2's cross-label check came from an
+audit finding whose reasoning was sound — `popVals` genuinely cannot catch a mismatch on a
+polymorphic stack — and whose conclusion was wrong, because on a polymorphic stack there is nothing
+to catch. Its comment even claimed it "never rejects a valid subtyped `br_table`". **A finding can be
+well-argued, land a real check, and still be inventing a requirement**; the corpus is the arbiter, and
+it had been telling us so from behind a `NoTarget` cascade for months. The unit test that encoded the
+invented rule had to be inverted along with the code.
+
+⚠️ **`nullexnref` was modelled as `nullref` (the ANY-family bottom) and R10 made that
+load-bearing.** Once `(ref.null noexn)` decoded to the exn head, the two spellings of one type
+disagreed and `(global $nullexn nullexnref (ref.null noexn))` was a `TypeMismatch` against itself.
+Fixed by mapping `0x74` into the exn family. **Two encodings of one type must land on one value type;
+picking the wrong FAMILY only shows up when both spellings meet.**
+
+**R10's residue (32 assertions), diagnosed and left:**
+- `ref_null.wast` **27** — `(func (result (ref null $t)) (global.get $nullfunc))` where `$nullfunc`
+  is `nullfuncref`. We fold `nullfuncref`/`nullexternref` onto `funcref`/`externref`, which loses
+  their BOTTOM-ness, so they cannot flow into a concrete `(ref null $t)`. The real fix is distinct
+  bottom types in `types.zig` plus `subtypeOf` support — a lattice change with wide blast radius,
+  and its own item rather than an R10 footnote.
+- `id.wast` **5** — exotic identifiers (`$!?@#a$%^&*b-+_.:9'`|/\<=>~`) and quoted `$"…"` ids, a
+  lexer gap in `sexpr.zig`.
+
+### ✅ R5 IS DONE (2026-08-13) — 978 suppressed assertions unblocked, and the item was 50× bigger than filed
+
+**Corpus 143 → 216 failures, 61,429 → 62,333 passing, 2,407 → 1,429 skipped.** No file lost a single
+pass — verified by joining the per-file pass counts, not by reading the totals. The failure count
+went UP and that is the pass working: 978 assertions that had never executed now do, 904 of them
+passing.
+
+⚠️ **The item said "~23". It was 1,291.** R5 was filed as "`(module quote …)` and 21 `NoTarget`
+cascades", triaged from the FAILURE column. But an unimplemented command form does not produce
+failures — it produces **skips**, and skips were never itemised. One `return error.BadCommand` in
+`moduleBinary` was suppressing **1,291 assertions, more than half of every skip in the suite**,
+because a quoted module is how the spec tests anything about *text*: malformed literals, bad tokens,
+invalid names. **An item triaged from the failure column will always undercount a defect whose
+symptom is a skip** — R3 hit the same shape at a tenth the scale.
+
+⚠️ **R8 was a subset of R5 and nobody noticed.** `utf8-invalid-encoding.wast` is 176
+`assert_malformed (module quote …)` assertions — every one skipped for the same single reason. R8
+was filed separately, as "an unverified security-relevant check", and its own text asked exactly the
+right question: *is the skip the runner's gap or ours?* It was the runner's. All 176 now run and
+pass. **Two items with one cause, filed apart because one was counted in failures and the other in
+skips.**
+
+**What R5 revealed is bigger than what it fixed.** Running those 1,291 assertions surfaced **215
+accept-invalid failures in the WAT assembler** — the same class R4 had just closed for the binary
+decoder, in a surface the corpus had never been able to reach. Two causes accounted for ~146 and are
+fixed here because they are one theme, *lenient literals*:
+
+| | cause | count | what it was |
+| --- | --- | --- | --- |
+| C1 | **`std.fmt.parseInt`/`parseFloat` used as the wasm literal grammar** | ~70 | Zig accepts `_` where wasm forbids it (`0x_100`, `0x00_`, `0xff__ffff`) and takes a leading-point float (`.0`, `.0e0`). Replaced by `validIntLit`/`validFloatLit` over §6.3.1. |
+| C2 | **out-of-range constants silently TRUNCATED** | ~76 | `i32.const 0x100000000` became `0`; `v128.const i8x16 0x100` became sixteen zero bytes; `f32.const 0x1p128` became `+inf`. Each is a **wrong value compiled from source that looked fine**, not merely a missed assertion. Each `v128` lane is now bounded by its own width. |
+
+Two smaller ones went with them: a bare `-nan` lost its sign bit (the sign was applied only on the
+`nan:…` path, and NaN sign is observable through `reinterpret`/`copysign`), and
+`(f32.const nan:arithmetic)` assembled — those two spellings are result MATCHERS for an assertion,
+never values in a module.
+
+⚠️ **R4's "core accept-invalid is ZERO" is now FALSE, and it was true when written.** R4 closed every
+accept-invalid the corpus could *see*; R5 gave the corpus eyes for the text front-end and 88 more
+appeared in core files. This is the cleanest instance yet of the standing rule: **a conformance
+number says nothing about a surface the corpus does not reach** — and "the corpus reaches it" is
+itself a property that can silently be false.
+
+**R9 — the remainder, for whoever takes it next.** 88 core accept-invalids, grouped:
+`func`/`call_indirect`/`return_call_indirect` **35** (the `(type $sig) (result …) (param …)` ordering
+rule in a type use), `token.wast` **15** (token separation — `(data"a")` needs whitespace between a
+keyword and a string), `simd_lane` **8**, and ~30 spread over `table`/`memory`/`type`/`global`/
+`id`/`start`/`struct`/`block`/`if`/`loop`/`obsolete-keywords`. Plus 20 `custom-descriptors` and 12
+threads, which belong to the untargeted proposal and R7 respectively.
+
+### ✅ R4 IS DONE (2026-08-13) — 157 → 143, and core accept-invalid is now ZERO
+
+**Corpus 157 → 143 failures, 61,412 → 61,429 passing, 2,412 → 2,407 skipped**, zero regressions in
+the full per-file diff. Five core files went entirely clean — `table.wast`, `ref.wast`,
+`ref_func.wast`, `tag.wast`, `try_table.wast`. **Every accept-invalid in a core spec file is closed**;
+the 29 that remain are 20 in `custom-descriptors` (untargeted) and 9 in `proposals/threads`, which is
+R7's.
+
+The 12 triaged failures were **five causes**, and the item's framing — "modules we wrongly accept" —
+was only half the story: **two of the five ALSO caused false rejects**, so the same off-by-one was
+simultaneously letting invalid modules in and keeping valid ones out.
+
+| | cause | count | what it actually was |
+| --- | --- | --- | --- |
+| C1 | **a non-defaultable table element type with no initializer** | 5 | `(table 0 (ref func))` has no starting value for its slots and is invalid at ANY length; the rule was unchecked, and the `0x40`-form initializer that exempts a table from it was never validated either |
+| C2 | **`try_table` catch labels resolved one frame too deep** | 3 | +1 false reject — see below |
+| C3 | **a block type naming an out-of-range type index** | 2 | the assembler INTERNED the signature, manufacturing the very index that made it valid |
+| C4 | **an imported tag's result type unchecked** | 1 | the loop walked `module.tags`, the DEFINED half of the space |
+| C5 | **the start function treated as declaring a `ref.func`** | 1 | §3.5.1 erases `start` when building `C.refs`; the code, the comment above it, and the test all said otherwise |
+
+⚠️ **C2 is the headline, and it is the producer/consumer rule generalised: THREE implementations
+agreed with each other.** A `try_table` catch clause's label indexes the *enclosing* scope — the EH
+proposal checks the catches in `C` and only the body in `C, labels [t2*]`. `wat.zig` pushed the
+try_table's own label before resolving catch targets, `validate.zig` resolved them after
+`pushCtrl`, and `interp.zig` branched to `d + c.label`. All three were off by exactly one frame, in
+the same direction, so every round trip was self-consistent and the corpus was green. It took
+reading the spec rule to see it — no test could, because the three parties that would have to
+disagree never did. **Two consumers agreeing is not corroboration when they share the mistake.**
+
+⚠️ **And it failed in both directions at once.** `(func (result exnref) (try_table (catch 0 0))
+(unreachable))` was ACCEPTED (label 0 is really the function block `[exnref]`, which a plain `catch`
+delivering `[]` cannot satisfy), while `(func (result exnref) (try_table (catch_ref $e 0)) …)` was
+REJECTED (the same label fits `catch_ref` exactly). One off-by-one, an accept-invalid and a false
+reject, in the same file. **When a rule is off by a constant, look for failures in both directions
+before believing the item's framing.**
+
+⚠️ **C1 and C3 were both workarounds in the ASSEMBLER, and both stopped being cosmetic.**
+- `(table N reftype initexpr)` was lowered to a synthetic active element segment of N copies, on the
+  recorded reasoning that the resulting table state is observably identical and the distinct `0x40`
+  encoding "is not required for the execution assertions". The state is identical; the MODULE is not
+  — a table with an explicit initializer and a table with an element segment differ in exactly the
+  property validation needs, so `(table 0 (ref func))` became indistinguishable from a legal one.
+- A block type with a single concrete-ref result was emitted as an interned type index, because
+  `readBlockType` could not decode the canonical multi-byte valtype `0x63/0x64 ht`. Interning
+  *creates a type-section entry*, so `(block (result (ref 1)))` in a one-type module made index 1
+  exist — as the block's own signature, self-referentially — and validated clean.
+
+**An encoding chosen to make execution agree can erase the distinction validation runs on**, and **a
+workaround in the producer for a gap in the consumer does not stay cosmetic**. Both are fixed at both
+ends; `readBlockType` now decodes the canonical form and `BlockType` grew a `.ref` variant.
+
+⚠️ **C5's wrong rule was written down three times.** The code set `refs` from the start function, the
+comment above it listed "or the start function" among the declaring positions, and the unit test
+asserted `(module (func $f) (start $f) … (ref.func $f))` valid under the heading "each of the four
+declaring positions". There are three. **A test that encodes the same misreading as the code is not
+evidence — it is the misreading, restated.**
+
+⚠️ **Two more defects surfaced inside the R4 files after the five landed**, both false rejects:
+`exnref_nn` was defined in `types.zig` and taught to `readBlockType` but never to `Module.readValType`
+(so `(ref exn)` worked as a block type and was `BadValType` everywhere else), and `checkCatch`
+compared the materialized exception reference as the *nullable* `exnref` when `catch_ref` produces a
+non-null `(ref exn)`. Fixing the first only changed the error message of the second — **a failure's
+cause count is not known until it passes**, for the third pass running.
+
+**Size: R4 came out SMALLER** — −512 exe / −116 lib / −512 dll — because deleting the two workarounds
+cost more than the five rules add. The N-copies table lowering is gone, and with it the
+`max_table_init_copies` cap that existed only to bound its allocation amplification. **Removing a
+workaround can pay for the rule that made it unnecessary.**
+
+### ✅ R3 IS DONE (2026-08-13) — 193 → 157, and **225 skipped assertions became real runs**
+
+**Corpus 193 → 157 failures, 61,187 → 61,412 passing, 2,637 → 2,412 skipped**, zero regressions in
+the full per-file diff. All seven target files are CLEAN: `array.wast`, `array_copy.wast`,
+`array_fill.wast`, `array_init_data.wast`, `array_init_elem.wast`, `array_new_data.wast`,
+`array_new_elem.wast` — together **20 passed / 16 failed / 197 skipped → 215 passed / 0 failed /
+2 skipped**.
+
+⚠️ **The item named four ops. SIX were missing.** `array.new_data`, `array.new_elem`,
+`array.init_data`, `array.init_elem` — *and* `array.fill` and `array.copy`, which the triage never
+mentioned because it read failure messages and every one of those files died on its *first*
+instruction. `array_fill.wast` and `array_copy.wast` each reported exactly **1 failure** while
+running **zero** assertions. **An estimate built from error messages undercounts** — third time.
+
+⚠️ **THE REAL COST WAS NEVER IN THE FAILURE COLUMN.** R3 was triaged at ~10 failures and scored 16,
+which reads as a small item. It was not: a module that fails to build takes *every assertion that
+targets it* into `NoTarget` skips, so the six missing ops were suppressing **197 assertions in the
+target files and 225 corpus-wide**. Failures went down 36; *runs* went up 225. **When triaging by
+failure count, read the SKIP column in the same row** — a file at `0 passed, 1 failed, 34 skipped`
+is a total blackout wearing the badge of a single defect.
+
+**What each op needed, and where the work actually was:**
+
+| | layer | what was missing |
+| --- | --- | --- |
+| C1 | `opcode.zig` | six `Op` tags + three new `Imm` shapes (`gc_data`, `gc_elem`, `gc_array_copy`) and their `0xFB` sub-opcodes `0x09/0x0a/0x10/0x11/0x12/0x13` |
+| C2 | `wat.zig` | the mnemonics — **this is where every `.wast` actually died**, at `UnknownInstr`, before the decoder was ever reached |
+| C3 | `validate.zig` | element-type rules (a data segment cannot initialise a *reference* element), mutability for the four writing forms, `elem_type <: t'` by subtyping, and the data-count requirement |
+| C4 | `interp.zig` | little-endian element decode at the element's own byte width, and memmove semantics for `array.copy` |
+| C5 | `features.zig` | the `.gc` classification — caught automatically by the coverage pin, which failed the build until all six were classified |
+
+⚠️ **The two operands of `array.new_data` are in DIFFERENT UNITS** — the offset counts *bytes* into
+the segment, the size counts *elements* — so the bound is `offset + size × width`. Getting this
+wrong is not a conformance nicety: with 12 bytes of segment, `array.new_data` for 12 `i32`s would
+read 48 bytes, i.e. **36 bytes past the segment**, and the arms are on the unvalidated path too.
+The in-repo test asserts the trap in both the scaled and off-by-one-byte directions.
+
+⚠️ **`array.copy` can name the SAME array twice, so it is `memmove`, not `memcpy`.** Every
+non-overlapping case passes with a forward copy; only a backward overlap exposes it, and it smears
+one element across the range when it does. A test that only copies between two distinct arrays would
+have shipped this.
+
+⚠️ **`array.copy`'s type check cannot go through `unpacked()`.** A packed `i8` element and a plain
+`i32` element both project `i32` onto the operand stack, so comparing the *unpacked* forms calls
+`(array i8)` and `(array i32)` compatible — and then copies raw bytes between arrays of different
+element widths. The storage forms must be compared first. Same family as R2's C3: **the type the
+stack shows you is not the type the memory has.**
+
+⚠️ **Two defects surfaced INSIDE the R3 files that were not R3** — the "a failure's cause count is
+not known until it passes" rule again, twice in one item:
+
+1. **`isRefType` in the assembler listed only `funcref`/`externref`**, so `(elem $e i31ref …)` fell
+   through to the *func-index* form and read `i31ref` as a function name → `BadImmediate`. It now
+   defers to `shorthandRefType`, the table the cast ops already use. This closed **R6 entirely**
+   (`i31.wast` 8 → 0) plus `br_on_cast`/`br_on_cast_fail` 5 → 2 in core and 6 → 3 under
+   `custom-descriptors`. **A second copy of a lookup table is a second place to be incomplete.**
+2. **`call_indirect $t` with no type annotation would not assemble.** The table index was consumed
+   only when a `(type …)`/`(param …)`/`(result …)` followed it, but the type use is *optional* and
+   absent means `[] -> []`, so `(call_indirect $t (i32.const 0))` left `$t` for the operand loop,
+   which tried to assemble a table name as an instruction → `UnknownInstr`. Identical shape to the
+   flat `br_table` fix: a guard tightened around one form, excluding a sibling that is equally
+   legal. `isIndexAtom` is the right predicate in both.
+
+⚠️ **A raw `0xC5` byte decoded and EXECUTED as `i32.trunc_sat_f32_s`** — found while looking for
+free `Op` values, not by a test. `0xc5..0xcc` are internal tags for the saturating-truncation ops
+(wire form `0xFC` + sub-opcode); the guard that rejects raw internal-tag bytes covered `0xd7..0xfa`
+only, and `immediateKind` classifies `0x45...0xcc` as `.none`, so eight non-opcodes were accepted as
+real instructions. The guard is now two ranges — `0xc5..0xcf` **and** `0xd7..0xfa`, because
+`0xd0..0xd6` are genuine single-byte ops sitting between them. **A guard written against the tags
+that existed when it landed does not cover the tags that already existed elsewhere**; the fix that
+introduced it stopped at the range it was debugging.
+
+**Size:** +6,144 exe / +8,258 lib / **+7,168 dll**, and unlike R2 *all* of it is R3's — the pre-R3
+commit was measured in a worktree first and sat at (exe, dll) or just under (lib) its ceiling. The
+DLL moves for the first time in three entries because these are decoder/validator/interpreter arms
+the C ABI genuinely reaches, where R2's linking work was not.
+
+### ✅ R2 IS DONE (2026-08-13) — 237 → 193, five causes, and it was 44 failures, not 35
+
+**Corpus 237 → 193 failures, 61,152 → 61,187 passing, 2,649 → 2,637 skipped** (12 assertions that
+were suppressed now actually run), zero regressions at any of the five steps. **All five target files
+are CLEAN**: `elem.wast`, `linking.wast`, `linking0.wast`, `linking3.wast`, `instance.wast`. R2 also
+took failures out of `try_table` (6→4), `legacy/try_catch` (1→0), `tag` (1→0), `table` (7→6),
+`table64` (2→1), `memory`, `memory64` and `custom-descriptors/exact-func-import` (7→5).
+
+**The 35 triaged split into FIVE causes, only two of which the item name suggested:**
+
+| | cause | count | what it actually was |
+| --- | --- | --- | --- |
+| C1 | **a funcref was a bare function index** | 17 | resolved against whatever instance was *executing*, so any funcref crossing a boundary re-bound to a different function |
+| C2 | **an imported global was copied by value** | 1 | a `(mut i32)` import was a snapshot; the exporter's writes were invisible |
+| C3 | **the §5.5.6 typed-table form did not decode** | 8 | `0x40 0x00 tt expr`; plus elem/table types compared by family instead of subtyping |
+| C4 | **`(module definition)`/`(module instance)` unimplemented** | 8 | a HARNESS gap, not a wazmrt defect — and it was hiding a real one (tag identity) |
+| C5 | **data segments applied before element segments** | 1 | §4.5.5 order is elements first; plus a failed instance was discarded, killing its funcrefs |
+
+⚠️ **C1 is the headline and it was a soundness-shaped defect, not just a conformance one.** A funcref
+value was the function's index, and `call_indirect` looked that index up in *the reading instance's*
+module. Put a funcref in a shared table — which is the entire point of an imported table — and the
+reader dispatches to whatever sits at that index in ITS module. `interp.zig` even carried a comment
+describing the symptom ("the importer chooses the function indices, and the *owning* module
+reinterprets them") as an acceptable consequence of a rejected module, rather than as the general
+defect it was. Reference values now live in an `interp.Store` shared by everything linked together.
+
+⚠️ **The type check did not protect the call, because it was wrong in the same direction.**
+`checkIndirectType` read the callee's type from the reader's module too — so the wrong function's
+type came from the wrong module, agreed with itself, and the call proceeded. **A check that makes the
+same mistake as the thing it checks is not a check.** Cross-instance `call_indirect` now compares
+through `typematch`, the same way R1 made imports compare.
+
+⚠️ **Fixing one defect exposed the next in the same failure — twice.** `linking.wast` L410/L423 went
+from `result mismatch 0x4` to `trap UndefinedFunc` when C1 landed: the wrong answer had been *hiding*
+C5. And C4 — a pure harness gap — turned instance.wast from 0/8 into 10/2, where the 2 were a genuine
+tag-identity defect (an exception thrown with one import of a tag was not caught by a handler naming
+another import of the same tag). **A failure's cause count is not known until it passes.**
+
+⚠️ **A retraction that re-checks the reasoning has not re-checked the requirement.** C3's elem/table
+type comparison was raised by a 10th-pass audit, retracted as false, and marked `Don't "fix" it
+again` at the site. The retraction was right that `ValType.nullable()` is not a predicate — and the
+RULE was still wrong: §3.5.11 wants subtyping, and family-equality accepted a nullable `funcref`
+segment into a `(ref func)` table. Switching to real subtyping then rejected four valid modules,
+because the decoder recorded elem forms 0–3 as `funcref` when §5.5.12 gives them `(ref func)`. Three
+defects stacked behind one retracted finding.
+
+⚠️ **A gate only gates the commits that RUN it.** `zig build size` failed on all three artifacts —
+but measuring against a worktree at the pre-R2 commit showed most of the overshoot was already there,
+left by the R1 commits of 2026-08-12. R2's true share is +5,120 exe / +1,068 lib / **+0 dll**. The
+gate works; nothing invoked it. See `tools/size-ceilings.txt`.
+
+**Structural changes worth knowing before touching this code:**
+
+- **`Instance.init`/`initWithImports` are GONE**, replaced by
+  `instantiate`/`instantiateWithImports` taking a DESTINATION POINTER. An instance's address is part
+  of its identity now — element segments create funcrefs naming `self` before instantiation returns —
+  so it cannot be built and then moved. The compiler finds every call site; a comment would not.
+- **`interp.Store`** holds the instances a group of linked modules share. Slots are tombstoned on
+  `deinit`, never reused, so a stale funcref (or an arbitrary integer from the C ABI) is a clean
+  `UndefinedFunc`, never a dangling pointer. Linking across two stores is `error.CrossStoreLink`.
+- **`Instance.Global`** is a shared cell, like `Memory` and `Table` already were; `global_hi` folded
+  into it. **The C ABI shared this defect and the corpus could not see it** — `define_instance`
+  copied a published instance's global at link time, commented as "a snapshot, which is what the ABI
+  can carry". It binds the cell now. Same shape as R1's `define_instance` finding.
+- **Instantiation is `allocate` (§4.5.4) + `applyActiveSegments` (§4.5.5)**, so an instance whose
+  segment init traps stays ALIVE (the store adopts it) and the entries it already wrote into an
+  imported table keep working. The first cut kept the allocation errdefers in scope and double-freed;
+  the existing "a rejected module cannot leave entries in another module's table" test caught it.
+- **`.wast` failures now carry the source LINE** (`sexpr.parseAllWithLines`). Triaging 35 failures by
+  re-deriving which assertion each one was is exactly the hand work that mislabelled three of five
+  items on the 2026-08-11 list.
+
+### ✅ R1 IS DONE (2026-08-12) — 275 → 237, in four verified steps
+
+**38 failures, not the 25 estimated**, and the estimate was low for a structural reason worth keeping:
+the triage counted the failures whose MESSAGE named a type mismatch. The same root cause was also
+producing `TypeMismatch` at validation, `assert_invalid` acceptances, and — twice — a silently wrong
+*encoding*. Corpus **275 → 237**, 61,115 → 61,152 passing, **6 fewer SKIPS** (assertions that now
+actually run), zero regressions at any step. Clean files: `type-equivalence`, `type-subtyping`,
+`type-rec`, `imports`. `linking` 12 → 11, `elem` 16 → 14, `tag` 3 → 1, `i31` 9 → 8, `table` 8 → 7.
+
+New **`src/typematch.zig`** compares types structurally across modules under *iso*-recursive rules
+(§3.3.10): the unit of identity is the rec group, and two types match only at the same position in
+equivalent groups. `Module` now keeps `rec_start`/`rec_len` and the type index of every function and
+tag, because `Extern.func` keeps only the expanded signature — **and a signature is not an identity**.
+
+⚠️ **The bug was wrong in BOTH directions, and the accept side is the dangerous one.** Comparing
+module-local indices rejected valid links (two modules holding one type at different indices) *and*
+accepted invalid ones — `(ref $A)` at index 0 in one module and an unrelated `(ref $B)` at index 0 in
+another compared EQUAL, so the importer received values of a type it never agreed to. **Type confusion
+across a module boundary, reached by ordinary linking.** A defect that only ever showed up as
+"conformance failure" was also a soundness hole.
+
+**What the four steps actually found — three of them were not "type comparison" at all:**
+
+| | defect | why it was invisible |
+| --- | --- | --- |
+| 1 | link matching compared expanded signatures | the stated R1 item |
+| 2 | `call_indirect` compared signatures, not index subtyping | `(sub (func))` and `(sub final (func))` have identical params and results and are DIFFERENT types, so a final type answered a call naming the extensible one |
+| 3 | the WAT assembler **dropped element-segment types** | two of the eight elem encodings have `funcref` baked in and carry no type byte; the assembler picked them by shape, so any other element type vanished and the table rejected its own initializer |
+| 4 | inline function types were identified with rec-group MEMBERS | §6.6.12 allows only a singleton, final, no-supertype type; `internSig` matched on params/results alone |
+
+⚠️ **A cache key must name everything the answer depends on.** The matcher's memo was first keyed on
+the two rec-group start indices — a statement about *no particular modules* — so one link's verdict was
+served to an unrelated later link. It flipped 32 import assertions and was caught only because
+`imports.wast` regressed 5 → 21; every file R1 was aimed at had improved either way. **A win in the
+target files is not evidence the change is right.**
+
+⚠️ **The 4th step was in the SHIPPED C ABI, and the corpus could never have found it.** `capi.zig`'s
+`define_instance` (one guest module's import bound to another's export) carried the same raw-`!=`
+signature comparison, in the path an *embedder* uses, with **no behavioural test** — only a
+symbol-existence entry. The `.wast` suite does not exercise the C ABI, so the corpus read 237 both
+before and after. **A conformance number says nothing about a surface the corpus does not reach.**
+`typematch` is now exported from `root.zig` so any future linker is pointed at it.
+
+⚠️ **`zig build test-security` cannot pass from this repo's own cwd.** `D:` is **exFAT**, which has no
+symlinks, and the sandbox-escape tests plant symlink fixtures under the cwd's `.zig-cache/tmp`. That is
+what the step's "run from an NTFS cwd" note means. Verified by running the same test binary from a `C:`
+cwd — 3/3 OK. Do not read those two failures as a regression; do not "fix" them in `wasi.zig`.
+
+⚠️ **2,637 assertions are still SKIPPED and that is not a pass.** (2,655 before R1 → 2,649 after it
+→ 2,637 after R2; both times the recovered assertions were ones no longer suppressed by a module that
+failed to build — R2's 12 came from implementing `(module definition)`/`(module instance)`.) The largest pools: `br_table.wast`
+**161**, `custom-descriptors/exact-casts` 108, `wide-arithmetic` 107, `br_on_cast_desc_eq*` 101 each.
+`br_table.wast` is core spec and worth a look on its own — 161 unrun assertions in a control-flow
+instruction is a bigger blind spot than most of the failures above.
+
+### ✅ TRACK 3 — FIRST MEASUREMENT (2026-08-14): 5.3× on end-to-end invocation, and the fairness rule did not change it
+
+`zig build bakeoff -Dcorpus=<dir> [-Dreps=N]` (`tools/bakeoff.mjs`, driven by deno like `ffi-demo`).
+12 invocations from wasmtk's `wasm_mod` corpus × 9 reps, ReleaseFast, x86_64-windows:
+
+| runtime | configuration | median ms | min ms | vs wazmrt |
+| --- | --- | --- | --- | --- |
+| **wazmrt** | interpreter | **6.77** | **5.61** | — |
+| wasmtime | `-C compiler=winch` (fast start) | 36.63 | 33.22 | 5.41× |
+| wasmtime | `-O opt-level=0` (fast start) | 36.27 | 32.47 | 5.36× |
+| wasmtime | default `opt-level=2` (slowest start) | 35.92 | 33.72 | 5.31× |
+| wasmer | default (cranelift) | 36.69 | 33.61 | 5.42× |
+
+🎯 **THE BINDING FAIRNESS RULE WAS APPLIED IN FULL AND THE CONCLUSION SURVIVED IT.** wasmtime's three
+configurations land within **2% of each other** (35.92 / 36.27 / 36.63), so on modules this size the
+startup cost is *runtime and process initialisation, not Cranelift compile time*. That is what makes
+the number quotable: it is not the "beat a runtime in its slowest configuration" claim the rule
+exists to forbid. **Fast-start wasmtime is still 5.4× slower here.**
+
+⚠️ **State exactly what this measures, every time.** End-to-end PROCESS wall-clock —
+`spawn → read → decode → validate → instantiate → call → print → exit` — which is what one
+invocation costs in the dev-loop regime Decision 2 targets. It is **not** in-process decode timing
+and **not** steady-state throughput; a JIT wins hot loops and this table cannot see that (the
+2026-07-14 bench already recorded exactly that shape). The defensible claim stays *"wasmtime-class
+module compatibility, at a fraction of the footprint, faster on anything not precompiled."*
+
+⚠️ **THAT CAVEAT WAS A PREDICTION AND IT IS NOW MEASURED FALSE — see the `start`-mode entry below.**
+The text here used to say the 55–6,225-byte corpus understated the advantage, and that "on a large
+module the fast-start configurations should separate from the default and the absolute gap should
+widen". Run against a **1.97 MB** module: nothing moves. Kept as written, struck through by the
+measurement, because a prediction that was recorded and then refuted is more useful than one quietly
+deleted.
+
+⚠️ **A benchmark that mis-invokes a competitor reports that competitor as BROKEN.** The first run
+disqualified wasmer on `add(100, -1)`: the harness omitted the `--` separator, so `-1` parsed as a
+flag. It looked exactly like a wrong answer. **Check a disqualification against a hand-run before
+believing it** — the same discipline as an audit finding being a hypothesis. Verifying every result
+is still right: a benchmark that does not check its output is measuring the wrong thing.
+
+**wazero is absent from the INVOKE table on purpose**: its CLI runs `_start` only and cannot invoke a
+named export. That is why `start` mode exists — see below, where it competes.
+
+### ✅ TRACK 3, SECOND CUT (2026-08-14) — `start` mode, a 210× size ladder, and a prediction refuted
+
+`zig build bakeoff -Dmode=start -Dcorpus=<dir>` runs WASI `_start` programs. It brings **wazero** in
+(its CLI can do nothing else) and **wasmrt**, the sibling competing for the same slot, and it is
+where LARGE modules live. No oracle is privileged: every runtime must produce the same stdout and a
+disagreement is *reported, not adjudicated*.
+
+| runtime | median ms | vs wazmrt |
+| --- | --- | --- |
+| **wazmrt** (Zig, interpreter) | **34.11** | — |
+| **wasmrt** (Rust, interpreter) | 35.79 | **1.05×** |
+| wazero (Go, compiler) | 68.56 | 2.01× |
+| wasmtime `-C compiler=winch` | 82.59 | 2.42× |
+| wasmtime default `opt-level=2` | 82.46 | 2.42× |
+| wasmtime `-O opt-level=0` | 84.34 | 2.47× |
+| wasmer | 86.43 | 2.53× |
+
+⚠️ **THE SIZE LADDER REFUTES THE PREDICTION THIS ROADMAP MADE.** The first cut said the small corpus
+understated the advantage and that a large module would separate the fast-start configs from the
+default. Measured across **9 KB → 1.97 MB, a 210× range**:
+
+| module | bytes | wazmrt | wt:winch | wt:O0 | wt:default | wazero |
+| --- | --- | --- | --- | --- | --- | --- |
+| string-formatting | 9,391 | 34.1 | 80.9 | 80.3 | 85.9 | 58.6 |
+| Phase38Combined | 11,147 | 37.0 | 85.1 | 82.2 | 82.5 | 58.1 |
+| fib-rs-opt | 44,838 | 33.4 | 78.7 | 84.3 | 80.7 | 68.6 |
+| **fib-rs-test** | **1,968,591** | **32.4** | **82.6** | **84.7** | **79.5** | **73.6** |
+
+**Nothing moves.** Cranelift compiles 2 MB inside the noise; the cost is fixed startup for everyone.
+So the honest claim is *narrower and more robust* than predicted: the advantage is **flat in module
+size up to 2 MB**, not growing with it. **A recorded prediction that the measurement refutes is worth
+more than one quietly deleted** — the earlier text is struck in place above.
+
+⚠️ **AND THE RATIO IS LOAD-DEPENDENT; THE DIFFERENCE IS NOT.** The first cut measured 5.3× on a quiet
+machine; these runs, on a loaded one, give 2.4×. Both are honest — but when a fixed per-process cost
+is shared by every entrant, inflating it compresses the *ratio* while leaving the *absolute gap*
+roughly intact (~29 ms then, ~48 ms here). **Quote the difference, or quote the ratio with the load
+conditions attached.**
+
+⚠️ **wasmrt TIES wazmrt** — 1.05× here, 1.02× in invoke mode. The two candidates for the runtime slot
+are equivalent on startup, so **startup is not the differentiator between them**; footprint is
+(wazmrt's DLL is 2.5× smaller, and 269 KB with Track 2c's flags). Worth knowing before any further
+startup work is justified on competitive grounds.
+
+⚠️ **A DIFFERENTIAL FINDING, and it is wasmtime that is alone.** On
+`27_string-formatting.wasm` the runtimes disagree by exactly one byte: the guest's source is
+`console.log(true); console.log(123);` and the correct output has a newline between them.
+
+| implementation | bytes | |
+| --- | --- | --- |
+| wazmrt (Zig) · wasmrt (Rust) · wazero (Go) · wasmer (Rust) · **V8** (node `node:wasi`) | 223 | `true\n123` |
+| **wasmtime 47.0.3** | **222** | `true123` |
+
+**Five independent implementations across four languages agree, including V8** — the reference
+engine, and the one **wasmtk actually runs on**. ⚠️ **The cause is NOT traced**, so this is a
+reproducible observation, not a diagnosis: something about that guest's `fd_write` sequence is
+handled differently by wasmtime. Worth checking into wasmtk (whose
+`dync_cross_runtime_tests.ts` runs output through wasmtime/wasmer/wazero — if it compares stdout
+exactly, it should already see this) and into wasmrt. **The differential check found this on its
+first run, which is the argument for having no privileged oracle.**
+
+### ⚠️ THE SPAWN FLOOR (2026-08-14) — the CLI benchmark is ~90% process spawn, and that reframes the claim
+
+Measured on the same loaded box, 25 reps, median:
+
+| | wazmrt | wasmtime |
+| --- | --- | --- |
+| `--version` — **no wasm work at all** | **30.32 ms** | **76.47 ms** |
+| the 1.97 MB module, end to end | 33.26 ms | 85.83 ms |
+| **⇒ all wasm work (decode+validate+instantiate+run)** | **~2.9 ms** | **~9.4 ms** |
+
+🎯 **The end-to-end advantage is mostly "a smaller binary loads faster", not "a faster engine".**
+Spawning wazmrt costs 30 ms before a byte of wasm is touched; the entire wasm pipeline on a 2 MB
+module is under 3 ms. Both facts are real, and the *first* is what a dev loop actually experiences —
+but they are **different claims**, and the CLI benchmark cannot separate them. It is also why the
+size ladder is flat: the variable part is ~3 ms inside a ~33 ms measurement.
+
+This does not weaken the position — it relocates it. The project's thesis has always been that
+**footprint is the differentiator**, and this is that thesis showing up in the startup number rather
+than a separate advantage. It does mean the honest phrasing is *"a wazmrt invocation costs ~2.5× less
+end to end, most of it because the binary is a fraction of the size"* — not *"the engine decodes
+2.5× faster"*, which is a claim this measurement never made and which someone would check.
+
+⚠️ **Measure the floor before attributing a difference.** Two runtimes differed by ~50 ms and it
+would have been natural to bank that as engine speed; ~46 ms of it is there before either engine
+starts.
+
+**This is exactly what the remaining Track 3 item is for.**
+
+### ✅ TRACK 3 IS COMPLETE (2026-08-14) — the engine pipeline, spawn excluded: **20–55×**
+
+`zig build phases -Dmodules=<a,b,c>` (`tools/phases.mjs`). wazmrt measured **in-process** via the
+bench binary; wasmtime's `compile` measured with **its own spawn floor subtracted**, floor and work
+sampled alternately so drift hits both equally. Bytes → ready to execute, ms:
+
+| module | bytes | **wazmrt** | wt:winch | wt:O0 | wt:default | ratio |
+| --- | --- | --- | --- | --- | --- | --- |
+| string-formatting | 9,391 | **0.16** | 9.10 | 10.68 | 10.87 | **55×** |
+| fib-rs-opt | 44,838 | **0.49** | 11.83 | 18.75 | 19.63 | **24×** |
+| fib-rs-test | 1,968,591 | **0.72** | 14.54 | 21.68 | 22.06 | **20×** |
+
+wazmrt's own split (µs, in-process):
+
+| module | decode | validate | +instantiate |
+| --- | --- | --- | --- |
+| string-formatting | 6.52 | 158.11 | 217.63 |
+| fib-rs-opt | 5.74 | 487.09 | 760.37 |
+| fib-rs-test | **37.83** | **681.86** | 1110.74 |
+
+🎯 **THE END-TO-END BENCHMARK UNDERSTATED THE ENGINE DIFFERENCE BY ROUGHLY 10×.** The CLI said 2.4×;
+the engines differ by 20–55×. A ~30 ms spawn floor did not merely add noise — **it hid the entire
+effect**, because it dwarfed a quantity that is under 1 ms on our side. *A benchmark whose floor is
+larger than its signal measures the floor.*
+
+⚠️ **And it reverses the "nothing moves with size" finding, correctly.** The end-to-end ladder was
+flat and the fast-start configs looked identical to the default; at engine level they are not —
+winch is **34% faster than default** on the 1.97 MB module (14.54 vs 22.06), and every runtime scales
+with size. The flatness was the floor, not the engines. **The same measurement can be right about
+what it measures and wrong about what you conclude.**
+
+⚠️ **Decode is nearly free; VALIDATION is our bytes→ready cost.** 37.8 µs to decode 1.97 MB against
+681.9 µs to validate it — validation is ~95% of the pipeline. That is where any future startup work
+belongs, and it is not where anyone would have guessed from the name "decode → validate →
+instantiate".
+
+**What the ratio does and does not license.** The two sides produce different things: wasmtime emits
+native code, wazmrt a validated IR to interpret. The number says how fast each reaches something
+runnable, and it is only meaningful beside the trade — **wasmtime pays this once and wins in a hot
+loop**. wasmtime's figure also includes writing the `.cwasm`, so it over-states its compute a little.
+The tool prints both caveats under every table it produces, for the same reason the bake-off prints
+its scope.
+
+*(Superseded — the scope this was planned from:)*
+
+### 📋 the original plan — Track 3's last item: the in-process breakdown
+
+**The question it answers, which nothing else can:** of wazmrt's ~2.9 ms of wasm work on a 2 MB
+module, how much is decode, how much validate, how much instantiate — and how does each compare to
+wasmtime doing the same? The CLI harness cannot tell you, because ~90% of what it times is spawn.
+
+**Shape.** Two harnesses reporting the same three phases in one process, N reps, medians:
+
+| side | how | why |
+| --- | --- | --- |
+| wazmrt | extend `zig build bench` — `Module.decode` / `validate` / `instantiate` are already separate calls | no new dependency; the phases exist as functions already |
+| wasmtime | a small Rust bin using the `wasmtime` crate: `Module::from_binary` (decode+compile) then `Instance::new` | cargo is already a project dependency via wasmrt; the C SDK would have to be fetched per triplet |
+| wasmrt | its own crate, same three phases | it TIES wazmrt end to end, so the interesting comparison is where the ~3 ms goes |
+
+⚠️ **The phases do not line up, and pretending they do is the trap.** wasmtime's `Module::new`
+*compiles*; wazmrt's `decode` builds an IR and `validate` type-checks. There is no honest
+phase-by-phase row — the comparable quantity is **total time from bytes to a callable instance**,
+with each runtime's internal split reported *beside* it rather than aligned against it. Say that in
+the output, the way the current harness states its scope.
+
+⚠️ **Report the floor with the result**, per the entry above. An in-process number without the
+process-spawn context invites exactly the misattribution this section documents.
+
+**Estimated size:** small on the wazmrt side (the calls are already separate); the Rust harness is a
+~50-line `main.rs` plus a `Cargo.toml`. The judgement call worth making deliberately is whether a
+cargo build belongs in this repo's `zig build` graph at all, or whether the Rust side lives in
+`bench/` as an opt-in step like `-Drust-gate`.
+
+### ✅ TRACK 2c IS DONE (2026-08-14) — the embed artifact is optional-weight now
+
+**`-Dwat=false` / `-Dwasi=false` compile the WAT assembler / the WASI host out of the EMBED
+artifacts.** Measured ReleaseSmall:
+
+| configuration | static lib | DLL | vs full |
+| --- | --- | --- | --- |
+| default (wat + wasi) | 1,022,520 | **882,688** | — |
+| `-Dwat=false` | 840,962 | 738,816 | −16.3% |
+| `-Dwasi=false` | 502,178 | 419,840 | −52.4% |
+| both off | 319,916 | **275,456** | **−68.8%** |
+
+🎯 **862 KB → 269 KB for an embedder that needs neither** — within ~47 KB of the 227 KB the DLL
+measured *before* the wasm-c-api replacement. **That closes the question Track 1 opened.** The
+"IT GOT BIGGER, NOT SMALLER" entry above was right that the growth was WAT + WASI + `Io`; it is now
+optional rather than structural, and the strongest card in the consumer survey — *"replacing
+megabytes of per-triplet vendored SDK with a 222 KB self-owned library"* — is back within reach.
+
+⚠️ **WASI is the bigger half by 3×, and the roadmap named `-Dwat=false` FIRST.** `wasi.zig` drags in
+`std.Io`, file handling and `Io.Threaded`; the assembler is mostly its own code. **Rank size levers
+by measurement, not by which one is easier to picture** — the same rule as ranking conformance items
+by assertions unblocked.
+
+**With both features on the artifacts are BYTE-IDENTICAL**, so the gate costs nothing when unused.
+The freestanding wasm build is unchanged (37,382) in all four configurations: `wasm_entry.zig` never
+referenced either module, so both were already dead-stripped there.
+
+**How it is built, and the two things that matter:**
+
+1. **Two config modules, not one.** `-Dwat`/`-Dwasi` feed `embed_cfg`, used by the C-ABI static lib,
+   the DLL and the freestanding wasm; the CLI, tests and conformance runner take `full_cfg`, which
+   is hard-wired to both-on. ⚠️ A single global option would have silently descoped the CLI, and
+   **`.wat` is not being descoped** (owner, 2026-08-11) — running text is a stated CLI capability.
+2. **A disabled feature is REJECTED LOUDLY.** `wazmrt_module_new_wat`, `wazmrt_wat_to_wasm` and
+   `wazmrt_linker_define_wasi` return a real error naming the build flag
+   (*"this build has the WAT text assembler compiled out (-Dwat=false); rebuild with -Dwat=true"*),
+   never a NULL module or a no-op linker. The embedder cannot see our build options, so
+   "unsupported" alone would send them looking in the wrong place.
+
+**New gate: `zig build features`** compiles the C ABI in all four combinations. A comptime gate rots
+the moment someone adds an ungated `root.wasi.…` reference, and the default build cannot notice
+because the flag is only false in a configuration nothing else compiles. ⚠️ **It earned its keep
+immediately**: `-Dwasi=false` did not compile until six use sites in `capi.zig` were guarded — and
+the guards had to be `if (comptime root.enable_wasi)`, because a run-time-only check leaves
+`initWasi` REFERENCED and the whole host linked in, gating nothing.
+
+⚠️ **The size gate had a hole this exposed, now closed.** `zig-out` carries no record of the FLAGS
+that produced what is in it, so `zig build size` after a gated `dll` build graded the small artifact
+against the full build's ceiling and printed **607,232 bytes UNDER** — a false win, and one that
+reads as an invitation to lower the ceiling and mis-record the real size permanently. `size_gate.zig`
+now takes the feature string and refuses anything but `wat,wasi`, the same shape as its existing
+ReleaseSmall check. **A gate that measures "whatever is on disk" needs to know what produced it.**
 
 ### What is left after Track 1 (2026-08-11)
-
-- **Track 2c — comptime feature gating (`-Dwat=false` / `-Dwasi=false`).** Promoted from optional to
-  necessary by the measured growth above. ⚠️ `.wat` is NOT being descoped (owner, 2026-08-11) — the
-  CLI keeps assembling text unconditionally; the question is only whether an *embedder* who never
-  assembles text must carry the assembler.
-- **Track 3 — the bake-off harness.** wazmrt vs wasmrt vs wasmtime, on wasmtk's and rsxtk's real
-  corpora, **with wasmtime in a FAST-START configuration** (`OptLevel::None`/Winch), never only
-  `OptLevel::Speed`.
+- **Track 3 — the bake-off harness.** ✅ **FIRST CUT LANDED 2026-08-14 — see below.** Still open:
+  wasmrt (the Rust competitor) as a fourth entrant, rsxtk's corpus, and an IN-PROCESS
+  decode/validate/instantiate breakdown (which needs a Rust-side harness to be comparable).
 - **wasmtk branch `test/cross-runtime-wazmrt-wasmrt`** (`72cf256ffad`) — the 5-runtime portability gate,
   deliberately unmerged pending the runtime decision.
 
@@ -273,6 +1195,14 @@ compatibility, at a fraction of the footprint, faster on anything not precompile
 
 *(Sections below are dated as written. The **2026-07-27** state supersedes all earlier test counts and
 open-item lists; the fine-grained audit ledger lives in `known-issues.md`.)*
+
+> ⚠️ **CORRECTION (2026-08-12): "COMPLETE" below was false for 16 days.** memory64 has two halves and
+> only the memory one was built — `readTableType` carried a literal `// tables are 32-bit` and refused
+> `is64` outright, so **table64 did not exist**: ~78 corpus failures behind a completeness claim in the
+> authoritative memory. Implemented 2026-08-12 (see below). **The lesson is about the claim, not the
+> code:** it was written from the memory-side test files passing, and no one asked what else the
+> proposal contained. *A proposal is done when its spec files pass, not when the feature you had in
+> mind works.*
 
 **Latest (2026-07-27) — memory64 (Item 3), the last unimplemented proposal, is COMPLETE.** A memory
 declared `i64` now uses 64-bit addresses, and its `memory.size`/`grow` operate in i64 — implemented end
@@ -1075,6 +2005,28 @@ changing that code.
 
 ## Parking lot / open questions
 
+- **SCOPED, NOT TAKEN (2026-08-17): per-directory feature policy in the `.wast` runner** — the only
+  way to clear the last 8 baseline entries (`proposals/threads`, 6 in `imports.wast` + 2 in
+  `memory.wast`). Those files assert `(module (memory 0) (memory 0))` and
+  `(module (table 10 funcref) (table 10 funcref))` are INVALID, because that snapshot predates
+  multi-memory and multi-table. wazmrt implements both, so it accepts them — **the runtime is ahead
+  of the file**, and refusing them would be the regression. A spec proposal directory is meant to be
+  run with THAT PROPOSAL'S feature set, so the honest fix is to run `proposals/threads/` with
+  `multi_memory` and multi-table off.
+  ⚠️ **The blocker is that `features` is DESCRIPTIVE, not ENFORCING.** `validate()` takes
+  `(gpa, *const Module)` and no feature set; `features.zig`'s `require(fs, …)` walk only *computes*
+  which proposal a module needs, for `zig build features`. So the work is (a) thread a
+  `features.Set` through `validate` and its ~15 callers, (b) add enforcement arms — including a
+  multi-table rule, which has no `Feature` today (multiple tables arrived with `reference_types`,
+  but gating on that would also disable the `funcref` these files legitimately use, so it needs its
+  own flag), (c) a directory→feature-set table in `wast.zig`. **Not worth it for 8 assertions
+  alone** — but it is the correct mechanism the moment a second proposal directory is targeted, and
+  it would make `zig build features` and the validator share one source of truth.
+  ⚠️ **REJECTED cheap alternative:** special-casing "under `proposals/threads/`, refuse >1
+  memory/table" directly in the runner. ~15 lines, and it turns the number green — but it creates a
+  SECOND place where "what is enabled" is decided, which is the exact one-call-site divergence that
+  produced the 14 mis-scored failures found on 2026-08-14. **Don't fix a scoring problem by adding a
+  second scorer.**
 - Interpreter shape: **DECIDED 2026-07-02 — Option A** (switch over a pre-decoded IR); see
   `design-decisions.md`. Open sub-question: whether/when to add the Option B register-rewriting pass —
   decide empirically against size+speed once basic execution works and there's a benchmark.

@@ -4,10 +4,51 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // ---- Comptime feature gating (Track 2c) --------------------------------
+    // `-Dwat=false` / `-Dwasi=false` compile the WAT assembler / the WASI host
+    // out of the EMBED artifacts (C-ABI static lib, DLL, freestanding wasm).
+    //
+    // ⚠️ **The flags do NOT reach the CLI, the tests or the conformance runner**
+    // — those always build with both on. Running `.wat` is a stated capability
+    // of the CLI (owner, 2026-08-11) and this is an embedder opt-out, never a
+    // removal. That is why there are two config modules below rather than one:
+    // a single global option would have silently descoped the CLI, which is the
+    // exact thing the roadmap says not to do.
+    //
+    // The measured reason this exists: replacing the wasm-c-api surface took the
+    // DLL 227 KB → 845 KB, because the embed artifact now carries `wat.zig` +
+    // `sexpr.zig`, `wasi.zig` and an `Io`. Every FFI consumer pays for both.
+    const want_wat = b.option(bool, "wat", "Include the WAT text assembler in the EMBED artifacts (C ABI / wasm). Default true; the CLI always has it.") orelse true;
+    const want_wasi = b.option(bool, "wasi", "Include the WASI preview-1 host in the EMBED artifacts. Default true; the CLI always has it.") orelse true;
+
+    const embed_cfg = b.addOptions();
+    embed_cfg.addOption(bool, "enable_wat", want_wat);
+    embed_cfg.addOption(bool, "enable_wasi", want_wasi);
+    // A second, always-on config for the CLI/test/conformance path.
+    const full_cfg = b.addOptions();
+    full_cfg.addOption(bool, "enable_wat", true);
+    full_cfg.addOption(bool, "enable_wasi", true);
+
+    // Every artifact rooted at `capi.zig`/`wasm_entry.zig` compiles its own copy
+    // of `root.zig`, so each needs a `wazmrt_config` import. One module per
+    // config, shared by all its artifacts.
+    //
+    // ⚠️ These are block-scoped `const`s on purpose. A helper returning
+    // `&.{ … }` hands back a pointer to its own dead stack frame, and the build
+    // runner segfaults in `createModuleDependencies` — a long way from the
+    // cause.
+    const embed_imports: []const std.Build.Module.Import = &.{
+        .{ .name = "wazmrt_config", .module = embed_cfg.createModule() },
+    };
+    const full_imports: []const std.Build.Module.Import = &.{
+        .{ .name = "wazmrt_config", .module = full_cfg.createModule() },
+    };
+
     // ---- Core library module (dependency-free, wasm-friendly) --------------
     const mod = b.addModule("wazmrt", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .imports = full_imports,
     });
 
     // ---- Signature trust anchor (build-time embed) -------------------------
@@ -52,6 +93,7 @@ pub fn build(b: *std.Build) void {
         .linkage = .static,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/capi.zig"),
+            .imports = embed_imports,
             .target = target,
             .optimize = optimize,
         }),
@@ -68,6 +110,7 @@ pub fn build(b: *std.Build) void {
         .linkage = .dynamic,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/capi.zig"),
+            .imports = embed_imports,
             .target = target,
             .optimize = optimize,
         }),
@@ -97,6 +140,7 @@ pub fn build(b: *std.Build) void {
         .name = "wazmrt",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/wasm_entry.zig"),
+            .imports = embed_imports,
             .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
             .optimize = .ReleaseSmall,
         }),
@@ -127,6 +171,7 @@ pub fn build(b: *std.Build) void {
             .linkage = .static,
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/capi.zig"),
+            .imports = embed_imports,
                 .target = gnu,
                 .optimize = optimize,
             }),
@@ -154,6 +199,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = .ReleaseFast,
                 .imports = &.{.{ .name = "wazmrt", .module = b.createModule(.{
                     .root_source_file = b.path("src/root.zig"),
+            .imports = full_imports,
                     .target = target,
                     .optimize = .ReleaseFast,
                 }) }},
@@ -163,6 +209,28 @@ pub fn build(b: *std.Build) void {
         if (b.args) |args| run_bench.addArgs(args); // `zig build bench -- out.wasm` emits the module
         const bench_step = b.step("bench", "Run the interpreter microbenchmark (ReleaseFast)");
         bench_step.dependOn(&run_bench.step);
+
+        // ---- Engine-pipeline breakdown (`zig build phases -Dmodules=<a,b,c>`)
+        // Track 3's last item, and it lives HERE so it can hand the driver the
+        // bench BINARY. `bakeoff` times whole processes and ~90% of that is spawn
+        // on this platform, so it cannot say whether a runtime leads because its
+        // ENGINE is fast or because its BINARY is small. This separates them.
+        //
+        // ⚠️ Do NOT nest `zig build bench` from inside the driver: it contends for
+        // the build lock, and `std.debug.print` goes to STDERR, so a driver
+        // reading stdout silently sees nothing. Both cost a debugging round here.
+        {
+            const mods = b.option([]const u8, "modules", "Comma-separated .wasm paths for `zig build phases`") orelse "";
+            const ph = b.addSystemCommand(&.{ "deno", "run", "--allow-read", "--allow-run", "--allow-write" });
+            ph.addFileArg(b.path("tools/phases.mjs"));
+            ph.addArtifactArg(bench);
+            ph.addArg(b.pathJoin(&.{ b.cache_root.path orelse ".", "phases-scratch.cwasm" }));
+            var it = std.mem.splitScalar(u8, mods, ',');
+            while (it.next()) |m| if (m.len != 0) ph.addArg(m);
+            ph.has_side_effects = true; // a measurement; never a cached verdict
+            const ph_step = b.step("phases", "Engine pipeline: bytes->runnable, spawn excluded (needs deno + wasmtime)");
+            ph_step.dependOn(&ph.step);
+        }
     }
 
     // ---- Compiled-program conformance gate (`zig build wasi-gate`) ---------
@@ -230,6 +298,7 @@ pub fn build(b: *std.Build) void {
     const capi_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/capi.zig"),
+            .imports = full_imports,
             .target = target,
             .optimize = optimize,
         }),
@@ -277,6 +346,7 @@ pub fn build(b: *std.Build) void {
     {
         const mod_tests_safe = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path("src/root.zig"),
+            .imports = full_imports,
             .target = target,
             .optimize = .ReleaseSafe,
         }) });
@@ -286,12 +356,70 @@ pub fn build(b: *std.Build) void {
         // loud panic here.
         const capi_tests_safe = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path("src/capi.zig"),
+            .imports = full_imports,
             .target = target,
             .optimize = .ReleaseSafe,
         }) });
         const test_safe_step = b.step("test-safe", "Run the test suite under ReleaseSafe (optimized + safety checks kept)");
         test_safe_step.dependOn(&b.addRunArtifact(mod_tests_safe).step);
         test_safe_step.dependOn(&b.addRunArtifact(capi_tests_safe).step);
+    }
+
+    // ---- Bake-off harness (`zig build bakeoff -Dcorpus=<dir>`) -------------
+    // Track 3: measure wazmrt against the runtimes it means to replace, on real
+    // modules, with the comparison configured FAIRLY — wasmtime in its
+    // fast-start modes (winch / opt-level=0), not only its slowest-starting
+    // default. Driven by a Deno script for the same reason `ffi-demo` is: it
+    // needs to spawn and time other processes, and deno is already a dependency
+    // of one step rather than a new one.
+    {
+        const corpus = b.option([]const u8, "corpus", "Directory of .wasm + .test.json for `zig build bakeoff` (wasmtk's tests/module/wasm_mod)");
+        const reps = b.option(usize, "reps", "Repetitions per invocation for `zig build bakeoff` (default 7)") orelse 7;
+        const bake = b.addSystemCommand(&.{ "deno", "run", "--allow-read", "--allow-run", "--allow-env" });
+        bake.addFileArg(b.path("tools/bakeoff.mjs"));
+        bake.addArg(corpus orelse "");
+        bake.addArg(b.fmt("{d}", .{reps}));
+        bake.addArg(b.option([]const u8, "mode", "`invoke` (exported fn + .test.json) or `start` (WASI _start; brings wazero in and covers LARGE modules)") orelse "invoke");
+        bake.has_side_effects = true; // it is a measurement; never serve a cached verdict
+        // Needs the CLI built in the mode being measured — benchmarking a Debug
+        // build would produce a number that flatters every competitor.
+        bake.step.dependOn(b.getInstallStep());
+        const bake_step = b.step("bakeoff", "Benchmark wazmrt vs wasmtime/wasmer on a real corpus (needs deno; -Dcorpus=<dir>)");
+        bake_step.dependOn(&bake.step);
+    }
+
+
+    // ---- Feature-gate build check (`zig build features`) -------------------
+    // Compiles the C ABI in ALL FOUR `-Dwat`/`-Dwasi` combinations. A comptime
+    // gate rots the moment someone adds an ungated `root.wasi.…` reference, and
+    // the default build — the one everybody runs — cannot notice, because the
+    // gate is only false in a configuration nothing else compiles. This step is
+    // the same shape as `test-security` and the size gate: its whole value is
+    // that it CAN go red.
+    //
+    // Compile-only (no install): the artifacts are measured by hand when the
+    // numbers change; what has to stay true continuously is that they BUILD.
+    {
+        const features_step = b.step("features", "Compile the C ABI in all four -Dwat/-Dwasi combinations (Track 2c gate)");
+        for ([_][2]bool{ .{ true, true }, .{ false, true }, .{ true, false }, .{ false, false } }) |combo| {
+            const o = b.addOptions();
+            o.addOption(bool, "enable_wat", combo[0]);
+            o.addOption(bool, "enable_wasi", combo[1]);
+            const probe = b.addLibrary(.{
+                .name = b.fmt("wazmrt_features_{s}_{s}", .{
+                    if (combo[0]) "wat" else "nowat",
+                    if (combo[1]) "wasi" else "nowasi",
+                }),
+                .linkage = .static,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/capi.zig"),
+                    .imports = &.{.{ .name = "wazmrt_config", .module = o.createModule() }},
+                    .target = target,
+                    .optimize = optimize,
+                }),
+            });
+            features_step.dependOn(&probe.step);
+        }
     }
 
     // ---- Size gate (`zig build size -Doptimize=ReleaseSmall`) --------------
@@ -314,6 +442,9 @@ pub fn build(b: *std.Build) void {
         // The mode is passed to the TOOL rather than checked here: a configure-time warning would
         // print on every `zig build`, including the ones that never asked for this step.
         run_size.addArg(@tagName(optimize));
+        // The Track 2c feature flags, for the same reason as the mode: `zig-out` has no record of
+        // which FLAGS produced what is in it, and a gated artifact grading as "under" is a false win.
+        run_size.addArg(b.fmt("{s},{s}", .{ if (want_wat) "wat" else "nowat", if (want_wasi) "wasi" else "nowasi" }));
         run_size.addArg(b.getInstallPath(.bin, ""));
         run_size.addArg(b.getInstallPath(.lib, ""));
         run_size.has_side_effects = true; // measure what is on disk NOW, never a cached verdict
@@ -346,6 +477,8 @@ pub fn build(b: *std.Build) void {
         run_conf.addArg(testsuite orelse ""); // empty ⇒ the runner prints guidance
         run_conf.addArg(baseline orelse ""); // empty ⇒ gate on zero failures
         run_conf.addArg(if (write_baseline) "write" else "check");
+        const show_failures = b.option(usize, "failures", "List up to N failures per failing file (default 1)") orelse 1;
+        run_conf.addArg(b.fmt("{d}", .{show_failures}));
         const conf_step = b.step("conformance", "Run the spec testsuite (.wast) — needs -Dtestsuite=<dir>; add -Dbaseline=<file> to gate on regressions");
         conf_step.dependOn(&run_conf.step);
     }

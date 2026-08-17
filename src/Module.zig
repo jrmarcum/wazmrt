@@ -87,7 +87,12 @@ pub const CompType = union(enum) {
 /// the counts are kept as u64 (a 32-bit memory still fits ≤ 2^16).
 pub const Limits = struct { min: u64, max: ?u64, shared: bool = false, is64: bool = false };
 
-pub const TableType = struct { element: types.ValType, limits: Limits };
+/// `init_expr` is the table's explicit initializer (§5.5.6's `0x40 0x00 tt e`
+/// form, function-references): every slot starts as that value instead of null.
+/// Null for the plain form and for every imported table. A table whose element
+/// type is NON-NULLABLE has no null to start from, so this is the only way to
+/// declare one.
+pub const TableType = struct { element: types.ValType, limits: Limits, init_expr: ?[]const u8 = null };
 pub const MemoryType = struct { limits: Limits };
 pub const GlobalType = struct { content: types.ValType, mutable: bool };
 
@@ -116,6 +121,16 @@ pub const Import = struct {
     module: []const u8,
     name: []const u8,
     type: Extern,
+    /// The TYPE INDEX this import declared, for a `func` or `tag` import; null
+    /// for table/memory/global (which spell their type inline, not by index).
+    ///
+    /// `Extern.func` keeps only the expanded signature, and a signature is not an
+    /// identity: `(ref $t)` inside it carries a MODULE-LOCAL index, so comparing
+    /// two modules' signatures compares numbers that mean different things in
+    /// each. Link-time matching needs the index to reach the rec group, the
+    /// supertype chain and the finality flag — everything that makes two types
+    /// the same type (§4.5.3). See `typematch.zig`.
+    type_index: ?u32 = null,
 };
 
 pub const Export = struct {
@@ -193,6 +208,28 @@ comp_types: []const CompType,
 /// future `ref.cast`; unused by the current slice" until 2026-07-21, long after
 /// GC P3 shipped — dead-code bait that could have cost a live field.)
 supertypes: []const ?u32,
+/// Whether each type index is FINAL — closed to extension. True for a bare
+/// composite type (shorthand for `sub final`) and for an explicit `0x4f`; false
+/// only for `0x50`. Parallel to `comp_types`.
+type_finals: []const bool,
+/// Canonical identity per type index: equal ids mean the same type. See
+/// `canonOf` / `isSubtype`. **Module-local** — two modules' ids are not
+/// comparable; crossing that boundary is `typematch.zig`'s job.
+canon: []const u32,
+/// First type index of the rec group each type index belongs to, and the group's
+/// length. A standalone `(type …)` is recorded as a group of one.
+///
+/// Rec groups are the UNIT OF TYPE IDENTITY under iso-recursive typing (§3.3.10):
+/// two types are the same only if they sit at the same position in equivalent
+/// groups. Flattening groups into consecutive indices loses that, so it is kept
+/// here — `canonicalizeTypes` needs it, and so does cross-module matching.
+rec_start: []const u32,
+rec_len: []const u32,
+/// Type index of each function in the function index space (imports first, then
+/// defined), and likewise for tags. Parallel to the spaces `funcType`/`tagType`
+/// walk.
+func_type_indices: []const u32,
+tag_type_indices: []const u32,
 /// Type index of each *defined* function (function section), in order.
 functions: []const u32,
 /// Type index of each exception tag (tag section §5.5.14, EH proposal). Each
@@ -204,6 +241,15 @@ exports: []const Export,
 /// Body of each defined function (code section), positionally matching
 /// `functions`. May be empty if the module has no code section.
 code: []const Code,
+/// Segment count from the data-count section (§5.5.16), or null if the module
+/// has no such section.
+///
+/// The VALUE is redundant — `decode` already checks it equals `data.len` — but
+/// the PRESENCE is not: §5.5.16 makes the section mandatory for any module whose
+/// code uses `memory.init`/`data.drop`, so that a streaming decoder knows the
+/// segment count before it reaches the code section. `validate` needs to tell
+/// "absent" from "present and 0", which `data.len` alone cannot.
+data_count: ?u32,
 /// The global index space (imported globals first, then defined), for
 /// resolving `global.get`/`global.set` during validation.
 globals: []const GlobalType,
@@ -236,11 +282,20 @@ const Decoder = struct {
     a: std.mem.Allocator,
     comp_types: []const CompType = &.{},
     supertypes: []const ?u32 = &.{},
+    type_finals: []const bool = &.{},
+    canon: []const u32 = &.{},
+    rec_start: []const u32 = &.{},
+    rec_len: []const u32 = &.{},
     /// Composite kind of each type index, pre-scanned before bodies are decoded
     /// so a `(ref $t)` value type can collapse to the right family (func /
     /// struct / array) even when `$t` is a forward reference in a rec group.
     type_kinds: []const CompKind = &.{},
     func_space: std.ArrayList(FuncType) = .empty,
+    /// Type INDEX of each function in `func_space`, positionally parallel to it —
+    /// the identity `func_space`'s expanded signatures throw away.
+    func_type_space: std.ArrayList(u32) = .empty,
+    /// Type index of each tag in `tag_space`, positionally parallel to it.
+    tag_type_space: std.ArrayList(u32) = .empty,
     table_space: std.ArrayList(TableType) = .empty,
     mem_space: std.ArrayList(MemoryType) = .empty,
     global_space: std.ArrayList(GlobalType) = .empty,
@@ -276,6 +331,9 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
     var data_count: ?u32 = null;
     var func_names: ?[]const u8 = null;
 
+    // Rank of the last non-custom section seen, for the §5.5.2 order check below.
+    var last_rank: u8 = 0;
+
     while (!r.atEnd()) {
         const raw_id = try r.readByte();
         if (raw_id > types.SectionId.max) return error.InvalidSectionId;
@@ -284,6 +342,18 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
         const offset = r.pos;
         const payload = try r.readBytes(size);
         try sections.append(a, .{ .id = id, .offset = offset, .size = size });
+
+        // §5.5.2 fixes the section order and allows each non-custom section AT
+        // MOST ONCE. We used to decode whatever sequence arrived, so a duplicate
+        // section silently overwrote the first (`imports = try decode…` and its
+        // siblings just reassign) and a reversed pair decoded fine — 16 of the
+        // 25 `binary.wast` accept-invalid failures. STRICTLY increasing rank is
+        // both checks in one: equal rank is the duplicate, lower is disorder.
+        if (id != .custom) {
+            const rank = sectionRank(id);
+            if (rank <= last_rank) return error.SectionOrder;
+            last_rank = rank;
+        }
 
         var sub = Reader.init(payload);
         switch (id) {
@@ -317,6 +387,15 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
             .start => start = try sub.readVarU32(),
             else => {},
         }
+
+        // §5.5.1 makes a section's declared size part of the encoding: the
+        // contents must consume it EXACTLY. We read the payload as a bounded
+        // slice, so overrun already fails as `UnexpectedEof` — but leftover
+        // bytes were silently dropped, which accepted every "inconsistent count"
+        // module in `binary.wast` (a vec declaring 1 entry followed by 2, a data
+        // segment declaring 5 bytes followed by 6). A custom section is exempt:
+        // everything after its name is opaque by definition.
+        if (id != .custom and !sub.atEnd()) return error.SectionSizeMismatch;
     }
 
     // If present, the data-count section must equal the data-segment count (§5.5.16).
@@ -328,11 +407,18 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
         .sections = try sections.toOwnedSlice(a),
         .comp_types = d.comp_types,
         .supertypes = d.supertypes,
+        .type_finals = d.type_finals,
+        .canon = d.canon,
+        .rec_start = d.rec_start,
+        .rec_len = d.rec_len,
+        .func_type_indices = try d.func_type_space.toOwnedSlice(a),
+        .tag_type_indices = try d.tag_type_space.toOwnedSlice(a),
         .functions = functions,
         .tags = tags,
         .imports = imports,
         .exports = exports,
         .code = code,
+        .data_count = data_count,
         .data = data,
         .elements = elements,
         .start = start,
@@ -341,6 +427,39 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
         .memories = try d.mem_space.toOwnedSlice(a),
         .tables = try d.table_space.toOwnedSlice(a),
         .func_names = func_names,
+    };
+}
+
+/// Position of a section in the fixed order of §5.5.2, as a dense rank.
+///
+/// ⚠️ **This is NOT the section id.** Two sections sit somewhere other than where
+/// their id would put them, and both are proposals that bolted an id onto the
+/// end of the range while inserting the section into the middle of the grammar:
+///
+///   - **tag** (id 13, EH) goes between *memory* (5) and *global* (6).
+///   - **data_count** (id 12) goes between *element* (9) and *code* (10) — it has
+///     to precede the code it counts for, or a single-pass validator could not
+///     use it.
+///
+/// Sorting by raw id would therefore reject every valid module that has one.
+/// `custom` never reaches here (it is exempt from ordering) and gets rank 0.
+pub fn sectionRank(id: types.SectionId) u8 {
+    return switch (id) {
+        .custom => 0,
+        .type => 1,
+        .import => 2,
+        .function => 3,
+        .table => 4,
+        .memory => 5,
+        .tag => 6,
+        .global => 7,
+        .@"export" => 8,
+        .start => 9,
+        .element => 10,
+        .data_count => 11,
+        .code => 12,
+        .data => 13,
+        _ => 0, // unreachable: `raw_id > max` is rejected before the call
     };
 }
 
@@ -403,11 +522,25 @@ pub fn importedFuncCount(self: Module) u32 {
     return n;
 }
 
+/// Size of the function index space: imported functions then defined ones.
+pub fn funcCount(self: *const Module) u32 {
+    return self.importedFuncCount() + @as(u32, @intCast(self.functions.len));
+}
+
 /// Number of imported tables (they occupy the low table indices).
 pub fn importedTableCount(self: Module) u32 {
     var n: u32 = 0;
     for (self.imports) |imp| {
         if (imp.type == .table) n += 1;
+    }
+    return n;
+}
+
+/// Number of imported tags (they occupy the low tag indices).
+pub fn importedTagCount(self: Module) u32 {
+    var n: u32 = 0;
+    for (self.imports) |imp| {
+        if (imp.type == .tag) n += 1;
     }
     return n;
 }
@@ -436,14 +569,25 @@ pub fn funcType(self: *const Module, index: u32) ?FuncType {
     return self.funcSig(self.functions[defined]);
 }
 
-/// The type index of a function (imports first, then defined), or null for an
-/// imported function (our import table keeps the signature, not the type index).
+/// The type index of a function (imports first, then defined), or null if out of
+/// range.
+///
+/// Imported functions used to answer null — "our import table keeps the
+/// signature, not the type index" — which cost two things. `ref.func` on an
+/// imported function pushed the abstract `funcref` head instead of its concrete
+/// `(ref $t)`, losing type information a valid module may depend on; and link-time
+/// matching had no index to work from at all, so it compared expanded signatures
+/// whose `(ref $t)` indices mean different things in each module. Both are the
+/// same omission, so both are fixed by recording the index at decode.
 pub fn funcTypeIndex(self: *const Module, func_index: u32) ?u32 {
-    const imported = self.importedFuncCount();
-    if (func_index < imported) return null;
-    const defined = func_index - imported;
-    if (defined >= self.functions.len) return null;
-    return self.functions[defined];
+    if (func_index >= self.func_type_indices.len) return null;
+    return self.func_type_indices[func_index];
+}
+
+/// The type index of a tag (imports first, then defined), or null if out of range.
+pub fn tagTypeIndex(self: *const Module, tag_index: u32) ?u32 {
+    if (tag_index >= self.tag_type_indices.len) return null;
+    return self.tag_type_indices[tag_index];
 }
 
 /// The function signature at type index `ti`, or null if `ti` is out of range
@@ -495,8 +639,14 @@ pub fn arrayField(self: *const Module, ti: u32) ?FieldType {
 /// index is out of range.
 pub fn refHead(self: *const Module, ht: opcode.HeapType) Error!types.ValType.RefHeap {
     return switch (ht) {
-        .func, .nofunc => .func,
-        .extern_, .noextern => .extern_,
+        .func => .func,
+        .extern_ => .extern_,
+        // Each bottom is its OWN head, not its hierarchy's top — folding them
+        // here made `ref.test (ref nofunc)` answer for any funcref, which
+        // `headMatches` then had to special-case back out.
+        .nofunc => .nofunc,
+        .noextern => .noextern,
+        .noexn => .noexn,
         .any => .any,
         .eq => .eq,
         .i31 => .i31,
@@ -515,12 +665,60 @@ pub fn refHead(self: *const Module, ht: opcode.HeapType) Error!types.ValType.Ref
     };
 }
 
+/// Is type index `i` FINAL (closed to extension)? Out of range reads as final —
+/// the conservative answer, since an unknown type must not become extensible.
+pub fn isFinal(self: *const Module, i: u32) bool {
+    return if (i < self.type_finals.len) self.type_finals[i] else true;
+}
+
+/// The canonical identity of type index `i`. Two indices name the SAME type iff
+/// their canonical ids are equal. Out of range answers with the index itself.
+pub fn canonOf(self: *const Module, i: u32) u32 {
+    return if (i < self.canon.len) self.canon[i] else i;
+}
+
+/// The rec group type index `i` belongs to, as `[start, start+len)`. A type
+/// outside the declared space reads as a group of one containing itself, so
+/// callers need no separate bounds check.
+pub fn recGroup(self: *const Module, i: u32) struct { start: u32, len: u32 } {
+    if (i >= self.rec_start.len) return .{ .start = i, .len = 1 };
+    return .{ .start = self.rec_start[i], .len = self.rec_len[i] };
+}
+
+/// Are two value types the SAME type within this module? Beyond an identical bit
+/// pattern, two concrete references match when their nullability and family bits
+/// agree and their type indices are canonically equal.
+///
+/// Raw `==` is wrong for exactly the case GC exists to support: `(ref $t1)` and
+/// `(ref $t2)` naming two isomorphic rec groups are one type but two indices, so
+/// `==` compares the index numbers and says no. Use this wherever the spec asks
+/// for type IDENTITY within a module — an INVARIANT position, such as a mutable
+/// struct field, where subtyping would be unsound in both directions.
+pub fn valTypeEq(self: *const Module, x: types.ValType, y: types.ValType) bool {
+    if (x == y) return true;
+    if (!x.isConcrete() or !y.isConcrete()) return false;
+    if (types.ValType.flagBits(x) != types.ValType.flagBits(y)) return false;
+    return self.canonOf(x.concreteIndex()) == self.canonOf(y.concreteIndex());
+}
+
 /// Is type index `a` a (reflexive/transitive) subtype of `b`, walking the
 /// declared GC supertype chain?
+///
+/// Compares CANONICAL ids, not raw indices: two separately-declared but
+/// structurally isomorphic rec groups define one type, so `$f1` and `$f2` below
+/// are the same type and each is its own subtype.
+///
+///     (rec (type $f1 (sub (func))) (type (struct (field (ref $f1)))))
+///     (rec (type $f2 (sub (func))) (type (struct (field (ref $f2)))))
+///
+/// Comparing raw indices said no, which rejected valid modules outright and —
+/// once declared supertypes started being checked — made legitimate `(sub …)`
+/// declarations across equivalent groups look ill-formed.
 pub fn isSubtype(self: *const Module, a: u32, b: u32) bool {
+    const target = self.canonOf(b);
     var cur: ?u32 = a;
     while (cur) |c| {
-        if (c == b) return true;
+        if (self.canonOf(c) == target) return true;
         cur = if (c < self.supertypes.len) self.supertypes[c] else null;
     }
     return false;
@@ -537,8 +735,15 @@ fn readValType(r: *Reader, kinds: []const CompKind) Error!types.ValType {
     const b = try r.readByte();
     return switch (b) {
         0x7f, 0x7e, 0x7d, 0x7c, 0x7b => @enumFromInt(b), // i32 i64 f32 f64 v128
-        0x70, 0x73 => .funcref, // funcref, nullfuncref (nofunc) → func family head
-        0x6f, 0x72 => .externref, // externref, nullexternref (noextern)
+        0x70 => .funcref,
+        0x6f => .externref,
+        // ⚠️ `nullfuncref`/`nullexternref` used to fold onto the family HEAD
+        // (`0x70, 0x73 => .funcref`). A bottom is not its top: folded, it stops
+        // being below the hierarchy's CONCRETE types, so
+        // `(global $nullfunc nullfuncref …)` could not flow into a
+        // `(ref null $t)`. Each bottom is its own value type now.
+        0x73 => .nullfuncref,
+        0x72 => .nullexternref,
         // The WasmGC `any` internal hierarchy (full GC, P3): each abstract head is
         // its own value type, encoded by its real valtype byte.
         0x6e => .anyref,
@@ -555,7 +760,17 @@ fn readValType(r: *Reader, kinds: []const CompKind) Error!types.ValType {
         // `externref` — which the C ABI would then hand out as a host pointer
         // although it is an `exn_store` index.
         0x69 => .exnref,
-        0x74 => .nullref, // nullexnref — bottom; closest modelled type
+        // `nullexnref` — the bottom of the EXN hierarchy, its own type.
+        //
+        // ⚠️ It was `nullref` (the ANY-hierarchy bottom) as a "closest modelled
+        // type" approximation, and R10 made that inconsistency load-bearing: once
+        // `(ref.null noexn)` decoded to the exn head, the two spellings of the
+        // SAME type disagreed and `(global $nullexn nullexnref (ref.null noexn))`
+        // was a TypeMismatch against itself. R10 corrected the FAMILY by folding
+        // it onto `exnref`; this corrects the remaining half — a bottom is not
+        // its top. **Two encodings of one type must land on one value type, and
+        // that value type has to be the right one, not merely a consistent one.**
+        0x74 => .nullexnref,
         0x68 => .funcref_nn, // our synthetic non-null tags (assembler round-trip)
         0x67 => .externref_nn,
         0x66 => .anyref_nn,
@@ -564,6 +779,14 @@ fn readValType(r: *Reader, kinds: []const CompKind) Error!types.ValType {
         0x61 => .structref_nn,
         0x59 => .arrayref_nn,
         0x58 => .nullref_nn,
+        // ⚠️ `exnref_nn` was defined in `types.zig` and taught to `readBlockType`,
+        // and THIS reader was missed — so `(ref exn)` round-tripped as a block
+        // type but was `BadValType` in every other position. `try_table.wast`'s
+        // last module uses it in a block RESULT LIST (two results, so the
+        // signature is interned and read back through here rather than through
+        // `readBlockType`), which is why one valid module was rejected. A tag
+        // added to one of two readers is a tag that works in half the positions.
+        0x57 => .exnref_nn,
         0x63 => try readHeapTypeRef(r, true, kinds), // (ref null ht)
         0x64 => try readHeapTypeRef(r, false, kinds), // (ref ht) — non-nullable
         else => error.BadValType,
@@ -591,15 +814,22 @@ fn readHeapTypeRef(r: *Reader, nullable: bool, kinds: []const CompKind) Error!ty
         return types.ValType.concreteRef(nullable, head, ti);
     }
     const both: [2]types.ValType = switch (ht) {
-        -0x10, -0x0d => .{ .funcref, .funcref_nn }, // func, nofunc
-        -0x11, -0x0e => .{ .externref, .externref_nn }, // extern, noextern
+        -0x10 => .{ .funcref, .funcref_nn }, // func
+        -0x11 => .{ .externref, .externref_nn }, // extern
         -0x12 => .{ .anyref, .anyref_nn }, // any
         -0x13 => .{ .eqref, .eqref_nn }, // eq
         -0x14 => .{ .i31ref, .i31ref_nn }, // i31
         -0x15 => .{ .structref, .structref_nn }, // struct
         -0x16 => .{ .arrayref, .arrayref_nn }, // array
+        -0x17 => .{ .exnref, .exnref_nn }, // exn (EH)
+        // The four bottoms, each its own type rather than folded onto its top —
+        // see `readValType` above. This reader and `readValType` must stay in
+        // step: they are the two spellings of the same heap type, and R10's
+        // `nullexnref` incident is what happens when they disagree.
         -0x0f => .{ .nullref, .nullref_nn }, // none
-        -0x17 => .{ .exnref, .exnref_nn }, // exn (EH proposal) — was folded into externref
+        -0x0d => .{ .nullfuncref, .nullfuncref_nn }, // nofunc
+        -0x0e => .{ .nullexternref, .nullexternref_nn }, // noextern
+        -0x0c => .{ .nullexnref, .nullexnref_nn }, // noexn
         // An undefined heap-type code used to decode as `externref` ("other →
         // opaque"), so a malformed type was thereafter indistinguishable from a
         // real externref in validation, the C-ABI type objects, and the `.wast`
@@ -652,7 +882,10 @@ fn readLimits(r: *Reader) Error!Limits {
 fn readTableType(r: *Reader, kinds: []const CompKind) Error!TableType {
     const element = try readValType(r, kinds);
     const limits = try readLimits(r);
-    if (limits.shared or limits.is64) return error.MalformedFlag; // tables are 32-bit, unshared
+    // A table may be 64-bit (memory64 proposal, "table64" half — the index type
+    // sits in the same limits-flag bit as a memory's). It may never be SHARED:
+    // the threads proposal defines shared memories only.
+    if (limits.shared) return error.MalformedFlag;
     return .{ .element = element, .limits = limits };
 }
 
@@ -708,12 +941,18 @@ fn skipConstExpr(r: *Reader) Error!void {
                 // misread as `end` (0x0b) and truncate the captured expression.
                 const sub = try r.readVarU32();
                 switch (sub) {
-                    0x00, 0x01, 0x06, 0x07 => _ = try r.readVarU32(), // struct.new*/array.new* : type index
-                    0x08 => { // array.new_fixed : type index + element count
+                    // One index: struct.new*, array.new*, array.get*, array.set,
+                    // array.fill.
+                    0x00, 0x01, 0x06, 0x07, 0x0b, 0x0c, 0x0d, 0x0e, 0x10 => _ = try r.readVarU32(),
+                    // Two indices: array.new_fixed (type + count), array.new_data /
+                    // array.init_data (type + data), array.new_elem /
+                    // array.init_elem (type + elem), array.copy (type + type),
+                    // struct.get*/struct.set (type + field).
+                    0x02, 0x03, 0x04, 0x05, 0x08, 0x09, 0x0a, 0x11, 0x12, 0x13 => {
                         _ = try r.readVarU32();
                         _ = try r.readVarU32();
                     },
-                    else => {}, // ref.i31 / *.convert_* : no immediate
+                    else => {}, // ref.i31 / array.len / *.convert_* : no immediate
                 }
             },
             else => {}, // other zero-operand ops (extended-const arithmetic, etc.)
@@ -734,26 +973,206 @@ fn decodeTypeSection(d: *Decoder, r: *Reader) Error!void {
 
     var comp: std.ArrayList(CompType) = .empty;
     var supers: std.ArrayList(?u32) = .empty;
+    var finals: std.ArrayList(bool) = .empty;
+    // Rec-group extent per type index. Flattening the groups away lost the one
+    // piece of information canonicalisation needs — which references are
+    // INTERNAL to a group — so a standalone type is recorded as a group of one.
+    var rec_start: std.ArrayList(u32) = .empty;
+    var rec_len: std.ArrayList(u32) = .empty;
     var nrec = try r.readVarU32();
     while (nrec > 0) : (nrec -= 1) {
+        const start: u32 = @intCast(comp.items.len);
+        var members: u32 = 1;
         if (try r.peekByte() == 0x4e) {
             _ = try r.readByte(); // rec group
-            var k = try r.readVarU32();
-            while (k > 0) : (k -= 1) try decodeSubType(d, r, &comp, &supers);
+            members = try r.readVarU32();
+            var k = members;
+            while (k > 0) : (k -= 1) try decodeSubType(d, r, &comp, &supers, &finals);
         } else {
-            try decodeSubType(d, r, &comp, &supers);
+            try decodeSubType(d, r, &comp, &supers, &finals);
+        }
+        var k: u32 = 0;
+        while (k < members) : (k += 1) {
+            try rec_start.append(d.a, start);
+            try rec_len.append(d.a, members);
         }
     }
     d.comp_types = try comp.toOwnedSlice(d.a);
     d.supertypes = try supers.toOwnedSlice(d.a);
+    d.type_finals = try finals.toOwnedSlice(d.a);
+    d.rec_start = try rec_start.toOwnedSlice(d.a);
+    d.rec_len = try rec_len.toOwnedSlice(d.a);
+    try checkTypeRefScope(d.comp_types, d.rec_start, d.rec_len);
+    d.canon = try canonicalizeTypes(d.a, d.comp_types, d.supertypes, d.type_finals, d.rec_start, d.rec_len);
+}
+
+/// Reject a `(ref $t)` that points FORWARD, past the end of its own rec group
+/// (§3.1.1: a type may only refer to types declared before it or inside its own
+/// group — "unknown type").
+///
+/// `readValType` bounds a concrete index by the TOTAL declared type count, which
+/// accepts `(type $t1 (func (param (ref $t2)))) (type $t2 …)` — two separate
+/// groups referring forwards. That is not merely a missed rejection: it lets a
+/// module build reference cycles that span rec groups, and every algorithm that
+/// walks type references — canonicalisation, cross-module matching — assumes
+/// external references point strictly BACKWARDS to stay well-founded. Without
+/// this check a hand-built module can send them into unbounded recursion.
+///
+/// The supertype is already checked at its own site (`decodeSubType`), which is
+/// stricter still: a supertype must precede the type itself, not merely its group.
+fn checkTypeRefScope(comp_types: []const CompType, rec_start: []const u32, rec_len: []const u32) Error!void {
+    for (comp_types, 0..) |c, i| {
+        const limit = rec_start[i] + rec_len[i]; // one past this group's last member
+        switch (c) {
+            .func => |f| {
+                for (f.params) |v| try checkValTypeScope(v, limit);
+                for (f.results) |v| try checkValTypeScope(v, limit);
+            },
+            .@"struct" => |fs| for (fs) |fld| try checkValTypeScope(fld.storage.unpacked(), limit),
+            .array => |fld| try checkValTypeScope(fld.storage.unpacked(), limit),
+        }
+    }
+}
+
+fn checkValTypeScope(v: types.ValType, limit: u32) Error!void {
+    if (v.isConcrete() and v.concreteIndex() >= limit) return error.IndexOutOfRange;
+}
+
+/// Assign each type index a CANONICAL identity, so that two structurally
+/// isomorphic `rec` groups define one type rather than two (§3.3.10).
+///
+/// The whole difficulty is that a rec group's members refer to *each other* by
+/// absolute type index, so two copies of the same group are byte-different while
+/// being the same type. The fix is to serialise a group with its INTERNAL
+/// references rewritten as positions within the group, and its external ones as
+/// the canonical id of the target. That form is identical for isomorphic groups,
+/// so interning it in a hash map assigns them the same id.
+///
+/// Groups are processed in index order, so an external reference always points
+/// at a group whose canonical id is already known (a type index may only refer
+/// backwards, or inside its own group).
+fn canonicalizeTypes(
+    a: std.mem.Allocator,
+    comp_types: []const CompType,
+    supertypes: []const ?u32,
+    finals: []const bool,
+    rec_start: []const u32,
+    rec_len: []const u32,
+) Error![]const u32 {
+    const canon = try a.alloc(u32, comp_types.len);
+    var interned: std.StringHashMapUnmanaged(u32) = .{};
+    defer interned.deinit(a);
+
+    var key: std.ArrayList(u8) = .empty;
+    defer key.deinit(a);
+
+    var i: u32 = 0;
+    while (i < comp_types.len) {
+        const start = rec_start[i];
+        const len = rec_len[i];
+        key.clearRetainingCapacity();
+
+        var k: u32 = 0;
+        while (k < len) : (k += 1) {
+            const t = start + k;
+            try key.append(a, if (finals[t]) 1 else 0);
+            if (supertypes[t]) |s| {
+                try key.append(a, 1);
+                try writeTypeRef(a, &key, s, start, len, canon);
+            } else try key.append(a, 0);
+            try writeCompType(a, &key, comp_types[t], start, len, canon);
+        }
+
+        // The first group with a given shape names the shape; later copies of it
+        // reuse that group's base, which is what makes their members equal.
+        const gop = try interned.getOrPut(a, key.items);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try a.dupe(u8, key.items);
+            gop.value_ptr.* = start;
+        }
+        const base = gop.value_ptr.*;
+        k = 0;
+        while (k < len) : (k += 1) canon[start + k] = base + k;
+        i = start + len;
+    }
+    return canon;
+}
+
+/// Serialise a type reference: relative when it points inside the group being
+/// canonicalised, else by the target's already-assigned canonical id.
+fn writeTypeRef(a: std.mem.Allocator, out: *std.ArrayList(u8), t: u32, start: u32, len: u32, canon: []const u32) Error!void {
+    if (t >= start and t < start + len) {
+        try out.append(a, 0); // in-group: position, so isomorphic groups agree
+        try out.appendSlice(a, std.mem.asBytes(&(t - start)));
+    } else {
+        try out.append(a, 1);
+        const id = if (t < canon.len and t < start) canon[t] else t; // forward refs can't occur in a valid module
+        try out.appendSlice(a, std.mem.asBytes(&id));
+    }
+}
+
+fn writeValType(a: std.mem.Allocator, out: *std.ArrayList(u8), v: types.ValType, start: u32, len: u32, canon: []const u32) Error!void {
+    if (!v.isConcrete()) {
+        try out.append(a, 0);
+        try out.appendSlice(a, std.mem.asBytes(&@intFromEnum(v)));
+        return;
+    }
+    // Keep the concrete/nullable/family bits verbatim and canonicalise only the
+    // index — `(ref $t)` and `(ref null $t)` stay distinct types.
+    try out.append(a, 1);
+    const flags: u32 = v.flagBits();
+    try out.appendSlice(a, std.mem.asBytes(&flags));
+    try writeTypeRef(a, out, v.concreteIndex(), start, len, canon);
+}
+
+fn writeFieldType(a: std.mem.Allocator, out: *std.ArrayList(u8), f: FieldType, start: u32, len: u32, canon: []const u32) Error!void {
+    try out.append(a, if (f.mutable) 1 else 0);
+    switch (f.storage) {
+        .val => |v| {
+            try out.append(a, 0);
+            try writeValType(a, out, v, start, len, canon);
+        },
+        .i8 => try out.append(a, 1),
+        .i16 => try out.append(a, 2),
+    }
+}
+
+fn writeCompType(a: std.mem.Allocator, out: *std.ArrayList(u8), c: CompType, start: u32, len: u32, canon: []const u32) Error!void {
+    switch (c) {
+        .func => |f| {
+            try out.append(a, 0);
+            try out.appendSlice(a, std.mem.asBytes(&@as(u32, @intCast(f.params.len))));
+            for (f.params) |p| try writeValType(a, out, p, start, len, canon);
+            try out.appendSlice(a, std.mem.asBytes(&@as(u32, @intCast(f.results.len))));
+            for (f.results) |r| try writeValType(a, out, r, start, len, canon);
+        },
+        .@"struct" => |fs| {
+            try out.append(a, 1);
+            try out.appendSlice(a, std.mem.asBytes(&@as(u32, @intCast(fs.len))));
+            for (fs) |f| try writeFieldType(a, out, f, start, len, canon);
+        },
+        .array => |f| {
+            try out.append(a, 2);
+            try writeFieldType(a, out, f, start, len, canon);
+        },
+    }
 }
 
 /// Decode one sub type: an optional `0x50`/`0x4f` (non-final / final) wrapper
 /// carrying a supertype list (GC MVP: at most one), then a composite type.
-fn decodeSubType(d: *Decoder, r: *Reader, comp: *std.ArrayList(CompType), supers: *std.ArrayList(?u32)) Error!void {
+fn decodeSubType(d: *Decoder, r: *Reader, comp: *std.ArrayList(CompType), supers: *std.ArrayList(?u32), finals: *std.ArrayList(bool)) Error!void {
     var super: ?u32 = null;
+    // FINAL unless an explicit `0x50` says otherwise: a bare composite type is
+    // shorthand for `sub final`, and `0x4f` is the spelled-out form. Only `0x50`
+    // opens a type for extension.
+    //
+    // Both wrapper bytes used to decode identically, so finality was thrown away
+    // and `(type $t (func))` `(type $s (sub $t (func)))` — extending a final type
+    // — was accepted. Two of `type-subtyping.wast`'s accept-invalid failures.
+    var final = true;
     const tag = try r.peekByte();
     if (tag == 0x50 or tag == 0x4f) {
+        final = tag == 0x4f;
         _ = try r.readByte();
         const ns = try r.readVarU32();
         if (ns > 1) return error.BadType; // MVP allows at most one supertype
@@ -768,6 +1187,7 @@ fn decodeSubType(d: *Decoder, r: *Reader, comp: *std.ArrayList(CompType), supers
     }
     try comp.append(d.a, try decodeCompType(d, r));
     try supers.append(d.a, super);
+    try finals.append(d.a, final);
 }
 
 /// Decode a composite type: `0x60` func / `0x5f` struct / `0x5e` array.
@@ -874,10 +1294,14 @@ fn decodeImportSection(d: *Decoder, r: *Reader) Error![]const Import {
         imp.module = try readName(d.a, r);
         imp.name = try readName(d.a, r);
         const kind: types.ExternKind = @enumFromInt(try r.readByte());
+        imp.type_index = null;
         imp.type = switch (kind) {
             .func => blk: {
-                const ft = try funcTypeAt(d, try r.readVarU32());
+                const ti = try r.readVarU32();
+                const ft = try funcTypeAt(d, ti);
                 try d.func_space.append(d.a, ft);
+                try d.func_type_space.append(d.a, ti);
+                imp.type_index = ti;
                 break :blk .{ .func = ft };
             },
             .table => blk: {
@@ -898,8 +1322,11 @@ fn decodeImportSection(d: *Decoder, r: *Reader) Error![]const Import {
             .tag => blk: {
                 // Tag import: an attribute byte (0 = exception) + a type index.
                 if ((try r.readByte()) != 0x00) return error.MalformedFlag;
-                const ft = try funcTypeAt(d, try r.readVarU32());
+                const ti = try r.readVarU32();
+                const ft = try funcTypeAt(d, ti);
                 try d.tag_space.append(d.a, ft);
+                try d.tag_type_space.append(d.a, ti);
+                imp.type_index = ti;
                 break :blk .{ .tag = ft };
             },
             else => return error.UnknownExternKind,
@@ -914,6 +1341,7 @@ fn decodeFunctionSection(d: *Decoder, r: *Reader) Error![]const u32 {
     for (list) |*i| {
         i.* = try r.readVarU32();
         try d.func_space.append(d.a, try funcTypeAt(d, i.*));
+        try d.func_type_space.append(d.a, i.*);
     }
     return list;
 }
@@ -928,13 +1356,30 @@ fn decodeTagSection(d: *Decoder, r: *Reader) Error![]const u32 {
         if (attr != 0x00) return error.MalformedFlag; // only the exception attribute (0) exists
         i.* = try r.readVarU32();
         try d.tag_space.append(d.a, try funcTypeAt(d, i.*)); // defined tags follow imported ones
+        try d.tag_type_space.append(d.a, i.*);
     }
     return list;
 }
 
 fn decodeTableSection(d: *Decoder, r: *Reader) Error!void {
     var count = try r.readVarU32();
-    while (count > 0) : (count -= 1) try d.table_space.append(d.a, try readTableType(r, d.type_kinds));
+    while (count > 0) : (count -= 1) {
+        // §5.5.6: `table ::= tt:tabletype | 0x40 0x00 tt:tabletype e:expr`. The
+        // second form (function-references) carries an explicit initializer.
+        // `0x40` is not a valtype byte, so the whole form used to decode as
+        // `BadValType` — seven `elem.wast` modules, every one of them a table
+        // with a non-nullable `(ref func)` element type, which cannot be
+        // expressed WITHOUT this form.
+        if ((try r.peekByte()) != 0x40) {
+            try d.table_space.append(d.a, try readTableType(r, d.type_kinds));
+            continue;
+        }
+        _ = try r.readByte(); // 0x40
+        if ((try r.readByte()) != 0x00) return error.MalformedFlag; // reserved
+        var tt = try readTableType(r, d.type_kinds);
+        tt.init_expr = try readConstExprBytes(d.a, r);
+        try d.table_space.append(d.a, tt);
+    }
 }
 
 fn decodeMemorySection(d: *Decoder, r: *Reader) Error!void {
@@ -1043,6 +1488,14 @@ fn decodeElementSection(d: *Decoder, r: *Reader) Error![]const Element {
             // Func-index form. Non-flag-0 variants carry a leading elemkind byte.
             if (flags != 0) _ = try r.readByte(); // elemkind (0x00 = funcref)
             e.funcs = try readFuncVec(d.a, r);
+            // §5.5.12 gives forms 0–3 the type `(ref func)` — NON-nullable — not
+            // `funcref`: each entry expands to `ref.func y`, which can never be
+            // null. Only form 4 defaults to nullable `funcref`. Recording them
+            // all as `funcref` was invisible while the segment/table type check
+            // normalized nullability away; once that check became real subtyping
+            // (§3.5.11), it rejected every funcidx segment aimed at a
+            // `(ref func)` table — four valid `elem.wast` modules.
+            e.elem_type = .funcref_nn;
         } else {
             // Const-expr form. Non-flag-4 variants carry a leading reftype byte.
             if (flags != 4) e.elem_type = try readValType(r, d.type_kinds);
@@ -1173,6 +1626,42 @@ test "rejects a reserved global-mutability byte" {
     try std.testing.expectError(error.MalformedFlag, Module.decode(std.testing.allocator, &bytes));
 }
 
+test "rejects a duplicate or out-of-order section (§5.5.2)" {
+    // 16 of `binary.wast`'s 25 accept-invalid failures were this one rule. A
+    // duplicate was the worse half: the second decode just REASSIGNED the field,
+    // so the module built from the last copy and the first silently vanished.
+    const hdr = types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 };
+    const cases = [_][]const u8{
+        &(hdr ++ [_]u8{ 0x07, 0x01, 0x00, 0x07, 0x01, 0x00 }), // export twice
+        &(hdr ++ [_]u8{ 0x08, 0x01, 0x00, 0x08, 0x01, 0x00 }), // start twice
+        &(hdr ++ [_]u8{ 0x02, 0x01, 0x00, 0x01, 0x01, 0x00 }), // import before type
+        &(hdr ++ [_]u8{ 0x05, 0x01, 0x00, 0x04, 0x01, 0x00 }), // memory before table
+    };
+    for (cases) |bytes|
+        try std.testing.expectError(error.SectionOrder, Module.decode(std.testing.allocator, bytes));
+
+    // ...but the order is NOT ascending id, and getting that wrong would refuse
+    // valid modules instead. `tag` (13) belongs between memory (5) and global
+    // (6); `data_count` (12) between element (9) and code (10). Both must decode.
+    const tag_then_global = types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+        [_]u8{ 0x01, 0x04, 0x01, 0x60, 0x00, 0x00 } ++ // type: () -> ()
+        [_]u8{ 0x0d, 0x03, 0x01, 0x00, 0x00 } ++ // tag: one tag of type 0
+        [_]u8{ 0x06, 0x04, 0x01, 0x7f, 0x00, 0x0b }; // global: i32 const 0
+    var m = try Module.decode(std.testing.allocator, &tag_then_global);
+    defer m.deinit();
+    try std.testing.expectEqual(@as(usize, 1), m.tags.len);
+}
+
+test "rejects a section whose declared size leaves trailing bytes (§5.5.1)" {
+    // A type section sized for TWO func types but declaring a count of one. The
+    // vector parsed fine and the extra `\60\00\00` was simply dropped, so the
+    // module built — `binary.wast` calls this "section size mismatch" and has
+    // seven of them (type/import/global/export/elem/data/data-segment).
+    const bytes = types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+        [_]u8{ 0x01, 0x07, 0x01, 0x60, 0x00, 0x00, 0x60, 0x00, 0x00 };
+    try std.testing.expectError(error.SectionSizeMismatch, Module.decode(std.testing.allocator, &bytes));
+}
+
 test "rejects a self-referential supertype (would otherwise hang isSubtype)" {
     // type section: one type = sub (0x50) with supertype [0] (itself), func [] -> [].
     const bytes = types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
@@ -1271,9 +1760,9 @@ test "decodes a code section with locals and a body" {
         types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
         [_]u8{ 0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f } ++ // type
         [_]u8{ 0x03, 0x02, 0x01, 0x00 } ++ // function: 1 func of type 0
+        [_]u8{ 0x07, 0x07, 0x01, 0x03, 'a', 'd', 'd', 0x00, 0x00 } ++ // export
         // code: 1 entry, size 9 = locals(01 01 7f) ++ body(20 00 20 01 6a 0b)
-        [_]u8{ 0x0a, 0x0b, 0x01, 0x09, 0x01, 0x01, 0x7f, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b } ++
-        [_]u8{ 0x07, 0x07, 0x01, 0x03, 'a', 'd', 'd', 0x00, 0x00 }; // export
+        [_]u8{ 0x0a, 0x0b, 0x01, 0x09, 0x01, 0x01, 0x7f, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b };
 
     var m = try Module.decode(std.testing.allocator, &bytes);
     defer m.deinit();

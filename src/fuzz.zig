@@ -146,7 +146,8 @@ fn tryDecodeAndInstantiate(gpa: std.mem.Allocator, input: []const u8, r: *Reache
     defer m.deinit();
     r.decoded += 1;
     if (instantiationTooBig(&m)) return;
-    var inst = interp.Instance.init(gpa, &m) catch return;
+    var inst: interp.Instance = undefined;
+    inst.instantiate(gpa, &m) catch return;
     inst.deinit(); // before m.deinit() (defer): the instance borrows the module
     r.instantiated += 1;
 }

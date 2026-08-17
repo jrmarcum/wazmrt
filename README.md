@@ -20,18 +20,25 @@ compliance process, and for the ledger of any reused code.
 > `ref.as_non_null`, `br_on_null`, non-null refs with local-initialization
 > checking), and **WasmGC** — `i31` references (`ref.i31`, `i31.get_s`/`_u`),
 > **struct and array** heap objects (`struct.new`/`get`/`set`, `array.new`/
-> `new_fixed`/`get`/`set`/`len`, `ref.eq`, packed `i8`/`i16` fields), casts
+> `new_default`/`new_fixed`/`get`/`set`/`len`, the array bulk ops
+> `array.fill`/`copy`/`new_data`/`new_elem`/`init_data`/`init_elem`, `ref.eq`,
+> packed `i8`/`i16` fields), casts
 > (`ref.test`/`ref.cast`, `br_on_cast`/`br_on_cast_fail`), **concrete
 > `(ref $t)` references** (self-referential structs, exact-type params), and
 > declared subtyping (`(sub $super …)`) over the `any`/`eq`/`i31`/`struct`/
-> `array` reference hierarchy — and runs a corpus of real modules to their
-> expected values
+> `array` reference hierarchy, with types compared **structurally across module
+> boundaries** when linking (so two modules that separately declare the same
+> recursive type link, and two that merely reuse a type index do not)
+> — and runs a corpus of real modules to their expected values
 > (`fib(20)=6765`, `sieve(30)=10`, …). It ships a native **WAT text assembler**
 > (`.wat` → wasm) and a **WAST script runner** (`wazmrt file.wast`) that runs the
 > official WebAssembly spec testsuite (positive assertions plus
-> `assert_invalid`/`assert_malformed`/`assert_trap`/`assert_unlinkable`) — e.g.
-> `table_init` 729/0, `table_copy` 1649/0, `imports` 137, `call_ref` 30, `start`
-> 11/0. It runs a module's **start function** at instantiation, embeds through a
+> `assert_invalid`/`assert_malformed`/`assert_trap`/`assert_unlinkable`, and the
+> `(module definition …)`/`(module instance …)` script forms) — e.g.
+> `table_init` 729/0, `table_copy` 1649/0, `imports` 128/0, `call_ref` 31/0,
+> `start` 10/0. Failures are reported with the **source line** of the assertion
+> that produced them. It runs a module's **start function** at instantiation, embeds
+> through a
 > small **native C ABI** (instantiate/call, host functions with a caller handle,
 > `.wat` straight from text, WASI, resource ceilings — loadable over FFI, see
 > below), and runs **WASI
@@ -61,16 +68,87 @@ zig build test                     # unit tests
 zig build test-safe                # the same suite under ReleaseSafe (optimized, safety checks kept)
 zig build wasi-gate                # compile Zig+C wasm32-wasi programs, run them, assert output
                                    #   add -Drust-gate=true to also cross-check a rustc build
-zig build conformance -Dtestsuite=<dir>   # run a WebAssembly spec-testsuite checkout (.wast)
+zig build conformance -Dtestsuite=<dir> -Dbaseline=tools/conformance-baseline.txt
+                                   # run the spec testsuite; gates on REGRESSIONS vs an
+                                   # explained baseline (89 non-defects + 1 known deviation)
                                    #   -Dbaseline=<file>        gate on regressions, not zero failures
                                    #   -Dwrite-baseline=true    generate that baseline from today's run
+                                   #   -Dfailures=N             list up to N failures per file (default 1)
+zig build size -Doptimize=ReleaseSmall    # fail the build if a shipped artifact grew past its ceiling
 zig build wasm                     # build the runtime itself as a wasm module
 zig build dll                      # C-ABI shared library (for FFI: Deno, ctypes, …)
 zig build capi-smoke               # build + run the C example (needs no external deps)
 zig build ffi-demo                 # build the DLL + run examples/deno_ffi_capi.mjs (needs deno)
 zig build size -Doptimize=ReleaseSmall   # fail if a shipped artifact grew past its ceiling
+zig build features                 # compile the C ABI in all four -Dwat/-Dwasi combinations
 zig build bench                    # interpreter microbenchmark (ReleaseFast)
+zig build bakeoff -Dcorpus=<dir>   # benchmark vs wasmtime/wasmer/wazero end-to-end (needs deno)
+zig build phases  -Dmodules=<a,b> # engine pipeline only, process spawn excluded
 ```
+
+### Startup
+
+`zig build bakeoff` times a full invocation — process spawn, decode, validate,
+instantiate, call — against the runtimes wazmrt is meant to replace. Over
+wasmtk's `wasm_mod` corpus (12 invocations × 9 reps, ReleaseFast, x86_64-windows):
+
+| runtime | configuration | median | vs wazmrt |
+| --- | --- | --- | --- |
+| **wazmrt** | interpreter | **6.77 ms** | — |
+| wasmtime | `-C compiler=winch` | 36.63 ms | 5.4× |
+| wasmtime | `-O opt-level=0` | 36.27 ms | 5.4× |
+| wasmtime | default (`opt-level=2`) | 35.92 ms | 5.3× |
+| wasmer | default | 36.69 ms | 5.4× |
+
+wasmtime is measured in its **fast-start** configurations as well as its default,
+because beating a compiler in its slowest-starting mode would prove nothing. All
+three land within 2% of each other, and that holds from 9 KB to a 1.97 MB module —
+a 210× range over which none of the numbers move.
+
+**What this is, precisely.** It is the cost of *one invocation*, which is what a
+dev loop pays. It is **not** engine speed: `wazmrt --version`, which touches no
+wasm at all, costs 30 ms of the 33 ms, so most of the advantage is that a ~1 MB
+binary loads faster than a large one. The entire wasm pipeline on that 2 MB module
+is under 3 ms. Both facts are real and the first is what you feel — but the honest
+phrasing is *"an invocation costs less, mostly because the binary is small"*, not
+*"the engine decodes faster"*.
+
+**With spawn excluded** (`zig build phases`), the engine pipeline — bytes to
+something runnable — is **20–55× faster** than wasmtime's: 0.72 ms vs 14.5–22.1 ms
+on that 1.97 MB module. The end-to-end table understates the engine difference by
+about 10×, because a ~30 ms process floor dwarfs a sub-millisecond quantity. The
+two produce different things, though — wasmtime emits native code and wins a hot
+loop; wazmrt produces an IR to interpret.
+
+It is also not steady-state throughput; a JIT wins hot loops. Every result is
+checked, and in `-Dmode=start` no runtime is treated as the oracle — they must
+agree with each other, and a disagreement is reported rather than adjudicated.
+Runtimes are sampled once per repetition, interleaved, so machine drift cancels
+instead of being attributed to one of them.
+
+### Slimming the embedded library
+
+If you embed wazmrt over the C ABI and never assemble `.wat` or use WASI, compile
+them out. Both default to on; the flags affect **only** the C-ABI library, the
+DLL and the wasm build — the CLI always assembles text and always has WASI.
+
+```
+zig build dll -Doptimize=ReleaseSmall -Dwat=false -Dwasi=false
+```
+
+Measured (ReleaseSmall, x86_64-windows):
+
+| build | static lib | shared library |
+| --- | --- | --- |
+| default | 1,022,520 | 882,688 |
+| `-Dwat=false` | 840,962 | 738,816 |
+| `-Dwasi=false` | 502,178 | 419,840 |
+| both off | 319,916 | **275,456** |
+
+A compiled-out entry point does not fail quietly: `wazmrt_module_new_wat`,
+`wazmrt_wat_to_wasm` and `wazmrt_linker_define_wasi` return an error naming the
+flag to rebuild with. With both features on the artifacts are byte-identical to
+a build without the flags, so there is no cost to leaving them alone.
 
 Run `wazmrt --help` (`-h`) for the full list of run modes, WASI/verification
 flags, and subcommands, or `wazmrt --version` (`-v`) for the version and whether
@@ -268,6 +346,16 @@ so there is no licence or NOTICE that has to travel with the artifact.
 > validates text in-process — no `wat2wasm`, no temp file, no build step. (Use
 > `wazmrt_wat_to_wasm()` if you would rather cache the binary; parsing text costs
 > more per module than decoding one, so the win is the edit-run loop.)
+>
+> The text front end holds `.wat` to the spec grammar, not just to what it can
+> make sense of: type uses are ordered (`(type …)`, then every `(param …)`, then
+> every `(result …)`), an inline signature written beside `(type $x)` must
+> reproduce that type, identifiers must be unique within an index space, and
+> tokens must be separated (`(data"a")` is rejected). If you have `.wat` that an
+> older wazmrt accepted and this one refuses, it is text the reference
+> implementation rejects too — there are no deliberate exceptions left. The last
+> one was `anyfunc`, the pre-standard spelling of `funcref`; it is now refused,
+> and the error names `funcref` so the fix is one word.
 >
 > **Host callbacks get a caller handle.** `wazmrt_caller_read`/`_write` read and
 > write *guest* memory from inside the callback, which is what essentially every

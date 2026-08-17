@@ -16,7 +16,12 @@ about a file **deleted on 2026-08-11**. They are kept because they are the *evid
 replacement's design: value handles exist precisely so that class cannot recur. See
 `design-decisions.md`.
 
-## 🎯 TASK-TO-FIX LIST — 62 real defects from the proposal-dir spec runs (2026-08-11)
+## 🎯 TASK-TO-FIX LIST — from the proposal-dir spec runs (2026-08-11)
+
+⚠️ **Updated 2026-08-12: T1 is fixed, T2 dissolved with it, and T5 was never a defect.** The "62" below
+is the original triage's count and is now wrong in both directions — T1 was **68** assertions, not 43
+(25 of them in the *main* suite, which the proposal-dir framing hid), and T5's 2 were miscounted
+symptoms. **T3 and T4 remain.** Read the per-item sections for what actually happened.
 
 Ran wasmtk's `tests/module/` corpus: **427 files, 60,568 assertions passed / 525 failed / 3,038
 skipped**. 164 of those failures sit in `testsuite-main/proposals/` + `legacy/`. Classified every one
@@ -33,46 +38,159 @@ by its first-failure text:
 project's own rule — *a runtime that executes an invalid module is over-permissive, not authoritative*
 — is being broken in a corner nobody had run before.
 
-### 🔴 T1 — ACCEPT-INVALID: 43 modules accepted that the spec requires be REJECTED
+### 🔴 ✅ T1 — ACCEPT-INVALID — FIXED 2026-08-12 (and it took T2 and T5 with it)
 
-- `proposals/custom-descriptors/binary.wast` — **25 failures**, first: `assert_invalid/malformed:
-  module was accepted (should be rejected)`.
-- `proposals/custom-page-sizes/custom-page-sizes-invalid.wast` — **18 failures**, same verdict.
+Corpus **525 → 455 failures**, 86 → 82 files with failures, **zero regressions** (every baseline entry
+decreased or vanished). `testsuite-main/binary.wast` and the `custom-descriptors` copy are both
+**completely clean**.
 
-**Why it matters more than the count suggests:** these files are almost entirely *negative*
-assertions. wazmrt is not failing to run something — it is **building modules whose encodings are
-malformed**, which is the accept-invalid class the 12th/13th passes spent so much effort closing.
-**Likely cause:** an unknown/reserved bit in the memory-limits flag byte (custom-page-sizes adds a
-page-size field there) and unknown type-section forms (custom-descriptors) are being ignored rather
-than refused. The decoder already rejects *some* reserved limits flags (`MalformedFlag`) — this is the
-sibling case it misses. **Sweep for the sibling**, per the standing lesson.
+⚠️ **THE TRIAGE MISLOCATED IT AND THE HYPOTHESIS WAS WRONG.** Two lessons, both expensive to relearn:
 
-### 🔴 T2 — SILENT WRONG ANSWER on custom page sizes (12 failures)
+1. **It was a CORE-SPEC defect, not a proposal one.** The *main* `testsuite-main/binary.wast` carried
+   **the same 25 failures** as `proposals/custom-descriptors/binary.wast` — the two files differ by one
+   import-kind byte. Grouping the run's failures by directory made a core-decoder hole look like a
+   proposal gap. **When a proposal-dir file fails, diff it against its main-suite original before
+   believing the label.**
+2. **The suspected cause did not exist.** The guess was "an ignored reserved bit in the memory-limits
+   flag" — but `readLimits` already rejected `flag > 0x07`. Right instinct (*sweep for the sibling*),
+   wrong sibling.
 
-`proposals/custom-page-sizes/custom-page-sizes.wast` — first failure: `assert_return "grow": result
-mismatch (got 0xffffffff)`.
+**Method that found it:** the conformance runner only records each file's FIRST failure, so 25 defects
+looked like one. Splitting `binary.wast` into 127 one-form files and running the directory gave all 25
+at once, and they fell into three obvious classes immediately. **That splitter is worth rebuilding any
+time a single file shows a double-digit failure count.**
 
-wazmrt **accepted** a module declaring a custom page size, then executed it wrongly: `memory.grow`
-returned −1. This is worse than T1 and is the *worst* failure mode in this codebase's taxonomy — not a
-refusal, not a trap, but a plausible wrong value handed to the guest. Fixing T1 (reject the encoding)
-almost certainly fixes this too; if the proposal is ever implemented, the grow semantics need their own
+**The four gaps — each one hid the next:**
+
+| | rule | missed | where |
+| --- | --- | --- | --- |
+| 1 | §5.5.2 section **order + at-most-once** | 16 | `Module.decode` |
+| 2 | §5.5.1 section **size consumed exactly** | 7 | `Module.decode` |
+| 3 | §5.5.16 **data-count section required** for `memory.init`/`data.drop` | 2 | `validate` |
+| 4 | trailing forms in a WAT `(memory …)` field | 18 | `wat.zig` |
+
+- ⚠️ **`sectionRank` is NOT the section id.** `tag` (13) belongs between *memory* (5) and *global* (6);
+  `data_count` (12) between *element* (9) and *code* (10). Both proposals appended an id to the end of
+  the range while inserting the section into the middle of the grammar. Ordering by raw id would have
+  refused every valid EH and bulk-memory module — a gate wrong in the over-refusing direction, the
+  same shape as ABI-2 near-miss #3.
+- 🔴 **Gap 3 had a mirror-image half in our own assembler: it emitted the data-count section NEVER.**
+  Landing the decoder check alone turned **~96 previously passing corpus assertions red**. Every
+  `(data …)` module wazmrt assembled was malformed the moment a body touched a segment, and nothing
+  caught it because **the two halves of the same gap agreed with each other**. *A producer and a
+  consumer that share an author share their blind spots; conformance only bites when one of them is
+  someone else's.*
+- 🟠 **14 hand-written test fixtures were malformed** — code section before export, `tag`/`memory`
+  before `function`. They had decoded happily for the life of the project. This is the FOURTH sighting
+  of the ABI-2 lesson #6 shape. `ehModule` now asserts spec section order so the class cannot recur.
+- The duplicate-section half was the worse one: a second section just **reassigned** the field
+  (`imports = try decode…`), so the module built from the last copy and the first vanished silently.
+
+**Honesty note.** `(pagesize …)` is now `error.UnsupportedProposal`, listed in `isOurLimitation`, so
+those assertions score as **SKIPS, not passes** — the modules are valid under a proposal wazmrt does
+not target, so refusing them is our gap, not a verdict. That is why passes only rose 32 while failures
+fell 70. Fixing this also exposed the missing our-limitation arm in `assertUnlinkable`, the same
+green-washing hole `assertRejected` had already closed.
+
+### ✅ T2 — SILENT WRONG ANSWER on custom page sizes — DISSOLVED BY T1 (2026-08-12)
+
+`custom-page-sizes.wast` returned `0xffffffff` from `memory.grow` because the WAT assembler **dropped
+`(pagesize N)` on the floor** and built an ordinary 64 KiB-page memory. The module never matched its
+own source. It now refuses to build (`UnsupportedProposal`), so the silent wrong answer — the worst
+failure mode in this codebase's taxonomy — is gone. The file's remaining failures are the by-design
+class: a proposal wazmrt does not implement. If it is ever implemented, grow semantics need their own
 test.
 
-### 🟠 T3 — legacy `rethrow` traps where it must return (3 failures)
+### ✅ T5 — RESOLVED (2026-08-12): investigated, and there was NO DEFECT to fix
 
-`legacy/rethrow.wast` — first failure: `assert_return: unexpected trap UncaughtException`.
+`memory_max.wast` / `memory_max_i64.wast` reported `assert_unlinkable: non-link error InvalidLimits`,
+which read as a stage misclassification. **All four assertions in each file use `(pagesize …)`.** With
+the pagesize dropped, `(memory 0xFFFF_FFFF (pagesize 1))` became a *default*-page-size memory of 4 G
+pages, which legitimately overflows → `InvalidLimits` at decode. The stage was never wrong; the memory
+was. Both files went clean with T1.
 
-⚠️ **This one is in a feature wazmrt DOES implement** (legacy EH, Phase 6.3), so it is a genuine
-runtime bug rather than a scope gap: a caught exception re-raised by `rethrow` is escaping the handler
-that should catch it. Same family as the 2026-07-27 fix where *"a throw inside a catch handler must go
-outward"* — this is the neighbouring case that fix did not cover.
+⚠️ **The transferable lesson: a defect classified by its error message can be a shadow of a defect
+three layers up.** T5 was triaged as its own item, in its own severity band, from a symptom that had
+nothing to do with limits.
 
-### 🟠 T4 — legacy `try`/`catch` encoding not decoded (2 failures)
+**Re-verified 2026-08-12** after all the T-work landed, because "not a defect" is a claim that should
+be re-checked rather than trusted: `memory_max.wast` and `memory_max_i64.wast` do not appear in the
+failing set at all, and the corpus contains **zero** `assert_unlinkable: non-link error` failures in
+any of its 284 files. The class is empty, not merely these two files.
 
-`legacy/try_catch.wast` — first failure: `module failed to build: UnknownInstr`.
+### 🟠 ✅ T3 — legacy `rethrow` — FIXED 2026-08-12. It was TWO defects, not one.
 
-Legacy try/catch is implemented, so some *variant* in this file is not — likely a block-type or
-`catch_all` form the decoder does not accept. Find the exact opcode before assuming scope.
+`legacy/rethrow.wast` is now **completely clean**; corpus 455 → 452. The triage saw only the first of
+its three failures, because the runner records one failure per file. **Splitting the file revealed a
+second, different defect** — and unlike T1, the module here is shared, so each assertion had to be
+re-paired with it rather than split off alone.
+
+**1. Runtime — a stale workaround (1 failure).** `rethrow-recatch` trapped with `UncaughtException`
+instead of returning 23. `rethrow l` popped the label stack down past `l` before re-raising, to stop
+the target's own handler from re-matching and looping. **`throwException` has done that properly since
+2026-07-27** — it skips any try whose `caught` is set — so all the pop still did was destroy the
+INTERVENING trys, which are exactly the ones that must catch. The label selects *which exception*;
+propagation starts *where the rethrow is*.
+
+⚠️ **The guard's own comment described the obsolete division of labour** ("`rethrow` avoids this by
+popping the try before re-raising"), so the code that made the pop redundant documented it as still
+load-bearing. **A workaround whose replacement lands elsewhere does not announce itself** — this is
+audit-trigger category 1, found only because a spec test disagreed.
+
+**2. Validation — accept-invalid (2 failures).** `rethrow l` must name a `catch`/`catch_all` block;
+nothing else binds a caught exception. We checked only that the label *resolved*, so
+`(func (rethrow 0))` and `(func (block (rethrow 0)))` were **accepted**, and at run time re-raised
+whatever the enclosing frame had left in `handler_exn`. Same accept-invalid class as T1, in a feature
+wazmrt does implement. Now `error.InvalidRethrowLabel`.
+
+### ✅ T4 — was the TAIL-CALL proposal, IMPLEMENTED 2026-08-12
+
+Corpus **288 → 275**, +176 passing. `return_call.wast` and `return_call_indirect.wast` are clean;
+`return_call_ref.wast` 7 → 1; `legacy/try_catch.wast` (the file that produced the original symptom)
+went 5 passed / 2 failed / 33 skipped → **31 passed / 1 failed / 7 skipped**.
+
+⚠️ **The interesting part is `return_call_ref`, which had "shipped" with function-references.** It was
+implemented as *call the callee, then jump to the epilogue* — semantically correct, and it passes
+every shallow assertion. But a tail call's entire purpose is that **depth is unbounded**, and that
+version grew the native stack per hop, so `return_call_ref.wast`'s deep-recursion assertions died at
+the ~900-frame cap with `CallStackExhausted`. The real implementation reuses the frame:
+`Frame.tail` reports the callee and `Instance.callFunction` LOOPS instead of recursing.
+
+- **The buffers must be reused, not re-allocated.** `callFunction`'s allocator is an ARENA, so a
+  fresh `locals`/args per hop would retain a million allocations for one invocation of
+  `count(1_000_000)`. `locals_buf` and `Frame.tail_buf` grow and are reused; self-recursion keeps
+  the same sizes, so after the first hop the loop allocates nothing.
+- An **imported** callee still degrades to call-then-return — there is no frame of ours to reuse,
+  and the host boundary is a real native call either way.
+- Results are matched by **equality**, not subtyping: the callee replaces the frame, so its results
+  *are* this function's results.
+
+✅ **The `features.zig` COVERAGE PIN earned its keep.** Adding two opcodes broke the build with
+*"opcode.Op has 240 members, features.zig was written against 238"* before the gate could silently
+pass them. A new `tail_call` feature (14) was added to `Feature`, `opFeature`, and
+`WAZMRT_FEATURE_TAIL_CALL` in `include/wazmrt.h` — the C enum casts straight across and must not
+drift. **This is the pattern the three producer/consumer blind spots lacked: a mechanical check that
+fails closed when a new case appears.**
+
+**Still open:** `return_call_ref.wast` 1 and `legacy/try_catch.wast` 1, both cross-module type/tag
+identity (see the GC section). `try_delegate.wast` remains the deliberate `delegate` refusal.
+
+#### The original misdiagnosis (kept — it is the lesson)
+
+`legacy/try_catch.wast` fails to build with `UnknownInstr`, and the triage read that as "some legacy
+`try`/`catch` variant we do not decode". It is neither legacy nor EH: lines 155 and 165 use
+**`return_call` and `return_call_indirect`**. Opcodes **`0x12`/`0x13` do not exist anywhere in
+wazmrt** — no `opcode.zig` entry, no feature flag. The instructions merely happen to live in an EH
+test file.
+
+So T4 is the **by-design class** (a proposal wazmrt does not target), *not* a defect — unless the
+owner decides to target tail calls. **Scope decision, deliberately left open.** Note the cost is
+lower than it looks: `return_call_ref` (function-references) is already implemented, and its tail-call
+mechanism — `pc = ir.len` at `interp.zig` — is exactly what the other two need.
+
+⚠️ **Third mislabelled item in this list** (T1's location, T5's existence, now T4's subject). The
+triage classified 164 failures by their *first-failure text* alone, and that text names the symptom,
+never the cause.
 
 ### 🟡 T5 — wrong error STAGE for oversized memory limits (2 failures)
 
@@ -90,6 +208,440 @@ assertions that never ran (`wast.zig` skips unhandled command forms, and cascade
 depending on a module that failed to build). ⚠️ `utf8-invalid-encoding.wast` is **0 passed / 0 failed /
 176 skipped** — UTF-8 name validation is entirely unverified by this corpus despite the 13th pass
 recording it as fixed. Worth a separate look at whether the skip is the runner's gap or ours.
+
+## 🔢 table64 (2026-08-12) — memory64's other half, missing for 16 days behind a "COMPLETE" claim
+
+Corpus **372 → 288 failures**; `table_copy64` alone went from 22 build failures + 14 skips to **1,635
+passing assertions**; `table_{init,fill,get,grow,set,size}64` are clean. 2,957 → 2,826 skipped, i.e.
+~130 assertions that had never RUN now run.
+
+`Module.readTableType` carried `if (limits.shared or limits.is64) return error.MalformedFlag; //
+tables are 32-bit`, so a 64-bit table was refused at the first byte. Everything downstream then
+hard-coded `.i32` for every table index, length and count operand. What it took:
+
+- `tableAddrTy` in `validate` (the twin of `memAddrTy`) applied to `table.get/set/size/grow/fill`,
+  `table.copy`, `table.init`'s **dst only** (`src`/`n` index the element *segment*, always 32-bit),
+  and `call_indirect`'s callee index.
+- `Instance.Table.max` widened `?u32 → ?u64` plus an `is64` field; `table.grow`'s overflow made
+  saturating, since a 64-bit delta overflows the sum outright.
+- Active-elem offsets take the **table's** index type, exactly as active-data offsets take their
+  memory's.
+- Entry ceiling is 2^32-1 for a 32-bit table and 2^64-1 for a 64-bit one (so only the 32-bit case
+  actually bounds).
+
+⚠️ **Two failures here were nowhere near where they pointed:**
+
+1. `isOffsetForm` listed `offset` / `i32.const` / `global.get` — **not `i64.const`**. An
+   `(elem (table $t) (i64.const 2) …)` offset was therefore not recognised as an offset *at all*,
+   fell through to the element list, and was parsed as a **function index** → `BadImmediate`, an
+   error about immediates raised from a place that had nothing to do with the actual mistake.
+2. `limitsFit` compared only min/max, so a 32-bit table/memory satisfied a 64-bit import and vice
+   versa — all eight cross-width imports in `memory64-imports.wast` linked when the spec requires
+   them unlinkable. **The index type is part of the type**, not a detail of the limits: every index
+   operand changes width, so the importer would have driven the object with wrong-width operands.
+   `shared` was unchecked there too, and is now.
+
+**Still open in this family:** `table64.wast` 2 (a `(module quote …)` → `BadCommand`, a runner gap,
+plus its cascade).
+
+## 🧬 GC type identity (2026-08-12) — three gaps, all mutually concealing
+
+`type-subtyping` + `type-rec` + `type-equivalence`: **64 → 26 failures**, corpus 420 → 372.
+`type-subtyping` alone went 43 → 12 (24 → 50 passing). Zero regressions.
+
+**1. Declared supertypes were never checked (19 accept-invalid).** The decoder recorded
+`supertypes[i]` and the validator trusted it, so a module could declare *any* type the supertype of
+*any* other — `(array i32)` under `(array i64)`, a struct under a func, `(func)` under `(func (param
+i32))`. `isSubtype`'s chain walk then agreed. ⚠️ **This is not a tidiness bug: it makes `ref.cast`
+unsound.** The cast succeeds and the interpreter reads the value at a type it does not have. Now
+`error.InvalidSubtype`, implementing §3.3.9 matching (params contravariant, results covariant, struct
+fields extendable-but-positional, mutable fields INVARIANT).
+
+**2. Finality was decoded and thrown away.** `0x50` (open) and `0x4f` (final) took the same branch, so
+extending a final type was accepted. The assembler had the mirror bug: it emitted the sub form **only
+when a supertype was present**, so `(type $e0 (sub (array i32)))` — `sub`, no supertype — went out as
+a bare composite and came back FINAL. Fixing only the validator therefore rejected valid modules.
+
+**3. Rec groups were flattened by the assembler (the big one).** `(rec …)` members were emitted
+ungrouped, and the decoder had no group boundaries either — so every member became its own singleton
+group. Types are canonicalised **by whole-group isomorphism plus position**, so this silently rewrote
+the module into a different one: `(rec (func) (struct))` and `(rec (struct) (func))` define four
+distinct types, but flattened they collapse to two. wazmrt now records rec extents and interns each
+group's serialised form — internal references rewritten as positions, external ones as the target's
+canonical id — in `Module.canonicalizeTypes`. `isSubtype` compares canonical ids.
+
+⚠️ **THE THIRD PRODUCER/CONSUMER BLIND SPOT IN TWO DAYS**, after the data-count section (T1) and the
+`0x50` wrapper above. Each time, `wat.zig` dropped something and `Module.zig` did not require it, so
+the two halves agreed and the round trip looked clean. **Our assembler is not an oracle for our
+decoder.** Any conformance failure that reaches the WAT path should be checked at BOTH ends before the
+runtime is suspected — and a decoder rule with no matching emitter rule is a bug that hides itself.
+
+## 🧬 ✅ Cross-module type identity — R1, FIXED 2026-08-12 (the 4th gap, and the largest)
+
+Corpus **275 → 237**, 61,115 → 61,152 passing, **6 fewer SKIPS**, zero regressions across three
+commits. `type-equivalence`, `type-subtyping`, `type-rec` and `imports` are all **clean**.
+Triaged at 25 failures; it was **38**, because the triage counted the failures whose *message* named a
+type mismatch and the same root cause was also emitting `TypeMismatch` at validation, silent
+`assert_invalid` acceptances, and two wrong *encodings*.
+
+**The defect.** A concrete `(ref $t)` is a `ValType` carrying a **module-local type index**. Link
+matching compared two modules' expanded signatures with `std.mem.eql`, i.e. compared index numbers that
+mean different things on each side. ⚠️ **Wrong in BOTH directions, and the accept side is a soundness
+hole, not a conformance score:** `(ref $A)` at index 0 in one module and an unrelated `(ref $B)` at
+index 0 in another compared EQUAL, so an import linked to an export of a type it never agreed to and
+the guest received values it would read as something else. **Type confusion across a module boundary,
+reached by ordinary linking.**
+
+**The fix.** New `src/typematch.zig`: structural comparison walking both modules' type sections in
+step, under *iso*-recursive rules (§3.3.10) — the unit of identity is the rec group, and two types
+match only at the same position in equivalent groups. Equi-recursive comparison (unfold both to
+infinite trees) is the tempting simplification and is **too permissive**: it equates a self-referential
+group of one with a mutually referential group of two, which the spec keeps distinct. Import matching
+uses subtyping (§4.5.3); globals are invariant when mutable, table elements always, tags always.
+`Module` now keeps `rec_start`/`rec_len` and the type index of every function and tag — `Extern.func`
+kept only the expanded signature, and **a signature is not an identity**.
+
+**Three of the four defects were not "type comparison" at all**, which is why the estimate was low:
+
+1. **`call_indirect` compared signatures, not index subtyping.** §4.4.8 wants the entry's type to be a
+   *subtype* of the named one. Equality rejected valid calls; comparing signatures accepted invalid
+   ones — `(sub (func))` and `(sub final (func))` have identical params and results and are **different
+   types**, so a final type answered a call naming the extensible one and no trap fired.
+2. **The assembler dropped element-segment types.** Two of the eight elem encodings have `funcref`
+   baked in and carry no type byte (the func-index form's elemkind; flag 4). The assembler chose them
+   by *shape*, so any other element type was silently discarded and every
+   `(table (ref null $t) (elem $f))` rejected its own initializer.
+3. **Inline function types were identified with rec-group MEMBERS.** §6.6.12 allows only a singleton,
+   final, no-supertype type; `internSig` matched on params/results alone.
+
+⚠️ **A FOURTH producer/consumer blind spot** (after the data-count section, the `0x50` wrapper and the
+flattened rec groups above). Same shape every time: `wat.zig` dropped something, `Module.zig` did not
+require it, the round trip looked clean. The tally is now four in three days — treat "our assembler is
+not an oracle for our decoder" as a standing rule, not an observation.
+
+⚠️ **A CACHE KEY MUST NAME EVERYTHING THE ANSWER DEPENDS ON.** The matcher memoises rec-group pairs.
+Keyed on the two *start indices* alone it cached a statement about no particular modules, so one link's
+verdict was served to an unrelated later link — 32 import assertions flipped. **It was caught only
+because `imports.wast` regressed 5 → 21; every file R1 was aimed at improved either way.** A win in the
+target files is not evidence the change is correct — diff the WHOLE per-file summary, every run.
+
+⚠️ **`zig build test-security` cannot pass from this repo's cwd.** `D:` is **exFAT**, which has no
+symlinks, and those tests plant symlink fixtures under the cwd's `.zig-cache/tmp` — hence the step's
+"run from an NTFS cwd" note. Verified by running the same test binary from a `C:` cwd: 3/3 OK. **Not a
+regression, and not something to "fix" in `wasi.zig`.**
+
+⚠️ **THE SAME DEFECT WAS IN THE SHIPPED C ABI, AND ALMOST GOT WRITTEN OFF.** `capi.zig`'s
+`define_instance` path — one guest module's import bound to another's export — compared the two
+expanded signatures with `a != b`, i.e. exactly the module-local-index comparison this whole entry is
+about, in the path an *embedder* actually uses. It now goes through `typematch`. Two things about how
+it was found are worth more than the fix:
+
+- A first grep for `funcTypeEq|matchExtern|TypeMismatch` in `capi.zig` returned nothing, and that was
+  nearly recorded as "the C ABI does no import type checking at all". It does check — just under
+  different names, inline, with raw `!=`. **A grep for the names you expect finds the code you
+  expected to exist, not the code that is there.**
+- The path had **no behavioural test** (only a symbol-existence entry in `wazmrt_abi_symbols.c`), so
+  nothing would have caught either the original defect or a bad fix. A test now pins both directions:
+  the same type reached through a different index must LINK, and a different type at the same index
+  must be REFUSED. Verified discriminating by inverting the assertion and watching it fail — **a new
+  test that has never failed has not been shown to test anything.**
+
+## 🔗 ✅ Reference identity across a link — R2, FIXED 2026-08-13 (five causes, 44 failures)
+
+Triaged as 35 failures in `elem` / `linking` / `instance` / `linking0` / `linking3`; closing them
+took 44 out of the corpus (**237 → 193**, 61,152 → 61,187 passing, 2,649 → 2,637 skipped) because
+three of the five causes were also failing files nobody had attributed to R2. Programme state and the
+method lessons are in `roadmap.md` → "R2 IS DONE"; this entry is the defect record.
+
+**C1 — a `funcref` was a bare function index (17).** `interp.zig`'s `call_indirect` carried the
+comment `// funcref value = function index` and resolved it against `self.inst`. A funcref that
+crossed an instance boundary — a shared table, a `funcref` global, a param, a result — therefore
+named *a different function*: whatever sat at that index in the reader's module.
+
+- **It stayed self-consistent, which is why it read as correct.** `checkIndirectType` also read the
+  callee's type from the reader's module, so the type check agreed with the wrong function.
+- **It was reachable by ordinary linking**, not by anything adversarial: an imported table exists to
+  be written by one module and read by another.
+- The `linking.wast` `$Mt`/`$Ot` pair predicts six observations exactly under the hypothesis (Mt
+  reads slot 1 as its own `h` = −4, Ot reads slot 3 as its own imported `$h` = −4, …). Constructing
+  that prediction *before* touching the code is what identified the cause in one pass.
+- ⚠️ **The symptom was already written down as acceptable.** A comment in the active-element loop
+  described "the importer chooses the function indices, and the *owning* module reinterprets them"
+  as a consequence of a *rejected* module — the general defect was in the sentence and went unread.
+- Fix: `interp.Store` holds the instances that share reference values; a funcref is
+  `(slot+1)<<32 | func_index`. Slots are tombstoned on `deinit`, never reused, so a stale funcref or
+  an arbitrary integer from the C ABI is a clean `UndefinedFunc`, never a dangling pointer.
+  Cross-store linking is `error.CrossStoreLink`. Cross-instance `call_indirect` compares types
+  through `typematch`, as R1 made imports do.
+- ⚠️ **`Instance.init`/`initWithImports` are gone**, replaced by `instantiate`/
+  `instantiateWithImports` taking a destination pointer: an instance's ADDRESS is part of its
+  identity, and element segments create funcrefs naming it before instantiation returns.
+
+**C2 — an imported global was copied by value (1).** `Imports.globals: []const Value`, so a
+`(mut i32)` import was a snapshot and the exporter's `global.set` was invisible. `Instance.Global` is
+a shared cell now, like `Memory` and `Table` already were. ⚠️ **The C ABI had the same defect on a
+path the corpus does not reach**: `define_instance` read a published instance's global once at link
+time, commented as "a snapshot, which is what the ABI can carry". Same shape as R1's `define_instance`
+finding, one release later.
+
+**C3 — the §5.5.6 typed-table form did not decode (8).** `0x40 0x00 tabletype expr` gives a table an
+explicit initializer; `0x40` is not a valtype byte, so the whole form failed `BadValType`. It is the
+*only* way to declare a non-nullable element type — there is no null to start the slots from. Two
+more defects sat behind it: the active-elem/table type check compared families with nullability
+erased instead of subtyping (§3.5.11), and once that became real subtyping it rejected four valid
+modules because the decoder recorded elem forms 0–3 as `funcref` when §5.5.12 gives them `(ref func)`.
+⚠️ The type check carried a `Don't "fix" it again` retraction: right about the mechanism, wrong about
+the rule.
+
+**C4 — `(module definition)`/`(module instance)` unimplemented (8) — a HARNESS gap hiding a real
+defect.** `instance.wast` scored 0 passed / 8 failed / 12 skipped and *every* failure was the runner.
+With the commands implemented it read 10/2, and the 2 were genuine: `Exception.tag` was the throwing
+module's tag INDEX compared against the catching module's index. `instance.wast` imports one tag
+twice and throws with the second, catches with the first — one tag, two indices, no match, so the
+exception fell through to `catch_all`. **An exception routed to the wrong handler**, and `wast.zig`
+returned no identity at all for a tag import ("just a local identity in this module's tag index
+space"). Tags now carry a store-wide identity: defined tags get a fresh one, imported tags adopt the
+provider's. That also took `try_table` 6 → 4, `tag` 1 → 0, `legacy/try_catch` 1 → 0.
+
+**C5 — active data segments were applied before active element segments (1).** §4.5.5 runs the
+element inits (steps 9–12) before the data inits (13–14). A module with an out-of-bounds data segment
+aborted before its element segments ran, so entries the spec requires to persist in an imported table
+were never written (`linking0.wast` slot 7). `linking.wast` hid this: an earlier module had already
+written that slot, so the read looked right for the wrong reason. Second half: a
+partially-instantiated instance was thrown away, killing the funcrefs its segments had already
+stored. Instantiation is now `allocate` (§4.5.4) + `applyActiveSegments` (§4.5.5), and the store
+adopts an instance whose segment init traps. ⚠️ The first cut left the allocation errdefers in scope,
+so the same storage was freed twice — caught immediately by the existing "a rejected module cannot
+leave entries in another module's table" test.
+
+**Every fix has a `.wast`-level regression test, and the two most important were confirmed to FAIL
+against the restored old behaviour before being kept** — the funcref-in-a-table one, and the
+funcref-in-a-global one, which reproduced `elem.wast`'s `CallStackExhausted` symptom exactly.
+
+## 🚧 ✅ First-module failures that blacked out whole files — R10, FIXED 2026-08-13 (416 assertions)
+
+Nine core spec files failed on their FIRST module and took every remaining assertion into
+`NoTarget`. Thirteen failures, ~420 suppressed assertions, and +1,536 bytes to fix — the best ratio
+of the series. Programme state is in `roadmap.md` → "R10 IS DONE"; this entry is the defect record.
+
+**C1 — `extern.convert_any` / `any.convert_extern` existed only in constant expressions (172).**
+`validateConstExpr` and `evalConstExpr` both implemented `0xFB 0x1a`/`0x1b`; there was no `Op`, so a
+function BODY using one was `UnknownInstr` at the assembler and undecodable after it. `ref_test`,
+`ref_cast`, `br_on_cast`, `br_on_cast_fail` and `extern` all open with such a module. **A feature
+implemented for one of its two contexts reads as implemented.** The internal tags went in the
+unassigned `0x16`/`0x17` slots, so the raw-byte guard is now three ranges.
+
+**C2 — `br_table` carried a cross-label rule the spec does not have (161).** A "#2f" audit finding
+added a pairwise subtype check between each label and the default, reasoning that `popVals` cannot
+catch a mismatch once the stack is polymorphic. True, and beside the point: §3.3.5.9 wants one `[t*]`
+that is a subtype of every label's type, and after `unreachable` the stack supplies ⊥, which is a
+subtype of everything. `br_table.wast` names the case `meet-bottom` and requires it ACCEPTED.
+
+- ⚠️ **Deleted, not narrowed.** In reachable code the pops already catch a genuine mismatch, because
+  the first label leaves a concrete type the next label's pop must satisfy. What remains is the
+  Appendix algorithm verbatim: arity equality plus `push_opds(pop_opds(label_types(l)))`.
+- ⚠️ **A unit test encoded the invented rule** and had to be inverted with the code. Its comment
+  claimed the check "never rejects a valid subtyped `br_table`".
+
+**C3 — `popVals` + `pushVals` is not `push_opds(pop_opds(…))`.** The probe pops ⊥ and pushes back
+CONCRETE declared types, so probing label 0 poisoned label 1's probe — `meet-bottom` then failed
+"expected f64, found f32" for a second, different reason. `popPushVals` puts back what it took.
+
+**C4 — flat `else $l` / `end $l` unconsumed (5).** §6.5.2 lets a block's label be repeated at its
+`else`/`end` as a redundancy check. Unconsumed, the id was assembled as the next instruction and came
+back `UnknownInstr` naming a label, killing `stack.wast`. It is now consumed *and verified against
+the open block*, which is the only reason the form exists.
+
+**C5 — `br_on_non_null` popped the label's types wholesale (33).** The label's last type is the
+non-null `(ref ht)` and the operand is `(ref null ht)`, so popping `lt` asked the stack for the
+non-null form — "expected anyref_nn, found anyref" — and rejected the canonical idiom the
+instruction exists for. Two files.
+
+**C6 — `br_on_cast_fail` carried `src` instead of `src \ dst` (25).** With a NULLABLE target a null
+matches and takes the fall-through, so the value reaching the label is non-null. The subtraction was
+already implemented eleven lines below, for br_on_cast's fall-through — **the same rule applied to
+one of the two paths that need it.** `br_on_cast_fail.wast` names the case `null-diff`.
+
+**Also fixed: `nullexnref` was modelled as `nullref`**, the ANY-family bottom. Harmless until
+`(ref.null noexn)` started decoding to the exn head, at which point the two spellings of one type
+disagreed and `(global $nullexn nullexnref (ref.null noexn))` was a `TypeMismatch` against itself.
+
+**Residue (32 assertions), diagnosed and left:** `ref_null.wast` 27 needs distinct BOTTOM types —
+we fold `nullfuncref`/`nullexternref` onto `funcref`/`externref`, losing the bottom-ness that lets
+them flow into a concrete `(ref null $t)`, and fixing it is a `types.zig` lattice change with wide
+blast radius. `id.wast` 5 is a lexer gap on exotic and quoted identifiers.
+
+## 📜 ✅ The runner could not build a quoted module — R5, FIXED 2026-08-13 (1,291 assertions)
+
+A single `return error.BadCommand` in `wast.zig`'s `moduleBinary`, commented
+`// (module quote …) not supported yet`, was suppressing **1,291 assertions — more than half of every
+skip in the suite**. A `(module quote "…")` gives the module as SOURCE TEXT, which is how the spec
+tests anything about text: malformed literals, bad tokens, invalid names. Programme state is in
+`roadmap.md` → "R5 IS DONE"; this entry is the defect record.
+
+- The fix is small: concatenate the string pieces (the lexer has already resolved escapes to bytes,
+  so `"\80"` really is byte 0x80 — the point of the whole UTF-8 corpus), wrap in `(module …)` unless
+  the text already opens one, and assemble.
+- ⚠️ **The wrapping test has to be exact.** Wrapping an already-complete module yields
+  `(module (module …))`, which fails to assemble — and would then score a malformed module as
+  correctly rejected **for the wrong reason**. Same false-pass shape as R4's `StackUnderflow` case,
+  which is why the check looks for `(module` followed by a delimiter rather than a bare `startsWith`.
+- `assert_exception` was skipped as an unknown keyword too — 41 assertions across `throw.wast`,
+  `throw_ref.wast`, `try_table.wast` and the legacy EH files, i.e. exactly the ones that check
+  exceptions ESCAPE.
+
+**R8 was a subset of this and was filed as its own item.** `utf8-invalid-encoding.wast` is 176
+`assert_malformed (module quote …)`; all 176 now run and **pass**. UTF-8 name validation was correct
+all along and had simply never been executed — the item's own question ("is the skip the runner's gap
+or ours?") had the right shape and the answer was "the runner's".
+
+**What it revealed is larger than what it fixed: 215 accept-invalids in the WAT assembler**, the
+class R4 had just closed for the binary decoder, in a surface nothing could previously reach.
+~146 are fixed here because they are one theme:
+
+- **`std.fmt.parseInt`/`parseFloat` were being used as the wasm literal grammar.** Zig accepts `_`
+  where wasm forbids it (`0x_100`, `0x00_`, `0xff__ffff` — the separator must sit *between* digits)
+  and `parseFloat` takes a leading-point form (`.0`, `.0e0`) that wasm requires a digit before.
+  Replaced by `validIntLit`/`validFloatLit` over §6.3.1.
+- **Out-of-range constants were silently TRUNCATED.** `i32.const 0x100000000` compiled to `0`;
+  `v128.const i8x16 0x100 …` to sixteen zero bytes; `f32.const 0x1p128` to `+inf`. These are wrong
+  VALUES from source that looks fine, not merely missed assertions. Each `v128` lane is now bounded
+  by its own width, and a float literal that rounds to infinity is refused unless it *is* `inf` —
+  a guard that, written as a bare `isInf`, rejects `inf` itself.
+- **A bare `-nan` lost its sign bit** (applied only on the `nan:…` path). NaN sign is observable via
+  `reinterpret`/`copysign`, so this was a wrong value too; it had been failing since before R5.
+- **`(f32.const nan:arithmetic)` assembled.** Those two spellings are result MATCHERS for an
+  assertion, never values in a module; `wast.zig` recognises them itself because it must compare a
+  *class* of NaNs rather than a bit pattern.
+
+**The remaining 88 are R9** — see `roadmap.md`. They are core-file accept-invalids in the text front
+end: type-use ordering (35), token separation (15), SIMD lanes (8), and a spread of ~30.
+
+## 🛡️ ✅ Accept-invalid in core spec files — R4, FIXED 2026-08-13 (five causes, core class now ZERO
+## when measured through the paths the corpus could then reach — see R5 above, which found 88 more)
+
+The class the whole T1 → R4 arc was about: modules the spec calls invalid that wazmrt accepted and
+would then happily execute. **Every one in a core spec file is closed.** Programme state and the
+method lessons are in `roadmap.md` → "R4 IS DONE"; this entry is the defect record.
+
+**C1 — a table with a non-defaultable element type and no initializer (5).** `(table 0 (ref func))`
+declares slots that have no starting value, and no length saves it: even at 0 entries `table.grow`
+would have to invent one. Unchecked. **And the exemption was unchecked too** — a table using
+§5.5.6's `0x40` initializer form could name a const-expr of any type, with only the interpreter
+finding out at instantiation.
+
+- ⚠️ **Why it was invisible: the assembler erased the distinction.** `(table N reftype initexpr)` was
+  lowered to a synthetic active element segment of N copies of the initializer, recorded at the site
+  as safe because the resulting table state is observably identical and the `0x40` encoding "is not
+  required for the execution assertions". The state is identical; the module is not. A table with an
+  initializer and a table with an element segment differ in precisely the property the rule needs.
+  The assembler now emits the real form, and the N-copy allocation (plus the
+  `max_table_init_copies` cap that existed only to bound it) is gone.
+
+**C2 — `try_table` catch labels resolved one frame too deep (3, plus 1 false reject).** A catch
+clause's label indexes the try_table's ENCLOSING scope (EH proposal §3.4 validates the catches in
+`C`, only the body in `C, labels [t2*]`). `wat.zig` pushed the try_table's label before resolving
+catch targets, `validate.zig` resolved them after `pushCtrl`, and `interp.zig` branched to
+`d + c.label`.
+
+- ⚠️ **All three were wrong in the same direction, so they agreed and the corpus was green.** This is
+  the producer/consumer blind spot with three parties instead of two, and no test could have found it
+  — the round trip is self-consistent. Only the spec rule exposes it.
+- ⚠️ **It produced an accept-invalid and a false reject simultaneously.**
+  `(func (result exnref) (try_table (catch 0 0)) (unreachable))` was accepted (label 0 is really the
+  function block `[exnref]`; a plain `catch` delivers `[]`), and
+  `(func (result exnref) (try_table (catch_ref $e 0)) …)` was rejected (the same label fits exactly).
+- Fixing it required updating six in-repo tests that encoded the old convention — four hand-built EH
+  binaries and two WAT modules.
+
+**C3 — a block type naming an out-of-range type index (2).** `(block (result (ref 1)))` in a module
+with one type must be "unknown type". `readBlockType` could not decode the canonical multi-byte
+valtype (`0x63/0x64 heaptype`), so the assembler interned a function signature and emitted a type
+INDEX instead — **manufacturing index 1 as the block's own signature**, self-referentially, which
+made the module valid. Both halves are canonical now; `BlockType` gained a `.ref` variant because the
+decoder cannot resolve a concrete heap type to its family head without the module's kinds.
+
+- ⚠️ **The `if` form of the same test was already "passing" — for the wrong reason.** It failed
+  `StackUnderflow` on an unrelated malformation, scoring as a correct rejection. A negative assertion
+  satisfied by the wrong error is a false pass, the same family as `isOurLimitation`.
+
+**C4 — an imported tag's result type unchecked (1).** The tag-section walk iterated `module.tags`,
+which is the DEFINED tags only; imported tags lead the index space. Half a space is not a space —
+the same shape as the imported/defined splits in the funcref and global work.
+
+**C5 — the start function treated as declaring a `ref.func` (1).** §3.5.1 builds `C.refs` from
+`funcidx(module with funcs = ε with start = ε)`: `start` is erased along with the function section,
+so "the module runs it" does not double as "the module may take its address".
+
+- ⚠️ **The wrong rule was written down three times** — in the code, in the comment above it ("a
+  global initializer, an element segment, an export, **or the start function**"), and in a unit test
+  asserting the start case valid under the heading "each of the four declaring positions". There are
+  three. A test that restates the code's misreading is not evidence.
+
+**Two more, found after the five landed, both false rejects.** `exnref_nn` was defined in `types.zig`
+and taught to `opcode.readBlockType` but never to `Module.readValType`, so `(ref exn)` worked as a
+block type and was `BadValType` in every other position; and `checkCatch` compared the materialized
+exception reference as the nullable `exnref` when `catch_ref` produces a non-null `(ref exn)`. Fixing
+the first only changed the second's error message — **a failure's cause count is not known until it
+passes**, third pass running.
+
+## 🧮 ✅ GC array bulk ops — R3, FIXED 2026-08-13 (six ops missing, 225 assertions unblocked)
+
+Triaged as "four ops absent from `opcode.zig`, ~10 failures". It was **six** ops and 16 failures, and
+the failure count was the least interesting number in the item. Programme state and the method
+lessons are in `roadmap.md` → "R3 IS DONE"; this entry is the defect record.
+
+**The six.** `array.new_data` (`0xFB 0x09`), `array.new_elem` (`0x0a`), `array.fill` (`0x10`),
+`array.copy` (`0x11`), `array.init_data` (`0x12`), `array.init_elem` (`0x13`). `array.fill` and
+`array.copy` were never named in the triage because their files died on the first instruction and
+reported one failure each having run **nothing**.
+
+**Where they died was the ASSEMBLER, not the decoder.** Every failure message read `UnknownInstr`,
+which `wat.zig` raises — the `.wast` corpus reaches the decoder only through the text path. The item
+was filed against `opcode.zig` (correctly, as the root) but the *observable* was one layer up. Same
+producer/consumer pair as the four incidents in the section below, in the direction that is easier to
+miss: the emitter had no rule because the op did not exist.
+
+**Three semantic traps the ops themselves carry.**
+
+- ⚠️ **`array.new_data`'s two operands are in different units** — offset in *bytes*, size in
+  *elements* — so the segment bound is `offset + size × width`. Unscaled, a 12-byte segment would
+  serve twelve `i32`s: **36 bytes past the end**, on a path the unvalidated runner also uses.
+- ⚠️ **`array.copy` may name the same array twice**, so it is `memmove`. Every non-overlapping case
+  passes with a forward copy; a backward overlap smears one element across the range.
+- ⚠️ **`array.copy`'s element check cannot compare `unpacked()` types.** Packed `i8` and plain `i32`
+  both project `i32` onto the operand stack, so the projection says `(array i8)` and `(array i32)`
+  are compatible — and the copy then moves values between different storage widths. Storage forms are
+  compared first, and only then value-type subtyping.
+
+**Two defects found INSIDE the R3 files that were not R3.** ("A failure's cause count is not known
+until it passes" — twice in one item.)
+
+1. **`isRefType` (assembler) listed only `funcref`/`externref`** while `shorthandRefType`, twenty
+   lines away, held all ten abstract heads. `(elem $e i31ref …)` therefore fell through to the
+   func-index form and read `i31ref` as a function name → `BadImmediate`, three steps from the cause.
+   Deduplicating onto `shorthandRefType` closed **R6 entirely** (`i31.wast` 8 → 0) and took
+   `br_on_cast`/`br_on_cast_fail` 5 → 2 (core) and 6 → 3 (`custom-descriptors`).
+2. **`call_indirect $t` with no type annotation would not assemble.** The table index was consumed
+   only if a `(type …)`/`(param …)`/`(result …)` followed, but the type use is optional (absent =
+   `[] -> []`), so `(call_indirect $t (i32.const 0))` left `$t` to the operand loop, which tried to
+   assemble a *table name* as an instruction → `UnknownInstr`. `isIndexAtom` is the correct
+   predicate, and the flat `br_table` fix had already learned this.
+
+**🔴 An accept-invalid found by reading, not by a test: a raw `0xC5` byte executed as
+`i32.trunc_sat_f32_s`.** Found while looking for free `Op` values. `0xc5..0xcc` are internal tags for
+the saturating-truncation ops (real wire form `0xFC` + sub-opcode), and `immediateKind` classifies
+`0x45...0xcc` as `.none`, so eight bytes that are **not wasm opcodes at all** decoded and executed as
+real instructions. The guard that exists precisely to stop this covered `0xd7..0xfa` only — the range
+its author was debugging — and `0xc5..0xcc` already existed when it landed. Now two ranges,
+`0xc5..0xcf` and `0xd7..0xfa`, because `0xd0..0xd6` are genuine single-byte ops in between; the
+regression test asserts both the rejections and the acceptance of `0xc0..0xc4` and `0xd0..0xd6` on
+either side.
+
+**Tests.** Six in-repo tests (`wat.zig`, `opcode.zig`) rather than corpus-only, because the `.wast`
+suite lives on removable media and cannot gate a commit. Three were confirmed to FAIL against
+deliberately broken implementations — width scaling removed, `memmove` reduced to `memcpy`, the
+packed-storage comparison disabled — before being kept.
 
 ## 🧾 ABI-2 build (2026-08-11) — bugs and near-misses found while replacing the C ABI
 
@@ -365,7 +917,171 @@ Measured against the real `.wat` corpus at `wasmtk/tests` (**493 files**): assem
 - **The memory-index immediate was emitted as 0 WITHOUT being read**, so `(memory.size 7)` and
   `(memory.size $nope)` ran against memory 0 — the sole silent acceptor among index spaces. Now: unknown
   name → `UnknownIdentifier`, non-zero index → `UnsupportedInstr`.
-- **`anyfunc`** (pre-standard spelling of `funcref`) accepted; assembles byte-identically.
+- ✅ **CLOSED 2026-08-14 — references cross the C ABI as HANDLES now, like every other value kind.**
+  `Store.ext_refs` interns the internal value; the host gets `(store_id << 32) | (slot+1)`, with
+  **null as handle 0** so a `memset`-zeroed `wazmrt_val_t` is null by construction. An inbound
+  handle is looked up and **refused if this store did not issue it** — never reinterpreted.
+  `wazmrt_ref_is_valid` completes the set beside the instance/func/memory/global checks.
+  **Boxing is complete rather than best-effort because the ABI has no API for a host to CREATE a
+  reference**: every handle an embedder holds came from a guest value crossing the boundary, so an
+  unknown one is unambiguously an error. That fact is also what dissolved the objection this entry
+  was parked on — there is no "host-invented value" case to round-trip.
+  ⚠️ **The real argument was never the security one.** The header promised *"opaque to the host"*
+  while handing over the interpreter's private encoding: bit 63 an i31, bit 62 a host reference,
+  all-ones null, a structured high half an (owner, index) pair. **An undocumented forbidden value
+  space is an interop bug before it is a security one**, and there was no `is_valid` for refs as
+  there was for everything else. The ABI already boxed instances, funcs, memories and globals —
+  refs were the one kind left out, *the same enumeration failure as R2 converting only funcrefs*.
+  Verified in `tests/capi_smoke.c` (a reference round-trips unchanged; an invented handle is
+  refused), because this is the surface the corpus cannot reach — R1's lesson.
+  Size: **+0 exe / +828 lib / +1,024 dll** — nothing in the CLI, which never crosses a reference
+  through the C ABI. *(Original report:)*
+  **Surfaces when:** an embedder passes a `WAZMRT_EXTERNREF` value it invented (a small integer
+  handle, the natural choice) into a guest that does `any.convert_extern` and then
+  `ref.test`/`ref.cast`/`struct.get`.
+  **What it is:** the runtime's `any`-hierarchy value space is `null_ref` | i31 (bit 63) | **GC heap
+  index**. S1 added `interp.host_tag` (bit 62) and applies it in `wast.zig`'s `internExtern`, which
+  closed the whole class for the corpus — but `capi.zig`'s `valToSlots` still does
+  `.funcref, .externref => slots[0] = v.of.ref`, a raw pass-through, and `wazmrt.h` invites exactly
+  that (*"opaque to the host: pass it back unchanged"*). A host value of `2` therefore internalizes
+  to GC object #2. `gcObject` bounds-checks, so a LARGE value is a clean `GcOutOfBounds`; a small
+  one is inside the heap and `ref.cast` succeeds against a real object.
+  **Why it is not fixed here:** the fix is to BOX — intern the host's `u64` into a tagged handle on
+  the way in and unbox on the way out, which is invisible to a host that only passes values back
+  (the documented contract) and is what `internExtern` already does for the runner. But it changes
+  what a `wazmrt_val_t` externref *is*, needs a per-store intern pool with a cap (cf.
+  `max_gc_objects`), and must not break a host passing back a value the GUEST produced
+  (`extern.convert_any` of a struct) — that one has to round-trip as the same reference. **Changing
+  a shipped ABI's value model is an owner decision, not a conformance-pass side effect.**
+  ⚠️ **This is the R1 shape for the third time: the defect existed in both the interpreter and the
+  C ABI, the corpus could only ever see the interpreter half, and fixing that half does not sweep
+  the other.** Do not read "S1 closed 12 failures" as "the class is closed".
+
+  **↳ RESEARCH, 2026-08-14 — what the sibling projects do, read from their code, not assumed:**
+  - **`wasmtk` does not use `externref` AT ALL.** One mention in the whole repo (`src/utils.ts`), an
+    entry in a **binaryen type-ID table**, and `getTypeName` does not even map it — it falls through
+    to `"unknown"`. wasmtk runs wasm via `WebAssembly.instantiate` (V8) with i32 offsets into linear
+    memory through the bindgen codegen. **The primary consumer is indifferent to this decision.**
+  - **`wasmrt` has the IDENTICAL design** — `WASMRT_EXTERNREF = 5 /* likewise */` with the same
+    *"opaque to the host: pass it back unchanged"* wording, and `Value::from(v.of.ref_)`, a raw
+    pass-through. Its `ref_matches` is structurally identical to wazmrt's pre-S1 version: null →
+    nullable, `I31_TAG` → i31, else `store.gc_heap.get(idx)`. **No host tag.**
+  - ⚠️ **But `wasmrt` does not implement `any.convert_extern` / `extern.convert_any` at all** (empty
+    grep across `wasmrt-core`), so the collision is present in its DESIGN and not reachable in its
+    behaviour. **wazmrt did not introduce the flaw — R10 made the shared flaw reachable** by
+    implementing those two ops (they had existed only in const-exprs). wasmrt inherits the reachable
+    version the moment it implements them, which its "full browser-standard parity" scope requires.
+  - **No consumer needs externref today.** The `universalWasmLoader-*` family reads guest memory
+    through a caller handle (`wasmtime_caller_export_get` + `memory_data`) — i32 offsets, not
+    externrefs. `wasmrt/cmem/known-issues.md` already reasons this way about wazmrt's deferred
+    externref residual: *"likely moot: none of the loaders need them."*
+  - **Consequence for sequencing:** this is a TWO-PROJECT representation decision, not a wazmrt bug
+    fix. The `wasmrt_*` alias header exists so a consumer can A/B the engines by swapping a DLL, so
+    boxing in one and not the other makes the two surfaces differ semantically. Best taken in both
+    at once, and *before* wasmrt implements the convert ops — otherwise wasmrt ships the reachable
+    bug and the surfaces diverge under pressure rather than by design.
+
+- ✅ **FIXED 2026-08-14 — a GC reference crossing an INSTANCE boundary read the wrong object.**
+  A GC reference is now `gcRefValue(owner_slot, index)` — R2's entity model applied to the `any`
+  hierarchy — resolved through `Store.resolveGc` at every access. **+452 bytes** (lib), and the
+  corpus is byte-identical (62,889 / 104 / 951) because it barely crosses GC references between
+  instances, which is why nothing caught this for months. Regression tests:
+  `tests/gc_cross_instance_repro.wast` (9 assertions) and an in-repo `wast.zig` test, the latter
+  because the `.wast` corpus lives on removable media and cannot gate a commit.
+  ✅ **AND THE RESIDUAL IS CLOSED TOO (same day) — a store-wide `TypeRegistry`.** The fix above left
+  concrete `(ref $t)` against a FOREIGN object as a deliberate loud false negative, because the
+  indices mean different things in the two modules (R1) and deciding it needed `typematch`, which
+  needs an allocator `refMatches` lacks on the cast path. Rec groups are now **interned as each
+  module joins the store** — content-addressed, with outside references keyed by their
+  already-assigned store id (available because groups intern in index order and outside refs point
+  strictly backwards, which `Module.checkTypeRefScope` already guaranteed). A cross-module cast is
+  an integer compare plus a supertype walk; the structural work happens once, at instantiation.
+  ⚠️ **The key must reference outside groups by ID, never inline them** — inlining is the obvious
+  way to make keys self-contained and blows up exponentially on chained groups, a DoS surface on
+  exactly the untrusted path. ⚠️ **And it must still REFUSE a structurally different type**: the
+  regression test pins both directions, because replacing a false negative with a false positive is
+  R1's failure mode and the dangerous one. Cross-module declared subtyping travels too.
+  ⚠️ **Startup cost: none measurable (+0.01 ms median), and the first measurement said +40%** — see
+  `best-practices.md` on interleaving A/B runs.
+  *(Original report:)*
+  **Surfaces when:** two linked instances pass a `structref`/`arrayref`/`anyref` between them — an
+  exported global, a shared `anyref` table, or a call parameter.
+  **What it is:** a GC reference value is a **bare index into the READER's per-instance
+  `gc_heap`** (`interp.zig` — `Instance.gc_heap`, by design, `design-decisions.md` §2b). It carries
+  no owner identity, so the reader indexes *its own* heap with a foreign index. Reproducer, run
+  through the `.wast` runner:
+
+  ```
+  (module $A (type $ta (struct (field i32)))
+    (global (export "g") anyref (struct.new $ta (i32.const 111))))
+  (register "A" $A)
+  (module $B (type $tb (struct (field i32)))
+    (global $fromA (import "A" "g") anyref)
+    (global $mine (mut anyref) (ref.null any))
+    (func (export "seed") (global.set $mine (struct.new $tb (i32.const 222))))
+    (func (export "readA") (result i32)
+      (struct.get $tb 0 (ref.cast (ref $tb) (global.get $fromA)))))
+  (assert_return (invoke $B "seed"))
+  (assert_return (invoke $B "readA") (i32.const 111))   ;; -> got 222
+  ```
+
+  ⚠️ **The `ref.cast` SUCCEEDS.** `refMatches` reads the object's type index out of the reader's own
+  heap entry and checks it against the reader's own `comp_types`, so it is self-consistent and
+  cannot notice the substitution. **A check that reads the same wrong table as the thing it checks
+  is not a check** — R2's C1 said this about `checkIndirectType` and funcrefs, in almost these
+  words. This is that bug for the `any` hierarchy.
+  **Severity, stated precisely:** *not* memory unsafety — both `gcObject` and `refMatches` bounds-check,
+  so an index past the reader's heap is a clean trap or a false `ref.test`. It is **reference
+  substitution**: the guest silently gets a different, validly-typed object. That breaks the GC
+  proposal's core guarantee (references are unforgeable and identity-preserving) across a module
+  boundary, and it is a *wrong answer*, which this codebase ranks above a crash.
+  **Why the corpus never caught it:** the spec suite crosses GC references between instances almost
+  nowhere, and `i31` — the one GC reference it does pass around — is TAGGED (bit 63) and therefore
+  immune. The failure needs a heap object, two instances, and the reader holding an object at the
+  same index.
+
+  ⚠️ **THESE TWO ENTRIES ARE ONE DESIGN ISSUE, and that is the useful framing.** wazmrt's
+  `any`-hierarchy value space is `null_ref` | i31 (bit 63) | *everything else*, and "everything
+  else" is a bare `usize` with no kind and no owner:
+
+  | value | tagged? | owner-scoped? | status |
+  | --- | --- | --- | --- |
+  | `i31` | yes (bit 63) | n/a (immediate) | fine |
+  | host `externref` | **since S1** (bit 62) | n/a | fixed in the runner; **raw at the C ABI** |
+  | GC heap object | **no** | **no** — per-instance index | **broken across instances** |
+  | `funcref` | n/a | **yes** — store slot, biased by 1 | fixed by R2 |
+
+  **R2 already solved this exact problem for funcrefs**: a reference value names an ENTITY, not an
+  index, and the entities live in an `interp.Store` shared by everything linked together
+  (`design-decisions.md`, invariant 1). GC objects never got the same treatment. **The principled
+  fix is one change, not two** — give `any`-hierarchy references the same owner-carrying encoding,
+  which subsumes the externref question because a host value then simply is not one of them.
+- **The LEGACY bare memory/table index in a segment** — `(data 0 (i32.const 10) "…")` and
+  `(elem 0 (i32.const 1) $f $g)`, the pre-bulk-memory / pre-reference-types spellings of
+  `(data (memory 0) …)` / `(elem (table 0) …)`. Accepted deliberately (R7, 2026-08-14), because the
+  era-pinned `proposals/threads` corpus writes them and refusing would leave six assertions failing
+  either way. ⚠️ **Bounded so it cannot loosen anything else: a bare index is a memuse/tableuse ONLY
+  when an offset form immediately follows it.** An offset is always a list and data bytes are always
+  strings, so no modern spelling collides, and a passive `(elem 0 $f)` is untouched. ⚠️ **The reason
+  this had to be fixed rather than merely rejected: unrecognised, the data form did not fail — the
+  index and the offset were both dropped and the segment assembled ACTIVE-in-source /
+  PASSIVE-in-binary.** Unlike `anyfunc` below, no spec assertion contradicts this one, so the
+  legacy spelling is still accepted: a pre-standard form is only a deviation once the suite says so.
+- **`anyfunc` — CLOSED 2026-08-17. wazmrt now REFUSES it, and has zero deliberate spec
+  deviations.** It used to assemble byte-identically to `funcref`; `obsolete-keywords.wast` L40
+  (`(global $g anyfunc (ref.null func))`) asserts the module is malformed, which made this the last
+  accept-invalid in any core spec file. The owner took the trade. Refusal is `error.ObsoleteKeyword`
+  — a DEDICATED error, not `BadValType`, so the message can name `funcref`: the input is legacy, not
+  nonsense, and the compatibility hint survives even though the acceptance does not. Cost paid: the
+  two MVP-era inputs that motivated it (`ArtOfWebAssembly_tests/Chapter3/table_export.wat` and
+  `table_test.wat` in the wasmtk corpus) now need `funcref`; they sit in an optional corpus that no
+  `zig build` step gates, which is what made the trade cheap — **check whether a compatibility
+  affordance is actually load-bearing before pricing its removal.**
+  ⚠️ **`isRefType` still answers TRUE for `anyfunc`, deliberately.** Returning false routes
+  `(table 4 anyfunc)` down the func-index path, where `anyfunc` parses as a function NAME and fails
+  as `UnknownIdentifier` — which `wast.zig` banks as OUR limitation. The deviation would have come
+  back disguised as a SKIP and the baseline would have gone green for the wrong reason. **A rejection
+  has to be routed to the code that knows WHY, or it lands in the wrong bucket.**
 - **Legacy folded `try`/`catch` — assembler AND validator.** The interpreter has executed legacy
   (older-LLVM) EH since Phase 6.3, but the assembler had no text form for it (`(try (do …) (catch $t …)
   (catch_all …))` was `UnknownInstr`) and the VALIDATOR had no arms for `try_`/`catch_`/`catch_all`/

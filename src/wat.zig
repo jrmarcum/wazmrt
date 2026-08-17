@@ -39,6 +39,11 @@ pub const Error = sexpr.Error || error{
     NotAModule,
     BadModuleField,
     BadValType,
+    /// A pre-standard spelling the spec renamed and now calls MALFORMED —
+    /// `anyfunc` for `funcref` (spec PR #1157). Distinct from `BadValType` so
+    /// the refusal can name the modern spelling instead of just "bad type":
+    /// the input is legacy, not nonsense, and the fix is one word.
+    ObsoleteKeyword,
     UnknownInstr,
     UnknownIdentifier,
     BadImmediate,
@@ -46,6 +51,18 @@ pub const Error = sexpr.Error || error{
     /// An `import` (top-level or inline) after a func/table/memory/global
     /// definition — malformed: imports must precede all definitions (§6.6.13).
     ImportAfterDefinition,
+    /// §6.6.13 — two identifiers bound in the same index space (or two locals,
+    /// or two fields of one struct). Malformed, not invalid: nothing downstream
+    /// can see it, because the binary format has no names at all.
+    DuplicateName,
+    /// Syntax wazmrt RECOGNISES as belonging to a wasm proposal it does not
+    /// target — today only `(memory … (pagesize N))` (custom-page-sizes).
+    ///
+    /// Distinct from `BadModuleField` on purpose. The module may be perfectly
+    /// valid under its proposal, so refusing it is *our* gap, not a verdict on
+    /// the module; `wast.zig`'s `isOurLimitation` therefore scores it as a SKIP
+    /// rather than banking it as a conformance pass.
+    UnsupportedProposal,
 } || std.mem.Allocator.Error;
 
 // --- Shape-checked s-expression accessors -----------------------------------
@@ -68,11 +85,13 @@ fn wantStr(s: Sexpr) Error![]const u8 {
     };
 }
 
-/// Cap on the synthesized element copies for `(table N reftype initexpr)`. `N`
-/// is attacker-written text and each copy is an `Sexpr`, so an unbounded `N`
-/// turns 48 bytes into a request for tens of GB. 2^20 entries is far beyond any
-/// real table literal.
-const max_table_init_copies: u32 = 1 << 20;
+// A `max_table_init_copies` cap lived here: `(table N reftype initexpr)` used to
+// synthesize N copies of the initializer as an active element segment, so an
+// attacker-written `N` turned 48 bytes of text into a request for tens of GB.
+// R4 (2026-08-13) emits §5.5.6's `0x40` form instead — one initializer, no copies
+// — so both the amplification and the cap that contained it are gone. **The best
+// bound on an allocation is not needing it.**
+
 /// The i-th element of a form, or `error.BadModuleField` if the form is too short.
 fn nth(items: []const Sexpr, i: usize) Error!Sexpr {
     return if (i < items.len) items[i] else error.BadModuleField;
@@ -125,6 +144,18 @@ const Sig = struct {
     /// function section point at a non-func type (`BadType` at decode). It only
     /// worked when a real `(func)` type happened to be declared first.
     gc_placeholder: bool = false,
+    /// May an INLINE function type (`(func $f (param i32))`, a `call_indirect`
+    /// with no `(type …)`) be identified with this declared type?
+    ///
+    /// §6.6.12 says only when the type forms its own rec group of one, final and
+    /// with no supertype — because that is exactly the type the abbreviation
+    /// stands for. `internSig` matched on params/results alone and so handed an
+    /// inline type the index of a MEMBER OF A REC GROUP, which is a different
+    /// type: `(rec (type $ft (func)) (type (struct)))` then accepted
+    /// `(global (ref $ft) (ref.func $f))` for a plain `(func $f)`, three
+    /// accept-invalids in `type-rec.wast`. Types interned by `internSig` itself
+    /// are singletons by construction and keep the default.
+    implicit_reusable: bool = true,
 };
 
 /// A GC struct field / array element (assembler side): storage type + mutability.
@@ -135,14 +166,27 @@ const GcField = struct { storage: GcStorage, mutable: bool };
 /// their fields here. Interned block-type/func sigs (beyond the named types)
 /// are implicitly `.func`.
 const GcTypeDef = union(enum) { func, @"struct": []const GcField, array: GcField };
-const TableDef = struct { min: u32, max: ?u32, elem: V = .funcref };
+/// `min`/`max` are `u64` and `is64` records the index type: a 64-bit table
+/// (table64) may declare limits past `u32`, exactly like a 64-bit memory.
+/// `init` is `(table N reftype initexpr)`'s explicit initializer, emitted as
+/// §5.5.6's `0x40 0x00 tabletype expr` form. It is the ONLY way a table with a
+/// non-nullable element type can have a starting state, which is why the
+/// validator can require one.
+const TableDef = struct { min: u64, max: ?u64, elem: V = .funcref, is64: bool = false, init: ?Sexpr = null };
 /// An element segment. `funcs` (func-index form) OR `exprs` (const-expr form) —
 /// exactly one is non-empty. `offset` applies only to active segments.
 const ElemDef = struct {
     mode: enum { active, passive, declarative },
     table_index: u32,
-    /// Offset const-expr form for active segments (null → implicit `i32.const 0`).
+    /// Offset const-expr form for active segments (null → an implicit zero).
     offset_form: ?Sexpr,
+    /// Index type of the target table, for the IMPLICIT offset only — a 64-bit
+    /// table's offset is `i64.const 0`, not `i32.const 0`. Only the
+    /// `(table i64 reftype (elem …))` abbreviation can reach this: every written
+    /// offset carries its own type. Emitting the i32 form against an i64 table
+    /// is a `TypeMismatch` at validation, which is what `call_indirect64.wast`
+    /// hit the moment the table itself started assembling.
+    is64: bool = false,
     elem_type: V,
     expr_form: bool,
     funcs: []const Sexpr,
@@ -154,7 +198,7 @@ const ElemDef = struct {
 const GlobalDef = struct { valtype: V, mutable: bool, init: []const Sexpr };
 /// An imported global (`(global (import "m" "n") type)`).
 const ImportedGlobal = struct { module: []const u8, name: []const u8, valtype: V, mutable: bool };
-const ImportedTable = struct { module: []const u8, name: []const u8, min: u32, max: ?u32, elem: V };
+const ImportedTable = struct { module: []const u8, name: []const u8, min: u64, max: ?u64, elem: V, is64: bool = false };
 const ImportedMemory = struct { module: []const u8, name: []const u8, min: u64, max: ?u64, shared: bool = false, is64: bool = false };
 const ImportedTag = struct { module: []const u8, name: []const u8, sig: u32 };
 
@@ -208,6 +252,9 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // Declared supertype (`(sub $super …)`) of each named type, or null; resolved
     // against `type_names` at type-section emission.
     var gc_supers: List(?Sexpr) = .empty;
+    // Whether each named GC type is FINAL (closed to extension) — true unless
+    // the source wrote `sub` without `final`. Index-aligned with `gc_supers`.
+    var gc_finals: List(bool) = .empty;
     var globals: List(GlobalDef) = .empty;
     var global_imports: List(ImportedGlobal) = .empty;
     var table_imports: List(ImportedTable) = .empty;
@@ -241,23 +288,52 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // field/param may forward-reference a later type, e.g. within a `(rec …)`
     // group — the assembler emits them ungrouped, the decoder flattens the same).
     var type_forms: List([]const Sexpr) = .empty;
+    // Size of each declared type group, in order — 1 for a standalone `(type …)`.
+    //
+    // ⚠️ **The grouping is part of the TYPE, not layout.** Two types are the same
+    // only if their whole rec groups are isomorphic *and* they sit at the same
+    // position, so `(rec (func) (struct))` and `(rec (struct) (func))` define
+    // four distinct types. We flattened `(rec …)` away here and emitted the
+    // members ungrouped, which silently rewrote the module into a different one
+    // — every member became its own singleton group, and structurally identical
+    // members then collapsed together. `type-rec.wast` catches it five ways.
+    var rec_sizes: List(u32) = .empty;
+    // Size of the rec group each DECLARED type index belongs to, index-aligned
+    // with `type_forms` — `rec_sizes` is per group, and the implicit-type rule
+    // below has to ask the question per type.
+    var type_group_size: List(u32) = .empty;
     for (module[start..]) |field| {
         const kw = field.keyword() orelse continue;
         if (std.mem.eql(u8, kw, "type")) {
             try type_names.append(a, typeDefName((try wantList(field))));
             try type_forms.append(a, (try wantList(field)));
+            try rec_sizes.append(a, 1);
+            try type_group_size.append(a, 1);
         } else if (std.mem.eql(u8, kw, "rec")) {
+            var n: u32 = 0;
             for ((try wantList(field))[1..]) |t| {
                 if (std.mem.eql(u8, t.keyword() orelse continue, "type")) {
                     try type_names.append(a, typeDefName((try wantList(t))));
                     try type_forms.append(a, (try wantList(t)));
+                    n += 1;
                 }
             }
+            try rec_sizes.append(a, n);
+            var k: u32 = 0;
+            while (k < n) : (k += 1) try type_group_size.append(a, n);
         }
     }
     // Pre-pass B: parse the bodies now that all type names resolve.
     for (type_forms.items) |form|
-        try parseTypeBody(a, form, type_names.items, &sigs, &gc_types, &gc_field_names, &gc_supers);
+        try parseTypeBody(a, form, type_names.items, &sigs, &gc_types, &gc_field_names, &gc_supers, &gc_finals);
+    // An inline function type stands for `(rec (type (func …)))` — a singleton,
+    // final, no supertype — so it may only be identified with a declared type of
+    // exactly that shape (§6.6.12). Everything else is a different type however
+    // well its params and results line up.
+    for (type_group_size.items, 0..) |n, ti| {
+        if (ti >= sigs.items.len) break;
+        sigs.items[ti].implicit_reusable = n == 1 and gc_finals.items[ti] and gc_supers.items[ti] == null;
+    }
 
     // Pass 1: collect the remaining definitions. Imports (top-level or inline)
     // must precede every func/table/memory/global/tag definition (§6.6.13), so an
@@ -320,14 +396,18 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             // `tag_names` length gives (imported tags are appended there too).
             var tag_exports: List([]const u8) = .empty;
             var import_mn: ?struct { m: []const u8, n: []const u8 } = null;
+            var tag_seen: u8 = 0; // §6.6.5 type-use ordering — see `typeUseOrder`
             while (j < items.len) : (j += 1) {
                 const tkw = items[j].keyword() orelse break;
                 if (std.mem.eql(u8, tkw, "type")) {
+                    try typeUseOrder(&tag_seen, 1);
                     type_ref = try resolveType(type_names.items, try nth(try wantList(items[j]), 1));
                 } else if (std.mem.eql(u8, tkw, "param")) {
-                    try parseDecls(a, (try wantList(items[j])), &params, null, type_names.items);
+                    try typeUseOrder(&tag_seen, 2);
+                    try parseDecls(a, (try wantList(items[j])), &params, null, type_names.items, true);
                 } else if (std.mem.eql(u8, tkw, "result")) {
-                    try parseDecls(a, (try wantList(items[j])), &results, null, type_names.items);
+                    try typeUseOrder(&tag_seen, 3);
+                    try parseDecls(a, (try wantList(items[j])), &results, null, type_names.items, false);
                 } else if (std.mem.eql(u8, tkw, "export")) {
                     try tag_exports.append(a, try fieldStr(items[j], 1));
                 } else if (std.mem.eql(u8, tkw, "import")) {
@@ -378,6 +458,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 const imp = (try wantList(items[mi]));
                 mi += 1;
                 const lim = try parseMemLimits(items, &mi, this_is64, this_type_seen);
+                try checkMemTail(items, mi);
                 try mem_imports.append(a, .{ .module = (try strAt(imp, 1)), .name = (try strAt(imp, 2)), .min = lim.min, .max = lim.max, .shared = lim.shared, .is64 = lim.is64 });
             } else if (mi < items.len and eqKw(items[mi], "data")) {
                 // (memory (data "…")) — size the memory to the bytes and append an
@@ -402,6 +483,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 // type may sit here (canonical) or right after the name; `shared`
                 // (threads) follows the limits and requires a max.
                 const lim = try parseMemLimits(items, &mi, this_is64, this_type_seen);
+                try checkMemTail(items, mi);
                 try memories.append(a, .{ .min = lim.min, .max = lim.max, .shared = lim.shared, .is64 = lim.is64 });
             }
             try mem_names.append(a, this_name);
@@ -417,12 +499,30 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             }
             try data_names.append(a, dname);
             var seg_mem: u32 = 0;
-            if (di < items.len) if (items[di].asList()) |l| {
-                if (l.len >= 2 and eqAtom(l[0], "memory")) {
-                    seg_mem = try resolveByName(mem_names.items, l[1]);
+            if (di < items.len) {
+                if (items[di].asList()) |l| {
+                    if (l.len >= 2 and eqAtom(l[0], "memory")) {
+                        seg_mem = try resolveByName(mem_names.items, l[1]);
+                        di += 1;
+                    }
+                }
+                // ⚠️ **The LEGACY bare memory index — `(data 0 (i32.const 10) "…")`.**
+                // Before bulk-memory the memuse was a plain `memidx`, not
+                // `(memory x)`, and the era-pinned `proposals/threads` corpus
+                // still writes it. We recognised only the modern form, so the `0`
+                // fell through to the byte loop (which keeps strings and dropped
+                // it) and the OFFSET was then read as… nothing — **an active
+                // segment in the source came out PASSIVE in the binary**, and
+                // `(i32.load (i32.const 10))` read 0 instead of the data. Not a
+                // rejection: a silently DIFFERENT module, this codebase's worst
+                // failure mode. Unambiguous to recognise, because an offset is
+                // always a list and data bytes are always strings — only the
+                // legacy shape puts an index atom in front of a list here.
+                else if (isIndexAtom(items[di]) and di + 1 < items.len and items[di + 1].asList() != null) {
+                    seg_mem = try resolveByName(mem_names.items, items[di]);
                     di += 1;
                 }
-            };
+            }
             // The offset is any leading list (`(offset …)` or a folded const-expr
             // like `(i32.const N)` / `(global.get $g)` — even a malformed one, so
             // the validator can reject it); data bytes are always strings. Absent
@@ -435,7 +535,11 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             var bytes: List(u8) = .empty;
             for (items[di..]) |it| switch (it) {
                 .string => |sbytes| try bytes.appendSlice(a, sbytes),
-                else => {},
+                // Anything else here is not a data string and has no position in
+                // the grammar. Ignoring it is how the legacy memuse above went
+                // missing for so long — a dropped token is a module that does not
+                // match its source.
+                else => return error.BadModuleField,
             };
             try datas.append(a, .{ .mem_index = seg_mem, .offset_form = offset_form, .bytes = bytes.items });
         } else if (std.mem.eql(u8, kw, "table")) {
@@ -455,14 +559,19 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 for (items[exp_start..ti]) |ex|
                     try exports.append(a, .{ .name = try fieldStr(ex, 1), .kind = 1, .index = tidx });
                 ti += 1;
-                const tmin = try parseIndex(try nth(items, ti));
-                ti += 1;
-                var tmax: ?u32 = null;
-                if (ti < items.len and !isRefType(items[ti])) {
-                    tmax = try parseIndex(items[ti]);
+                var t_is64 = false;
+                if (ti < items.len and (eqAtom(items[ti], "i64") or eqAtom(items[ti], "i32"))) {
+                    t_is64 = eqAtom(items[ti], "i64");
                     ti += 1;
                 }
-                try table_imports.append(a, .{ .module = (try strAt(imp, 1)), .name = (try strAt(imp, 2)), .min = tmin, .max = tmax, .elem = try parseValType(try nth(items, ti), type_names.items) });
+                const tmin = try parseU64(try nth(items, ti));
+                ti += 1;
+                var tmax: ?u64 = null;
+                if (ti < items.len and !isRefType(items[ti])) {
+                    tmax = try parseU64(items[ti]);
+                    ti += 1;
+                }
+                try table_imports.append(a, .{ .module = (try strAt(imp, 1)), .name = (try strAt(imp, 2)), .min = tmin, .max = tmax, .elem = try parseValType(try nth(items, ti), type_names.items), .is64 = t_is64 });
                 try table_names.append(a, tname);
             } else {
                 try parseTable(a, items, &tables, &table_names, &elems, &elem_names, &exports, type_names.items);
@@ -486,14 +595,19 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                     tname = desc[ti].atom;
                     ti += 1;
                 }
-                const tmin = try parseIndex(try nth(desc, ti));
-                ti += 1;
-                var tmax: ?u32 = null;
-                if (ti < desc.len and !isRefType(desc[ti])) {
-                    tmax = try parseIndex(desc[ti]);
+                var t_is64 = false;
+                if (ti < desc.len and (eqAtom(desc[ti], "i64") or eqAtom(desc[ti], "i32"))) {
+                    t_is64 = eqAtom(desc[ti], "i64");
                     ti += 1;
                 }
-                try table_imports.append(a, .{ .module = (try strAt(items, 1)), .name = (try strAt(items, 2)), .min = tmin, .max = tmax, .elem = try parseValType(try nth(desc, ti), type_names.items) });
+                const tmin = try parseU64(try nth(desc, ti));
+                ti += 1;
+                var tmax: ?u64 = null;
+                if (ti < desc.len and !isRefType(desc[ti])) {
+                    tmax = try parseU64(desc[ti]);
+                    ti += 1;
+                }
+                try table_imports.append(a, .{ .module = (try strAt(items, 1)), .name = (try strAt(items, 2)), .min = tmin, .max = tmax, .elem = try parseValType(try nth(desc, ti), type_names.items), .is64 = t_is64 });
                 try table_names.append(a, tname);
             } else if (std.mem.eql(u8, dkw, "memory")) {
                 // (import "m" "n" (memory $id? i64? min max? shared?))
@@ -524,6 +638,11 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         } else if (std.mem.eql(u8, kw, "start")) {
             // (start $f | N) — resolve after the func index space is complete.
             if (items.len < 2) return error.BadModuleField;
+            // A module has at most ONE start function (§2.5.9 — the start
+            // section is optional and singular). A second `(start …)` used to
+            // overwrite the first, so the module ran a start function its own
+            // source did not name first.
+            if (start_ref != null) return error.BadModuleField;
             start_ref = items[1];
         } else if (!std.mem.eql(u8, kw, "type") and !std.mem.eql(u8, kw, "rec")) {
             // Anything else is a typo or an unsupported field, and silently
@@ -541,6 +660,25 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         if (global_imports.items.len > imp_before[3]) try import_order.append(a, .global);
         if (tag_imports.items.len > imp_before[4]) try import_order.append(a, .tag);
     }
+
+    // §6.6.13: identifiers bound in the same index space must be pairwise
+    // distinct. Checked HERE, once per space, rather than at each append site:
+    // every space is filled from two places (an import and a definition) and the
+    // spec's rule spans both — `(import … (memory $foo 1))` next to
+    // `(memory $foo 1)` is a duplicate, and a per-site check is the shape that
+    // misses exactly that pair. Nothing downstream can catch it either: names do
+    // not survive into the binary, so the assembler is the only layer that ever
+    // sees the collision.
+    for ([_][]const ?[]const u8{
+        func_names.items, table_names.items,  mem_names.items,
+        global_names.items, tag_names.items,  type_names.items,
+        elem_names.items,   data_names.items,
+    }) |space| try checkUniqueNames(a, space);
+    // A function's local space is its params followed by its declared locals —
+    // one namespace, so `(param $foo i32) (local $foo i32)` collides.
+    for (funcs.items) |f| try checkUniqueNames(a, f.local_names.items);
+    // …and each struct type's fields are their own namespace.
+    for (gc_field_names.items) |fields| try checkUniqueNames(a, fields);
 
     // Module-level exports, resolved now that every index space is complete.
     // Doing this in-pass rejected forward references — and binaryen emits all
@@ -568,13 +706,24 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // Imported-function type indices (for the import section).
     var func_import_type: List(u32) = .empty;
     for (func_imports.items) |fi| {
-        const ti = if (fi.type_ref) |tr| try resolveType(type_names.items, tr) else try internSig(a, &sigs, fi.params, fi.results);
+        const ti = if (fi.type_ref) |tr| blk: {
+            const idx = try resolveType(type_names.items, tr);
+            try checkInlineTypeUse(&sigs, idx, fi.params, fi.results);
+            break :blk idx;
+        } else try internSig(a, &sigs, fi.params, fi.results);
         try func_import_type.append(a, ti);
     }
 
     var func_type: List(u32) = .empty;
     for (funcs.items) |*f| {
-        const ti = if (f.type_ref) |tr| try resolveType(type_names.items, tr) else try internSig(a, &sigs, f.params.items, f.results.items);
+        const ti = if (f.type_ref) |tr| blk: {
+            const idx = try resolveType(type_names.items, tr);
+            // The inline `(param …)`/`(result …)`, when written alongside a
+            // `(type …)`, is a CHECK on the named type — not a second, silently
+            // ignored declaration. See `checkInlineTypeUse`.
+            try checkInlineTypeUse(&sigs, idx, f.params.items, f.results.items);
+            break :blk idx;
+        } else try internSig(a, &sigs, f.params.items, f.results.items);
         try func_type.append(a, ti);
         // A `(type $t)` reference supplies the params; when they aren't *also*
         // written inline, they still occupy the low local indices, so prepend
@@ -598,6 +747,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // any signature they might intern lands in section 1. Const-exprs can't intern
     // a signature today, but this keeps the invariant structural, not incidental.
     const global_pay = try encodeGlobalSection(a, globals.items, &sigs, type_names.items, global_names.items, func_names.items);
+    const table_pay = try encodeTableSection(a, tables.items, &sigs, type_names.items, global_names.items, func_names.items);
     const elem_pay = try encodeElementSection(a, elems.items, &sigs, type_names.items, global_names.items, func_names.items);
     const data_pay = try encodeDataSection(a, datas.items, &sigs, type_names.items, global_names.items, func_names.items);
 
@@ -609,17 +759,47 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // any index beyond it is an interned func signature.
     {
         var s: List(u8) = .empty;
-        try uleb(a, &s, sigs.items.len);
+        // The section counts REC-TYPE entries, and a `(rec …)` of n members is
+        // ONE entry. Interned block-type signatures sit past the named defs and
+        // are each their own entry.
+        const named = gc_types.items.len;
+        var entries: usize = sigs.items.len - named;
+        for (rec_sizes.items) |n| entries += if (n == 0) 0 else 1;
+        try uleb(a, &s, entries);
+        // Walks `rec_sizes` alongside the type indices so a group header can be
+        // emitted before its first member.
+        var group: usize = 0;
+        var group_left: u32 = 0;
         for (sigs.items, 0..) |sig, ti| {
+            if (ti < named and group_left == 0) {
+                while (group < rec_sizes.items.len and rec_sizes.items[group] == 0) group += 1;
+                if (group < rec_sizes.items.len) {
+                    group_left = rec_sizes.items[group];
+                    group += 1;
+                    // A bare subtype IS a singleton group, so only n > 1 needs the
+                    // explicit `0x4e` header.
+                    if (group_left > 1) {
+                        try s.append(a, 0x4e);
+                        try uleb(a, &s, group_left);
+                    }
+                } else group_left = 1;
+            }
+            if (group_left > 0) group_left -= 1;
             const def: GcTypeDef = if (ti < gc_types.items.len) gc_types.items[ti] else .func;
-            // A declared supertype emits the sub form (`0x50` = sub, non-final) +
-            // a one-element supertype vector before the composite type. Finality
-            // is not tracked (unused by the decoder/validator).
-            if (ti < gc_supers.items.len) if (gc_supers.items[ti]) |sr| {
-                try s.append(a, 0x50);
-                try uleb(a, &s, 1);
-                try uleb(a, &s, try resolveType(type_names.items, sr));
-            };
+            // Emit the sub form whenever the source said `sub` — even with no
+            // supertype, because that is what makes the type EXTENSIBLE (`0x50`
+            // = non-final, `0x4f` = final). A bare composite type is `sub final`
+            // by definition, so only a `final`-with-supertype declaration needs
+            // the explicit `0x4f`.
+            const is_final = ti >= gc_finals.items.len or gc_finals.items[ti];
+            const super: ?Sexpr = if (ti < gc_supers.items.len) gc_supers.items[ti] else null;
+            if (!is_final or super != null) {
+                try s.append(a, if (is_final) 0x4f else 0x50);
+                if (super) |sr| {
+                    try uleb(a, &s, 1);
+                    try uleb(a, &s, try resolveType(type_names.items, sr));
+                } else try uleb(a, &s, 0);
+            }
             switch (def) {
                 .func => {
                     try s.append(a, 0x60);
@@ -663,7 +843,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 try nameBytes(a, &s, t.name);
                 try s.append(a, 0x01); // table import
                 try emitValType(a, &s, t.elem); // element reftype
-                try emitLimits(a, &s, t.min, if (t.max) |mx| @as(u64, mx) else null, false, false);
+                try emitLimits(a, &s, t.min, t.max, false, t.is64);
                 ci[1] += 1;
             },
             .mem => {
@@ -702,16 +882,9 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         for (func_type.items) |ti| try uleb(a, &s, ti);
         try emitSection(a, &out, 3, s.items);
     }
-    // Table section (4)
-    if (tables.items.len != 0) {
-        var s: List(u8) = .empty;
-        try uleb(a, &s, tables.items.len);
-        for (tables.items) |t| {
-            try emitValType(a, &s, t.elem); // element reftype (funcref / externref)
-            try emitLimits(a, &s, t.min, if (t.max) |mx| @as(u64, mx) else null, false, false);
-        }
-        try emitSection(a, &out, 4, s.items);
-    }
+    // Table section (4) — pre-encoded above (before the type section), because a
+    // table initializer is a const-expr and may intern a signature.
+    if (tables.items.len != 0) try emitSection(a, &out, 4, table_pay);
     // Memory section (5) — the *defined* memories only (imported ones live in
     // the import section). Multi-memory: a vector of limits.
     if (memories.items.len != 0) {
@@ -752,6 +925,20 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     }
     // Element section (9) — pre-encoded above (before the type section).
     if (elems.items.len != 0) try emitSection(a, &out, 9, elem_pay);
+    // Data-count section (12) — the segment count, ahead of the code that uses
+    // it. §5.5.16 REQUIRES it in any module whose code has `memory.init`/
+    // `data.drop`, and we emitted it never: every `(data …)` module this
+    // assembler produced was malformed the moment a body touched a segment.
+    // Nothing caught it because the decoder did not enforce the rule either —
+    // the two halves of the same gap agreed with each other. Emitting it
+    // whenever there IS a data section is simplest and always legal: when no
+    // instruction needs it the section is merely optional, and `decode` checks
+    // the count against `data.len` either way.
+    if (datas.items.len != 0) {
+        var s: List(u8) = .empty;
+        try uleb(a, &s, datas.items.len);
+        try emitSection(a, &out, 12, s.items);
+    }
     // Code section (10) — pre-encoded bodies
     {
         var s: List(u8) = .empty;
@@ -783,6 +970,26 @@ fn encodeGlobalSection(a: std.mem.Allocator, globals: []const GlobalDef, sigs: *
     return s.items;
 }
 
+/// Encode the table section (4) payload. A table with no initializer is the
+/// plain `tabletype`; one with an initializer takes §5.5.6's second form,
+/// `0x40 0x00 tabletype expr` (function-references) — the only encoding in which
+/// a NON-NULLABLE element type has a starting value, and therefore the only one
+/// the validator can accept for such a table.
+fn encodeTableSection(a: std.mem.Allocator, tables: []const TableDef, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8) Error![]const u8 {
+    if (tables.len == 0) return &.{};
+    var s: List(u8) = .empty;
+    try uleb(a, &s, tables.len);
+    for (tables) |t| {
+        if (t.init != null) try s.appendSlice(a, &.{ 0x40, 0x00 }); // form + reserved byte
+        try emitValType(a, &s, t.elem); // element reftype
+        try emitLimits(a, &s, t.min, t.max, false, t.is64);
+        if (t.init) |init_expr| {
+            try emitConstExpr(a, &s, sigs, type_names, global_names, func_names, &[_]Sexpr{init_expr});
+        }
+    }
+    return s.items;
+}
+
 /// Encode the element section (9) payload — all 8 flag variants
 /// (active/passive/declarative × func-index/const-expr forms).
 fn encodeElementSection(a: std.mem.Allocator, elems: []const ElemDef, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8) Error![]const u8 {
@@ -790,29 +997,48 @@ fn encodeElementSection(a: std.mem.Allocator, elems: []const ElemDef, sigs: *Lis
     var s: List(u8) = .empty;
     try uleb(a, &s, elems.len);
     for (elems) |e| {
-        // flag bits: bit0 = passive/declarative, bit1 = declarative-or-explicit-table,
-        // bit2 = const-expr form.
-        const explicit_table = e.mode == .active and e.table_index != 0;
+        // ⚠️ Two of the eight variants have `funcref` BAKED IN and carry no type
+        // byte at all: the func-index form's elemkind has no other encoding, and
+        // flag 4 (active, table 0, const-expr) omits the reftype entirely. So a
+        // segment whose element type is anything else — a concrete `(ref null $t)`
+        // from `(table (ref null $t) (elem $f))`, or `externref` — has to be
+        // written in a variant that can say so, or the type is silently DROPPED
+        // and the segment decodes as `funcref`. It was, which made every such
+        // table reject its own initializer as `TypeMismatch`.
+        const typed = e.elem_type != .funcref;
+        const as_expr = e.expr_form or typed;
+        // Flag 4 cannot carry a reftype, so a typed segment takes the
+        // explicit-table variant (flag 6) even when the table IS 0.
+        const explicit_table = e.mode == .active and (e.table_index != 0 or typed);
         var flag: u8 = 0;
         switch (e.mode) {
             .active => flag |= if (explicit_table) 0b010 else 0,
             .passive => flag |= 0b001,
             .declarative => flag |= 0b011,
         }
-        if (e.expr_form) flag |= 0b100;
+        if (as_expr) flag |= 0b100;
         try s.append(a, flag);
         if (explicit_table) try uleb(a, &s, e.table_index);
-        if (e.mode == .active) try emitOffsetExpr(a, &s, sigs, type_names, global_names, func_names, e.offset_form);
+        if (e.mode == .active) try emitOffsetExpr(a, &s, sigs, type_names, global_names, func_names, e.offset_form, e.is64);
         // The leading kind byte: elemkind (0x00) for non-flag-0 func-index
         // variants, reftype for non-flag-4 const-expr variants.
-        if (!e.expr_form and flag != 0) {
+        if (!as_expr and flag != 0) {
             try s.append(a, 0x00); // elemkind funcref
-        } else if (e.expr_form and flag != 4) {
+        } else if (as_expr and flag != 4) {
             try emitValType(a, &s, e.elem_type); // reftype
         }
         if (e.expr_form) {
             try uleb(a, &s, e.exprs.len);
             for (e.exprs) |ex| try emitElementExpr(a, &s, sigs, type_names, global_names, func_names, ex);
+        } else if (as_expr) {
+            // A typed segment written as bare function indices: each index goes
+            // out as the `(ref.func $f)` expression it abbreviates.
+            try uleb(a, &s, e.funcs.len);
+            for (e.funcs) |ref| {
+                try s.append(a, @intFromEnum(Op.ref_func));
+                try uleb(a, &s, try resolveByName(func_names, ref));
+                try s.append(a, @intFromEnum(Op.end));
+            }
         } else {
             try uleb(a, &s, e.funcs.len);
             for (e.funcs) |ref| try uleb(a, &s, try resolveByName(func_names, ref));
@@ -832,12 +1058,12 @@ fn encodeDataSection(a: std.mem.Allocator, datas: []const DataSeg, sigs: *List(S
             try s.append(a, 0x01); // passive
         } else if (seg.mem_index == 0) {
             try s.append(a, 0x00); // active, memory 0
-            try emitOffsetExpr(a, &s, sigs, type_names, global_names, func_names, seg.offset_form);
+            try emitOffsetExpr(a, &s, sigs, type_names, global_names, func_names, seg.offset_form, false);
         } else {
             // active, explicit memory index (multi-memory)
             try s.append(a, 0x02);
             try uleb(a, &s, seg.mem_index);
-            try emitOffsetExpr(a, &s, sigs, type_names, global_names, func_names, seg.offset_form);
+            try emitOffsetExpr(a, &s, sigs, type_names, global_names, func_names, seg.offset_form, false);
         }
         try uleb(a, &s, seg.bytes.len);
         try s.appendSlice(a, seg.bytes);
@@ -883,38 +1109,55 @@ fn typeDefName(items: []const Sexpr) ?[]const u8 {
 /// `sigs`) or the struct/array fields (to `gc_types`) plus the declared supertype
 /// (to `gc_supers`, resolved at emit) at the next type index — all index-aligned
 /// with `type_names` (already fully populated, so concrete `(ref $t)` resolves).
-fn parseTypeBody(a: std.mem.Allocator, items: []const Sexpr, type_names: []const ?[]const u8, sigs: *List(Sig), gc_types: *List(GcTypeDef), gc_field_names: *List([]const ?[]const u8), gc_supers: *List(?Sexpr)) Error!void {
+fn parseTypeBody(a: std.mem.Allocator, items: []const Sexpr, type_names: []const ?[]const u8, sigs: *List(Sig), gc_types: *List(GcTypeDef), gc_field_names: *List([]const ?[]const u8), gc_supers: *List(?Sexpr), gc_finals: *List(bool)) Error!void {
     var i: usize = 1;
     if (i < items.len and isId(items[i])) i += 1; // skip $name (already collected)
     var body = try wantList(try nth(items, i));
     // Unwrap a `(sub final? $super? <comptype>)`: the inner comptype is the last
     // element; a supertype id among the middle elements (skipping `final`) is
     // captured so the type section can emit the sub form (GC MVP: ≤1 supertype).
+    //
+    // ⚠️ FINALITY IS PART OF THE TYPE, not decoration. `(sub …)` without `final`
+    // opens the type for extension; a bare `(func …)` / `(struct …)` / `(array
+    // …)` is final. We recorded only the supertype, so `(type $e0 (sub (array
+    // i32)))` — `sub`, no supertype — emitted a BARE composite and came back
+    // final, and every later `(sub $e0 …)` then extended a closed type.
     var super_ref: ?Sexpr = null;
+    var final = true;
     if (body.len >= 2 and eqAtom(body[0], "sub")) {
+        final = false;
         for (body[1 .. body.len - 1]) |part| {
-            if (isId(part) or (part.asAtom() != null and !eqAtom(part, "final"))) {
-                super_ref = part;
-                break;
+            if (eqAtom(part, "final")) {
+                final = true;
+                continue;
             }
+            if (super_ref == null and (isId(part) or part.asAtom() != null)) super_ref = part;
         }
         body = body[body.len - 1].asList() orelse return error.BadModuleField;
     }
     try gc_supers.append(a, super_ref);
+    try gc_finals.append(a, final);
 
     const kw = try wantAtom(try nth(body, 0));
     if (std.mem.eql(u8, kw, "func")) {
         var params: List(V) = .empty;
         var results: List(V) = .empty;
+        // §6.6.4 `functype ::= '(' 'func' param* result* ')'` — ordered, and a
+        // `(type …)` has no place inside one.
+        var seen: u8 = 0;
         for (body[1..]) |part| {
             // An unrecognised part used to be skipped, so
             // `(type $t (func (parm i32) (reslt i32)))` interned `() -> ()` and a
             // `call_indirect` against `$t` then checked the WRONG signature.
             const pk = part.keyword() orelse return error.BadModuleField;
             if (std.mem.eql(u8, pk, "param")) {
-                try parseDecls(a, (try wantList(part)), &params, null, type_names);
+                try typeUseOrder(&seen, 2);
+                // A type definition IS a binding position for parameter ids —
+                // `(type (func (param $x i32)))` is legal, unlike a block type.
+                try parseDecls(a, (try wantList(part)), &params, null, type_names, true);
             } else if (std.mem.eql(u8, pk, "result")) {
-                try parseDecls(a, (try wantList(part)), &results, null, type_names);
+                try typeUseOrder(&seen, 3);
+                try parseDecls(a, (try wantList(part)), &results, null, type_names, false);
             } else return error.BadModuleField;
         }
         try sigs.append(a, .{ .params = params.items, .results = results.items });
@@ -1003,6 +1246,18 @@ fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef
     // here — the sibling of the guards `parseGlobal`/`parseElem`/the inline-import
     // branch already got. Unguarded this reads an adjacent `Sexpr` and switches on
     // a garbage union tag (UB in the shipped ReleaseFast build).
+    // §6.6.7 puts the optional index type `i32`/`i64` (table64) ahead of BOTH
+    // table forms — the limits form and the `reftype (elem …)` abbreviation.
+    // ⚠️ It was consumed only inside the limits branch below, so
+    // `(table $t i64 funcref (elem $f))` took the `i64` as a shape, failed
+    // `isRefType`, and then asked `parseU64("funcref")` → `BadImmediate` on the
+    // whole module. Same guard-around-one-form shape as the `call_indirect`
+    // table index and the flat `br_table`.
+    var is64 = false;
+    if (i < items.len and (eqAtom(items[i], "i64") or eqAtom(items[i], "i32"))) {
+        is64 = eqAtom(items[i], "i64");
+        i += 1;
+    }
     const shape = try nth(items, i);
     if (isRefType(shape)) {
         // (table reftype (elem …))
@@ -1013,54 +1268,71 @@ fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef
             // (`(elem $f $g)`) or const-expr forms (`(elem (ref.func $f) …)`).
             const inner = (try wantList(items[i]))[1..];
             const count: u32 = @intCast(inner.len);
-            try tables.append(a, .{ .min = count, .max = count, .elem = et });
+            try tables.append(a, .{ .min = count, .max = count, .elem = et, .is64 = is64 });
             if (inner.len != 0 and inner[0].asList() != null) {
-                try elems.append(a, .{ .mode = .active, .table_index = table_index, .offset_form = null, .elem_type = et, .expr_form = true, .funcs = &.{}, .exprs = inner });
+                try elems.append(a, .{ .mode = .active, .table_index = table_index, .offset_form = null, .is64 = is64, .elem_type = et, .expr_form = true, .funcs = &.{}, .exprs = inner });
             } else {
-                try elems.append(a, .{ .mode = .active, .table_index = table_index, .offset_form = null, .elem_type = .funcref, .expr_form = false, .funcs = inner, .exprs = &.{} });
+                // The inline abbreviation inherits the TABLE's element type — it
+                // is shorthand for `(elem (i32.const 0) <tabletype> (ref.func $f) …)`,
+                // not for a funcref segment. Hard-coding `funcref` made every
+                // `(table (ref null $t) (elem $f))` reject its own initializer.
+                try elems.append(a, .{ .mode = .active, .table_index = table_index, .offset_form = null, .is64 = is64, .elem_type = et, .expr_form = false, .funcs = inner, .exprs = &.{} });
             }
             try elem_names.append(a, null);
         } else {
-            try tables.append(a, .{ .min = 0, .max = null, .elem = et });
+            try tables.append(a, .{ .min = 0, .max = null, .elem = et, .is64 = is64 });
         }
     } else {
-        const min = try parseIndex(shape);
+        // The index type (`i64` for table64) was already consumed above, in the
+        // one place that serves both table forms.
+        const min = try parseU64(shape);
         i += 1;
-        var max: ?u32 = null;
+        var max: ?u64 = null;
         if (i < items.len and !isRefType(items[i])) {
-            max = try parseIndex(items[i]);
+            max = try parseU64(items[i]);
             i += 1;
         }
         // `(table 1)` / `(table 1 2)` run out of items here — the twin-index
         // pattern: the `max` probe above is guarded, this read was not.
         const et = try parseValType(try nth(items, i), type_names);
         i += 1;
-        try tables.append(a, .{ .min = min, .max = max, .elem = et });
-        // Table initializer expression `(table N reftype initexpr)`: fill all N
-        // slots with the value. We synthesize an active elem of N copies at
-        // offset 0 — observably identical table state (a distinct 0x40 binary
-        // encoding is not required for the execution assertions).
-        if (i < items.len and items[i].asList() != null) {
-            const init_expr = items[i];
-            // `min` is attacker-written text: `(table 4000000000 funcref (…))` —
-            // 48 bytes — asks for ~96 GB of `Sexpr`. `alloc` overflow-checks the
-            // multiply so it fails cleanly rather than corrupting, but it is the
-            // text-side twin of the OOM amplification `Reader.readVecLen` closed
-            // on the binary side, so bound it the same way.
-            if (min > max_table_init_copies) return error.BadImmediate;
-            const copies = try a.alloc(Sexpr, min);
-            for (copies) |*c| c.* = init_expr;
-            try elems.append(a, .{ .mode = .active, .table_index = table_index, .offset_form = null, .elem_type = et, .expr_form = true, .funcs = &.{}, .exprs = copies });
-            try elem_names.append(a, null);
-        }
+        // Table initializer expression `(table N reftype initexpr)` → §5.5.6's
+        // `0x40 0x00 tabletype expr` form, recorded here and emitted by the table
+        // section encoder.
+        //
+        // ⚠️ This used to synthesize an active element segment of N copies of the
+        // initializer instead, on the reasoning that the resulting table state is
+        // observably identical and "a distinct 0x40 binary encoding is not
+        // required for the execution assertions". The state is identical; the
+        // MODULE is not. A table with an explicit initializer and a table with an
+        // element segment differ in exactly the property the validator needs to
+        // see — whether the table declares a starting value — so `(table 0
+        // (ref func))`, which has none and must be rejected, was indistinguishable
+        // from one that does. It also allocated `min` Sexprs, which is why the
+        // copy cap below existed at all. **An encoding chosen to make execution
+        // agree can erase the distinction validation runs on.**
+        const init: ?Sexpr = if (i < items.len and items[i].asList() != null) items[i] else null;
+        try tables.append(a, .{ .min = min, .max = max, .elem = et, .is64 = is64, .init = init });
     }
 }
 
 /// True if the form is a reference type: `funcref` / `externref` / `(ref …)`.
 fn isRefType(s: Sexpr) bool {
     if (s.asList()) |l| return l.len >= 1 and eqAtom(l[0], "ref");
-    // `anyfunc` is the pre-standard spelling of `funcref`.
-    return eqAtom(s, "funcref") or eqAtom(s, "externref") or eqAtom(s, "anyfunc");
+    // `anyfunc` is REFUSED (`obsoleteValType`), but it still answers true here
+    // on purpose: saying false would route `(table 4 anyfunc)` down the
+    // func-index path, where `anyfunc` reads as a function NAME and fails as
+    // `UnknownIdentifier` — our own-limitation bucket, so a spec deviation
+    // would come back disguised as a skip. Claiming it IS a ref type sends it
+    // to `parseValType`, the one place that knows why it is rejected.
+    if (eqAtom(s, "anyfunc")) return true;
+    // Every abstract shorthand — `funcref`, `externref` and the GC heads
+    // (`anyref`/`eqref`/`i31ref`/`structref`/`arrayref`/`null*ref`) — comes from
+    // `shorthandRefType`, the single table the cast ops already use. Listing only
+    // `funcref`/`externref` here made `(elem $e i31ref (ref.i31 …))` fall through
+    // to the FUNC-INDEX form, where `i31ref` was read as a function name and
+    // failed as `BadImmediate` — a wrong answer three steps from its cause.
+    return s.asAtom() != null and shorthandRefType(s.asAtom().?) != null;
 }
 
 /// `(elem $id? mode? tableuse? offset? kind item*)` — active / passive /
@@ -1084,6 +1356,17 @@ fn parseElem(a: std.mem.Allocator, items: []const Sexpr, elems: *List(ElemDef), 
         if (i < items.len and eqKw(items[i], "table")) {
             mode = .active;
             table_index = try resolveByName(table_names, try nth(try wantList(items[i]), 1));
+            i += 1;
+        } else if (i + 1 < items.len and isIndexAtom(items[i]) and isOffsetForm(items[i + 1])) {
+            // The LEGACY bare table index — `(elem 0 (i32.const 1) $f $g)`, the
+            // pre-reference-types spelling of `(elem (table 0) …)`, still written
+            // by the era-pinned `proposals/threads` corpus. Unrecognised, the `0`
+            // fell through to the func-index list and `resolveByName` was handed
+            // the OFFSET as a function name → `BadImmediate` on a whole module.
+            // Gated on an offset FOLLOWING it, so a passive `(elem 0 $f $g)` —
+            // where the next item is a func id, not an offset — is untouched.
+            mode = .active;
+            table_index = try resolveByName(table_names, items[i]);
             i += 1;
         }
         if (i < items.len and isOffsetForm(items[i])) {
@@ -1111,7 +1394,12 @@ fn isOffsetForm(s: Sexpr) bool {
     const l = s.asList() orelse return false;
     if (l.len == 0) return false;
     const kw = l[0].asAtom() orelse return false;
-    return std.mem.eql(u8, kw, "offset") or std.mem.eql(u8, kw, "i32.const") or std.mem.eql(u8, kw, "global.get");
+    // `i64.const` belongs here for a 64-bit table (table64), whose active-elem
+    // offset takes the table's index type. Without it the offset was not
+    // recognised as one at all and fell through to the element list, where it
+    // was read as a function index — `BadImmediate`, nowhere near the cause.
+    return std.mem.eql(u8, kw, "offset") or std.mem.eql(u8, kw, "i32.const") or
+        std.mem.eql(u8, kw, "i64.const") or std.mem.eql(u8, kw, "global.get");
 }
 
 /// `(global $name? (export "x")* (import "m" "n")? (mut? valtype) init-expr?)`.
@@ -1192,14 +1480,16 @@ fn parseImport(a: std.mem.Allocator, items: []const Sexpr, global_imports: *List
 /// Emit an active segment's offset const-expr + `end`. Unwraps `(offset …)`,
 /// accepts a folded const-expr (`(i32.const N)` / `(global.get $g)`), and emits
 /// an implicit `i32.const 0` when no offset form is present.
-fn emitOffsetExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, form: ?Sexpr) Error!void {
+fn emitOffsetExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, form: ?Sexpr, is64: bool) Error!void {
     if (form) |f| {
         if (f.asList()) |l| {
             if (l.len != 0 and eqAtom(l[0], "offset")) return emitConstExpr(a, out, sigs, type_names, global_names, func_names, l[1..]);
         }
         return emitConstExpr(a, out, sigs, type_names, global_names, func_names, &[_]Sexpr{f});
     }
-    try out.append(a, @intFromEnum(Op.i32_const));
+    // The IMPLICIT offset takes the target's index type — `i64.const 0` for a
+    // 64-bit table/memory. See `ElemDef.is64`.
+    try out.append(a, @intFromEnum(if (is64) Op.i64_const else Op.i32_const));
     try sleb(a, out, 0);
     try out.append(a, @intFromEnum(Op.end));
 }
@@ -1248,6 +1538,9 @@ fn parseFunc(a: std.mem.Allocator, form: []const Sexpr, type_names: []const ?[]c
         f.name = form[i].atom;
         i += 1;
     }
+    // §6.6.13: `(func id? (export …)* (import …)? typeuse local* instr*)`, and
+    // the type use is itself ordered — see `typeUseOrder`.
+    var seen: u8 = 0;
     while (i < form.len) : (i += 1) {
         const kw = form[i].keyword() orelse break; // start of the body
         const list = (try wantList(form[i]));
@@ -1255,24 +1548,62 @@ fn parseFunc(a: std.mem.Allocator, form: []const Sexpr, type_names: []const ?[]c
             try f.exports.append(a, (try strAt(list, 1)));
         } else if (std.mem.eql(u8, kw, "import")) {
             f.import = .{ .module = (try strAt(list, 1)), .name = (try strAt(list, 2)) }; // (import "m" "n")
-        } else if (std.mem.eql(u8, kw, "type")) {
-            f.type_ref = try nth(list, 1); // (type $t)
-        } else if (std.mem.eql(u8, kw, "param")) {
-            try parseDecls(a, list, &f.params, &f.local_names, type_names);
-        } else if (std.mem.eql(u8, kw, "result")) {
-            try parseDecls(a, list, &f.results, null, type_names);
-        } else if (std.mem.eql(u8, kw, "local")) {
-            try parseDecls(a, list, &f.locals, &f.local_names, type_names);
+        } else if (typeUseRank(kw)) |rank| {
+            try typeUseOrder(&seen, rank);
+            switch (rank) {
+                1 => f.type_ref = try nth(list, 1), // (type $t)
+                2 => try parseDecls(a, list, &f.params, &f.local_names, type_names, true),
+                3 => try parseDecls(a, list, &f.results, null, type_names, false),
+                else => try parseDecls(a, list, &f.locals, &f.local_names, type_names, true),
+            }
         } else break; // body starts (e.g. a folded instruction)
     }
     f.body = form[i..];
+    // A `(param …)` / `(result …)` / `(local …)` AFTER the body starts is not a
+    // late declaration — there is no such instruction, and the grammar has no
+    // position for one. Letting it fall through to the instruction emitter
+    // reported `UnknownInstr`, which `wast.zig` scores as an assembler gap (a
+    // SKIP) rather than the malformed verdict it is.
+    //
+    // ⚠️ **In FLAT syntax a type use IS a top-level body form** — `block`,
+    // `loop`, `if`, `select` and `call_indirect` are bare atoms there, with
+    // their `(result …)` / `(param …)` following as siblings. So the
+    // discriminator is what comes BEFORE: after an atom it is that instruction's
+    // type use; after a FOLDED instruction it has no legal reading.
+    //
+    // ⚠️ And a type-use form CHAINS off another — `select (result i32) (result)`
+    // and `call_indirect (type $proc) (param) (result)` are both in the corpus,
+    // so "the previous item is an atom" is too narrow and cost `select.wast` and
+    // `stack.wast` a module each. Carry the permission forward instead.
+    var prev_opens_type_use = false;
+    for (f.body) |b| {
+        const k = b.keyword() orelse {
+            prev_opens_type_use = b.asAtom() != null; // a string opens nothing
+            continue;
+        };
+        if (typeUseRank(k) == null) {
+            prev_opens_type_use = false; // a folded instruction
+            continue;
+        }
+        if (!prev_opens_type_use) return error.BadModuleField;
+    }
     return f;
 }
 
 /// Parse a `(param …)` / `(result …)` / `(local …)` group. Handles the named
 /// single form `(param $x i32)` and the anonymous multi form `(param i32 i32)`.
-fn parseDecls(a: std.mem.Allocator, list: []const Sexpr, out_types: *List(V), out_names: ?*List(?[]const u8), type_names: []const ?[]const u8) Error!void {
-    if (list.len >= 3 and isId(list[1])) {
+///
+/// `allow_id` is whether an identifier may be bound here. An id names a LOCAL,
+/// so it is legal only where locals exist — a function definition, a
+/// `(type (func …))` definition, a tag. A block type and a `call_indirect` type
+/// use have no local context, and `(result …)` never takes an id anywhere.
+fn parseDecls(a: std.mem.Allocator, list: []const Sexpr, out_types: *List(V), out_names: ?*List(?[]const u8), type_names: []const ?[]const u8, allow_id: bool) Error!void {
+    if (list.len >= 2 and isId(list[1])) {
+        if (!allow_id) return error.BadModuleField;
+        // The named form declares exactly ONE type. `(param $x i32 i64)` used to
+        // keep the `i32` and silently drop the `i64` — a signature that does not
+        // match its own source.
+        if (list.len != 3) return error.BadModuleField;
         try out_types.append(a, try parseValType(list[2], type_names));
         if (out_names) |n| try n.append(a, list[1].atom);
     } else {
@@ -1280,6 +1611,63 @@ fn parseDecls(a: std.mem.Allocator, list: []const Sexpr, out_types: *List(V), ou
             try out_types.append(a, try parseValType(t, type_names));
             if (out_names) |n| try n.append(a, null);
         }
+    }
+}
+
+/// Section rank of a type-use / function-header keyword, or null when `kw` is
+/// none of them — which inside a `func` means the body has started.
+fn typeUseRank(kw: []const u8) ?u8 {
+    if (std.mem.eql(u8, kw, "type")) return 1;
+    if (std.mem.eql(u8, kw, "param")) return 2;
+    if (std.mem.eql(u8, kw, "result")) return 3;
+    if (std.mem.eql(u8, kw, "local")) return 4;
+    return null;
+}
+
+/// §6.6.5 orders a type use strictly — at most one `(type x)`, then every
+/// `(param …)`, then every `(result …)` — and §6.6.13 puts a function's
+/// `(local …)` groups after all three. `seen` is the highest rank consumed so
+/// far.
+///
+/// ⚠️ **Every site parsed these in ANY order and any repetition.** So
+/// `(func (result i32) (param i32) (i32.const 0))` — an explicit
+/// `assert_malformed` in five core files — assembled into an ordinary
+/// `[i32] -> [i32]` function. The order is not decoration: it is what makes the
+/// abbreviated form readable without backtracking, and 22 corpus assertions
+/// pin it.
+fn typeUseOrder(seen: *u8, rank: u8) Error!void {
+    // `param`/`result`/`local` may repeat, so an equal rank is a violation only
+    // for the at-most-once `(type …)`.
+    if (rank < seen.* or (rank == 1 and seen.* >= 1)) return error.BadModuleField;
+    seen.* = rank;
+}
+
+/// §6.6.5: when a type use gives BOTH `(type x)` and an inline `(param …)` /
+/// `(result …)`, the inline form is a CHECK on `C.types[x]`, not extra
+/// information — it must reproduce that type exactly.
+///
+/// ⚠️ Ignoring it let `(func (type $sig) (result i32) …)`, with `$sig` being
+/// `[i32] -> [i32]`, assemble against `$sig` while the source declared
+/// `[] -> [i32]`. The function then had a parameter its own text denied.
+fn checkInlineTypeUse(sigs: *const List(Sig), type_ref: u32, params: []const V, results: []const V) Error!void {
+    if (params.len == 0 and results.len == 0) return; // nothing inline to check
+    if (type_ref >= sigs.items.len) return; // a bad index is a downstream verdict
+    const sig = sigs.items[type_ref];
+    if (!std.mem.eql(V, sig.params, params) or !std.mem.eql(V, sig.results, results))
+        return error.BadModuleField;
+}
+
+/// §6.6.13 — reject a repeated identifier in one namespace. Anonymous entries
+/// (`null`) never collide. Hash-set rather than the obvious O(n²) scan: a
+/// binaryen-optimized module carries tens of thousands of named functions, and
+/// `decode → validate → instantiate` is a first-class metric here.
+fn checkUniqueNames(a: std.mem.Allocator, names: []const ?[]const u8) Error!void {
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(a);
+    try seen.ensureTotalCapacity(a, @intCast(names.len));
+    for (names) |n| {
+        const nm = n orelse continue;
+        if (seen.getOrPutAssumeCapacity(nm).found_existing) return error.DuplicateName;
     }
 }
 
@@ -1302,7 +1690,17 @@ fn parseValType(s: Sexpr, type_names: []const ?[]const u8) Error!V {
         return error.BadValType;
     }
     const atom = s.asAtom() orelse return error.BadValType;
+    if (obsoleteValType(atom) != null) return error.ObsoleteKeyword;
     return stringToValType(atom) orelse error.BadValType;
+}
+
+/// Pre-standard value-type spellings the spec renamed. Recognised ONLY to
+/// refuse them by name — `obsolete-keywords.wast` asserts each is malformed,
+/// so mapping one onto its replacement is a conformance deviation, not a
+/// kindness. Returns the modern spelling for the error message.
+fn obsoleteValType(atom: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, atom, "anyfunc")) return "funcref";
+    return null;
 }
 
 /// A heap type → a reference value type. A concrete `$t` / numeric index → a
@@ -1325,12 +1723,24 @@ fn heapTypeToValType(s: Sexpr, nullable: bool, type_names: []const ?[]const u8) 
         if (ti > V.max_concrete_index) return error.BadImmediate;
         return V.concreteRef(nullable, .@"struct", ti);
     }
-    const pair: ?[2]V = if (std.mem.eql(u8, atom, "func") or std.mem.eql(u8, atom, "funcref") or std.mem.eql(u8, atom, "nofunc"))
+    // ⚠️ Each hierarchy's BOTTOM is its own pair, not its top's. Folding
+    // `nofunc`/`noextern`/`noexn` onto func/extern/exn here made
+    // `(ref.null nofunc)` the same type as `(ref null func)` — which is wrong in
+    // the direction that matters, since only the bottom flows into a concrete
+    // `(ref null $t)`. The binary decoder was corrected in the same pass; these
+    // two are the producer/consumer pair for this type and must not drift.
+    const pair: ?[2]V = if (std.mem.eql(u8, atom, "func") or std.mem.eql(u8, atom, "funcref"))
         .{ .funcref, .funcref_nn }
-    else if (std.mem.eql(u8, atom, "extern") or std.mem.eql(u8, atom, "externref") or std.mem.eql(u8, atom, "noextern"))
+    else if (std.mem.eql(u8, atom, "extern") or std.mem.eql(u8, atom, "externref"))
         .{ .externref, .externref_nn }
-    else if (std.mem.eql(u8, atom, "exn") or std.mem.eql(u8, atom, "exnref") or std.mem.eql(u8, atom, "noexn"))
+    else if (std.mem.eql(u8, atom, "exn") or std.mem.eql(u8, atom, "exnref"))
         .{ .exnref, .exnref_nn }
+    else if (std.mem.eql(u8, atom, "nofunc") or std.mem.eql(u8, atom, "nullfuncref"))
+        .{ .nullfuncref, .nullfuncref_nn }
+    else if (std.mem.eql(u8, atom, "noextern") or std.mem.eql(u8, atom, "nullexternref"))
+        .{ .nullexternref, .nullexternref_nn }
+    else if (std.mem.eql(u8, atom, "noexn") or std.mem.eql(u8, atom, "nullexnref"))
+        .{ .nullexnref, .nullexnref_nn }
     else if (std.mem.eql(u8, atom, "any") or std.mem.eql(u8, atom, "anyref"))
         .{ .anyref, .anyref_nn }
     else if (std.mem.eql(u8, atom, "eq") or std.mem.eql(u8, atom, "eqref"))
@@ -1353,16 +1763,23 @@ fn stringToValType(atom: []const u8) ?V {
     const map = .{
         .{ "i32", V.i32 },             .{ "i64", V.i64 },             .{ "f32", V.f32 },
         .{ "f64", V.f64 },             .{ "v128", V.v128 },
-        .{ "funcref", V.funcref },     .{ "nullfuncref", V.funcref },
-        // `anyfunc` is the pre-standard spelling of `funcref` (MVP-era tools and
-        // hand-written .wat still emit it, e.g. `(table N anyfunc)`).
-        .{ "anyfunc", V.funcref },
-        .{ "externref", V.externref }, .{ "nullexternref", V.externref },
+        .{ "funcref", V.funcref },
+        // NO `anyfunc` alias here — see `obsoleteValType`. It mapped to
+        // `V.funcref` until the baseline audit showed it was the last place
+        // wazmrt was knowingly wrong by the spec.
+        .{ "externref", V.externref },
         // The WasmGC `any` hierarchy — each shorthand its own value type.
         .{ "anyref", V.anyref },       .{ "eqref", V.eqref },
         .{ "i31ref", V.i31ref },       .{ "structref", V.structref },
-        .{ "arrayref", V.arrayref },   .{ "nullref", V.nullref },
-        .{ "exnref", V.exnref },       .{ "nullexnref", V.exnref },
+        .{ "arrayref", V.arrayref },
+        .{ "exnref", V.exnref },
+        // The four BOTTOMS. `nullfuncref`/`nullexternref`/`nullexnref` used to
+        // map to their family HEAD here, so the shorthand and the `(ref null
+        // nofunc)` long form named different types — and neither could reach a
+        // concrete `(ref null $t)`.
+        .{ "nullref", V.nullref },     .{ "nullfuncref", V.nullfuncref },
+        .{ "nullexternref", V.nullexternref },
+        .{ "nullexnref", V.nullexnref },
     };
     inline for (map) |m| {
         if (std.mem.eql(u8, atom, m[0])) return m[1];
@@ -1467,11 +1884,11 @@ fn emitFoldedOne(ctx: *Ctx, l: []const Sexpr, i: usize) Error!usize {
         .try_table => try emitTryTable(ctx, l),
         .@"if" => try emitFoldedIf(ctx, l),
         .select => try emitFoldedSelect(ctx, l),
-        .call_indirect => {
+        .call_indirect, .return_call_indirect => {
             const ann = try parseCallIndirectType(ctx, l, 1);
             var j = ann.next;
             while (j < l.len) j = try emitOne(ctx, l, j); // operands
-            try emitCallIndirect(ctx, ann.idx, ann.table);
+            try emitCallIndirect(ctx, op, ann.idx, ann.table);
         },
         .ref_test, .ref_cast => {
             if (l.len < 2) return error.BadImmediate;
@@ -1498,23 +1915,45 @@ fn emitFoldedOne(ctx: *Ctx, l: []const Sexpr, i: usize) Error!usize {
 /// `(param)(result)`) from `items[start..]`; return its type index + next index.
 fn parseCallIndirectType(ctx: *Ctx, items: []const Sexpr, start: usize) Error!struct { idx: u32, table: u32, next: usize } {
     var j = start;
-    // Optional explicit table index/id — only when an atom is *followed by* a
-    // `(type …)`/`(param …)`/`(result …)` annotation (`call_indirect $t (type …)`).
-    // Otherwise a bare atom is the next instruction (e.g. flat `call_indirect select`).
+    // Optional explicit table index/id. The predicate is `isIndexAtom` — a
+    // `$name` or a digit — because a FOLLOWING instruction is never either
+    // (`call_indirect select` is an atom too, which is why a bare `asAtom()`
+    // would be wrong here).
+    //
+    // ⚠️ This used to additionally require a `(type …)`/`(param …)`/`(result …)`
+    // to follow, which silently dropped the *abbreviated* form: the type use is
+    // OPTIONAL and absent means `[] -> []`, so `(call_indirect $t (i32.const 0))`
+    // left `$t` unconsumed, and the operand loop then tried to assemble `$t` as
+    // an instruction — `UnknownInstr`, naming a table. Same shape as the flat
+    // `br_table` fix: the guard was tightened around one form and excluded a
+    // sibling that is equally legal.
     var table: u32 = 0;
-    if (j + 1 < items.len and items[j].asAtom() != null and isTypeUse(items[j + 1])) {
+    if (j < items.len and isIndexAtom(items[j])) {
         table = try resolveByName(ctx.table_names, items[j]);
         j += 1;
     }
     var type_ref: ?Sexpr = null;
     var params: List(V) = .empty;
     var results: List(V) = .empty;
+    var seen: u8 = 0;
     while (j < items.len and items[j].keyword() != null) : (j += 1) {
         const kw = items[j].keyword().?;
-        if (std.mem.eql(u8, kw, "type")) type_ref = try nth(try wantList(items[j]), 1) else if (std.mem.eql(u8, kw, "param")) try parseDecls(ctx.a, (try wantList(items[j])), &params, null, ctx.type_names) else if (std.mem.eql(u8, kw, "result")) try parseDecls(ctx.a, (try wantList(items[j])), &results, null, ctx.type_names) else break;
+        const rank = typeUseRank(kw) orelse break;
+        if (rank == 4) break; // `local` is not part of a type use
+        try typeUseOrder(&seen, rank);
+        // No local context here, so no `(param $x …)` — see `parseDecls`.
+        switch (rank) {
+            1 => type_ref = try nth(try wantList(items[j]), 1),
+            2 => try parseDecls(ctx.a, (try wantList(items[j])), &params, null, ctx.type_names, false),
+            else => try parseDecls(ctx.a, (try wantList(items[j])), &results, null, ctx.type_names, false),
+        }
     }
-    const idx = if (type_ref) |tr| try resolveType(ctx.type_names, tr) else try internSig(ctx.a, ctx.sigs, params.items, results.items);
-    return .{ .idx = idx, .table = table, .next = j };
+    if (type_ref) |tr| {
+        const idx = try resolveType(ctx.type_names, tr);
+        try checkInlineTypeUse(ctx.sigs, idx, params.items, results.items);
+        return .{ .idx = idx, .table = table, .next = j };
+    }
+    return .{ .idx = try internSig(ctx.a, ctx.sigs, params.items, results.items), .table = table, .next = j };
 }
 
 /// True if the form is a `call_indirect` type annotation: `(type …)` /
@@ -1524,8 +1963,10 @@ fn isTypeUse(s: Sexpr) bool {
     return std.mem.eql(u8, kw, "type") or std.mem.eql(u8, kw, "param") or std.mem.eql(u8, kw, "result");
 }
 
-fn emitCallIndirect(ctx: *Ctx, type_index: u32, table: u32) Error!void {
-    try ctx.out.append(ctx.a, @intFromEnum(Op.call_indirect));
+/// `op` is `call_indirect` or its tail-call twin `return_call_indirect` — the
+/// immediates are identical, only the opcode byte differs.
+fn emitCallIndirect(ctx: *Ctx, op: Op, type_index: u32, table: u32) Error!void {
+    try ctx.out.append(ctx.a, @intFromEnum(op));
     try uleb(ctx.a, ctx.out, type_index);
     try uleb(ctx.a, ctx.out, table);
 }
@@ -1534,7 +1975,7 @@ fn emitCallIndirect(ctx: *Ctx, type_index: u32, table: u32) Error!void {
 fn emitFoldedSelect(ctx: *Ctx, l: []const Sexpr) Error!void {
     var j: usize = 1;
     var tys: List(V) = .empty;
-    while (j < l.len and eqKw(l[j], "result")) : (j += 1) try parseDecls(ctx.a, (try wantList(l[j])), &tys, null, ctx.type_names);
+    while (j < l.len and eqKw(l[j], "result")) : (j += 1) try parseDecls(ctx.a, (try wantList(l[j])), &tys, null, ctx.type_names, false);
     while (j < l.len) j = try emitOne(ctx, l, j); // operands
     try emitSelect(ctx, tys.items);
 }
@@ -1581,11 +2022,15 @@ fn emitTryTable(ctx: *Ctx, l: []const Sexpr) Error!void {
     var j: usize = 1;
     const label = parseOptLabel(l, &j);
     const bt = try parseBlockTypeSig(ctx, l, &j);
-    // Push the try_table's own label first so a `(catch … $l)` targeting it
-    // resolves to 0 (label 0 = the try_table block); outer labels are > 0.
-    try ctx.labels.append(ctx.a, label);
     try emitBlockTypeSig(ctx, bt);
+    // ⚠️ The catch clauses are emitted BEFORE the try_table's own label is
+    // pushed: a catch's target label is an index into the ENCLOSING label stack
+    // (EH proposal §3.4 checks the catches in `C`, only the body in
+    // `C, labels [t2*]`). Pushing first made `(catch … $l)` resolve one frame too
+    // deep — the exact mirror of the validator's bug, so the two halves agreed
+    // with each other and neither was an oracle for the other.
     try emitCatchClauses(ctx, l, &j);
+    try ctx.labels.append(ctx.a, label);
     try emitSeq(ctx, l[j..]);
     try ctx.out.append(ctx.a, @intFromEnum(Op.end));
     _ = ctx.labels.pop();
@@ -1666,16 +2111,23 @@ fn emitFoldedTry(ctx: *Ctx, l: []const Sexpr) Error!void {
         if (d.len != 0 and eqAtom(d[0], "delegate")) return error.UnsupportedInstr;
     };
 
+    // §6.5.x (legacy EH): `(try (do …) (catch $t …)* (catch_all …)?)` — AT MOST
+    // ONE `catch_all`, and it is last. Unbounded, `(try (do) (catch_all)
+    // (catch_all))` emitted two `0x19` handlers into one try, which
+    // `legacy/try_catch.wast` pins as malformed.
+    var seen_catch_all = false;
     while (j < l.len) : (j += 1) {
         const cl = l[j].asList() orelse return error.BadImmediate;
         if (cl.len == 0) return error.BadImmediate;
         const ckw = cl[0].asAtom() orelse return error.BadImmediate;
+        if (seen_catch_all) return error.BadImmediate; // nothing may follow `catch_all`
         if (std.mem.eql(u8, ckw, "catch")) {
             if (cl.len < 2) return error.BadImmediate;
             try ctx.out.append(ctx.a, @intFromEnum(Op.catch_));
             try uleb(ctx.a, ctx.out, try resolveByName(ctx.tag_names, cl[1]));
             try emitSeq(ctx, cl[2..]);
         } else if (std.mem.eql(u8, ckw, "catch_all")) {
+            seen_catch_all = true;
             try ctx.out.append(ctx.a, @intFromEnum(Op.catch_all));
             try emitSeq(ctx, cl[1..]);
         } else return error.BadImmediate; // only catch/catch_all/delegate may follow `(do …)`
@@ -1718,6 +2170,21 @@ fn emitFoldedIf(ctx: *Ctx, l: []const Sexpr) Error!void {
     _ = ctx.labels.pop();
 }
 
+/// Consume the optional label id that may follow a flat `else`/`end` (§6.5.2) and
+/// return how many items it took (0 or 1). The id must name the block being
+/// closed; a mismatch is malformed, which is the only reason the form exists.
+fn closingLabelId(ctx: *Ctx, items: []const Sexpr, j: usize) Error!usize {
+    if (j >= items.len) return 0;
+    const atom = items[j].asAtom() orelse return 0;
+    if (atom.len == 0 or atom[0] != '$') return 0;
+    const open = if (ctx.labels.items.len != 0) ctx.labels.items[ctx.labels.items.len - 1] else null;
+    // An id repeated on an UNLABELLED block, or naming a different one, is
+    // malformed — `(block … end $wrong)` must not assemble.
+    const nm = open orelse return error.BadImmediate;
+    if (!std.mem.eql(u8, nm, atom)) return error.BadImmediate;
+    return 1;
+}
+
 /// A flat instruction at `items[i]` (`name` is its atom); return the next index.
 fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Error!usize {
     if (lookupSimd(name)) |sd| return emitSimd(ctx, sd, items, i + 1, false);
@@ -1733,26 +2200,36 @@ fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Erro
             return j;
         },
         .try_table => {
-            // Flat: `try_table $l? blocktype? catch* … end`. Push the label before
-            // resolving the catch labels (label 0 = the try_table itself); the
+            // Flat: `try_table $l? blocktype? catch* … end`. The catch labels are
+            // resolved in the ENCLOSING label scope, so they are emitted before the
+            // try_table's own label is pushed — see `emitTryTable` for why. The
             // body instructions follow and the eventual `end` pops the label.
             try ctx.out.append(ctx.a, @intFromEnum(op));
             var j = i + 1;
             const label = parseOptLabel(items, &j);
             const bt = try parseBlockTypeSig(ctx, items, &j);
-            try ctx.labels.append(ctx.a, label);
             try emitBlockTypeSig(ctx, bt);
             try emitCatchClauses(ctx, items, &j);
+            try ctx.labels.append(ctx.a, label);
             return j;
         },
+        // §6.5.2: a flat `else`/`end` may REPEAT the enclosing block's label —
+        // `if $body … else $body … end $body` — as a redundancy check on deeply
+        // nested code. We consumed neither, so the id was left to be assembled as
+        // the next instruction and came back `UnknownInstr` naming a label. That
+        // killed `stack.wast`'s only module and its whole file with it.
+        //
+        // The repetition is checked, not just skipped: that is the entire reason
+        // the form exists, and a mismatched id is malformed.
         .@"else" => {
             try ctx.out.append(ctx.a, @intFromEnum(Op.@"else"));
-            return i + 1;
+            return i + 1 + try closingLabelId(ctx, items, i + 1);
         },
         .end => {
             try ctx.out.append(ctx.a, @intFromEnum(Op.end));
+            const consumed = try closingLabelId(ctx, items, i + 1);
             if (ctx.labels.items.len != 0) _ = ctx.labels.pop();
-            return i + 1;
+            return i + 1 + consumed;
         },
         .br_table => {
             try ctx.out.append(ctx.a, @intFromEnum(Op.br_table));
@@ -1774,13 +2251,13 @@ fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Erro
         .select => {
             var j = i + 1;
             var tys: List(V) = .empty;
-            while (j < items.len and eqKw(items[j], "result")) : (j += 1) try parseDecls(ctx.a, (try wantList(items[j])), &tys, null, ctx.type_names);
+            while (j < items.len and eqKw(items[j], "result")) : (j += 1) try parseDecls(ctx.a, (try wantList(items[j])), &tys, null, ctx.type_names, false);
             try emitSelect(ctx, tys.items);
             return j;
         },
-        .call_indirect => {
+        .call_indirect, .return_call_indirect => {
             const ann = try parseCallIndirectType(ctx, items, i + 1);
-            try emitCallIndirect(ctx, ann.idx, ann.table);
+            try emitCallIndirect(ctx, op, ann.idx, ann.table);
             return ann.next;
         },
         .ref_test, .ref_cast => {
@@ -1892,17 +2369,22 @@ fn parseBlockTypeSig(ctx: *Ctx, l: []const Sexpr, j: *usize) Error!BlockTy {
     var type_ref: ?u32 = null;
     var params: List(V) = .empty;
     var results: List(V) = .empty;
+    var seen: u8 = 0;
     while (j.* < l.len) {
         const kw = l[j.*].keyword() orelse break;
-        if (std.mem.eql(u8, kw, "type")) {
-            type_ref = try resolveType(ctx.type_names, try nth(try wantList(l[j.*]), 1));
-        } else if (std.mem.eql(u8, kw, "param")) {
-            try parseDecls(ctx.a, try wantList(l[j.*]), &params, null, ctx.type_names);
-        } else if (std.mem.eql(u8, kw, "result")) {
-            try parseDecls(ctx.a, try wantList(l[j.*]), &results, null, ctx.type_names);
-        } else break;
+        const rank = typeUseRank(kw) orelse break;
+        if (rank == 4) break; // `local` is not part of a type use
+        try typeUseOrder(&seen, rank);
+        // A block has no local context, so `(block (param $x i32) …)` is
+        // malformed even though the same spelling is fine on a `func`.
+        switch (rank) {
+            1 => type_ref = try resolveType(ctx.type_names, try nth(try wantList(l[j.*]), 1)),
+            2 => try parseDecls(ctx.a, try wantList(l[j.*]), &params, null, ctx.type_names, false),
+            else => try parseDecls(ctx.a, try wantList(l[j.*]), &results, null, ctx.type_names, false),
+        }
         j.* += 1;
     }
+    if (type_ref) |tr| try checkInlineTypeUse(ctx.sigs, tr, params.items, results.items);
     return .{ .type_ref = type_ref, .sig = .{ .params = params.items, .results = results.items } };
 }
 
@@ -1918,10 +2400,21 @@ fn emitBlockTypeSig(ctx: *Ctx, bt: BlockTy) Error!void {
     if (sig.params.len == 0 and sig.results.len == 0) {
         try ctx.out.append(ctx.a, 0x40);
     } else if (sig.params.len == 0 and sig.results.len == 1 and !sig.results[0].isConcrete()) {
-        // Single non-concrete result → the value-type byte form. A concrete ref
-        // can't use the single-byte form (its `0x64 ti` would be misread as an
-        // s33 block type), so it falls through to an interned type index.
+        // Single non-concrete result → the single value-type byte.
         try ctx.out.append(ctx.a, @intCast(@intFromEnum(sig.results[0])));
+    } else if (sig.params.len == 0 and sig.results.len == 1 and sig.results[0].isConcrete()) {
+        // Single CONCRETE ref result → `0x63/0x64 <heaptype>`, the canonical
+        // multi-byte valtype form (§5.3.6).
+        //
+        // ⚠️ This used to fall through to an interned type index, because
+        // `readBlockType` could not decode the multi-byte form — a workaround in
+        // the producer for a gap in the consumer. It did not stay cosmetic:
+        // interning MANUFACTURES a type-section entry, so
+        // `(block (result (ref 1)))` in a one-type module made index 1 exist (the
+        // block's own signature, self-referentially) and the module validated,
+        // where `ref.wast` requires "unknown type". Both halves are canonical now.
+        try ctx.out.append(ctx.a, if (sig.results[0].isNonNullRef()) 0x64 else 0x63);
+        try sleb(ctx.a, ctx.out, @intCast(sig.results[0].concreteIndex()));
     } else {
         try sleb(ctx.a, ctx.out, try internSig(ctx.a, ctx.sigs, sig.params, sig.results));
     }
@@ -1973,6 +2466,12 @@ fn abstractHeapCode(atom: []const u8) ?i64 {
         .{ "struct", -0x15 }, .{ "array", -0x16 }, .{ "none", -0x0f },
         .{ "func", -0x10 }, .{ "extern", -0x11 }, .{ "nofunc", -0x0d },
         .{ "noextern", -0x0e },
+        // ⚠️ `exn` was missing, so `(ref.null exn)` — the canonical way to write a
+        // null exception reference — was `BadImmediate`. That single omission
+        // failed `ref_null.wast`'s FIRST module and took the other 32 assertions
+        // in the file into `NoTarget` with it. `readHeapType`, `readHeapTypeRef`
+        // and `heapTypeToValType` all knew `exn`; this table did not.
+        .{ "exn", -0x17 }, .{ "noexn", -0x0c },
     };
     inline for (map) |m| if (std.mem.eql(u8, atom, m[0])) return m[1];
     return null;
@@ -2122,6 +2621,27 @@ fn emitInstr(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
             try uleb(ctx.a, ctx.out, try resolveType(ctx.type_names, immediates[0]));
             try uleb(ctx.a, ctx.out, try resolveByName(&.{}, immediates[1])); // element count
         },
+        // `array.new_data $t $d` / `array.init_data $t $d` — the segment operand is
+        // resolved against the DATA names (`$d` or a numeric index), the same way
+        // `memory.init` does; the type index comes first in both text and binary.
+        .gc_data => {
+            if (immediates.len < 2) return error.BadImmediate;
+            try uleb(ctx.a, ctx.out, try resolveType(ctx.type_names, immediates[0]));
+            try uleb(ctx.a, ctx.out, try resolveByName(ctx.data_names, immediates[1]));
+        },
+        // `array.new_elem $t $e` / `array.init_elem $t $e` — same shape against the
+        // ELEMENT names.
+        .gc_elem => {
+            if (immediates.len < 2) return error.BadImmediate;
+            try uleb(ctx.a, ctx.out, try resolveType(ctx.type_names, immediates[0]));
+            try uleb(ctx.a, ctx.out, try resolveByName(ctx.elem_names, immediates[1]));
+        },
+        // `array.copy $dst $src` — two array TYPE indices, destination first.
+        .gc_array_copy => {
+            if (immediates.len < 2) return error.BadImmediate;
+            try uleb(ctx.a, ctx.out, try resolveType(ctx.type_names, immediates[0]));
+            try uleb(ctx.a, ctx.out, try resolveType(ctx.type_names, immediates[1]));
+        },
         else => return error.UnsupportedInstr, // block_type (handled structurally), call_indirect
     }
 }
@@ -2203,7 +2723,7 @@ fn flatImmCount(op: Op) usize {
         .local, .global, .func, .label, .i32c, .i64c, .f32c, .f64c, .ref_type, .gc_type => 1,
         .data, .data_init => 1, // memory.init / data.drop: a data index
         .tag => 1, // throw <tagidx>
-        .gc_field, .gc_type_n => 2,
+        .gc_field, .gc_type_n, .gc_data, .gc_elem, .gc_array_copy => 2,
         else => 0,
     };
 }
@@ -2300,9 +2820,11 @@ fn emitSimd(ctx: *Ctx, sd: SimdOp, items: []const Sexpr, start: usize, is_folded
             lane = try simdLaneByte(items[j]);
             j += 1;
         },
+        // A shuffle index is a `laneidx` too — same rule, so the same parser.
+        // A second copy of it is a second place to be incomplete.
         .shuffle => for (0..16) |k| {
             if (j >= items.len) return error.BadImmediate;
-            cbytes[k] = std.math.cast(u8, @as(u32, @bitCast(@as(i32, @truncate(try parseWatI32(items[j])))))) orelse return error.BadImmediate;
+            cbytes[k] = try simdLaneByte(items[j]);
             j += 1;
         },
         .const_ => j = try parseV128Const(items, j, &cbytes),
@@ -2368,8 +2890,17 @@ fn emitSimd(ctx: *Ctx, sd: SimdOp, items: []const Sexpr, start: usize, is_folded
 /// Parse a SIMD lane / shuffle index atom into a byte (the decoder range-checks
 /// it against the op's lane count). `(i32x4.extract_lane 999)` -> `BadImmediate`
 /// rather than an `@intCast(u32->u8)` overflow (UB in ReleaseFast).
+///
+/// ⚠️ **A `laneidx` is `u8` — a NAT, so a sign is not part of the literal.**
+/// `(i32x4.replace_lane +3 …)` used to assemble as lane 3 because this went
+/// through `parseWatI32`, whose grammar is `sign? uN`. Leading zeros and `_`
+/// separators stay legal (`03`, `0x0_7`); only the sign goes.
 fn simdLaneByte(s: Sexpr) Error!u8 {
-    return std.math.cast(u8, @as(u32, @bitCast(@as(i32, @truncate(try parseWatI32(s)))))) orelse error.BadImmediate;
+    const atom = s.asAtom() orelse return error.BadImmediate;
+    if (atom.len > 0 and (atom[0] == '+' or atom[0] == '-')) return error.BadImmediate;
+    if (!validIntLit(atom)) return error.BadImmediate;
+    const v = std.fmt.parseInt(u32, atom, 0) catch return error.BadImmediate;
+    return std.math.cast(u8, v) orelse error.BadImmediate;
 }
 
 /// Map an atomic (`0xFE`) mnemonic to its sub-opcode, or null. The rmw/cmpxchg
@@ -2478,24 +3009,31 @@ fn parseV128Const(items: []const Sexpr, start: usize, out: *[16]u8) Error!usize 
     // Number of lane values that must follow the shape atom.
     const count: usize = if (std.mem.eql(u8, shape, "i8x16")) 16 else if (std.mem.eql(u8, shape, "i16x8") or std.mem.eql(u8, shape, "f32x4") or std.mem.eql(u8, shape, "i32x4")) (if (std.mem.eql(u8, shape, "i16x8")) 8 else 4) else if (std.mem.eql(u8, shape, "i64x2") or std.mem.eql(u8, shape, "f64x2")) 2 else return error.BadImmediate;
     if (j + count > items.len) return error.BadImmediate;
+    // ⚠️ **Each lane is bounded by its OWN width, not by i32.** These arms used to
+    // parse every integer lane as an i32/i64 and then mask it down, so
+    // `v128.const i8x16 0x100 …` silently became sixteen zero bytes and
+    // `-0x81` became `0x7f`. `simd_const.wast` has ~40 `assert_malformed`s on
+    // exactly that, none of which could run before `(module quote …)` did.
+    // `parseIntLitN` refuses anything outside the lane type's signed OR unsigned
+    // range, which makes the truncation below lossless by construction.
     if (std.mem.eql(u8, shape, "i8x16")) {
         for (0..16) |k| {
-            out[k] = @intCast(@as(u32, @bitCast(@as(i32, @truncate(try parseWatI32(items[j]))))) & 0xff);
+            out[k] = @truncate(@as(u64, @bitCast(try parseIntLitN(i8, u8, items[j].asAtom() orelse return error.BadImmediate))));
             j += 1;
         }
     } else if (std.mem.eql(u8, shape, "i16x8")) {
         for (0..8) |k| {
-            std.mem.writeInt(u16, out[k * 2 ..][0..2], @truncate(@as(u64, @bitCast(try parseWatI32(items[j])))), .little);
+            std.mem.writeInt(u16, out[k * 2 ..][0..2], @truncate(@as(u64, @bitCast(try parseIntLitN(i16, u16, items[j].asAtom() orelse return error.BadImmediate)))), .little);
             j += 1;
         }
     } else if (std.mem.eql(u8, shape, "i32x4")) {
         for (0..4) |k| {
-            std.mem.writeInt(u32, out[k * 4 ..][0..4], @truncate(@as(u64, @bitCast(try parseWatI32(items[j])))), .little);
+            std.mem.writeInt(u32, out[k * 4 ..][0..4], @truncate(@as(u64, @bitCast(try parseIntLitN(i32, u32, items[j].asAtom() orelse return error.BadImmediate)))), .little);
             j += 1;
         }
     } else if (std.mem.eql(u8, shape, "i64x2")) {
         for (0..2) |k| {
-            std.mem.writeInt(u64, out[k * 8 ..][0..8], @bitCast(try parseWatI64(items[j])), .little);
+            std.mem.writeInt(u64, out[k * 8 ..][0..8], @bitCast(try parseIntLitN(i64, u64, items[j].asAtom() orelse return error.BadImmediate)), .little);
             j += 1;
         }
     } else if (std.mem.eql(u8, shape, "f32x4")) {
@@ -2518,6 +3056,17 @@ fn lookupOp(name: []const u8) ?Op {
     var buf: [64]u8 = undefined;
     if (name.len > buf.len) return null;
     for (name, 0..) |c, i| buf[i] = if (c == '.') '_' else c;
+    // ⚠️ **`Op` holds legacy-EH CLAUSE tags (`catch_all` = 0x19) as well as
+    // instructions, and this lookup cannot tell them apart — that is CORRECT and
+    // must stay.** In FLAT legacy syntax `try … catch_all … end` the clause IS a
+    // bare mnemonic in the instruction stream, so filtering it here breaks the
+    // form: a guard added for `(func (catch_all))` cost two corpus passes.
+    // Nothing is lost by allowing it, because `validate.zig`'s `.catch_,
+    // .catch_all` arm rejects a clause whose enclosing frame is not a
+    // `try_legacy`/`catch_legacy` — a stray `catch_all` is `MismatchedCatch`.
+    // **The rule lives in the validator, where both the text and the binary path
+    // reach it; a producer-side filter would have covered only one and broken a
+    // legal spelling.**
     return std.meta.stringToEnum(Op, buf[0..name.len]);
 }
 
@@ -2570,6 +3119,26 @@ const MemLimits = struct { min: u64, max: ?u64 = null, shared: bool = false, is6
 /// emit); either position is accepted, neither required. Advances `mi`. One home
 /// for the parse the three memory sites (inline defined / inline import /
 /// top-level `(import … (memory …))`) used to each copy.
+/// Reject anything left over in a `(memory …)` field after its limits.
+///
+/// `parseMemLimits` stops at the first item that is not a number / `shared`, and
+/// the caller used to just walk away — so every trailing form was **silently
+/// dropped**. `(memory 0 (pagesize 3))` therefore assembled into a plain 64 KiB-
+/// page memory: the module built, ran, and disagreed with its own source. That
+/// is 18 of `custom-page-sizes-invalid.wast`'s assertions, and the *reason* the
+/// `memory.grow` in `custom-page-sizes.wast` answers −1 — the memory was never
+/// the one the text asked for. A trailing ATOM already failed (`parseU64` chokes
+/// on it); only lists slipped through, which is why this went unnoticed.
+///
+/// `pagesize` is named separately because it is real syntax from a real proposal
+/// we do not implement, not a typo — see `error.UnsupportedProposal`.
+fn checkMemTail(items: []const Sexpr, mi: usize) Error!void {
+    if (mi >= items.len) return;
+    if (items[mi].asList()) |l| if (l.len != 0 and eqAtom(l[0], "pagesize"))
+        return error.UnsupportedProposal;
+    return error.BadModuleField;
+}
+
 fn parseMemLimits(items: []const Sexpr, mi: *usize, is64_seen: bool, type_seen: bool) Error!MemLimits {
     var is64 = is64_seen;
     // Consume the index type here only if one wasn't already taken after the name
@@ -2595,18 +3164,121 @@ fn parseMemLimits(items: []const Sexpr, mi: *usize, is64_seen: bool, type_seen: 
     return .{ .min = min, .max = max, .shared = shared, .is64 = is64 };
 }
 
+// --- Strict numeric-literal syntax (§6.3.1) ---------------------------------
+//
+// ⚠️ **`std.fmt.parseInt`/`parseFloat` are NOT wasm-text literal parsers**, and
+// treating them as one was an accept-invalid class ~70 assertions wide. Zig's
+// grammar is close enough to look right and differs exactly where the spec is
+// strict: it takes `_` in positions wasm forbids (`0x_100`, `0x00_`,
+// `0xff__ffff`) and `parseFloat` accepts a leading-point form (`.0`, `.0e0`)
+// that wasm requires a digit before. Every one of those is an `assert_malformed`
+// in `const.wast` / `float_literals.wast` / `int_literals.wast`, and **all of
+// them were invisible until `(module quote …)` ran** — the literals only appear
+// in quoted text.
+//
+// The grammar, with the underscore rule stated once because it is the whole
+// subtlety: `_` is a *separator BETWEEN digits*, so it may never lead, trail, or
+// double.
+//
+//     num     ::= digit (_? digit)*
+//     hexnum  ::= hexdigit (_? hexdigit)*
+//     float   ::= num (. num?)? ((e|E) sign? num)?
+//     hexfloat::= 0x hexnum (. hexnum?)? ((p|P) sign? num)?
+
+fn isDigit(c: u8) bool {
+    return c >= '0' and c <= '9';
+}
+fn isHexDigit(c: u8) bool {
+    return isDigit(c) or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+}
+
+/// Consume `num`/`hexnum` at `s[i.*..]`, advancing `i`. False if there is not at
+/// least one digit, or if an `_` is not surrounded by digits on both sides.
+fn scanDigits(s: []const u8, i: *usize, comptime hex: bool) bool {
+    const ok = if (hex) isHexDigit else isDigit;
+    if (i.* >= s.len or !ok(s[i.*])) return false; // must START with a digit
+    while (i.* < s.len) {
+        if (ok(s[i.*])) {
+            i.* += 1;
+        } else if (s[i.*] == '_') {
+            // A separator needs a digit on each side: the previous character is
+            // one by construction, so only the NEXT has to be checked.
+            if (i.* + 1 >= s.len or !ok(s[i.* + 1])) return false;
+            i.* += 1;
+        } else break;
+    }
+    return true;
+}
+
+/// Is `lit` a syntactically valid wasm-text integer literal (`sign? uN`)?
+fn validIntLit(lit: []const u8) bool {
+    var i: usize = 0;
+    if (i < lit.len and (lit[i] == '+' or lit[i] == '-')) i += 1;
+    const hex = std.mem.startsWith(u8, lit[i..], "0x") or std.mem.startsWith(u8, lit[i..], "0X");
+    if (hex) i += 2;
+    if (!(if (hex) scanDigits(lit, &i, true) else scanDigits(lit, &i, false))) return false;
+    return i == lit.len; // no trailing junk
+}
+
+/// Is `lit` a syntactically valid wasm-text float literal? Covers `inf`/`nan`
+/// and the `nan:…` payload forms as well as `float`/`hexfloat`.
+fn validFloatLit(lit: []const u8) bool {
+    var i: usize = 0;
+    if (i < lit.len and (lit[i] == '+' or lit[i] == '-')) i += 1;
+    const rest = lit[i..];
+    if (std.mem.eql(u8, rest, "inf")) return true;
+    if (std.mem.eql(u8, rest, "nan")) return true;
+    if (std.mem.startsWith(u8, rest, "nan:")) {
+        const tail = rest[4..];
+        if (std.mem.eql(u8, tail, "canonical") or std.mem.eql(u8, tail, "arithmetic")) return true;
+        if (!std.mem.startsWith(u8, tail, "0x")) return false;
+        var j: usize = 2;
+        return scanDigits(tail, &j, true) and j == tail.len;
+    }
+    const hex = std.mem.startsWith(u8, rest, "0x") or std.mem.startsWith(u8, rest, "0X");
+    if (hex) i += 2;
+    if (!(if (hex) scanDigits(lit, &i, true) else scanDigits(lit, &i, false))) return false;
+    if (i < lit.len and lit[i] == '.') {
+        i += 1;
+        // The fraction is OPTIONAL (`1.` is valid) but must be well-formed if present.
+        if (i < lit.len and (if (hex) isHexDigit(lit[i]) else isDigit(lit[i]))) {
+            if (!(if (hex) scanDigits(lit, &i, true) else scanDigits(lit, &i, false))) return false;
+        }
+    }
+    if (i < lit.len) {
+        // The exponent marker is `p`/`P` for hexfloat, `e`/`E` for decimal —
+        // crossing them (`0x1e5`, `1p3`) is not an exponent at all.
+        const marker: [2]u8 = if (hex) .{ 'p', 'P' } else .{ 'e', 'E' };
+        if (lit[i] != marker[0] and lit[i] != marker[1]) return false;
+        i += 1;
+        if (i < lit.len and (lit[i] == '+' or lit[i] == '-')) i += 1;
+        if (!scanDigits(lit, &i, false)) return false; // the exponent is always decimal
+    }
+    return i == lit.len;
+}
+
+/// Parse an `iN` literal that must fit N bits in EITHER spelling — signed
+/// `[-2^(N-1), 2^(N-1)-1]` or unsigned `[0, 2^N-1]` — and return it as the
+/// sign-extended pattern the SLEB encoder wants.
+///
+/// ⚠️ **`i32.const 0x100000000` used to become `0`.** The old code parsed into an
+/// `i64` and `@truncate`d, so an out-of-range literal was silently reinterpreted
+/// rather than refused — a wrong VALUE compiled from valid-looking source, not
+/// merely a missed `assert_malformed`. §6.3.2 says a literal outside the type's
+/// range is malformed, and `const.wast` pins ~20 of them.
+fn parseIntLitN(comptime S: type, comptime U: type, atom: []const u8) Error!i64 {
+    if (!validIntLit(atom)) return error.BadImmediate;
+    if (std.fmt.parseInt(S, atom, 0)) |v| return v else |_| {}
+    if (std.fmt.parseInt(U, atom, 0)) |u| return @as(S, @bitCast(u)) else |_| {}
+    return error.BadImmediate;
+}
+
 fn parseWatI32(s: Sexpr) Error!i64 {
-    const atom = s.asAtom() orelse return error.BadImmediate;
-    const v = std.fmt.parseInt(i64, atom, 0) catch (std.fmt.parseInt(u32, atom, 0) catch return error.BadImmediate);
-    return @as(i32, @truncate(v)); // sign-extended back to i64 for SLEB
+    return parseIntLitN(i32, u32, s.asAtom() orelse return error.BadImmediate);
 }
 
 fn parseWatI64(s: Sexpr) Error!i64 {
-    const atom = s.asAtom() orelse return error.BadImmediate;
-    return std.fmt.parseInt(i64, atom, 0) catch {
-        const u = std.fmt.parseInt(u64, atom, 0) catch return error.BadImmediate;
-        return @bitCast(u);
-    };
+    return parseIntLitN(i64, u64, s.asAtom() orelse return error.BadImmediate);
 }
 
 fn floatBits(ctx: *Ctx, comptime U: type, s: Sexpr) Error!void {
@@ -2622,20 +3294,54 @@ fn floatBits(ctx: *Ctx, comptime U: type, s: Sexpr) Error!void {
 /// ordinary values plus plain `inf`/`nan`; this adds the wasm `nan:canonical` /
 /// `nan:arithmetic` / `nan:0x<payload>` forms. Returns null on a malformed literal.
 fn floatLitBits(comptime U: type, comptime F: type, lit: []const u8) ?U {
-    if (std.mem.indexOfScalar(u8, lit, ':')) |c| {
+    // Syntax first, value second: `std.fmt.parseFloat` would happily take `.0`
+    // and `0x_1.0`, which the text format does not define. See `validFloatLit`.
+    if (!validFloatLit(lit)) return null;
+    // Every `nan` form goes through here, including the BARE one.
+    //
+    // ⚠️ This used to key on the presence of a `:`, so `nan:0x…`/`nan:canonical`
+    // got their sign bit applied and a plain `-nan` did not — it fell through to
+    // `std.fmt.parseFloat`, which returns a positive NaN. `float_literals.wast`'s
+    // `f32.negative_nan`/`f64.negative_nan` are exactly that, and they were
+    // failing before R5 too; the sign of a NaN is observable through
+    // `f32.copysign` and `i32.reinterpret_f32`, so this is a wrong VALUE, not a
+    // cosmetic bit.
+    const neg = lit.len != 0 and lit[0] == '-';
+    const body = if (lit.len != 0 and (lit[0] == '-' or lit[0] == '+')) lit[1..] else lit;
+    if (std.mem.startsWith(u8, body, "nan")) {
         const canonical: U = if (F == f32) 0x7fc00000 else 0x7ff8000000000000;
         const sign_bit: U = @as(U, 1) << (@bitSizeOf(F) - 1);
         const mant_mask: U = (@as(U, 1) << std.math.floatMantissaBits(F)) - 1;
         var bits: U = canonical;
-        const tail = lit[c + 1 ..];
-        if (!std.mem.eql(u8, tail, "canonical") and !std.mem.eql(u8, tail, "arithmetic")) {
-            const payload = std.fmt.parseInt(U, tail, 0) catch return null;
-            bits = (canonical & ~mant_mask) | (payload & mant_mask);
+        if (std.mem.startsWith(u8, body, "nan:")) {
+            const tail = body[4..];
+            // `nan:canonical` / `nan:arithmetic` are RESULT MATCHERS in a `.wast`
+            // assertion, not values: no module may contain them, and
+            // `(f32.const nan:arithmetic)` is malformed. `wast.zig` recognises the
+            // two spellings itself (it has to compare a *class* of NaNs, not a bit
+            // pattern), so this parser — which exists only to emit a module — must
+            // refuse them rather than quietly encode a canonical NaN.
+            if (std.mem.eql(u8, tail, "canonical") or std.mem.eql(u8, tail, "arithmetic")) return null;
+            {
+                const payload = std.fmt.parseInt(U, tail, 0) catch return null;
+                // A NaN payload of zero would encode an INFINITY, not a NaN.
+                if (payload & mant_mask == 0) return null;
+                bits = (canonical & ~mant_mask) | (payload & mant_mask);
+            }
         }
-        if (lit.len != 0 and lit[0] == '-') bits |= sign_bit;
+        if (neg) bits |= sign_bit;
         return bits;
     }
     const f = parseFloatLit(F, lit) orelse return null;
+    // §6.3.3: a float literal that ROUNDS TO INFINITY is out of range — only the
+    // literal `inf` may produce one. `0x1p128` is 2^128, past f32's maximum, and
+    // silently became `+inf`: a wrong value, and one that then compares equal to
+    // a legitimate overflow result.
+    //
+    // The `inf` spelling has to be excluded explicitly. Writing this check as a
+    // bare `isInf` first REJECTED `inf` — the guard has to distinguish "the value
+    // is infinite" from "the source said infinite", which is the whole rule.
+    if (std.math.isInf(f) and !std.mem.eql(u8, body, "inf")) return null;
     return @bitCast(f);
 }
 
@@ -2846,15 +3552,17 @@ fn parseTagType(a: std.mem.Allocator, items: []const Sexpr, start: usize, sigs: 
     var type_ref: ?u32 = null;
     var params: List(V) = .empty;
     var results: List(V) = .empty;
+    var seen: u8 = 0;
     while (j < items.len) : (j += 1) {
         const tkw = items[j].keyword() orelse break;
-        if (std.mem.eql(u8, tkw, "type")) {
-            type_ref = try resolveType(type_names, try nth(try wantList(items[j]), 1));
-        } else if (std.mem.eql(u8, tkw, "param")) {
-            try parseDecls(a, (try wantList(items[j])), &params, null, type_names);
-        } else if (std.mem.eql(u8, tkw, "result")) {
-            try parseDecls(a, (try wantList(items[j])), &results, null, type_names);
-        } else break;
+        const rank = typeUseRank(tkw) orelse break;
+        if (rank == 4) break; // `local` is not part of a type use
+        try typeUseOrder(&seen, rank);
+        switch (rank) {
+            1 => type_ref = try resolveType(type_names, try nth(try wantList(items[j]), 1)),
+            2 => try parseDecls(a, (try wantList(items[j])), &params, null, type_names, true),
+            else => try parseDecls(a, (try wantList(items[j])), &results, null, type_names, false),
+        }
     }
     return resolveTagSig(a, sigs, type_ref, params.items, results.items);
 }
@@ -2865,13 +3573,7 @@ fn parseTagType(a: std.mem.Allocator, items: []const Sexpr, start: usize, sigs: 
 /// inline signature. Shared by imported (`parseTagType`) and defined tags.
 fn resolveTagSig(a: std.mem.Allocator, sigs: *List(Sig), type_ref: ?u32, params: []const V, results: []const V) Error!u32 {
     if (type_ref) |tr| {
-        // Guard the index — a malformed numeric type index is caught downstream at
-        // decode/validate; here we only cross-check when both forms are present.
-        if ((params.len != 0 or results.len != 0) and tr < sigs.items.len) {
-            const sig = sigs.items[tr];
-            if (!std.mem.eql(V, sig.params, params) or !std.mem.eql(V, sig.results, results))
-                return error.BadModuleField;
-        }
+        try checkInlineTypeUse(sigs, tr, params, results);
         return tr;
     }
     return try internSig(a, sigs, params, results);
@@ -2880,6 +3582,7 @@ fn resolveTagSig(a: std.mem.Allocator, sigs: *List(Sig), type_ref: ?u32, params:
 fn internSig(a: std.mem.Allocator, sigs: *List(Sig), params: []const V, results: []const V) Error!u32 {
     for (sigs.items, 0..) |sig, i| {
         if (sig.gc_placeholder) continue; // a struct/array slot is not a func type
+        if (!sig.implicit_reusable) continue; // see `Sig.implicit_reusable`
         if (std.mem.eql(V, sig.params, params) and std.mem.eql(V, sig.results, results)) return @intCast(i);
     }
     try sigs.append(a, .{ .params = params, .results = results });
@@ -3004,7 +3707,8 @@ fn assembleAndRun(src: []const u8, name: []const u8, args: []const interp.Value)
     const a = arena.allocator();
     const bin = try assemble(a, src);
     var m = try Module.decode(a, bin);
-    var inst = try interp.Instance.init(a, &m);
+    var inst: interp.Instance = undefined;
+    try inst.instantiate(a, &m);
     const r = try inst.invoke(name, args);
     return r[0];
 }
@@ -3038,6 +3742,18 @@ test "assembler rejects malformed forms without indexing out of bounds" {
     // `@intCast(u32→u8)`-overflow (UB in ReleaseFast).
     try std.testing.expectError(error.BadImmediate, assemble(a, "(module (func (i32x4.extract_lane 999)))"));
     try std.testing.expectError(error.BadImmediate, assemble(a, "(module (func (i8x16.shuffle 999 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0)))"));
+    // A `laneidx` is `u8`, a NAT — a sign is not part of the literal, in either
+    // the lane or the shuffle position.
+    for ([_][]const u8{
+        "(module (func (result i32) (i32x4.extract_lane +3 (v128.const i32x4 0 0 0 0))))",
+        "(module (func (result i32) (i8x16.extract_lane_u +0x0f (v128.const i8x16 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0))))",
+        "(module (func (i8x16.shuffle +1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0)))",
+    }) |src| {
+        try std.testing.expectError(error.BadImmediate, assemble(a, src));
+    }
+    // …but leading zeros and `_` separators stay legal in that position.
+    _ = try assemble(a, "(module (func (result i32) (i32x4.extract_lane 03 (v128.const i32x4 0 0 0 0))))");
+    _ = try assemble(a, "(module (func (result i32) (i16x8.extract_lane_u 0x0_7 (v128.const i16x8 0 0 0 0 0 0 0 0))))");
 }
 
 test "parser rejects a deeply-nested paren bomb instead of overflowing the stack" {
@@ -3294,15 +4010,21 @@ test "SIMD audit regressions (sub_sat_u / nearest / i64x2 all_true+bitmask / dem
     , "f", &.{}));
 }
 
-test "#2f: br_table with mismatched label types (unreachable code) is rejected" {
+test "br_table label types need only agree in ARITY, and only in polymorphic code" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    // Otherwise valid: the block yields f64 → drop → i32.const → the func's i32.
-    // But `br_table 0 1` targets label 0 (the f64 block) and label 1 (the func,
-    // result i32) — incompatible. After `unreachable` the stack is polymorphic,
-    // so `popVals` can't catch it; the cross-label type check (#2f) must.
-    const bin = try assemble(a,
+
+    // ⚠️ **This test asserted the opposite until R10 (2026-08-13), and it was
+    // wrong.** A "#2f" audit finding added a pairwise subtype check between every
+    // `br_table` label and the default, on the reasoning that `popVals` cannot
+    // catch a mismatch once the stack is polymorphic. The reasoning was right and
+    // the RULE does not exist: §3.3.5.9 wants one `[t*]` that is a subtype of
+    // every label's type, and after `unreachable` the stack supplies ⊥, which is a
+    // subtype of everything. `br_table.wast` names the case `meet-bottom` and the
+    // official suite requires it ACCEPTED — the check rejected it and blacked out
+    // 161 assertions. A finding can be well-argued and still invent a rule.
+    const ok = try assemble(a,
         \\(module (func (result i32)
         \\  (block (result f64)
         \\    unreachable
@@ -3310,8 +4032,31 @@ test "#2f: br_table with mismatched label types (unreachable code) is rejected" 
         \\  drop
         \\  (i32.const 5)))
     );
-    var m = try Module.decode(a, bin);
-    try std.testing.expectError(error.TypeMismatch, validate(a, &m));
+    var m = try Module.decode(a, ok);
+    try validate(a, &m);
+
+    // Arity is still cross-checked — one `[t*]` cannot have two lengths. Here
+    // label 0 is the block (`[f64]`) and label 1 the function (`[]`).
+    var m2 = try Module.decode(a, try assemble(a,
+        \\(module (func
+        \\  (block (result f64)
+        \\    unreachable
+        \\    (br_table 0 1 (i32.const 0)))
+        \\  drop))
+    ));
+    try std.testing.expectError(error.TypeMismatch, validate(a, &m2));
+
+    // And in REACHABLE code a genuine mismatch is still caught, by the pops
+    // themselves: the first label leaves a concrete f64 the second must satisfy.
+    var m3 = try Module.decode(a, try assemble(a,
+        \\(module (func (result i32)
+        \\  (block (result f64)
+        \\    (f64.const 1)
+        \\    (br_table 0 1 (i32.const 0)))
+        \\  drop
+        \\  (i32.const 5)))
+    ));
+    try std.testing.expectError(error.TypeMismatch, validate(a, &m3));
 }
 
 test "assembles memory.size / memory.grow (WAT was missing the .mem_index arm)" {
@@ -3473,7 +4218,8 @@ test "table.size / table.grow / table.fill" {
         \\  (func (export "get") (param i32) (result externref) (table.get $t (local.get 0))))
     );
     var m = try Module.decode(a, bin);
-    var inst = try interp.Instance.init(a, &m);
+    var inst: interp.Instance = undefined;
+    try inst.instantiate(a, &m);
     try std.testing.expectEqual(@as(i32, 1), interp.asI32((try inst.invoke("size", &.{}))[0]));
     // grow by 2 (init 99) → returns old size 1; size now 3.
     try std.testing.expectEqual(@as(i32, 1), interp.asI32((try inst.invoke("grow", &.{ interp.i32Value(2), interp.i64Value(99) }))[0]));
@@ -3498,7 +4244,8 @@ test "table.get / table.set on an externref table" {
         \\  (func (export "get") (param i32) (result externref) (table.get $t (local.get 0))))
     );
     var m = try Module.decode(a, bin);
-    var inst = try interp.Instance.init(a, &m);
+    var inst: interp.Instance = undefined;
+    try inst.instantiate(a, &m);
     _ = try inst.invoke("set", &.{ interp.i32Value(1), interp.i64Value(42) });
     try std.testing.expectEqual(@as(i64, 42), interp.asI64((try inst.invoke("get", &.{interp.i32Value(1)}))[0]));
     // Slot 0 was never set → null reference sentinel.
@@ -3527,7 +4274,9 @@ test "reads an imported global from the host value" {
         \\  (func (export "get-y") (result i32) (global.get $y)))
     );
     var m = try Module.decode(a, bin);
-    var inst = try interp.Instance.initWithImports(a, &m, .{ .globals = &.{interp.i32Value(777)} });
+    var inst: interp.Instance = undefined;
+    var imported_x: interp.Instance.Global = .{ .value = interp.i32Value(777) };
+    try inst.instantiateWithImports(a, &m, .{ .globals = &.{&imported_x} });
     try std.testing.expectEqual(@as(i32, 777), interp.asI32((try inst.invoke("get-x", &.{}))[0]));
     // A defined global's init may read the imported one: 777 + 1.
     try std.testing.expectEqual(@as(i32, 778), interp.asI32((try inst.invoke("get-y", &.{}))[0]));
@@ -3548,7 +4297,9 @@ test "v128 global inits from an imported v128 global (both 64-bit halves)" {
     // Imported v128 = i32x4 { 10, 20, 30, 40 }: low half is lanes 0/1, high 2/3.
     const lo: interp.Value = 10 | (@as(u64, 20) << 32);
     const hi: interp.Value = 30 | (@as(u64, 40) << 32);
-    var inst = try interp.Instance.initWithImports(a, &m, .{ .globals = &.{lo}, .globals_hi = &.{hi} });
+    var inst: interp.Instance = undefined;
+    var imported_v: interp.Instance.Global = .{ .value = lo, .hi = hi };
+    try inst.instantiateWithImports(a, &m, .{ .globals = &.{&imported_v} });
     // The defined global copied both halves — lane 0 from the low, lane 3 from the high.
     try std.testing.expectEqual(@as(i32, 10), interp.asI32((try inst.invoke("lo", &.{}))[0]));
     try std.testing.expectEqual(@as(i32, 40), interp.asI32((try inst.invoke("hi", &.{}))[0]));
@@ -3570,7 +4321,8 @@ test "calls an imported (host) function" {
     );
     var m = try Module.decode(a, bin);
     const imports: interp.Instance.Imports = .{ .funcs = &.{.{ .native = hostAdd }} };
-    var inst = try interp.Instance.initWithImports(a, &m, imports);
+    var inst: interp.Instance = undefined;
+    try inst.instantiateWithImports(a, &m, imports);
     // The imported func occupies index 0; call-add dispatches to the host adder.
     try std.testing.expectEqual(@as(i32, 7), interp.asI32((try inst.invoke("call-add", &.{ interp.i32Value(3), interp.i32Value(4) }))[0]));
 }
@@ -3924,16 +4676,27 @@ test "multi-memory: assembles byte-identically to the single-memory form for mem
     const implicit = try assemble(a, "(module (memory 1) (func (result i32) (i32.load (i32.const 0))))");
     try std.testing.expectEqualSlices(u8, implicit, explicit);
 }
-test "anyfunc is accepted as the pre-standard spelling of funcref" {
+test "anyfunc is refused as malformed, in every position it can appear" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    // `(table N anyfunc)` (MVP-era tools still emit it) must assemble, validate,
-    // and produce a byte-identical module to the `funcref` spelling.
-    const with_anyfunc = try assemble(a, "(module (table 4 anyfunc) (func $f) (elem (i32.const 0) $f))");
-    const with_funcref = try assemble(a, "(module (table 4 funcref) (func $f) (elem (i32.const 0) $f))");
-    try std.testing.expectEqualSlices(u8, with_funcref, with_anyfunc);
-    var m = try Module.decode(a, with_anyfunc);
+    // `obsolete-keywords.wast` asserts `anyfunc` is MALFORMED. This test used to
+    // assert the opposite — that it assembled byte-identically to `funcref` —
+    // and that inversion was the last deviation in the conformance baseline.
+    //
+    // The global form is the one the spec file actually pins; the table form is
+    // the one MVP-era tools emit, and it is here because a naive fix makes it
+    // fail as `UnknownIdentifier` (see `isRefType`) — which `wast.zig` banks as
+    // OUR limitation, quietly turning a deviation into a skip.
+    for ([_][]const u8{
+        "(module (global $g anyfunc (ref.null func)))",
+        "(module (table 4 anyfunc) (func $f) (elem (i32.const 0) $f))",
+        "(module (func (param anyfunc)))",
+    }) |src| try std.testing.expectError(error.ObsoleteKeyword, assemble(a, src));
+
+    // The modern spelling is untouched.
+    const ok = try assemble(a, "(module (table 4 funcref) (func $f) (elem (i32.const 0) $f))");
+    var m = try Module.decode(a, ok);
     try validate(a, &m);
 }
 
@@ -4106,7 +4869,8 @@ test "assembles multi-value function results" {
         \\  (local.get 1) (local.get 0)))
     );
     var m = try Module.decode(a, bin);
-    var inst = try interp.Instance.init(a, &m);
+    var inst: interp.Instance = undefined;
+    try inst.instantiate(a, &m);
     const r = try inst.invoke("swap", &.{ interp.i32Value(3), interp.i32Value(7) });
     try std.testing.expectEqual(@as(usize, 2), r.len);
     try std.testing.expectEqual(@as(i32, 7), interp.asI32(r[0]));
@@ -4393,6 +5157,596 @@ test "GC array: array.new_fixed builds from operands" {
         \\      (i32.const 2))))
     ;
     try std.testing.expectEqual(@as(i32, 30), interp.asI32(try assembleAndRun(src, "third", &.{})));
+}
+
+// --- R10 (2026-08-13): the blockers that blacked out whole files -------------
+// Each of these failed the FIRST module of a spec file and took every remaining
+// assertion in it into `NoTarget`. The unit cost is one defect; the corpus cost
+// was 416 assertions.
+
+test "R10: extern.convert_any / any.convert_extern work in a function body" {
+    // They existed ONLY in the const-expr evaluator — no `Op`, so a body using
+    // one was `UnknownInstr` at the assembler. Five spec files open with a module
+    // that does (172 assertions).
+    const src =
+        \\(module
+        \\  (func (export "roundtrip") (result i32)
+        \\    (ref.is_null (any.convert_extern (extern.convert_any (ref.i31 (i32.const 7))))))
+        \\  (func (export "null_stays_null") (result i32)
+        \\    (ref.is_null (extern.convert_any (ref.null any))))
+        \\  (func (export "value") (result i32)
+        \\    (i31.get_u (ref.cast (ref i31)
+        \\      (any.convert_extern (extern.convert_any (ref.i31 (i32.const 42))))))))
+    ;
+    // A converted non-null reference is still non-null, and survives the round
+    // trip with its value — the conversion changes only the static type.
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "roundtrip", &.{})));
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(src, "null_stays_null", &.{})));
+    try std.testing.expectEqual(@as(i32, 42), interp.asI32(try assembleAndRun(src, "value", &.{})));
+
+    // The raw internal tag bytes must NOT decode — `0x16`/`0x17` are unassigned
+    // in the single-byte space, and their `immediateKind` is `.none`, which is
+    // reachable from real ops.
+    for ([_]u8{ 0x16, 0x17 }) |b| {
+        try std.testing.expectError(error.UnsupportedOpcode, opcode.decodeBody(std.testing.allocator, &[_]u8{b}));
+    }
+}
+
+test "R10: the exn heap type is spellable in ref.null" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // `abstractHeapCode` knew every head except `exn`/`noexn`, so `(ref.null exn)`
+    // was `BadImmediate` and `ref_null.wast` died on its first module.
+    for ([_][]const u8{
+        "(module (func (export \"f\") (result exnref) (ref.null exn)))",
+        "(module (func (export \"f\") (result exnref) (ref.null noexn)))",
+        "(module (global exnref (ref.null exn)))",
+        "(module (global nullexnref (ref.null noexn)))",
+    }) |src| {
+        var m = Module.decode(a, assemble(a, src) catch |e| {
+            std.debug.print("failed to assemble: {s}\n", .{src});
+            return e;
+        }) catch |e| {
+            std.debug.print("failed to decode: {s}\n", .{src});
+            return e;
+        };
+        validate(a, &m) catch |e| {
+            std.debug.print("failed to validate: {s}\n", .{src});
+            return e;
+        };
+    }
+}
+
+test "R10: flat else/end may repeat the block label" {
+    // §6.5.2's redundancy check. Unconsumed, the id was assembled as the next
+    // instruction — `UnknownInstr` naming a label — which killed `stack.wast`.
+    const src =
+        \\(module (func (export "f") (param i32) (result i32)
+        \\  block $b (result i32)
+        \\    local.get 0
+        \\    if $b (result i32)
+        \\      i32.const 10
+        \\    else $b
+        \\      i32.const 20
+        \\    end $b
+        \\  end $b))
+    ;
+    try std.testing.expectEqual(@as(i32, 10), interp.asI32(try assembleAndRun(src, "f", &.{interp.i32Value(1)})));
+    try std.testing.expectEqual(@as(i32, 20), interp.asI32(try assembleAndRun(src, "f", &.{interp.i32Value(0)})));
+
+    // A repeated id must MATCH — checking it is the only reason the form exists.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.BadImmediate, assemble(arena.allocator(),
+        \\(module (func block $b end $wrong))
+    ));
+}
+
+test "R10: br_on_non_null takes the NULLABLE operand for a non-null label" {
+    // The label's last type is `(ref ht)` and the operand is `(ref null ht)`;
+    // popping the label types wholesale asked the stack for the non-null form.
+    // This is the canonical idiom the instruction exists for.
+    const src =
+        \\(module
+        \\  (type $t (func (result i32)))
+        \\  (func $g (result i32) (i32.const 7))
+        \\  (elem declare func $g)
+        \\  (table 2 (ref null $t))
+        \\  (func (export "f") (param i32) (result i32)
+        \\    (block $l (result (ref $t))
+        \\      (br_on_non_null $l (table.get (local.get 0)))
+        \\      (return (i32.const -1)))
+        \\    (call_ref $t)))
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = try Module.decode(a, try assemble(a, src));
+    try validate(a, &m); // was TypeMismatch: expected (ref $t), found (ref null $t)
+}
+
+test "R10: br_on_cast_fail carries src MINUS dst to its label" {
+    // `null-diff`: with a NULLABLE dst, a null takes the fall-through, so the
+    // value reaching the label is non-null and the label may declare `(ref any)`.
+    // The subtraction was implemented for br_on_cast's fall-through only.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src =
+        \\(module
+        \\  (type $st (struct))
+        \\  (func (export "f") (param anyref) (result i32)
+        \\    (block $l (result (ref any))
+        \\      (block (result (ref null $st))
+        \\        (br_on_cast_fail $l (ref null any) (ref null $st) (local.get 0)))
+        \\      (return (i32.const 1)))
+        \\    (drop)
+        \\    (i32.const 2)))
+    ;
+    var m = try Module.decode(a, try assemble(a, src));
+    try validate(a, &m);
+}
+
+// --- R5 (2026-08-13): strict numeric literals --------------------------------
+// None of these could be reached from the spec suite until `(module quote …)`
+// was implemented — the literals only appear inside quoted module text.
+
+test "R5: literal syntax follows the wasm text format, not Zig's" {
+    // `_` is a separator BETWEEN digits: never leading, trailing, or doubled.
+    for ([_][]const u8{ "0x_100", "0x00_", "0xff__ffff", "_100", "100_", "1__0" }) |bad| {
+        std.testing.expect(!validIntLit(bad)) catch |e| {
+            std.debug.print("accepted a bad int literal: {s}\n", .{bad});
+            return e;
+        };
+    }
+    for ([_][]const u8{ "0", "100", "1_0", "0xff", "0xff_ff", "-1", "+0x7f" }) |good| {
+        std.testing.expect(validIntLit(good)) catch |e| {
+            std.debug.print("rejected a good int literal: {s}\n", .{good});
+            return e;
+        };
+    }
+    // A float needs a digit before the point, and the same underscore rule; the
+    // exponent marker belongs to its own radix (`e` decimal, `p` hex).
+    // `0x1e5p1` is deliberately in the GOOD list below: in hex, `e` is a digit and
+    // `p` is the marker, so it reads as 0x1e5 × 2¹. Writing it here first was a
+    // test bug, not a code one — the radix decides which letters are digits.
+    for ([_][]const u8{ ".0", ".0e0", "0x_1.0", "1e", "1e+", "0x1p", "1p3", "1e5p1", "nan:0x_1" }) |bad| {
+        std.testing.expect(!validFloatLit(bad)) catch |e| {
+            std.debug.print("accepted a bad float literal: {s}\n", .{bad});
+            return e;
+        };
+    }
+    for ([_][]const u8{ "0.0", "1.", "1e5", "1E+5", "0x1p3", "0x1.8p+1", "0x1e5p1", "0xff", "inf", "-inf", "nan", "-nan", "nan:0x200000", "nan:canonical" }) |good| {
+        std.testing.expect(validFloatLit(good)) catch |e| {
+            std.debug.print("rejected a good float literal: {s}\n", .{good});
+            return e;
+        };
+    }
+}
+
+test "R5: a constant outside its type's range is refused, not truncated" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Silently truncating is the dangerous half: `i32.const 0x100000000` became 0,
+    // a wrong VALUE compiled from source that looked fine. Each lane of a
+    // `v128.const` is bounded by its own width for the same reason.
+    for ([_][]const u8{
+        "(module (func (i32.const 0x100000000) drop))",
+        "(module (func (i64.const 0x10000000000000000) drop))",
+        "(module (func (v128.const i8x16 0x100 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0) drop))",
+        "(module (func (v128.const i8x16 -0x81 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0) drop))",
+        "(module (func (v128.const i16x8 0x10000 0 0 0 0 0 0 0) drop))",
+        "(module (func (f32.const 0x1p128) drop))", // rounds to inf -> out of range
+        "(module (func (f32.const nan:arithmetic) drop))", // a matcher, not a value
+    }) |src| {
+        std.testing.expectError(error.BadImmediate, assemble(a, src)) catch |e| {
+            std.debug.print("accepted an out-of-range constant: {s}\n", .{src});
+            return e;
+        };
+    }
+
+    // ⚠️ The syntax cases belong HERE, going through `assemble`, not only in the
+    // predicate test above. Inverting the fix showed why: disabling the
+    // `validIntLit`/`validFloatLit` CALL SITES left the predicate test green,
+    // because it calls the predicates directly. A test of a rule is not a test
+    // that the rule is consulted.
+    for ([_][]const u8{
+        "(module (func (i32.const 0x_100) drop))",
+        "(module (func (i32.const 0x00_) drop))",
+        "(module (func (i32.const 0xff__ffff) drop))",
+        "(module (func (f32.const .0) drop))",
+        "(module (func (f32.const .0e0) drop))",
+        "(module (func (f32.const 0x_1.0) drop))",
+    }) |src| {
+        std.testing.expectError(error.BadImmediate, assemble(a, src)) catch |e| {
+            std.debug.print("accepted an out-of-range constant: {s}\n", .{src});
+            return e;
+        };
+    }
+
+    // The boundary values on both spellings must still assemble, and `inf` — the
+    // one literal allowed to BE infinite — must survive the overflow check.
+    for ([_][]const u8{
+        "(module (func (i32.const 0xffffffff) drop))",
+        "(module (func (i32.const -0x80000000) drop))",
+        "(module (func (i64.const 0xffffffffffffffff) drop))",
+        "(module (func (f32.const inf) drop))",
+        "(module (func (f32.const -inf) drop))",
+        "(module (func (v128.const i8x16 0xff -0x80 0 0 0 0 0 0 0 0 0 0 0 0 0 0) drop))",
+    }) |src| {
+        _ = assemble(a, src) catch |e| {
+            std.debug.print("rejected a valid constant: {s}\n", .{src});
+            return e;
+        };
+    }
+}
+
+test "R5: a negative NaN keeps its sign bit" {
+    // `-nan` fell through to std.fmt.parseFloat, which returns a POSITIVE NaN, so
+    // the sign — observable via reinterpret/copysign — was silently dropped.
+    const src =
+        \\(module
+        \\  (func (export "neg") (result i32) (i32.reinterpret_f32 (f32.const -nan)))
+        \\  (func (export "pos") (result i32) (i32.reinterpret_f32 (f32.const nan))))
+    ;
+    try std.testing.expectEqual(@as(i32, @bitCast(@as(u32, 0xffc00000))), interp.asI32(try assembleAndRun(src, "neg", &.{})));
+    try std.testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x7fc00000))), interp.asI32(try assembleAndRun(src, "pos", &.{})));
+}
+
+// --- R4 (2026-08-13): the accept-invalid class in core spec files ------------
+// Each case below was a module wazmrt ACCEPTED that the spec calls invalid — the
+// failure direction where a test passing proves nothing, because the runtime
+// happily executes the module it should have refused.
+
+test "R4: a table whose element type is non-defaultable needs an initializer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Accepted before R4: a `(ref …)` element type has no default value, so these
+    // describe tables whose slots cannot be given a starting state. The LENGTH is
+    // irrelevant — a 0-length table still fails, because `table.grow` would have
+    // to invent one.
+    for ([_][]const u8{
+        "(module (table 0 (ref func)))",
+        "(module (table 10 (ref func)))",
+        "(module (table 0 (ref extern)))",
+        "(module (type $f (func)) (table 0 (ref $f)))",
+        "(module (type $f (func)) (table 0 0 (ref $f)))",
+    }) |src| {
+        var m = try Module.decode(a, try assemble(a, src));
+        std.testing.expectError(error.TypeMismatch, validate(a, &m)) catch |e| {
+            std.debug.print("accepted a non-defaultable table: {s}\n", .{src});
+            return e;
+        };
+    }
+
+    // …and the forms that ARE legal must keep working: a defaultable element type
+    // needs no initializer, and an explicit initializer of the right type licenses
+    // a non-nullable one. The second is emitted as §5.5.6's `0x40` form, which is
+    // the encoding the rule above is really testing for.
+    for ([_][]const u8{
+        "(module (table 1 funcref))",
+        "(module (table 0 (ref null func)))",
+        "(module (func $g) (elem declare func $g) (table 1 (ref func) (ref.func $g)))",
+    }) |src| {
+        var m = try Module.decode(a, try assemble(a, src));
+        try validate(a, &m);
+    }
+
+    // An initializer of the WRONG type is still a mismatch — the `0x40` form was
+    // never validated at all before R4, so this reached the interpreter instead.
+    var bad = try Module.decode(a, try assemble(a, "(module (table 1 (ref func) (ref.null func)))"));
+    try std.testing.expectError(error.TypeMismatch, validate(a, &bad));
+}
+
+test "R4: a block type naming an out-of-range type index is an unknown type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Only one type exists in each module, so `(ref 1)` names nothing. These were
+    // accepted because the assembler INTERNED the block signature as a new type —
+    // manufacturing index 1 as the block's own (self-referential) signature. The
+    // canonical encoding is the multi-byte valtype `0x64 <heaptype>`, which
+    // creates no type and lets the decoder's existing bound check fire.
+    // The assertion is that the module is REFUSED, not which stage refuses it:
+    // `(ref 1)` in a two-result signature is caught by the decoder's type-count
+    // bound, while the single-result form now reaches the validator as an
+    // unresolvable heap type. Pinning the stage would make this test fail on a
+    // correct change.
+    for ([_][]const u8{
+        "(module (func $b (drop (block (result (ref 1)) (unreachable)))))",
+        "(module (func $l (drop (loop (result (ref 1)) (unreachable)))))",
+        "(module (func $i (drop (if (result (ref 1)) (then (unreachable)) (else (unreachable))))))",
+    }) |src| {
+        const refused = blk: {
+            const bin = assemble(a, src) catch break :blk true;
+            var m = Module.decode(a, bin) catch break :blk true;
+            validate(a, &m) catch break :blk true;
+            break :blk false;
+        };
+        if (!refused) {
+            std.debug.print("accepted an out-of-range block result type: {s}\n", .{src});
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // The in-range form still round-trips — and now through the canonical
+    // encoding, so this also pins `readBlockType`'s multi-byte valtype path.
+    const ok =
+        \\(module
+        \\  (type $t (func))
+        \\  (func $g)
+        \\  (elem declare func $g)
+        \\  (func (export "f") (result i32)
+        \\    (ref.is_null (block (result (ref null $t)) (ref.func $g)))))
+    ;
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(ok, "f", &.{})));
+}
+
+test "R4: a try_table catch label indexes the ENCLOSING scope" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `catch 0` here names the FUNCTION block, whose result is `[exnref]`; a plain
+    // `catch` on a tag with no params delivers `[]`, so this is a type mismatch.
+    // Read as "label 0 = the try_table itself" — the off-by-one `wat.zig`,
+    // `validate.zig` and `interp.zig` all shared — it type-checks and was accepted.
+    for ([_][]const u8{
+        "(module (tag) (func (result exnref) (try_table (catch 0 0)) (unreachable)))",
+        "(module (tag) (func (result exnref) (try_table (catch_all 0)) (unreachable)))",
+        "(module (tag) (func (try_table (catch_ref 0 0))))",
+        "(module (func (try_table (catch_all_ref 0))))",
+    }) |src| {
+        var m = try Module.decode(a, try assemble(a, src));
+        std.testing.expectError(error.TypeMismatch, validate(a, &m)) catch |e| {
+            std.debug.print("accepted a mistyped catch clause: {s}\n", .{src});
+            return e;
+        };
+    }
+
+    // The mirror: with the SAME index, a catch whose delivered values fit the
+    // enclosing label is valid — and was rejected before R4, because the label was
+    // resolved one frame too deep. One off-by-one, both failure directions.
+    const ok = "(module (tag $e) (func (result exnref) (try_table (catch_ref $e 0)) (unreachable)))";
+    var m = try Module.decode(a, try assemble(a, ok));
+    try validate(a, &m);
+}
+
+test "R4: an IMPORTED tag is type-checked like a defined one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // A tag's type must be `[t*] -> []`. The defined form was checked; the import
+    // form was not, because the loop walked `module.tags` — the DEFINED half of a
+    // space whose imported half leads it.
+    var imported = try Module.decode(a, try assemble(a, "(module (import \"\" \"\" (tag (result i32))))"));
+    try std.testing.expectError(error.InvalidTag, validate(a, &imported));
+    var defined = try Module.decode(a, try assemble(a, "(module (tag (result i32)))"));
+    try std.testing.expectError(error.InvalidTag, validate(a, &defined));
+    // A well-typed imported tag still validates.
+    var good = try Module.decode(a, try assemble(a, "(module (import \"\" \"\" (tag (param i32))))"));
+    try validate(a, &good);
+}
+
+// --- R3 (2026-08-13): the six array bulk ops ---------------------------------
+// These six were absent from `opcode.zig` entirely, so nothing below could even
+// ASSEMBLE — every spec-suite file that reached one died at `UnknownInstr`. The
+// in-repo tests live here (rather than only in the external corpus) because the
+// `.wast` suite lives on removable media and cannot gate a commit.
+
+test "R3 array.new_data: elements are read little-endian at the element's width" {
+    const src =
+        \\(module
+        \\  (type $i32a (array (mut i32)))
+        \\  (type $i8a (array (mut i8)))
+        \\  (data $d "\01\00\00\00\02\00\00\00\ff\ff\ff\ff")
+        \\  (func (export "wide") (param i32) (result i32)
+        \\    (array.get $i32a (array.new_data $i32a $d (i32.const 0) (i32.const 3))
+        \\                     (local.get 0)))
+        \\  (func (export "packed_u") (param i32) (result i32)
+        \\    (array.get_u $i8a (array.new_data $i8a $d (i32.const 0) (i32.const 12))
+        \\                      (local.get 0)))
+        \\  (func (export "len") (result i32)
+        \\    (array.len (array.new_data $i32a $d (i32.const 4) (i32.const 2)))))
+    ;
+    // Three i32s from 12 bytes: 1, 2, -1.
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(src, "wide", &.{interp.i32Value(0)})));
+    try std.testing.expectEqual(@as(i32, 2), interp.asI32(try assembleAndRun(src, "wide", &.{interp.i32Value(1)})));
+    try std.testing.expectEqual(@as(i32, -1), interp.asI32(try assembleAndRun(src, "wide", &.{interp.i32Value(2)})));
+    // The same bytes as a packed i8 array: element 4 is the low byte of the
+    // second i32. A width bug would read it as 2 (element index scaled wrong).
+    try std.testing.expectEqual(@as(i32, 2), interp.asI32(try assembleAndRun(src, "packed_u", &.{interp.i32Value(4)})));
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "packed_u", &.{interp.i32Value(5)})));
+    // A byte OFFSET with an element COUNT: 4 bytes in, 2 elements = 8 bytes, fits.
+    try std.testing.expectEqual(@as(i32, 2), interp.asI32(try assembleAndRun(src, "len", &.{})));
+}
+
+test "R3 array.new_data: the segment bound is in BYTES, so size scales by the element width" {
+    // 12 bytes hold 12 i8s but only 3 i32s. `offset + size` (unscaled) would let
+    // the i32 form read 12 elements = 48 bytes off the end of the segment — the
+    // exact confusion the two operand units invite.
+    const src =
+        \\(module
+        \\  (type $i32a (array (mut i32)))
+        \\  (data $d "\01\00\00\00\02\00\00\00\03\00\00\00")
+        \\  (func (export "fits") (result i32)
+        \\    (array.len (array.new_data $i32a $d (i32.const 0) (i32.const 3))))
+        \\  (func (export "over") (result i32)
+        \\    (array.len (array.new_data $i32a $d (i32.const 0) (i32.const 4))))
+        \\  (func (export "off_by_a_byte") (result i32)
+        \\    (array.len (array.new_data $i32a $d (i32.const 1) (i32.const 3)))))
+    ;
+    try std.testing.expectEqual(@as(i32, 3), interp.asI32(try assembleAndRun(src, "fits", &.{})));
+    try std.testing.expectError(error.MemoryOutOfBounds, assembleAndRun(src, "over", &.{}));
+    try std.testing.expectError(error.MemoryOutOfBounds, assembleAndRun(src, "off_by_a_byte", &.{}));
+}
+
+test "R3 array.new_elem / array.init_elem: references come from an element segment" {
+    const src =
+        \\(module
+        \\  (type $arr (array (mut i31ref)))
+        \\  (elem $e i31ref (ref.i31 (i32.const 11)) (ref.i31 (i32.const 22)) (ref.i31 (i32.const 33)))
+        \\  (func (export "nth") (param i32) (result i32)
+        \\    (i31.get_u (array.get $arr (array.new_elem $arr $e (i32.const 0) (i32.const 3))
+        \\                               (local.get 0))))
+        \\  (func (export "oob") (result i32)
+        \\    (array.len (array.new_elem $arr $e (i32.const 1) (i32.const 3))))
+        \\  (func (export "init") (param i32) (result i32)
+        \\    (local $a (ref $arr))
+        \\    (local.set $a (array.new_default $arr (i32.const 4)))
+        \\    (array.init_elem $arr $e (local.get $a) (i32.const 1) (i32.const 1) (i32.const 2))
+        \\    (i31.get_u (array.get $arr (local.get $a) (local.get 0)))))
+    ;
+    try std.testing.expectEqual(@as(i32, 11), interp.asI32(try assembleAndRun(src, "nth", &.{interp.i32Value(0)})));
+    try std.testing.expectEqual(@as(i32, 33), interp.asI32(try assembleAndRun(src, "nth", &.{interp.i32Value(2)})));
+    // An elem-segment overrun is a TABLE out-of-bounds, not a memory one.
+    try std.testing.expectError(error.TableOutOfBounds, assembleAndRun(src, "oob", &.{}));
+    // init_elem writes segment[1..3] into array[1..3]: a[1]=22, a[2]=33.
+    try std.testing.expectEqual(@as(i32, 22), interp.asI32(try assembleAndRun(src, "init", &.{interp.i32Value(1)})));
+    try std.testing.expectEqual(@as(i32, 33), interp.asI32(try assembleAndRun(src, "init", &.{interp.i32Value(2)})));
+}
+
+test "R3 array.fill and array.init_data write in place" {
+    const src =
+        \\(module
+        \\  (type $arr (array (mut i32)))
+        \\  (data $d "\07\00\00\00\08\00\00\00")
+        \\  (func (export "fill") (param i32) (result i32)
+        \\    (local $a (ref $arr))
+        \\    (local.set $a (array.new_default $arr (i32.const 5)))
+        \\    (array.fill $arr (local.get $a) (i32.const 1) (i32.const 9) (i32.const 3))
+        \\    (array.get $arr (local.get $a) (local.get 0)))
+        \\  (func (export "fill_oob")
+        \\    (array.fill $arr (array.new_default $arr (i32.const 5))
+        \\                     (i32.const 3) (i32.const 9) (i32.const 3)))
+        \\  (func (export "fill_edge") (result i32)
+        \\    (local $a (ref $arr))
+        \\    (local.set $a (array.new_default $arr (i32.const 5)))
+        \\    (array.fill $arr (local.get $a) (i32.const 5) (i32.const 9) (i32.const 0))
+        \\    (array.len (local.get $a)))
+        \\  (func (export "init_data") (param i32) (result i32)
+        \\    (local $a (ref $arr))
+        \\    (local.set $a (array.new_default $arr (i32.const 4)))
+        \\    (array.init_data $arr $d (local.get $a) (i32.const 2) (i32.const 0) (i32.const 2))
+        \\    (array.get $arr (local.get $a) (local.get 0))))
+    ;
+    // fill a[1..4) with 9: a = [0,9,9,9,0].
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "fill", &.{interp.i32Value(0)})));
+    try std.testing.expectEqual(@as(i32, 9), interp.asI32(try assembleAndRun(src, "fill", &.{interp.i32Value(3)})));
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "fill", &.{interp.i32Value(4)})));
+    try std.testing.expectError(error.GcOutOfBounds, assembleAndRun(src, "fill_oob", &.{}));
+    // index == length with count 0 is IN bounds — the classic off-by-one.
+    try std.testing.expectEqual(@as(i32, 5), interp.asI32(try assembleAndRun(src, "fill_edge", &.{})));
+    // init_data copies the two i32s from $d into a[2..4).
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "init_data", &.{interp.i32Value(1)})));
+    try std.testing.expectEqual(@as(i32, 7), interp.asI32(try assembleAndRun(src, "init_data", &.{interp.i32Value(2)})));
+    try std.testing.expectEqual(@as(i32, 8), interp.asI32(try assembleAndRun(src, "init_data", &.{interp.i32Value(3)})));
+}
+
+test "R3 array.copy: overlapping ranges in ONE array behave like memmove" {
+    // Both refs may name the same object, so a naive forward `@memcpy` would
+    // smear the first element across the overlap when dst > src. `array.wast`
+    // exercises this, and a plain copy passes every non-overlapping case first.
+    const src =
+        \\(module
+        \\  (type $arr (array (mut i32)))
+        \\  (func $mk (result (ref $arr))
+        \\    (array.new_fixed $arr 5 (i32.const 1) (i32.const 2) (i32.const 3) (i32.const 4) (i32.const 5)))
+        \\  (func (export "forward") (param i32) (result i32)
+        \\    (local $a (ref $arr))
+        \\    (local.set $a (call $mk))
+        \\    (array.copy $arr $arr (local.get $a) (i32.const 0) (local.get $a) (i32.const 2) (i32.const 3))
+        \\    (array.get $arr (local.get $a) (local.get 0)))
+        \\  (func (export "backward") (param i32) (result i32)
+        \\    (local $a (ref $arr))
+        \\    (local.set $a (call $mk))
+        \\    (array.copy $arr $arr (local.get $a) (i32.const 2) (local.get $a) (i32.const 0) (i32.const 3))
+        \\    (array.get $arr (local.get $a) (local.get 0)))
+        \\  (func (export "between") (param i32) (result i32)
+        \\    (local $d (ref $arr))
+        \\    (local.set $d (array.new_default $arr (i32.const 5)))
+        \\    (array.copy $arr $arr (local.get $d) (i32.const 1) (call $mk) (i32.const 3) (i32.const 2))
+        \\    (array.get $arr (local.get $d) (local.get 0)))
+        \\  (func (export "oob")
+        \\    (array.copy $arr $arr (call $mk) (i32.const 3) (call $mk) (i32.const 0) (i32.const 3))))
+    ;
+    // dst < src: [1,2,3,4,5] -> [3,4,5,4,5].
+    try std.testing.expectEqual(@as(i32, 3), interp.asI32(try assembleAndRun(src, "forward", &.{interp.i32Value(0)})));
+    try std.testing.expectEqual(@as(i32, 5), interp.asI32(try assembleAndRun(src, "forward", &.{interp.i32Value(2)})));
+    // dst > src: [1,2,3,4,5] -> [1,2,1,2,3]. A forward copy would give [1,2,1,1,1].
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(src, "backward", &.{interp.i32Value(2)})));
+    try std.testing.expectEqual(@as(i32, 2), interp.asI32(try assembleAndRun(src, "backward", &.{interp.i32Value(3)})));
+    try std.testing.expectEqual(@as(i32, 3), interp.asI32(try assembleAndRun(src, "backward", &.{interp.i32Value(4)})));
+    // Between two distinct arrays: d[1..3) = src[3..5) = [4,5].
+    try std.testing.expectEqual(@as(i32, 4), interp.asI32(try assembleAndRun(src, "between", &.{interp.i32Value(1)})));
+    try std.testing.expectEqual(@as(i32, 5), interp.asI32(try assembleAndRun(src, "between", &.{interp.i32Value(2)})));
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "between", &.{interp.i32Value(3)})));
+    try std.testing.expectError(error.GcOutOfBounds, assembleAndRun(src, "oob", &.{}));
+}
+
+test "R3 array bulk ops: the accept-invalid cases validation has to refuse" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Case = struct { src: []const u8, want: anyerror };
+    for ([_]Case{
+        // A data segment has no encoding for a REFERENCE element (§3.3.7).
+        .{ .src =
+        \\(module (type $r (array (mut funcref))) (data $d "\00")
+        \\  (func (drop (array.new_data $r $d (i32.const 0) (i32.const 1)))))
+        , .want = error.TypeMismatch },
+        // `array.fill` / `array.init_*` / the `array.copy` destination all WRITE,
+        // so an immutable element type must be refused — the same rule
+        // `array.set` carries, and the one an accept-invalid would make a
+        // soundness hole rather than a conformance miss.
+        .{ .src =
+        \\(module (type $imm (array i32))
+        \\  (func (array.fill $imm (array.new $imm (i32.const 1) (i32.const 2))
+        \\                         (i32.const 0) (i32.const 1) (i32.const 1))))
+        , .want = error.ImmutableField },
+        .{ .src =
+        \\(module (type $imm (array i32)) (data $d "\00\00\00\00")
+        \\  (func (array.init_data $imm $d (array.new $imm (i32.const 1) (i32.const 2))
+        \\                                 (i32.const 0) (i32.const 0) (i32.const 1))))
+        , .want = error.ImmutableField },
+        .{ .src =
+        \\(module (type $imm (array i32)) (type $mut (array (mut i32)))
+        \\  (func (array.copy $imm $mut (array.new $imm (i32.const 1) (i32.const 2)) (i32.const 0)
+        \\                              (array.new $mut (i32.const 1) (i32.const 2)) (i32.const 0)
+        \\                              (i32.const 1))))
+        , .want = error.ImmutableField },
+        // `array.copy` between a PACKED and an unpacked element: both project i32
+        // onto the stack, so comparing `unpacked()` alone would call them equal
+        // and copy an i8 array's raw bytes into an i32 array.
+        .{ .src =
+        \\(module (type $p (array (mut i8))) (type $w (array (mut i32)))
+        \\  (func (array.copy $w $p (array.new_default $w (i32.const 2)) (i32.const 0)
+        \\                          (array.new_default $p (i32.const 2)) (i32.const 0)
+        \\                          (i32.const 1))))
+        , .want = error.TypeMismatch },
+        // An out-of-range segment index in either family.
+        .{ .src =
+        \\(module (type $w (array (mut i32))) (data $d "\00")
+        \\  (func (drop (array.new_data $w 7 (i32.const 0) (i32.const 0)))))
+        , .want = error.UndefinedData },
+        .{ .src =
+        \\(module (type $r (array (mut funcref)))
+        \\  (func (drop (array.new_elem $r 3 (i32.const 0) (i32.const 0)))))
+        , .want = error.UndefinedElem },
+    }) |c| {
+        var m = try Module.decode(a, try assemble(a, c.src));
+        std.testing.expectError(c.want, validate(a, &m)) catch |e| {
+            std.debug.print("case did not fail as expected:\n{s}\n", .{c.src});
+            return e;
+        };
+    }
 }
 
 test "GC ref.eq: identity of struct references" {
@@ -4691,20 +6045,31 @@ test "a defined table larger than the entry budget is refused at instantiation" 
     // the per-instance entry budget refuses it cleanly instead. (Assembles and
     // decodes fine — the ceiling is an instantiation-time resource limit.)
     var m = try Module.decode(a, try assemble(a, "(module (table 0xffffffff funcref))"));
-    try std.testing.expectError(error.TableLimitExceeded, interp.Instance.init(a, &m));
+    var too_big: interp.Instance = undefined;
+    try std.testing.expectError(error.TableLimitExceeded, too_big.instantiate(a, &m));
     // A modest table instantiates.
     var ok = try Module.decode(a, try assemble(a, "(module (table 10 funcref))"));
-    var inst = try interp.Instance.init(a, &ok);
+    var inst: interp.Instance = undefined;
+    try inst.instantiate(a, &ok);
     inst.deinit();
 }
 
+// ⚠️ Both tests below used to write the handler as `(try_table (catch_all 0) …)`
+// directly in a `(func (result i32))` — i.e. label 0 meaning "the try_table
+// itself", which is how `wat.zig`, `validate.zig` and `interp.zig` all read it
+// until R4 (2026-08-13). A catch label is an index into the try_table's
+// ENCLOSING scope, so that form now means "branch to the function block", which
+// `catch_all` cannot do when the function returns i32 — correctly rejected. The
+// handler needs a real enclosing block, which is exactly how every module in the
+// spec suite's `try_table.wast` is written.
 test "EH wat: catch_all catches and control resumes after the try_table" {
     const src =
         \\(module
         \\  (tag $e)
         \\  (func (export "f") (result i32)
-        \\    (try_table (catch_all 0)
-        \\      throw $e)
+        \\    (block $h
+        \\      (try_table (catch_all $h)
+        \\        throw $e))
         \\    i32.const 55))
     ;
     try std.testing.expectEqual(@as(i32, 55), interp.asI32(try assembleAndRun(src, "f", &.{})));
@@ -4716,8 +6081,9 @@ test "EH wat: an exception thrown in a callee is caught in the caller" {
         \\  (tag $e)
         \\  (func $callee throw $e)
         \\  (func (export "f") (result i32)
-        \\    (try_table (catch_all 0)
-        \\      call $callee)
+        \\    (block $h
+        \\      (try_table (catch_all $h)
+        \\        call $callee))
         \\    i32.const 7))
     ;
     try std.testing.expectEqual(@as(i32, 7), interp.asI32(try assembleAndRun(src, "f", &.{})));
@@ -4933,4 +6299,600 @@ test "legacy EH: a raw throw inside a catch handler propagates to the OUTER try,
     var m = try Module.decode(a, try assemble(a, src));
     try validate(a, &m);
     try std.testing.expectEqual(@as(i32, 7), interp.asI32(try assembleAndRun(src, "f", &.{})));
+}
+
+test "a (memory …) field may not carry unconsumed trailing forms" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `(pagesize N)` is custom-page-sizes syntax wazmrt does not implement. It
+    // used to be DROPPED: `(memory 0 (pagesize 1))` assembled into an ordinary
+    // 64 KiB-page memory that then disagreed with its own source — the reason
+    // `custom-page-sizes.wast`'s `memory.grow` answered −1. A distinct error
+    // keeps it a SKIP in the conformance runner rather than a claimed pass.
+    try std.testing.expectError(error.UnsupportedProposal, assemble(a, "(module (memory 0 (pagesize 1)))"));
+    try std.testing.expectError(error.UnsupportedProposal, assemble(a, "(module (memory 0 (pagesize 3)))"));
+    try std.testing.expectError(error.UnsupportedProposal, assemble(a, "(module (memory (import \"m\" \"n\") 0 (pagesize 1)))"));
+
+    // The hole was lists specifically — a trailing ATOM already failed, because
+    // `parseU64` chokes on it. Anything unrecognised must now be refused.
+    try std.testing.expectError(error.BadModuleField, assemble(a, "(module (memory 1 (nonsense 4)))"));
+
+    // ...without refusing the forms that legitimately trail the limits.
+    _ = try assemble(a, "(module (memory 1))");
+    _ = try assemble(a, "(module (memory 1 2))");
+    _ = try assemble(a, "(module (memory 1 2 shared))");
+    _ = try assemble(a, "(module (memory i64 1 2))");
+    _ = try assemble(a, "(module (memory $m (export \"m\") 1 2))");
+    _ = try assemble(a, "(module (memory (data \"abc\")))");
+}
+
+test "the assembler emits a data-count section for any module with data segments" {
+    // §5.5.16 requires it once a body uses `memory.init`/`data.drop`, and we
+    // emitted it never — so every such module this assembler produced was
+    // malformed. Invisible until the decoder started enforcing the rule, since
+    // the two gaps agreed with each other.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const src =
+        \\(module (memory 1) (data $d "abc")
+        \\  (func (export "f")
+        \\    (memory.init $d (i32.const 0) (i32.const 0) (i32.const 3))
+        \\    (data.drop $d)))
+    ;
+    var m = try Module.decode(a, try assemble(a, src));
+    try std.testing.expectEqual(@as(?u32, 1), m.data_count);
+    try validate(a, &m); // would be `DataCountRequired` without the section
+
+    // No data segments ⇒ no section, which is equally required: an empty
+    // data-count section would then disagree with nothing but still be noise.
+    const m2 = try Module.decode(a, try assemble(a, "(module (memory 1))"));
+    try std.testing.expectEqual(@as(?u32, null), m2.data_count);
+}
+
+test "legacy rethrow re-raises from the CURRENT position, so an inner try catches it" {
+    // `rethrow.wast`'s `rethrow-recatch`: the label picks WHICH exception, not
+    // where propagation starts. `rethrow 2` names the outer catch but fires from
+    // inside an inner try, so that inner try must catch it.
+    //
+    // This trapped with `UncaughtException`, because `rethrow` popped the label
+    // stack down past its target first — destroying exactly the intervening try
+    // that should have caught. The pop was a workaround for the target's own
+    // handler re-matching, which `throwException` has handled since 2026-07-27.
+    const src =
+        \\(module (tag $e0)
+        \\  (func (export "f") (param i32) (result i32)
+        \\    (try (result i32)
+        \\      (do (throw $e0))
+        \\      (catch $e0
+        \\        (try (result i32)
+        \\          (do (if (i32.eqz (local.get 0)) (then (rethrow 2))) (i32.const 42))
+        \\          (catch $e0 (i32.const 23)))))))
+    ;
+    // 0 -> rethrow fires, inner catch takes it; 1 -> no rethrow, falls through.
+    try std.testing.expectEqual(@as(i32, 23), interp.asI32(try assembleAndRun(src, "f", &.{interp.i32Value(0)})));
+    try std.testing.expectEqual(@as(i32, 42), interp.asI32(try assembleAndRun(src, "f", &.{interp.i32Value(1)})));
+}
+
+test "a rethrow label must name a catch block" {
+    // `rethrow l` re-raises the exception caught AT `l`; no other label kind
+    // binds one. We checked only that the label resolved, so both of these were
+    // accepted and then read whatever the enclosing frame had left behind.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    for ([_][]const u8{
+        "(module (func (rethrow 0)))", // the function body's implicit block
+        "(module (func (block (rethrow 0))))", // a plain block
+        "(module (func (loop (rethrow 0))))", // sibling: a loop
+        "(module (tag $e) (func (try (do (rethrow 0)) (catch $e))))", // the try's BODY, not its catch
+    }) |src| {
+        var m = try Module.decode(a, try assemble(a, src));
+        try std.testing.expectError(error.InvalidRethrowLabel, validate(a, &m));
+    }
+
+    // ...and the valid forms must still validate: label 0 from directly inside a
+    // catch, and a label reaching further out past an intervening block.
+    for ([_][]const u8{
+        "(module (tag $e) (func (try (do (throw $e)) (catch $e (rethrow 0)))))",
+        "(module (tag $e) (func (try (do (throw $e)) (catch_all (rethrow 0)))))",
+        "(module (tag $e) (func (try (do (throw $e)) (catch $e (block (rethrow 1))))))",
+    }) |src| {
+        var m = try Module.decode(a, try assemble(a, src));
+        try validate(a, &m);
+    }
+}
+
+test "rec groups survive assembly, and position within a group is part of identity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The assembler used to flatten `(rec …)` into ungrouped types, which is a
+    // DIFFERENT module: every member became its own singleton group, and
+    // structurally identical members from different groups then canonicalised
+    // together. Here `$f1` and `$f2` are both `(func)`, but sit at different
+    // positions in non-isomorphic groups, so they are distinct types and the
+    // global must be rejected.
+    {
+        const src =
+            \\(module
+            \\  (rec (type $f1 (func)) (type (struct)))
+            \\  (rec (type (struct)) (type $f2 (func)))
+            \\  (func $f (type $f2))
+            \\  (global (ref $f1) (ref.func $f)))
+        ;
+        var m = try Module.decode(a, try assemble(a, src));
+        try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, m.canon);
+        try std.testing.expectError(error.TypeMismatch, validate(a, &m));
+    }
+    // ...but two ISOMORPHIC groups do define the same types, so the same shape
+    // with the members in the same order must validate.
+    {
+        const src =
+            \\(module
+            \\  (rec (type $f1 (func)) (type (struct)))
+            \\  (rec (type $f2 (func)) (type (struct)))
+            \\  (func $f (type $f2))
+            \\  (global (ref $f1) (ref.func $f)))
+        ;
+        var m = try Module.decode(a, try assemble(a, src));
+        // Group 2 canonicalises onto group 1: same ids, so `$f1` == `$f2`.
+        try std.testing.expectEqualSlices(u32, &.{ 0, 1, 0, 1 }, m.canon);
+        try validate(a, &m);
+    }
+}
+
+test "a declared supertype must actually be one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // We recorded `supertypes[i]` and never checked it, so any type could be
+    // declared the supertype of any other — and `isSubtype` then agreed, which
+    // makes `ref.cast` succeed on a value that does not have the target type.
+    for ([_][]const u8{
+        // Final: a bare composite type is `sub final`, so it is closed.
+        "(module (type $t (func)) (type $s (sub $t (func))))",
+        "(module (type $t (struct)) (type $s (sub $t (struct))))",
+        // Kind mismatch.
+        "(module (type $f (sub (func (param i32)))) (type $s (sub $f (struct))))",
+        // Array element type must match.
+        "(module (type $a (sub (array i32))) (type $b (sub $a (array i64))))",
+        // Mutability is invariant, and cannot be re-opened.
+        "(module (type $a (sub (array (ref any)))) (type $b (sub $a (array (mut (ref any))))))",
+        // Function arity/params must match.
+        "(module (type $f (sub (func))) (type $g (sub $f (func (param i32)))))",
+        // A struct subtype may add fields but not drop or retype them.
+        "(module (type $s (sub (struct (field i32)))) (type $t (sub $s (struct (field i64)))))",
+        "(module (type $s (sub (struct (field i32) (field i32)))) (type $t (sub $s (struct (field i32)))))",
+    }) |src| {
+        var m = try Module.decode(a, try assemble(a, src));
+        try std.testing.expectError(error.InvalidSubtype, validate(a, &m));
+    }
+
+    // ...and the legitimate extensions must still validate.
+    for ([_][]const u8{
+        "(module (type $t (sub (func))) (type $s (sub $t (func))))",
+        "(module (type $s (sub (struct (field i32)))) (type $t (sub $s (struct (field i32) (field i64)))))",
+        "(module (type $a (sub (array i32))) (type $b (sub $a (array i32))))",
+        "(module (type $a (sub (array (mut i32)))) (type $b (sub $a (array (mut i32)))))",
+        // Explicit `final` with a supertype: extends, but is itself closed.
+        "(module (type $t (sub (func))) (type $s (sub final $t (func))))",
+    }) |src| {
+        var m = try Module.decode(a, try assemble(a, src));
+        try validate(a, &m);
+    }
+}
+
+test "64-bit tables (table64): index operands take i64 end to end" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The decoder hard-rejected `is64` on a table ("tables are 32-bit"), and the
+    // assembler could not parse the index type at all, so every 64-bit-table
+    // file in the suite failed to build. memory64 shipped with only its memory
+    // half done, while the roadmap recorded the proposal as COMPLETE.
+    const src =
+        \\(module
+        \\  (table $t i64 8 16 funcref)
+        \\  (func $f (result i32) (i32.const 7))
+        \\  (elem (table $t) (i64.const 2) func $f)
+        \\  (func (export "size") (result i64) (table.size $t))
+        \\  (func (export "grow") (result i64) (table.grow $t (ref.null func) (i64.const 4)))
+        \\  (func (export "call") (result i32) (call_indirect $t (type 0) (i64.const 2))))
+    ;
+    var m = try Module.decode(a, try assemble(a, src));
+    try std.testing.expect(m.tables[0].limits.is64);
+    try validate(a, &m);
+
+    // `table.size`/`table.grow` answer in the table's index type...
+    try std.testing.expectEqual(@as(i64, 8), interp.asI64(try assembleAndRun(src, "size", &.{})));
+    try std.testing.expectEqual(@as(i64, 8), interp.asI64(try assembleAndRun(src, "grow", &.{})));
+    // ...and an i64 `call_indirect` index reaches the element the i64 elem
+    // offset placed. `isOffsetForm` did not list `i64.const`, so that offset was
+    // read as a FUNCTION INDEX and the module failed to build.
+    try std.testing.expectEqual(@as(i32, 7), interp.asI32(try assembleAndRun(src, "call", &.{})));
+
+    // The index type is part of the type: 32-bit operands on a 64-bit table are
+    // a type error, not a convenience conversion.
+    {
+        const bad =
+            \\(module (table $t i64 8 funcref)
+            \\  (func (export "f") (result i64) (table.size $t) (drop) (i32.const 0) (table.get $t) (drop) (i64.const 0)))
+        ;
+        var bm = try Module.decode(a, try assemble(a, bad));
+        try std.testing.expectError(error.TypeMismatch, validate(a, &bm));
+    }
+    // A 32-bit table is unchanged — its operands stay i32.
+    {
+        const ok = "(module (table $t 8 funcref) (func (export \"f\") (result i32) (table.size $t)))";
+        var om = try Module.decode(a, try assemble(a, ok));
+        try std.testing.expect(!om.tables[0].limits.is64);
+        try validate(a, &om);
+    }
+}
+
+test "tail calls reuse the frame, so recursion depth is unbounded" {
+
+    // 100_000 hops is ~100x the call-depth cap. A tail call implemented as
+    // call-then-return passes every shallow assertion and dies here, which is
+    // exactly what happened: `return_call_ref` shipped that way with
+    // function-references, and its deep-recursion assertions reported
+    // `CallStackExhausted`. Depth is the whole point of the proposal, so it is
+    // the property worth pinning.
+    const direct =
+        \\(module (func $count (export "count") (param i64) (result i64)
+        \\  (if (result i64) (i64.eqz (local.get 0))
+        \\    (then (local.get 0))
+        \\    (else (return_call $count (i64.sub (local.get 0) (i64.const 1)))))))
+    ;
+    try std.testing.expectEqual(@as(i64, 0), interp.asI64(try assembleAndRun(direct, "count", &.{interp.i64Value(100_000)})));
+
+    const indirect =
+        \\(module
+        \\  (type $t (func (param i64) (result i64)))
+        \\  (table 1 funcref) (elem (i32.const 0) $count)
+        \\  (func $count (export "count") (type $t)
+        \\    (if (result i64) (i64.eqz (local.get 0))
+        \\      (then (local.get 0))
+        \\      (else (return_call_indirect (type $t)
+        \\              (i64.sub (local.get 0) (i64.const 1)) (i32.const 0))))))
+    ;
+    try std.testing.expectEqual(@as(i64, 0), interp.asI64(try assembleAndRun(indirect, "count", &.{interp.i64Value(100_000)})));
+
+    // `return_call_ref` is now the same real tail call, not call-then-return.
+    const via_ref =
+        \\(module
+        \\  (type $t (func (param i64) (result i64)))
+        \\  (elem declare func $count)
+        \\  (func $count (export "count") (type $t)
+        \\    (if (result i64) (i64.eqz (local.get 0))
+        \\      (then (local.get 0))
+        \\      (else (return_call_ref $t
+        \\              (i64.sub (local.get 0) (i64.const 1)) (ref.func $count))))))
+    ;
+    try std.testing.expectEqual(@as(i64, 0), interp.asI64(try assembleAndRun(via_ref, "count", &.{interp.i64Value(100_000)})));
+}
+
+test "a tail call's results must be the calling function's results" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The callee REPLACES the frame, so its results are returned as ours —
+    // equality, not the subtyping a normal `call` would allow on the operand
+    // stack. A mismatch is invalid, not a coercion.
+    for ([_][]const u8{
+        "(module (func $g (result i32) (i32.const 0)) (func (export \"f\") (result i64) (return_call $g)))",
+        "(module (func $g (result i32) (i32.const 0)) (func (export \"f\") (return_call $g)))",
+        "(module (type $t (func (result i32))) (table 1 funcref)" ++
+            " (func (export \"f\") (result i64) (return_call_indirect (type $t) (i32.const 0))))",
+    }) |src| {
+        var m = try Module.decode(a, try assemble(a, src));
+        try std.testing.expectError(error.TypeMismatch, validate(a, &m));
+    }
+
+    // Matching results validate, and an i64 table index reaches the indirect form.
+    {
+        const ok = "(module (func $g (result i32) (i32.const 7)) (func (export \"f\") (result i32) (return_call $g)))";
+        var m = try Module.decode(a, try assemble(a, ok));
+        try validate(a, &m);
+        try std.testing.expectEqual(@as(i32, 7), interp.asI32(try assembleAndRun(ok, "f", &.{})));
+    }
+}
+
+test "a legacy try takes at most one catch_all, and it comes last" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectError(error.BadImmediate, assemble(a, "(module (func (try (do) (catch_all) (catch_all))))"));
+    try std.testing.expectError(error.BadImmediate, assemble(a, "(module (tag $e) (func (try (do) (catch_all) (catch $e))))"));
+    // One catch_all, last, still assembles — with catches before it.
+    _ = try assemble(a, "(module (tag $e) (func (try (do) (catch $e) (catch_all))))");
+    // ⚠️ And a bare `catch_all` must stay ASSEMBLABLE: in flat legacy syntax the
+    // clause is a mnemonic in the instruction stream. Filtering it out of
+    // `lookupOp` broke that form. The rule that a clause needs an enclosing
+    // `try` belongs to the validator, which rejects this as `MismatchedCatch`
+    // and covers the binary path too.
+    var m = try Module.decode(a, try assemble(a, "(module (tag $e) (func (catch_all)))"));
+    try std.testing.expectError(error.MismatchedCatch, validate(a, &m));
+}
+
+test "each hierarchy's bottom is below its WHOLE hierarchy — and only its own" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const decls =
+        "(module (type $ft (func)) (type $st (struct (field i32)))" ++
+        " (global $null nullref (ref.null none))" ++
+        " (global $nullfunc nullfuncref (ref.null nofunc))" ++
+        " (global $nullexn nullexnref (ref.null noexn))" ++
+        " (global $nullextern nullexternref (ref.null noextern))";
+    // A bottom flows into the CONCRETE types of its own hierarchy — the property
+    // folding it onto the family head destroyed, and the whole of
+    // `ref_null.wast`'s second module.
+    for ([_][]const u8{
+        " (func (export \"f\") (result (ref null $ft)) (global.get $nullfunc)))",
+        " (func (export \"f\") (result (ref null $st)) (global.get $null)))",
+        // …and into its abstract supertypes, which already worked.
+        " (func (export \"f\") (result funcref) (global.get $nullfunc)))",
+        " (func (export \"f\") (result exnref) (global.get $nullexn)))",
+        " (func (export \"f\") (result externref) (global.get $nullextern)))",
+        " (func (export \"f\") (result anyref) (global.get $null)))",
+    }) |tail| {
+        var m = try Module.decode(a, try assemble(a, try std.fmt.allocPrint(a, "{s}{s}", .{ decls, tail })));
+        try validate(a, &m);
+    }
+    // ⚠️ The other direction is the one a flat `== .none` check got wrong: a
+    // bottom belongs to exactly ONE hierarchy. Each of these crosses families.
+    for ([_][]const u8{
+        " (func (export \"f\") (result (ref null $ft)) (global.get $null)))", // any-bottom → concrete func
+        " (func (export \"f\") (result (ref null $st)) (global.get $nullfunc)))", // func-bottom → concrete struct
+        " (func (export \"f\") (result externref) (global.get $nullfunc)))",
+        " (func (export \"f\") (result funcref) (global.get $nullextern)))",
+        " (func (export \"f\") (result anyref) (global.get $nullexn)))",
+    }) |tail| {
+        var m = try Module.decode(a, try assemble(a, try std.fmt.allocPrint(a, "{s}{s}", .{ decls, tail })));
+        try std.testing.expectError(error.TypeMismatch, validate(a, &m));
+    }
+    // A bottom is UNINHABITED except by null, so a real funcref does not test as
+    // one. (`headMatches` keeps saying no; `refHead` no longer folds the target.)
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(
+        "(module (elem declare func $f) (func $f)" ++
+            " (func (export \"g\") (result i32) (ref.test (ref nofunc) (ref.func $f))))",
+        "g",
+        &.{},
+    )));
+    // …while the funcref itself still tests as a funcref.
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(
+        "(module (elem declare func $f) (func $f)" ++
+            " (func (export \"g\") (result i32) (ref.test (ref func) (ref.func $f))))",
+        "g",
+        &.{},
+    )));
+}
+
+test "a tail call's results may be a SUBTYPE of the caller's, not only equal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // §3.3.8 wants `[t2*] <: [t2'*]`. Equality refused every widening return —
+    // a callee giving the non-null `(ref $t)` to a caller declaring the nullable
+    // `(ref null $t)`, or the more abstract `(ref func)`.
+    const ok =
+        "(module (type $t (func)) (type $t1 (func (result (ref $t))))" ++
+        " (elem declare func $f11)" ++
+        " (func $f11 (result (ref $t)) (return_call_ref $t1 (ref.func $f11)))" ++
+        " (func $f21 (result (ref null $t)) (return_call_ref $t1 (ref.func $f11)))" ++
+        " (func $f31 (result (ref func)) (return_call_ref $t1 (ref.func $f11))))";
+    var m = try Module.decode(a, try assemble(a, ok));
+    try validate(a, &m);
+    // …and it is subtyping, not "anything goes": i32 is not a subtype of i64.
+    var bad = try Module.decode(a, try assemble(a,
+        "(module (type $t (func (result i32))) (func $g (type $t) (i32.const 1))" ++
+            " (func (export \"f\") (result i64) (return_call $g)))"));
+    try std.testing.expectError(error.TypeMismatch, validate(a, &bad));
+}
+
+test "a 64-bit table takes its index type before EITHER table form" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // `(table $t i64 funcref (elem …))` — the index type was consumed only in the
+    // limits branch, so the `reftype (elem …)` abbreviation read `i64` as a shape
+    // and then asked `parseU64("funcref")`. And the abbreviation's IMPLICIT offset
+    // has to be `i64.const 0`: an i32 zero against an i64 table is a TypeMismatch,
+    // which is precisely what surfaced once the table itself assembled.
+    var m = try Module.decode(a, try assemble(a,
+        "(module (type $out (func (result i32))) (func $c (type $out) (i32.const 1))" ++
+            " (table $t64 i64 funcref (elem $c))" ++
+            " (func (call_indirect $t64 (type $out) (i64.const 0)) (drop)))"));
+    try validate(a, &m);
+    // The limits form keeps working, in both index types.
+    _ = try assemble(a, "(module (table i64 0 funcref))");
+    _ = try assemble(a, "(module (table i32 1 2 funcref))");
+}
+
+test "an element expression may name a DEFINED global, not only an imported one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // §3.5.13 validates elem segments under the full context C; only `global*`
+    // uses the restricted C'. Bounding element expressions by the imported-global
+    // count rejected this valid module — `global.wast`'s last one is built on it.
+    var m = try Module.decode(a, try assemble(a,
+        "(module (func $f) (global $gf funcref (ref.func $f))" ++
+            " (table $t 10 funcref) (elem (table $t) (i32.const 0) funcref (global.get $gf)))"));
+    try validate(a, &m);
+}
+
+test "S1: an internalized host reference is not a GC heap object" {
+    // ⚠️ A host `externref` used to be a bare small integer, and a GC reference
+    // is a bare small integer too — the same space. `any.convert_extern` is
+    // identity, so a host reference of 0 became GC heap object 0. Here that
+    // object is a struct, so `ref.test (ref struct)` answered 1 and a `ref.cast`
+    // would have handed the guest a reference to it: a forgery primitive built
+    // out of a value the HOST chose.
+    const src =
+        "(module (type $st (struct (field i32)))" ++
+        " (func (export \"is_struct\") (param $x externref) (result i32)" ++
+        "   (drop (struct.new $st (i32.const 6)))" ++ // becomes heap object 0
+        "   (ref.test (ref struct) (any.convert_extern (local.get $x))))" ++
+        " (func (export \"is_any\") (param $x externref) (result i32)" ++
+        "   (ref.test (ref any) (any.convert_extern (local.get $x))))" ++
+        " (func (export \"is_eq\") (param $x externref) (result i32)" ++
+        "   (ref.test (ref eq) (any.convert_extern (local.get $x)))))";
+    const host = interp.hostRefValue(0); // the payload that collided with heap[0]
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "is_struct", &.{host})));
+    try std.testing.expectEqual(@as(i32, 0), interp.asI32(try assembleAndRun(src, "is_eq", &.{host})));
+    // …but it IS in the `any` hierarchy: the GC hierarchy puts host values
+    // directly under `any`, so this must stay 1. Asserting only the negatives
+    // would pass against a value that matched nothing at all.
+    try std.testing.expectEqual(@as(i32, 1), interp.asI32(try assembleAndRun(src, "is_any", &.{host})));
+}
+
+test "R7: the legacy bare memory/table index in data and elem segments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // `(data 0 <offset> …)` is the pre-bulk-memory spelling of
+    // `(data (memory 0) <offset> …)`. ⚠️ Unrecognised, it did not FAIL — the `0`
+    // was dropped and the offset with it, so the segment came out PASSIVE and the
+    // bytes were never written. Assert the VALUE, not that it assembles.
+    try std.testing.expectEqual(@as(i32, 16), interp.asI32(try assembleAndRun(
+        "(module (memory 1) (data 0 (i32.const 10) \"\\10\")" ++
+            " (func (export \"f\") (result i32) (i32.load (i32.const 10))))",
+        "f",
+        &.{},
+    )));
+    // `(elem 0 <offset> …)`, the same shape for tables — this one failed loudly
+    // (`resolveByName` was handed the offset list as a function name).
+    const elem_src =
+        "(module (type $t (func (result i32))) (table 3 funcref)" ++
+        " (elem 0 (i32.const 1) $f $g)" ++
+        " (func $f (result i32) (i32.const 11)) (func $g (result i32) (i32.const 22))" ++
+        " (func (export \"call\") (param i32) (result i32) (call_indirect (type $t) (local.get 0))))";
+    try std.testing.expectEqual(@as(i32, 11), interp.asI32(try assembleAndRun(elem_src, "call", &.{interp.i32Value(1)})));
+    try std.testing.expectEqual(@as(i32, 22), interp.asI32(try assembleAndRun(elem_src, "call", &.{interp.i32Value(2)})));
+    // The legacy form is recognised only when an OFFSET follows, so a passive
+    // segment whose first func index happens to be `0` is untouched.
+    _ = try assemble(a, "(module (func $f) (elem func 0 $f))");
+    // …and a stray token among the data strings is now refused rather than
+    // dropped, which is how the missing memuse above stayed invisible.
+    try std.testing.expectError(error.BadModuleField, assemble(a, "(module (memory 1) (data (i32.const 0) nonsense \"a\"))"));
+}
+
+test "R9: a type use is ORDERED — (type) then param* then result*" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sig = "(type $sig (func (param i32) (result i32)))";
+    for ([_][]const u8{
+        // Every permutation the corpus pins, in a `func`…
+        "(module " ++ sig ++ " (func (type $sig) (result i32) (param i32) (i32.const 0)))",
+        "(module " ++ sig ++ " (func (param i32) (type $sig) (result i32) (i32.const 0)))",
+        "(module " ++ sig ++ " (func (param i32) (result i32) (type $sig) (i32.const 0)))",
+        "(module " ++ sig ++ " (func (result i32) (type $sig) (param i32) (i32.const 0)))",
+        "(module " ++ sig ++ " (func (result i32) (param i32) (type $sig) (i32.const 0)))",
+        "(module (func (result i32) (param i32) (i32.const 0)))",
+        // …and in a `call_indirect` type use.
+        "(module " ++ sig ++ " (table 0 funcref) (func (result i32)" ++
+            " (call_indirect (result i32) (param i32) (i32.const 0) (i32.const 0))))",
+        // A second `(type …)` is not a repetition the grammar allows.
+        "(module " ++ sig ++ " (func (type $sig) (type $sig) (i32.const 0)))",
+        // §6.6.13: locals come after the whole type use.
+        "(module (func (local i32) (param i32)))",
+        "(module (func (local i32) (result i32) (local.get 0)))",
+        // §6.6.4: a `functype` in a type definition is ordered too.
+        "(module (type (func (result i32) (param i32))))",
+    }) |src| {
+        try std.testing.expectError(error.BadModuleField, assemble(a, src));
+    }
+    // The ordered spellings still assemble, including repeated groups.
+    _ = try assemble(a, "(module " ++ sig ++ " (func (type $sig) (param i32) (result i32) (local i64) (local.get 0)))");
+    _ = try assemble(a, "(module (type (func (param i32 i32) (param i64) (result f32) (result f64))))");
+    // A `(param …)` after a FOLDED instruction is malformed, but the same form
+    // after a flat `block` atom is that block's type — see `parseFunc`.
+    try std.testing.expectError(error.BadModuleField, assemble(a, "(module (func (nop) (local i32)))"));
+    _ = try assemble(a, "(module (func (result i32) (nop) block (result i32) (i32.const 1) end))");
+    // …and a flat type use CHAINS off another one, which is why the permission
+    // is carried forward rather than tested against the single previous item.
+    _ = try assemble(a, "(module (table 1 funcref) (func (result i32) unreachable select (result i32) (result)))");
+    _ = try assemble(a, "(module (type $proc (func)) (table 1 funcref)" ++
+        " (func block i32.const 0 call_indirect (type $proc) (param) (result) end))");
+}
+
+test "R9: a type use's inline signature must reproduce the type it names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "(module (type $sig (func)) (func (type $sig) (result i32) (i32.const 0)))",
+        "(module (type $sig (func (param i32) (result i32))) (func (type $sig) (result i32) (i32.const 0)))",
+        "(module (type $sig (func (param i32) (result i32))) (func (type $sig) (param i32) (i32.const 0)))",
+        "(module (type $sig (func (param i32 i32) (result i32)))" ++
+            " (func (type $sig) (param i32) (result i32) (unreachable)))",
+    }) |src| {
+        try std.testing.expectError(error.BadModuleField, assemble(a, src));
+    }
+    // An inline form that AGREES is the legal redundant spelling.
+    _ = try assemble(a, "(module (type $sig (func (param i32) (result i32)))" ++
+        " (func (type $sig) (param i32) (result i32) (local.get 0)))");
+}
+
+test "R9: parameter ids bind only where locals exist" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "(module (func (i32.const 0) (block (param $x i32) (drop))))",
+        "(module (func (i32.const 0) (loop (param $x i32) (drop))))",
+        "(module (func (i32.const 0) (i32.const 1) (if (param $x i32) (then (drop)) (else (drop)))))",
+        "(module (table 0 funcref) (func (call_indirect (param $x i32) (i32.const 0) (i32.const 0))))",
+        "(module (type (func (result $x i32))))", // `result` never takes an id
+        "(module (func (param $x i32 i64)))", // the named form declares ONE type
+    }) |src| {
+        try std.testing.expectError(error.BadModuleField, assemble(a, src));
+    }
+    // A func and a type definition ARE binding positions for a parameter id.
+    _ = try assemble(a, "(module (func (param $x i32) (drop (local.get $x))))");
+    _ = try assemble(a, "(module (type (func (param $x i32) (result i32))))");
+}
+
+test "R9: an identifier may not be bound twice in one namespace" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "(module (func $foo) (func $foo))",
+        // …and the rule spans imports and definitions, which is exactly the pair
+        // a per-append-site check would miss.
+        "(module (import \"\" \"\" (func $foo)) (func $foo))",
+        "(module (import \"\" \"\" (func $foo)) (import \"\" \"\" (func $foo)))",
+        "(module (global $foo i32 (i32.const 0)) (global $foo i32 (i32.const 0)))",
+        "(module (import \"\" \"\" (global $foo i32)) (global $foo i32 (i32.const 0)))",
+        "(module (memory $foo 1) (memory $foo 1))",
+        "(module (import \"\" \"\" (memory $foo 1)) (memory $foo 1))",
+        "(module (table $foo 1 funcref) (table $foo 1 funcref))",
+        "(module (import \"\" \"\" (table $foo 1 funcref)) (table $foo 1 funcref))",
+        // Params and locals share one namespace.
+        "(module (func (param $foo i32) (param $foo i32)))",
+        "(module (func (param $foo i32) (local $foo i32)))",
+        "(module (func (local $foo i32) (local $foo i32)))",
+        // A struct's fields are their own namespace.
+        "(module (type (struct (field $x i32) (field $x i32))))",
+    }) |src| {
+        try std.testing.expectError(error.DuplicateName, assemble(a, src));
+    }
+    // At most one start section (§2.5.9) — not a name clash, the same family.
+    try std.testing.expectError(error.BadModuleField, assemble(a, "(module (func $a (unreachable)) (func $b (unreachable)) (start $a) (start $b))"));
+    // Distinct names in the same space, and the same name in DIFFERENT spaces,
+    // both stay legal.
+    _ = try assemble(a, "(module (func $a) (func $b) (global $a i32 (i32.const 0)) (memory $a 1))");
 }

@@ -130,6 +130,10 @@ bool wazmrt_func_is_valid(const wazmrt_store_t *, wazmrt_func_t);
 bool wazmrt_memory_is_valid(const wazmrt_store_t *, wazmrt_memory_t);
 bool wazmrt_global_is_valid(const wazmrt_store_t *, wazmrt_global_t);
 
+/* Does this store recognise `ref` as a reference handle it issued? 0 (null) is
+ * always valid. See wazmrt_valkind_t below for why references are handles. */
+bool wazmrt_ref_is_valid(const wazmrt_store_t *, uint64_t ref);
+
 /* ---- Values ---------------------------------------------------------------------------
  * The types that cross the host boundary. A guest may use the GC reference types internally;
  * they cannot be passed to or from a host call, and calling an export whose signature
@@ -145,8 +149,17 @@ typedef enum {
     WAZMRT_I64       = 1,
     WAZMRT_F32       = 2,
     WAZMRT_F64       = 3,
-    WAZMRT_FUNCREF   = 4,  /* opaque to the host: pass it back unchanged */
-    WAZMRT_EXTERNREF = 5,  /* likewise                                   */
+    /* Reference values are HANDLES, like wazmrt_instance_t and friends — not the
+     * engine's internal encoding. `of.ref` is meaningful only to the store that
+     * issued it; 0 is the null reference, so a zeroed wazmrt_val_t is null by
+     * construction. Pass one back unchanged and it round-trips; hand a store a
+     * handle it did not issue (or one from another store) and the call is
+     * REFUSED, never reinterpreted. Check with wazmrt_ref_is_valid().
+     *
+     * The engine has no API to mint a reference from host data: every handle you
+     * hold came from a guest value crossing this boundary. */
+    WAZMRT_FUNCREF   = 4,
+    WAZMRT_EXTERNREF = 5,
     WAZMRT_V128      = 6
 } wazmrt_valkind_t;
 
@@ -216,7 +229,8 @@ typedef enum {
     WAZMRT_FEATURE_MEMORY64                  = 10,
     WAZMRT_FEATURE_FUNCTION_REFERENCES       = 11,  /* requires REFERENCE_TYPES     */
     WAZMRT_FEATURE_GC                        = 12,  /* requires FUNCTION_REFERENCES */
-    WAZMRT_FEATURE_EXCEPTIONS                = 13   /* requires REFERENCE_TYPES     */
+    WAZMRT_FEATURE_EXCEPTIONS                = 13,  /* requires REFERENCE_TYPES     */
+    WAZMRT_FEATURE_TAIL_CALL                 = 14
 } wazmrt_feature_t;
 
 wazmrt_config_t *wazmrt_config_new(void);

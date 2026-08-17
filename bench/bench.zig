@@ -92,7 +92,8 @@ fn benchHash(io: Io, a: std.mem.Allocator, path: []const u8) !void {
         const funcs = a.alloc(wazmrt.interp.Instance.HostFunc, nfuncs) catch unreachable;
         defer a.free(funcs);
         for (funcs) |*f| f.* = .{ .native_env = .{ .ctx = &stub_ctx, .call = stubCall } };
-        var inst = wazmrt.Instance.initWithImports(a, &m, .{ .funcs = funcs }) catch |e| {
+        var inst: wazmrt.Instance = undefined;
+        inst.instantiateWithImports(a, &m, .{ .funcs = funcs }) catch |e| {
             std.debug.print("  instantiate FAILED: {t}\n", .{e});
             inst_ok = false;
             break;
@@ -145,6 +146,16 @@ fn benchHash(io: Io, a: std.mem.Allocator, path: []const u8) !void {
         if (val_ok) "" else " — VALIDATION FAILED, time is meaningless",
     });
     if (inst_ok) std.debug.print("  ==> hashing adds {d:.1}% to cold start\n", .{per_hash / (di_ns / fiters) * 100.0});
+
+    // Machine-readable line for `tools/phases.mjs`, which puts these beside a
+    // compiling runtime's pipeline. Microseconds, tab-separated, one per module.
+    std.debug.print("PHASES\t{s}\t{d}\t{d:.2}\t{d:.2}\t{d:.2}\n", .{
+        path,
+        bytes.len,
+        decode_ns / fiters / 1000.0,
+        dv_ns / fiters / 1000.0,
+        di_ns / fiters / 1000.0,
+    });
 }
 
 var stub_ctx: u8 = 0;
@@ -184,7 +195,8 @@ pub fn main(init: std.process.Init) !void {
     {
         var module = try wazmrt.decode(a, bin);
         defer module.deinit();
-        var inst = try wazmrt.Instance.init(a, &module);
+        var inst: wazmrt.Instance = undefined;
+        try inst.instantiate(a, &module);
         defer inst.deinit();
 
         const n: i32 = 1_000_000;
@@ -219,7 +231,8 @@ pub fn main(init: std.process.Init) !void {
         const start = nowNs(io);
         for (0..reps) |_| {
             var module = try wazmrt.decode(a, bin);
-            var inst = try wazmrt.Instance.init(a, &module);
+            var inst: wazmrt.Instance = undefined;
+            try inst.instantiate(a, &module);
             a.free(try inst.invoke("sum", &.{wazmrt.interp.i32Value(0)}));
             inst.deinit();
             module.deinit();

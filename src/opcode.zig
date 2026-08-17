@@ -45,6 +45,11 @@ pub const Op = enum(u8) {
     @"return" = 0x0f,
     call = 0x10,
     call_indirect = 0x11,
+    // Tail calls (tail-call proposal). Same immediates as `call`/`call_indirect`;
+    // the callee REPLACES this frame rather than nesting inside it, so its
+    // results must be the current function's results.
+    return_call = 0x12,
+    return_call_indirect = 0x13,
     // Exception handling (exnref proposal, Phase 6).
     throw = 0x08, // immediate: a tag index — package operands into an exception + throw
     throw_ref = 0x0a, // rethrow the exnref on the stack (null → trap)
@@ -60,6 +65,20 @@ pub const Op = enum(u8) {
     // Typed function references (function-references proposal).
     call_ref = 0x14, // immediate: a type index (the func ref's signature)
     return_call_ref = 0x15,
+
+    // GC: the extern↔any bridge (`0xFB 0x1a` / `0x1b`). INTERNAL tags in the
+    // unassigned `0x16`/`0x17` slots — the wire form is the `0xFB` prefix, and
+    // `decodeBody` rejects the raw bytes alongside the other tag ranges.
+    //
+    // ⚠️ These existed ONLY in the constant-expression path (`validateConstExpr`
+    // and `evalConstExpr`) — there was no `Op`, so a function BODY using them was
+    // `UnknownInstr` at the assembler and undecodable after it. One missing
+    // mnemonic pair failed the first module of `ref_test`, `ref_cast`,
+    // `br_on_cast`, `br_on_cast_fail` and `extern`, blacking out **172
+    // assertions**. A feature implemented for one of its two contexts reads as
+    // implemented.
+    extern_convert_any = 0x16, // 0xFB 0x1a: [(ref null? any)] -> [(ref null? extern)]
+    any_convert_extern = 0x17, // 0xFB 0x1b: [(ref null? extern)] -> [(ref null? any)]
 
     // Reference
     ref_null = 0xd0, // immediate: a heaptype byte (func / extern)
@@ -307,6 +326,16 @@ pub const Op = enum(u8) {
     array_get_u = 0xeb, // 0xFB 0x0d (packed)
     array_set = 0xec, // 0xFB 0x0e: [(ref null $t) i32 t'] -> []
     array_len = 0xed, // 0xFB 0x0f: [(ref null array)] -> [i32]
+    // The array bulk ops. These were absent from this table entirely until R3
+    // (2026-08-13) — GC shipped as a targeted proposal with a sixth of its array
+    // instructions missing, and every `.wast` reaching one died at the ASSEMBLER
+    // (`UnknownInstr`), which cascaded 197 further assertions into skips.
+    array_new_data = 0xdd, // 0xFB 0x09: [i32 i32] -> [(ref $t)] (offset, size)
+    array_new_elem = 0xde, // 0xFB 0x0a: [i32 i32] -> [(ref $t)] (offset, size)
+    array_fill = 0xdf, // 0xFB 0x10: [(ref null $t) i32 t' i32] -> []
+    array_copy = 0xcd, // 0xFB 0x11: [(ref null $t1) i32 (ref null $t2) i32 i32] -> []
+    array_init_data = 0xce, // 0xFB 0x12: [(ref null $t) i32 i32 i32] -> []
+    array_init_elem = 0xcf, // 0xFB 0x13: [(ref null $t) i32 i32 i32] -> []
 
     // GC ops carried under the `0xFB` prefix. Like the table ops above, these
     // enum values are INTERNAL tags in an unused byte range — the wire encoding
@@ -346,6 +375,7 @@ pub const HeapType = union(enum) {
     nofunc,
     noextern,
     exn, // exception heap type (EH proposal, Phase 6)
+    noexn, // the bottom of the exn hierarchy — see `types.ValType.RefHeap`
     concrete: u32, // a type index
 };
 
@@ -390,6 +420,12 @@ pub fn gcSubOpcode(op: Op) ?u8 {
         .array_new => 0x06,
         .array_new_default => 0x07,
         .array_new_fixed => 0x08,
+        .array_new_data => 0x09,
+        .array_new_elem => 0x0a,
+        .array_fill => 0x10,
+        .array_copy => 0x11,
+        .array_init_data => 0x12,
+        .array_init_elem => 0x13,
         .array_get => 0x0b,
         .array_get_s => 0x0c,
         .array_get_u => 0x0d,
@@ -402,6 +438,8 @@ pub fn gcSubOpcode(op: Op) ?u8 {
         .ref_i31 => 0x1c,
         .i31_get_s => 0x1d,
         .i31_get_u => 0x1e,
+        .extern_convert_any => 0x1a,
+        .any_convert_extern => 0x1b,
         else => null,
     };
 }
@@ -411,6 +449,12 @@ pub const BlockType = union(enum) {
     empty,
     value: types.ValType,
     type_index: u32,
+    /// A single `(ref null? ht)` result — the two MULTI-byte valtypes, which the
+    /// decoder cannot collapse into `.value` because a concrete heap type index
+    /// needs the module's composite kinds to pick its family head. Kept
+    /// unresolved here and turned into a `ValType` by the validator/interpreter,
+    /// which have the module. (`.value` still carries every single-byte valtype.)
+    ref: RefType,
 };
 
 /// A load/store memory-immediate. `memory` is the target memory index
@@ -473,6 +517,14 @@ pub const Imm = union(enum) {
     gc_field: struct { type_index: u32, field: u32 },
     /// A GC array type index + element count (`array.new_fixed`).
     gc_type_n: struct { type_index: u32, n: u32 },
+    /// A GC array type index + a DATA-segment index (`array.new_data` /
+    /// `array.init_data`).
+    gc_data: struct { type_index: u32, data: u32 },
+    /// A GC array type index + an ELEMENT-segment index (`array.new_elem` /
+    /// `array.init_elem`).
+    gc_elem: struct { type_index: u32, elem: u32 },
+    /// Destination + source array type indices (`array.copy`).
+    gc_array_copy: struct { dst: u32, src: u32 },
     /// A GC cast target reference type (`ref.test` / `ref.cast`).
     ref_cast: RefType,
     /// A GC cast-branch (`br_on_cast` / `br_on_cast_fail`): a label + the source
@@ -541,6 +593,12 @@ const ImmKind = enum {
     gc_type,
     gc_field,
     gc_type_n,
+    /// `array.new_data` / `array.init_data` — a type index + a data index.
+    gc_data,
+    /// `array.new_elem` / `array.init_elem` — a type index + an elem index.
+    gc_elem,
+    /// `array.copy` — two array type indices (dst, src).
+    gc_array_copy,
     ref_cast,
     br_cast,
     tag,
@@ -576,8 +634,8 @@ pub fn immediateKind(op: Op) ImmKind {
         0x1f => .try_table, // try_table <blocktype> vec(catch)
         0x0c, 0x0d, 0x09, 0x18 => .label, // br/br_if + legacy `rethrow`/`delegate`
         0x0e => .br_table,
-        0x10 => .func,
-        0x11 => .call_indirect,
+        0x10, 0x12 => .func, // call / return_call
+        0x11, 0x13 => .call_indirect, // call_indirect / return_call_indirect
         0x14, 0x15 => .func, // call_ref / return_call_ref — imm.func = type index
         0xd5, 0xd6 => .label, // br_on_null / br_on_non_null
         0x20, 0x21, 0x22 => .local,
@@ -604,14 +662,21 @@ pub fn immediateKind(op: Op) ImmKind {
         // Everything else in the core-MVP range has no immediate; `0xc5…0xcc` are
         // the saturating-truncation tags (also immediate-free).
         0x00, 0x01, 0x05, 0x0b, 0x0f, 0x1a, 0x1b, 0xd1, 0xd3, 0xd4, 0x45...0xcc => .none,
-        // GC ops with no immediate: ref.i31/i31.get_s/i31.get_u, array.len.
-        0xf0, 0xf1, 0xf2, 0xed => .none,
-        // GC ops with a single type index.
-        0xe6, 0xe7, 0xe9, 0xea, 0xeb, 0xec, 0xf3, 0xf4 => .gc_type,
+        // GC ops with no immediate: ref.i31/i31.get_s/i31.get_u, array.len, and
+        // the extern↔any bridge (`0x16`/`0x17`, rejected as raw bytes below).
+        0xf0, 0xf1, 0xf2, 0xed, 0x16, 0x17 => .none,
+        // GC ops with a single type index (`array.fill` = 0xDF included).
+        0xe6, 0xe7, 0xe9, 0xea, 0xeb, 0xec, 0xf3, 0xf4, 0xdf => .gc_type,
         // GC struct ops with a type index + field index.
         0xf5, 0xf6, 0xf7, 0xf8 => .gc_field,
         // array.new_fixed: type index + element count.
         0xe8 => .gc_type_n,
+        // array.new_data / array.init_data: type index + data-segment index.
+        0xdd, 0xce => .gc_data,
+        // array.new_elem / array.init_elem: type index + elem-segment index.
+        0xde, 0xcf => .gc_elem,
+        // array.copy: destination + source array type indices.
+        0xcd => .gc_array_copy,
         // ref.test / ref.cast: a target reference type.
         0xee, 0xef => .ref_cast,
         // br_on_cast / br_on_cast_fail: a label + source & destination ref types.
@@ -620,9 +685,26 @@ pub fn immediateKind(op: Op) ImmKind {
     };
 }
 
-/// Decode a block type (§5.3.6): an s33 — negative values encode empty/valtype,
-/// non-negative values are a type index.
+/// Decode a block type (§5.3.6): `0x40` (empty), a valtype, or a non-negative
+/// s33 type index. Every *single-byte* valtype encodes as a negative s33, which
+/// is what lets one `readVarS33` separate the three cases.
 fn readBlockType(r: *Reader) DecodeError!BlockType {
+    // ⚠️ …except the two MULTI-byte valtypes. `(ref null ht)` = `0x63 ht` and
+    // `(ref ht)` = `0x64 ht` are ordinary valtypes and therefore ordinary block
+    // types, but only their first byte is in the s33 stream — the heap type
+    // follows. Reading them as a bare s33 yields −29/−28, which matched no arm,
+    // so a concrete-ref block type was undecodable. `wat.zig` worked around it by
+    // interning a function type and emitting a type INDEX instead, which is legal
+    // but non-canonical — and it MANUFACTURED a type entry, so
+    // `(block (result (ref 1)))` in a module with one type resolved `(ref 1)` to
+    // the signature the block had just created and validated clean. `ref.wast`
+    // requires it rejected as "unknown type". **A workaround in the producer for
+    // a gap in the consumer does not stay cosmetic.**
+    const first = try r.peekByte();
+    if (first == 0x63 or first == 0x64) {
+        _ = try r.readByte();
+        return .{ .ref = .{ .nullable = first == 0x63, .heap = try readHeapType(r) } };
+    }
     const v = try r.readVarS33();
     if (v >= 0) {
         if (v > std.math.maxInt(u32)) return error.UnsupportedOpcode; // guard the @intCast
@@ -906,6 +988,14 @@ pub fn readHeapType(r: *Reader) DecodeError!HeapType {
         -0x0d => .nofunc,
         -0x0e => .noextern,
         -0x17 => .exn, // 0x69
+        // `noexn` (0x74) — the bottom of the exn hierarchy, its OWN head now.
+        // ⚠️ It used to fold onto `exn`, "because only null inhabits it, so the
+        // distinction is unobservable in this model". The distinction is not
+        // unobservable: a bottom type is a subtype of every type in its
+        // hierarchy — including the CONCRETE ones — which is exactly the property
+        // `ref_null.wast` tests and which folding erases. The same correction
+        // applies to `nofunc`/`noextern` below.
+        -0x0c => .noexn,
         else => error.UnsupportedOpcode,
     };
 }
@@ -955,6 +1045,12 @@ pub fn decodeBodyTracked(
                 0x06 => .{ .op = .array_new, .imm = .{ .gc_type = try r.readVarU32() } },
                 0x07 => .{ .op = .array_new_default, .imm = .{ .gc_type = try r.readVarU32() } },
                 0x08 => .{ .op = .array_new_fixed, .imm = .{ .gc_type_n = .{ .type_index = try r.readVarU32(), .n = try r.readVarU32() } } },
+                0x09 => .{ .op = .array_new_data, .imm = .{ .gc_data = .{ .type_index = try r.readVarU32(), .data = try r.readVarU32() } } },
+                0x0a => .{ .op = .array_new_elem, .imm = .{ .gc_elem = .{ .type_index = try r.readVarU32(), .elem = try r.readVarU32() } } },
+                0x10 => .{ .op = .array_fill, .imm = .{ .gc_type = try r.readVarU32() } },
+                0x11 => .{ .op = .array_copy, .imm = .{ .gc_array_copy = .{ .dst = try r.readVarU32(), .src = try r.readVarU32() } } },
+                0x12 => .{ .op = .array_init_data, .imm = .{ .gc_data = .{ .type_index = try r.readVarU32(), .data = try r.readVarU32() } } },
+                0x13 => .{ .op = .array_init_elem, .imm = .{ .gc_elem = .{ .type_index = try r.readVarU32(), .elem = try r.readVarU32() } } },
                 0x0b => .{ .op = .array_get, .imm = .{ .gc_type = try r.readVarU32() } },
                 0x0c => .{ .op = .array_get_s, .imm = .{ .gc_type = try r.readVarU32() } },
                 0x0d => .{ .op = .array_get_u, .imm = .{ .gc_type = try r.readVarU32() } },
@@ -969,6 +1065,8 @@ pub fn decodeBodyTracked(
                 0x1c => .{ .op = .ref_i31, .imm = .none },
                 0x1d => .{ .op = .i31_get_s, .imm = .none },
                 0x1e => .{ .op = .i31_get_u, .imm = .none },
+                0x1a => .{ .op = .extern_convert_any, .imm = .none },
+                0x1b => .{ .op = .any_convert_extern, .imm = .none },
                 else => return error.UnsupportedOpcode,
             };
             try list.append(a, instr);
@@ -1022,10 +1120,19 @@ pub fn decodeBodyTracked(
             try list.append(a, try decodeAtomic(&r, try r.readVarU32()));
             continue;
         }
-        // `0xd7..0xfa` are wazmrt's INTERNAL tags for ops whose real wire form is
-        // `0xFB`/`0xFC` + a LEB sub-opcode (handled above). A raw byte in that
-        // range is not a valid single-byte wasm opcode, so accepting it executed
-        // a non-standard encoding as if it were e.g. `table.grow`.
+        // `0xc5..0xcf` and `0xd7..0xfa` are wazmrt's INTERNAL tags for ops whose
+        // real wire form is `0xFB`/`0xFC` + a LEB sub-opcode (handled above). A raw
+        // byte in either range is not a valid single-byte wasm opcode, so accepting
+        // one executed a non-standard encoding as if it were e.g. `table.grow`.
+        //
+        // ⚠️ TWO ranges, not one — `0xd0..0xd6` (`ref.null` … `br_on_non_null`) are
+        // REAL single-byte opcodes sitting between them. Only `0xd7..0xfa` was
+        // guarded until R3 (2026-08-13), which left the eight saturating-truncation
+        // tags `0xc5..0xcc` open: `immediateKind` classifies `0x45...0xcc` as
+        // `.none`, so a raw `0xC5` byte — not a wasm opcode at all — decoded and
+        // executed as `i32.trunc_sat_f32_s`. Same accept-invalid the original guard
+        // was written to close; it just stopped short of tags that already existed.
+        // `0xcd..0xcf` are R3's `array.copy`/`array.init_data`/`array.init_elem`.
         //
         // The pre-existing guard rejected by *immediate kind*, which catches only
         // the tags whose kind is unreachable from any real single-byte op — it
@@ -1033,7 +1140,13 @@ pub fn decodeBodyTracked(
         // (`.none`), whose kinds are legitimately reachable. A range check is the
         // property that actually holds. (`0xd0–0xd6` are real ops; `0xfb–0xfd`
         // are prefixes consumed above, and both sit outside this range.)
-        if (b0 >= 0xd7 and b0 <= 0xfa) return error.UnsupportedOpcode;
+        // THREE ranges now: R10 put the extern↔any bridge in the unassigned
+        // `0x16`/`0x17` slots, the only pair left outside the two blocks below.
+        // Their `immediateKind` is `.none`, which is reachable from real ops, so
+        // without this arm a raw `0x16` byte would decode and EXECUTE as
+        // `extern.convert_any` — the accept-invalid R3 closed for `0xc5..0xcc`.
+        if (b0 == 0x16 or b0 == 0x17 or
+            (b0 >= 0xc5 and b0 <= 0xcf) or (b0 >= 0xd7 and b0 <= 0xfa)) return error.UnsupportedOpcode;
         const op: Op = @enumFromInt(b0);
         const imm: Imm = switch (immediateKind(op)) {
             .none => .none,
@@ -1083,7 +1196,7 @@ pub fn decodeBodyTracked(
             // reaching here means a raw synthetic-tag byte, which is malformed.
             // 0xFB/0xFC-prefixed ops are decoded via the prefix interceptions
             // above; reaching here means a raw synthetic-tag byte (malformed).
-            .elem, .data, .data_init, .mem_copy, .mem_reserved, .table_init, .table_copy, .gc_type, .gc_field, .gc_type_n, .ref_cast, .br_cast => return error.UnsupportedOpcode,
+            .elem, .data, .data_init, .mem_copy, .mem_reserved, .table_init, .table_copy, .gc_type, .gc_field, .gc_type_n, .gc_data, .gc_elem, .gc_array_copy, .ref_cast, .br_cast => return error.UnsupportedOpcode,
             .unsupported => return error.UnsupportedOpcode,
         };
         try list.append(a, .{ .op = op, .imm = imm });
@@ -1183,14 +1296,22 @@ test "rejects raw internal-tag bytes that are not real single-byte opcodes" {
         0xe3, 0xe4, 0xe5, // table.grow/size/fill  (kind .table — also a real kind)
         0xed, // array.len              (kind .none  — also a real kind)
         0xf0, 0xf1, 0xf2, // ref.i31 / i31.get_s/u  (kind .none)
-        0xd7, 0xdb, 0xfa, // range endpoints + the SIMD tag
+        0xd7, 0xdb, 0xfa, // upper-range endpoints + the SIMD tag
+        // R3: the LOWER tag range, which no guard covered until 2026-08-13. The
+        // eight `0xc5..0xcc` saturating-truncation tags all classify as `.none`,
+        // so a raw byte decoded and EXECUTED as a real instruction — `0xC5` ran
+        // as `i32.trunc_sat_f32_s`. `0xcd..0xcf` are the new array bulk tags.
+        0xc5, 0xc8, 0xcc, // saturating-truncation range: low, middle, high
+        0xcd, 0xce, 0xcf, // array.copy / array.init_data / array.init_elem
+        0xdd, 0xde, 0xdf, // array.new_data / array.new_elem / array.fill
     };
     for (tags) |b| {
         const body = [_]u8{b};
         try std.testing.expectError(error.UnsupportedOpcode, decodeBody(std.testing.allocator, &body));
     }
 
-    // The real single-byte ops just below the range must still decode.
+    // The real single-byte ops BETWEEN the two tag ranges must still decode —
+    // `0xd0..0xd6` sit in the gap, which is why the guard cannot be one range.
     for ([_]u8{ 0xd1, 0xd4, 0xd6 }) |b| { // ref.is_null / ref.as_non_null / br_on_non_null
         const body = if (b == 0xd6) [_]u8{ b, 0x00 } else [_]u8{ b, 0x0b }; // br_on_non_null takes a label
         const ir = decodeBody(std.testing.allocator, &body) catch |e| {
@@ -1199,4 +1320,55 @@ test "rejects raw internal-tag bytes that are not real single-byte opcodes" {
         };
         defer std.testing.allocator.free(ir);
     }
+    // …and so must the real ops just BELOW the lower range (`0xc0..0xc4`, the
+    // sign-extension operators), or the new lower bound has been set too low.
+    for ([_]u8{ 0xc0, 0xc4 }) |b| {
+        const ir = try decodeBody(std.testing.allocator, &[_]u8{ b, 0x0b });
+        defer std.testing.allocator.free(ir);
+    }
+}
+
+test "R3: the six array bulk ops decode from their 0xFB sub-opcodes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Each is `0xFB <sub> <imm…>`; the immediates are LEB indices.
+    const body = [_]u8{
+        0xfb, 0x09, 0x01, 0x02, // array.new_data  $1 $2
+        0xfb, 0x0a, 0x03, 0x04, // array.new_elem  $3 $4
+        0xfb, 0x10, 0x05, // array.fill      $5
+        0xfb, 0x11, 0x06, 0x07, // array.copy      $6 $7
+        0xfb, 0x12, 0x08, 0x09, // array.init_data $8 $9
+        0xfb, 0x13, 0x0a, 0x0b, // array.init_elem $10 $11
+        0x0b, // end
+    };
+    const ir = try decodeBody(a, &body);
+    try std.testing.expectEqual(@as(usize, 7), ir.len);
+
+    try std.testing.expectEqual(Op.array_new_data, ir[0].op);
+    try std.testing.expectEqual(@as(u32, 1), ir[0].imm.gc_data.type_index);
+    try std.testing.expectEqual(@as(u32, 2), ir[0].imm.gc_data.data);
+    try std.testing.expectEqual(Op.array_new_elem, ir[1].op);
+    try std.testing.expectEqual(@as(u32, 3), ir[1].imm.gc_elem.type_index);
+    try std.testing.expectEqual(@as(u32, 4), ir[1].imm.gc_elem.elem);
+    try std.testing.expectEqual(Op.array_fill, ir[2].op);
+    try std.testing.expectEqual(@as(u32, 5), ir[2].imm.gc_type);
+    try std.testing.expectEqual(Op.array_copy, ir[3].op);
+    try std.testing.expectEqual(@as(u32, 6), ir[3].imm.gc_array_copy.dst);
+    try std.testing.expectEqual(@as(u32, 7), ir[3].imm.gc_array_copy.src);
+    try std.testing.expectEqual(Op.array_init_data, ir[4].op);
+    try std.testing.expectEqual(@as(u32, 9), ir[4].imm.gc_data.data);
+    try std.testing.expectEqual(Op.array_init_elem, ir[5].op);
+    try std.testing.expectEqual(@as(u32, 11), ir[5].imm.gc_elem.elem);
+
+    // Round-trip the sub-opcode table: what the assembler emits is what the
+    // decoder just read. A decoder rule with no matching emitter rule is the
+    // producer/consumer blind spot this codebase has hit four times.
+    try std.testing.expectEqual(@as(?u8, 0x09), gcSubOpcode(.array_new_data));
+    try std.testing.expectEqual(@as(?u8, 0x0a), gcSubOpcode(.array_new_elem));
+    try std.testing.expectEqual(@as(?u8, 0x10), gcSubOpcode(.array_fill));
+    try std.testing.expectEqual(@as(?u8, 0x11), gcSubOpcode(.array_copy));
+    try std.testing.expectEqual(@as(?u8, 0x12), gcSubOpcode(.array_init_data));
+    try std.testing.expectEqual(@as(?u8, 0x13), gcSubOpcode(.array_init_elem));
 }

@@ -28,6 +28,7 @@ const root = @import("root.zig");
 
 const Module = root.Module;
 const interp = root.interp;
+const typematch = root.typematch;
 
 /// The C ABI's allocator. Under the test target this is the testing allocator, which fails on
 /// double-free and leaks; otherwise the libc-free `smp_allocator`. Comptime, so release builds
@@ -410,6 +411,11 @@ const InstanceSlot = struct {
     /// only say `HostTrap` — it cannot carry the host's message. Consumed by whoever reports the
     /// failure, so the embedder gets its own trap back instead of a generic one.
     pending_trap: ?*Trap = null,
+    /// The store this slot belongs to. Needed wherever a value crosses the ABI:
+    /// references are HANDLES issued by that store's table, so converting one
+    /// requires knowing which store to ask. Set at creation; the store outlives
+    /// its slots.
+    store: *Store = undefined,
 
     /// Take the host trap if there is one, else make one from the interpreter's error.
     fn takeTrap(self: *InstanceSlot, err: anyerror) ?*Trap {
@@ -425,6 +431,9 @@ const InstanceSlot = struct {
     /// crash. Returns true when the error was really an exit, having recorded the code.
     fn tookExit(self: *InstanceSlot, err: anyerror) bool {
         if (err != error.HostTrap) return false;
+        // A `-Dwasi=false` build has no exits to take: no WASI host can be
+        // installed, so `self.wasi` is always null.
+        if (comptime !root.enable_wasi) return false;
         const w = self.wasi orelse return false;
         const code = w.wasi.exit_code orelse return false;
         // WASI's `proc_exit` takes a u32; the ABI reports int32_t, so 0xFFFFFFFF reads as -1 —
@@ -446,10 +455,38 @@ const Ref = struct { inst: u32, index: u32 };
 pub const Store = struct {
     id: u64,
     engine: *Engine,
+    /// The interpreter-side store every instance here joins, so a `funcref` means
+    /// the same function to all of them. `define_instance` links one guest module
+    /// to another's exports, which is exactly the case that needs it: without a
+    /// shared store the importer would resolve the exporter's funcrefs against
+    /// its OWN function index space. See `interp.Store`.
+    refs: interp.Store = undefined,
     instances: std.ArrayList(*InstanceSlot) = .empty,
     funcs: std.ArrayList(Ref) = .empty,
     memories: std.ArrayList(Ref) = .empty,
     globals: std.ArrayList(Ref) = .empty,
+    /// Interned INTERNAL reference values the host has been shown, so a
+    /// `funcref`/`externref` crossing the ABI is a HANDLE like every other value
+    /// kind here — not the interpreter's raw encoding.
+    ///
+    /// ⚠️ **This was a raw pass-through, and it was the last hole in the
+    /// value-handle model.** Instances, funcs, memories and globals have been
+    /// `(store_id << 32) | (slot+1)`, validated by lookup, since ABI 2 — the
+    /// header's whole premise is dropping the object model so the bug class is
+    /// *inexpressible rather than policed*. References were the one kind still
+    /// handed over raw, which meant the interpreter's private encoding leaked
+    /// across the boundary: bit 63 marks an i31, bit 62 a host reference,
+    /// all-ones is null, and a structured high half is an (owner, index) pair.
+    /// A host that passed back exactly what it got was fine; nothing enforced
+    /// that, and there was no `is_valid` for refs as there is for the rest. **An
+    /// undocumented forbidden value space is an interop bug before it is a
+    /// security one.**
+    ///
+    /// Boxing is complete here precisely because the ABI has **no API for a host
+    /// to CREATE a reference** — the host only ever sees handles this table
+    /// issued, so an inbound value is always a lookup and an unknown one is
+    /// refused rather than guessed.
+    ext_refs: std.ArrayList(interp.Value) = .empty,
 
     /// Does `id` name a live slot in this store? The whole point of value handles: validity is
     /// *decided here*, never trusted from the caller.
@@ -468,7 +505,43 @@ pub const Store = struct {
     fn instanceOf(self: *Store, r: Ref) *InstanceSlot {
         return self.instances.items[r.inst];
     }
+
+    /// Hand the host a HANDLE for an internal reference value.
+    ///
+    /// Null maps to handle 0, which is invalid-by-construction everywhere else
+    /// in this ABI (slot 0 is never used) — so a `memset`-zeroed `wazmrt_val_t`
+    /// is a null reference rather than a wild one, the same trick the other
+    /// handle kinds already play.
+    ///
+    /// Interned by value, so the same reference always yields the same handle:
+    /// a host comparing two handles for equality gets the answer it expects, and
+    /// returning one reference in a loop does not grow the table.
+    fn boxRef(self: *Store, v: interp.Value) ?u64 {
+        if (v == interp.null_ref) return 0;
+        for (self.ext_refs.items, 0..) |e, i| {
+            if (e == v) return Handle.make(self.id, @intCast(i));
+        }
+        // Bounded like every other guest-driven table here (`max_gc_objects`,
+        // `exn_store`): a guest that returns a fresh reference per call must not
+        // be able to grow host memory without limit.
+        if (self.ext_refs.items.len >= max_ext_refs) return null;
+        self.ext_refs.append(alloc, v) catch return null;
+        return Handle.make(self.id, @intCast(self.ext_refs.items.len - 1));
+    }
+
+    /// The internal reference value a host handle names, or null if it names
+    /// none — a handle from another store, a stale one, or a value the host
+    /// invented. **Refused, never reinterpreted.**
+    fn unboxRef(self: *const Store, h: u64) ?interp.Value {
+        if (h == 0) return interp.null_ref;
+        const i = self.resolve(h, self.ext_refs.items.len) orelse return null;
+        return self.ext_refs.items[i];
+    }
 };
+
+/// Ceiling on distinct references handed across the C ABI per store. Generous —
+/// a real embedder holds a handful — and finite, which is the point.
+const max_ext_refs: usize = 1 << 20;
 
 var next_store_id: std.atomic.Value(u64) = .init(1);
 
@@ -476,6 +549,7 @@ export fn wazmrt_store_new(e: ?*Engine) ?*Store {
     const eng = e orelse return null;
     const s = alloc.create(Store) catch return null;
     s.* = .{ .id = next_store_id.fetchAdd(1, .monotonic), .engine = eng };
+    s.refs = .init(alloc);
     return s;
 }
 
@@ -491,7 +565,7 @@ export fn wazmrt_store_delete(s: ?*Store) void {
         slot.inst.deinit();
         // Before the arena goes: `Wasi.deinit` closes the preopened directory handles it owns,
         // which are OS resources the arena knows nothing about.
-        if (slot.wasi) |w| w.wasi.deinit();
+        if (comptime root.enable_wasi) if (slot.wasi) |w| w.wasi.deinit();
         // Symmetric to `wazmrt_linker_delete`: drop the linker's reference to us first.
         if (slot.linker) |lk| {
             for (lk.slots.items, 0..) |cand, k| {
@@ -505,10 +579,13 @@ export fn wazmrt_store_delete(s: ?*Store) void {
         releaseModule(slot.module);
         alloc.destroy(slot);
     }
+    // After every instance is gone: `Instance.deinit` tombstones its slot here.
+    store.refs.deinit();
     store.instances.deinit(alloc);
     store.funcs.deinit(alloc);
     store.memories.deinit(alloc);
     store.globals.deinit(alloc);
+    store.ext_refs.deinit(alloc);
     alloc.destroy(store);
 }
 
@@ -531,6 +608,11 @@ export fn wazmrt_memory_is_valid(s: ?*const Store, h: MemoryHandle) bool {
     const store = s orelse return false;
     return store.owns(h.id, store.memories.items.len);
 }
+export fn wazmrt_ref_is_valid(s: ?*const Store, ref: u64) bool {
+    const st = s orelse return false;
+    return st.unboxRef(ref) != null;
+}
+
 export fn wazmrt_global_is_valid(s: ?*const Store, h: GlobalHandle) bool {
     const store = s orelse return false;
     return store.owns(h.id, store.globals.items.len);
@@ -694,6 +776,23 @@ export fn wazmrt_module_delete(m: ?*CModule) void {
 // text costs more per module than decoding a binary, so a module run repeatedly is still better
 // assembled once and cached — which is what `wazmrt_wat_to_wasm` is for.
 
+/// The refusal a `-Dwat=false` build gives for every text entry point (Track 2c).
+///
+/// ⚠️ **Loud, not silent.** A gated-out feature that returns "success with
+/// nothing done" is the canonical fall-through failure this codebase refuses
+/// everywhere else: the embedder would get a NULL module, or a linker with no
+/// WASI in it, and discover the cause at run time in the guest. The message
+/// names the build flag, because the caller cannot see our build options and
+/// "unsupported" alone would send them looking in the wrong place.
+fn featureDisabled(
+    comptime fn_name: []const u8,
+    comptime what: []const u8,
+    comptime flag: []const u8,
+) ?*Error {
+    return errorf(fn_name ++ ": this build has " ++ what ++
+        " compiled out (-D" ++ flag ++ "=false); rebuild with -D" ++ flag ++ "=true", .{});
+}
+
 /// Assemble text to a binary the caller owns and frees with `wazmrt_bytes_delete`.
 export fn wazmrt_wat_to_wasm(
     text: ?[*]const u8,
@@ -701,6 +800,7 @@ export fn wazmrt_wat_to_wasm(
     out: ?*[*]u8,
     out_len: ?*usize,
 ) ?*Error {
+    if (comptime !root.enable_wat) return featureDisabled("wazmrt_wat_to_wasm", "the WAT text assembler", "wat");
     const src = (text orelse return errorf("wazmrt_wat_to_wasm: text is NULL", .{}))[0..len];
     const out_p = out orelse return errorf("wazmrt_wat_to_wasm: out is NULL", .{});
     const out_len_p = out_len orelse return errorf("wazmrt_wat_to_wasm: out_len is NULL", .{});
@@ -731,6 +831,7 @@ export fn wazmrt_module_new_wat(
     len: usize,
     out: ?**CModule,
 ) ?*Error {
+    if (comptime !root.enable_wat) return featureDisabled("wazmrt_module_new_wat", "the WAT text assembler", "wat");
     var bin: [*]u8 = undefined;
     var bin_len: usize = 0;
     if (wazmrt_wat_to_wasm(text, len, &bin, &bin_len)) |err| return err;
@@ -834,7 +935,7 @@ fn valKindOf(vt: root.types.ValType) ?ValKind {
 
 /// Write one value into `slots`, returning how many it consumed. Null if the kind disagrees with
 /// the declared parameter type — a mismatch is refused, never reinterpreted.
-fn valToSlots(v: Val, want: root.types.ValType, slots: []interp.Value) ?u32 {
+fn valToSlots(st: *Store, v: Val, want: root.types.ValType, slots: []interp.Value) ?u32 {
     const k = valKindOf(want) orelse return null;
     if (v.kind != k) return null;
     switch (want) {
@@ -842,7 +943,7 @@ fn valToSlots(v: Val, want: root.types.ValType, slots: []interp.Value) ?u32 {
         .i64 => slots[0] = interp.i64Value(v.of.i64),
         .f32 => slots[0] = interp.f32Value(v.of.f32),
         .f64 => slots[0] = interp.f64Value(v.of.f64),
-        .funcref, .externref => slots[0] = v.of.ref,
+        .funcref, .externref => slots[0] = st.unboxRef(v.of.ref) orelse return null,
         .v128 => {
             // Low half first, matching how the interpreter stacks a vector.
             slots[0] = std.mem.readInt(u64, v.of.v128[0..8], .little);
@@ -853,7 +954,7 @@ fn valToSlots(v: Val, want: root.types.ValType, slots: []interp.Value) ?u32 {
     return interp.slotWidth(want);
 }
 
-fn slotsToVal(slots: []const interp.Value, got: root.types.ValType, out: *Val) ?u32 {
+fn slotsToVal(st: *Store, slots: []const interp.Value, got: root.types.ValType, out: *Val) ?u32 {
     const k = valKindOf(got) orelse return null;
     out.kind = k;
     switch (got) {
@@ -861,7 +962,7 @@ fn slotsToVal(slots: []const interp.Value, got: root.types.ValType, out: *Val) ?
         .i64 => out.of.i64 = interp.asI64(slots[0]),
         .f32 => out.of.f32 = interp.asF32(slots[0]),
         .f64 => out.of.f64 = interp.asF64(slots[0]),
-        .funcref, .externref => out.of.ref = slots[0],
+        .funcref, .externref => out.of.ref = st.boxRef(slots[0]) orelse return null,
         .v128 => {
             std.mem.writeInt(u64, out.of.v128[0..8], slots[0], .little);
             std.mem.writeInt(u64, out.of.v128[8..16], slots[1], .little);
@@ -1321,6 +1422,7 @@ export fn wazmrt_wasi_config_preopen_dir(
 }
 
 export fn wazmrt_linker_define_wasi(l: ?*Linker, c: ?*const WasiConfig) ?*Error {
+    if (comptime !root.enable_wasi) return featureDisabled("wazmrt_linker_define_wasi", "the WASI preview-1 host", "wasi");
     const lk = l orelse return errorf("wazmrt_linker_define_wasi: linker is NULL", .{});
     const cfg = c orelse return errorf("wazmrt_linker_define_wasi: config is NULL", .{});
     if (lk.wasi) |*old| old.deinit();
@@ -1336,7 +1438,13 @@ export fn wazmrt_wasi_exit_code(l: ?*const Linker, out: ?*i32) bool {
 }
 
 /// Everything one instance's WASI host needs, all living in that instance's arena.
-const WasiState = struct {
+///
+/// Empty in a `-Dwasi=false` build so `InstanceSlot.wasi: ?*WasiState` still has
+/// a type, while every field that names `root.wasi.*` disappears with it. The
+/// pointer is then always null — `wazmrt_linker_define_wasi` refuses before one
+/// can be created — so the guarded use sites are unreachable as well as
+/// unanalyzed.
+const WasiState = if (!root.enable_wasi) struct {} else struct {
     wasi: root.wasi.Wasi,
     out_writer: std.Io.File.Writer,
     err_writer: std.Io.File.Writer,
@@ -1442,7 +1550,7 @@ fn hostTrampoline(ctx: *anyopaque, args: []const interp.Value, results: []interp
             t.slot.pending_trap = wazmrt_trap_new("host call: argument slots exhausted");
             return false;
         }
-        _ = slotsToVal(args[si..], vt, &in[i]) orelse {
+        _ = slotsToVal(t.slot.store, args[si..], vt, &in[i]) orelse {
             t.slot.pending_trap = wazmrt_trap_new("host call: argument type cannot cross the ABI");
             return false;
         };
@@ -1465,7 +1573,7 @@ fn hostTrampoline(ctx: *anyopaque, args: []const interp.Value, results: []interp
             t.slot.pending_trap = wazmrt_trap_new("host call: result slots exhausted");
             return false;
         }
-        _ = valToSlots(out[i], vt, results[oi..]) orelse {
+        _ = valToSlots(t.slot.store, out[i], vt, results[oi..]) orelse {
             t.slot.pending_trap = wazmrt_trap_new("host call: result has the wrong type");
             return false;
         };
@@ -1535,8 +1643,12 @@ fn resolveImports(
     };
 
     const funcs = sa.alloc(interp.Instance.HostFunc, nfunc) catch return errorf("out of memory", .{});
-    const globals = sa.alloc(interp.Value, nglobal) catch return errorf("out of memory", .{});
-    const globals_hi = sa.alloc(interp.Value, nglobal) catch return errorf("out of memory", .{});
+    const globals = sa.alloc(*interp.Instance.Global, nglobal) catch return errorf("out of memory", .{});
+
+    // One matcher per link, so its module-pointer-keyed memo lives no longer than
+    // the modules it names (see `typematch.Ctx`).
+    var tm: typematch.Ctx = .init(sa);
+    defer tm.deinit();
 
     var fi: usize = 0;
     var gi: usize = 0;
@@ -1546,7 +1658,12 @@ fn resolveImports(
                 // WASI is backed by the runtime's own host, not by a linker entry. Checked
                 // first so an embedder cannot shadow a WASI syscall with a define_func of the
                 // same name and have the two silently disagree about which one runs.
-                if (lk.wasi != null and std.mem.eql(u8, im.module, "wasi_snapshot_preview1")) {
+                // `comptime root.enable_wasi and` — not just a run-time guard: it
+                // is what keeps `initWasi` UNREFERENCED in a `-Dwasi=false`
+                // build, which is what actually keeps `wasi.zig` out of the
+                // artifact. A run-time-only check would leave the whole host
+                // linked in and gate nothing.
+                if (comptime root.enable_wasi) if (lk.wasi != null and std.mem.eql(u8, im.module, "wasi_snapshot_preview1")) {
                     if (slot.wasi == null) {
                         slot.wasi = initWasi(lk.engine, &lk.wasi.?, sa) catch |err|
                             return errorf("wasi: {s}", .{@errorName(err)});
@@ -1554,7 +1671,7 @@ fn resolveImports(
                     funcs[fi] = slot.wasi.?.wasi.hostFunc(im.name);
                     fi += 1;
                     continue;
-                }
+                };
                 const def = lk.find(im.module, im.name) orelse {
                     // A namespace published by `define_instance`. Explicit definitions win, so
                     // this is only consulted after the table misses.
@@ -1564,16 +1681,25 @@ fn resolveImports(
                         const oslot = store.instances.items[oi];
                         const idx = findExport(oslot.module, im.name, .func) orelse
                             return errorf("import '{s}'.'{s}': the published instance exports no such function", .{ im.module, im.name });
-                        const have = oslot.module.inner.funcType(idx) orelse
-                            return errorf("import '{s}'.'{s}': the published export has no type", .{ im.module, im.name });
                         // Same rule as for host callbacks: two declarations exist, so compare
                         // them rather than trusting that a shared name means a shared signature.
-                        if (have.params.len != want.params.len or have.results.len != want.results.len)
+                        //
+                        // ⚠️ Compare through `typematch`, NOT the two expanded signatures. Both
+                        // sides are real wasm modules here, so a parameter may be a concrete
+                        // `(ref $t)` — and that carries a MODULE-LOCAL type index, which made
+                        // `a != b` compare two unrelated numbering schemes. It rejected valid
+                        // links and, worse, accepted invalid ones whenever two different types
+                        // happened to sit at the same index in their modules, handing the guest
+                        // values of a type it never agreed to. This is the shipped embedder path,
+                        // so it had the defect `wast.zig` was fixed for and no test covering it.
+                        const want_ti = im.type_index orelse
+                            return errorf("import '{s}'.'{s}': the declared import has no type index", .{ im.module, im.name });
+                        const have_ti = oslot.module.inner.funcTypeIndex(idx) orelse
+                            return errorf("import '{s}'.'{s}': the published export has no type", .{ im.module, im.name });
+                        const compatible = tm.funcImportOk(&oslot.module.inner, have_ti, &cm.inner, want_ti) catch
+                            return errorf("out of memory", .{});
+                        if (!compatible)
                             return errorf("import '{s}'.'{s}': signature mismatch with the published instance", .{ im.module, im.name });
-                        for (want.params, have.params) |a, b| if (a != b)
-                            return errorf("import '{s}'.'{s}': parameter type mismatch with the published instance", .{ im.module, im.name });
-                        for (want.results, have.results) |a, b| if (a != b)
-                            return errorf("import '{s}'.'{s}': result type mismatch with the published instance", .{ im.module, im.name });
                         funcs[fi] = .{ .wasm = .{ .instance = &oslot.inst, .func_index = idx } };
                         fi += 1;
                         continue;
@@ -1619,8 +1745,11 @@ fn resolveImports(
                 fi += 1;
             },
             .global => |want| {
-                // A published instance's exported global, read at link time — a snapshot, which
-                // is what the ABI can carry (it has no mutable-global sharing).
+                // A published instance's exported global, bound as the SHARED CELL — a
+                // `(mut i32)` the exporter writes is now visible here. It used to be read once
+                // at link time and copied, so the importer held a snapshot that never changed:
+                // the same defect `linking.wast` caught on the `.wast` path, on the embedder
+                // path the corpus never reaches (R1's lesson, again).
                 if (lk.find(im.module, im.name) == null) {
                     if (lk.findInstance(im.module)) |h| {
                         const oi = store.resolve(h.id, store.instances.items.len) orelse
@@ -1631,7 +1760,6 @@ fn resolveImports(
                         if (idx >= oslot.inst.globals.len)
                             return errorf("import '{s}'.'{s}': published global is out of range", .{ im.module, im.name });
                         globals[gi] = oslot.inst.globals[idx];
-                        globals_hi[gi] = if (idx < oslot.inst.global_hi.len) oslot.inst.global_hi[idx] else 0;
                         gi += 1;
                         continue;
                     }
@@ -1644,10 +1772,13 @@ fn resolveImports(
                     .instance => return errorf("import '{s}'.'{s}': namespace entry used as a value", .{ im.module, im.name }),
                 };
                 var two: [2]interp.Value = .{ 0, 0 };
-                _ = valToSlots(v, want.content, &two) orelse
+                _ = valToSlots(store, v, want.content, &two) orelse
                     return errorf("import '{s}'.'{s}': global value has the wrong type", .{ im.module, im.name });
-                globals[gi] = two[0];
-                globals_hi[gi] = two[1];
+                // A host-defined constant needs a cell of its own, on the instance's arena so
+                // it outlives every read the guest makes through it.
+                const cell = sa.create(interp.Instance.Global) catch return errorf("out of memory", .{});
+                cell.* = .{ .value = two[0], .hi = two[1] };
+                globals[gi] = cell;
                 gi += 1;
             },
             // Refused LOUDLY rather than left unbound: an unbacked memory or table import would
@@ -1662,7 +1793,6 @@ fn resolveImports(
     out.* = .{
         .funcs = funcs,
         .globals = globals,
-        .globals_hi = globals_hi,
         // The engine's ceilings, carried per-instance so `memory.grow`/`table.grow` re-check
         // them at run time rather than only at instantiation.
         .max_memory_bytes = lk.engine.max_memory_bytes,
@@ -1693,7 +1823,7 @@ export fn wazmrt_linker_instantiate(
     // The slot is allocated FIRST so the arena has its final address before `allocator()` is
     // taken from it — see the warning on `InstanceSlot`.
     const slot = alloc.create(InstanceSlot) catch return errorf("out of memory", .{});
-    slot.* = .{ .arena = std.heap.ArenaAllocator.init(alloc), .inst = undefined, .module = cm };
+    slot.* = .{ .arena = std.heap.ArenaAllocator.init(alloc), .inst = undefined, .module = cm, .store = store };
     const sa = slot.arena.allocator();
 
     var imports: interp.Instance.Imports = .{};
@@ -1703,8 +1833,9 @@ export fn wazmrt_linker_instantiate(
         return msg;
     }
 
-    slot.inst = interp.Instance.initWithImports(sa, &cm.inner, imports) catch |err| {
-        if (slot.wasi) |w| w.wasi.deinit();
+    imports.store = &store.refs;
+    slot.inst.instantiateWithImports(sa, &cm.inner, imports) catch |err| {
+        if (comptime root.enable_wasi) if (slot.wasi) |w| w.wasi.deinit();
         slot.arena.deinit();
         alloc.destroy(slot);
         return errorf("instantiate: {s}", .{@errorName(err)});
@@ -1712,7 +1843,7 @@ export fn wazmrt_linker_instantiate(
 
     // The guest's memory only exists once the instance does, and every WASI call that touches a
     // buffer needs it — so this must happen after init and before anything can run.
-    if (slot.wasi) |w| w.wasi.memory = slot.inst.memory0();
+    if (comptime root.enable_wasi) { if (slot.wasi) |w| { w.wasi.memory = slot.inst.memory0(); } }
 
     slot.inst.runStart() catch |err| {
         if (trap_out) |p| p.* = slot.takeTrap(err);
@@ -1725,7 +1856,7 @@ export fn wazmrt_linker_instantiate(
     slot.linker = lk;
     lk.slots.append(alloc, slot) catch {
         slot.inst.deinit();
-        if (slot.wasi) |w| w.wasi.deinit();
+        if (comptime root.enable_wasi) if (slot.wasi) |w| w.wasi.deinit();
         slot.arena.deinit();
         alloc.destroy(slot);
         return errorf("out of memory", .{});
@@ -1924,7 +2055,7 @@ export fn wazmrt_func_call(
     var si: usize = 0;
     for (ft.params, 0..) |vt, i| {
         const v = (args orelse return errorf("wazmrt_func_call: args is NULL", .{}))[i];
-        const w = valToSlots(v, vt, slots[si..]) orelse
+        const w = valToSlots(slot.store, v, vt, slots[si..]) orelse
             return errorf("wazmrt_func_call: argument {d} has the wrong type", .{i});
         si += w;
     }
@@ -1941,7 +2072,7 @@ export fn wazmrt_func_call(
         for (ft.results, 0..) |vt, i| {
             const w = interp.slotWidth(vt);
             if (gi + w > got.len) return errorf("wazmrt_func_call: result {d} is missing", .{i});
-            _ = slotsToVal(got[gi..], vt, &dst[i]) orelse
+            _ = slotsToVal(slot.store, got[gi..], vt, &dst[i]) orelse
                 return errorf("wazmrt_func_call: result {d} has a type this ABI cannot carry", .{i});
             gi += w;
         }
@@ -2019,11 +2150,11 @@ export fn wazmrt_global_get(s: ?*const Store, h: GlobalHandle, out: ?*Val) bool 
     const vt = slot.module.inner.globals[r.index].content;
     // A v128 global keeps its high half in a parallel array, so it cannot be read as one slot.
     if (vt == .v128) {
-        var two = [2]interp.Value{ slot.inst.globals[r.index], slot.inst.global_hi[r.index] };
-        return slotsToVal(&two, vt, out_p) != null;
+        var two = [2]interp.Value{ slot.inst.globals[r.index].value, slot.inst.globals[r.index].hi };
+        return slotsToVal(slot.store, &two, vt, out_p) != null;
     }
-    const one = [1]interp.Value{slot.inst.globals[r.index]};
-    return slotsToVal(&one, vt, out_p) != null;
+    const one = [1]interp.Value{slot.inst.globals[r.index].value};
+    return slotsToVal(slot.store, &one, vt, out_p) != null;
 }
 
 // =========================================================================================
@@ -2485,6 +2616,71 @@ test "a host/guest signature disagreement is refused at link time" {
     const err2 = wazmrt_linker_instantiate(l, s, m, &inst, &trap);
     defer wazmrt_error_delete(err2);
     try testing.expect(err2 != null);
+}
+
+test "define_instance: a concrete (ref $t) import matches by TYPE, not by index" {
+    // The `define_instance` path binds one guest module's import to another's export, so both
+    // sides are real wasm modules and a parameter can be a concrete `(ref $t)` — which carries a
+    // MODULE-LOCAL type index. Comparing the expanded signatures compared those indices, which is
+    // two different numbering schemes: it rejected good links and accepted bad ones whenever two
+    // unrelated types sat at the same index. Nothing covered this path, so both directions are
+    // pinned here.
+    const provider_wat =
+        \\(module
+        \\  (type $pair (func (param i32 i32) (result i32)))
+        \\  (func $use (param (ref $pair)) (result i32) (i32.const 7))
+        \\  (export "use" (func $use))
+        \\)
+    ;
+    // Same type, reached through a DIFFERENT index (a padding type comes first). Must link.
+    const good_wat =
+        \\(module
+        \\  (type $pad (func (result f64)))
+        \\  (type $pair (func (param i32 i32) (result i32)))
+        \\  (func (import "P" "use") (param (ref $pair)) (result i32))
+        \\)
+    ;
+    // A DIFFERENT type at the SAME index the provider uses — the case raw index comparison
+    // wrongly accepted, handing the guest a reference of a type it never agreed to.
+    const bad_wat =
+        \\(module
+        \\  (type $other (func (param f32) (result i64)))
+        \\  (func (import "P" "use") (param (ref $other)) (result i32))
+        \\)
+    ;
+
+    const e = wazmrt_engine_new().?;
+    defer wazmrt_engine_delete(e);
+    const s = wazmrt_store_new(e).?;
+    defer wazmrt_store_delete(s);
+
+    var pm: *CModule = undefined;
+    try testing.expect(wazmrt_module_new_wat(e, provider_wat, provider_wat.len, &pm) == null);
+    defer wazmrt_module_delete(pm);
+
+    const pl = wazmrt_linker_new(e).?;
+    defer wazmrt_linker_delete(pl);
+    var pinst: InstanceHandle = .{ .id = 0 };
+    var trap: ?*Trap = null;
+    try testing.expect(wazmrt_linker_instantiate(pl, s, pm, &pinst, &trap) == null);
+
+    const l = wazmrt_linker_new(e).?;
+    defer wazmrt_linker_delete(l);
+    try testing.expect(wazmrt_linker_define_instance(l, "P", pinst) == null);
+
+    var gm: *CModule = undefined;
+    try testing.expect(wazmrt_module_new_wat(e, good_wat, good_wat.len, &gm) == null);
+    defer wazmrt_module_delete(gm);
+    var ginst: InstanceHandle = .{ .id = 0 };
+    try testing.expect(wazmrt_linker_instantiate(l, s, gm, &ginst, &trap) == null);
+
+    var bm: *CModule = undefined;
+    try testing.expect(wazmrt_module_new_wat(e, bad_wat, bad_wat.len, &bm) == null);
+    defer wazmrt_module_delete(bm);
+    var binst: InstanceHandle = .{ .id = 0 };
+    const err = wazmrt_linker_instantiate(l, s, bm, &binst, &trap);
+    defer wazmrt_error_delete(err);
+    try testing.expect(err != null);
 }
 
 test "unknown imports as traps: links, then traps when called" {

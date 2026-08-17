@@ -106,7 +106,11 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
             return exit_failure;
         };
         try out.print("{s}: {d} passed, {d} failed, {d} skipped\n", .{ path, s.passed, s.failed, s.skipped });
-        if (s.first_failure) |f| try out.print("  first failure: {s}\n", .{f});
+        // Every failure, not just the first: one line of output was what made 25
+        // distinct decoder defects in `binary.wast` read as a single problem.
+        for (s.failures.items) |f| try out.print("  failure: {s}\n", .{f});
+        if (s.failed > s.failures.items.len)
+            try out.print("  ... and {d} more\n", .{s.failed - s.failures.items.len});
         // A .wast with failing assertions is a failing run — it used to exit 0,
         // so a CI step running the testsuite could never notice.
         return if (s.failed != 0) exit_failure else 0;
@@ -950,7 +954,8 @@ fn runWasi(
             try funcs.append(arena, .{ .native_env = .{ .ctx = &wasi, .call = unresolvedImport } });
     }
 
-    var inst = try interp.Instance.initWithImports(arena, module, .{ .funcs = funcs.items, .max_memory_bytes = max_memory, .max_table_elems = max_table_elems });
+    var inst: interp.Instance = undefined;
+    try inst.instantiateWithImports(arena, module, .{ .funcs = funcs.items, .max_memory_bytes = max_memory, .max_table_elems = max_table_elems });
     defer inst.deinit();
     wasi.memory = inst.memory0(); // module memory now exists
 
@@ -1020,7 +1025,8 @@ fn runFunction(
         };
     }
 
-    var inst = interp.Instance.init(arena, module) catch |e| {
+    var inst: interp.Instance = undefined;
+    inst.instantiate(arena, module) catch |e| {
         try out.print("error: instantiate: {s}\n", .{@errorName(e)});
         return exit_failure;
     };

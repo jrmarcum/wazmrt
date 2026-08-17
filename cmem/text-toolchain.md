@@ -83,7 +83,17 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
   compares (NaN-aware). CLI `.wast` mode. **Passes thousands of positive + negative official-testsuite
   assertions** (see `testing.md`). Handles `(register "name" $id?)` + cross-module imports, **module
   `$name` tracking so `(invoke $M …)` / `(get $M …)` / `(register "x" $M)` target a named (non-current)
-  module** (`9745ecb`), and the `(get …)` action (reads an exported global). Deferred: `(module quote …)`.
+  module** (`9745ecb`), and the `(get …)` action (reads an exported global).
+  **Added 2026-08-13 (R2):** `(module definition $M …)` + `(module instance $I $M)` — a definition is
+  assembled but NOT instantiated, and each `instance` command builds a fresh one, which is how
+  `instance.wast` checks that instantiation is generative. That file had been scoring 0 passed / 8
+  failed / 12 skipped, and **every one of those failures was this gap, not a runtime defect** —
+  worth remembering when a whole file looks broken. Also **every failure message now carries the
+  1-based source LINE** of the command that produced it (`L342: assert_return …`), from
+  `sexpr.parseAllWithLines`.
+  **Still deferred: `(module quote …)`** — the last big runner gap, and the bulk of R5 in
+  `roadmap.md`. It costs `BadCommand` skips that suppress real verification rather than proving
+  anything; close it before quoting conformance numbers again.
 
 ## Staged plan
 
@@ -111,14 +121,14 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
 7. ~~Reference types~~ **DONE 2026-07-09** (`ref.null`/`ref.is_null`/`ref.func` `0xD0`–`0xD2` across
    opcode/interp/validator; `(ref null? func|extern)` value types + heaptype immediates in the
    assembler; `(ref.null …)`/`(ref.extern N)`/`(ref.func)` value literals in the WAST runner). Null =
-   `maxInt(u64)` stack sentinel; a funcref is its function index. `select.wast` 0 → **124/0**.
+   `maxInt(u64)` stack sentinel; a funcref is its function index (⚠️ **SUPERSEDED 2026-08-13, R2 — it names its instance too**). `select.wast` 0 → **124/0**.
 8. ~~Multi-table + NaN-payload float literals~~ **DONE 2026-07-09**. Interp holds an array of funcref
    tables; `call_indirect` uses `imm.table`; element segments apply to their `table_index`. Assembler
    tracks table names, resolves `call_indirect $t` (gated on a following `(type …)` annotation so a
    flat `call_indirect select` isn't misread), emits per-table element flags (`0x02`). `floatBits`
    parses `nan:canonical`/`nan:arithmetic`/`nan:0x<payload>`. `call_indirect.wast` 120/1 → **132/0**,
    `local_tee.wast` 0 → **55/0**; no regressions (HEAD-baselined).
-9. ~~Imported globals + extended-const init expressions~~ **DONE 2026-07-09**. `Instance.initWithImports`
+9. ~~Imported globals + extended-const init expressions~~ **DONE 2026-07-09**. `Instance.initWithImports` (⚠️ renamed `instantiateWithImports` 2026-08-13; imported globals are now BORROWED CELLS, not copied values)
    fills imported-global slots from host values (imports head the global index space); the WAST runner
    backs the standard `spectest` globals; the assembler parses `(global (import "m" "n") type)` and
    emits an import section (2); `ref.null`/`ref.func` work in const-inits; and `evalConstExpr` is now a
@@ -180,9 +190,104 @@ reuses `opcode.zig` in reverse (instruction name → `Op`).
 
 ## Notes / invariants
 
+- ⚠️ **TWO LEGACY SEGMENT SPELLINGS ARE ACCEPTED ON PURPOSE (R7, 2026-08-14).**
+  `(data 0 <offset> …)` and `(elem 0 <offset> …)` — a bare `memidx`/`tableidx`
+  where the modern grammar wants `(memory x)` / `(table x)`. The era-pinned
+  `proposals/threads` corpus writes them. **Gated so it cannot loosen anything
+  else: a bare index counts only when an offset form immediately FOLLOWS it** —
+  an offset is always a list and data bytes are always strings, so no modern
+  spelling can collide, and a passive `(elem 0 $f)` is untouched. ⚠️ The reason
+  this had to be *fixed* rather than merely rejected: unrecognised, the data form
+  did not fail — the index and its offset were both dropped and the segment came
+  out **ACTIVE in the source, PASSIVE in the binary**. The byte loop's silent
+  `else => {}` is what hid it; it rejects now.
+- ⚠️ **THE TEXT GRAMMAR IS A SPEC SURFACE, NOT A CONVENIENCE (R9, 2026-08-14).**
+  Until R9 the assembler treated `.wat` syntax as something to *accept* — the
+  five type-use sites each had their own loop with no ordering, no uniqueness
+  check on any index space, and no verification that an inline signature written
+  beside `(type $x)` matched it. 71 corpus assertions said otherwise, and the
+  argument is not tidiness: `wazmrt_module_new_wat` and `wazmrt_wat_to_wasm` are
+  shipped C-ABI entry points, so **an embedder's `.wat` gets exactly the checking
+  the assembler does and no more.** The rules now live in one place each —
+  `typeUseRank`/`typeUseOrder` (§6.6.5 ordering), `checkInlineTypeUse` (the
+  inline form is a CHECK on the named type), `checkUniqueNames` (§6.6.13,
+  per-namespace), `parseDecls(…, allow_id)` (a parameter id binds a local, so it
+  is legal only where locals exist) — and every site calls them.
+- ⚠️ **A text-format rule has TWO spellings to satisfy, and the flat one is where
+  the mistakes are (R9).** In folded syntax a block type is nested inside its
+  instruction's list; in flat syntax `block`/`loop`/`if`/`select`/`call_indirect`
+  are bare atoms and their type use is a SIBLING — which also CHAINS
+  (`select (result i32) (result)`, `call_indirect (type $proc) (param) (result)`,
+  both in the corpus). A rule written against the folded form alone cost
+  `select.wast` and `stack.wast` a module each before it was drawn right.
+- ⚠️ **The lexer is shared with the `.wast` HARNESS, so a stricter producer rule
+  is also a stricter harness rule (R9).** Enforcing §6.2.1's
+  `reserved ::= (idchar | string)+` (so `(data"a")` is one token that no
+  production accepts) turned `id.wast` into a whole-file *runner error*, because
+  the script itself writes `$"007"`. That forced `$"…"` quoted identifiers — a
+  separately-filed item — into the same pass. Quoted ids normalise to `$` ++ the
+  decoded bytes, so `(br $"007")` finds `block $007` and **no name lookup
+  anywhere had to learn the form exists**.
 - **Reuse, don't duplicate, the opcode table.** The assembler builds a
   name→`Op` map from `opcode.zig`; the encoder must stay in lockstep with the
   decoder (same authority).
+- ⚠️ **That rule applies to EVERY table here, not only the opcode one (R3,
+  2026-08-13).** `isRefType` carried its own hand-written list of reference-type
+  keywords — `funcref`, `externref`, `anyfunc` — while `shorthandRefType`, in the
+  same file, already mapped all ten abstract heads. `(elem $e i31ref …)` therefore
+  missed the const-expr form, fell through to the func-index form, and reported
+  `BadImmediate` about a type name it had read as a function name. It now defers
+  to `shorthandRefType`. **A second copy of a lookup table is a second place to be
+  incomplete**, and the copy is always the one that goes stale.
+- ⚠️ **An OPTIONAL clause must not be required by the code that consumes it
+  (R3).** `call_indirect`'s table index was consumed only when a
+  `(type …)`/`(param …)`/`(result …)` followed it — but the type use is optional
+  (absent means `[] -> []`), so `(call_indirect $t (i32.const 0))` left `$t` for
+  the operand loop and failed as `UnknownInstr` naming a table. `isIndexAtom` is
+  the right predicate, as the flat `br_table` fix had already established. When a
+  grammar clause is optional, the parser's lookahead must not assume its sibling.
+- ⚠️ **A missing MNEMONIC surfaces here, not where it is missing from.** R3's six
+  GC array ops were absent from `opcode.zig`, but every `.wast` failure read
+  `UnknownInstr` from `wat.zig`, because the corpus reaches the decoder only
+  through the text path. When triaging an instruction-level failure, the file
+  named by the error is rarely the file to fix.
+- ⚠️ **NUMERIC LITERALS HAVE THEIR OWN GRAMMAR — `std.fmt` IS NOT IT (R5, 2026-08-13).**
+  `validIntLit`/`validFloatLit`/`scanDigits` implement §6.3.1 and run BEFORE `std.fmt.parseInt`/
+  `parseFloat`, which are close enough to look right and differ exactly where the spec is strict:
+  Zig takes `_` in positions wasm forbids (the separator must sit *between* digits) and `parseFloat`
+  accepts `.0`. And the permissive path did not just over-accept — it **silently truncated**:
+  `i32.const 0x100000000` compiled to `0`, `v128.const i8x16 0x100` to zero bytes, `f32.const
+  0x1p128` to `+inf`. Every `v128` lane is now bounded by its own width via `parseIntLitN`, and a
+  literal that rounds to infinity is refused unless it *is* `inf`.
+- ⚠️ **`(module quote …)` IS THE ONLY WAY THE SUITE TESTS TEXT (R5).** The WAST runner assembles the
+  quoted source at run time, wrapping it in `(module …)` only when it does not already open one —
+  the wrapping test must be exact, because `(module (module …))` fails to assemble and would score a
+  malformed module as correctly rejected for the wrong reason. Implementing it unblocked **1,291
+  assertions** and immediately exposed 215 accept-invalids in this file. **Whatever the assembler
+  gets wrong is invisible until the runner can hand it text.**
+- ⚠️ **THE ASSEMBLER IS PART OF THE VALIDATION SURFACE (R4, 2026-08-13).** Two
+  accept-invalid classes were caused by encodings chosen here, not by missing
+  validator rules:
+  - `(table N reftype initexpr)` was lowered to a synthetic active element segment
+    of N copies, which is execution-equivalent and **validation-destroying**: a
+    table with an initializer and one with an element segment differ in exactly
+    the property the defaultability rule tests, so `(table 0 (ref func))` could not
+    be told from a legal table. It now emits §5.5.6's `0x40 0x00 tt expr` form —
+    which also retired the `max_table_init_copies` cap, since there are no copies.
+  - A single concrete-ref block type was emitted as an INTERNED type index, because
+    `readBlockType` could not decode the canonical `0x63/0x64 heaptype` valtype.
+    Interning creates a type-section entry, so `(block (result (ref 1)))` in a
+    one-type module made index 1 exist — as the block's own signature — and the
+    module validated. Both ends are canonical now.
+
+  **Before choosing an encoding, ask what it erases, not only what it preserves.**
+- ⚠️ **`try_table` catch labels resolve in the ENCLOSING scope (R4).** The
+  try_table's own label is pushed for its BODY only, so `emitCatchClauses` runs
+  before `ctx.labels.append`. This was wrong here, in `validate.zig` and in
+  `interp.zig` — all three off by the same frame, so they agreed and the corpus
+  passed. Numeric catch labels are emitted verbatim and were unaffected; only
+  `$name` targets moved, which is why the breakage appeared as *runtime* failures
+  in `catch-complex-1`-style modules rather than as assembly errors.
 - **Self-contained.** No external assembler at build or test time (matches the
   libc-free / no-deps ethos).
 - Coverage tracks the interpreter: instructions the interpreter can't yet run

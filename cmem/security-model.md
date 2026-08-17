@@ -53,7 +53,7 @@ A subtle but load-bearing consequence, worth stating because the two wazmrt run 
   the outside world is the **imports** the host wires at instantiation. No import for a thing ⇒ the module
   physically cannot do that thing (capability-security by construction).
 - **`wazmrt <module> <export> [args]`** (a plain exported-function call) wires **no imports**
-  (`runFunction` → `Instance.init` = `initWithImports(..., .{})`). The function computes over its own
+  (`runFunction` → `Instance.instantiate` = `instantiateWithImports(…, .{})`; spelled `init`/`initWithImports` until 2026-08-13). The function computes over its own
   linear memory and returns a value; it **cannot read or write files** — a module that imports a file
   function either fails to instantiate (`MissingImport`) or traps (`UnsupportedImportCall`) at the call.
 - **`wazmrt <module.wasm>`** (a WASI `_start` command) wires the `wasi_snapshot_preview1` imports —
@@ -174,6 +174,102 @@ see `known-issues.md` on why they had drifted.)*
   widen by reopening.
 - **Symlink containment** (#17) — no symlink is traversed; a guest cannot be redirected out of a preopen.
 - **Sockets are not implemented** (`sock_*` → `NOTSUP`).
+- **A reference value cannot be reinterpreted by the module that receives it (2026-08-13, R2).** A
+  `funcref` names its defining instance, not an index; a tag carries a store-wide identity; and
+  linking against an instance or table from a different `interp.Store` is refused
+  (`error.CrossStoreLink`) rather than silently reinterpreted. See the entry below for what this
+  replaced.
+
+### UTF-8 name validation is VERIFIED at last — R5, 2026-08-13
+
+`utf8-invalid-encoding.wast` ran **0 of its 176 assertions** for as long as the corpus has been used,
+because every one is an `assert_malformed (module quote …)` and the runner could not build a quoted
+module. It was recorded as an evidence hole (R8) precisely because **an unverified security-relevant
+check is indistinguishable from a passing one**. R5 implemented the form; all 176 now execute and
+pass. The validation was correct all along — which is the outcome to hope for and never the outcome
+to assume.
+
+⚠️ **Note what the fix was: the RUNNER, not the runtime.** The item asked "is the skip the runner's
+gap or ours?" — the right question, and unanswerable without running the thing. Any other
+security-relevant property whose corpus reads `0 passed / 0 failed / N skipped` deserves the same
+question before it is treated as held.
+
+### The accept-invalid class in core spec files — R4, 2026-08-13 (⚠️ superseded in scope by R5)
+
+⚠️ **Read this entry with R5's correction.** R4 closed every accept-invalid the corpus could then
+*reach*; R5 gave the corpus access to the TEXT front-end and **88 more appeared in core files**, in
+the assembler rather than the decoder. The class is not closed — it is closed on one of two surfaces.
+The severity argument below is unchanged and applies to both.
+
+**wazmrt no longer accepts any module the core spec testsuite calls invalid.** The 29 `assert_invalid`
+failures that remain are 20 in `custom-descriptors` and 9 in `proposals/threads` — an untargeted
+proposal and R7's item. This is the property the T-list opened with in 2026-08-11 and it took four
+passes to reach.
+
+Why it belongs here rather than only in the conformance record: **`wasm_module_validate` is a shipped
+C-ABI entry point**, so every accepted-but-invalid module is the embedder asking "is this safe to
+run?" and being told yes. None of R4's five was memory-unsafe on its own — the interpreter's own
+bounds checks hold regardless — but each one is the verifier disagreeing with the specification an
+embedder is entitled to assume.
+
+- ⚠️ **One of the five could not have been found by testing.** The `try_table` catch-label off-by-one
+  was identical in the assembler, the validator and the interpreter, so every round trip agreed. A
+  verifier and the thing it verifies sharing a mistake is the same shape as R2's `call_indirect` type
+  check, one level up: there, the check read the callee's type from the same wrong module; here,
+  three components computed the same wrong label depth. **Ask what the verifier and the verified have
+  in common** — and count how many implementations of the rule exist.
+- ⚠️ **The regression guard is one grep.** Over a `-Dfailures=600` conformance run,
+  `grep "should be rejected"` is the entire accept-invalid class. Run it after any decoder or
+  validator change; a new hit is a security-relevant regression even when the failure count as a
+  whole improves.
+
+### Eight non-opcodes were decoded and EXECUTED — CLOSED 2026-08-13 (R3)
+
+**Not reachable as an escape, and recorded because the reasoning that let it survive is the reusable
+part.** `opcode.zig` gives internal `Op` tags to instructions whose real wire form is a prefix byte
+plus a LEB sub-opcode. A raw byte in that tag range is *not a wasm opcode*, and accepting one runs a
+non-standard encoding as a real instruction. A guard exists for exactly this — and it covered
+`0xd7..0xfa` only, so `0xc5..0xcc` (the eight saturating-truncation tags, which **already existed
+when the guard was written**) stayed open: `immediateKind` classifies `0x45...0xcc` as `.none`, so a
+body containing a bare `0xC5` validated and executed as `i32.trunc_sat_f32_s`.
+
+- **Severity is low and should be stated as low.** The synthesised instruction is memory-safe and
+  type-checked like any other; the loss is that wazmrt *accepts a module the spec calls malformed*,
+  and an embedder's `validate` therefore answers a question it was not asked.
+- ⚠️ **It was found by reading, not by a test** — while looking for free enum values. The regression
+  test that now covers it asserts both directions: the tag bytes are rejected, and the real ops on
+  either side (`0xc0..0xc4` sign-extension, `0xd0..0xd6` reference ops) still decode. The guard is
+  necessarily **two ranges**, because genuine single-byte opcodes sit between the two tag blocks.
+- 🔑 **The lesson: a guard covers the cases its author was debugging, not the cases that match its
+  reason.** The original fix enumerated the tags in the bug in front of it. When the property is
+  "this byte is an internal tag", the guard must enumerate every internal tag — and must be re-checked
+  whenever tags are added, which is why R3's new tags went in beside a widened range and a test that
+  names them.
+
+### Cross-module reference confusion — CLOSED 2026-08-13 (R2)
+
+**Not a sandbox escape, and worth recording precisely because it looked like one and was not.** A
+`funcref` was a bare function index resolved against whatever instance was *executing*, so a funcref
+written into a shared table by one module dispatched, in another module, to whatever function sat at
+that index there. Two modules linked by ordinary `register`/import — no hostile input needed —
+disagreed about what a reference meant.
+
+**Why it stopped short of a memory-safety issue:** the reading instance resolved the index, the type,
+and the body all in its *own* module, so the call was internally consistent — wrong function, but a
+real function called with its real signature. The damage is **wrong-answer**, not type confusion:
+`interp.zig`'s own comment reached that conclusion ("wrong-function dispatch rather than memory
+unsafety") and was right about it, while missing that the same sentence described a general defect
+rather than a quirk of rejected modules.
+
+⚠️ **The lesson is about the CHECK, not the bug.** `call_indirect`'s type check read the callee's
+type from the reader's module too — so it agreed with the wrong function and passed. **A check that
+resolves its subject the same wrong way as the code it checks provides no safety margin at all.** Ask
+what a verifier and the verified have in common before counting the verifier as defence in depth.
+
+Same shape, same day: an exception thrown with an imported tag was not caught by a handler naming a
+*different import of the same tag*, because a tag import carried no identity — so exceptions routed
+to the wrong handler across a link. Both are fixed by giving the linked entity an identity that
+outlives the index; details in `known-issues.md` → "Reference identity across a link".
 
 **Therefore the only way a guest introduces code to the machine is: it writes a file, and something
 *else* with real privilege executes it.** The wasm side is inert throughout. Privilege is always
