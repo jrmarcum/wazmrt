@@ -442,6 +442,25 @@
 # and an import-matching limit), not an overrun. **Enumerating the constant was still the right
 # move; it just found a different class than expected.**
 
+# RAISED 2026-08-17 (EMIT-INVALID fix — non-null abstract refs emit `0x64 heaptype`). Measured in
+# the REFERENCE configuration.
+#
+#   artifact       before         after       share
+#   wazmrt.exe    969,216       969,216          +0
+#   wazmrt.lib  1,032,734     1,032,908        +174
+#   wazmrt.dll    890,880       890,880          +0
+#
+# 174 bytes to stop emitting invalid binaries. One `else if` arm in `emitValType` plus the twelve-
+# case `nullable()` mapping it calls.
+#
+# ⚠️ **The two zeros are PE alignment, not staleness** — both were rebuilt in this run, and the
+# unpadded `.lib` carries the real figure (the R7 entry documents this same three-way pattern).
+#
+# 🎓 The measurement worth keeping is the one that did NOT move: the conformance corpus is
+# byte-identical across this fix (63,248 / 79 / 604), because every `.wast` module goes out through
+# our assembler and back in through our decoder, which accepts both encodings. **A gate can be
+# perfectly green and structurally blind.** wasmtime caught it in one command.
+
 wazmrt.exe  969216
-wazmrt.lib  1032734
+wazmrt.lib  1032908
 wazmrt.dll  890880

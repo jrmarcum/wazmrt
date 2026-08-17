@@ -292,10 +292,10 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
   *exactly* its ceiling; the file was two builds old. **An exactly-zero delta is a timestamp check
   waiting to happen.**
 
-**Unit tests: 645/645** (`zig build test --summary all`, 2026-08-17 end of day, from an NTFS cwd —
-`test-safe` 645/645, `test-security` 3/3). The day's additions: F3+F4 added 5 (era policy ×3,
+**Unit tests: 647/647** (`zig build test --summary all`, 2026-08-17 end of day, from an NTFS cwd —
+`test-safe` 647/647, `test-security` 3/3). The day's additions: F3+F4 added 5 (era policy ×3,
 multi_table gating, the every-feature-settable regression test) and the skip-scoring split added 1.
-⚠️ **From this repo's own `D:` cwd the same run reads 641/645 (4 skipped)** — `std.testing.tmpDir`
+⚠️ **From this repo's own `D:` cwd the same run reads 643/647 (4 skipped)** — `std.testing.tmpDir`
 scratches under `.zig-cache/tmp` relative to the CWD, which exFAT cannot give symlinks, and
 redirecting the zig cache does NOT reach it. Quote NTFS numbers.
 *(Superseded: 633 earlier the same day; 631, labelled "final" on 2026-08-14. Below is that entry,

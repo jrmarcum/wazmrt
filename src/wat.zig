@@ -3679,10 +3679,36 @@ fn internSig(a: std.mem.Allocator, sigs: *List(Sig), params: []const V, results:
 
 /// Emit one value type. A numeric/abstract type is its single byte; a concrete
 /// typed reference `(ref null? $t)` is `0x63`/`0x64` + the type index (`s33`).
+/// Emit a `valtype` (§5.3.4).
+///
+/// 🚨 **THIS EMITTED INVALID BINARIES UNTIL 2026-08-17, and only on the way OUT.** The `else` arm
+/// used to write `@intFromEnum(v)` for every non-concrete type, which is right for the numeric and
+/// *nullable* reference types — their enum values ARE their valtype bytes — and wrong for all
+/// twelve non-null abstract refs, whose values (`i31ref_nn = 0x62`, `funcref_nn = 0x68`, …) are
+/// **synthetic internal tags occupying real valtype bytes**. So `(ref i31)` assembled to the
+/// single byte `0x62`.
+///
+/// **The spec has no single-byte shorthand for a non-null reference.** Every shorthand
+/// (`0x69`–`0x6e`, `0x70`–`0x74`) is a NULLABLE form; a non-null ref is `0x64 heaptype`, always.
+/// `(ref i31)` is `64 6c`. Every other runtime rejected the modules we produced.
+///
+/// ⚠️ **It survived because the defect is ASYMMETRIC.** Our decoder reads the standard `0x64 ht`
+/// form correctly *and* accepts our own raw tags, so wazmrt round-trips its own output and reads
+/// everyone else's — the damage was only ever visible to a third party. That is *"our assembler is
+/// not an oracle for our decoder"* for the fifth time, and the first where the output leaves the
+/// process: `wazmrt_wat_to_wasm` is a shipped C-ABI entry point that hands these bytes to an
+/// embedder. **A round-trip test cannot see this class; assert the BYTES.**
+///
+/// The heap-type byte is derived via `nullable()` rather than written out as a second table,
+/// because for all twelve the nullable form's valtype byte IS the heap type byte — a second copy
+/// of a lookup table is a second place to be incomplete.
 fn emitValType(a: std.mem.Allocator, out: *List(u8), v: V) Error!void {
     if (v.isConcrete()) {
         try out.append(a, if (v.isNonNullRef()) 0x64 else 0x63);
         try sleb(a, out, v.concreteIndex());
+    } else if (v.isNonNullRef()) {
+        try out.append(a, 0x64);
+        try out.append(a, @intCast(@intFromEnum(v.nullable())));
     } else {
         try out.append(a, @intCast(@intFromEnum(v)));
     }
@@ -6479,6 +6505,64 @@ test "a (memory …) field may not carry unconsumed trailing forms" {
     _ = try assemble(a, "(module (memory i64 1 2))");
     _ = try assemble(a, "(module (memory $m (export \"m\") 1 2))");
     _ = try assemble(a, "(module (memory (data \"abc\")))");
+}
+
+test "a non-null abstract ref emits `0x64 heaptype`, NOT its internal tag byte" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // 🚨 REGRESSION TEST FOR A SHIPPED INTEROP DEFECT. `(ref i31)` assembled to the single byte
+    // `0x62` — an internal tag, not a valtype the spec defines — so every module wazmrt produced
+    // using a non-null abstract ref was rejected by every other runtime.
+    //
+    // ⚠️ **THIS ASSERTS THE BYTES ON PURPOSE.** A round-trip test is structurally blind here: our
+    // decoder accepts both the raw tag and the standard form, so assembling and re-decoding
+    // succeeded before the fix and succeeds after it. The only way to see the bug is to look at
+    // what actually leaves the process.
+    {
+        const bin = try assemble(a, "(module (type $s (struct (field (ref i31)))))");
+        // 5f = struct, 01 = one field, then the field's valtype, then 00 = immutable.
+        try std.testing.expect(std.mem.indexOf(u8, bin, &[_]u8{ 0x5f, 0x01, 0x64, 0x6c, 0x00 }) != null);
+        // And the old encoding must be gone: 5f 01 62 00.
+        try std.testing.expect(std.mem.indexOf(u8, bin, &[_]u8{ 0x5f, 0x01, 0x62, 0x00 }) == null);
+    }
+    // The NULLABLE form is a genuine one-byte shorthand and must stay one byte.
+    {
+        const bin = try assemble(a, "(module (type $s (struct (field (ref null i31)))))");
+        try std.testing.expect(std.mem.indexOf(u8, bin, &[_]u8{ 0x5f, 0x01, 0x6c, 0x00 }) != null);
+    }
+
+    // All twelve non-null abstract refs, each checked for `0x64 <its nullable byte>`. Written as a
+    // loop over the TYPE rather than a list of hand-written byte pairs, because a hand-written
+    // list would share the blind spot of the code it checks.
+    const cases = [_]struct { txt: []const u8, vt: V }{
+        .{ .txt = "func", .vt = .funcref_nn },
+        .{ .txt = "extern", .vt = .externref_nn },
+        .{ .txt = "any", .vt = .anyref_nn },
+        .{ .txt = "eq", .vt = .eqref_nn },
+        .{ .txt = "i31", .vt = .i31ref_nn },
+        .{ .txt = "struct", .vt = .structref_nn },
+        .{ .txt = "array", .vt = .arrayref_nn },
+        .{ .txt = "none", .vt = .nullref_nn },
+        .{ .txt = "nofunc", .vt = .nullfuncref_nn },
+        .{ .txt = "noextern", .vt = .nullexternref_nn },
+        .{ .txt = "exn", .vt = .exnref_nn },
+        .{ .txt = "noexn", .vt = .nullexnref_nn },
+    };
+    for (cases) |c| {
+        const src = try std.fmt.allocPrint(a, "(module (type $s (struct (field (ref {s})))))", .{c.txt});
+        const bin = try assemble(a, src);
+        const want = [_]u8{ 0x5f, 0x01, 0x64, @intCast(@intFromEnum(c.vt.nullable())), 0x00 };
+        try std.testing.expect(std.mem.indexOf(u8, bin, &want) != null);
+        // The raw internal tag must appear nowhere in the module.
+        try std.testing.expect(std.mem.indexOf(u8, bin, &[_]u8{ 0x5f, 0x01, @intCast(@intFromEnum(c.vt)), 0x00 }) == null);
+        // ...and it still decodes back to the type we started from, so the fix did not trade
+        // correctness on the wire for a broken read path.
+        var m = try Module.decode(a, bin);
+        defer m.deinit();
+        try std.testing.expectEqual(c.vt, m.comp_types[0].@"struct"[0].storage.val);
+    }
 }
 
 test "custom page sizes: the limits flag round-trips, and BYTE-granular bounds actually hold" {

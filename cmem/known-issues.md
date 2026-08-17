@@ -38,6 +38,56 @@ by its first-failure text:
 project's own rule — *a runtime that executes an invalid module is over-permissive, not authoritative*
 — is being broken in a corner nobody had run before.
 
+### 🔴 ✅ EMIT-INVALID — wazmrt ASSEMBLED NON-STANDARD BINARIES — FIXED 2026-08-17
+
+**Every module wazmrt assembled containing a non-null abstract reference — `(ref func)`, `(ref any)`,
+`(ref eq)`, `(ref i31)`, `(ref struct)`, `(ref array)`, `(ref extern)`, `(ref none)`, `(ref exn)`,
+`(ref nofunc)`, `(ref noextern)`, `(ref noexn)` — was INVALID to every other runtime.**
+
+`emitValType` wrote `@intFromEnum(v)` for any non-concrete type. That is correct for the numeric and
+*nullable* reference types, whose enum values genuinely are their valtype bytes, and wrong for the
+twelve non-null forms, whose values are **synthetic internal tags sitting on real valtype bytes**
+(`i31ref_nn = 0x62`, `funcref_nn = 0x68`, …). So `(ref i31)` assembled to the single byte `0x62`.
+**The spec has no single-byte shorthand for a non-null reference** — every shorthand
+(`0x69`–`0x6e`, `0x70`–`0x74`) is a nullable form, and a non-null ref is `0x64 heaptype`, always.
+
+**Confirmed against wasmtime, which is the only thing that could have caught it:**
+
+```
+wazmrt's old output   00 61 73 6d 01 00 00 00  01 05 01 5f 01 62 00
+  → Error: failed to parse WebAssembly module
+    Caused by: unexpected exact type (at offset 0xd)
+fixed output          00 61 73 6d 01 00 00 00  01 06 01 5f 01 64 6c 00   → compiles clean
+```
+
+⚠️ **Read that error message.** wasmtime does not say "bad byte" — it says **"unexpected exact
+type"**, because `0x62` is the `Exact` heap-type prefix in the custom-descriptors proposal
+(binaryen `wasm-binary.h:418`). The synthetic tag had grown into a real spec byte. **This is why
+the defect BLOCKED Track D**: D1 cannot encode `(ref (exact $t))` while 0x62 means `(ref i31)` here.
+
+🔑 **THE REASON IT SURVIVED, AND THE TRANSFERABLE PART: THE DEFECT IS ASYMMETRIC, SO NO TEST WE
+OWN COULD SEE IT.** Our decoder reads the standard `0x64 ht` form correctly *and* accepts our own
+raw tags, so wazmrt round-trips its own output and reads everyone else's. **The whole conformance
+corpus is blind to it** — the run before and after this fix is byte-identical at 63,248 / 79 / 604,
+because every `.wast` module goes out through our assembler and back in through our decoder. Fifth
+occurrence of *"our assembler is not an oracle for our decoder"*, and the first where the damage
+LEAVES THE PROCESS: `wazmrt_wat_to_wasm` is a shipped C-ABI entry point whose entire purpose is
+handing these bytes to an embedder, and running `.wat` directly is a stated differentiator.
+
+**Fix:** `emitValType` emits `0x64` + the heap-type byte, derived through `nullable()` rather than
+from a second hand-written table (for all twelve, the nullable form's valtype byte *is* the heap
+type byte — a second copy of a lookup table is a second place to be incomplete). The decoder still
+ACCEPTS the raw tags, deliberately: older wazmrt output exists and refusing to read it would turn
+one bug into two. **We stopped writing them; we did not stop reading them.**
+
+**Regression test asserts the BYTES**, over all twelve types, looping on the type rather than a
+hand-written byte list — a round-trip test is structurally incapable of failing here, and a
+hand-written list would share the blind spot of the code it checks. Inversion-verified (build
+succeeded, test failed).
+
+⚠️ **Open follow-up:** any `.wasm` in the wasmtk / `wasm_wast` corpora that was produced BY wazmrt
+is suspect and should be re-generated. Not audited yet.
+
 ### 🔴 ✅ T1 — ACCEPT-INVALID — FIXED 2026-08-12 (and it took T2 and T5 with it)
 
 Corpus **525 → 455 failures**, 86 → 82 files with failures, **zero regressions** (every baseline entry

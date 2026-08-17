@@ -248,6 +248,21 @@ groups, and element-segment types. — `known-issues.md`
 **A decoder rule with no matching emitter rule is a bug that hides itself.** Any conformance failure
 reaching the WAT path must be checked at BOTH ends before the runtime is suspected. — `known-issues.md`
 
+🚨 **A SYNTHETIC INTERNAL TAG PLACED IN A REAL ENCODING SPACE WILL EVENTUALLY MEAN SOMETHING ELSE —
+and if you EMIT it, the damage leaves the process.** wazmrt gave its twelve non-null abstract
+reference types synthetic valtype bytes in "an otherwise-unused range", and `emitValType` wrote
+them out raw, so `(ref i31)` assembled to the single byte `0x62`. The spec has no one-byte
+non-null shorthand; it is `0x64 heaptype`. Every such module wazmrt produced was invalid to every
+other runtime — and by 2026 `0x62` had become the custom-descriptors `Exact` prefix, so wasmtime
+rejected our output with **"unexpected exact type"**. **Reserve internal tags OUTSIDE the format's
+space, or convert at the boundary; "currently unused" is a statement about today's spec.**
+⚠️ **And the reason it survived nine months: the defect was ASYMMETRIC, so nothing we own could
+see it.** Our decoder accepted both the standard form and our own tags, so we round-tripped our
+output and read everyone else's; **the entire conformance corpus is blind by construction** — the
+run before and after the fix is byte-identical. **When a bug can only be seen by a third party,
+the test has to BE a third party** (here: hand-build the bytes, hand them to wasmtime) **or assert
+the bytes directly. A round-trip proves agreement with yourself.** — emit-invalid, `known-issues.md`
+
 **Two consumers agreeing is not corroboration when they share the mistake — and there can be THREE.**
 R4's `try_table` catch label was resolved one frame too deep by the assembler, the validator *and*
 the interpreter, identically, so every round trip was self-consistent and the whole corpus was green.
