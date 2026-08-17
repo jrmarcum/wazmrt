@@ -9,6 +9,31 @@ and revised without wading through one giant file. Keep files small and single-t
 
 ---
 
+## 🚨 ENVIRONMENT BLOCKER (2026-08-17) — `zig build` CANNOT RUN from this repo on D:
+
+**If a build fails with a bare `error: Unexpected` — no step, no path, and `--verbose` adds
+nothing — it is NOT your change.** The `D:` volume this repo lives on is throwing hardware errors
+(Windows System log, event ID 51, "error detected on device \Device\Harddisk1\DR3 during a paging
+operation"). It corrupted zig's `.zig-cache` (even `zig build --help` failed until the cache was
+moved aside) **and** git's commit-graph, in the same hour.
+
+**Workaround used on 2026-08-17, and it works:** copy the tree to `C:` and build there —
+
+```
+robocopy . <C:\path> /E /XD .git .zig-cache zig-out
+```
+
+`zig build test` / `conformance` / `size` all pass from the copy. Everything committed that day was
+verified that way, including the size ceilings.
+
+⚠️ **Clearing the caches FEELS like a fix and is not** — both are regenerable, so clearing them moves
+the symptom off the cause. **Back up and `chkdsk` before trusting the volume.** A full backup of the
+repo including `.git` was verified readable on 2026-08-17. **Confirm the drive is healthy before
+reading any build result from D: as evidence of anything.** See `best-practices.md` §2 for the
+diagnosis method — the decisive step was rebuilding UNMODIFIED HEAD, which reproduced it.
+
+---
+
 ## ⚡ READ THIS FIRST — the C ABI changed completely on 2026-08-11
 
 **wazmrt no longer implements the standard wasm-c-api. It was DELETED.** The C ABI is now a native,
