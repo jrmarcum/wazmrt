@@ -87,7 +87,7 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
 every snapshot below it is older and kept as history. *(Superseded same day: 63,391 / 4 / 497, then 63,315 / 16 / 578, then 63,344 / 53 / 515, then 63,190 / 81 / 673, then 62,898 / 81 / 965.)*
 
 ✅ **EVERY TARGETED PROPOSAL NOW SHIPS. Track D (custom-descriptors) is COMPLETE — D1 through D5,
-all on 2026-08-17** — and Track P before it. There is no untargeted proposal left.
+all on 2026-08-17** — and Track P before it. ⚠️ **NOT "no untargeted proposal left"** — `custom-annotations` still is one (`annotations.wast`, a runner-lex gap, baseline group 1). What closed is the last untargeted proposal that the corpus scored as FAILURES.
 
 **Deliberate spec deviations: ZERO** (the last, `anyfunc`, closed 2026-08-17). ⚠️ **But the 2
 remaining failures are the FIRST baseline entries that are wazmrt DEFECTS**, not proposals we

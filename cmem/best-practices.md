@@ -440,6 +440,53 @@ it**, and the better the explanation, the longer it will sit there unexamined. R
 justified entries periodically, precisely because they are the ones nothing prompts you to revisit.
 — F4, `roadmap.md`
 
+**`git checkout <file>` to undo a probe discards EVERYTHING uncommitted in that file.** A one-line
+measurement probe was reverted that way mid-D4 and it took the entire uncommitted D4 validation work
+with it — silently, because the command succeeds either way. It surfaced minutes later as a
+per-file conformance drop that read like a real regression, and cost a bisect to trace back to the
+undo rather than to the code. **Undo a probe the way you made it (edit the line back), or commit
+before probing.** A destructive command whose blast radius is "the file" is the wrong tool when your
+intent is "the line". — D4, `roadmap.md`
+
+**A harness that RECONSTRUCTS paths does not judge by the same rules as the real run.** The per-file
+conformance harness copied each `.wast` into its own scratch directory to isolate it — which
+stripped the `proposals/custom-descriptors` path segment that `wast.featuresForPath` keys the
+proposal ERA on. Every descriptor file was then judged without the feature and reported ~120 skips,
+which looked exactly like the implementation had broken. The full run had been correct throughout.
+**When behaviour depends on a path, a harness that rewrites paths is not a smaller version of the
+real run — it is a different run.** Reproduce the path structure, or use the real one. — D4,
+`roadmap.md`
+
+**A block typed at the TOP type accepts either branch shape, so a direction bug passes every
+execution test.** `br_on_cast_desc_eq` and its `_fail` twin carry different types to the label — the
+destination on a match, the source-minus-destination on a miss — but every test wrote
+`(block (result anyref) …)`, which accepts both. Swapping which spelling fires on a match failed
+nothing. **Type the block at the DISTINGUISHING type** (`(ref $a)` here) when the property under
+test is which branch is taken. — D4, `roadmap.md`
+
+**A stack-polymorphic `return` swallows a leftover operand, hiding a missing pop.** The same
+`br_on_cast_desc_eq` tests all ended their block with `return`, so forgetting to consume the
+descriptor operand — which makes the validator pop the DESCRIPTOR as the ref, leaving the real value
+stranded — type-checked cleanly. **Balance the stack exactly when the property under test is operand
+consumption**, or the polymorphic tail absorbs the bug. — D4, `roadmap.md`
+
+**A proposal can RETYPE an instruction that already exists, not only add new ones — and an era model
+built for "this snapshot LACKS feature X" cannot express that.** custom-descriptors relaxes
+`br_on_cast`'s `rt2 <: rt1` requirement, so the identical module is `assert_invalid` in the core
+testsuite and VALID in the proposal snapshot. Every prior era entry restricted a directory relative
+to the merged spec; this one had to be **opt-IN by directory**, because the era that LACKS the
+proposal is the merged spec — i.e. every other file. **Before assuming a proposal is additive, look
+for an existing instruction whose typing it changes**; the corpus states it plainly by shipping the
+same module twice with opposite verdicts. — D4, `roadmap.md`
+
+**`git branch -d` checks against the branch's UPSTREAM, not against `main`.** A branch whose commits
+reached the remote via a *different* branch is fully merged and still trips the guard — its message
+says so exactly ("not merged to `refs/remotes/origin/X`, even though it is merged to HEAD") and is
+easy to misread as "this has unmerged work". Reaching for `-D` skips the check entirely, which is
+the wrong lesson to learn from a false alarm. **Delete the remote ref first**, so the fallback
+comparison against `HEAD` becomes the meaningful one and the guard still protects you. — the
+post-Track-D branch cleanup
+
 ## 5. Recording what you found
 
 **"Update the project memory" means AUDIT for stale live claims, not edit the files you happened to
@@ -532,6 +579,25 @@ R9's eight test inversions reported no failing test because commenting out the c
 parameter unused — a hard error in Zig — so the build never ran, and the "which tests failed" grep
 matched nothing either way. Assert the build succeeded before reading an inversion's silence. — R9,
 `testing.md`
+
+**An inversion that catches NOTHING has three causes, and they need three different responses.**
+Tracks D2–D4 hit all three, and telling them apart takes an argument, not a rerun:
+1. **The arm is genuinely redundant** → *delete it.* D3 added a byte-range guard for three new
+   opcode tags whose stated reason — "their immediate kind is one real ops also have" — was simply
+   false; the kind switch already refused every `.gc_type` byte. **A redundant guard carrying a
+   false justification is worse than no guard: it teaches the next reader the wrong rule.**
+2. **The arm has a MIRROR that catches the case instead** → *keep both, and say so.* D2's rec-group
+   and struct checks in `checkDescriptorLinks` each reported "not caught" alone and were caught as a
+   PAIR — delete either on the strength of a green suite and the module is accepted the moment its
+   mirror is touched.
+3. **The arm defends a path the tests cannot reach** → *keep it and write down why.* D4's
+   `descEqMatches` type check is subsumed by the descriptor-identity check for any VALIDATED module
+   (a descriptor object belongs to exactly one described object), but it is real defence on the
+   UNVALIDATED run path, where a hand-built module can pair any value with any descriptor.
+
+⚠️ **The failure mode is treating all three as case 1.** "No test caught it" is a question, not a
+verdict — the same shape as *finding a real defect at a layer is not evidence it causes your
+symptom* (§2). — D2/D3/D4, `roadmap.md`
 
 **A rule about a NAMESPACE belongs on the namespace, not on the writers.** Every wasm index space is
 filled from two places — an import and a definition — and the uniqueness rule spans both, so a
