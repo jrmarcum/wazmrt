@@ -349,6 +349,25 @@ while a feature-gating draft was wrong in the FALSE-POSITIVE direction and a sym
 it fail, restore it. R1's `define_instance` test was confirmed this way; the path it covers had only a
 symbol-existence entry before. — R1, `known-issues.md`
 
+🔒 **FOR A SOUNDNESS RULE, WRITE THE WRONG ANSWER DOWN — the score cannot tell you the rule is
+enforced, only that the files you looked at got better.** D1 had correct exactness arms in BOTH
+`subtypeOf` and `headMatches`, and conformance reported 0 regressions and 7 improvements — and
+`ref.test (ref (exact $super))` still answered **1** for a subtype, because the four cast
+sub-opcodes read their target through a path that dropped the `exact` prefix. The corpus was blind
+because those files were already failing for other reasons. **An assertion count would have shipped
+type confusion.** Third time on this branch a soundness defect passed the whole corpus and was
+found only by constructing the case: the host-externref/GC-index collision and the cross-instance
+object substitution were the other two. **The test to write is not "does the feature work" but
+"does the thing that must NOT match, not match" — plus its neighbours, so a blanket refusal cannot
+pass for the right answer.** — D1, `roadmap.md`
+
+**Implementing half a feature turns its false passes into visible failures — that is progress, not
+regression.** Mid-D1 the count showed 18 LOST passes. None was real: those `assert_invalid`
+assertions had been passing because the syntax could not be PARSED (`BadValType` is not on
+`isOurLimitation`, so a parse gap scored as a correct rejection), and they only became honest once
+the semantic half landed. **Before treating a pass-count drop as a regression, ask what those
+assertions were passing ON.** — D1, `roadmap.md`
+
 **When a test fails after your change, ask whether its EXAMPLE still demonstrates its PROPERTY
 before you touch either.** R5's green-washing regression test failed on the skip-scoring split, and
 it was right to: its example was `some.bogus.instruction`, chosen to stand for "a mnemonic our

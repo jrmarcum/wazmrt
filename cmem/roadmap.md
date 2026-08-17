@@ -1332,6 +1332,29 @@ Descriptors make a struct type's runtime description a first-class value, which 
 EXACT. It extends GC, which wazmrt ships — an extension of a shipped proposal, not a new subsystem.
 **D1 gates everything else; do not reorder.**
 
+- ✅ **D1 — DONE 2026-08-17.** `(exact $t)` in text and binary, with subtyping enforced. Closed
+  **26 failures and 89 skips = 115 assertions**; `exact-casts.wast` 0/3/108 → clean, `exact.wast`
+  17 failures → 2.
+  **Representation:** `exact_bit` at bit 27, taken from the index field (31/30/29-28 were all
+  spoken for), halving the index range to ~134M — so the decoder now enforces `max_concrete_index`
+  explicitly, because that bound and the declared-type-count bound are no longer the same
+  constraint and `concreteRef` MASKS (an over-range index truncates to a smaller VALID one).
+  `flagBits` carries the bit, without which `(ref (exact $t))` and `(ref $t)` compare equal
+  wherever identity is asked. `concreteRefEx` is a separate constructor, not a fourth parameter:
+  all 31 existing call sites mean "inexact", and inexact is not a policy — it is what a plain
+  `(ref $t)` MEANS. **Rules:** an exact SUPER admits only an exact sub of the same type; an exact
+  SUB satisfies an inexact super normally.
+  🔒 **THE LESSON, and it is the one D3/D4 should be planned around: the by-construction
+  wrong-answer test found live type confusion AFTER the score said the work was done.** With
+  `subtypeOf` and `headMatches` both carrying correct exactness arms, and conformance reporting
+  0 regressions / 7 improvements, `ref.test (ref (exact $super))` **still answered 1 for a
+  subtype** — the four `ref.test`/`ref.cast` sub-opcodes read their target through a path that
+  dropped the `0x62` prefix. The corpus could not see it because those files were already failing
+  for other reasons. **An assertion count would have shipped D1 with a soundness hole in it.**
+  ⚠️ Also worth knowing before D2: mid-change this showed **18 LOST passes that were not a
+  regression** — those `assert_invalid`s had been passing because we could not PARSE `exact`
+  (`BadValType` is not on `isOurLimitation`, so a parse gap scored as a correct rejection).
+  Implementing half a feature exposed them as false passes. *(Original scoping below.)*
 - **D1 — the `(exact $t)` reference-type former. THE HARD ONE.** ⚠️ Exact refs change **SUBTYPING**,
   not just parsing: `(ref (exact $t))` is **NOT** satisfied by a subtype of `$t`. So `subtypeOf`,
   `refMatches`, `headMatches` and the `TypeRegistry` canonicaliser all change together.
@@ -1342,6 +1365,23 @@ EXACT. It extends GC, which wazmrt ships — an extension of a shipped proposal,
   substitution). **Every cast arm needs a targeted WRONG-ANSWER test, not an assertion count** — the
   cross-instance defect passed the whole corpus before it was found by construction, not by score.
   Carries `exact.wast` (17), `exact-func-import` (5), `exact-casts` (3), `array_new_exact` (1).
+- 🎯 **D2 — NEXT, and the reconnaissance is DONE (2026-08-17). Start here.**
+  **Binary grammar, read off `binary-descriptors.wast`:** `0x4d <typeidx>` = descriptor,
+  `0x4c <typeidx>` = describes. Both sit **between** the optional `0x50`/`0x4f` sub-type wrapper
+  and the composite type — e.g. `4d 01 5f 00`. A repeated clause is malformed; that file asserts
+  *"cannot have multiple descriptor clauses"* explicitly.
+  **Text syntax:** `(descriptor $d)` / `(describes $s)`, including qualified names (`$A.desc`).
+  **Where the code goes:** `Module.decodeSubType` parses both clauses, and `Module` needs
+  `descriptors`/`describes` arrays parallel to the existing `supertypes`/`finals`; `wat.zig`
+  parses and emits them in the position the decoder expects — ⚠️ **assert the BYTES, do not
+  round-trip** (see the emit-invalid entry in `known-issues.md`); `interp.zig`'s `groupKey`
+  (≈line 484) must fold the descriptor links into the structural key.
+  🔒 **`groupKey` is the load-bearing one and the trap is the same shape as D1's:** a descriptor
+  link missing from the key makes two structurally-identical-but-differently-described types
+  canonicalise together — a cross-module WRONG ANSWER that will not show up as a failure, exactly
+  as D1's dropped `0x62` did not. **It needs a targeted cross-module test, not an assertion
+  count.** Worth 23 assertions (`descriptors.wast` 21 + `binary-descriptors` 2).
+  *(Original scoping below.)*
 - **D2 — `(descriptor $d)` / `(describes $s)` on struct types.** Type-section syntax + binary form.
   ⚠️ **Rec-group interning must include the descriptor links in the structural key** — otherwise two
   structurally-identical-but-differently-described types canonicalise together, which is a

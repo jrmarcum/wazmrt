@@ -86,8 +86,10 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
 **284 files — 63,344 assertions passed / 53 failed / 515 skipped**, and `zig build conformance -Dbaseline=tools/conformance-baseline.txt` reports **0 regressions**. This is the number to quote;
 every snapshot below it is older and kept as history. *(Superseded same day: 63,190 / 81 / 673, then 62,898 / 81 / 965.)*
 
-**Deliberate spec deviations: ZERO** (the last, `anyfunc`, closed 2026-08-17). **ALL 79 remaining
-failures are custom-descriptors** — `roadmap.md`'s Track D, the only untargeted proposal left.
+**Deliberate spec deviations: ZERO** (the last, `anyfunc`, closed 2026-08-17). **ALL 53 remaining
+failures are custom-descriptors** — `roadmap.md`'s Track D, the only untargeted proposal left, and
+its D1 (`exact` references) is DONE. **Next: D2** — see the roadmap, where the binary grammar and
+the `groupKey` trap are written up so it can be resumed cold.
 ✅ **Track P (custom-page-sizes) is DONE 2026-08-17**: all four files 0 failed / 0 skipped, 61
 assertions passing where 5 passed / 2 failed / 69 skipped. ⚠️ **It was carried in the baseline as
 "2 assertions" and was worth 69 SKIPS — a 35× undercount**, because a module the assembler cannot
@@ -292,10 +294,10 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
   *exactly* its ceiling; the file was two builds old. **An exactly-zero delta is a timestamp check
   waiting to happen.**
 
-**Unit tests: 647/647** (`zig build test --summary all`, 2026-08-17 end of day, from an NTFS cwd —
-`test-safe` 647/647, `test-security` 3/3). The day's additions: F3+F4 added 5 (era policy ×3,
+**Unit tests: 651/651** (`zig build test --summary all`, 2026-08-17 end of day, from an NTFS cwd —
+`test-safe` 651/651, `test-security` 3/3). The day's additions: F3+F4 added 5 (era policy ×3,
 multi_table gating, the every-feature-settable regression test) and the skip-scoring split added 1.
-⚠️ **From this repo's own `D:` cwd the same run reads 643/647 (4 skipped)** — `std.testing.tmpDir`
+⚠️ **From this repo's own `D:` cwd the same run reads 647/651 (4 skipped)** — `std.testing.tmpDir`
 scratches under `.zig-cache/tmp` relative to the CWD, which exFAT cannot give symlinks, and
 redirecting the zig cache does NOT reach it. Quote NTFS numbers.
 *(Superseded: 633 earlier the same day; 631, labelled "final" on 2026-08-14. Below is that entry,
