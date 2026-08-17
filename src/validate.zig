@@ -95,6 +95,11 @@ pub const Error = Module.Error || error{
     /// (§3.3.9). Left unchecked, `isSubtype` believes it and `ref.cast` succeeds
     /// on a value that does not have the target type.
     InvalidSubtype,
+    /// A `(descriptor $d)` / `(describes $s)` clause that is not a well-formed
+    /// pair (custom-descriptors): the target is outside the declaring type's rec
+    /// group, does not point back, is not a struct, or is used before it is
+    /// declared. See `checkDescriptorLinks`.
+    InvalidDescriptor,
     /// A legacy `rethrow l` whose label is not a `catch`/`catch_all` block.
     /// Nothing else binds a caught exception, so there is nothing to re-raise.
     InvalidRethrowLabel,
@@ -168,6 +173,11 @@ pub fn validate(gpa: std.mem.Allocator, module: *const Module) Error!void {
     // before anything consults `isSubtype`, which simply trusts the chain — so
     // an unchecked declaration turns `ref.cast` into a lie the interpreter then
     // acts on.
+    // Descriptor links first: `declaredSubtypeOk` compares a sub's descriptor
+    // against its super's, and that comparison only means anything once both
+    // links are known to be real pairs.
+    try checkDescriptorLinks(module);
+
     for (module.supertypes, 0..) |maybe_sup, i| if (maybe_sup) |sup|
         if (!declaredSubtypeOk(module, @intCast(i), sup)) return error.InvalidSubtype;
 
@@ -667,6 +677,21 @@ const FuncValidator = struct {
 
     fn pushValT(self: *FuncValidator, t: V) Error!void {
         try self.vals.append(self.a, .{ .val = t });
+    }
+
+    /// 🔒 custom-descriptors: a type that declares a `(descriptor $d)` may only be
+    /// allocated by the descriptor-carrying form (`struct.new_desc`, Track D3).
+    ///
+    /// This lives here rather than waiting for D3 because it is the guard that
+    /// keeps HALF the feature from being unsound: now that the type section
+    /// records descriptor links, a plain `struct.new $a` on a described `$a`
+    /// would mint a value that its own type says carries a description and does
+    /// not — and every later reader of that description would be reading a field
+    /// nothing ever wrote. Refusing the allocation is the honest answer while the
+    /// allocating instruction does not exist yet. (`struct_new_desc.wast` asserts
+    /// it for both `struct.new` and `struct.new_default`.)
+    fn requireNoDescriptor(self: *FuncValidator, ti: u32) Error!void {
+        if (self.module.descriptorOf(ti) != null) return error.InvalidDescriptor;
     }
     fn pushVal(self: *FuncValidator, st: StackType) Error!void {
         try self.vals.append(self.a, st);
@@ -1417,6 +1442,7 @@ const FuncValidator = struct {
             // collapse to `structref` in our model; the exact type index rides in
             // the immediate (fields/mutability come from it).
             .struct_new => {
+                try self.requireNoDescriptor(instr.imm.gc_type);
                 const fields = self.module.structFields(instr.imm.gc_type) orelse return error.UndefinedType;
                 var i = fields.len;
                 while (i > 0) { // operands are pushed field 0 first → pop in reverse
@@ -1426,6 +1452,7 @@ const FuncValidator = struct {
                 try self.pushValT(V.concreteRef(false, .@"struct", instr.imm.gc_type));
             },
             .struct_new_default => {
+                try self.requireNoDescriptor(instr.imm.gc_type);
                 const fields = self.module.structFields(instr.imm.gc_type) orelse return error.UndefinedType;
                 for (fields) |f| if (f.storage.unpacked().isNonNullRef()) return error.TypeMismatch; // not defaultable
                 try self.pushValT(V.concreteRef(false, .@"struct", instr.imm.gc_type));
@@ -1834,10 +1861,63 @@ fn refTypeValType(module: *const Module, rt: opcode.RefType) Error!V {
 /// Nineteen of `type-subtyping.wast`'s accept-invalid failures, and every one of
 /// them makes `ref.cast`/`br_on_cast` unsound: the cast succeeds and the
 /// interpreter then reads the value at a type it does not have.
+/// custom-descriptors §"Validation": every `(descriptor $d)` / `(describes $s)`
+/// clause must name a struct in the SAME rec group that points back, and the
+/// `describes` direction must point BACKWARDS.
+///
+/// The rec-group requirement is what makes a descriptor pair a single unit of
+/// type identity: the two types are mutually recursive by construction, so a
+/// link that escaped its group would let one half be canonicalised — and
+/// therefore substituted — independently of the other. The backwards rule on
+/// `describes` (a type may not describe itself or a later type) is the same
+/// well-foundedness argument `decodeSubType` already makes for supertypes: it
+/// keeps the pair's ordering a total one, so a walk over the links terminates.
+///
+/// ⚠️ **The two halves below MIRROR each other on purpose, and the inversion
+/// results say so: the rec-group check and the struct check each report "not
+/// caught" when removed ALONE, and are caught when removed as a PAIR.** That is
+/// not dead code — once one clause is deleted, the mutual-link check routes the
+/// case to the other half, which then makes the same complaint from the other
+/// side. Deleting either one on the strength of a green suite leaves the module
+/// accepted the moment its mirror is touched.
+fn checkDescriptorLinks(module: *const Module) Error!void {
+    for (0..module.comp_types.len) |raw| {
+        const i: u32 = @intCast(raw);
+        const g = module.recGroup(i);
+        const in_group = struct {
+            fn f(t: u32, start: u32, len: u32) bool {
+                return t >= start and t < start + len;
+            }
+        }.f;
+
+        if (module.descriptorOf(i)) |d| {
+            if (!in_group(d, g.start, g.len)) return error.InvalidDescriptor;
+            // A descriptor pair is two structs; `(func)`/`(array …)` on either
+            // side has no runtime description to carry.
+            if (!isStructType(module, i) or !isStructType(module, d)) return error.InvalidDescriptor;
+            // The link must be mutual — a lone `(descriptor $d)` where `$d` says
+            // nothing about `$i` would give `$i` a description that does not
+            // claim it.
+            if (module.describesOf(d) != i) return error.InvalidDescriptor;
+        }
+        if (module.describesOf(i)) |s| {
+            if (!in_group(s, g.start, g.len)) return error.InvalidDescriptor;
+            if (s >= i) return error.InvalidDescriptor; // "forward use of described type"
+            if (!isStructType(module, i) or !isStructType(module, s)) return error.InvalidDescriptor;
+            if (module.descriptorOf(s) != i) return error.InvalidDescriptor;
+        }
+    }
+}
+
+fn isStructType(module: *const Module, i: u32) bool {
+    return i < module.comp_types.len and module.comp_types[i] == .@"struct";
+}
+
 fn declaredSubtypeOk(module: *const Module, sub_i: u32, sup_i: u32) bool {
     if (sup_i >= module.comp_types.len or sub_i >= module.comp_types.len) return false;
     // A final type is closed: nothing may name it as a supertype.
     if (module.isFinal(sup_i)) return false;
+    if (!descriptorsMatch(module, sub_i, sup_i)) return false;
     const sub = module.comp_types[sub_i];
     const sup = module.comp_types[sup_i];
     return switch (sup) {
@@ -1870,6 +1950,37 @@ fn declaredSubtypeOk(module: *const Module, sub_i: u32, sup_i: u32) bool {
             else => false,
         },
     };
+}
+
+/// custom-descriptors: the descriptor half of §3.3.9's sub-type check.
+///
+/// Two rules, and they are NOT symmetric — the asymmetry is the whole point:
+///
+///   • **descriptor** is one-directional. A supertype WITH a descriptor forces
+///     every subtype to have one too, and the subtype's must be a subtype of
+///     it — otherwise a value reached through the supertype would hand back a
+///     description of the wrong shape. A supertype WITHOUT a descriptor imposes
+///     nothing, so a subtype is free to add one.
+///   • **describes** is biconditional. A descriptor's position in the hierarchy
+///     has to track its describee's in both directions, so a subtype and its
+///     supertype either both describe something or neither does — and when they
+///     do, the subtype must describe a subtype of what the supertype describes.
+///
+/// 🔒 Both arms are load-bearing for `ref.cast`: getting either backwards lets a
+/// cast to a descriptor type succeed on a value whose description is a sibling
+/// rather than a subtype, which is the same type confusion as D1's exactness
+/// hole. `descriptors.wast` asserts each direction separately, including the
+/// two cases where a VALID link on one side masks an invalid one on the other.
+fn descriptorsMatch(module: *const Module, sub_i: u32, sup_i: u32) bool {
+    if (module.descriptorOf(sup_i)) |ds| {
+        const db = module.descriptorOf(sub_i) orelse return false;
+        if (!module.isSubtype(db, ds)) return false;
+    }
+    const ss = module.describesOf(sup_i);
+    const sb = module.describesOf(sub_i);
+    if ((ss == null) != (sb == null)) return false;
+    if (ss) |s| if (!module.isSubtype(sb.?, s)) return false;
+    return true;
 }
 
 /// §3.3.8 field matching. A MUTABLE field is INVARIANT — it is both read and

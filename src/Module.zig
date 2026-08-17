@@ -235,6 +235,20 @@ supertypes: []const ?u32,
 /// composite type (shorthand for `sub final`) and for an explicit `0x4f`; false
 /// only for `0x50`. Parallel to `comp_types`.
 type_finals: []const bool,
+/// custom-descriptors: the type index named by each type's `(descriptor $d)`
+/// clause (`0x4d`), or null. `$d` is the struct that DESCRIBES this one, and it
+/// sits LATER in the same rec group. Parallel to `comp_types`.
+///
+/// 🔒 A descriptor link is part of the TYPE, not an annotation on it: two
+/// structurally identical structs with different descriptors are different
+/// types, so `canonicalizeTypes`, `interp.groupKey` and `typematch.eqMember`
+/// all fold both of these arrays into their keys.
+descriptors: []const ?u32,
+/// custom-descriptors: the type index named by each type's `(describes $s)`
+/// clause (`0x4c`), or null — the inverse of `descriptors`, pointing at an
+/// EARLIER member of the same rec group. Both directions are recorded because
+/// canonicalisation runs before validation has established that they agree.
+describes: []const ?u32,
 /// Canonical identity per type index: equal ids mean the same type. See
 /// `canonOf` / `isSubtype`. **Module-local** — two modules' ids are not
 /// comparable; crossing that boundary is `typematch.zig`'s job.
@@ -306,6 +320,8 @@ const Decoder = struct {
     comp_types: []const CompType = &.{},
     supertypes: []const ?u32 = &.{},
     type_finals: []const bool = &.{},
+    descriptors: []const ?u32 = &.{},
+    describes: []const ?u32 = &.{},
     canon: []const u32 = &.{},
     rec_start: []const u32 = &.{},
     rec_len: []const u32 = &.{},
@@ -431,6 +447,8 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Module {
         .comp_types = d.comp_types,
         .supertypes = d.supertypes,
         .type_finals = d.type_finals,
+        .descriptors = d.descriptors,
+        .describes = d.describes,
         .canon = d.canon,
         .rec_start = d.rec_start,
         .rec_len = d.rec_len,
@@ -692,6 +710,16 @@ pub fn refHead(self: *const Module, ht: opcode.HeapType) Error!types.ValType.Ref
 /// the conservative answer, since an unknown type must not become extensible.
 pub fn isFinal(self: *const Module, i: u32) bool {
     return if (i < self.type_finals.len) self.type_finals[i] else true;
+}
+
+/// The `(descriptor $d)` of type index `i` (custom-descriptors), or null.
+pub fn descriptorOf(self: *const Module, i: u32) ?u32 {
+    return if (i < self.descriptors.len) self.descriptors[i] else null;
+}
+
+/// The `(describes $s)` of type index `i` (custom-descriptors), or null.
+pub fn describesOf(self: *const Module, i: u32) ?u32 {
+    return if (i < self.describes.len) self.describes[i] else null;
 }
 
 /// The canonical identity of type index `i`. Two indices name the SAME type iff
@@ -1042,9 +1070,7 @@ fn decodeTypeSection(d: *Decoder, r: *Reader) Error!void {
     var scan = r.*; // Reader is a value cursor — copy for the pre-scan pass.
     d.type_kinds = try prescanTypeKinds(d.a, &scan);
 
-    var comp: std.ArrayList(CompType) = .empty;
-    var supers: std.ArrayList(?u32) = .empty;
-    var finals: std.ArrayList(bool) = .empty;
+    var t: TypeLists = .{};
     // Rec-group extent per type index. Flattening the groups away lost the one
     // piece of information canonicalisation needs — which references are
     // INTERNAL to a group — so a standalone type is recorded as a group of one.
@@ -1052,15 +1078,15 @@ fn decodeTypeSection(d: *Decoder, r: *Reader) Error!void {
     var rec_len: std.ArrayList(u32) = .empty;
     var nrec = try r.readVarU32();
     while (nrec > 0) : (nrec -= 1) {
-        const start: u32 = @intCast(comp.items.len);
+        const start: u32 = @intCast(t.comp.items.len);
         var members: u32 = 1;
         if (try r.peekByte() == 0x4e) {
             _ = try r.readByte(); // rec group
             members = try r.readVarU32();
             var k = members;
-            while (k > 0) : (k -= 1) try decodeSubType(d, r, &comp, &supers, &finals);
+            while (k > 0) : (k -= 1) try decodeSubType(d, r, &t);
         } else {
-            try decodeSubType(d, r, &comp, &supers, &finals);
+            try decodeSubType(d, r, &t);
         }
         var k: u32 = 0;
         while (k < members) : (k += 1) {
@@ -1068,14 +1094,27 @@ fn decodeTypeSection(d: *Decoder, r: *Reader) Error!void {
             try rec_len.append(d.a, members);
         }
     }
-    d.comp_types = try comp.toOwnedSlice(d.a);
-    d.supertypes = try supers.toOwnedSlice(d.a);
-    d.type_finals = try finals.toOwnedSlice(d.a);
+    d.comp_types = try t.comp.toOwnedSlice(d.a);
+    d.supertypes = try t.supers.toOwnedSlice(d.a);
+    d.type_finals = try t.finals.toOwnedSlice(d.a);
+    d.descriptors = try t.descriptors.toOwnedSlice(d.a);
+    d.describes = try t.describes.toOwnedSlice(d.a);
     d.rec_start = try rec_start.toOwnedSlice(d.a);
     d.rec_len = try rec_len.toOwnedSlice(d.a);
     try checkTypeRefScope(d.comp_types, d.rec_start, d.rec_len);
-    d.canon = try canonicalizeTypes(d.a, d.comp_types, d.supertypes, d.type_finals, d.rec_start, d.rec_len);
+    d.canon = try canonicalizeTypes(d.a, d);
 }
+
+/// The parallel per-type-index arrays the type section accumulates. Grouped
+/// into one struct so `decodeSubType` keeps a two-argument shape as the
+/// custom-descriptors clauses add arrays to it.
+const TypeLists = struct {
+    comp: std.ArrayList(CompType) = .empty,
+    supers: std.ArrayList(?u32) = .empty,
+    finals: std.ArrayList(bool) = .empty,
+    descriptors: std.ArrayList(?u32) = .empty,
+    describes: std.ArrayList(?u32) = .empty,
+};
 
 /// Reject a `(ref $t)` that points FORWARD, past the end of its own rec group
 /// (§3.1.1: a type may only refer to types declared before it or inside its own
@@ -1122,14 +1161,12 @@ fn checkValTypeScope(v: types.ValType, limit: u32) Error!void {
 /// Groups are processed in index order, so an external reference always points
 /// at a group whose canonical id is already known (a type index may only refer
 /// backwards, or inside its own group).
-fn canonicalizeTypes(
-    a: std.mem.Allocator,
-    comp_types: []const CompType,
-    supertypes: []const ?u32,
-    finals: []const bool,
-    rec_start: []const u32,
-    rec_len: []const u32,
-) Error![]const u32 {
+fn canonicalizeTypes(a: std.mem.Allocator, d: *const Decoder) Error![]const u32 {
+    const comp_types = d.comp_types;
+    const supertypes = d.supertypes;
+    const finals = d.type_finals;
+    const rec_start = d.rec_start;
+    const rec_len = d.rec_len;
     const canon = try a.alloc(u32, comp_types.len);
     var interned: std.StringHashMapUnmanaged(u32) = .{};
     defer interned.deinit(a);
@@ -1151,6 +1188,17 @@ fn canonicalizeTypes(
                 try key.append(a, 1);
                 try writeTypeRef(a, &key, s, start, len, canon);
             } else try key.append(a, 0);
+            // 🔒 The descriptor links belong in the KEY. Leaving them out lets two
+            // structurally identical groups that describe different things intern
+            // together, so a `ref.cast` to one succeeds on a value of the other —
+            // a wrong answer no failing assertion would show, because both
+            // modules are individually valid.
+            for ([_]?u32{ d.descriptors[t], d.describes[t] }) |maybe_link| {
+                if (maybe_link) |l| {
+                    try key.append(a, 1);
+                    try writeTypeRef(a, &key, l, start, len, canon);
+                } else try key.append(a, 0);
+            }
             try writeCompType(a, &key, comp_types[t], start, len, canon);
         }
 
@@ -1231,7 +1279,8 @@ fn writeCompType(a: std.mem.Allocator, out: *std.ArrayList(u8), c: CompType, sta
 
 /// Decode one sub type: an optional `0x50`/`0x4f` (non-final / final) wrapper
 /// carrying a supertype list (GC MVP: at most one), then a composite type.
-fn decodeSubType(d: *Decoder, r: *Reader, comp: *std.ArrayList(CompType), supers: *std.ArrayList(?u32), finals: *std.ArrayList(bool)) Error!void {
+fn decodeSubType(d: *Decoder, r: *Reader, t: *TypeLists) Error!void {
+    const comp = &t.comp;
     var super: ?u32 = null;
     // FINAL unless an explicit `0x50` says otherwise: a bare composite type is
     // shorthand for `sub final`, and `0x4f` is the spelled-out form. Only `0x50`
@@ -1256,9 +1305,33 @@ fn decodeSubType(d: *Decoder, r: *Reader, comp: *std.ArrayList(CompType), supers
             if (super.? >= comp.items.len) return error.BadType;
         }
     }
+    // custom-descriptors: `0x4c <typeidx>` (describes) then `0x4d <typeidx>`
+    // (descriptor), at most one each and in THAT order — both sit between the
+    // sub-type wrapper and the composite type.
+    //
+    // ⚠️ Order and multiplicity are enforced by CONSTRUCTION, not by a counter:
+    // whatever byte survives here has to be a composite-type tag, so a repeated
+    // clause or a `0x4d` written before a `0x4c` falls through to
+    // `decodeCompType` and is refused there. That is exactly the shape
+    // `binary-descriptors.wast` asserts ("malformed definition type"), and it
+    // cannot drift out of step with the accepting path the way a second,
+    // hand-written rejection table could.
+    var describes: ?u32 = null;
+    var descriptor: ?u32 = null;
+    if (try r.peekByte() == 0x4c) {
+        _ = try r.readByte();
+        describes = try r.readVarU32();
+    }
+    if (try r.peekByte() == 0x4d) {
+        _ = try r.readByte();
+        descriptor = try r.readVarU32();
+    }
+
     try comp.append(d.a, try decodeCompType(d, r));
-    try supers.append(d.a, super);
-    try finals.append(d.a, final);
+    try t.supers.append(d.a, super);
+    try t.finals.append(d.a, final);
+    try t.describes.append(d.a, describes);
+    try t.descriptors.append(d.a, descriptor);
 }
 
 /// Decode a composite type: `0x60` func / `0x5f` struct / `0x5e` array.
@@ -1309,6 +1382,17 @@ fn scanSubType(a: std.mem.Allocator, r: *Reader, kinds: *std.ArrayList(CompKind)
         _ = try r.readByte();
         var ns = try r.readVarU32();
         while (ns > 0) : (ns -= 1) _ = try r.readVarU32(); // supertype indices
+    }
+    // The custom-descriptors clauses, skipped in the same order `decodeSubType`
+    // reads them — this pass only needs to land on the composite-type tag, and
+    // the real decode is what rejects a malformed clause sequence.
+    if (try r.peekByte() == 0x4c) {
+        _ = try r.readByte();
+        _ = try r.readVarU32();
+    }
+    if (try r.peekByte() == 0x4d) {
+        _ = try r.readByte();
+        _ = try r.readVarU32();
     }
     switch (try r.readByte()) {
         0x60 => {

@@ -193,7 +193,7 @@ CLOSED, AND SO IS EVERYTHING AFTER IT.** R1–R5, R7, R9 and R10 are done, R6 wa
 by R5, the singleton batch took the remainder, and the bottom-type lattice took the last of it —
 corpus is **104 failures / 62,889 passing / 951 skipped** (measured 2026-08-14).
 
-🏁 **EVERY CORE SPEC FILE IS AT ZERO FAILURES.** Corpus **53 failures / 63,344 passing / 515 skipped** (2026-08-17 end of day), and the baseline gate reports **0 regressions**. **LIVE SPLIT: ALL 81 are non-defects; deliberate deviations are ZERO** — every one is custom-descriptors, i.e. Track D — TRACK P IS DONE (custom-page-sizes implemented 2026-08-17: 4 files, 0 failed, 0 skipped). The 8 era-pinned `proposals/threads` assertions CLOSED via F3+F4, and the skip total fell 965 → 673 via the skip-scoring split; both same day. *(Superseded: 89 failures / 62,890 passing / 965 skipped.)* ⚠️ **14 of the previously-reported 104 were a SCORING BUG** — a bare `(module …)` build failure never consulted `isOurLimitation`, so our own gaps were counted as defects here while scoring as skips everywhere else. `delegate` was one of them, never a deviation; `anyfunc`, the last real one, was closed 2026-08-17. *(Superseded:)* 90 failures / 62,889 passing; 89 non-defects + ONE deliberate deviation; LIVE SPLIT: 102 by design + 2 recorded deliberate
+🏁 **EVERY CORE SPEC FILE IS AT ZERO FAILURES.** Corpus **16 failures / 63,315 passing / 578 skipped** (2026-08-17 end of day), and the baseline gate reports **0 regressions**. **LIVE SPLIT: ALL 16 are non-defects; deliberate deviations are ZERO** — every one is custom-descriptors, i.e. Track D, whose TYPE-SECTION half now ships (D1 + D2) leaving only the instructions — TRACK P IS DONE (custom-page-sizes implemented 2026-08-17: 4 files, 0 failed, 0 skipped). ⚠️ D2 dropped the pass and grand-total columns for correct reasons; see testing.md before reading that as a regression. *(Superseded: 53 failures / 63,344 passing / 515 skipped.)* The 8 era-pinned `proposals/threads` assertions CLOSED via F3+F4, and the skip total fell 965 → 673 via the skip-scoring split; both same day. *(Superseded: 89 failures / 62,890 passing / 965 skipped.)* ⚠️ **14 of the previously-reported 104 were a SCORING BUG** — a bare `(module …)` build failure never consulted `isOurLimitation`, so our own gaps were counted as defects here while scoring as skips everywhere else. `delegate` was one of them, never a deviation; `anyfunc`, the last real one, was closed 2026-08-17. *(Superseded:)* 90 failures / 62,889 passing; 89 non-defects + ONE deliberate deviation; LIVE SPLIT: 102 by design + 2 recorded deliberate
 deviations** — `anyfunc` (`obsolete-keywords.wast`, the pre-standard spelling of `funcref`, kept
 because two real `.wat` inputs use it) and `delegate` (`legacy/try_delegate.wast`, refused loudly
 because no oracle exists to route it). **There are no undiagnosed failures left**, which changes what
@@ -1365,7 +1365,57 @@ EXACT. It extends GC, which wazmrt ships — an extension of a shipped proposal,
   substitution). **Every cast arm needs a targeted WRONG-ANSWER test, not an assertion count** — the
   cross-instance defect passed the whole corpus before it was found by construction, not by score.
   Carries `exact.wast` (17), `exact-func-import` (5), `exact-casts` (3), `array_new_exact` (1).
-- 🎯 **D2 — NEXT, and the reconnaissance is DONE (2026-08-17). Start here.**
+- ✅ **D2 — DONE 2026-08-17.** `(descriptor $d)` / `(describes $s)` in text and binary, their
+  validation rules, and the links folded into **all three** type-identity keys. Closed
+  **37 failures**: `descriptors.wast` 21 → 0, `binary-descriptors.wast` 2 → 0, and 14 more across
+  the four instruction files that had been mis-assembling.
+  **Grammar, confirmed against wasmtime 47.0.3 (see below):** `0x4c <typeidx>` = describes,
+  `0x4d <typeidx>` = descriptor, **describes FIRST**, both after the `0x50`/`0x4f` wrapper and its
+  supertype vector. The reconnaissance below had the two bytes right and **the ORDER backwards** —
+  `binary-descriptors.wast`'s third module is a `4c 00 4d 02` chain and its fourth asserts
+  `4d … 4c …` malformed. Order and multiplicity are enforced **by construction**: at most one of
+  each is read, so a repeat or a swap leaves a byte where the composite tag must be and
+  `decodeCompType` refuses it. No second grammar table to drift.
+  **Validation:** `checkDescriptorLinks` (same rec group, mutual, both structs, `describes` points
+  strictly BACKWARDS) + `descriptorsMatch` in `declaredSubtypeOk`. ⚠️ **The subtyping rule is
+  ASYMMETRIC and that is the whole of it** — `descriptor` is one-directional (a super with one
+  forces one on every sub, a super without one imposes nothing), `describes` is biconditional.
+  🔒 **Three keys, not one.** The reconnaissance named `interp.groupKey`; there are **three**
+  places type identity is decided and all three had the trap — `Module.canonicalizeTypes`
+  (module-local), `interp.groupKey` (store-wide), `typematch.eqMember` (cross-module, i.e. what an
+  IMPORT goes through). Each has a by-construction test with a control arm proving the key still
+  interns equal things equal. *A checklist that names one site is a checklist for one site.*
+  🎓 **Two lessons worth carrying into D3:**
+  **(1) The three totals moved 63,344/53/515 → 63,315/16/578 — passes DOWN 29, total DOWN 3.**
+  The lost passes were FALSE: those modules assembled with the descriptor clause silently dropped,
+  so their assertions ran against a module the file did not write. Now they assemble correctly and
+  are refused at the D3/D4 instruction they use → skips. **And the total is not conserved**, which
+  is new: a module that fails to build contributes ONE failure, one that builds contributes
+  nothing, so three modules that started building took three countable assertions out of the corpus.
+  Expect this again at D3.
+  **(2) An independent oracle exists for the ENCODING even though no local runtime implements the
+  proposal.** `wasmtime 47.0.3` fed our exact bytes answers *"custom descriptors proposal must be
+  enabled to use descriptor and describes (at offset 0xb)"* — it parsed the form, named it, and
+  pointed at the right byte. That is the emit-invalid lesson satisfied by something other than our
+  own decoder. Use it for D3/D4's encodings too.
+  🐛 **Found while doing D2, fixed here:** `(type $a (struct) <anything>)` silently DROPPED
+  everything after the composite type — the parser took the element at that position and ignored
+  the rest, so `(type $a (struct) (descriptor $b))` would have assembled as a bare struct with the
+  descriptor gone. Same silent-drop shape as the `(func (parm i32))` bug the field parsers already
+  guard, one level up.
+  🔒 **Also added, out of D2's stated scope and deliberately:** `struct.new`/`struct.new_default`
+  now REFUSE a type that declares a descriptor. `struct.new_desc` is D3, so nothing can build one
+  of these values yet — which is exactly why the plain forms must refuse rather than mint a value
+  whose own type promises a description it does not carry. Half a feature is where the unsoundness
+  lives; 2 of `struct_new_desc.wast`'s assertions fell out of it.
+  ⚠️ **Inversion results, and one of them is a trap for a later reader:** 16 arms caught
+  individually. The rec-group check and the struct check in `checkDescriptorLinks` each report
+  **NOT CAUGHT alone and caught as a PAIR** — they mirror each other, and once one is deleted the
+  mutual-link check routes the case to the other half. They are not dead code; the doc comment
+  there says so. Two inversions also failed to COMPILE first (an unused capture, an unused local
+  `fn`) — the `best-practices` rule about reading a build failure before reading silence, twice.
+  *(Original reconnaissance below, kept because its one wrong call is the instructive part.)*
+- **D2 — the reconnaissance (2026-08-17), superseded by the entry above.**
   **Binary grammar, read off `binary-descriptors.wast`:** `0x4d <typeidx>` = descriptor,
   `0x4c <typeidx>` = describes. Both sit **between** the optional `0x50`/`0x4f` sub-type wrapper
   and the composite type — e.g. `4d 01 5f 00`. A repeated clause is malformed; that file asserts
@@ -1388,10 +1438,21 @@ EXACT. It extends GC, which wazmrt ships — an extension of a shipped proposal,
   cross-module wrong answer of exactly the kind the store-wide `TypeRegistry` was built to fix.
   `TypeRegistry.groupKey` / `appendField` change here. Carries `descriptors.wast` (21),
   `binary-descriptors` (2).
-- **D3 — allocation and descriptor read: `struct.new_desc` (8), `ref.get_desc` (7).**
+- 🎯 **D3 — NEXT. Allocation and descriptor read: `struct.new_desc` (8), `ref.get_desc` (7).**
   ⚠️ **The descriptor a value carries must name an ENTITY, not a type index** — R2's model applies
   directly, and cross-instance `ref.get_desc` must resolve through the store. This is the third time
   that lesson would apply; if it is missed again it will be the same bug a third time.
+  **What D2 leaves ready:** `Module.descriptorOf(ti)` / `describesOf(ti)` answer the type question,
+  the links are already in all three identity keys, and validation guarantees a described type is a
+  struct paired mutually with a struct in its own rec group — so D3 may assume a well-formed pair
+  and need only carry the VALUE. The `struct.new`/`struct.new_default` refusal added in D2 is the
+  guard to RELAX (not delete) when `struct.new_desc` lands.
+  **Remaining failures it should close**, from the live baseline: `struct_new_desc.wast` 5 (three
+  are `assert_trap` reaching `UnsupportedInstr`, two are module builds), `ref_get_desc.wast` 2, and
+  it unblocks most of the 578-skip pool — `br_on_cast_desc_eq`/`_fail` are 122 skips each and
+  `ref_cast_desc_eq` 109, all currently at ZERO failures because the modules do not build.
+  ⚠️ **Rank D3/D4 by those skips, not by the 16 failures.** That is the fourth restatement of the
+  R3/R5/P lesson and D2 is the fifth instance: its 23 nominal assertions moved 63 skips.
 - **D4 — the descriptor casts:** `br_on_cast_desc_eq` (5), `br_on_cast_desc_eq_fail` (5),
   `ref_cast_desc_eq` (3), `br_on_cast` (1), `br_on_cast_fail` (1).
 - **D5 — `array.new_exact`** (1).

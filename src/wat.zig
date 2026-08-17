@@ -255,12 +255,8 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // not just by number — the form binaryen/wat-tools and hand-written GC .wat
     // actually emit.
     var gc_field_names: List([]const ?[]const u8) = .empty;
-    // Declared supertype (`(sub $super …)`) of each named type, or null; resolved
-    // against `type_names` at type-section emission.
-    var gc_supers: List(?Sexpr) = .empty;
-    // Whether each named GC type is FINAL (closed to extension) — true unless
-    // the source wrote `sub` without `final`. Index-aligned with `gc_supers`.
-    var gc_finals: List(bool) = .empty;
+    // The `(sub …)` / custom-descriptors decoration of each named type.
+    var deco: TypeDecoration = .{};
     var globals: List(GlobalDef) = .empty;
     var global_imports: List(ImportedGlobal) = .empty;
     var table_imports: List(ImportedTable) = .empty;
@@ -331,14 +327,15 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     }
     // Pre-pass B: parse the bodies now that all type names resolve.
     for (type_forms.items) |form|
-        try parseTypeBody(a, form, type_names.items, &sigs, &gc_types, &gc_field_names, &gc_supers, &gc_finals);
+        try parseTypeBody(a, form, type_names.items, &sigs, &gc_types, &gc_field_names, &deco);
     // An inline function type stands for `(rec (type (func …)))` — a singleton,
     // final, no supertype — so it may only be identified with a declared type of
     // exactly that shape (§6.6.12). Everything else is a different type however
     // well its params and results line up.
     for (type_group_size.items, 0..) |n, ti| {
         if (ti >= sigs.items.len) break;
-        sigs.items[ti].implicit_reusable = n == 1 and gc_finals.items[ti] and gc_supers.items[ti] == null;
+        sigs.items[ti].implicit_reusable = n == 1 and deco.finals.items[ti] and
+            deco.supers.items[ti] == null and deco.undecorated(ti);
     }
 
     // Pass 1: collect the remaining definitions. Imports (top-level or inline)
@@ -816,8 +813,8 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             // = non-final, `0x4f` = final). A bare composite type is `sub final`
             // by definition, so only a `final`-with-supertype declaration needs
             // the explicit `0x4f`.
-            const is_final = ti >= gc_finals.items.len or gc_finals.items[ti];
-            const super: ?Sexpr = if (ti < gc_supers.items.len) gc_supers.items[ti] else null;
+            const is_final = ti >= deco.finals.items.len or deco.finals.items[ti];
+            const super: ?Sexpr = if (ti < deco.supers.items.len) deco.supers.items[ti] else null;
             if (!is_final or super != null) {
                 try s.append(a, if (is_final) 0x4f else 0x50);
                 if (super) |sr| {
@@ -825,6 +822,20 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                     try uleb(a, &s, try resolveType(type_names.items, sr));
                 } else try uleb(a, &s, 0);
             }
+            // custom-descriptors: `describes` (0x4c) before `descriptor` (0x4d),
+            // both after the sub wrapper and before the composite type. The
+            // order is the binary grammar's, and it is the reverse of nothing —
+            // `binary-descriptors.wast` asserts a `0x4d` written first is
+            // malformed, so emitting them the other way round would produce
+            // modules our own decoder is required to reject.
+            if (ti < deco.describes.items.len) if (deco.describes.items[ti]) |dr| {
+                try s.append(a, 0x4c);
+                try uleb(a, &s, try resolveType(type_names.items, dr));
+            };
+            if (ti < deco.descriptors.items.len) if (deco.descriptors.items[ti]) |dr| {
+                try s.append(a, 0x4d);
+                try uleb(a, &s, try resolveType(type_names.items, dr));
+            };
             switch (def) {
                 .func => {
                     try s.append(a, 0x60);
@@ -1132,15 +1143,44 @@ fn typeDefName(items: []const Sexpr) ?[]const u8 {
 /// Parse a `(type $name? <comptype>)` body (`(func …)`/`(struct …)`/`(array …)`,
 /// optionally `(sub final? $super? <comptype>)`). Appends the func signature (to
 /// `sigs`) or the struct/array fields (to `gc_types`) plus the declared supertype
-/// (to `gc_supers`, resolved at emit) at the next type index — all index-aligned
+/// plus its `(sub …)`/descriptor decoration (to `deco`, resolved at emit —
+/// custom-descriptors clauses may name a later member of the same rec group,
+/// exactly as a supertype may) at the next type index — all index-aligned
 /// with `type_names` (already fully populated, so concrete `(ref $t)` resolves).
-fn parseTypeBody(a: std.mem.Allocator, items: []const Sexpr, type_names: []const ?[]const u8, sigs: *List(Sig), gc_types: *List(GcTypeDef), gc_field_names: *List([]const ?[]const u8), gc_supers: *List(?Sexpr), gc_finals: *List(bool)) Error!void {
+/// The `(sub …)` / custom-descriptors decoration of each declared type,
+/// index-aligned with `sigs`: what the type extends, whether it is closed to
+/// extension, and its descriptor links. Grouped into one struct because every
+/// member is filled by `parseTypeBody` and resolved together at emit — and
+/// because the alternative was a tenth positional parameter.
+const TypeDecoration = struct {
+    /// Declared supertype (`(sub $super …)`), or null; resolved against
+    /// `type_names` at type-section emission.
+    supers: List(?Sexpr) = .empty,
+    /// FINAL (closed to extension) — true unless the source wrote `sub` without
+    /// `final`.
+    finals: List(bool) = .empty,
+    /// `(descriptor $d)` and `(describes $s)`, unresolved for the same reason
+    /// `supers` is: a clause may name a type declared later in its rec group.
+    descriptors: List(?Sexpr) = .empty,
+    describes: List(?Sexpr) = .empty,
+
+    /// Does type `ti` carry NO descriptor link? (Out of range reads as none, so
+    /// callers spanning implicit types need no bounds check.)
+    fn undecorated(self: *const TypeDecoration, ti: usize) bool {
+        const d = ti < self.descriptors.items.len and self.descriptors.items[ti] != null;
+        const s = ti < self.describes.items.len and self.describes.items[ti] != null;
+        return !d and !s;
+    }
+};
+
+fn parseTypeBody(a: std.mem.Allocator, items: []const Sexpr, type_names: []const ?[]const u8, sigs: *List(Sig), gc_types: *List(GcTypeDef), gc_field_names: *List([]const ?[]const u8), deco: *TypeDecoration) Error!void {
     var i: usize = 1;
     if (i < items.len and isId(items[i])) i += 1; // skip $name (already collected)
-    var body = try wantList(try nth(items, i));
-    // Unwrap a `(sub final? $super? <comptype>)`: the inner comptype is the last
-    // element; a supertype id among the middle elements (skipping `final`) is
-    // captured so the type section can emit the sub form (GC MVP: ≤1 supertype).
+    var body = items[i..];
+    // Unwrap a `(sub final? $super? <clauses> <comptype>)`: the inner comptype is
+    // the last element; a supertype id among the middle elements (skipping
+    // `final`) is captured so the type section can emit the sub form (GC MVP:
+    // ≤1 supertype).
     //
     // ⚠️ FINALITY IS PART OF THE TYPE, not decoration. `(sub …)` without `final`
     // opens the type for extension; a bare `(func …)` / `(struct …)` / `(array
@@ -1149,19 +1189,44 @@ fn parseTypeBody(a: std.mem.Allocator, items: []const Sexpr, type_names: []const
     // final, and every later `(sub $e0 …)` then extended a closed type.
     var super_ref: ?Sexpr = null;
     var final = true;
-    if (body.len >= 2 and eqAtom(body[0], "sub")) {
+    const first = try wantList(try nth(items, i));
+    if (first.len >= 2 and eqAtom(first[0], "sub")) {
         final = false;
-        for (body[1 .. body.len - 1]) |part| {
-            if (eqAtom(part, "final")) {
+        var k: usize = 1;
+        while (k < first.len - 1 and first[k].asAtom() != null) : (k += 1) {
+            if (eqAtom(first[k], "final")) {
                 final = true;
                 continue;
             }
-            if (super_ref == null and (isId(part) or part.asAtom() != null)) super_ref = part;
+            if (super_ref == null) super_ref = first[k];
         }
-        body = body[body.len - 1].asList() orelse return error.BadModuleField;
+        body = first[k..];
     }
-    try gc_supers.append(a, super_ref);
-    try gc_finals.append(a, final);
+    // The custom-descriptors clauses, at most one each and `describes` FIRST.
+    // Parsing them positionally is what enforces both rules: a second clause or
+    // a `(descriptor …)` written before a `(describes …)` is still sitting where
+    // the composite type has to be, and the keyword check below refuses it.
+    // `descriptors.wast` asserts all three spellings malformed ("unexpected
+    // token"), and a separate seen-flags pass would be a second place for the
+    // grammar to live.
+    var describes_ref: ?Sexpr = null;
+    var descriptor_ref: ?Sexpr = null;
+    if (body.len >= 2 and std.mem.eql(u8, body[0].keyword() orelse "", "describes")) {
+        describes_ref = try nth(try wantList(body[0]), 1);
+        body = body[1..];
+    }
+    if (body.len >= 2 and std.mem.eql(u8, body[0].keyword() orelse "", "descriptor")) {
+        descriptor_ref = try nth(try wantList(body[0]), 1);
+        body = body[1..];
+    }
+    // Exactly one element may remain: the composite type. A trailing clause the
+    // loop above declined to eat lands here and is rejected.
+    if (body.len != 1) return error.BadModuleField;
+    try deco.supers.append(a, super_ref);
+    try deco.finals.append(a, final);
+    try deco.describes.append(a, describes_ref);
+    try deco.descriptors.append(a, descriptor_ref);
+    body = try wantList(body[0]);
 
     const kw = try wantAtom(try nth(body, 0));
     if (std.mem.eql(u8, kw, "func")) {
@@ -7262,4 +7327,250 @@ test "R9: an identifier may not be bound twice in one namespace" {
     // Distinct names in the same space, and the same name in DIFFERENT spaces,
     // both stay legal.
     _ = try assemble(a, "(module (func $a) (func $b) (global $a i32 (i32.const 0)) (memory $a 1))");
+}
+
+test "D2: `(descriptor $d)`/`(describes $s)` assemble to the BYTES the grammar says" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // ⚠️ **ASSERTS THE BYTES ON PURPOSE** (the emit-invalid lesson): our own decoder accepts what
+    // our assembler writes almost by construction, so a round trip is blind to emitting a form no
+    // other runtime would take. The one that matters here is CLAUSE ORDER — `binary-descriptors.wast`
+    // asserts a `0x4d` written before a `0x4c` is malformed, so getting it backwards would make us
+    // emit modules we are ourselves required to reject.
+    {
+        const bin = try assemble(a, "(module (rec (type $a (descriptor $b) (struct)) (type $b (describes $a) (struct))))");
+        // count=1, rec of 2, `4d 01` struct{}, `4c 00` struct{} — byte for byte the first module
+        // of binary-descriptors.wast.
+        try std.testing.expect(std.mem.indexOf(u8, bin, &[_]u8{
+            0x01, 0x4e, 0x02, 0x4d, 0x01, 0x5f, 0x00, 0x4c, 0x00, 0x5f, 0x00,
+        }) != null);
+    }
+    // A type carrying BOTH clauses writes `describes` first — the middle link of a three-type
+    // chain, and the exact case the "descriptor before describes" malformed assertion targets.
+    {
+        const bin = try assemble(a,
+            \\(module (rec
+            \\  (type $k (descriptor $l) (struct))
+            \\  (type $l (describes $k) (descriptor $m) (struct))
+            \\  (type $m (describes $l) (struct))))
+        );
+        try std.testing.expect(std.mem.indexOf(u8, bin, &[_]u8{ 0x4c, 0x00, 0x4d, 0x02, 0x5f, 0x00 }) != null);
+    }
+    // Inside a `(sub …)` the clauses follow the wrapper, not precede it.
+    {
+        const bin = try assemble(a, "(module (rec (type $c (sub (descriptor $d) (struct))) (type $d (sub (describes $c) (struct)))))");
+        try std.testing.expect(std.mem.indexOf(u8, bin, &[_]u8{ 0x50, 0x00, 0x4d, 0x01, 0x5f, 0x00 }) != null);
+        try std.testing.expect(std.mem.indexOf(u8, bin, &[_]u8{ 0x50, 0x00, 0x4c, 0x00, 0x5f, 0x00 }) != null);
+    }
+    // ...and with a supertype, after the supertype vector.
+    {
+        const bin = try assemble(a,
+            \\(module (rec
+            \\  (type $A (sub (descriptor $A.desc) (struct)))
+            \\  (type $A.desc (sub (describes $A) (struct)))
+            \\  (type $B (sub $A (descriptor $B.desc) (struct)))
+            \\  (type $B.desc (sub $A.desc (describes $B) (struct)))))
+        );
+        try std.testing.expect(std.mem.indexOf(u8, bin, &[_]u8{ 0x50, 0x01, 0x00, 0x4d, 0x03, 0x5f, 0x00 }) != null);
+        var m = try Module.decode(a, bin);
+        defer m.deinit();
+        try validate(a, &m);
+        try std.testing.expectEqual(@as(?u32, 1), m.descriptorOf(0));
+        try std.testing.expectEqual(@as(?u32, 0), m.describesOf(1));
+        try std.testing.expectEqual(@as(?u32, 3), m.descriptorOf(2));
+        try std.testing.expectEqual(@as(?u32, 2), m.describesOf(3));
+        // The clauses must not disturb what was already there.
+        try std.testing.expectEqual(@as(?u32, 0), m.supertypes[2]);
+        try std.testing.expect(!m.isFinal(2));
+    }
+}
+
+/// A minimal module carrying `body` as its type section — for asserting on the
+/// binary grammar directly, where the assembler cannot express the malformation.
+fn typeSectionModule(a: std.mem.Allocator, body: []const u8) ![]u8 {
+    var out: List(u8) = .empty;
+    try out.appendSlice(a, &.{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 });
+    try out.append(a, 1); // type section id
+    try uleb(a, &out, body.len);
+    try out.appendSlice(a, body);
+    return out.items;
+}
+
+test "D2: the clause GRAMMAR — at most one each, `describes` first, in text and in binary" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Text: all three spellings `descriptors.wast` calls malformed ("unexpected token"). They are
+    // refused by POSITION — after at most one of each clause the next element has to be the
+    // composite type — so there is no second copy of the grammar to drift out of step.
+    for ([_][]const u8{
+        "(module (rec (type $a (descriptor $b) (struct)) (type $b (descriptor $c) (describes $a) (struct)) (type $c (describes $b) (struct))))",
+        "(module (rec (type $a (descriptor $b) (descriptor $b) (struct)) (type $b (describes $a) (struct))))",
+        "(module (rec (type $a (descriptor $b) (struct)) (type $b (describes $a) (describes $a) (struct))))",
+    }) |src| try std.testing.expectError(error.BadModuleField, assemble(a, src));
+
+    // ...and nothing may follow the composite type either. `(type …)` is `id? deftype` (§6.6.4),
+    // and the parser used to take the element at that position and IGNORE the rest — the same
+    // silent-drop shape as the `(func (parm i32))` bug the struct/func arms below already guard,
+    // one level up. Without this, `(type $a (struct) (descriptor $b))` would assemble as a bare
+    // struct and the descriptor would simply vanish.
+    for ([_][]const u8{
+        "(module (type $a (struct) (struct)))",
+        "(module (rec (type $a (struct) (descriptor $b)) (type $b (describes $a) (struct))))",
+    }) |src| try std.testing.expectError(error.BadModuleField, assemble(a, src));
+
+    // Binary: the same three, hand-built. A repeated or out-of-order clause leaves a byte where a
+    // composite-type tag must be, and `decodeCompType` refuses it.
+    for ([_][]const u8{
+        &.{ 0x01, 0x4e, 0x02, 0x4d, 0x01, 0x4d, 0x01, 0x5f, 0x00, 0x4c, 0x00, 0x5f, 0x00 }, // descriptor twice
+        &.{ 0x01, 0x4e, 0x02, 0x4d, 0x01, 0x5f, 0x00, 0x4c, 0x00, 0x4c, 0x00, 0x5f, 0x00 }, // describes twice
+        &.{ 0x01, 0x4e, 0x03, 0x4d, 0x01, 0x5f, 0x00, 0x4d, 0x02, 0x4c, 0x00, 0x5f, 0x00, 0x4c, 0x01, 0x5f, 0x00 }, // 0x4d before 0x4c
+    }) |type_section| {
+        const bytes = try typeSectionModule(a, type_section);
+        try std.testing.expectError(error.BadType, Module.decode(a, bytes));
+    }
+    // The well-formed three-type chain from the same file must still decode — otherwise the three
+    // rejections above would prove only that we refuse the whole feature.
+    {
+        const bytes = try typeSectionModule(a, &.{
+            0x01, 0x4e, 0x03,
+            0x4d, 0x01, 0x5f, 0x00,
+            0x4c, 0x00, 0x4d, 0x02, 0x5f, 0x00,
+            0x4c, 0x01, 0x5f, 0x00,
+        });
+        var m = try Module.decode(a, bytes);
+        defer m.deinit();
+        try validate(a, &m);
+    }
+}
+
+test "D2 validation: a descriptor link must be a real, mutual, in-group pair of structs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Each arm of `checkDescriptorLinks`, one module apiece — the wording after `//` is the
+    // reference implementation's message for that case in `descriptors.wast`.
+    for ([_][]const u8{
+        "(module (type (descriptor 1) (struct)) (type (struct)))", // descriptor type is outside rec group
+        "(module (type (struct)) (type (describes 0) (struct)))", // described type is outside rec group
+        "(module (type (descriptor 1) (struct)) (type (describes 0) (struct)))", // ...even as an adjacent pair
+        "(module (rec (type (descriptor 1) (struct)) (type (struct))))", // type is not described by its descriptor
+        "(module (rec (type (struct)) (type (describes 0) (struct))))", // described type is not described by descriptor
+        "(module (rec (type (describes 1) (struct)) (type (descriptor 0) (struct))))", // forward use of described type
+        "(module (type (describes 0) (descriptor 0) (struct)))", // ...including describing itself
+        "(module (rec (type (descriptor 1) (func)) (type (describes 0) (struct))))", // descriptor type must be a struct
+        "(module (rec (type (descriptor 1) (struct)) (type (describes 0) (func))))", // described type must be a struct
+        "(module (rec (type (descriptor 1) (array i8)) (type (describes 0) (struct))))",
+        "(module (rec (type (descriptor 1) (struct)) (type (describes 0) (array i8))))",
+    }) |src| {
+        var m = try Module.decode(a, try assemble(a, src));
+        defer m.deinit();
+        try std.testing.expectError(error.InvalidDescriptor, validate(a, &m));
+    }
+}
+
+test "D2 validation: `descriptor` is one-directional in subtyping, `describes` is not" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // 🔒 The asymmetry IS the rule, so both directions are pinned. Reading either arm the wrong way
+    // lets a cast to a descriptor type succeed on a value whose description is a sibling rather
+    // than a subtype — D1's exactness hole in a different position.
+    const accepted = [_][]const u8{
+        // The canonical pair, and the same pair split across two rec groups.
+        \\(module (rec
+        \\  (type $A (sub (descriptor $A.desc) (struct)))
+        \\  (type $A.desc (sub (describes $A) (struct)))
+        \\  (type $B (sub $A (descriptor $B.desc) (struct)))
+        \\  (type $B.desc (sub $A.desc (describes $B) (struct)))))
+        ,
+        \\(module
+        \\  (rec (type $A (sub (descriptor $A.desc) (struct))) (type $A.desc (sub (describes $A) (struct))))
+        \\  (rec (type $B (sub $A (descriptor $B.desc) (struct))) (type $B.desc (sub $A.desc (describes $B) (struct)))))
+        ,
+        // A subtype MAY add a descriptor its supertype does not have — the arm that keeps the
+        // descriptor rule from collapsing into a blanket "both or neither".
+        \\(module (rec
+        \\  (type $A (sub (struct)))
+        \\  (type $B (sub $A (descriptor $B.desc) (struct)))
+        \\  (type $B.desc (sub (describes $B) (struct)))))
+        ,
+    };
+    for (accepted) |src| {
+        var m = try Module.decode(a, try assemble(a, src));
+        defer m.deinit();
+        try validate(a, &m);
+    }
+
+    const rejected = [_][]const u8{
+        // A supertype WITH a descriptor forces one on every subtype.
+        \\(module (rec
+        \\  (type $A (sub (descriptor $A.desc) (struct)))
+        \\  (type $A.desc (sub (describes $A) (struct)))
+        \\  (type $B (sub $A (struct)))))
+        ,
+        // ...and the subtype's descriptor must be a SUBTYPE of it, not merely present.
+        \\(module (rec
+        \\  (type $A (sub (descriptor $A.desc) (struct)))
+        \\  (type $A.desc (sub (describes $A) (struct)))
+        \\  (type $B (sub $A (descriptor $B.desc) (struct)))
+        \\  (type $B.desc (sub (describes $B) (struct)))))
+        ,
+        // `describes`, both ways round: a subtype that describes something needs a supertype that
+        // does...
+        \\(module (rec
+        \\  (type $A.desc (sub (struct)))
+        \\  (type $B (sub (descriptor $B.desc) (struct)))
+        \\  (type $B.desc (sub $A.desc (describes $B) (struct)))))
+        ,
+        // ...and a supertype that describes something needs a subtype that does.
+        \\(module (rec
+        \\  (type $A (sub (descriptor $A.desc) (struct)))
+        \\  (type $A.desc (sub (describes $A) (struct)))
+        \\  (type $B.desc (sub $A.desc (struct)))))
+        ,
+        // The described types must relate the same way their descriptors do.
+        \\(module (rec
+        \\  (type $A (sub (descriptor $A.desc) (struct)))
+        \\  (type $A.desc (sub (describes $A) (struct)))
+        \\  (type $B (sub (descriptor $B.desc) (struct)))
+        \\  (type $B.desc (sub $A.desc (describes $B) (struct)))))
+        ,
+    };
+    for (rejected) |src| {
+        var m = try Module.decode(a, try assemble(a, src));
+        defer m.deinit();
+        try std.testing.expectError(error.InvalidSubtype, validate(a, &m));
+    }
+}
+
+test "D2 soundness: a described type cannot be allocated without its descriptor" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // 🔒 `struct.new_desc` is Track D3, so there is no way to build one of these yet — which is
+    // precisely why the plain forms must refuse. A `struct.new $a` on a described `$a` would mint a
+    // value whose own type promises a description it does not carry.
+    for ([_][]const u8{ "struct.new", "struct.new_default" }) |mnemonic| {
+        const src = try std.fmt.allocPrint(a,
+            \\(module
+            \\  (rec (type $a (descriptor $b) (struct)) (type $b (describes $a) (struct)))
+            \\  (func (result anyref) ({s} $a)))
+        , .{mnemonic});
+        var m = try Module.decode(a, try assemble(a, src));
+        defer m.deinit();
+        try std.testing.expectError(error.InvalidDescriptor, validate(a, &m));
+    }
+    // The undescribed case is untouched — otherwise the two above would pass for the wrong reason.
+    {
+        var m = try Module.decode(a, try assemble(a, "(module (type $a (struct)) (func (result anyref) (struct.new $a)))"));
+        defer m.deinit();
+        try validate(a, &m);
+    }
 }

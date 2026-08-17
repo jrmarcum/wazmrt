@@ -9,25 +9,37 @@
 # way to make a red number green. Every entry below falls into one of three
 # groups, and NONE of them is a wazmrt defect:
 #
-#   1. UNTARGETED PROPOSALS (custom-descriptors, custom-page-sizes) — 81
-#      assertions. wazmrt does not implement these proposals, so their modules
-#      do not build. Not a defect, and NOT a pass either: banking our own gaps
-#      as passes is the green-washing `wast.zig`'s `isOurLimitation` comment was
+#   1. UNTARGETED PROPOSALS (custom-descriptors) — 16 assertions, down from 81.
+#      wazmrt does not implement the rest of this proposal, so those modules do
+#      not build. Not a defect, and NOT a pass either: banking our own gaps as
+#      passes is the green-washing `wast.zig`'s `isOurLimitation` comment was
 #      written after. They are refusals, recorded as such.
 #
-#      WHAT IS MISSING, concretely — the 81 are two proposals, not 81 things:
+#      WHAT IS MISSING, concretely — the 16 are three increments, not 16 things:
 #
-#      custom-descriptors — 79 assertions across 13 files. A descriptor is a
-#        runtime value describing a struct type, so casts can be EXACT (this
-#        type, not a subtype) and RTTs become first-class. Needs, in the type
-#        section: `(descriptor $d)` / `(describes $s)` on a struct type, and the
-#        `(exact $t)` reference-type former — which is the big one, since exact
-#        refs change SUBTYPING, not just parsing, and `refMatches` / `subtypeOf`
-#        / the `TypeRegistry` canonicaliser all have to learn that
-#        `(ref (exact $t))` is NOT satisfied by a subtype of `$t`. Instructions:
-#        `struct.new_desc`, `ref.get_desc`, `ref.cast_desc`, `br_on_cast_desc`,
-#        `br_on_cast_desc_fail`, `array.new_exact`. Depends on GC, which wazmrt
-#        has — this is an extension of a shipped proposal, not a new subsystem.
+#      custom-descriptors — the TYPE SECTION half is now DONE.
+#        ✅ D1 (2026-08-17): the `(exact $t)` reference-type former, with
+#          subtyping enforced.
+#        ✅ D2 (2026-08-17): `(descriptor $d)` / `(describes $s)` in text and
+#          binary (`0x4c`/`0x4d`, `describes` first), their validation rules, and
+#          the descriptor links folded into all three type-identity keys
+#          (`Module.canonicalizeTypes`, `interp.groupKey`, `typematch.eqMember`).
+#          `descriptors.wast` 21 failures -> 0, `binary-descriptors.wast` 2 -> 0.
+#        Still open: D3 `struct.new_desc` / `ref.get_desc`, D4 the descriptor
+#          casts (`br_on_cast_desc_eq`, `ref_cast_desc_eq`, …), D5
+#          `array.new_exact`. All are INSTRUCTIONS; the types they need exist.
+#
+#        ⚠️ **D2 traded 29 passes for 63 skips while closing 37 failures, and the
+#        passes it lost were FALSE ones.** Those modules previously assembled
+#        with the `(descriptor …)` clause silently DROPPED, so their assertions
+#        ran against a different module than the file wrote; now the modules are
+#        assembled correctly and refused at the D3/D4 instruction they use, which
+#        is a skip. Same shape as D1's 18 lost passes. **The three totals moved
+#        63,344/53/515 -> 63,315/16/578** — and the 3-assertion drop in the grand
+#        total is real and expected: a module that FAILS to build contributes one
+#        failure, and one that builds contributes nothing, so three modules that
+#        started building (2 in binary-descriptors, 1 in descriptors) took three
+#        countable assertions out of the corpus with them.
 #
 #      custom-page-sizes — ✅ IMPLEMENTED 2026-08-17, group entry removed. All
 #        four files are now 0 failed / 0 SKIPPED (61 assertions passing, up from
@@ -77,15 +89,10 @@
 # ⚠️ Adding a line here to make the build green is the failure mode this file
 # invites. A new entry needs a group above, or it is a defect being hidden.
 1 proposals\custom-descriptors\array_new_exact.wast
-2 proposals\custom-descriptors\binary-descriptors.wast
 1 proposals\custom-descriptors\br_on_cast.wast
-3 proposals\custom-descriptors\br_on_cast_desc_eq.wast
-3 proposals\custom-descriptors\br_on_cast_desc_eq_fail.wast
 1 proposals\custom-descriptors\br_on_cast_fail.wast
-21 proposals\custom-descriptors\descriptors.wast
 4 proposals\custom-descriptors\exact-func-import.wast
 2 proposals\custom-descriptors\exact.wast
-1 proposals\custom-descriptors\ref_cast_desc_eq.wast
-6 proposals\custom-descriptors\ref_get_desc.wast
-8 proposals\custom-descriptors\struct_new_desc.wast
+2 proposals\custom-descriptors\ref_get_desc.wast
+5 proposals\custom-descriptors\struct_new_desc.wast
 error annotations.wast

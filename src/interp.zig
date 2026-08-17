@@ -498,6 +498,18 @@ fn groupKey(
             try out.append(gpa, 1);
             try appendTypeRef(gpa, out, m.supertypes[i].?, start, len, assigned);
         } else try out.append(gpa, 0);
+        // 🔒 The custom-descriptors links are part of the type, so they are part
+        // of the KEY. Omitting them interns two groups that differ only in what
+        // describes what onto one store-wide id — and a store-wide id is what
+        // makes a value from instance A acceptable to instance B, so the miss
+        // would be a cross-instance wrong answer that no single module can see.
+        // Same trap as the supertype above, and the same fix.
+        for ([_]?u32{ m.descriptorOf(i), m.describesOf(i) }) |maybe_link| {
+            if (maybe_link) |l| {
+                try out.append(gpa, 1);
+                try appendTypeRef(gpa, out, l, start, len, assigned);
+            } else try out.append(gpa, 0);
+        }
         try out.append(gpa, @intFromEnum(c.kind()));
         switch (c) {
             .func => |f| {
@@ -6216,4 +6228,68 @@ test "SIMD: fNxM.min/max propagate NaN and match the scalar ops on signed zero" 
         defer std.testing.allocator.free(r);
         try std.testing.expectEqual(c.want, @as(u32, @bitCast(asI32(r[0]))));
     }
+}
+
+test "D2 soundness: descriptor links are part of the store-wide type KEY" {
+    // 🔒 **THE LOAD-BEARING D2 TEST, and it is written by CONSTRUCTION.** The trap here is the
+    // same shape as D1's dropped `0x62` prefix: a descriptor link missing from `groupKey` makes
+    // two structurally-identical-but-differently-described rec groups intern to ONE store-wide
+    // id, and a store-wide id is precisely what lets a value from instance A satisfy a `(ref $t)`
+    // in instance B. Every module involved stays individually valid, so no conformance assertion
+    // anywhere can see it — only writing the wrong answer down can.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const gpa = std.testing.allocator;
+
+    // Two rec groups of two empty structs. The ONLY difference is the descriptor pair:
+    //   described: `4e 02` `4d 01` `5f 00` `4c 00` `5f 00`
+    //   plain:     `4e 02`         `5f 00`         `5f 00`
+    const described = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x01, 0x4e, 0x02, 0x4d, 0x01, 0x5f, 0x00, 0x4c, 0x00, 0x5f, 0x00 } },
+    });
+    const plain = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{ 0x01, 0x4e, 0x02, 0x5f, 0x00, 0x5f, 0x00 } },
+    });
+
+    var m_desc = try Module.decode(a, described);
+    var m_plain = try Module.decode(a, plain);
+    // A second copy of the described group, byte-identical — the control arm. Without it this
+    // test would also pass against a `groupKey` that simply never reuses a key.
+    var m_desc2 = try Module.decode(a, described);
+
+    var reg: TypeRegistry = .{};
+    defer reg.deinit(gpa);
+    const ids_desc = try reg.internModule(gpa, a, &m_desc);
+    const ids_plain = try reg.internModule(gpa, a, &m_plain);
+    const ids_desc2 = try reg.internModule(gpa, a, &m_desc2);
+
+    // The wrong answer: same id ⇒ the two types are interchangeable store-wide.
+    try std.testing.expect(ids_desc[0] != ids_plain[0]);
+    try std.testing.expect(ids_desc[1] != ids_plain[1]);
+    // ...and interning is still interning: the same group twice is the same type.
+    try std.testing.expectEqualSlices(u32, ids_desc, ids_desc2);
+}
+
+test "D2: a descriptor link changes MODULE-LOCAL canonical identity too" {
+    // The same trap one layer down. `Module.canonicalizeTypes` interns rec groups within a single
+    // module, and it is what `valTypeEq`/`isSubtype` compare — so a link missing from ITS key
+    // makes `(ref $described)` and `(ref $plain)` the same type inside one module, before any
+    // store is involved.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const bytes = try ehModule(a, &.{
+        .{ .id = 1, .body = &.{
+            0x02, // two rec groups
+            0x4e, 0x02, 0x4d, 0x01, 0x5f, 0x00, 0x4c, 0x00, 0x5f, 0x00, // types 0,1: described pair
+            0x4e, 0x02, 0x5f, 0x00, 0x5f, 0x00, // types 2,3: the same shape, undescribed
+        } },
+    });
+    var m = try Module.decode(a, bytes);
+    try std.testing.expect(m.canonOf(0) != m.canonOf(2));
+    try std.testing.expect(m.canonOf(1) != m.canonOf(3));
+    // Nominal subtyping must not quietly relate them either — neither declares the other.
+    try std.testing.expect(!m.isSubtype(0, 2) and !m.isSubtype(2, 0));
 }

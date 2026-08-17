@@ -127,6 +127,18 @@ pub const Ctx = struct {
         if ((supa == null) != (supb == null)) return false;
         if (supa) |x| if (!try self.eqRef(ma, sa, len, x, mb, sb, supb.?)) return false;
 
+        // custom-descriptors links, compared exactly like the supertype above:
+        // a type that carries a description and one that does not are different
+        // types, so an import whose declared type omits the clause must not
+        // match an export that has it — the cross-module face of the same rule
+        // `interp.groupKey` enforces inside a store.
+        const desc_a = [_]?u32{ ma.descriptorOf(ta), ma.describesOf(ta) };
+        const desc_b = [_]?u32{ mb.descriptorOf(tb), mb.describesOf(tb) };
+        for (desc_a, desc_b) |x, y| {
+            if ((x == null) != (y == null)) return false;
+            if (x) |xi| if (!try self.eqRef(ma, sa, len, xi, mb, sb, y.?)) return false;
+        }
+
         if (ta >= ma.comp_types.len or tb >= mb.comp_types.len) return false;
         return self.eqComp(ma, sa, len, ma.comp_types[ta], mb, sb, mb.comp_types[tb]);
     }
@@ -388,4 +400,30 @@ test "mutable global content is invariant across modules" {
         &mb,
         .{ .content = required, .mutable = true },
     ));
+}
+
+test "D2: a descriptor link is part of the type ACROSS modules" {
+    const a = testing.allocator;
+    // 🔒 The cross-module face of the `groupKey` trap. This is the comparison an IMPORT goes
+    // through, so answering "same type" here lets a module import a described `(ref $t)` and be
+    // linked against an export that carries no description at all — the value arrives promising a
+    // descriptor it does not have, and D3's `ref.get_desc` would read a field nothing ever wrote.
+    var described = try buildModule(a, "(module (rec (type $a (descriptor $b) (struct)) (type $b (describes $a) (struct))))");
+    defer described.deinit();
+    var plain = try buildModule(a, "(module (rec (type $a (struct)) (type $b (struct))))");
+    defer plain.deinit();
+    // Same shape, same links, different module — this pair MUST still match, or the check above
+    // would be passing because descriptors simply never compare equal.
+    var described2 = try buildModule(a, "(module (rec (type $x (descriptor $y) (struct)) (type $y (describes $x) (struct))))");
+    defer described2.deinit();
+
+    var ctx: Ctx = .init(a);
+    defer ctx.deinit();
+    try testing.expect(!try ctx.typeEq(&described, 0, &plain, 0));
+    try testing.expect(!try ctx.typeEq(&described, 1, &plain, 1));
+    try testing.expect(try ctx.typeEq(&described, 0, &described2, 0));
+    try testing.expect(try ctx.typeEq(&described, 1, &described2, 1));
+    // Nor does the structural walk quietly make one a SUBTYPE of the other.
+    try testing.expect(!try ctx.typeSub(&described, 0, &plain, 0));
+    try testing.expect(!try ctx.typeSub(&plain, 0, &described, 0));
 }

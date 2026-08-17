@@ -482,6 +482,29 @@
 # see it** — the files involved were already failing for other reasons — so an assertion count
 # would have called D1 done with live type confusion in it.
 
-wazmrt.exe  970752
-wazmrt.lib  1034976
-wazmrt.dll  892416
+# RAISED 2026-08-17 (TRACK D2 — `(descriptor $d)` / `(describes $s)`). Reference configuration.
+#
+#   artifact       before         after       share
+#   wazmrt.exe    970,752       972,800     +2,048
+#   wazmrt.lib  1,034,976     1,037,954     +2,978
+#   wazmrt.dll    892,416       894,976     +2,560
+#
+# 2,978 bytes (unpadded lib) for D2: two `?u32` arrays on `Module`, the `0x4c`/`0x4d` clauses in
+# `decodeSubType` and the kind pre-scan, the text clauses in `parseTypeBody` and their emitters,
+# `checkDescriptorLinks` + `descriptorsMatch` in the validator, and the links folded into all
+# three type-identity keys (`canonicalizeTypes`, `interp.groupKey`, `typematch.eqMember`).
+#
+# Closed 37 failures: `descriptors.wast` 21 -> 0, `binary-descriptors.wast` 2 -> 0, plus 14 across
+# the four instruction files that stopped mis-assembling. Corpus 63,344 -> 63,315 passed,
+# 53 -> 16 failed, 515 -> 578 skipped, 0 regressions. ⚠️ **The pass and total columns moved DOWN
+# and that is the correct outcome** — see the baseline header for why (false passes from modules
+# assembled with the descriptor clause dropped).
+#
+# 🔒 The load-bearing test here is not an assertion count either: descriptor links absent from a
+# type-identity key make two structurally-identical-but-differently-described groups intern
+# together, which no individually-valid module can expose. Written by construction in
+# `interp.zig`'s "descriptor links are part of the store-wide type KEY".
+
+wazmrt.exe  972800
+wazmrt.lib  1037954
+wazmrt.dll  894976
