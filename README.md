@@ -80,7 +80,8 @@ zig build ffi-demo                 # build the DLL + run examples/deno_ffi_capi.
 zig build size -Doptimize=ReleaseSmall   # fail if a shipped artifact grew past its ceiling
 zig build features                 # compile the C ABI in all four -Dwat/-Dwasi combinations
 zig build bench                    # interpreter microbenchmark (ReleaseFast)
-zig build bakeoff -Dcorpus=<dir>   # benchmark vs wasmtime/wasmer on a real corpus (needs deno)
+zig build bakeoff -Dcorpus=<dir>   # benchmark vs wasmtime/wasmer/wazero end-to-end (needs deno)
+zig build phases  -Dmodules=<a,b> # engine pipeline only, process spawn excluded
 ```
 
 ### Startup
@@ -109,6 +110,13 @@ binary loads faster than a large one. The entire wasm pipeline on that 2 MB modu
 is under 3 ms. Both facts are real and the first is what you feel — but the honest
 phrasing is *"an invocation costs less, mostly because the binary is small"*, not
 *"the engine decodes faster"*.
+
+**With spawn excluded** (`zig build phases`), the engine pipeline — bytes to
+something runnable — is **20–55× faster** than wasmtime's: 0.72 ms vs 14.5–22.1 ms
+on that 1.97 MB module. The end-to-end table understates the engine difference by
+about 10×, because a ~30 ms process floor dwarfs a sub-millisecond quantity. The
+two produce different things, though — wasmtime emits native code and wins a hot
+loop; wazmrt produces an IR to interpret.
 
 It is also not steady-state throughput; a JIT wins hot loops. Every result is
 checked, and in `-Dmode=start` no runtime is treated as the oracle — they must

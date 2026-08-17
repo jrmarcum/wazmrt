@@ -316,6 +316,13 @@ a comment's subject read as a field name. **Each was cheap to check and expensiv
 When a claim will leave this repo — a commit message, a cross-project report, a number in a README —
 verify it against the artifact, not against something that talks about the artifact.
 
+**A BENCHMARK WHOSE FLOOR IS LARGER THAN ITS SIGNAL MEASURES THE FLOOR.** The end-to-end CLI harness
+put wazmrt 2.4× ahead of wasmtime. With process spawn excluded, the engines differ by **20–55×**. A
+~30 ms floor did not add noise to a sub-millisecond quantity — it *hid the entire effect*, and it
+also flattened a real size dependence into "nothing moves". **The same measurement can be right about
+what it measures and wrong about what you conclude from it.** Take the floor out before reading a
+difference as a property of the thing you care about. — Track 3, `roadmap.md`
+
 **MEASURE THE FLOOR BEFORE ATTRIBUTING A DIFFERENCE.** wazmrt beat wasmtime by ~50 ms end to end, and
 banking that as engine speed would have been natural. `--version` — no wasm work at all — costs
 30 ms vs 76 ms, so ~46 ms of the gap exists before either engine starts; the whole wasm pipeline on a

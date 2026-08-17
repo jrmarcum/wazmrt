@@ -209,6 +209,28 @@ pub fn build(b: *std.Build) void {
         if (b.args) |args| run_bench.addArgs(args); // `zig build bench -- out.wasm` emits the module
         const bench_step = b.step("bench", "Run the interpreter microbenchmark (ReleaseFast)");
         bench_step.dependOn(&run_bench.step);
+
+        // ---- Engine-pipeline breakdown (`zig build phases -Dmodules=<a,b,c>`)
+        // Track 3's last item, and it lives HERE so it can hand the driver the
+        // bench BINARY. `bakeoff` times whole processes and ~90% of that is spawn
+        // on this platform, so it cannot say whether a runtime leads because its
+        // ENGINE is fast or because its BINARY is small. This separates them.
+        //
+        // ⚠️ Do NOT nest `zig build bench` from inside the driver: it contends for
+        // the build lock, and `std.debug.print` goes to STDERR, so a driver
+        // reading stdout silently sees nothing. Both cost a debugging round here.
+        {
+            const mods = b.option([]const u8, "modules", "Comma-separated .wasm paths for `zig build phases`") orelse "";
+            const ph = b.addSystemCommand(&.{ "deno", "run", "--allow-read", "--allow-run", "--allow-write" });
+            ph.addFileArg(b.path("tools/phases.mjs"));
+            ph.addArtifactArg(bench);
+            ph.addArg(b.pathJoin(&.{ b.cache_root.path orelse ".", "phases-scratch.cwasm" }));
+            var it = std.mem.splitScalar(u8, mods, ',');
+            while (it.next()) |m| if (m.len != 0) ph.addArg(m);
+            ph.has_side_effects = true; // a measurement; never a cached verdict
+            const ph_step = b.step("phases", "Engine pipeline: bytes->runnable, spawn excluded (needs deno + wasmtime)");
+            ph_step.dependOn(&ph.step);
+        }
     }
 
     // ---- Compiled-program conformance gate (`zig build wasi-gate`) ---------
@@ -365,6 +387,7 @@ pub fn build(b: *std.Build) void {
         const bake_step = b.step("bakeoff", "Benchmark wazmrt vs wasmtime/wasmer on a real corpus (needs deno; -Dcorpus=<dir>)");
         bake_step.dependOn(&bake.step);
     }
+
 
     // ---- Feature-gate build check (`zig build features`) -------------------
     // Compiles the C ABI in ALL FOUR `-Dwat`/`-Dwasi` combinations. A comptime

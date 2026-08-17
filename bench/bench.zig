@@ -146,6 +146,16 @@ fn benchHash(io: Io, a: std.mem.Allocator, path: []const u8) !void {
         if (val_ok) "" else " — VALIDATION FAILED, time is meaningless",
     });
     if (inst_ok) std.debug.print("  ==> hashing adds {d:.1}% to cold start\n", .{per_hash / (di_ns / fiters) * 100.0});
+
+    // Machine-readable line for `tools/phases.mjs`, which puts these beside a
+    // compiling runtime's pipeline. Microseconds, tab-separated, one per module.
+    std.debug.print("PHASES\t{s}\t{d}\t{d:.2}\t{d:.2}\t{d:.2}\n", .{
+        path,
+        bytes.len,
+        decode_ns / fiters / 1000.0,
+        dv_ns / fiters / 1000.0,
+        di_ns / fiters / 1000.0,
+    });
 }
 
 var stub_ctx: u8 = 0;

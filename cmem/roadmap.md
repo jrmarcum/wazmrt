@@ -952,7 +952,52 @@ starts.
 
 **This is exactly what the remaining Track 3 item is for.**
 
-### 📋 SCOPED, NOT STARTED — Track 3's last item: the in-process breakdown
+### ✅ TRACK 3 IS COMPLETE (2026-08-14) — the engine pipeline, spawn excluded: **20–55×**
+
+`zig build phases -Dmodules=<a,b,c>` (`tools/phases.mjs`). wazmrt measured **in-process** via the
+bench binary; wasmtime's `compile` measured with **its own spawn floor subtracted**, floor and work
+sampled alternately so drift hits both equally. Bytes → ready to execute, ms:
+
+| module | bytes | **wazmrt** | wt:winch | wt:O0 | wt:default | ratio |
+| --- | --- | --- | --- | --- | --- | --- |
+| string-formatting | 9,391 | **0.16** | 9.10 | 10.68 | 10.87 | **55×** |
+| fib-rs-opt | 44,838 | **0.49** | 11.83 | 18.75 | 19.63 | **24×** |
+| fib-rs-test | 1,968,591 | **0.72** | 14.54 | 21.68 | 22.06 | **20×** |
+
+wazmrt's own split (µs, in-process):
+
+| module | decode | validate | +instantiate |
+| --- | --- | --- | --- |
+| string-formatting | 6.52 | 158.11 | 217.63 |
+| fib-rs-opt | 5.74 | 487.09 | 760.37 |
+| fib-rs-test | **37.83** | **681.86** | 1110.74 |
+
+🎯 **THE END-TO-END BENCHMARK UNDERSTATED THE ENGINE DIFFERENCE BY ROUGHLY 10×.** The CLI said 2.4×;
+the engines differ by 20–55×. A ~30 ms spawn floor did not merely add noise — **it hid the entire
+effect**, because it dwarfed a quantity that is under 1 ms on our side. *A benchmark whose floor is
+larger than its signal measures the floor.*
+
+⚠️ **And it reverses the "nothing moves with size" finding, correctly.** The end-to-end ladder was
+flat and the fast-start configs looked identical to the default; at engine level they are not —
+winch is **34% faster than default** on the 1.97 MB module (14.54 vs 22.06), and every runtime scales
+with size. The flatness was the floor, not the engines. **The same measurement can be right about
+what it measures and wrong about what you conclude.**
+
+⚠️ **Decode is nearly free; VALIDATION is our bytes→ready cost.** 37.8 µs to decode 1.97 MB against
+681.9 µs to validate it — validation is ~95% of the pipeline. That is where any future startup work
+belongs, and it is not where anyone would have guessed from the name "decode → validate →
+instantiate".
+
+**What the ratio does and does not license.** The two sides produce different things: wasmtime emits
+native code, wazmrt a validated IR to interpret. The number says how fast each reaches something
+runnable, and it is only meaningful beside the trade — **wasmtime pays this once and wins in a hot
+loop**. wasmtime's figure also includes writing the `.cwasm`, so it over-states its compute a little.
+The tool prints both caveats under every table it produces, for the same reason the bake-off prints
+its scope.
+
+*(Superseded — the scope this was planned from:)*
+
+### 📋 the original plan — Track 3's last item: the in-process breakdown
 
 **The question it answers, which nothing else can:** of wazmrt's ~2.9 ms of wasm work on a 2 MB
 module, how much is decode, how much validate, how much instantiate — and how does each compare to
