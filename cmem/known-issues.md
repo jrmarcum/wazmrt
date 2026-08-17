@@ -1065,19 +1065,23 @@ Measured against the real `.wat` corpus at `wasmtk/tests` (**493 files**): assem
   strings, so no modern spelling collides, and a passive `(elem 0 $f)` is untouched. ⚠️ **The reason
   this had to be fixed rather than merely rejected: unrecognised, the data form did not fail — the
   index and the offset were both dropped and the segment assembled ACTIVE-in-source /
-  PASSIVE-in-binary.** Same family as `anyfunc` below: a pre-standard spelling with an exact modern
-  equivalent, kept for real inputs.
-- **`anyfunc`** (pre-standard spelling of `funcref`) accepted; assembles byte-identically.
-  ⚠️ **UPGRADED 2026-08-14 to a KNOWN, DELIBERATE spec deviation with a corpus assertion against
-  it.** `obsolete-keywords.wast` L40 (`(global $g anyfunc (ref.null func))`) asserts the module is
-  malformed, and wazmrt accepts it — the single R9 assertion left failing, and the only
-  accept-invalid remaining in any core spec file. It is kept because two real `.wat` inputs the
-  project actually runs use it (`ArtOfWebAssembly_tests/Chapter3/table_export.wat` and
-  `table_test.wat` in the wasmtk corpus), so removing it trades one conformance assertion for two
-  broken inputs. **Reversing this is an owner decision, not a conformance-pass side effect** — which
-  is why R9 left it failing and labelled rather than quietly "fixing" it. If the trade is ever
-  taken, the change is one entry in `stringToValType` plus `isRefType` in `wat.zig`, and the test
-  "anyfunc is accepted as the pre-standard spelling of funcref" has to be inverted with it.
+  PASSIVE-in-binary.** Unlike `anyfunc` below, no spec assertion contradicts this one, so the
+  legacy spelling is still accepted: a pre-standard form is only a deviation once the suite says so.
+- **`anyfunc` — CLOSED 2026-08-17. wazmrt now REFUSES it, and has zero deliberate spec
+  deviations.** It used to assemble byte-identically to `funcref`; `obsolete-keywords.wast` L40
+  (`(global $g anyfunc (ref.null func))`) asserts the module is malformed, which made this the last
+  accept-invalid in any core spec file. The owner took the trade. Refusal is `error.ObsoleteKeyword`
+  — a DEDICATED error, not `BadValType`, so the message can name `funcref`: the input is legacy, not
+  nonsense, and the compatibility hint survives even though the acceptance does not. Cost paid: the
+  two MVP-era inputs that motivated it (`ArtOfWebAssembly_tests/Chapter3/table_export.wat` and
+  `table_test.wat` in the wasmtk corpus) now need `funcref`; they sit in an optional corpus that no
+  `zig build` step gates, which is what made the trade cheap — **check whether a compatibility
+  affordance is actually load-bearing before pricing its removal.**
+  ⚠️ **`isRefType` still answers TRUE for `anyfunc`, deliberately.** Returning false routes
+  `(table 4 anyfunc)` down the func-index path, where `anyfunc` parses as a function NAME and fails
+  as `UnknownIdentifier` — which `wast.zig` banks as OUR limitation. The deviation would have come
+  back disguised as a SKIP and the baseline would have gone green for the wrong reason. **A rejection
+  has to be routed to the code that knows WHY, or it lands in the wrong bucket.**
 - **Legacy folded `try`/`catch` — assembler AND validator.** The interpreter has executed legacy
   (older-LLVM) EH since Phase 6.3, but the assembler had no text form for it (`(try (do …) (catch $t …)
   (catch_all …))` was `UnknownInstr`) and the VALIDATOR had no arms for `try_`/`catch_`/`catch_all`/

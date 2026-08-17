@@ -305,6 +305,26 @@
 # was still handed to embedders as the interpreter's RAW encoding while instances, funcs,
 # memories and globals had been checked handles since ABI 2.
 
+# RAISED 2026-08-17 (`anyfunc` REFUSED — the last deliberate spec deviation closed).
+#
+#   artifact       before        after      share
+#   wazmrt.exe    964,608      964,608         +0
+#   wazmrt.lib  1,029,720    1,029,730        +10
+#   wazmrt.dll    888,832      888,832         +0
+#
+# **+10 bytes, the smallest raise in this file's history**, and the honest figure: the static lib is
+# unpadded, while the exe and DLL absorbed the same 10 bytes inside PE alignment they already had
+# (the R7 entry documents this same three-way pattern from the other direction). Rebuilt in this
+# run, so the two zeros are alignment, not the stale-artifact trap.
+#
+# What bought them: `obsoleteValType` (one string compare) and the `ObsoleteKeyword` error name.
+# It REMOVED a `stringToValType` entry and added a rejection — which is why a conformance fix costs
+# ten bytes rather than a rule's worth. Same shape as R4: the cheapest changes alter what a token
+# MEANS rather than adding machinery.
+#
+# ⚠️ Measured on a COPY of the tree on C:, not in the repo on D: — that volume was throwing
+# event-51 paging errors and `zig build` could not run there at all. See `best-practices.md` §2.
+
 wazmrt.exe  964608
-wazmrt.lib  1029720
+wazmrt.lib  1029730
 wazmrt.dll  888832

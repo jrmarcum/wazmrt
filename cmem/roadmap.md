@@ -2005,6 +2005,28 @@ changing that code.
 
 ## Parking lot / open questions
 
+- **SCOPED, NOT TAKEN (2026-08-17): per-directory feature policy in the `.wast` runner** — the only
+  way to clear the last 8 baseline entries (`proposals/threads`, 6 in `imports.wast` + 2 in
+  `memory.wast`). Those files assert `(module (memory 0) (memory 0))` and
+  `(module (table 10 funcref) (table 10 funcref))` are INVALID, because that snapshot predates
+  multi-memory and multi-table. wazmrt implements both, so it accepts them — **the runtime is ahead
+  of the file**, and refusing them would be the regression. A spec proposal directory is meant to be
+  run with THAT PROPOSAL'S feature set, so the honest fix is to run `proposals/threads/` with
+  `multi_memory` and multi-table off.
+  ⚠️ **The blocker is that `features` is DESCRIPTIVE, not ENFORCING.** `validate()` takes
+  `(gpa, *const Module)` and no feature set; `features.zig`'s `require(fs, …)` walk only *computes*
+  which proposal a module needs, for `zig build features`. So the work is (a) thread a
+  `features.Set` through `validate` and its ~15 callers, (b) add enforcement arms — including a
+  multi-table rule, which has no `Feature` today (multiple tables arrived with `reference_types`,
+  but gating on that would also disable the `funcref` these files legitimately use, so it needs its
+  own flag), (c) a directory→feature-set table in `wast.zig`. **Not worth it for 8 assertions
+  alone** — but it is the correct mechanism the moment a second proposal directory is targeted, and
+  it would make `zig build features` and the validator share one source of truth.
+  ⚠️ **REJECTED cheap alternative:** special-casing "under `proposals/threads/`, refuse >1
+  memory/table" directly in the runner. ~15 lines, and it turns the number green — but it creates a
+  SECOND place where "what is enabled" is decided, which is the exact one-call-site divergence that
+  produced the 14 mis-scored failures found on 2026-08-14. **Don't fix a scoring problem by adding a
+  second scorer.**
 - Interpreter shape: **DECIDED 2026-07-02 — Option A** (switch over a pre-decoded IR); see
   `design-decisions.md`. Open sub-question: whether/when to add the Option B register-rewriting pass —
   decide empirically against size+speed once basic execution works and there's a benchmark.

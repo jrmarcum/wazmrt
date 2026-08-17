@@ -39,6 +39,11 @@ pub const Error = sexpr.Error || error{
     NotAModule,
     BadModuleField,
     BadValType,
+    /// A pre-standard spelling the spec renamed and now calls MALFORMED —
+    /// `anyfunc` for `funcref` (spec PR #1157). Distinct from `BadValType` so
+    /// the refusal can name the modern spelling instead of just "bad type":
+    /// the input is legacy, not nonsense, and the fix is one word.
+    ObsoleteKeyword,
     UnknownInstr,
     UnknownIdentifier,
     BadImmediate,
@@ -1314,7 +1319,12 @@ fn parseTable(a: std.mem.Allocator, items: []const Sexpr, tables: *List(TableDef
 /// True if the form is a reference type: `funcref` / `externref` / `(ref …)`.
 fn isRefType(s: Sexpr) bool {
     if (s.asList()) |l| return l.len >= 1 and eqAtom(l[0], "ref");
-    // `anyfunc` is the pre-standard spelling of `funcref`.
+    // `anyfunc` is REFUSED (`obsoleteValType`), but it still answers true here
+    // on purpose: saying false would route `(table 4 anyfunc)` down the
+    // func-index path, where `anyfunc` reads as a function NAME and fails as
+    // `UnknownIdentifier` — our own-limitation bucket, so a spec deviation
+    // would come back disguised as a skip. Claiming it IS a ref type sends it
+    // to `parseValType`, the one place that knows why it is rejected.
     if (eqAtom(s, "anyfunc")) return true;
     // Every abstract shorthand — `funcref`, `externref` and the GC heads
     // (`anyref`/`eqref`/`i31ref`/`structref`/`arrayref`/`null*ref`) — comes from
@@ -1680,7 +1690,17 @@ fn parseValType(s: Sexpr, type_names: []const ?[]const u8) Error!V {
         return error.BadValType;
     }
     const atom = s.asAtom() orelse return error.BadValType;
+    if (obsoleteValType(atom) != null) return error.ObsoleteKeyword;
     return stringToValType(atom) orelse error.BadValType;
+}
+
+/// Pre-standard value-type spellings the spec renamed. Recognised ONLY to
+/// refuse them by name — `obsolete-keywords.wast` asserts each is malformed,
+/// so mapping one onto its replacement is a conformance deviation, not a
+/// kindness. Returns the modern spelling for the error message.
+fn obsoleteValType(atom: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, atom, "anyfunc")) return "funcref";
+    return null;
 }
 
 /// A heap type → a reference value type. A concrete `$t` / numeric index → a
@@ -1744,9 +1764,9 @@ fn stringToValType(atom: []const u8) ?V {
         .{ "i32", V.i32 },             .{ "i64", V.i64 },             .{ "f32", V.f32 },
         .{ "f64", V.f64 },             .{ "v128", V.v128 },
         .{ "funcref", V.funcref },
-        // `anyfunc` is the pre-standard spelling of `funcref` (MVP-era tools and
-        // hand-written .wat still emit it, e.g. `(table N anyfunc)`).
-        .{ "anyfunc", V.funcref },
+        // NO `anyfunc` alias here — see `obsoleteValType`. It mapped to
+        // `V.funcref` until the baseline audit showed it was the last place
+        // wazmrt was knowingly wrong by the spec.
         .{ "externref", V.externref },
         // The WasmGC `any` hierarchy — each shorthand its own value type.
         .{ "anyref", V.anyref },       .{ "eqref", V.eqref },
@@ -4656,16 +4676,27 @@ test "multi-memory: assembles byte-identically to the single-memory form for mem
     const implicit = try assemble(a, "(module (memory 1) (func (result i32) (i32.load (i32.const 0))))");
     try std.testing.expectEqualSlices(u8, implicit, explicit);
 }
-test "anyfunc is accepted as the pre-standard spelling of funcref" {
+test "anyfunc is refused as malformed, in every position it can appear" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    // `(table N anyfunc)` (MVP-era tools still emit it) must assemble, validate,
-    // and produce a byte-identical module to the `funcref` spelling.
-    const with_anyfunc = try assemble(a, "(module (table 4 anyfunc) (func $f) (elem (i32.const 0) $f))");
-    const with_funcref = try assemble(a, "(module (table 4 funcref) (func $f) (elem (i32.const 0) $f))");
-    try std.testing.expectEqualSlices(u8, with_funcref, with_anyfunc);
-    var m = try Module.decode(a, with_anyfunc);
+    // `obsolete-keywords.wast` asserts `anyfunc` is MALFORMED. This test used to
+    // assert the opposite — that it assembled byte-identically to `funcref` —
+    // and that inversion was the last deviation in the conformance baseline.
+    //
+    // The global form is the one the spec file actually pins; the table form is
+    // the one MVP-era tools emit, and it is here because a naive fix makes it
+    // fail as `UnknownIdentifier` (see `isRefType`) — which `wast.zig` banks as
+    // OUR limitation, quietly turning a deviation into a skip.
+    for ([_][]const u8{
+        "(module (global $g anyfunc (ref.null func)))",
+        "(module (table 4 anyfunc) (func $f) (elem (i32.const 0) $f))",
+        "(module (func (param anyfunc)))",
+    }) |src| try std.testing.expectError(error.ObsoleteKeyword, assemble(a, src));
+
+    // The modern spelling is untouched.
+    const ok = try assemble(a, "(module (table 4 funcref) (func $f) (elem (i32.const 0) $f))");
+    var m = try Module.decode(a, ok);
     try validate(a, &m);
 }
 

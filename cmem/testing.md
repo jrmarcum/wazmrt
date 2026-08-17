@@ -103,7 +103,18 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
 - **Failure messages carry the source LINE** of the `.wast` command that produced them (`L342: …`),
   added 2026-08-13 via `sexpr.parseAllWithLines`. Before that, matching 35 failures back to their
   assertions was hand work.
-- 🏁 **90 is not 90 defects — it is 89 non-defects and ONE deliberate deviation.** ⚠️ **14 of the previous 104 were a SCORING BUG**, not a result: a bare `(module …)` that failed to build called `fail()` without consulting `isOurLimitation`, so `UnsupportedProposal`/`UnknownInstr`/`UnsupportedInstr` — our own gaps, scored as SKIPS on every assertion path — were reported as defects here. Fixed 2026-08-14; `delegate` was one of them, so it was never a deviation, just a mis-scored gap. **The remaining 90: 81 untargeted proposals + 8 era-pinned `proposals/threads` + 1 `anyfunc`.** ⚠️ **A by-design refusal is NOT a pass** — banking our own gaps as passes is the green-washing `isOurLimitation` was written after — so they are recorded in `tools/conformance-baseline.txt`, every line with a reason, and the step gates on REGRESSIONS. *(Superseded:)* 104 is not 104 defects: 102 are BY DESIGN and the other 2 are RECORDED DELIBERATE
+- 🏁 **89 failures, and NONE of them is a defect or a deviation (2026-08-17).** The count went
+  104 → 90 → 89 in two steps, and neither step was a bug fix in the runtime:
+  ⚠️ **14 of the 104 were a SCORING BUG**, not a result — a bare `(module …)` that failed to build
+  called `fail()` without consulting `isOurLimitation`, so `UnsupportedProposal`/`UnknownInstr`/
+  `UnsupportedInstr` — our own gaps, scored as SKIPS on every assertion path — were reported as
+  defects here. Fixed 2026-08-14; `delegate` was one of them, so it was **never a deviation**, just a
+  mis-scored gap. Then `anyfunc` was closed 2026-08-17 (see `known-issues.md`), taking the last
+  deliberate deviation with it. **The remaining 89: 81 untargeted proposals + 8 era-pinned
+  `proposals/threads`. Deliberate deviations: ZERO.** ⚠️ **A by-design refusal is NOT a pass** —
+  banking our own gaps as passes is the green-washing `isOurLimitation` was written after — so they
+  are recorded in `tools/conformance-baseline.txt`, every line with a reason, and the step gates on
+  REGRESSIONS. *(Superseded:)* 104 is not 104 defects: 102 are BY DESIGN and the other 2 are RECORDED DELIBERATE
   DEVIATIONS** — `anyfunc` and `delegate`. **Every core spec file is at zero failures and there are
   no undiagnosed failures left.** R1–R5, R7, R9, R10 done, R6 closed by R3, R8 by R5, the singleton
   batch took 22 and the bottom-type lattice the last 28 (27 of them SKIPS).
@@ -143,8 +154,9 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
   `(elem 0 <offset> …)`. **Read the failures, not the folder name.**
 - ✅ **R9 closed 70 of its 71** for +3,584 bytes (2026-08-14) — nine causes, fourteen files to zero,
   and **accept-invalid in core spec files is back to ZERO** but for one deliberate deviation
-  (`anyfunc`, the pre-standard spelling of `funcref`: kept on purpose, two real `.wat` corpus files
-  use it, recorded in `known-issues.md`). ⚠️ **R9 was filed at 85 and measured 71 — the first
+  (`anyfunc`, the pre-standard spelling of `funcref`, kept on purpose for two real `.wat` corpus
+  files). **The 71st closed 2026-08-17** when the owner took that trade: accept-invalid in core spec
+  files is now unconditionally zero. ⚠️ **R9 was filed at 85 and measured 71 — the first
   OVER-count of the series.** Every prior correction ran the other way, which had quietly trained
   the warning below to read as "expect worse". **Stale is stale in both directions.**
 - ⚠️ **AN INVERSION THAT DOES NOT COMPILE LOOKS EXACTLY LIKE AN INVERSION NOTHING CAUGHT.** Two of
@@ -250,7 +262,8 @@ Two harness facts worth keeping:
 The reported assembler-feature gaps were then closed across two batches (see known-issues, "Assembler
 gaps" and "Open items 1–7"): inline `(export …)` on a tag, forward-referenced exports,
 `(export "mem" (memory $name))`, flat `br_table`, data-segment names, the discarded memory-index
-immediate, `anyfunc`, named struct fields, legacy folded `try`/`catch`, **GC const-exprs**,
+immediate, `anyfunc` (accepted then; **REFUSED since 2026-08-17**), named struct fields, legacy
+folded `try`/`catch`, **GC const-exprs**,
 **multi-memory text**, and **the whole atomics family**. **Score after the memory64 batch (Item 3,
 2026-07-27): 59,705 passed / 394 failed** over the 258 core files (up from 58,639 — the overflow-safe
 memory64 bounds lifted base-suite edge cases), plus the **threads `atomic.wast` suite at 302/0**, the

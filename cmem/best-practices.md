@@ -84,6 +84,24 @@ those failures as a regression. — R1, `roadmap.md`
 
 ## 2. Investigating a defect
 
+**Before debugging a toolchain failure, prove it is yours: build the UNMODIFIED commit.** `zig build`
+started dying with a bare `error: Unexpected` — no step, no file, nothing that `--verbose` or
+`--summary all` would expand. Stashing the one edited file and rebuilding HEAD, a commit that had
+been green hours earlier, reproduced it exactly. That single check reclassified the whole
+investigation from "what did I break" to "what broke around me". **A one-command falsification is
+worth more than any amount of reading the diff you already believe in.**
+
+**Two unrelated tools reporting corruption in one directory is a STORAGE finding, not two bugs.**
+Same incident: zig's `.zig-cache` was unreadable (`zig build --help` failed until it was moved
+aside) *and* git warned `unable to find all commit-graph files`. Two independent caches, one
+directory, same hour. The Windows System log then had six `disk`/event-51 "error was detected on
+device … during a paging operation" entries for that volume. Confirmed by copying the tree to the
+other drive, where `zig build test` exited 0 immediately. ⚠️ **Both caches were REGENERABLE, so
+clearing them felt like a fix and was not** — it moved the symptom without touching the cause.
+**Correlate the failures you were not looking for; the second one is what names the cause.** And
+when a build tool's error text has no step and no path, suspect the environment before the source.
+— `anyfunc` closure, 2026-08-17
+
 **A defect classified by its error message can be a shadow of a defect three layers up.** T5 was filed
 as "oversized limits refused at the wrong stage"; it was not a defect at all, but a symptom of the WAT
 assembler dropping `(pagesize …)` four layers away. — T-list, `roadmap.md`
@@ -210,6 +228,22 @@ on modules that were fine. Check whether the mirror half exists before shipping 
 `known-issues.md`
 
 ## 4. Tests and gates
+
+**When you start REFUSING something, check which bucket the refusal lands in.** Closing the
+`anyfunc` deviation looked like deleting one map entry. But `isRefType` also special-cased
+`anyfunc`; dropping it there too would have sent `(table 4 anyfunc)` down the func-index path, where
+`anyfunc` parses as a function NAME and fails as `UnknownIdentifier` — which `wast.zig` banks as OUR
+limitation. The spec deviation would have reappeared as a SKIP and the baseline would have gone
+green for the wrong reason. So `isRefType` still answers true, on purpose, to route the input to the
+one function that knows why it is rejected. **A scoring system that sorts by error type turns "which
+error do I return" into a correctness question** — and the new test pins all three syntactic
+positions precisely because only one of them is what the spec file happens to use.
+— `anyfunc` closure, 2026-08-17
+
+**Price a compatibility affordance by what actually depends on it, not by its rationale.** `anyfunc`
+was kept for two years of arguments about "real inputs that use it". The two files were in an
+optional corpus that no `zig build` step gates — one grep, and the trade went from contested to
+obvious. **Find the gate before you weigh the cost.** — `anyfunc` closure, 2026-08-17
 
 **A gate that cannot pass is not a gate — and a gate that cannot fail is not one either.** Both
 directions have bitten: `zig build conformance` once failed unconditionally (`design-decisions.md`),

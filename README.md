@@ -353,8 +353,9 @@ so there is no licence or NOTICE that has to travel with the artifact.
 > reproduce that type, identifiers must be unique within an index space, and
 > tokens must be separated (`(data"a")` is rejected). If you have `.wat` that an
 > older wazmrt accepted and this one refuses, it is text the reference
-> implementation rejects too — with one deliberate exception, the pre-standard
-> `anyfunc` spelling of `funcref`, which stays accepted.
+> implementation rejects too — there are no deliberate exceptions left. The last
+> one was `anyfunc`, the pre-standard spelling of `funcref`; it is now refused,
+> and the error names `funcref` so the fix is one word.
 >
 > **Host callbacks get a caller handle.** `wazmrt_caller_read`/`_write` read and
 > write *guest* memory from inside the callback, which is what essentially every

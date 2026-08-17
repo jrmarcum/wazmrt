@@ -15,6 +15,27 @@
 #      as passes is the green-washing `wast.zig`'s `isOurLimitation` comment was
 #      written after. They are refusals, recorded as such.
 #
+#      WHAT IS MISSING, concretely — the 81 are two proposals, not 81 things:
+#
+#      custom-descriptors — 79 assertions across 13 files. A descriptor is a
+#        runtime value describing a struct type, so casts can be EXACT (this
+#        type, not a subtype) and RTTs become first-class. Needs, in the type
+#        section: `(descriptor $d)` / `(describes $s)` on a struct type, and the
+#        `(exact $t)` reference-type former — which is the big one, since exact
+#        refs change SUBTYPING, not just parsing, and `refMatches` / `subtypeOf`
+#        / the `TypeRegistry` canonicaliser all have to learn that
+#        `(ref (exact $t))` is NOT satisfied by a subtype of `$t`. Instructions:
+#        `struct.new_desc`, `ref.get_desc`, `ref.cast_desc`, `br_on_cast_desc`,
+#        `br_on_cast_desc_fail`, `array.new_exact`. Depends on GC, which wazmrt
+#        has — this is an extension of a shipped proposal, not a new subsystem.
+#
+#      custom-page-sizes — 2 assertions in 1 file. A memory declares its page
+#        size: `(memory 1 (pagesize 1))`, for 1-byte pages on tiny targets
+#        instead of the fixed 64 KiB. Small and self-contained: a limits field
+#        threaded through decode/validate/instantiate and into every bounds
+#        check and `memory.grow`. Already recognised and refused by name
+#        (`UnsupportedProposal`), which is why it scores as a skip elsewhere.
+#
 #   2. ERA-PINNED SNAPSHOT (proposals/threads) — 8 assertions. That directory
 #      predates multi-memory and multi-table, so it asserts
 #      `(module (memory 0) (memory 0))` is INVALID. wazmrt implements both
@@ -22,12 +43,13 @@
 #      be the regression. **Here the runtime is ahead of the file.** Decisive
 #      check: the assertions appear nowhere in the main testsuite.
 #
-#   3. ONE DELIBERATE DEVIATION — `obsolete-keywords.wast`, 1 assertion.
-#      wazmrt accepts `anyfunc`, the pre-standard spelling of `funcref`, which
-#      the spec calls malformed. Kept because two real `.wat` files in the
-#      wasmtk corpus use it. **This is the only line here where wazmrt is
-#      knowingly wrong by the spec** — see `cmem/known-issues.md`, and revisit
-#      it if those inputs stop mattering.
+#   3. DELIBERATE DEVIATIONS — NONE. There is no longer any line here where
+#      wazmrt is knowingly wrong by the spec. The last one was
+#      `obsolete-keywords.wast`: wazmrt accepted `anyfunc`, the pre-standard
+#      spelling of `funcref`, to keep two MVP-era `.wat` files in the wasmtk
+#      corpus assembling. It is now refused as `ObsoleteKeyword`, whose message
+#      names the modern spelling — the compatibility hint survives, the
+#      deviation does not. Those two corpus files need `funcref`.
 #
 # `error annotations.wast` is the custom-annotations proposal: deliberately
 # exotic tokens the runner cannot lex. Untargeted, same as group 1.
@@ -51,4 +73,3 @@
 6 proposals\threads\imports.wast
 2 proposals\threads\memory.wast
 error annotations.wast
-1 obsolete-keywords.wast
