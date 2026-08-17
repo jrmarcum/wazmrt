@@ -1281,7 +1281,8 @@ today are DESCRIPTIVE.~~ *(The walk is not merely computed — it is wired as a 
   **Result: the 8 closed, and the feared regression did not happen — 62,890 → 62,898 passed,
   89 → 81 failed, 965 → 965 SKIPPED.** The skip column is the one that mattered: *a file that trades
   passes for skips is invisible in a failure diff*, so all three totals were read, per the rule.
-  Baseline group 2 is now empty.
+  Baseline group 2 is now empty. *(Those are F3+F4's own deltas. The skip total then fell 965 → 673
+  later the same day via the skip-scoring split — a separate change; see `testing.md`.)*
   🎓 **And the lesson these 8 actually taught: a well-argued baseline entry is still an entry.**
   They carried the best reasoning in that file — "the runtime is ahead of the file", which is TRUE —
   and the argument justified the score so well that nobody asked whether the RUNNER could simply be

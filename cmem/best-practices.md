@@ -125,6 +125,31 @@ because a five-second grep came after the conclusion instead of before it.
 When a build tool's error text has no step and no path, suspect the environment before the
 source — but then find out WHICH environment. — `anyfunc` closure, 2026-08-17
 
+🚨 **AND THEN THE FILESYSTEM DIAGNOSIS ABOVE WAS WRONG TOO — it was the THIRD of four, and the
+most convincing.** The volume genuinely reported `Full Repair Needed`; the repair genuinely fixed
+it (`Get-Volume D` → `Healthy`/`OK`); **and the build failed exactly as before.**
+
+**FINDING A REAL DEFECT AT A LAYER IS NOT EVIDENCE THAT IT CAUSES YOUR SYMPTOM.** This is the rule
+the whole four-diagnosis sequence was paying for, and the first three all violated it in the same
+way: each found something genuinely wrong (stale event-51 entries, a plausible AV agent, a damaged
+volume) and stopped there, because *a confirmed defect feels like an answer*. The event log was
+real, the filesystem damage was real, the repair was worth doing. None of them was the cause.
+
+**What finally worked was varying ONE THING AT A TIME instead of reasoning about which layer looked
+guiltiest:** a minimal `zig init` project built fine on D: (so not exFAT-inherent), a minimal DLL
+project built fine (so not the DLL step), the real repo built once and then failed on the *second,
+byte-identical* invocation (so not the source), and the same build with its cache on NTFS worked
+indefinitely (so: the cache location). **A `.zig-cache` on that exFAT volume survives exactly one
+build and is then poisoned.** Fix: `ZIG_LOCAL_CACHE_DIR` on an NTFS path — one environment variable,
+replacing a "copy the whole tree to C:" workaround that had been accepted as the cost of doing
+business.
+
+⚠️ **The corollary, which reverses a rule stated 25 lines above: "clearing the cache felt like a fix
+and was not" was itself backwards.** Clearing the cache *is* the fix — for one build. The cache
+LOCATION is the fix for all of them. **A workaround that works exactly once is a clue about
+frequency, not a failed fix; ask what makes the second attempt different.** — the D: build blocker,
+`INDEX.md` (2026-08-17, fourth and final diagnosis)
+
 **A defect classified by its error message can be a shadow of a defect three layers up.** T5 was filed
 as "oversized limits refused at the wrong stage"; it was not a defect at all, but a symptom of the WAT
 assembler dropping `(pagesize …)` four layers away. — T-list, `roadmap.md`
@@ -245,6 +270,38 @@ and `readBlockType` but not `Module.readValType`, so `(ref exn)` round-tripped a
 was `BadValType` everywhere else. When a type gains an encoding, grep for every reader of that
 encoding. — R4, `known-issues.md`
 
+**When a LANGUAGE KEYWORD forces you to rename one member of a set, check the whole set — the
+renamed one is the one that breaks, and its siblings working is what hides it.** `Op.catch_` carries
+its underscore only because `catch` is a Zig keyword, so `stringToEnum` could not find it by its
+wasm spelling while `catch_all` resolved normally. A stray `catch_all` therefore reached the
+validator and was rejected with a real verdict; a stray `catch` came back `UnknownInstr` and scored
+as our own gap — **two spellings of one clause graded differently for the identical malformation.**
+It was invisible for as long as it existed because the sibling worked. *(Same family as the
+`@"unreachable"`/`@"if"` counting rule in §4, and the sharper form of it: a keyword workaround
+changes BEHAVIOUR, not just greppability.)* — skip-scoring split, `testing.md`
+
+**Three spellings of one list, and the two written by hand were the two that were wrong.**
+`features.Feature` (the engine), `capi.Feature` (the C ABI) and `wazmrt_feature_t` (the shipped
+header) all enumerate the same proposals. `capi.Feature` stopped at `exceptions = 13` with
+`valid()` hardcoding `<= 13`, while the header *declared* `WAZMRT_FEATURE_TAIL_CALL = 14` — so
+`set_feature(TAIL_CALL, false)` returned false and did nothing, while `all_features(false)`, which
+counts with `features.count`, disabled it. **The header advertised a switch that was not there.**
+Two fixes, and take both: **derive the bound instead of restating it** (`< features.count`), and
+**pin the duplicates with a comptime check that compares NAMES AND VALUES, not just lengths** — two
+lists of equal length can still disagree, and a value mismatch makes `@enumFromInt` gate a
+*different* proposal than the caller selected. — F3, `roadmap.md`
+
+**An error name that conflates "your input is bad" with "we are incomplete" cannot be scored
+correctly by ANY caller.** `UnknownInstr` meant both "this mnemonic exists in no wasm proposal"
+(a verdict we are entitled to give) and "this is from a proposal we do not target" (our gap, which
+must not count as a pass), so the conformance runner had to treat every instance as our gap — and
+292 correct rejections across CORE files were banked as skips. The distinction was knowable only at
+the point of failure, never upstream. **Make the split where the information is, not in the code
+that has to score it.** ⚠️ And note the asymmetry when you do: an omission from the
+"we-are-incomplete" list is a FALSE PASS, not a missed one, so the list must be over-inclusive and
+its guard is that the untargeted-proposal directories never gain passes. — skip-scoring split,
+`testing.md`
+
 **Fixing only the consumer rejects valid input.** Finality was thrown away by the decoder *and*
 mis-emitted by the assembler; repairing the validator alone turned a silent accept into a loud reject
 on modules that were fine. Check whether the mirror half exists before shipping either. —
@@ -277,6 +334,24 @@ while a feature-gating draft was wrong in the FALSE-POSITIVE direction and a sym
 it fail, restore it. R1's `define_instance` test was confirmed this way; the path it covers had only a
 symbol-existence entry before. — R1, `known-issues.md`
 
+**When a test fails after your change, ask whether its EXAMPLE still demonstrates its PROPERTY
+before you touch either.** R5's green-washing regression test failed on the skip-scoring split, and
+it was right to: its example was `some.bogus.instruction`, chosen to stand for "a mnemonic our
+assembler doesn't know" — which was never an instance of "our limitation" at all. **The property
+was correct, the example had silently stopped matching it.** That example has now moved twice
+(it began as `(module quote …)` itself, until R5 implemented that form) while the property never
+changed once. The three outcomes are genuinely different and it is worth deciding which you are in:
+the code is wrong, the property is wrong, or **the example drifted** — and the third is the one that
+looks like the first. ⚠️ Fix it by keeping the property and re-picking the example, then **pin the
+inverse case beside it**, so the pair can only pass if the distinction is actually being drawn.
+— skip-scoring split, `wast.zig`
+
+**Zig forces an unused parameter to be a compile error, so plumbing and its first consumer must land
+in one commit** — which is also why an inversion test must assert the BUILD SUCCEEDED before reading
+its silence (two of R9's eight reported no failing test because commenting the check out left a
+parameter unused). Useful in the other direction too: it means a "thread this value through" step
+cannot be landed as dead scaffolding. — F1/F4, `roadmap.md`
+
 **A goal with no gate is a preference.** "Smallest binary" was a stated goal for a month with nothing
 measuring it, and the artifacts doubled. — `design-decisions.md`
 
@@ -294,14 +369,42 @@ was two builds old. A number that matches the ceiling to the byte is evidence of
 a change that cost nothing. Build every artifact you are about to report. — R3,
 `tools/size-ceilings.txt`
 
+**A gate's number must be REPRODUCIBLE IN THE CONFIGURATION IT WAS RECORDED IN — "what produced it"
+includes WHERE.** `wazmrt.lib` measures 1,029,730 / 1,029,738 / 1,029,882 / 1,029,922 for one
+unchanged commit, depending only on the source tree's path and the local cache path: the static
+archive is unpadded and embeds object/source paths, while the `.exe` and `.dll` absorb the same
+difference inside PE alignment and look perfectly stable. A clean HEAD read **+152 OVER** its
+ceiling and nearly bought a bogus ceiling raise attributing bytes to a change that did not cause
+them. **Before charging a sub-KB delta to your change, re-measure the parent in the same
+configuration** — and treat a gate that reads "whatever is on disk" as needing to know the build
+location too, not just the flags and the freshness. *(Third hole of this family, after the
+stale-artifact trap above and the `-Dwat=false` false win in `tools/size-ceilings.txt`.)* — D:
+build-blocker investigation, `tools/size-ceilings.txt`
+
 **Guard the property, not a proxy for it.** — `design-decisions.md`
 
 **A cache key must name everything the answer depends on.** — R1, `roadmap.md`
 
-**Never green-wash our own gaps.** An unimplemented command form or an unknown mnemonic is *not*
-evidence a module is invalid. `assert_invalid`, `assert_trap` and `assert_unlinkable` each need the
-"this is our limitation" arm, or the conformance numbers count our holes as passes. — `wast.zig`
+**Never green-wash our own gaps.** An unimplemented command form is *not* evidence a module is
+invalid. `assert_invalid`, `assert_trap` and `assert_unlinkable` each need the "this is our
+limitation" arm, or the conformance numbers count our holes as passes. — `wast.zig`
 `isOurLimitation`, `known-issues.md`
+
+⚠️ **REFINED 2026-08-17 — this rule used to say "or an unknown mnemonic", and that half was
+costing 292 correct answers.** Conservatism is right when an error is genuinely ambiguous and wrong
+when it only *looks* ambiguous: a mnemonic that exists in no wasm proposal is a malformation, and
+refusing it is a verdict we are entitled to give. **Being conservative is not free — it is a claim
+about our own ignorance, and that claim can be checked.** Check it before paying for it. (The
+mechanism belongs upstream, at the point where the difference is known — see §3.)
+
+**A well-argued entry in a baseline is still an entry.** The 8 era-pinned `proposals/threads`
+failures carried the best reasoning in `conformance-baseline.txt` — *"that directory predates
+multi-memory and multi-table, so the runtime is ahead of the file"*, which is **true** — and the
+argument was so satisfying that nobody asked whether the RUNNER could simply be told which era to
+judge by. It could, in about 40 lines. **An explanation for a failure is not a decision to keep
+it**, and the better the explanation, the longer it will sit there unexamined. Re-read your
+justified entries periodically, precisely because they are the ones nothing prompts you to revisit.
+— F4, `roadmap.md`
 
 ## 5. Recording what you found
 
@@ -323,11 +426,24 @@ a superseded block that still says "the number to quote" is worse than no marker
 failing number.** Asked to close "the last 89 for security reasons", the honest split ran the other
 way from the count: the 81 untargeted-proposal assertions are modules wazmrt *rejects*, and a module
 that will not run cannot do harm, so implementing those proposals **adds** attack surface rather than
-removing it. The real gap was invisible in the score — `validate()` takes no feature set, so no
-embedder can run a restricted subset of the language — and it surfaced only from the 8 assertions
-that looked like the *least* alarming group. **A conformance total counts disagreements, not
-exposure; they are different axes and a big number on one says nothing about the other.** Say so
-when scoping, then build what was asked. — Tracks F/P/D scoping, 2026-08-17
+removing it. **A conformance total counts disagreements, not exposure; they are different axes and a
+big number on one says nothing about the other.** Say so when scoping, then build what was asked.
+— Tracks F/P/D scoping, 2026-08-17
+
+🚨 **BEFORE SCOPING A TRACK, GREP FOR THE THING YOU ARE ABOUT TO BUILD.** The paragraph above
+originally continued *"the real gap is that `validate()` takes no feature set, so no embedder can
+run a restricted subset of the language"* — and **that was false when written.** Per-proposal
+gating had shipped six days earlier: `wazmrt_config_set_feature` in the header, hard rejection in
+both C-ABI module entry points, module structure *and* per-instruction coverage, a comptime
+coverage pin, four passing tests. **The same file contradicted itself two sections up**, where its
+own change-series table marks that step ✅. Track F was scoped as ~5 items of security work and was
+~70% already built; the security argument for its *ordering* evaporated with it.
+
+🎓 **This is the exact inverse of the memory64 and GC-P3 entries below — those recorded work as DONE
+that was not; this recorded work as TODO that already was — and the root cause is identical: a
+status line written from an ARGUMENT rather than from the code.** The argument was even a good one.
+Both directions cost real time, and both are prevented by the same five-second habit: open the
+file and grep before you write down what is missing. — Track F correction, `roadmap.md`
 
 **When you implement a feature the project has already been burned by, name the prior bug in the
 plan, not in the postmortem.** Track D's scope carries the two soundness defects this branch already

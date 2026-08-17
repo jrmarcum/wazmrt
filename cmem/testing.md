@@ -180,12 +180,16 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
   defects here. Fixed 2026-08-14; `delegate` was one of them, so it was **never a deviation**, just a
   mis-scored gap. Then `anyfunc` was closed 2026-08-17 (see `known-issues.md`), taking the last
   deliberate deviation with it. **The remaining 89: 81 untargeted proposals + 8 era-pinned
-  `proposals/threads`. Deliberate deviations: ZERO.** 🎯 **Both groups are SCOPED for implementation
-  in `roadmap.md` → PROPOSED TRACKS F / P / D (2026-08-17).** ⚠️ **Do not read "89 failures" as "89
-  security holes" — the security argument is not uniform.** The 81 are REFUSALS, which is the safe
-  direction; implementing those proposals ADDS attack surface. The genuine gap is that `validate()`
-  takes no feature set, so no embedder can run a restricted subset — that is Track F, and the 8
-  threads assertions fall out of it as a side effect. ⚠️ **A by-design refusal is NOT a pass** —
+  `proposals/threads`. Deliberate deviations: ZERO.** *(The 8 CLOSED later that day by F3+F4; live
+  figure is 81, all untargeted proposals — Tracks D and P. See the score at the top of this file.)*
+  ⚠️ **Do not read a failure count as a count of security holes — the security argument is not
+  uniform.** The 81 are REFUSALS, which is the safe direction; implementing those proposals ADDS
+  attack surface. ⚠️ **CORRECTED 2026-08-17: this passage continued "the genuine gap is that
+  `validate()` takes no feature set, so no embedder can run a restricted subset — that is Track F".
+  THAT WAS FALSE WHEN WRITTEN** — per-proposal gating shipped 2026-08-11 (`wazmrt_config_set_feature`
+  + hard rejection in both C-ABI entry points, structure *and* per-instruction). There was no
+  embedder hole to close. See `roadmap.md` → Track F and `best-practices.md` §5's
+  *"before scoping a track, grep for the thing you are about to build"*. ⚠️ **A by-design refusal is NOT a pass** —
   banking our own gaps as passes is the green-washing `isOurLimitation` was written after — so they
   are recorded in `tools/conformance-baseline.txt`, every line with a reason, and the step gates on
   REGRESSIONS. *(Superseded:)* 104 is not 104 defects: 102 are BY DESIGN and the other 2 are RECORDED DELIBERATE
