@@ -1094,6 +1094,7 @@ fn isRuntimeTrap(e: anyerror) bool {
         error.UninitializedElement,
         error.IndirectTypeMismatch,
         error.NullReference,
+        error.NullDescriptor, // "null descriptor reference" (custom-descriptors)
         error.GcOutOfBounds,
         error.CastFailure,
         error.HostTrap,
@@ -2267,4 +2268,170 @@ test "(either …) accepts any listed alternative, and still rejects a non-alter
         try std.testing.expectEqual(@as(usize, 1), s.passed);
         try std.testing.expectEqual(@as(usize, 0), s.failed);
     }
+}
+
+test "D3 soundness: a descriptor is an ENTITY — two instances do not share one" {
+    // 🔒 **THE TRAP THE ROADMAP NAMED FOR D3, written by CONSTRUCTION.** "The descriptor a value
+    // carries must name an ENTITY, not a type index" — R2's lesson, and the third place it
+    // applies. Both instances here are the SAME definition, so their type indices are identical
+    // and a descriptor stored as an index would make `ref.get_desc` on I1's object hand back
+    // I2's descriptor. `ref.eq` is the only way to see it: every type check passes either way,
+    // so no assertion about types can catch this and neither can the corpus.
+    const src =
+        \\(module definition $M
+        \\  (rec
+        \\    (type $a (descriptor $b) (struct))
+        \\    (type $b (describes $a) (struct)))
+        \\  (global $d (export "d") (ref (exact $b)) (struct.new $b))
+        \\  (func (export "make") (result (ref (exact $a)))
+        \\    (struct.new_desc $a (global.get $d)))
+        \\  (func (export "desc-of-mine-is-mine") (result i32)
+        \\    (ref.eq (ref.get_desc $a (call 0)) (global.get $d))))
+        \\(module instance $I1 $M)
+        \\(module instance $I2 $M)
+        \\(assert_return (invoke $I1 "desc-of-mine-is-mine") (i32.const 1))
+        \\(assert_return (invoke $I2 "desc-of-mine-is-mine") (i32.const 1))
+    ;
+    const s = try runScript(std.testing.allocator, src, null);
+    try std.testing.expectEqual(@as(usize, 2), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+
+    // The other half, and the one that would actually be WRONG rather than merely unchecked:
+    // I1's object must not report I2's descriptor. Two separate instances of one definition are
+    // generative, so their globals are distinct objects — `ref.eq` across them must be 0.
+    const cross =
+        \\(module definition $M
+        \\  (rec
+        \\    (type $a (descriptor $b) (struct))
+        \\    (type $b (describes $a) (struct)))
+        \\  (global $d (export "d") (ref (exact $b)) (struct.new $b))
+        \\  (func (export "make") (result (ref (exact $a)))
+        \\    (struct.new_desc $a (global.get $d))))
+        \\(module instance $I1 $M)
+        \\(module instance $I2 $M)
+        \\(register "I1" $I1)
+        \\(register "I2" $I2)
+        \\(module $Q
+        \\  (rec
+        \\    (type $a (descriptor $b) (struct))
+        \\    (type $b (describes $a) (struct)))
+        \\  (import "I1" "make" (func $m1 (result (ref (exact $a)))))
+        \\  (import "I1" "d" (global $d1 (ref (exact $b))))
+        \\  (import "I2" "d" (global $d2 (ref (exact $b))))
+        \\  (func (export "mine") (result i32)
+        \\    (ref.eq (ref.get_desc $a (call $m1)) (global.get $d1)))
+        \\  (func (export "theirs") (result i32)
+        \\    (ref.eq (ref.get_desc $a (call $m1)) (global.get $d2))))
+        \\(assert_return (invoke $Q "mine") (i32.const 1))
+        \\(assert_return (invoke $Q "theirs") (i32.const 0))
+    ;
+    // Read from a THIRD module, so the descriptor value crosses two boundaries. `mine` is the
+    // arm a type-index representation would still pass; `theirs` is the one it could not.
+    const s2 = try runScript(std.testing.allocator, cross, null);
+    try std.testing.expectEqual(@as(usize, 2), s2.passed);
+    try std.testing.expectEqual(@as(usize, 0), s2.failed);
+}
+
+test "D3: a null descriptor traps, at run time AND during instantiation" {
+    // `struct.new_desc` is a constant instruction, so the same rule has to hold on both paths —
+    // and they are two separate evaluators (`interp.step` and `evalConstGc`), which is exactly
+    // the shape that lets one of them forget. The const-expr trap surfaces as a failed
+    // instantiation, not a failed call.
+    const src =
+        \\(module
+        \\  (rec
+        \\    (type $a (descriptor $b) (struct))
+        \\    (type $b (describes $a) (struct)))
+        \\  (func (export "boom") (result (ref (exact $a)))
+        \\    (struct.new_desc $a (ref.null none))))
+        \\(assert_trap (invoke "boom") "null descriptor reference")
+        \\(assert_trap
+        \\  (module
+        \\    (rec
+        \\      (type $a (descriptor $b) (struct))
+        \\      (type $b (describes $a) (struct)))
+        \\    (global (ref (exact $a)) (struct.new_desc $a (ref.null (exact $b)))))
+        \\  "null descriptor reference")
+    ;
+    const s = try runScript(std.testing.allocator, src, null);
+    try std.testing.expectEqual(@as(usize, 2), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "D3 soundness: an EXACT cast across instances refuses a subtype" {
+    // 🔒 **A live type-confusion defect found while doing D3, fixed in `canonMatches`.**
+    // `refMatches`'s cross-module arm called `TypeRegistry.isSub` and never looked at `rt.exact`,
+    // so `ref.test (ref (exact $super))` on an object belonging to ANOTHER INSTANCE answered 1
+    // for a subtype. D1 closed exactly this hole for the same-module path and its tests could not
+    // reach here — the third time this codebase has found a defect by asking "and across
+    // instances?". The corpus cannot see it either: both modules are valid on their own.
+    const src =
+        \\(module $A
+        \\  (rec
+        \\    (type $super (sub (struct)))
+        \\    (type $sub (sub $super (struct))))
+        \\  (global (export "s") (ref (exact $sub)) (struct.new $sub)))
+        \\(register "A")
+        \\(module
+        \\  (rec
+        \\    (type $super (sub (struct)))
+        \\    (type $sub (sub $super (struct))))
+        \\  (import "A" "s" (global $s (ref (exact $sub))))
+        \\  (func (export "sub-vs-exact-super") (result i32)
+        \\    (ref.test (ref (exact $super)) (global.get $s)))
+        \\  (func (export "sub-vs-inexact-super") (result i32)
+        \\    (ref.test (ref $super) (global.get $s)))
+        \\  (func (export "sub-vs-exact-sub") (result i32)
+        \\    (ref.test (ref (exact $sub)) (global.get $s))))
+        \\(assert_return (invoke "sub-vs-exact-super") (i32.const 0))
+        \\(assert_return (invoke "sub-vs-inexact-super") (i32.const 1))
+        \\(assert_return (invoke "sub-vs-exact-sub") (i32.const 1))
+    ;
+    const s = try runScript(std.testing.allocator, src, null);
+    // The load-bearing line is the FIRST: a subtype must not satisfy an exact supertype across
+    // the boundary. The other two prove the fix is exactness and not a blanket refusal, which
+    // would pass the first for entirely the wrong reason.
+    try std.testing.expectEqual(@as(usize, 3), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "D3: a funcref's dynamic type is its DEFINITION's, through a chain of re-exports" {
+    // 🐛 Found while doing D3, and NOT a custom-descriptors bug: `definedFuncType` answered null
+    // for any imported or foreign funcref, so EVERY concrete cast on one failed — including the
+    // plain inexact `ref.test (ref $f)`. An import may legally name a SUPERTYPE, so reading the
+    // type off the importing module is wrong even when it answers; `$D` below re-exports what it
+    // imported inexactly, so the walk has to follow more than one hop.
+    const src =
+        \\(module $C
+        \\  (type $super (sub (func)))
+        \\  (type $sub (sub $super (func)))
+        \\  (func (export "f") (type $sub))
+        \\  (func (export "g") (type $super)))
+        \\(register "C")
+        \\(module $D
+        \\  (type $super (sub (func)))
+        \\  (import "C" "f" (func (type $super)))
+        \\  (export "f" (func 0)))
+        \\(register "D")
+        \\(module
+        \\  (type $super (sub (func)))
+        \\  (type $sub (sub $super (func)))
+        \\  (import "D" "f" (func $viaD (type $super)))
+        \\  (import "C" "g" (func $g (type $super)))
+        \\  (elem declare func $viaD $g)
+        \\  (func (export "exact-sub") (result i32)
+        \\    (ref.test (ref (exact $sub)) (ref.func $viaD)))
+        \\  (func (export "inexact-super") (result i32)
+        \\    (ref.test (ref $super) (ref.func $viaD)))
+        \\  (func (export "g-is-not-sub") (result i32)
+        \\    (ref.test (ref (exact $sub)) (ref.func $g))))
+        \\(assert_return (invoke "exact-sub") (i32.const 1))
+        \\(assert_return (invoke "inexact-super") (i32.const 1))
+        \\(assert_return (invoke "g-is-not-sub") (i32.const 0))
+    ;
+    const s = try runScript(std.testing.allocator, src, null);
+    // The third is the control: `$g` really IS only a `$super`, so the exact-`$sub` test must
+    // still answer 0. Without it the first two would pass under "always say yes".
+    try std.testing.expectEqual(@as(usize, 3), s.passed);
+    try std.testing.expectEqual(@as(usize, 0), s.failed);
 }

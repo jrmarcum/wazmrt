@@ -70,10 +70,9 @@ zig build wasi-gate                # compile Zig+C wasm32-wasi programs, run the
                                    #   add -Drust-gate=true to also cross-check a rustc build
 zig build conformance -Dtestsuite=<dir> -Dbaseline=tools/conformance-baseline.txt
                                    # run the spec testsuite; gates on REGRESSIONS vs an
-                                   # explained baseline (16 non-defects, 0 deliberate deviations:
-                                   # custom-descriptors, the one proposal wazmrt refuses — its
-                                   # TYPE-SECTION half ships (`exact` refs + descriptor/describes);
-                                   # what is left is the instructions)
+                                   # explained baseline (4 non-defects, 0 deliberate deviations:
+                                   # custom-descriptors, the one proposal wazmrt refuses — all of
+                                   # it ships now except the descriptor CASTS)
                                    #   -Dbaseline=<file>        gate on regressions, not zero failures
                                    #   -Dwrite-baseline=true    generate that baseline from today's run
                                    #   -Dfailures=N             list up to N failures per file (default 1)

@@ -123,6 +123,15 @@ fn opFeature(op: opcode.Op) ?Feature {
         .array_new_data, .array_new_elem, .array_fill, .array_copy, .array_init_data, .array_init_elem,
         .extern_convert_any, .any_convert_extern,
         .ref_test, .ref_cast, .br_on_cast, .br_on_cast_fail,
+        // custom-descriptors (Track D3) is filed under `.gc` DELIBERATELY, and it
+        // is under-strict: there is no `custom_descriptors` bit, so a host that
+        // enables GC gets these three too. That matches how D1's `(exact $t)`
+        // machinery was gated and it is the closest TRUE statement available —
+        // these instructions genuinely require GC. Splitting them out needs a new
+        // `Feature` variant, which ripples into `capi.Feature` and `wazmrt.h`
+        // under their comptime pin; that belongs with F5 (surface the set), not
+        // here, where it would make D3's size delta unattributable.
+        .struct_new_desc, .struct_new_default_desc, .ref_get_desc,
         => .gc,
 
         // Exception handling, both encodings.
@@ -236,16 +245,16 @@ pub fn firstViolation(gpa: std.mem.Allocator, module: *const Module, fs: Set) !?
 // confirm it really is MVP core), and only then update the number.
 comptime {
     const n = @typeInfo(opcode.Op).@"enum".fields.len;
-    if (n != 248) @compileError(std.fmt.comptimePrint(
-        "opcode.Op has {d} members, features.zig was written against 248. A new opcode must be " ++
+    if (n != 251) @compileError(std.fmt.comptimePrint(
+        "opcode.Op has {d} members, features.zig was written against 251. A new opcode must be " ++
             "classified in opFeature() before this number is updated — an unclassified opcode " ++
             "silently passes every proposal gate.",
         .{n},
     ));
 }
 
-// The classification behind that 248, recorded so the next person can re-check it cheaply rather
-// than re-deriving it: 76 opcodes are mapped to a proposal in `opFeature`, and the remaining 172
+// The classification behind that 251, recorded so the next person can re-check it cheaply rather
+// than re-deriving it: 79 opcodes are mapped to a proposal in `opFeature`, and the remaining 172
 // are WebAssembly 1.0 core — control flow, numerics, comparisons, loads/stores, locals/globals,
 // `select`, `drop`, `nop`, `memory.size`/`grow`.
 //

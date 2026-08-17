@@ -119,6 +119,12 @@ pub const default_max_table_elems: usize = 1 << 27;
 /// the field slices is bounded only indirectly. It is a backstop, not a budget.
 pub const default_max_gc_objects: usize = 1 << 24;
 
+/// How many re-export hops `definingFunc` will follow before giving up. A valid
+/// module graph is acyclic, so this is a hang-guard rather than a policy: an
+/// import chain long enough to hit it is malformed, and answering "unknown type"
+/// is the safe response. Generous enough that no real linking graph reaches it.
+const max_import_hops: usize = 256;
+
 /// Cap on live boxed exceptions (`exn_store`) per invocation. `catch_ref` /
 /// `catch_all_ref` box an exception so it can become an `exnref` value, and
 /// nothing bounded that: a guest loop catching by reference grew the store
@@ -265,6 +271,12 @@ pub const Error = Module.Error || error{
     /// A null reference where a non-null one is required (`call_ref` /
     /// `ref.as_non_null` on null).
     NullReference,
+    /// `struct.new_desc` was given a null descriptor, or `ref.get_desc` a null
+    /// reference (custom-descriptors, "null descriptor reference"). Kept
+    /// SEPARATE from `NullReference` because the two are different guest
+    /// mistakes with different spec messages, and a shared tag would make a
+    /// descriptor bug indistinguishable from an ordinary null deref in a report.
+    NullDescriptor,
     /// A table access (or element-segment init) outside the table bounds.
     TableOutOfBounds,
     /// `call_indirect` hit an uninitialized (null) table element.
@@ -949,9 +961,19 @@ pub const Instance = struct {
     /// the host. `gpa`-owned outer list.
     gc_heap: std.ArrayList(HeapObject) = .empty,
 
-    /// A heap-allocated GC object: its declared type index (RTT) and its struct
-    /// fields / array elements (arena-backed).
-    pub const HeapObject = struct { type_index: u32, fields: []Value };
+    /// A heap-allocated GC object: its declared type index (RTT), its struct
+    /// fields / array elements (arena-backed), and — for custom-descriptors — the
+    /// descriptor VALUE it was allocated with.
+    ///
+    /// 🔒 **`descriptor` is a `Value`, not a type index, and that is the whole
+    /// point.** A descriptor is a first-class object with its own identity, so
+    /// two instances that agree on the type still have DIFFERENT descriptors;
+    /// storing an index would make them interchangeable. It is the same entity-
+    /// not-index lesson as R2's funcrefs and the cross-instance GC defect, and
+    /// storing the `Value` is what makes cross-instance `ref.get_desc` resolve
+    /// through the store for free — the value already names the owning instance.
+    /// `null_ref` for a type with no descriptor.
+    pub const HeapObject = struct { type_index: u32, fields: []Value, descriptor: Value = null_ref };
 
     /// Shared linear memory. A single object is referenced by the defining
     /// instance and every importer, so `memory.grow` (which updates `bytes`) is
@@ -1091,7 +1113,7 @@ pub const Instance = struct {
         for (ir) |instr| {
             // A GC type index's required KIND depends on the op, so switch on it.
             switch (instr.op) {
-                .struct_new, .struct_new_default => if (module.structFields(instr.imm.gc_type) == null) return error.UndefinedType,
+                .struct_new, .struct_new_default, .struct_new_desc, .struct_new_default_desc, .ref_get_desc => if (module.structFields(instr.imm.gc_type) == null) return error.UndefinedType,
                 .array_new, .array_new_default, .array_get, .array_get_s, .array_get_u, .array_set, .array_fill => if (module.arrayField(instr.imm.gc_type) == null) return error.UndefinedType,
                 // `array_len` (imm = .none) and `array_new_fixed` (imm = .gc_type_n, checked below) carry no `.gc_type` — do not read it here.
                 else => {},
@@ -1811,9 +1833,14 @@ pub const Instance = struct {
     /// OWNING INSTANCE as well as the slot, so the reference keeps meaning after
     /// it crosses a module boundary.
     fn allocObject(self: *Instance, type_index: u32, fields: []Value) Error!Value {
+        return self.allocObjectDesc(type_index, fields, null_ref);
+    }
+
+    /// `allocObject` with a custom-descriptors descriptor value attached.
+    fn allocObjectDesc(self: *Instance, type_index: u32, fields: []Value, descriptor: Value) Error!Value {
         const idx = self.gc_heap.items.len;
         if (idx >= self.max_gc_objects) return error.GcHeapExhausted;
-        try self.gc_heap.append(self.gpa, .{ .type_index = type_index, .fields = fields });
+        try self.gc_heap.append(self.gpa, .{ .type_index = type_index, .fields = fields, .descriptor = descriptor });
         return gcRefValue(self.store_slot, @intCast(idx));
     }
 
@@ -1876,14 +1903,24 @@ pub const Instance = struct {
                 // `(module definition)`/`(module instance)` case) keeps the
                 // direct index path: the indices already ARE the identities.
                 if (rt.heap == .concrete and e.inst.module != self.module) {
-                    const want_local = rt.heap.concrete;
-                    if (want_local >= self.canon_ids.len) return false;
-                    if (obj.type_index >= e.inst.canon_ids.len) return false;
-                    return self.store.canon.isSub(e.inst.canon_ids[obj.type_index], self.canon_ids[want_local]);
+                    return self.canonMatches(e.inst, obj.type_index, rt);
                 }
                 return self.headMatches(kind, obj.type_index, rt.heap, rt.exact);
             },
-            .func => return self.headMatches(.func, self.definedFuncType(v), rt.heap, rt.exact),
+            // A funcref's type comes from the instance that DEFINES the function,
+            // and reaches the same cross-module comparison the GC arm uses.
+            .func => {
+                const d = self.definingFunc(v) orelse return false;
+                const m = d.inst.module;
+                // `funcTypeIndex` spans the whole index space — imports first,
+                // then defined — but `definingFunc` has already walked past every
+                // import, so this reads a DEFINED function's own type.
+                const ti = m.funcTypeIndex(d.index) orelse return false;
+                if (rt.heap == .concrete and m != self.module) {
+                    return self.canonMatches(d.inst, ti, rt);
+                }
+                return self.headMatches(.func, ti, rt.heap, rt.exact);
+            },
             else => return self.headMatches(.extern_, null, rt.heap, rt.exact),
         }
     }
@@ -1928,27 +1965,66 @@ pub const Instance = struct {
         }
     }
 
-    /// The type index of the function a funcref VALUE names (for `ref.cast` of a
-    /// funcref to a concrete func type), read from the DEFINING instance's
-    /// module; null when the value names no live function or names an imported
-    /// one (whose type index belongs to a third module).
+    /// Follow a funcref through any chain of IMPORTS to the instance that
+    /// actually DEFINES the function, and its index there.
     ///
-    /// ⚠️ Null for a funcref DEFINED IN ANOTHER INSTANCE too: the caller feeds
-    /// this index to `self.module.isSubtype`, and a type index only means
-    /// something inside the module that wrote it (R1). Comparing across modules
-    /// needs `typematch`, which `refMatches` has no allocator for — so a concrete
-    /// `ref.cast` of a foreign funcref TRAPS rather than answering from an index
-    /// that means nothing here. A false negative, loudly, instead of a wrong
-    /// cast quietly.
-    fn definedFuncType(self: *Instance, fref: Value) ?u32 {
+    /// 🔒 **A function's dynamic type is its DEFINITION's type, not the type the
+    /// importer declared for it.** An import may name a SUPERTYPE — that is the
+    /// point of subtyping — so reading the type off the importing module answers
+    /// with `$super` for a function that really is a `$sub`, and every exact cast
+    /// on it then fails. `exact-func-import.wast` states it directly: "even when
+    /// the function is imported inexactly, it can still be cast to its exact
+    /// type". Re-exporting stacks the problem, which is why this WALKS rather
+    /// than taking one hop.
+    ///
+    /// Returns null for a NATIVE host function: it has no wasm type index to
+    /// compare, so a concrete cast on it answers no rather than guessing. The hop
+    /// count is bounded because a cyclic import graph must terminate here rather
+    /// than hang, on the same principle as `isSubtype`'s guarded walk.
+    fn definingFunc(self: *Instance, fref: Value) ?struct { inst: *Instance, index: u32 } {
         const ad = self.store.resolve(fref) orelse return null;
-        const m = ad.instance.module;
-        if (m != self.module) return null;
-        const imported = m.importedFuncCount();
-        if (ad.index < imported) return null;
-        const d = ad.index - imported;
-        if (d >= m.functions.len) return null;
-        return m.functions[d];
+        var inst = ad.instance;
+        var index = ad.index;
+        var hops: usize = 0;
+        while (index < inst.imported_funcs) : (hops += 1) {
+            if (hops > max_import_hops) return null;
+            if (index >= inst.import_funcs.len) return null;
+            switch (inst.import_funcs[index]) {
+                .wasm => |w| {
+                    inst = w.instance;
+                    index = w.func_index;
+                },
+                .native, .native_env => return null,
+            }
+        }
+        return .{ .inst = inst, .index = index };
+    }
+
+    /// Compare a value's type — index `ti` in `owner`'s module — against a
+    /// CONCRETE cast target named in THIS module, through the store-wide
+    /// canonical ids. The one comparison that is meaningful across a module
+    /// boundary: a raw type index means nothing outside the module that wrote it
+    /// (R1), and `canon_ids` is what `TypeRegistry` exists to provide.
+    ///
+    /// 🔒 **`rt.exact` is honoured HERE, and it was not before (fixed 2026-08-17,
+    /// during D3).** The GC arm's cross-module path called `isSub` directly, so
+    /// `ref.test (ref (exact $t))` on an object belonging to ANOTHER INSTANCE
+    /// answered 1 for a SUBTYPE — the guest receiving a value of a type it proved
+    /// it did not have. That is D1's dropped-`0x62` hole exactly, in the one path
+    /// D1's tests did not reach, and it is the third time this codebase has found
+    /// the same defect by asking "and what about across instances?".
+    fn canonMatches(self: *Instance, owner: *Instance, ti: u32, rt: opcode.RefType) bool {
+        const want_local = switch (rt.heap) {
+            .concrete => |t| t,
+            else => return false,
+        };
+        if (want_local >= self.canon_ids.len) return false;
+        if (ti >= owner.canon_ids.len) return false;
+        const actual = owner.canon_ids[ti];
+        const target = self.canon_ids[want_local];
+        // Exact admits ONLY the same type; inexact walks the canonical chain.
+        if (rt.exact) return actual == target;
+        return self.store.canon.isSub(actual, target);
     }
 
     /// Run `callee` in ITS instance's context and bring the result — or the trap
@@ -2532,6 +2608,44 @@ const Frame = struct {
                     const obj = try self.inst.arena.allocator().alloc(Value, sf.len);
                     for (sf, 0..) |f, k| obj[k] = if (f.storage.unpacked().isRef()) null_ref else 0;
                     try self.pushU64(try self.inst.allocObject(instr.imm.gc_type, obj));
+                    pc += 1;
+                },
+                // --- custom-descriptors (D3): allocate with, and read back, a
+                // descriptor VALUE. The descriptor is the last operand, so it is
+                // on top of the stack and popped first.
+                .struct_new_desc, .struct_new_default_desc => {
+                    const ti = instr.imm.gc_type;
+                    const sf = self.inst.module.structFields(ti) orelse return error.UndefinedType;
+                    for (sf) |f| if (fieldIsV128(f.storage)) return error.UnsupportedInstruction;
+                    const desc = self.pop();
+                    // §"a null descriptor traps". Checked BEFORE the fields are
+                    // read so the trap does not depend on how many operands the
+                    // type happens to have.
+                    if (desc == null_ref) return error.NullDescriptor;
+                    const obj = try self.inst.arena.allocator().alloc(Value, sf.len);
+                    if (instr.op == .struct_new_desc) {
+                        const base = std.math.sub(usize, self.vstack.items.len, sf.len) catch return error.StackUnderflow;
+                        for (sf, 0..) |f, k| obj[k] = packField(f.storage, self.vstack.items[base + k]);
+                        self.vstack.shrinkRetainingCapacity(base);
+                    } else for (sf, 0..) |f, k| obj[k] = if (f.storage.unpacked().isRef()) null_ref else 0;
+                    try self.pushU64(try self.inst.allocObjectDesc(ti, obj, desc));
+                    pc += 1;
+                },
+                .ref_get_desc => {
+                    // Resolved through `gcEntry`, i.e. through the STORE — so a
+                    // reference that arrived from another instance reads ITS
+                    // object's descriptor, not whatever sits at that slot here.
+                    const ref = self.pop();
+                    if (ref == null_ref) return error.NullDescriptor;
+                    const e = try self.inst.gcEntry(ref);
+                    const desc = e.inst.gc_heap.items[e.index].descriptor;
+                    // Unreachable for a validated module — the type carries a
+                    // descriptor, so every allocation of it went through
+                    // `struct.new_desc`, which refuses null. A forged or
+                    // unvalidated reference can still land here, and it must trap
+                    // rather than hand back `null_ref` as a non-null result.
+                    if (desc == null_ref) return error.NullDescriptor;
+                    try self.pushU64(desc);
                     pc += 1;
                 },
                 .struct_get, .struct_get_s, .struct_get_u => {
@@ -4572,7 +4686,12 @@ fn evalConstExpr(ctx: ConstCtx, expr: []const u8) Error!Value {
                 try push(&stack, &sp, globals[gi].value);
             },
             0xd0 => { // ref.null <heaptype>
-                _ = try r.readByte();
+                // 🐛 This read ONE BYTE. A heap type is an `s33`, so any type
+                // index ≥ 128 desynced the const-expr stream, and the
+                // custom-descriptors `exact` former (`0x62 <typeidx>`) is two of
+                // them. The VALUE is discarded either way — a null is a null —
+                // but the byte count is not optional.
+                if (try r.readVarS33() == -0x1e) _ = try r.readVarS33();
                 try push(&stack, &sp, null_ref);
             },
             0xd2 => { // ref.func <funcidx>
@@ -4630,28 +4749,44 @@ fn evalConstGc(ctx: ConstCtx, r: *Reader, stack: *[16]Value, sp: *usize) Error!v
     // the property that keeps a global's initializer usable by an importer.
     const owner_slot = ctx.store_slot orelse return error.UnsupportedInstruction;
     const alloc = struct {
-        fn f(h: *std.ArrayList(Instance.HeapObject), g: std.mem.Allocator, slot: u32, ti: u32, fields: []Value) Error!Value {
+        fn f(h: *std.ArrayList(Instance.HeapObject), g: std.mem.Allocator, slot: u32, ti: u32, fields: []Value, desc: Value) Error!Value {
             const idx = h.items.len;
             // A test helper with no Instance in hand, so it checks the default directly.
             if (idx >= default_max_gc_objects) return error.GcHeapExhausted;
-            try h.append(g, .{ .type_index = ti, .fields = fields });
+            try h.append(g, .{ .type_index = ti, .fields = fields, .descriptor = desc });
             return gcRefValue(slot, @intCast(idx));
         }
     }.f;
 
     const sub = try r.readVarU32();
     switch (sub) {
-        0x00, 0x01 => { // struct.new / struct.new_default
+        // struct.new / struct.new_default / struct.new_desc / struct.new_default_desc.
+        // The descriptor-carrying forms are constant instructions (the corpus
+        // builds whole descriptor chains in globals); `ref.get_desc` is NOT, and
+        // falls through to the `else` arm below.
+        0x00, 0x01, 0x20, 0x21 => {
+            const with_desc = sub == 0x20 or sub == 0x21;
+            const defaulted = sub == 0x01 or sub == 0x21;
             const ti = try r.readVarU32();
             const fs = module.structFields(ti) orelse return error.UndefinedType;
             for (fs) |f| if (fieldIsV128(f.storage)) return error.UnsupportedInstruction;
+            // Popped FIRST — the descriptor is the last operand. A null one traps
+            // during instantiation, which is what `assert_trap (module …)` in
+            // `struct_new_desc.wast` asserts three ways.
+            var desc: Value = null_ref;
+            if (with_desc) {
+                if (sp.* < 1) return error.StackUnderflow;
+                sp.* -= 1;
+                desc = stack[sp.*];
+                if (desc == null_ref) return error.NullDescriptor;
+            }
             const obj = try arena.alloc(Value, fs.len);
-            if (sub == 0x00) {
+            if (!defaulted) {
                 const base = std.math.sub(usize, sp.*, fs.len) catch return error.StackUnderflow;
                 for (fs, 0..) |f, k| obj[k] = packField(f.storage, stack[base + k]);
                 sp.* = base;
             } else for (fs, 0..) |f, k| obj[k] = if (f.storage.unpacked().isRef()) null_ref else 0;
-            try pushConst(stack, sp, try alloc(heap, gpa, owner_slot, ti, obj));
+            try pushConst(stack, sp, try alloc(heap, gpa, owner_slot, ti, obj, desc));
         },
         0x06, 0x07 => { // array.new / array.new_default
             const ti = try r.readVarU32();
@@ -4664,14 +4799,14 @@ fn evalConstGc(ctx: ConstCtx, r: *Reader, stack: *[16]Value, sp: *usize) Error!v
                 sp.* -= 2;
                 const obj = try arena.alloc(Value, len);
                 @memset(obj, init_v);
-                try pushConst(stack, sp, try alloc(heap, gpa, owner_slot, ti, obj));
+                try pushConst(stack, sp, try alloc(heap, gpa, owner_slot, ti, obj, null_ref));
             } else {
                 if (sp.* < 1) return error.StackUnderflow;
                 const len = @as(u32, @bitCast(asI32(stack[sp.* - 1])));
                 sp.* -= 1;
                 const obj = try arena.alloc(Value, len);
                 @memset(obj, if (f.storage.unpacked().isRef()) null_ref else 0);
-                try pushConst(stack, sp, try alloc(heap, gpa, owner_slot, ti, obj));
+                try pushConst(stack, sp, try alloc(heap, gpa, owner_slot, ti, obj, null_ref));
             }
         },
         0x08 => { // array.new_fixed <type> <n>
@@ -4683,7 +4818,7 @@ fn evalConstGc(ctx: ConstCtx, r: *Reader, stack: *[16]Value, sp: *usize) Error!v
             const base = std.math.sub(usize, sp.*, n) catch return error.StackUnderflow;
             for (0..n) |k| obj[k] = packField(f.storage, stack[base + k]);
             sp.* = base;
-            try pushConst(stack, sp, try alloc(heap, gpa, owner_slot, ti, obj));
+            try pushConst(stack, sp, try alloc(heap, gpa, owner_slot, ti, obj, null_ref));
         },
         0x1c => { // ref.i31 — tag the low 31 bits, non-null (no allocation)
             if (sp.* < 1) return error.StackUnderflow;

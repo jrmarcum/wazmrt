@@ -350,6 +350,23 @@ pub const Op = enum(u8) {
     struct_get_u = 0xf7, // 0xFB 0x04 (packed)
     struct_set = 0xf8, // 0xFB 0x05: [(ref null $t) t'] -> []
 
+    // custom-descriptors (Track D3). ⚠️ **These three tags sit in the LOW byte
+    // range (`0x1d`/`0x1e`/`0x27`) — the last unassigned single-byte values —
+    // because `0xd7..0xfa` is full.** That makes them exactly the hazard the
+    // raw-byte guard in `decodeBody` exists for, and the reason each is listed
+    // there and in the internal-tag rejection test: `immediateKind` gives them
+    // `.gc_type`, a kind real ops also have, so an unguarded raw `0x1d` byte
+    // would decode AND EXECUTE as `struct.new_desc`. That accept-invalid has
+    // been shipped twice already (R3's `0xc5..0xcc`, R10's `0x16`/`0x17`).
+    //
+    // 🔒 **ONE unassigned byte is left. Track D4 needs three more tags, so it
+    // must widen `Op` to `enum(u16)` and move every internal tag above `0xff`
+    // FIRST** — at which point no raw byte can name one and the guard collapses
+    // to nothing. Doing that here would have made D3's size delta unattributable.
+    struct_new_desc = 0x1d, // 0xFB 0x20: [t'* (ref null (exact $d))] -> [(ref (exact $t))]
+    struct_new_default_desc = 0x1e, // 0xFB 0x21: [(ref null (exact $d))] -> [(ref (exact $t))]
+    ref_get_desc = 0x27, // 0xFB 0x22: [(ref null $t)] -> [(ref exact? $d)]
+
     // GC casts (0xFB prefix). ref.test/ref.cast carry a target reference type
     // (nullability + heap type); the null/non-null encodings collapse to one
     // internal tag distinguished by the decoded `RefType.nullable`.
@@ -417,6 +434,9 @@ pub fn gcSubOpcode(op: Op) ?u8 {
     return switch (op) {
         .struct_new => 0x00,
         .struct_new_default => 0x01,
+        .struct_new_desc => 0x20,
+        .struct_new_default_desc => 0x21,
+        .ref_get_desc => 0x22,
         .struct_get => 0x02,
         .struct_get_s => 0x03,
         .struct_get_u => 0x04,
@@ -514,7 +534,14 @@ pub const Imm = union(enum) {
     select_types: []const types.ValType,
     /// Heap type of `ref.null` (`0xd0`) — abstract head or a concrete type index;
     /// the validator resolves it to a (possibly concrete) nullable value type.
-    ref_type: HeapType,
+    /// `ref.null <heaptype>`. Carries exactness because the heap-type grammar
+    /// admits the custom-descriptors `exact` former here too — `(ref.null (exact
+    /// $t))` is a NULL of the exact type, and dropping the prefix would type it
+    /// as the inexact `(ref null $t)`, which `ref.get_desc` then reads as "not an
+    /// exact input" and answers with an inexact descriptor. `nullable` is always
+    /// true for this immediate; the field rides along so `refTypeValType` takes it
+    /// unchanged.
+    ref_type: RefType,
     /// A GC type index (`struct.new`/`array.new`/`array.get`/…).
     gc_type: u32,
     /// A GC struct type index + field index (`struct.get`/`struct.set`/…).
@@ -669,8 +696,10 @@ pub fn immediateKind(op: Op) ImmKind {
         // GC ops with no immediate: ref.i31/i31.get_s/i31.get_u, array.len, and
         // the extern↔any bridge (`0x16`/`0x17`, rejected as raw bytes below).
         0xf0, 0xf1, 0xf2, 0xed, 0x16, 0x17 => .none,
-        // GC ops with a single type index (`array.fill` = 0xDF included).
-        0xe6, 0xe7, 0xe9, 0xea, 0xeb, 0xec, 0xf3, 0xf4, 0xdf => .gc_type,
+        // GC ops with a single type index (`array.fill` = 0xDF included), plus
+        // custom-descriptors' `struct.new_desc`/`struct.new_default_desc`/`ref.get_desc`
+        // (`0x1d`/`0x1e`/`0x27` — low-range tags, rejected as raw bytes below).
+        0xe6, 0xe7, 0xe9, 0xea, 0xeb, 0xec, 0xf3, 0xf4, 0xdf, 0x1d, 0x1e, 0x27 => .gc_type,
         // GC struct ops with a type index + field index.
         0xf5, 0xf6, 0xf7, 0xf8 => .gc_field,
         // array.new_fixed: type index + element count.
@@ -1078,6 +1107,9 @@ pub fn decodeBodyTracked(
             const instr: Instr = switch (try r.readVarU32()) {
                 0x00 => .{ .op = .struct_new, .imm = .{ .gc_type = try r.readVarU32() } },
                 0x01 => .{ .op = .struct_new_default, .imm = .{ .gc_type = try r.readVarU32() } },
+                0x20 => .{ .op = .struct_new_desc, .imm = .{ .gc_type = try r.readVarU32() } },
+                0x21 => .{ .op = .struct_new_default_desc, .imm = .{ .gc_type = try r.readVarU32() } },
+                0x22 => .{ .op = .ref_get_desc, .imm = .{ .gc_type = try r.readVarU32() } },
                 0x02 => .{ .op = .struct_get, .imm = try readGcField(&r) },
                 0x03 => .{ .op = .struct_get_s, .imm = try readGcField(&r) },
                 0x04 => .{ .op = .struct_get_u, .imm = try readGcField(&r) },
@@ -1185,6 +1217,16 @@ pub fn decodeBodyTracked(
         // Their `immediateKind` is `.none`, which is reachable from real ops, so
         // without this arm a raw `0x16` byte would decode and EXECUTE as
         // `extern.convert_any` — the accept-invalid R3 closed for `0xc5..0xcc`.
+        // ⚠️ **D3's three tags (`0x1d`/`0x1e`/`0x27`) are deliberately NOT listed
+        // here, and an inversion is why.** They were added to this condition
+        // first; removing them again failed no test. Their `immediateKind` is
+        // `.gc_type`, and the kind switch below refuses every `.gc_type` byte
+        // outright — no real single-byte op carries a GC type index. That is
+        // precisely the property the kind guard LACKS for `.none`/`.table` tags,
+        // which is why those need the byte arms and these do not. A redundant
+        // guard carrying a false reason ("a kind real ops have") is how the next
+        // reader learns the wrong rule, so it is gone and the test below pins the
+        // behaviour instead.
         if (b0 == 0x16 or b0 == 0x17 or
             (b0 >= 0xc5 and b0 <= 0xcf) or (b0 >= 0xd7 and b0 <= 0xfa)) return error.UnsupportedOpcode;
         const op: Op = @enumFromInt(b0);
@@ -1229,7 +1271,10 @@ pub fn decodeBodyTracked(
                 }
                 break :blk .{ .select_types = tys };
             },
-            .ref_type => .{ .ref_type = try readHeapType(&r) },
+            .ref_type => blk: {
+                const ht = try readHeapTypeExact(&r);
+                break :blk .{ .ref_type = .{ .nullable = true, .heap = ht.heap, .exact = ht.exact } };
+            },
             .tag => .{ .tag = try r.readVarU32() },
             .try_table => try readTryTable(&r, a),
             // These are `0xFC`-prefixed ops decoded via the interception above;
@@ -1344,6 +1389,14 @@ test "rejects raw internal-tag bytes that are not real single-byte opcodes" {
         0xc5, 0xc8, 0xcc, // saturating-truncation range: low, middle, high
         0xcd, 0xce, 0xcf, // array.copy / array.init_data / array.init_elem
         0xdd, 0xde, 0xdf, // array.new_data / array.new_elem / array.fill
+        // D3: the custom-descriptors tags, and the FIRST internal tags in the LOW
+        // range. These are caught by the `.gc_type` arm of the immediate-kind
+        // switch rather than by a byte range — no real single-byte op carries a
+        // GC type index — so they are listed here to PIN that, not because a byte
+        // guard covers them. If a later change ever gives one of them an
+        // immediate kind a real op shares, this line starts failing and the byte
+        // guard becomes necessary; that is the whole point of listing them.
+        0x1d, 0x1e, 0x27, // struct.new_desc / struct.new_default_desc / ref.get_desc
     };
     for (tags) |b| {
         const body = [_]u8{b};

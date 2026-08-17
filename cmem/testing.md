@@ -83,26 +83,33 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
 
 ## 📊 CURRENT spec-testsuite score (2026-08-17) — EVERY CORE SPEC FILE IS AT ZERO
 
-**284 files — 63,315 assertions passed / 16 failed / 578 skipped**, and `zig build conformance -Dbaseline=tools/conformance-baseline.txt` reports **0 regressions**. This is the number to quote;
-every snapshot below it is older and kept as history. *(Superseded same day: 63,344 / 53 / 515, then 63,190 / 81 / 673, then 62,898 / 81 / 965.)*
+**284 files — 63,391 assertions passed / 4 failed / 497 skipped**, and `zig build conformance -Dbaseline=tools/conformance-baseline.txt` reports **0 regressions**. This is the number to quote;
+every snapshot below it is older and kept as history. *(Superseded same day: 63,315 / 16 / 578, then 63,344 / 53 / 515, then 63,190 / 81 / 673, then 62,898 / 81 / 965.)*
 
-**Deliberate spec deviations: ZERO** (the last, `anyfunc`, closed 2026-08-17). **ALL 16 remaining
-failures are custom-descriptors** — `roadmap.md`'s Track D, the only untargeted proposal left. Its
-D1 (`exact` references) and **D2 (`(descriptor $d)`/`(describes $s)`) are both DONE**, so the whole
-TYPE-SECTION half of the proposal ships; what is left is instructions (D3/D4/D5). **Next: D3** —
-see the roadmap, written up so it can be resumed cold.
+**Deliberate spec deviations: ZERO** (the last, `anyfunc`, closed 2026-08-17). **ALL 4 remaining
+failures are custom-descriptors** — `roadmap.md`'s Track D, the only untargeted proposal left.
+**D1, D2, D3 and D5 are all DONE**; only **D4, the descriptor casts**, remains, plus one
+well-diagnosed assertion each in `exact-func-import.wast` (link-time import matching) and
+`exact.wast`. **Next: D4** — see the roadmap, and note its stated prerequisite (widen `Op` to
+`enum(u16)`; one internal tag byte is left).
 
-⚠️ **D2 moved the pass and total columns DOWN and that was the correct outcome — read this before
-diffing.** 63,344/53/515 → 63,315/16/578: **−37 failures, −29 passes, +63 skips, −3 total.**
-- The 29 lost passes were **FALSE passes**. Those modules previously assembled with the
-  `(descriptor …)` clause silently DROPPED, so their assertions ran against a module the file did
-  not write. Assembled correctly, they are now refused at the D3/D4 instruction they use → skip.
-  Second instance of this exact pattern (D1 lost 18 the same way): **implementing half a feature
-  exposes the false passes the gap was banking.**
-- The 3-assertion drop in the GRAND TOTAL is new and is not loss. A module that FAILS to build
-  contributes one failure; one that BUILDS contributes nothing. Three modules started building
-  (2 in `binary-descriptors.wast`, 1 in `descriptors.wast`) and took three countable assertions out
-  of the corpus with them. **The corpus total is not a conserved quantity** — expect this at D3.
+⚠️ **RANK D4 BY THE SKIP COLUMN.** Its two failures are one each in `br_on_cast.wast` and
+`br_on_cast_fail.wast`; the real size is the **353 skips** in `br_on_cast_desc_eq.wast` (122),
+`br_on_cast_desc_eq_fail.wast` (122) and `ref_cast_desc_eq.wast` (109) — all at ZERO failures
+because their modules do not build. Sixth restatement of R3/R5/P.
+
+⚠️ **D2 AND D3 BOTH MOVED PASSES AND THE GRAND TOTAL DOWN, AND BOTH TIMES THAT WAS CORRECT — read
+this before diffing.** D2: 63,344/53/515 → 63,315/16/578. D3: 63,315/16/578 → 63,391/4/497
+(+76 passes, −12 failures, −81 skips, **−16 total**).
+- Passes lost to a **FALSE-PASS collapse**: those modules had been assembling with a clause
+  silently DROPPED, so their assertions ran against a module the file did not write. Assembled
+  correctly they are refused at the next unimplemented instruction → a skip. Third instance now
+  (D1 lost 18, D2 lost 29): **implementing half a feature exposes the false passes the gap was
+  banking.**
+- The GRAND TOTAL is **not a conserved quantity**. A module that FAILS to build contributes one
+  countable failure; one that BUILDS contributes nothing. So every module that starts building
+  removes an assertion from the total — D2 −3, D3 −16. Expect it again at D4, where 353 skipped
+  assertions sit behind three modules that do not build.
 ✅ **Track P (custom-page-sizes) is DONE 2026-08-17**: all four files 0 failed / 0 skipped, 61
 assertions passing where 5 passed / 2 failed / 69 skipped. ⚠️ **It was carried in the baseline as
 "2 assertions" and was worth 69 SKIPS — a 35× undercount**, because a module the assembler cannot
@@ -308,14 +315,20 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
   *exactly* its ceiling; the file was two builds old. **An exactly-zero delta is a timestamp check
   waiting to happen.**
 
-**Unit tests: 667/667** (`zig build test --summary all`, 2026-08-17 end of day, from an NTFS cwd —
-`test-safe` 667/667, `test-security` 3/3). The day's additions: F3+F4 added 5 (era policy ×3,
+**Unit tests: 691/691** (`zig build test --summary all`, 2026-08-17 end of day, from an NTFS cwd —
+`test-safe` 691/691, `test-security` 3/3). The day's additions: F3+F4 added 5 (era policy ×3,
 multi_table gating, the every-feature-settable regression test), the skip-scoring split added 1,
 and **Track D2 added 8** — the three type-identity keys (`canonicalizeTypes`, `interp.groupKey`,
 `typematch.eqMember`) each with a wrong-answer test and a control arm, the emitted BYTES, the
 text+binary clause grammar, the link and subtyping validation rules, and the descriptor-less
-allocation refusal. *(Superseded: 651 earlier the same day.)*
-⚠️ **From this repo's own `D:` cwd the same run reads 663/667 (4 skipped)** — `std.testing.tmpDir`
+allocation refusal. **Track D3 added 12 more** — the cross-instance descriptor-identity test (two
+instances of ONE definition, so a type-index representation would pass every type check and still
+answer wrong), exactness propagation in `ref.get_desc` both ways, the exact descriptor operand,
+allocator/type agreement on both validator paths, the emitted BYTES for all three opcodes, the
+distinct `NullDescriptor` trap, the cross-instance EXACT cast, the funcref import-chain walk, and
+regression tests for the three shipped defects D3 uncovered.
+*(Superseded: 667 and 651 earlier the same day.)*
+⚠️ **From this repo's own `D:` cwd the same run reads 687/691 (4 skipped)** — `std.testing.tmpDir`
 scratches under `.zig-cache/tmp` relative to the CWD, which exFAT cannot give symlinks, and
 redirecting the zig cache does NOT reach it. Quote NTFS numbers.
 *(Superseded: 633 earlier the same day; 631, labelled "final" on 2026-08-14. Below is that entry,

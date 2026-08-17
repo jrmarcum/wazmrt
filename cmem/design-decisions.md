@@ -576,13 +576,13 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
     **Removing a workaround can pay for the rule that made it unnecessary**, and a win left
     unrecorded is headroom for the next unnoticed drift.
     **Live sizes (2026-08-17 end of day, ReleaseSmall, Zig 0.16.0, x86_64-windows):** exe
-    **972,800**, static lib **1,037,954**, dll **894,976** — all three verified in one run
-    (Track D2: +2,048 / +2,978 / +2,560).
+    **976,384**, static lib **1,042,012**, dll **898,048** — all three verified in one run
+    (Track D3: +3,584 / +4,058 / +3,072; D2 before it: +2,048 / +2,978 / +2,560).
     ⚠️ **Measure in the REFERENCE CONFIGURATION** (a `C:` copy with its own default `.zig-cache`):
     the static lib embeds object/source paths, so one unchanged commit reads anywhere in
     1,029,730–1,029,922 depending on WHERE it was built, while the PE files hide the same
     difference in alignment. A sub-KB delta is not evidence of code growth until the parent is
-    re-measured the same way. *(Superseded: 970,752 / 1,034,976 / 892,416 and 964,608 / 1,029,730 / 888,832 earlier the same day;
+    re-measured the same way. *(Superseded: 972,800 / 1,037,954 / 894,976, 970,752 / 1,034,976 / 892,416 and 964,608 / 1,029,730 / 888,832 earlier the same day;
     2026-08-13 after R10 — exe 953,344, static lib 1,016,766, dll 878,592.)* ⚠️ Measure the static lib from a PLAIN `zig build` —
     `zig build dll` overwrites `wazmrt.lib` with the DLL's much smaller import library. ⚠️ And
     **`zig build` does not produce the DLL at all**, so the gate silently grades a stale one: R3's

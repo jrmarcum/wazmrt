@@ -1556,10 +1556,20 @@ fn parseImport(a: std.mem.Allocator, items: []const Sexpr, global_imports: *List
     var mutable = false;
     var valtype: V = undefined;
     const gtype = try nth(desc, di);
+    // 🐛 **SHIPPED DEFECT, fixed 2026-08-17 (found by Track D3's corpus): an
+    // imported global could not have a REFERENCE type at all.** This unwrapped
+    // EVERY list as `(mut T)` and parsed its last element, so
+    // `(import … (global (ref null func)))` handed `parseValType` the bare atom
+    // `func` and came back `BadValType` — and `(ref null $t)` handed it `$t`.
+    // Nothing to do with custom-descriptors; `(ref null (exact $t))` is simply
+    // the first spelling in the corpus that reached this line. The `(mut …)`
+    // shape must be TESTED, not assumed, because `(ref …)` is a list too.
     if (gtype.asList()) |gt| {
         if (gt.len == 0) return error.BadModuleField;
-        mutable = eqAtom(gt[0], "mut");
-        valtype = try parseValType(gt[gt.len - 1], type_names);
+        if (eqAtom(gt[0], "mut")) {
+            mutable = true;
+            valtype = try parseValType(try nth(gt, gt.len - 1), type_names);
+        } else valtype = try parseValType(gtype, type_names); // `(ref null? ht)`
     } else {
         valtype = try parseValType(gtype, type_names);
     }
@@ -1995,6 +2005,16 @@ fn emitFoldedOne(ctx: *Ctx, l: []const Sexpr, i: usize) Error!usize {
             var j = ann.next;
             while (j < l.len) j = try emitOne(ctx, l, j); // operands
             try emitCallIndirect(ctx, op, ann.idx, ann.table);
+        },
+        // `ref.null`'s heap type may be a LIST — `(ref.null (exact $t))` — and
+        // `emitFoldedPlain` stops collecting immediates at the first non-atom, so
+        // without this arm the `(exact $t)` was taken for a nested folded
+        // instruction and came back `UnknownInstr` ("no mnemonic `exact`"). The
+        // FLAT path never had the bug: it takes `flatImmCount` items whatever
+        // their shape. One more producer split where only half knew the grammar.
+        .ref_null => {
+            if (l.len != 2) return error.BadImmediate; // exactly one heap-type immediate, no operands
+            try emitInstr(ctx, op, l[1..2]);
         },
         .ref_test, .ref_cast => {
             if (l.len < 2) return error.BadImmediate;
@@ -2714,11 +2734,26 @@ fn emitInstr(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
         // ref.null takes a heap type as an `s33`: an abstract head code, or a
         // concrete `$t` / index (so `ref.null $t` is typed `(ref null $t)`).
         .ref_type => {
-            const ht = try imm0(immediates);
+            var ht = try imm0(immediates);
+            // `(ref.null (exact $t))` — the heap-type grammar admits the
+            // custom-descriptors former here as much as it does in a value type,
+            // and D3's corpus uses it to write a typed null descriptor. Emitted as
+            // `0x62` (the s33 −0x1e) followed by the type index, which is what
+            // `readHeapTypeExact` reads back.
+            var exact = false;
+            if (ht.asList()) |inner| {
+                if (inner.len != 2 or !eqAtom(inner[0], "exact")) return error.BadImmediate;
+                exact = true;
+                ht = inner[1];
+            }
             const atom = ht.asAtom() orelse return error.BadImmediate;
             if (abstractHeapCode(atom)) |code| {
+                // `exact` binds a single CONCRETE type; there is nothing for
+                // "exactly this" to mean about a family head.
+                if (exact) return error.BadValType;
                 try sleb(ctx.a, ctx.out, code);
             } else {
+                if (exact) try sleb(ctx.a, ctx.out, -0x1e);
                 try sleb(ctx.a, ctx.out, @intCast(try resolveType(ctx.type_names, ht)));
             }
         },
@@ -3219,11 +3254,13 @@ fn lookupOp(name: []const u8) ?Op {
 fn untargetedProposalMnemonic(name: []const u8) bool {
     const known = [_][]const u8{
         // custom-descriptors (Track D). Includes forms the corpus does not currently reach —
-        // those files fail earlier, at the `(descriptor …)` type syntax — because this list must
-        // describe the PROPOSAL, not today's first point of failure.
-        "ref.get_desc",     "ref.cast_desc",           "ref.cast_desc_eq",
-        "struct.new_desc",  "struct.new_default_desc", "br_on_cast_desc",
-        "br_on_cast_desc_eq", "br_on_cast_desc_fail",  "br_on_cast_desc_eq_fail",
+        // those files fail earlier — because this list must describe the PROPOSAL, not today's
+        // first point of failure. ⚠️ `struct.new_desc` / `struct.new_default_desc` /
+        // `ref.get_desc` were removed 2026-08-17 (D3): they are IMPLEMENTED, so `lookupOp`
+        // resolves them and this list is never consulted for them. Leaving a stale name here is
+        // not merely dead — it is a claim that we still refuse the instruction.
+        "ref.cast_desc",      "ref.cast_desc_eq",       "br_on_cast_desc",
+        "br_on_cast_desc_eq", "br_on_cast_desc_fail",   "br_on_cast_desc_eq_fail",
         "array.new_exact",
         // wide-arithmetic.
         "i64.add128",       "i64.sub128",              "i64.mul_wide_s",
@@ -4251,9 +4288,16 @@ test "mnemonic lookup: `catch` resolves like `catch_all`, and gaps are told from
     // (2) The split that scoring depends on. A real instruction from a proposal wazmrt does not
     //     target is OUR gap; a mnemonic that exists in no proposal is a malformation.
     try std.testing.expect(untargetedProposalMnemonic("i64.add128"));
-    try std.testing.expect(untargetedProposalMnemonic("ref.get_desc"));
-    try std.testing.expect(untargetedProposalMnemonic("struct.new_desc"));
+    try std.testing.expect(untargetedProposalMnemonic("br_on_cast_desc_eq"));
     try std.testing.expect(!untargetedProposalMnemonic("some.bogus.instruction"));
+    // (3) …and the OTHER direction, which is the one that goes stale. An IMPLEMENTED instruction
+    //     must resolve in `lookupOp` and must NOT be on the untargeted list — a name left behind
+    //     there claims we still refuse it, and would route a genuine malformation involving it to
+    //     "our gap" (a skip) instead of a verdict. Track D3 implemented these three.
+    for ([_][]const u8{ "ref.get_desc", "struct.new_desc", "struct.new_default_desc" }) |m| {
+        try std.testing.expect(lookupOp(m) != null);
+        try std.testing.expect(!untargetedProposalMnemonic(m));
+    }
     // ⚠️ The cases that actually bit: real-looking near-misses the spec suite constructs on
     // purpose. `i32.load32` does not exist (only `i64.load32_s/u`); `pmin`/`ceil` are float ops,
     // so an integer shape is nonsense; `v8x16.shuffle` and `get_local` are pre-standard spellings
@@ -4266,10 +4310,12 @@ test "mnemonic lookup: `catch` resolves like `catch_all`, and gaps are told from
         try std.testing.expect(!untargetedProposalMnemonic(m));
     }
 
-    // (3) And none of the untargeted names accidentally resolves — if one ever did, the entry
-    //     above would be dead weight silently claiming to gate something.
+    // (4) And none of the STILL-untargeted names accidentally resolves — if one ever did, the
+    //     entry would be dead weight silently claiming to gate something. The reverse check,
+    //     for names that HAVE been implemented, is (3) above; `ref.get_desc` moved from here
+    //     to there when D3 landed it.
     try std.testing.expect(lookupOp("i64.add128") == null);
-    try std.testing.expect(lookupOp("ref.get_desc") == null);
+    try std.testing.expect(lookupOp("br_on_cast_desc_eq") == null);
 }
 
 test "br_table label types need only agree in ARITY, and only in polymorphic code" {
@@ -7572,5 +7618,338 @@ test "D2 soundness: a described type cannot be allocated without its descriptor"
         var m = try Module.decode(a, try assemble(a, "(module (type $a (struct)) (func (result anyref) (struct.new $a)))"));
         defer m.deinit();
         try validate(a, &m);
+    }
+}
+
+test "D3 soundness: `ref.get_desc` exactness PROPAGATES from the operand" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // 🔒 **The soundness hinge of D3, and it is a VALIDATION rule, so it is written by
+    // construction rather than measured.** `ref.get_desc $t` may claim `(ref (exact $d))` only
+    // when the operand was exactly `$t`. An operand of some `$c <: $t` carries a `$d2 <: $d`, so
+    // handing back `(ref (exact $d))` for it is type confusion — the guest gets a value of a type
+    // it proved it did not have, which is D1's hole reached through the heap instead of a cast.
+    const types_ =
+        \\(rec
+        \\  (type $a (sub (descriptor $b) (struct)))
+        \\  (type $b (sub (describes $a) (struct)))
+        \\  (type $c (sub $a (descriptor $d) (struct)))
+        \\  (type $d (sub $b (describes $c) (struct))))
+    ;
+    // ACCEPTED: an exact operand of the INSPECTED type gives an exact result…
+    for ([_][]const u8{
+        "(func (param (ref (exact $a))) (result (ref (exact $b))) (ref.get_desc $a (local.get 0)))",
+        // …a bottom operand may claim it, because it will never produce a value…
+        "(func (result (ref (exact $b))) (ref.get_desc $a (ref.null none)))",
+        "(func (result (ref (exact $b))) (ref.get_desc $a (unreachable)))",
+        // …and an inexact operand still gives the inexact result, which is what keeps this a
+        // rule about EXACTNESS and not a blanket refusal.
+        "(func (param (ref $a)) (result (ref $b)) (ref.get_desc $a (local.get 0)))",
+        "(func (param (ref (exact $c))) (result (ref $b)) (ref.get_desc $a (local.get 0)))",
+    }) |body| {
+        const src = try std.fmt.allocPrint(a, "(module {s} {s})", .{ types_, body });
+        var m = try Module.decode(a, try assemble(a, src));
+        defer m.deinit();
+        try validate(a, &m);
+    }
+
+    // REJECTED — each is a distinct way to claim exactness the operand did not carry.
+    for ([_][]const u8{
+        // An inexact operand cannot produce an exact result.
+        "(func (param (ref $a)) (result (ref (exact $b))) (ref.get_desc $a (local.get 0)))",
+        // ...nor an inexact NULL, which is the case a nullability-only check would miss.
+        "(func (result (ref (exact $b))) (ref.get_desc $a (ref.null $a)))",
+        // An operand exact in a SUBTYPE is not exact in the inspected type: its real descriptor
+        // is `$d`, not `$b`.
+        "(func (param (ref (exact $c))) (result (ref (exact $b))) (ref.get_desc $a (local.get 0)))",
+        "(func (result (ref (exact $b))) (ref.get_desc $a (ref.null (exact $c))))",
+        // The result describes the INSPECTED type, never the operand's actual one.
+        "(func (param (ref (exact $c))) (result (ref $d)) (ref.get_desc $a (local.get 0)))",
+    }) |body| {
+        const src = try std.fmt.allocPrint(a, "(module {s} {s})", .{ types_, body });
+        var m = try Module.decode(a, try assemble(a, src));
+        defer m.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(a, &m));
+    }
+}
+
+test "D3: the allocator and the type must agree about carrying a descriptor" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Both directions, and both are needed: a described type allocated WITHOUT its descriptor
+    // would carry a description it does not have, and an undescribed one allocated WITH one
+    // would carry a description its type says nothing about. D2 added the first half (that is
+    // what the plain-form refusal was); D3 adds the second and relaxes the first for the new
+    // forms. ⚠️ Enforced on TWO paths — a function body and a const-expr — which are separate
+    // validators; the const-expr one had the D2 rule missing entirely until D3.
+    const types_ =
+        \\(rec (type $a (descriptor $b) (struct)) (type $b (describes $a) (struct)))
+        \\(type $plain (struct))
+    ;
+    for ([_][]const u8{
+        "(func (result anyref) (struct.new $a))", // described type, plain allocator
+        "(func (result anyref) (struct.new_default $a))",
+        "(func (result anyref) (struct.new_desc $plain (struct.new $b)))", // undescribed, desc allocator
+        "(func (result anyref) (struct.new_default_desc $plain))",
+        "(global (ref (exact $a)) (struct.new $a))", // the const-expr path
+        "(global (ref (exact $plain)) (struct.new_default_desc $plain))",
+    }) |field| {
+        const src = try std.fmt.allocPrint(a, "(module {s} {s})", .{ types_, field });
+        var m = try Module.decode(a, try assemble(a, src));
+        defer m.deinit();
+        try std.testing.expectError(error.InvalidDescriptor, validate(a, &m));
+    }
+    // The matching pairs must still be accepted, on both paths.
+    for ([_][]const u8{
+        "(func (result anyref) (struct.new_desc $a (struct.new $b)))",
+        "(func (result anyref) (struct.new_default_desc $a (struct.new $b)))",
+        "(func (result anyref) (struct.new $plain))",
+        "(global (ref (exact $a)) (struct.new_desc $a (struct.new $b)))",
+    }) |field| {
+        const src = try std.fmt.allocPrint(a, "(module {s} {s})", .{ types_, field });
+        var m = try Module.decode(a, try assemble(a, src));
+        defer m.deinit();
+        try validate(a, &m);
+    }
+}
+
+test "D3 soundness: `struct.new_desc` demands the EXACT descriptor, not a relative" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // 🔒 Accepting an inexact `(ref $b)` here would let a value be built whose stored description
+    // is some `$d <: $b`, and a later `ref.get_desc` on an exact `$a` would then hand the guest a
+    // `(ref (exact $b))` naming a value that is not one. Every near-miss the operand could be is
+    // listed, because "it type-checks as a struct" is exactly the level of care that is wrong.
+    const types_ =
+        \\(rec
+        \\  (type $a (sub (descriptor $b) (struct)))
+        \\  (type $b (sub (describes $a) (struct)))
+        \\  (type $c (sub $a (descriptor $d) (struct)))
+        \\  (type $d (sub $b (describes $c) (struct))))
+    ;
+    for ([_][]const u8{
+        "(param (ref $b))", // inexact — the descriptor must be exact
+        "(param (ref struct))", // an abstract struct ref
+        "(param (ref (exact $a)))", // the allocated type itself
+        "(param (ref (exact $d)))", // the SUBTYPE's descriptor
+    }) |param| {
+        const src = try std.fmt.allocPrint(a,
+            "(module {s} (func {s} (result anyref) (struct.new_desc $a (local.get 0))))",
+            .{ types_, param },
+        );
+        var m = try Module.decode(a, try assemble(a, src));
+        defer m.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(a, &m));
+    }
+    // …and the SUPERTYPE's descriptor is wrong for the subtype's allocation, the mirror case.
+    {
+        const src = try std.fmt.allocPrint(a,
+            "(module {s} (func (param (ref (exact $b))) (result anyref) (struct.new_desc $c (local.get 0))))",
+            .{types_},
+        );
+        var m = try Module.decode(a, try assemble(a, src));
+        defer m.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(a, &m));
+    }
+    // The right descriptor is accepted, nullable or not — otherwise the five rejections above
+    // would prove only that we refuse the instruction.
+    for ([_][]const u8{ "(param (ref (exact $b)))", "(param (ref null (exact $b)))" }) |param| {
+        const src = try std.fmt.allocPrint(a,
+            "(module {s} (func {s} (result anyref) (struct.new_desc $a (local.get 0))))",
+            .{ types_, param },
+        );
+        var m = try Module.decode(a, try assemble(a, src));
+        defer m.deinit();
+        try validate(a, &m);
+    }
+
+    // ⚠️ **And the same rule on the CONST-EXPR path, which is a second validator.** An inversion
+    // showed the body-path exactness check alone caught nothing here: a global initializer can
+    // build a whole descriptor chain, so a subtype's descriptor slipping in through a global is
+    // the same type confusion with a different entry point. `$d` is `$c`'s descriptor and a
+    // SUBTYPE of `$b` — so it satisfies an inexact `(ref null $b)` and must not satisfy the exact
+    // one. That is the operand shape the check exists for; an unrelated type would be refused by
+    // ordinary subtyping and prove nothing.
+    {
+        const bad = try std.fmt.allocPrint(a,
+            "(module {s} (global (ref (exact $a)) (struct.new_desc $a (struct.new $d))))",
+            .{types_},
+        );
+        var m = try Module.decode(a, try assemble(a, bad));
+        defer m.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(a, &m));
+    }
+    {
+        const ok = try std.fmt.allocPrint(a,
+            "(module {s} (global (ref (exact $c)) (struct.new_desc $c (struct.new $d))))",
+            .{types_},
+        );
+        var m = try Module.decode(a, try assemble(a, ok));
+        defer m.deinit();
+        try validate(a, &m);
+    }
+}
+
+test "D3: a null descriptor traps as NullDescriptor, not as an ordinary null deref" {
+    // The two are different guest mistakes with different spec messages ("null descriptor
+    // reference"), and `gcEntry` would already trap `ref.get_desc` on null as `NullReference` —
+    // so a trap-or-not assertion cannot tell the explicit check from the incidental one. An
+    // inversion proved it: commenting the `ref.get_desc` null check out failed nothing until
+    // this test named the error.
+    try std.testing.expectError(error.NullDescriptor, assembleAndRun(
+        \\(module
+        \\  (rec (type $a (descriptor $b) (struct)) (type $b (describes $a) (struct)))
+        \\  (func (export "f") (result (ref (exact $b)))
+        \\    (ref.get_desc $a (ref.null (exact $a)))))
+    , "f", &.{}));
+    try std.testing.expectError(error.NullDescriptor, assembleAndRun(
+        \\(module
+        \\  (rec (type $a (descriptor $b) (struct)) (type $b (describes $a) (struct)))
+        \\  (func (export "f") (result (ref (exact $a)))
+        \\    (struct.new_desc $a (ref.null none))))
+    , "f", &.{}));
+}
+
+test "D3: `ref.get_desc` needs a described type, and is not a constant instruction" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    for ([_]struct { src: []const u8, want: anyerror }{
+        // "type without descriptor" — including a non-struct, which has no descriptor either.
+        .{ .src = "(module (type $a (struct)) (func (param (ref $a)) (result anyref) (ref.get_desc $a (local.get 0))))", .want = error.InvalidDescriptor },
+        .{ .src = "(module (type $a (func)) (func (param (ref $a)) (result anyref) (ref.get_desc $a (local.get 0))))", .want = error.InvalidDescriptor },
+        // The DESCRIPTOR does not itself have one here, so it cannot be inspected either.
+        .{ .src = "(module (rec (type $a (descriptor $b) (struct)) (type $b (describes $a) (struct))) (func (param (ref $b)) (result anyref) (ref.get_desc $b (local.get 0))))", .want = error.InvalidDescriptor },
+        // "unknown type" — the index is checked before the descriptor link is read, so the
+        // report names the real problem instead of blaming a missing descriptor.
+        .{ .src = "(module (func (result anyref) (ref.get_desc 1 (unreachable))))", .want = error.UndefinedType },
+        // Reading a descriptor is a HEAP read, so it cannot appear in a constant expression —
+        // unlike `struct.new_desc`, which can.
+        .{ .src = "(module (rec (type $a (descriptor $b) (struct)) (type $b (describes $a) (struct))) (global (ref $b) (ref.get_desc $a (ref.null none))))", .want = error.ConstantExpressionRequired },
+    }) |c| {
+        var m = try Module.decode(a, try assemble(a, c.src));
+        defer m.deinit();
+        try std.testing.expectError(c.want, validate(a, &m));
+    }
+}
+
+test "D3: the descriptor instructions assemble to the BYTES the proposal assigns" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // ⚠️ **ASSERTS THE BYTES.** Only `ref.get_desc` is pinned by the corpus (`ref_get_desc.wast`
+    // hand-writes `\fb\22`); `struct.new_desc`/`struct.new_default_desc` appear in TEXT modules
+    // only, so a wrong sub-opcode for those would round-trip through our own decoder perfectly
+    // and be rejected by every other runtime. The values are binaryen's table, cross-checked
+    // against that one corpus byte.
+    const src =
+        \\(module
+        \\  (rec (type $a (descriptor $b) (struct)) (type $b (describes $a) (struct)))
+        \\  (func (param (ref (exact $b))) (result anyref) (struct.new_desc $a (local.get 0)))
+        \\  (func (param (ref (exact $b))) (result anyref) (struct.new_default_desc $a (local.get 0)))
+        \\  (func (param (ref $a)) (result anyref) (ref.get_desc $a (local.get 0))))
+    ;
+    const bin = try assemble(a, src);
+    try std.testing.expect(std.mem.indexOf(u8, bin, &[_]u8{ 0xfb, 0x20, 0x00 }) != null); // struct.new_desc $a
+    try std.testing.expect(std.mem.indexOf(u8, bin, &[_]u8{ 0xfb, 0x21, 0x00 }) != null); // struct.new_default_desc $a
+    try std.testing.expect(std.mem.indexOf(u8, bin, &[_]u8{ 0xfb, 0x22, 0x00 }) != null); // ref.get_desc $a
+    var m = try Module.decode(a, bin);
+    defer m.deinit();
+    try validate(a, &m);
+
+    // `(ref.null (exact $t))` is `0xd0 0x62 <ti>` — the same `exact` former a value type uses,
+    // in the heap-type position of an instruction immediate. The FOLDED form is the one that was
+    // broken (`emitFoldedPlain` stops collecting immediates at the first non-atom), so it is the
+    // one asserted here.
+    {
+        const n = try assemble(a, "(module (type $s (struct)) (func (result anyref) (ref.null (exact $s))))");
+        try std.testing.expect(std.mem.indexOf(u8, n, &[_]u8{ 0xd0, 0x62, 0x00 }) != null);
+        var mn = try Module.decode(a, n);
+        defer mn.deinit();
+        try validate(a, &mn);
+    }
+    // ...and `exact` still binds only CONCRETE types here, as it does everywhere else.
+    try std.testing.expectError(error.BadValType, assemble(a, "(module (func (result anyref) (ref.null (exact any))))"));
+}
+
+test "D3 regression: two `exact` value types in one module still decode" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // 🐛 `Module.skipValType` — the type-section KIND PRE-SCAN — consumed the `exact` former and
+    // left its type index in the stream, desyncing every later read. **One exact value type hid
+    // it** (the desync landed past the last type), so this needs TWO to fail: it reported
+    // `BadType` on a module that is valid. The pre-scan is a shadow of `readHeapTypeRefEx` that
+    // shares no code with it, which is the producer/consumer split this codebase keeps finding.
+    const src =
+        \\(module
+        \\  (type $a1 (array i8))
+        \\  (type $a2 (array i32))
+        \\  (func (result (ref (exact $a1))) (array.new_default $a1 (i32.const 0)))
+        \\  (func (result (ref (exact $a2))) (array.new_default $a2 (i32.const 0))))
+    ;
+    var m = try Module.decode(a, try assemble(a, src));
+    defer m.deinit();
+    try validate(a, &m);
+
+    // Every GC allocator produces an EXACT reference (this is what `array_new_exact.wast`
+    // asserts, and what lets `(global (ref (exact $t)) (struct.new $t))` type-check at all).
+    const allocators =
+        \\(module
+        \\  (type $s (struct)) (type $ar (array i8))
+        \\  (func (result (ref (exact $s))) (struct.new $s))
+        \\  (func (result (ref (exact $s))) (struct.new_default $s))
+        \\  (func (result (ref (exact $ar))) (array.new_default $ar (i32.const 0)))
+        \\  (func (result (ref (exact $ar))) (array.new_fixed $ar 1 (i32.const 0)))
+        \\  (global (ref (exact $s)) (struct.new $s)))
+    ;
+    var m2 = try Module.decode(a, try assemble(a, allocators));
+    defer m2.deinit();
+    try validate(a, &m2);
+}
+
+test "D3 regression: an imported global may have a REFERENCE type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // 🐛 **A SHIPPED DEFECT, and nothing to do with custom-descriptors.** `parseImport` unwrapped
+    // EVERY list global type as `(mut T)` and parsed its last element, so `(ref null func)` gave
+    // `parseValType` the bare atom `func`. No imported global could have a reference type at all
+    // — reference-types, function-references and GC alike — and no test covered it because the
+    // corpus files that use one also use `exact`, so they were failing earlier for another
+    // reason. `(mut …)` must be TESTED, not assumed, because `(ref …)` is a list too.
+    for ([_][]const u8{
+        "(module (import \"a\" \"b\" (global $g (ref null func))))",
+        "(module (import \"a\" \"b\" (global $g (ref null extern))))",
+        "(module (type $s (struct)) (import \"a\" \"b\" (global $g (ref null $s))))",
+        "(module (type $s (struct)) (import \"a\" \"b\" (global $g (ref null (exact $s)))))",
+        "(module (import \"a\" \"b\" (global $g (mut i32))))", // the shape that DID work, still does
+        "(module (import \"a\" \"b\" (global $g (mut (ref null func)))))",
+        "(module (import \"a\" \"b\" (global $g i64)))",
+    }) |src| {
+        var m = try Module.decode(a, try assemble(a, src));
+        defer m.deinit();
+        try validate(a, &m); // it must DECODE and VALIDATE; linking is a separate question
+    }
+    // Mutability still has to survive the fix — it is the thing the old code was reading.
+    {
+        var m = try Module.decode(a, try assemble(a, "(module (import \"a\" \"b\" (global $g (mut (ref null func)))))"));
+        defer m.deinit();
+        try std.testing.expect(m.globals[0].mutable);
+    }
+    {
+        var m = try Module.decode(a, try assemble(a, "(module (import \"a\" \"b\" (global $g (ref null func))))"));
+        defer m.deinit();
+        try std.testing.expect(!m.globals[0].mutable);
     }
 }

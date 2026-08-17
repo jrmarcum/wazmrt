@@ -505,6 +505,30 @@
 # together, which no individually-valid module can expose. Written by construction in
 # `interp.zig`'s "descriptor links are part of the store-wide type KEY".
 
-wazmrt.exe  972800
-wazmrt.lib  1037954
-wazmrt.dll  894976
+# RAISED 2026-08-17 (TRACK D3 — `struct.new_desc` / `struct.new_default_desc` / `ref.get_desc`,
+# and Track D5 with them). Reference configuration.
+#
+#   artifact       before         after       share
+#   wazmrt.exe    972,800       976,384     +3,584
+#   wazmrt.lib  1,037,954     1,042,012     +4,058
+#   wazmrt.dll    894,976       898,048     +3,072
+#
+# 4,058 bytes (unpadded lib) for: three `Op` tags through decode/validate/emit/interpret, a
+# `descriptor: Value` on every `HeapObject`, the descriptor-carrying arms in BOTH evaluators (run
+# path and const-expr), exactness propagation in `ref.get_desc`, `canonMatches`, `definingFunc`'s
+# import walk, and the `exact` former in `ref.null`'s heap-type position across four readers.
+#
+# Corpus 63,315 -> 63,391 passed, 16 -> 4 failed, 578 -> 497 skipped, 0 regressions.
+# `struct_new_desc.wast` 5 -> 0, `ref_get_desc.wast` 2 -> 0, `array_new_exact.wast` 1 -> 0
+# (Track D5, which is one line per allocator once allocations produce exact refs),
+# `exact-func-import.wast` 4 -> 1, `exact.wast` 2 -> 1.
+#
+# 🔒 Four defects fixed here were NOT custom-descriptors and three were shipped: the type-section
+# kind pre-scan desynced on a second `exact` value type; no imported global could have a REFERENCE
+# type at all; the const-expr `ref.null` read one byte where a heap type is an s33; and
+# `refMatches`'s cross-instance arm ignored `rt.exact`, so an exact cast accepted a subtype across
+# a module boundary — D1's type confusion in the one path D1's tests could not reach.
+
+wazmrt.exe  976384
+wazmrt.lib  1042012
+wazmrt.dll  898048

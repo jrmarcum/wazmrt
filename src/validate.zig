@@ -452,8 +452,13 @@ fn validateConstExpr(module: *const Module, expr: []const u8, expected: V, self_
                 try push(&stack, &sp, module.globals[gi].content);
             },
             0xd0 => { // ref.null <heaptype>
-                const heap = opcode.readHeapType(&r) catch return error.ConstantExpressionRequired;
-                try push(&stack, &sp, try refTypeValType(module, .{ .nullable = true, .heap = heap }));
+                // Exactness-aware, like the body decoder's `.ref_type` immediate.
+                // Reading this with the plain `readHeapType` left the `0x62`
+                // former in the stream and reported `ConstantExpressionRequired`
+                // — a reject-VALID on `(global (ref null (exact 0)) (ref.null
+                // (exact $t)))`, which is `exact.wast`'s FIRST module.
+                const ht = opcode.readHeapTypeExact(&r) catch return error.ConstantExpressionRequired;
+                try push(&stack, &sp, try refTypeValType(module, .{ .nullable = true, .heap = ht.heap, .exact = ht.exact }));
             },
             0xd2 => { // ref.func x
                 const fi = try r.readVarU32();
@@ -482,23 +487,40 @@ fn validateConstExpr(module: *const Module, expr: []const u8, expected: V, self_
                         if (sp < 1 or stack[sp - 1] != .i32) return error.TypeMismatch;
                         stack[sp - 1] = .i31ref_nn;
                     },
-                    0x00 => { // struct.new $t — pop each field (reverse), push (ref $t)
+                    // struct.new / struct.new_default / struct.new_desc / struct.new_default_desc.
+                    //
+                    // ⚠️ **This path is a SECOND validator and it has to carry every
+                    // rule the body one does.** D2 added the descriptor/allocator
+                    // agreement check to `FuncValidator` only, so until D3 a
+                    // `(global (ref (exact $a)) (struct.new $a))` on a described
+                    // `$a` was accepted here — the same rule, enforced on one of
+                    // the two paths that reach it. Globals are exactly where the
+                    // corpus builds descriptor chains, so the gap was live.
+                    0x00, 0x01, 0x20, 0x21 => {
+                        const with_desc = sub == 0x20 or sub == 0x21;
+                        const defaulted = sub == 0x01 or sub == 0x21;
                         const ti = try r.readVarU32();
                         const fields = module.structFields(ti) orelse return error.UndefinedType;
-                        if (sp < fields.len) return error.TypeMismatch;
-                        var i = fields.len;
-                        while (i > 0) {
-                            i -= 1;
+                        const desc = module.descriptorOf(ti);
+                        if (with_desc != (desc != null)) return error.InvalidDescriptor;
+                        if (with_desc) { // the descriptor is the LAST operand
+                            if (sp < 1) return error.TypeMismatch;
                             sp -= 1;
-                            if (!subtypeOf(module, stack[sp], fields[i].storage.unpacked())) return error.TypeMismatch;
+                            if (!subtypeOf(module, stack[sp], V.concreteRefEx(true, .@"struct", desc.?, true)))
+                                return error.TypeMismatch;
                         }
-                        try push(&stack, &sp, V.concreteRef(false, .@"struct", ti));
-                    },
-                    0x01 => { // struct.new_default $t — every field must be defaultable
-                        const ti = try r.readVarU32();
-                        const fields = module.structFields(ti) orelse return error.UndefinedType;
-                        for (fields) |f| if (f.storage.unpacked().isNonNullRef()) return error.TypeMismatch;
-                        try push(&stack, &sp, V.concreteRef(false, .@"struct", ti));
+                        if (defaulted) {
+                            for (fields) |f| if (f.storage.unpacked().isNonNullRef()) return error.TypeMismatch;
+                        } else {
+                            if (sp < fields.len) return error.TypeMismatch;
+                            var i = fields.len;
+                            while (i > 0) {
+                                i -= 1;
+                                sp -= 1;
+                                if (!subtypeOf(module, stack[sp], fields[i].storage.unpacked())) return error.TypeMismatch;
+                            }
+                        }
+                        try push(&stack, &sp, V.concreteRefEx(false, .@"struct", ti, true));
                     },
                     0x06 => { // array.new $t — operands (elem, size); size on top
                         const ti = try r.readVarU32();
@@ -506,14 +528,14 @@ fn validateConstExpr(module: *const Module, expr: []const u8, expected: V, self_
                         if (sp < 2 or stack[sp - 1] != .i32) return error.TypeMismatch;
                         sp -= 1;
                         if (!subtypeOf(module, stack[sp - 1], f.storage.unpacked())) return error.TypeMismatch;
-                        stack[sp - 1] = V.concreteRef(false, .array, ti);
+                        stack[sp - 1] = V.concreteRefEx(false, .array, ti, true);
                     },
                     0x07 => { // array.new_default $t — element must be defaultable
                         const ti = try r.readVarU32();
                         const f = module.arrayField(ti) orelse return error.UndefinedType;
                         if (f.storage.unpacked().isNonNullRef()) return error.TypeMismatch;
                         if (sp < 1 or stack[sp - 1] != .i32) return error.TypeMismatch;
-                        stack[sp - 1] = V.concreteRef(false, .array, ti);
+                        stack[sp - 1] = V.concreteRefEx(false, .array, ti, true);
                     },
                     0x08 => { // array.new_fixed $t N — pop N elements (reverse)
                         const ti = try r.readVarU32();
@@ -526,7 +548,7 @@ fn validateConstExpr(module: *const Module, expr: []const u8, expected: V, self_
                             sp -= 1;
                             if (!subtypeOf(module, stack[sp], f.storage.unpacked())) return error.TypeMismatch;
                         }
-                        try push(&stack, &sp, V.concreteRef(false, .array, ti));
+                        try push(&stack, &sp, V.concreteRefEx(false, .array, ti, true));
                     },
                     0x1a => { // extern.convert_any : (ref null? any) → (ref null? extern)
                         if (sp < 1 or !stack[sp - 1].isRef()) return error.TypeMismatch;
@@ -1378,7 +1400,7 @@ const FuncValidator = struct {
                 _ = try self.popExpect(dat); // dst
             },
 
-            .ref_null => try self.pushValT(try refTypeValType(self.module, .{ .nullable = true, .heap = instr.imm.ref_type })),
+            .ref_null => try self.pushValT(try refTypeValType(self.module, instr.imm.ref_type)),
             .ref_is_null => {
                 switch (try self.popVal()) { // requires a reference type (or polymorphic)
                     .val => |v| if (!v.isRef()) return error.TypeMismatch,
@@ -1449,13 +1471,66 @@ const FuncValidator = struct {
                     i -= 1;
                     _ = try self.popExpect(fields[i].storage.unpacked());
                 }
-                try self.pushValT(V.concreteRef(false, .@"struct", instr.imm.gc_type));
+                try self.pushValT(V.concreteRefEx(false, .@"struct", instr.imm.gc_type, true));
             },
             .struct_new_default => {
                 try self.requireNoDescriptor(instr.imm.gc_type);
                 const fields = self.module.structFields(instr.imm.gc_type) orelse return error.UndefinedType;
                 for (fields) |f| if (f.storage.unpacked().isNonNullRef()) return error.TypeMismatch; // not defaultable
-                try self.pushValT(V.concreteRef(false, .@"struct", instr.imm.gc_type));
+                try self.pushValT(V.concreteRefEx(false, .@"struct", instr.imm.gc_type, true));
+            },
+            // custom-descriptors (D3): the descriptor-carrying allocators. The
+            // descriptor is the LAST operand, so it is popped FIRST.
+            .struct_new_desc, .struct_new_default_desc => {
+                const ti = instr.imm.gc_type;
+                const fields = self.module.structFields(ti) orelse return error.UndefinedType;
+                // The mirror of `requireNoDescriptor`: a type WITHOUT a descriptor
+                // must use the plain form ("type without descriptor requires
+                // non-descriptor allocation"). Both directions are enforced, so
+                // the allocator and the type always agree about whether a value
+                // carries a description.
+                const d = self.module.descriptorOf(ti) orelse return error.InvalidDescriptor;
+                // 🔒 **The expectation is EXACT and that is the soundness hinge.**
+                // `(ref null (exact $d))` admits only `$d` itself — not a subtype
+                // of it, not the supertype's descriptor, not the allocated type.
+                // Accepting an inexact `(ref $d)` would let a value be built whose
+                // stored description is some `$d2 <: $d`, and a later
+                // `ref.get_desc` on an exact `$t` would then hand the guest a
+                // `(ref (exact $d))` naming a value that is not one — D1's
+                // exactness hole reached through the heap instead of a cast.
+                _ = try self.popExpect(V.concreteRefEx(true, .@"struct", d, true));
+                if (instr.op == .struct_new_desc) {
+                    var i = fields.len;
+                    while (i > 0) { // fields are pushed field 0 first → pop in reverse
+                        i -= 1;
+                        _ = try self.popExpect(fields[i].storage.unpacked());
+                    }
+                } else for (fields) |f| if (f.storage.unpacked().isNonNullRef()) return error.TypeMismatch;
+                try self.pushValT(V.concreteRefEx(false, .@"struct", ti, true));
+            },
+            .ref_get_desc => {
+                const ti = instr.imm.gc_type;
+                if (ti >= self.module.comp_types.len) return error.UndefinedType;
+                const d = self.module.descriptorOf(ti) orelse return error.InvalidDescriptor; // "type without descriptor"
+                // The operand is INEXACT and nullable — reading a description is
+                // legal on any subtype of `$t`, and on null (which traps).
+                const operand = try self.popExpect(V.concreteRef(true, .@"struct", ti));
+                // 🔒 **Exactness PROPAGATES; it is not a property of the
+                // instruction.** The result may only be `(ref (exact $d))` when the
+                // operand was exactly `$t` — an operand of some `$c <: $t` carries a
+                // `$d2 <: $d`, so claiming `(exact $d)` for it is type confusion.
+                // `ref_get_desc.wast` states it as "only exact inputs of the
+                // INSPECTED type produce exact outputs", and asserts the
+                // exact-subtype case invalid separately from the inexact one.
+                // A bottom operand (`ref.null none`, `unreachable`) yields no value
+                // at all, so it may claim the exact result.
+                const exact = switch (operand) {
+                    .unknown => true, // unreachable: nothing will be produced
+                    .val => |t| !t.isConcrete() or // bottom — the only non-concrete `popExpect` admits
+                        (t.isExact() and self.module.canonOf(t.concreteIndex()) == self.module.canonOf(ti)),
+                };
+                // Non-null: a null operand traps rather than producing a null.
+                try self.pushValT(V.concreteRefEx(false, .@"struct", d, exact));
             },
             .struct_get, .struct_get_s, .struct_get_u => {
                 const gf = instr.imm.gc_field;
@@ -1485,13 +1560,13 @@ const FuncValidator = struct {
                 const f = self.module.arrayField(instr.imm.gc_type) orelse return error.UndefinedType;
                 _ = try self.popExpect(.i32); // length
                 _ = try self.popExpect(f.storage.unpacked()); // init value
-                try self.pushValT(V.concreteRef(false, .array, instr.imm.gc_type));
+                try self.pushValT(V.concreteRefEx(false, .array, instr.imm.gc_type, true));
             },
             .array_new_default => {
                 const f = self.module.arrayField(instr.imm.gc_type) orelse return error.UndefinedType;
                 if (f.storage.unpacked().isNonNullRef()) return error.TypeMismatch; // not defaultable
                 _ = try self.popExpect(.i32); // length
-                try self.pushValT(V.concreteRef(false, .array, instr.imm.gc_type));
+                try self.pushValT(V.concreteRefEx(false, .array, instr.imm.gc_type, true));
             },
             .array_new_fixed => {
                 const tn = instr.imm.gc_type_n;
@@ -1505,7 +1580,7 @@ const FuncValidator = struct {
                 if (tn.n > self.body_len) return error.StackUnderflow;
                 var k: u32 = 0;
                 while (k < tn.n) : (k += 1) _ = try self.popExpect(f.storage.unpacked());
-                try self.pushValT(V.concreteRef(false, .array, tn.type_index));
+                try self.pushValT(V.concreteRefEx(false, .array, tn.type_index, true));
             },
             .array_get, .array_get_s, .array_get_u => {
                 const f = self.module.arrayField(instr.imm.gc_type) orelse return error.UndefinedType;
@@ -1542,7 +1617,7 @@ const FuncValidator = struct {
                 try self.requireDataSegment(gd.data);
                 _ = try self.popExpect(.i32); // size (in elements)
                 _ = try self.popExpect(.i32); // offset (in bytes, into the segment)
-                try self.pushValT(V.concreteRef(false, .array, gd.type_index));
+                try self.pushValT(V.concreteRefEx(false, .array, gd.type_index, true));
             },
             // `array.new_elem $t $e : [i32 i32] -> [(ref $t)]` — the mirror over an
             // ELEMENT segment, so the element type must be a reference the segment
@@ -1555,7 +1630,7 @@ const FuncValidator = struct {
                 if (!subtypeOf(self.module, self.module.elements[ge.elem].elem_type, f.storage.unpacked())) return error.TypeMismatch;
                 _ = try self.popExpect(.i32); // size (in elements)
                 _ = try self.popExpect(.i32); // offset (in elements, into the segment)
-                try self.pushValT(V.concreteRef(false, .array, ge.type_index));
+                try self.pushValT(V.concreteRefEx(false, .array, ge.type_index, true));
             },
             // `array.fill $t : [(ref null $t) i32 t' i32] -> []` (array, index,
             // value, count). Writes, so the element must be mutable.
@@ -1846,7 +1921,7 @@ fn requirePacking(is_plain_get: bool, storage: Module.StorageType) Error!void {
 fn refTypeValType(module: *const Module, rt: opcode.RefType) Error!V {
     const head = try module.refHead(rt.heap);
     return switch (rt.heap) {
-        .concrete => |ti| V.concreteRef(rt.nullable, head, ti),
+        .concrete => |ti| V.concreteRefEx(rt.nullable, head, ti, rt.exact),
         else => head.valType(rt.nullable),
     };
 }

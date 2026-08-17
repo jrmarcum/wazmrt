@@ -193,7 +193,7 @@ CLOSED, AND SO IS EVERYTHING AFTER IT.** R1–R5, R7, R9 and R10 are done, R6 wa
 by R5, the singleton batch took the remainder, and the bottom-type lattice took the last of it —
 corpus is **104 failures / 62,889 passing / 951 skipped** (measured 2026-08-14).
 
-🏁 **EVERY CORE SPEC FILE IS AT ZERO FAILURES.** Corpus **16 failures / 63,315 passing / 578 skipped** (2026-08-17 end of day), and the baseline gate reports **0 regressions**. **LIVE SPLIT: ALL 16 are non-defects; deliberate deviations are ZERO** — every one is custom-descriptors, i.e. Track D, whose TYPE-SECTION half now ships (D1 + D2) leaving only the instructions — TRACK P IS DONE (custom-page-sizes implemented 2026-08-17: 4 files, 0 failed, 0 skipped). ⚠️ D2 dropped the pass and grand-total columns for correct reasons; see testing.md before reading that as a regression. *(Superseded: 53 failures / 63,344 passing / 515 skipped.)* The 8 era-pinned `proposals/threads` assertions CLOSED via F3+F4, and the skip total fell 965 → 673 via the skip-scoring split; both same day. *(Superseded: 89 failures / 62,890 passing / 965 skipped.)* ⚠️ **14 of the previously-reported 104 were a SCORING BUG** — a bare `(module …)` build failure never consulted `isOurLimitation`, so our own gaps were counted as defects here while scoring as skips everywhere else. `delegate` was one of them, never a deviation; `anyfunc`, the last real one, was closed 2026-08-17. *(Superseded:)* 90 failures / 62,889 passing; 89 non-defects + ONE deliberate deviation; LIVE SPLIT: 102 by design + 2 recorded deliberate
+🏁 **EVERY CORE SPEC FILE IS AT ZERO FAILURES.** Corpus **4 failures / 63,391 passing / 497 skipped** (2026-08-17 end of day), and the baseline gate reports **0 regressions**. **LIVE SPLIT: ALL 4 are non-defects; deliberate deviations are ZERO** — every one is custom-descriptors, i.e. Track D, of which **D1, D2, D3 and D5 now ship, leaving only D4 (the descriptor casts)** — TRACK P IS DONE (custom-page-sizes implemented 2026-08-17: 4 files, 0 failed, 0 skipped). ⚠️ **Rank D4 by the 353 SKIPS behind its 2 failures**, not by the failures. ⚠️ D2 and D3 each dropped the pass and grand-total columns for correct reasons; see testing.md before reading that as a regression. *(Superseded: 16 failures / 63,315 passing / 578 skipped; 53 / 63,344 / 515.)* The 8 era-pinned `proposals/threads` assertions CLOSED via F3+F4, and the skip total fell 965 → 673 via the skip-scoring split; both same day. *(Superseded: 89 failures / 62,890 passing / 965 skipped.)* ⚠️ **14 of the previously-reported 104 were a SCORING BUG** — a bare `(module …)` build failure never consulted `isOurLimitation`, so our own gaps were counted as defects here while scoring as skips everywhere else. `delegate` was one of them, never a deviation; `anyfunc`, the last real one, was closed 2026-08-17. *(Superseded:)* 90 failures / 62,889 passing; 89 non-defects + ONE deliberate deviation; LIVE SPLIT: 102 by design + 2 recorded deliberate
 deviations** — `anyfunc` (`obsolete-keywords.wast`, the pre-standard spelling of `funcref`, kept
 because two real `.wat` inputs use it) and `delegate` (`legacy/try_delegate.wast`, refused loudly
 because no oracle exists to route it). **There are no undiagnosed failures left**, which changes what
@@ -1438,24 +1438,72 @@ EXACT. It extends GC, which wazmrt ships — an extension of a shipped proposal,
   cross-module wrong answer of exactly the kind the store-wide `TypeRegistry` was built to fix.
   `TypeRegistry.groupKey` / `appendField` change here. Carries `descriptors.wast` (21),
   `binary-descriptors` (2).
-- 🎯 **D3 — NEXT. Allocation and descriptor read: `struct.new_desc` (8), `ref.get_desc` (7).**
-  ⚠️ **The descriptor a value carries must name an ENTITY, not a type index** — R2's model applies
-  directly, and cross-instance `ref.get_desc` must resolve through the store. This is the third time
-  that lesson would apply; if it is missed again it will be the same bug a third time.
-  **What D2 leaves ready:** `Module.descriptorOf(ti)` / `describesOf(ti)` answer the type question,
-  the links are already in all three identity keys, and validation guarantees a described type is a
-  struct paired mutually with a struct in its own rec group — so D3 may assume a well-formed pair
-  and need only carry the VALUE. The `struct.new`/`struct.new_default` refusal added in D2 is the
-  guard to RELAX (not delete) when `struct.new_desc` lands.
-  **Remaining failures it should close**, from the live baseline: `struct_new_desc.wast` 5 (three
-  are `assert_trap` reaching `UnsupportedInstr`, two are module builds), `ref_get_desc.wast` 2, and
-  it unblocks most of the 578-skip pool — `br_on_cast_desc_eq`/`_fail` are 122 skips each and
-  `ref_cast_desc_eq` 109, all currently at ZERO failures because the modules do not build.
-  ⚠️ **Rank D3/D4 by those skips, not by the 16 failures.** That is the fourth restatement of the
-  R3/R5/P lesson and D2 is the fifth instance: its 23 nominal assertions moved 63 skips.
-- **D4 — the descriptor casts:** `br_on_cast_desc_eq` (5), `br_on_cast_desc_eq_fail` (5),
-  `ref_cast_desc_eq` (3), `br_on_cast` (1), `br_on_cast_fail` (1).
-- **D5 — `array.new_exact`** (1).
+- ✅ **D3 — DONE 2026-08-17.** `struct.new_desc` / `struct.new_default_desc` / `ref.get_desc`
+  (`0xFB 0x20`/`0x21`/`0x22`). `struct_new_desc.wast` and `ref_get_desc.wast` both **0 failed /
+  0 skipped**. ⚠️ **It is TWO allocators, not one** — the scoping line above said
+  "`struct.new_desc` (8)" and the file exercises `struct.new_default_desc` equally.
+  🔒 **The descriptor is stored as a `Value` on `HeapObject`, and that answered the roadmap's
+  warning for free:** a `Value` already names the owning instance via its store slot, so
+  cross-instance `ref.get_desc` resolves through the store with no extra code. The
+  by-construction test is two INSTANCES OF ONE DEFINITION — identical type indices, so a
+  type-index representation passes every type check and still hands back the wrong object.
+  🔒 **The other soundness hinge is `ref.get_desc`'s exactness, and it PROPAGATES.** The result is
+  `(ref (exact $d))` only when the operand was exactly `$t`; an operand exact in a SUBTYPE carries
+  a different descriptor, so claiming exactness for it is type confusion. The spec states it as
+  "only exact inputs of the inspected type produce exact outputs" and asserts the exact-subtype
+  case invalid separately from the inexact one — two arms, both tested.
+  **Opcodes confirmed independently:** wasmtime 47.0.3 answers *"custom descriptors operations
+  support is not enabled"* for all three, and *"unknown 0xfb subopcode"* for a made-up one — so
+  that is recognition, not a blanket message. Only `0x22` was pinned by the corpus; the other two
+  appear in TEXT modules only, so a wrong sub-opcode would have round-tripped through our own
+  decoder perfectly and been rejected everywhere else.
+  ⚠️ **FOUR defects fixed here were NOT custom-descriptors, and three were SHIPPED.** D3's corpus
+  was simply the first thing to reach them:
+  **(1)** `Module.skipValType` — the type-section kind PRE-SCAN — consumed the `exact` former and
+  left its type index in the stream. **One exact value type hid it**; two turned a valid module
+  into `BadType`.
+  **(2) No imported global could have a REFERENCE type at all.** `parseImport` unwrapped every
+  list global type as `(mut T)` and parsed its last element, so `(ref null func)` reached
+  `parseValType` as the bare atom `func`. Reference-types, function-references and GC alike, since
+  the reference-types proposal shipped.
+  **(3)** the const-expr `ref.null` read ONE BYTE where a heap type is an `s33` — so any type
+  index ≥ 128 desynced the initializer stream.
+  **(4) 🔒 `refMatches`'s cross-instance arm ignored `rt.exact` entirely**, so
+  `ref.test (ref (exact $t))` on an object owned by ANOTHER INSTANCE answered 1 for a subtype.
+  That is D1's type confusion in the one path D1's tests could not reach — **the third time this
+  codebase has found a defect by asking "and what about across instances?"**. Fixed in
+  `canonMatches`, which both the GC and funcref arms now share.
+  🐛 Also fixed: a funcref's dynamic type was read off the IMPORTING module, so every concrete
+  cast on an imported or foreign funcref failed — the plain inexact `ref.test (ref $f)` included.
+  An import may legally name a SUPERTYPE, so the type must come from the DEFINITION;
+  `definingFunc` now walks the import chain (re-exports stack, so one hop is not enough).
+  ⚠️ **Tag space: `Op` has ONE unassigned byte left.** D3 took `0x1d`/`0x1e`/`0x27`, the last
+  three. **D4 needs three more, so it must widen `Op` to `enum(u16)` and move every internal tag
+  above `0xff` FIRST** — after which no raw byte can name one and `decodeBody`'s guard collapses.
+  Doing it inside D3 would have made this entry's size delta unattributable. *(A byte-range guard
+  for the three new tags was added and then REMOVED: an inversion showed it caught nothing,
+  because the immediate-kind switch already refuses every `.gc_type` byte. The comment justifying
+  it — "a kind real ops have" — was simply false. A redundant guard teaches the next reader the
+  wrong rule.)*
+- ✅ **D5 — DONE 2026-08-17, with D3.** `array_new_exact.wast` 1 → 0. It is not an instruction at
+  all: it asserts that **every GC allocation produces an EXACT reference**, which is one argument
+  per allocator once `struct.new`'s result is exact — and D3 needed that anyway, because
+  `(global (ref (exact $d)) (struct.new $d))` appears throughout `struct_new_desc.wast`.
+- 🎯 **D4 — NEXT, and the LAST of Track D. The descriptor casts:** `ref.cast_desc_eq`
+  (`0xFB 0x23`, null variant `0x24`) and `br_on_cast_desc_eq`/`_fail` (`0x25`/`0x26`) — opcodes
+  from binaryen's table, the same source D3's three came from and which wasmtime confirmed.
+  ⚠️ **DO THE `Op` → `enum(u16)` WIDENING FIRST** (see D3's note): three tags are needed and one
+  byte is free.
+  ⚠️ **Rank it by SKIPS, not failures.** Its two failures are one each in `br_on_cast.wast` and
+  `br_on_cast_fail.wast`; the real size is the **353 skips** in `br_on_cast_desc_eq.wast` (122),
+  `br_on_cast_desc_eq_fail.wast` (122) and `ref_cast_desc_eq.wast` (109), all at ZERO failures
+  because their modules do not build. Sixth restatement of the R3/R5/P lesson.
+  **What D3 leaves ready:** `canonMatches` is the cross-instance comparison with exactness already
+  honoured, `HeapObject.descriptor` is the value to compare, and `ref.get_desc`'s exactness
+  propagation is the rule the `_desc_eq` casts will need in mirror form.
+  **Also still open, and NOT D4:** `exact-func-import.wast`'s last failure — link-time import
+  matching reads the DECLARED type where D3 taught the RUN-time path to read the defining one.
+  The linker needs `definingFunc`'s walk. One assertion, well diagnosed, cheap.
 
 **Cost:** expect the largest ceiling raises on the roadmap since the GC batches — D1 alone is
 comparable to the bottom-type lattice (+1 KB for 9 variants) or larger, and it touches decoder,

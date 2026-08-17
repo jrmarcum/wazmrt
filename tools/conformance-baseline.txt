@@ -9,15 +9,15 @@
 # way to make a red number green. Every entry below falls into one of three
 # groups, and NONE of them is a wazmrt defect:
 #
-#   1. UNTARGETED PROPOSALS (custom-descriptors) — 16 assertions, down from 81.
+#   1. UNTARGETED PROPOSALS (custom-descriptors) — 4 assertions, down from 81.
 #      wazmrt does not implement the rest of this proposal, so those modules do
 #      not build. Not a defect, and NOT a pass either: banking our own gaps as
 #      passes is the green-washing `wast.zig`'s `isOurLimitation` comment was
 #      written after. They are refusals, recorded as such.
 #
-#      WHAT IS MISSING, concretely — the 16 are three increments, not 16 things:
+#      WHAT IS MISSING, concretely — the 4 are two things, not 4:
 #
-#      custom-descriptors — the TYPE SECTION half is now DONE.
+#      custom-descriptors — everything but the DESCRIPTOR CASTS now ships.
 #        ✅ D1 (2026-08-17): the `(exact $t)` reference-type former, with
 #          subtyping enforced.
 #        ✅ D2 (2026-08-17): `(descriptor $d)` / `(describes $s)` in text and
@@ -25,21 +25,39 @@
 #          the descriptor links folded into all three type-identity keys
 #          (`Module.canonicalizeTypes`, `interp.groupKey`, `typematch.eqMember`).
 #          `descriptors.wast` 21 failures -> 0, `binary-descriptors.wast` 2 -> 0.
-#        Still open: D3 `struct.new_desc` / `ref.get_desc`, D4 the descriptor
-#          casts (`br_on_cast_desc_eq`, `ref_cast_desc_eq`, …), D5
-#          `array.new_exact`. All are INSTRUCTIONS; the types they need exist.
+#        ✅ D3 (2026-08-17): `struct.new_desc` / `struct.new_default_desc` /
+#          `ref.get_desc` (`0xFB 0x20`/`0x21`/`0x22`), the descriptor carried as a
+#          VALUE on every heap object, and exactness propagation.
+#          `struct_new_desc.wast` and `ref_get_desc.wast` both 0.
+#        ✅ D5 (2026-08-17, with D3): every GC allocation produces an EXACT
+#          reference. `array_new_exact.wast` 1 -> 0.
+#        ❗ Still open: **D4, the descriptor casts** — `ref.cast_desc_eq`
+#          (`0xFB 0x23`/`0x24`) and `br_on_cast_desc_eq`/`_fail` (`0x25`/`0x26`).
+#          Its two remaining FAILURES are `br_on_cast.wast` and
+#          `br_on_cast_fail.wast`, one each — but the number to size it by is the
+#          **353 SKIPS** in `br_on_cast_desc_eq.wast` (122),
+#          `br_on_cast_desc_eq_fail.wast` (122) and `ref_cast_desc_eq.wast`
+#          (109), all sitting at ZERO failures because their modules do not build.
+#          ⚠️ **Rank D4 by those skips.** That is the R3/R5/P lesson a sixth time.
 #
-#        ⚠️ **D2 traded 29 passes for 63 skips while closing 37 failures, and the
-#        passes it lost were FALSE ones.** Those modules previously assembled
-#        with the `(descriptor …)` clause silently DROPPED, so their assertions
-#        ran against a different module than the file wrote; now the modules are
-#        assembled correctly and refused at the D3/D4 instruction they use, which
-#        is a skip. Same shape as D1's 18 lost passes. **The three totals moved
-#        63,344/53/515 -> 63,315/16/578** — and the 3-assertion drop in the grand
-#        total is real and expected: a module that FAILS to build contributes one
-#        failure, and one that builds contributes nothing, so three modules that
-#        started building (2 in binary-descriptors, 1 in descriptors) took three
-#        countable assertions out of the corpus with them.
+#      The other 2 are single assertions in D1's own files, both diagnosed:
+#        `exact-func-import.wast` (1) — link-time import matching reads the
+#          DECLARED import type rather than the defining function's, so importing
+#          `(func (exact (type $sub)))` from a module that re-exported it
+#          inexactly is refused. D3 fixed the RUN-time half of exactly this
+#          (`definingFunc` walks the import chain); the linker needs the same walk.
+#        `exact.wast` (1) — one accept-invalid at L92.
+#
+#        ⚠️ **D2 and D3 both moved passes and the grand total DOWN while closing
+#        failures, and both times that was correct.** Modules that had been
+#        assembling with a clause silently DROPPED were running assertions against
+#        a module the file did not write; assembled correctly they are refused at
+#        the next unimplemented instruction, i.e. a skip. And a module that FAILS
+#        to build contributes one countable failure while one that BUILDS
+#        contributes nothing, so every module that starts building removes an
+#        assertion from the corpus total. D2: 63,344/53/515 -> 63,315/16/578.
+#        D3: 63,315/16/578 -> 63,391/4/497 (+76 passes, -12 failures, -81 skips,
+#        -16 total). **Read all three columns and expect the total to move.**
 #
 #      custom-page-sizes — ✅ IMPLEMENTED 2026-08-17, group entry removed. All
 #        four files are now 0 failed / 0 SKIPPED (61 assertions passing, up from
@@ -88,11 +106,8 @@
 #
 # ⚠️ Adding a line here to make the build green is the failure mode this file
 # invites. A new entry needs a group above, or it is a defect being hidden.
-1 proposals\custom-descriptors\array_new_exact.wast
 1 proposals\custom-descriptors\br_on_cast.wast
 1 proposals\custom-descriptors\br_on_cast_fail.wast
-4 proposals\custom-descriptors\exact-func-import.wast
-2 proposals\custom-descriptors\exact.wast
-2 proposals\custom-descriptors\ref_get_desc.wast
-5 proposals\custom-descriptors\struct_new_desc.wast
+1 proposals\custom-descriptors\exact-func-import.wast
+1 proposals\custom-descriptors\exact.wast
 error annotations.wast

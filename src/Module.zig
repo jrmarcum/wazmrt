@@ -1419,9 +1419,21 @@ fn skipValTypeVec(r: *Reader) Error!void {
 }
 
 /// Advance past one value type without resolving it (bytes only).
+///
+/// 🐛 **This skipped the `exact` FORMER's operand and desynced the whole pre-scan**
+/// (fixed 2026-08-17, found by Track D3's corpus). `(ref (exact $t))` is
+/// `0x64 0x62 <typeidx>`, and `0x62` reads as a complete one-byte s33 (−0x1e) — so
+/// this consumed the former and left `<typeidx>` in the stream, where the next
+/// read took it for a type tag. **A single exact value type in a module hid it**,
+/// because the desync landed at the end of the section; two of them turned a
+/// VALID module into `BadType`. `readHeapTypeRefEx` had the arm from the start;
+/// this shadow of it did not, which is the producer/consumer pair again — a
+/// skipper and a reader that must agree byte for byte and share no code.
 fn skipValType(r: *Reader) Error!void {
     const b = try r.readByte();
-    if (b == 0x63 or b == 0x64) _ = try r.readVarS33(); // (ref null? ht): + heaptype s33
+    if (b != 0x63 and b != 0x64) return; // not `(ref null? ht)` — a numeric/shorthand type
+    // `exact` binds one heap type and does not stack, so at most one prefix.
+    if (try r.readVarS33() == -0x1e) _ = try r.readVarS33();
 }
 
 fn skipFieldType(r: *Reader) Error!void {
