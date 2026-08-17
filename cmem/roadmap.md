@@ -193,7 +193,7 @@ CLOSED, AND SO IS EVERYTHING AFTER IT.** R1–R5, R7, R9 and R10 are done, R6 wa
 by R5, the singleton batch took the remainder, and the bottom-type lattice took the last of it —
 corpus is **104 failures / 62,889 passing / 951 skipped** (measured 2026-08-14).
 
-🏁 **EVERY CORE SPEC FILE IS AT ZERO FAILURES.** Corpus **90 failures / 62,889 passing / 965 skipped**, and the baseline gate reports **0 regressions**. ⚠️ **14 of the previously-reported 104 were a SCORING BUG** — a bare `(module …)` build failure never consulted `isOurLimitation`, so our own gaps were counted as defects here while scoring as skips everywhere else. **LIVE SPLIT: 89 non-defects + exactly ONE deliberate deviation (`anyfunc`)** — `delegate` was a mis-scored gap, never a deviation. *(Superseded:)* LIVE SPLIT: 102 by design + 2 recorded deliberate
+🏁 **EVERY CORE SPEC FILE IS AT ZERO FAILURES.** Corpus **89 failures / 62,890 passing / 965 skipped** (2026-08-17), and the baseline gate reports **0 regressions**. **LIVE SPLIT: ALL 89 are non-defects; deliberate deviations are ZERO** — 81 untargeted-proposal refusals + 8 era-pinned `proposals/threads`, both scoped as PROPOSED TRACKS F / P / D at the top of this file. ⚠️ **14 of the previously-reported 104 were a SCORING BUG** — a bare `(module …)` build failure never consulted `isOurLimitation`, so our own gaps were counted as defects here while scoring as skips everywhere else. `delegate` was one of them, never a deviation; `anyfunc`, the last real one, was closed 2026-08-17. *(Superseded:)* 90 failures / 62,889 passing; 89 non-defects + ONE deliberate deviation; LIVE SPLIT: 102 by design + 2 recorded deliberate
 deviations** — `anyfunc` (`obsolete-keywords.wast`, the pre-standard spelling of `funcref`, kept
 because two real `.wat` inputs use it) and `delegate` (`legacy/try_delegate.wast`, refused loudly
 because no oracle exists to route it). **There are no undiagnosed failures left**, which changes what
@@ -237,7 +237,7 @@ are not defects and there is nothing to fix unless the scope changes:
 the two above, so the "101 by design / 92 actionable" split written on 2026-08-12 was off by two in
 both directions. Corrected here rather than propagated.
 
-**LIVE SPLIT (2026-08-14, final): 104 failures = 102 by design + 2 recorded deliberate deviations**  — `anyfunc` and `delegate`. Formerly legacy EH **2**,
+**SPLIT AS OF 2026-08-14 — NOT LIVE, AND "final" WAS WRONG TWICE OVER: 104 failures = 102 by design + 2 recorded deliberate deviations**  — `anyfunc` and `delegate`. *(Both claims fell: 14 of the 104 were a scoring bug and `delegate` was one of them, so it was never a deviation; `anyfunc` was then closed 2026-08-17. Live figure is 89 failures, ZERO deviations — see the top of this file. **A snapshot labelled "final" is still a snapshot.**)* Formerly legacy EH **2**,
 core singletons **18**. R10's residue is now half closed: `id` 5 went with R9 (the quoted-`$"…"`
 identifier form, forced into scope — see below), leaving `ref_null` 27 skipped behind its unbuildable
 first module, which needs the bottom-type lattice change.
@@ -391,7 +391,8 @@ list: stale is stale in both directions.
 failure; fourteen went entirely clean — `block`, `call_indirect`, `func`, `id`, `if`, `loop`,
 `memory`, `return_call_indirect`, `simd_lane`, `start`, `struct`, `table`, `token`, `type` — and
 `global` 4 → 1, `proposals/threads/memory` 5 → 2. **Accept-invalid in core spec files is back to
-ZERO** except the one deliberate deviation below.
+ZERO** except the one deliberate deviation below — *and since 2026-08-17 that exception is gone too:
+`anyfunc` is refused, so the zero is now unconditional.*
 
 *(The totals move by −1 overall, and that is arithmetic, not a lost assertion: a `(module …)` command
 that FAILS to build scores a failure, while one that succeeds scores nothing. `id.wast`'s first

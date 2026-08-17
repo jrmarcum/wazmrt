@@ -575,8 +575,10 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
     and the interned block-type signature) that cost more than the five validation rules it added.
     **Removing a workaround can pay for the rule that made it unnecessary**, and a win left
     unrecorded is headroom for the next unnoticed drift.
-    **Live sizes (2026-08-13 after R10, ReleaseSmall, Zig 0.16.0, x86_64-windows):** exe **953,344**,
-    static lib **1,016,766**, dll **878,592**. ⚠️ Measure the static lib from a PLAIN `zig build` —
+    **Live sizes (2026-08-17, ReleaseSmall, Zig 0.16.0, x86_64-windows):** exe **964,608**,
+    static lib **1,029,730**, dll **888,832** — all three verified in one run, from a `C:` copy
+    (see `INDEX.md`'s environment blocker). *(Superseded: 2026-08-13 after R10 — exe 953,344,
+    static lib 1,016,766, dll 878,592.)* ⚠️ Measure the static lib from a PLAIN `zig build` —
     `zig build dll` overwrites `wazmrt.lib` with the DLL's much smaller import library. ⚠️ And
     **`zig build` does not produce the DLL at all**, so the gate silently grades a stale one: R3's
     first run reported the DLL at exactly its ceiling, from a file two builds old. **A delta of

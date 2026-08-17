@@ -305,6 +305,20 @@ evidence a module is invalid. `assert_invalid`, `assert_trap` and `assert_unlink
 
 ## 5. Recording what you found
 
+**"Update the project memory" means AUDIT for stale live claims, not edit the files you happened to
+touch.** After a session that revised six `cmem` files, an audit found six stale claims still
+standing — including **the `## 📊 CURRENT spec-testsuite score` heading in `testing.md`, the single
+line most likely to be quoted, in a file that had just been edited twice.** The edits had gone to
+the paragraphs the work reminded me of; the headline was never grepped for. ⚠️ Two numbers were
+stale in BOTH directions and disagreed with each other — `INDEX.md` claimed 631 unit tests and
+`overview.md` claimed 603, while the real figure measured **633**. **When two files disagree, do not
+pick the newer one — measure.** The audit that works is a grep for the OLD VALUES
+(`grep -rn "62,889\|90 fail\|953,344\|631/631" cmem/ README.md`), then classify every hit as live
+(fix) or dated history (leave, and mark it superseded if it claims to be current). ⚠️ **Watch for
+"final" and "the number to quote"** — both appeared on figures that were superseded within days, and
+a superseded block that still says "the number to quote" is worse than no marker at all.
+— memory audit, 2026-08-17
+
 **A REFUSAL is not a hole — rank security work by what the gap PERMITS, not by the size of the
 failing number.** Asked to close "the last 89 for security reasons", the honest split ran the other
 way from the count: the 81 untargeted-proposal assertions are modules wazmrt *rejects*, and a module

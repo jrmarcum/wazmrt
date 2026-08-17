@@ -81,10 +81,16 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
   validation**, which is strong evidence the type-checker is correct across real, deeply-nested
   control flow (not just the simple `wasm_mod` set).
 
-## 📊 CURRENT spec-testsuite score (2026-08-14) — EVERY CORE SPEC FILE IS AT ZERO
+## 📊 CURRENT spec-testsuite score (2026-08-17) — EVERY CORE SPEC FILE IS AT ZERO
 
-**284 files — 62,889 assertions passed / 90 failed / 965 skipped**, and `zig build conformance -Dbaseline=tools/conformance-baseline.txt` reports **0 regressions**. This is the number to quote;
+**284 files — 62,890 assertions passed / 89 failed / 965 skipped**, and `zig build conformance -Dbaseline=tools/conformance-baseline.txt` reports **0 regressions**. This is the number to quote;
 every snapshot below it is older and kept as history.
+
+**Deliberate spec deviations: ZERO** (the last, `anyfunc`, closed 2026-08-17). The 89 are 81
+untargeted-proposal refusals + 8 era-pinned `proposals/threads` assertions, both scoped for
+implementation as `roadmap.md` → PROPOSED TRACKS F / P / D. ⚠️ **Verified from a `C:` COPY of the
+tree** — `zig build` cannot run from this repo's own cwd; see `INDEX.md`'s environment blocker.
+*(Superseded: 2026-08-14's 62,889 / 90 / 965.)*
 
 ⚠️ **The failed count ROSE from 143 at R4 and that is an improvement.** R5 implemented
 `(module quote …)`, which had been suppressing 978 assertions; 904 of them pass, 73 fail. Passing
@@ -206,8 +212,12 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
   *exactly* its ceiling; the file was two builds old. **An exactly-zero delta is a timestamp check
   waiting to happen.**
 
-**Unit tests: 631** (`zig build test --summary all`, 2026-08-14, final) — 627 pass / 4 skip from
-this repo's own `D:` cwd, **631/631 from an NTFS cwd**, which is the number to quote. R3 added 7,
+**Unit tests: 633/633** (`zig build test --summary all`, measured 2026-08-17 from a `C:` copy —
+`zig build` cannot run from this repo's cwd; see `INDEX.md`'s environment blocker).
+*(Superseded: 631, labelled "final" on 2026-08-14. Below is that entry, kept for its D:-vs-NTFS
+detail, which still applies.)* **Unit tests: 631** (2026-08-14) — 627 pass / 4 skip from
+this repo's own `D:` cwd, **631/631 from an NTFS cwd** — the D:-vs-NTFS split is the part that still
+applies; the 631 itself is superseded by the 633 above. R3 added 7,
 R4 4, R5 3, R10 5, R9 6, R7 1, the singleton batch 5 and the lattice 2; each core test raises the printed total by two because the C-ABI
 target re-runs the core suite. `test-safe` 631/631, `test-security` 3/3 (NTFS cwd), size gate green
 at the batch ceilings (+136 bytes of real code for 22 closed failures — five of the six causes REPLACE a rule rather than add one).
