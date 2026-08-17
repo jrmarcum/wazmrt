@@ -11,6 +11,69 @@ This file tracks only what's left.
 
 Line numbers are hints (they drift) — the function/construct name is the durable anchor.
 
+---
+
+## 🧭 STANDING DELTAS (2026-08-17) — the three that are NOT going to close
+
+**A Standing Delta is a known, understood difference between wazmrt and some reference, which stays
+open because closing it is not ours to do or not answerable.** They are distinguished from every
+other entry in this file, and from the conformance baseline, by that last clause: a deferred item is
+*work not yet done*; a Standing Delta is *work that has no owner here*.
+
+🔑 **Why they get a name.** Each has now been re-raised more than once as "what's left to fix", and
+each time it costs a re-investigation to arrive back at the same answer. Naming them makes the answer
+citable. ⚠️ **The name is not a licence to stop looking.** A Standing Delta must carry (a) what the
+difference IS, (b) why it cannot be closed *here*, and (c) **the condition that would reopen it**. An
+entry that loses (c) has become an excuse; delete it or fix the thing.
+
+### SD-1 — wasmtime emits one byte fewer than five other implementations
+
+`wasmtk/tests/wasi/wasm_wasi/27_string-formatting.wasm`: wazmrt, wasmrt, wazero, wasmer and **V8**
+all emit 223 bytes (`true\n123`); **wasmtime 47.0.3 emits 222** (`true123`). Everything else in the
+output is byte-identical — only the newline differs.
+
+**Why it stays open:** ⚠️ **THE CAUSE IS NOT TRACED, and there is NO PRIVILEGED ORACLE.** wazmrt sits
+with the majority, including the reference engine, which is *evidence* and not a verdict. Declaring
+wasmtime wrong on a 5-to-1 vote is exactly the reasoning `best-practices.md` §2 warns about — finding
+a difference at a layer is not proof of which side is defective.
+**Reopens when:** anyone traces the divergence to a specific WASI call or format path, or wasmtime
+changes behaviour on this file. Full write-up in `tests/differential/README.md`.
+
+### SD-2 — `path_link` returns ENOTSUP on Windows (upstream Zig)
+
+`Io.Dir.hardLink` is `return error.OperationUnsupported` on Windows in Zig 0.16
+(`Threaded.zig:9509`) — std simply does not implement hard links there. POSIX is unaffected.
+
+**Why it stays open:** unlike its sibling `Dir.setTimestamps` (which we DID work around by using the
+fd-based call — see #18's family), there is **no existing `Io` function that creates a hard link on
+Windows**. The fix is raw `NtSetInformationFile(FileLinkInformationEx)` with WTF-16 and NT-path
+handling: a large, error-prone, Windows-specific lift out of all proportion to `path_link`'s value.
+**Reopens when:** Zig implements `Dir.hardLink` on Windows — so **recheck on every Zig upgrade**,
+along with the other two holes in that family.
+
+### SD-3 — runtime `delegate` routing is deliberately unimplemented
+
+The legacy exception-handling `delegate` instruction is refused everywhere rather than executed.
+
+**Why it stays open:** it is a **deliberate refusal, not a gap.** `delegate` is legacy EH, the
+proposal that replaced it (`try_table`) is fully implemented, and **there is no oracle** — nothing to
+check a routing implementation against, since the corpus files that use it are themselves legacy. A
+refusal is honest; a guessed implementation would be a wrong answer wearing a feature's clothes.
+⚠️ Note this is why `legacy/try_delegate.wast` refuses to build, which is CORRECT behaviour and must
+not be "fixed" by relaxing the refusal.
+**Reopens when:** an oracle appears — a reference implementation whose `delegate` routing we can
+differentially check against — or a real guest needs it.
+
+### Not a Standing Delta, and the distinction matters
+
+- **The 2 conformance failures** (`exact-func-import.wast`, `exact.wast`) are **baseline group 4**:
+  wazmrt defects, diagnosed, cheap, and *ours to fix*. They are debts, not deltas.
+- **`annotations.wast`** (runner error) is an untargeted proposal — baseline group 1. It closes the
+  moment custom-annotations is targeted, so it has an owner: us, later.
+- **Out-of-scope `.wast` harness command forms** are neither: not a bug, not in scope, no delta.
+
+---
+
 ⚠️ **READ THE C-ABI ENTRIES AS HISTORY.** `#20`, `#21`, `#22` and every other `wasm_c_api.zig` item is
 about a file **deleted on 2026-08-11**. They are kept because they are the *evidence* for the
 replacement's design: value handles exist precisely so that class cannot recur. See
@@ -1219,6 +1282,15 @@ Debug AND ReleaseSafe; c-smoke 319/319.
 - **Runtime `delegate` routing** stays deliberately unimplemented (refused everywhere, per above — no oracle).
 - Out-of-scope `.wast` harness command forms (`module definition`/`module instance` module-linking) — not a
   bug, not in scope.
+
+> ⚠️ **SUPERSEDED 2026-08-17 — read the STANDING DELTAS section at the top of this file instead.**
+> Two of the three above are now **SD-2** and **SD-3** and carry a reopen condition, which this list
+> never did. The third line was wrong by omission rather than by fact: `module definition` /
+> `module instance` were implemented on 2026-08-13 (R2) and are exercised by the cross-instance tests
+> D3 and D4 depend on — "not in scope" outlived its own truth by four days. And "every targeted
+> proposal is now implemented" was true of 2026-07-27's target list, not of the one that then grew
+> custom-page-sizes and custom-descriptors; both shipped 2026-08-17. **A dated claim is only about
+> its date.**
 
 ### Remaining LOW items (current, verified in code 2026-07-27)
 

@@ -12,6 +12,12 @@ is what **wasmtk** actually runs wasm on.
 
 ## OPEN — wasmtime 47.0.3 emits one byte less than five other implementations
 
+> 🧭 **This is SD-1 in `cmem/known-issues.md`'s STANDING DELTAS section** (named 2026-08-17). It stays
+> open because the cause is untraced and there is no privileged oracle — not because nobody has got
+> to it. **Reopens when** someone traces the divergence to a specific WASI call or format path, or
+> wasmtime changes behaviour on this file. The detail below is the evidence; the delta entry is the
+> decision.
+
 Module: `wasmtk/tests/wasi/wasm_wasi/27_string-formatting.wasm`
 Guest source: `console.log(true); console.log(123);` — so a newline belongs between them.
 
