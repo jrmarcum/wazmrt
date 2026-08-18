@@ -185,6 +185,7 @@ const Feature = enum(c_int) {
     multi_table = 15,
     custom_descriptors = 16,
     custom_page_sizes = 17,
+    wide_arithmetic = 18,
     _,
 
     /// Bound DERIVED from `features.count`, never written out again: the literal that used to sit
@@ -3011,6 +3012,12 @@ fn engineWithout(f: Feature) *Engine {
             _ = wazmrt_config_set_feature(cfg, .gc, false);
         },
         .function_references => _ = wazmrt_config_set_feature(cfg, .gc, false),
+        // Every wide-arithmetic instruction returns two i64s, so it falls with multi-value.
+        // ⚠️ This arm was added because the test CRASHED when `wide_arithmetic` landed: the
+        // helper's `unreachable` fired on the null engine an incoherent config produces. That is
+        // the layering rule doing its job — and the reason this switch has to be extended
+        // whenever `Set.incoherent` gains a pair, rather than the engine quietly repairing it.
+        .multi_value => _ = wazmrt_config_set_feature(cfg, .wide_arithmetic, false),
         else => {},
     }
     var cerr: ?*Error = null;

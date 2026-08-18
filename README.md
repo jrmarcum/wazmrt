@@ -35,7 +35,7 @@ compliance process, and for the ledger of any reused code.
 > official WebAssembly spec testsuite (positive assertions plus
 > `assert_invalid`/`assert_malformed`/`assert_trap`/`assert_unlinkable`, and the
 > `(module definition …)`/`(module instance …)` script forms) — **284 files,
-> 63,739 assertions passing, ZERO failing** as of 2026-08-18, covering every
+> 63,846 assertions passing, ZERO failing** as of 2026-08-18, covering every
 > proposal wazmrt targets up to and including WasmGC's **custom-descriptors**
 > (`(exact $t)`, descriptors, and the descriptor casts). Failures are reported with the **source line** of the assertion
 > that produced them. It runs a module's **start function** at instantiation, embeds
@@ -53,7 +53,7 @@ compliance process, and for the ledger of any reused code.
 > hashes, or verify an **Ed25519 signature** against an embedded root key (both
 > opt-in; see *Verifying modules* below). It also implements **exception
 > handling** (both the `exnref` proposal and the legacy `try`/`catch` encoding),
-> **multiple memories**, **memory64** (i64 memory addresses), **custom page sizes** (`(memory 1 (pagesize 1))` for byte-granular memories), **threads/atomics**
+> **multiple memories**, **memory64** (i64 memory addresses), **custom page sizes** (`(memory 1 (pagesize 1))` for byte-granular memories), **wide arithmetic** (`i64.add128`/`sub128`/`mul_wide_s`/`mul_wide_u` — 128-bit add/sub and 64x64→128 multiply), **threads/atomics**
 > (the whole `0xFE` family plus `shared` memories), and the **complete SIMD
 > (v128)** instruction set — every fixed-width op plus the relaxed-SIMD
 > extensions. Requires Zig 0.16.

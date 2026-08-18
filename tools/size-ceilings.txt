@@ -577,6 +577,55 @@
 # Corpus 63,731/2/144 -> **63,732 passed / 0 FAILED / 144 skipped**. The only remaining baseline
 # entry is `annotations.wast`, a runner-lex gap on an untargeted proposal.
 
+# RAISED 2026-08-18 by WIDE-ARITHMETIC — a whole proposal for 3 KB, and 109 of the 134 skips.
+#
+#   artifact       before         after       delta
+#   wazmrt.exe    987,136       988,160      +1,024
+#   wazmrt.lib  1,049,686     1,051,814      +2,128
+#   wazmrt.dll    900,608       900,608           0
+#
+# Corpus 63,739/0/134 -> **63,846 passed / 0 FAILED / 25 skipped**. `wide-arithmetic.wast` went
+# 0 passed / 0 failed / 109 skipped -> **107 / 0 / 0**, first run.
+#
+# 🔑 **The cheapest proposal wazmrt has ever added, and the reason is worth recording: four
+# instructions, no immediates, no new types, and Zig has native `u128`/`i128`** — so there is no
+# carry chain to get wrong. `i64.add128`, `i64.sub128`, `i64.mul_wide_s`, `i64.mul_wide_u`, all
+# `0xFC` sub-opcodes `0x13`–`0x16`, plus a `wide_arithmetic` feature bit layered on `multi_value`
+# (every one returns TWO i64s, so a module using any of them is a multi-value module by
+# construction).
+#
+# ⚠️ **The sub-opcode numbers came from the SPEC SUITE, not from inference, and that mattered
+# more here than usual.** `wide-arithmetic.wast` carries a `(module binary …)` of overlong LEBs —
+# `\fc\93\80\00`, `\fc\94\00`, `\fc\95\80\80\80\00`, `\fc\96\80\80\00` — which decode to 19–22.
+# Had they been guessed wrong, every TEXT assertion in that file would still have passed: our
+# assembler would emit the wrong byte and our decoder would read it back. **Our assembler is not
+# an oracle for our decoder**, and a proposal whose only in-tree spec is its own testsuite is
+# where that rule is load-bearing rather than decorative.
+#
+# ⚠️ **And the same shape once more inside the semantics: the 128-bit halves travel as `(lo, hi)`
+# with `lo` deepest, and NO type check can catch a transposition** — every operand and every
+# result is an i64, so a swapped implementation validates cleanly, satisfies every arity test and
+# returns wrong numbers. Pinned by a by-construction wrong-answer test (carry out of the low half,
+# borrow out of the low half, and a signed/unsigned pair that agrees on `lo` and differs only on
+# `hi`), and by the corpus's own `(1,2)+(3,4) = (4,6)`.
+#
+# 🎓 **Three tests had to move, and all three were STALE rather than broken** — the CLI's
+# `features.count` pin, `untargetedProposalMnemonic`'s example, and the `.wast` runner's example
+# of "our limitation". The last one has now moved THREE times (`(module quote …)` →
+# `some.bogus.instruction` → `i64.add128` → `array.new_exact`) and its own comment predicted it:
+# **its example is by definition something we have not built yet, so implementing anything is
+# expected to invalidate it.** When a test fails after a change, ask whether its EXAMPLE still
+# demonstrates its PROPERTY.
+#
+# 🔒 A fourth test CRASHED rather than failed: `engineWithout(.multi_value)` in `capi.zig` hit its
+# `unreachable` because the new layering made that config incoherent and the engine refused it.
+# That is the rule working — the switch listing dependents has to be extended whenever
+# `Set.incoherent` gains a pair, because the engine reports an incoherent set instead of
+# repairing it.
+#
+# WHAT IS LEFT: **25 skips, all of them SD-3** (legacy `try`/`delegate`/`rethrow`), a deliberate
+# refusal with no oracle. The corpus has no other outstanding gap.
+
 # RAISED 2026-08-18 by the SKIP-CLOSING PASS (steps 2 and 3 of the 144): 144 -> 134 skipped,
 # 63,732 -> 63,739 passed, 0 failed throughout, 0 regressions.
 #
@@ -672,6 +721,6 @@
 # new ones are the CLI's FIRST reachable tests — `main.zig` had no test target until `--features`
 # put a policy parser in it.
 
-wazmrt.exe  987136
-wazmrt.lib  1049686
+wazmrt.exe  988160
+wazmrt.lib  1051814
 wazmrt.dll  900608

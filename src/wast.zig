@@ -2296,14 +2296,20 @@ test "assert_invalid/malformed does not count OUR limitations as passes" {
     //     It began as `(module quote …)` itself (R5 implemented the form). It then became
     //     `some.bogus.instruction` — which 2026-08-17 showed was never an instance of this
     //     property at all: a mnemonic in NO proposal is a genuine malformation, and refusing it
-    //     is a verdict we are entitled to give, not a gap. The example is now a REAL instruction
-    //     from a proposal wazmrt does not target (`i64.add128`, wide-arithmetic), which is what
-    //     "our limitation" actually means. See `wat.untargetedProposalMnemonic`.
+    //     is a verdict we are entitled to give, not a gap. The example must be a REAL instruction
+    //     from a proposal wazmrt does not target, which is what "our limitation" actually means.
+    //     See `wat.untargetedProposalMnemonic`.
     //
-    //     🎓 When a test fails after a change, ask whether its EXAMPLE still demonstrates its
-    //     PROPERTY. Twice now the answer was no, and twice the property was fine.
+    //     🎓 **THREE TIMES NOW, and the property has not changed once.** `(module quote …)` →
+    //     `some.bogus.instruction` → `i64.add128` → `array.new_exact`: R5 implemented the first,
+    //     2026-08-17 showed the second was never an instance of the property at all, and
+    //     2026-08-18 implemented wide-arithmetic out from under the third. **When a test fails
+    //     after a change, ask whether its EXAMPLE still demonstrates its PROPERTY** — and expect
+    //     this one to move again, because its example is by definition something we have not
+    //     built yet. `array.new_exact` is custom-descriptors' and the proposal's own suite never
+    //     exercises it.
     {
-        const src = "(assert_malformed (module quote \"(func (i64.add128))\") \"unexpected token\")";
+        const src = "(assert_malformed (module quote \"(func (array.new_exact))\") \"unexpected token\")";
         const s = try runScript(gpa, src, null);
         try std.testing.expectEqual(@as(usize, 0), s.passed);
         try std.testing.expectEqual(@as(usize, 0), s.failed);
@@ -2345,9 +2351,11 @@ test "assert_invalid/malformed does not count OUR limitations as passes" {
     // (b) A mnemonic from an UNTARGETED PROPOSAL is an assembler gap, not evidence of invalidity —
     //     the same property as (a), reached through a direct `(module …)` rather than a quoted
     //     one, because the two paths score independently. Example updated 2026-08-17 for the
-    //     reason given at (a): `some.bogus.instruction` was never an instance of this property.
+    //     reason given at (a), and again 2026-08-18 when wide-arithmetic was implemented —
+    //     **both halves of this test move together, because they are the same property reached
+    //     two ways, and an example that stops being a gap stops demonstrating either.**
     {
-        const src = "(assert_invalid (module (func (result i32) (i64.add128))) \"type mismatch\")";
+        const src = "(assert_invalid (module (func (result i32) (array.new_exact))) \"type mismatch\")";
         const s = try runScript(gpa, src, null);
         try std.testing.expectEqual(@as(usize, 0), s.passed);
         try std.testing.expectEqual(@as(usize, 1), s.skipped);

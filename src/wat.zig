@@ -3359,9 +3359,10 @@ fn untargetedProposalMnemonic(name: []const u8) bool {
         // suite never exercises — they stay because this list must describe the PROPOSAL.
         "ref.cast_desc", "br_on_cast_desc", "br_on_cast_desc_fail",
         "array.new_exact",
-        // wide-arithmetic.
-        "i64.add128",       "i64.sub128",              "i64.mul_wide_s",
-        "i64.mul_wide_u",
+        // ⚠️ **wide-arithmetic's four were removed 2026-08-18 — they are IMPLEMENTED.** Same rule
+        // as the descriptor names above: `lookupOp` resolves them now, so this list is never
+        // consulted for them, and leaving a stale name here is not merely dead code — it is a
+        // standing claim that we still refuse the instruction.
     };
     for (known) |k| if (std.mem.eql(u8, name, k)) return true;
     return false;
@@ -4384,14 +4385,23 @@ test "mnemonic lookup: `catch` resolves like `catch_all`, and gaps are told from
 
     // (2) The split that scoring depends on. A real instruction from a proposal wazmrt does not
     //     target is OUR gap; a mnemonic that exists in no proposal is a malformation.
-    try std.testing.expect(untargetedProposalMnemonic("i64.add128"));
+    //     ⚠️ The example moved 2026-08-18: `i64.add128` used to stand here and wide-arithmetic is
+    //     now IMPLEMENTED, so it belongs in list (3) below instead. **A test whose example has
+    //     been implemented is not a failing test, it is a stale one** — and the two lists are
+    //     mirror images, so an example only ever migrates from this one to that one.
+    try std.testing.expect(untargetedProposalMnemonic("array.new_exact"));
     try std.testing.expect(untargetedProposalMnemonic("br_on_cast_desc"));
     try std.testing.expect(!untargetedProposalMnemonic("some.bogus.instruction"));
     // (3) …and the OTHER direction, which is the one that goes stale. An IMPLEMENTED instruction
     //     must resolve in `lookupOp` and must NOT be on the untargeted list — a name left behind
     //     there claims we still refuse it, and would route a genuine malformation involving it to
     //     "our gap" (a skip) instead of a verdict. Tracks D3 and D4 implemented these six.
-    for ([_][]const u8{ "ref.get_desc", "struct.new_desc", "struct.new_default_desc", "ref.cast_desc_eq", "br_on_cast_desc_eq", "br_on_cast_desc_eq_fail" }) |m| {
+    for ([_][]const u8{
+        "ref.get_desc",     "struct.new_desc", "struct.new_default_desc",
+        "ref.cast_desc_eq", "br_on_cast_desc_eq", "br_on_cast_desc_eq_fail",
+        // wide-arithmetic, implemented 2026-08-18 — all four moved out of the untargeted list.
+        "i64.add128", "i64.sub128", "i64.mul_wide_s", "i64.mul_wide_u",
+    }) |m| {
         try std.testing.expect(lookupOp(m) != null);
         try std.testing.expect(!untargetedProposalMnemonic(m));
     }
@@ -4411,7 +4421,7 @@ test "mnemonic lookup: `catch` resolves like `catch_all`, and gaps are told from
     //     entry would be dead weight silently claiming to gate something. The reverse check,
     //     for names that HAVE been implemented, is (3) above; `ref.get_desc` moved from here
     //     to there when D3 landed it.
-    try std.testing.expect(lookupOp("i64.add128") == null);
+    try std.testing.expect(lookupOp("array.new_exact") == null);
     try std.testing.expect(lookupOp("br_on_cast_desc") == null);
 }
 

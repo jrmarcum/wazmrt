@@ -253,7 +253,11 @@ typedef enum {
      * up to then accepted byte-paged memories even with `wazmrt_config_all_features(cfg, false)`.
      * Gates any memory in the index space — imported ones included — whose declared page size is
      * not 64 KiB. Requires nothing: it extends core memories. */
-    WAZMRT_FEATURE_CUSTOM_PAGE_SIZES         = 17
+    WAZMRT_FEATURE_CUSTOM_PAGE_SIZES         = 17,
+    /* wide-arithmetic: `i64.add128`, `i64.sub128`, `i64.mul_wide_s`, `i64.mul_wide_u` — 128-bit
+     * add/sub and 64x64->128 multiply. Every one returns TWO i64 results, so it cannot be enabled
+     * without MULTI_VALUE: a module using any of them is a multi-value module by construction. */
+    WAZMRT_FEATURE_WIDE_ARITHMETIC           = 18   /* requires MULTI_VALUE         */
 } wazmrt_feature_t;
 
 wazmrt_config_t *wazmrt_config_new(void);

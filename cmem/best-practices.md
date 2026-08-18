@@ -629,6 +629,40 @@ into a single malformed-module failure. Requiring EVERY top-level form to be a m
 the other way: an unrecognised form leaves the script on the ordinary path and stays the skip it
 already was. — the 144, `wast.zig`
 
+**WHEN A PROPOSAL'S ONLY IN-TREE SPEC IS ITS OWN TESTSUITE, TAKE THE WIRE FORMAT FROM THE
+TESTSUITE'S BINARY MODULE.** wide-arithmetic's four `0xFC` sub-opcodes were read off
+`wide-arithmetic.wast`'s `(module binary …)` — overlong LEBs whose whole purpose is to pin those
+numbers. ⚠️ **Had they been guessed wrong, every TEXT assertion in that file would still have
+passed**: our assembler would emit the wrong byte and our decoder would read it back, and the
+module would be wrong only against other runtimes. "Our assembler is not an oracle for our decoder"
+is usually about a dropped clause; here it is about a constant, and the fix is the same — get the
+number from outside wazmrt. — wide-arithmetic, `opcode.zig`
+
+**A CONVENTION THE TYPE SYSTEM CANNOT EXPRESS NEEDS A BY-CONSTRUCTION WRONG-ANSWER TEST.** The
+128-bit halves travel as `(lo, hi)` with `lo` deepest, and every operand and result is an i64 — so
+transposing them validates cleanly, satisfies every arity check, and returns wrong numbers. The
+same shape as D1's exactness bug, which the score also could not see. Pin it with values where the
+two halves differ and are not symmetric: a carry out of the low half, a borrow out of the low half,
+and a signed/unsigned pair that agrees on `lo` and differs only on `hi` — **that last one is the
+case a test reading only the low half would miss entirely.** — wide-arithmetic, `interp.zig`
+
+**A TEST THAT FAILS BECAUSE ITS EXAMPLE WAS IMPLEMENTED IS STALE, NOT BROKEN — AND SOME EXAMPLES
+ARE STALE BY DESIGN.** The `.wast` runner's example of "our limitation" has moved three times
+(`(module quote …)` → `some.bogus.instruction` → `i64.add128` → `array.new_exact`), because its
+example must always be an instruction wazmrt has NOT built. **Ask whether the example still
+demonstrates the property before touching the assertion**; twice the property was fine and once the
+example had never demonstrated it at all. ⚠️ Where a list and its mirror both exist (implemented
+vs. untargeted mnemonics), an example only ever migrates from one to the other — check both. —
+wide-arithmetic, `wast.zig`
+
+**A TEST HELPER THAT ENCODES A DEPENDENCY GRAPH MUST BE EXTENDED WITH THE GRAPH.** Adding
+`wide_arithmetic` (layered on `multi_value`) made `engineWithout(.multi_value)` produce an
+incoherent config; the engine refused it, and the helper's `unreachable` turned a correct refusal
+into a CRASH. That is the layering rule working — the engine reports an incoherent set rather than
+repairing it — but it means the helper's dependent-switch is part of `Set.incoherent`'s contract.
+**Whenever `incoherent` gains a pair, grep for the helpers that construct partial sets.** —
+wide-arithmetic, `capi.zig`
+
 ## 5. Recording what you found
 
 **"Update the project memory" means AUDIT for stale live claims, not edit the files you happened to

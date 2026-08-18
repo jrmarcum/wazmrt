@@ -2288,6 +2288,7 @@ const v128_2: []const V = &.{ .v128, .v128 };
 const v128_3: []const V = &.{ .v128, .v128, .v128 };
 const v128_shift: []const V = &.{ .v128, .i32 }; // vector, shift amount
 const addr_v128: []const V = &.{ .i32, .v128 }; // store / lane load-store: addr, vector
+const i64_4: []const V = &.{ .i64, .i64, .i64, .i64 }; // wide-arithmetic add128/sub128 operands
 
 fn sig(pop: []const V, push: []const V) FuncValidator.Sig {
     return .{ .pop = pop, .push = push };
@@ -2412,6 +2413,12 @@ fn simpleSig(op: Op) ?FuncValidator.Sig {
         // Memory
         0x3f => sig(empty, i32_1), // memory.size
         0x40 => sig(i32_1, i32_1), // memory.grow
+        // Wide arithmetic (0xFC 0x13..0x16). Two i64 results each, which is why the feature is
+        // layered on multi-value. ⚠️ The 128-bit halves travel as `(lo, hi)` with `lo` DEEPEST,
+        // and every operand and result here is an i64 — so a transposed implementation type-checks
+        // perfectly and only the corpus's arithmetic can catch it. See `Op.i64_add128`.
+        0x106, 0x107 => sig(i64_4, i64_2), // i64.add128 / i64.sub128
+        0x108, 0x109 => sig(i64_2, i64_2), // i64.mul_wide_s / i64.mul_wide_u
         else => null,
     };
 }

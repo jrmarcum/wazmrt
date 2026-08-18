@@ -81,6 +81,14 @@ pub const Feature = enum(u8) {
     ///
     /// Layered on nothing — it extends core memories, so it stands alone in `incoherent`.
     custom_page_sizes = 17,
+    /// wide-arithmetic: `i64.add128`, `i64.sub128`, `i64.mul_wide_s`, `i64.mul_wide_u` —
+    /// 128-bit add/sub and 64×64→128 multiply.
+    ///
+    /// ⚠️ **Layered on `multi_value`, and that is not a wazmrt invention.** Every one of the
+    /// four returns TWO i64 results, so a module using any of them is a multi-value module by
+    /// construction; enabling this while refusing multi-value describes nothing. See
+    /// `incoherent`.
+    wide_arithmetic = 18,
 
     pub fn name(self: Feature) []const u8 {
         return @tagName(self);
@@ -119,6 +127,9 @@ pub const Set = struct {
         if (self.has(.multi_table) and !self.has(.reference_types)) return .{ .multi_table, .reference_types };
         // custom-descriptors extends GC; enabling it alone describes no wasm version.
         if (self.has(.custom_descriptors) and !self.has(.gc)) return .{ .custom_descriptors, .gc };
+        // Every wide-arithmetic instruction returns two i64s, so it cannot be had without
+        // multi-value — a module using one is a multi-value module whether or not it says so.
+        if (self.has(.wide_arithmetic) and !self.has(.multi_value)) return .{ .wide_arithmetic, .multi_value };
         return null;
     }
 };
@@ -174,6 +185,9 @@ fn opFeature(op: opcode.Op) ?Feature {
 
         // Exception handling, both encodings.
         .throw, .throw_ref, .try_table, .try_, .catch_, .catch_all, .rethrow, .delegate => .exceptions,
+
+        // Wide arithmetic.
+        .i64_add128, .i64_sub128, .i64_mul_wide_s, .i64_mul_wide_u => .wide_arithmetic,
 
         .simd => .simd, // relaxed vs not is decided by the sub-opcode
         .atomic => .threads,
@@ -366,8 +380,8 @@ pub fn firstViolation(gpa: std.mem.Allocator, module: *const Module, fs: Set) !?
 // confirm it really is MVP core), and only then update the number.
 comptime {
     const n = @typeInfo(opcode.Op).@"enum".fields.len;
-    if (n != 254) @compileError(std.fmt.comptimePrint(
-        "opcode.Op has {d} members, features.zig was written against 254. A new opcode must be " ++
+    if (n != 258) @compileError(std.fmt.comptimePrint(
+        "opcode.Op has {d} members, features.zig was written against 258. A new opcode must be " ++
             "classified in opFeature() before this number is updated — an unclassified opcode " ++
             "silently passes every proposal gate.",
         .{n},
@@ -519,4 +533,44 @@ test "gating: custom_page_sizes — the proposal that shipped with no switch at 
             return e;
         };
     }
+}
+
+test "gating: wide_arithmetic, and its multi_value layering" {
+    const off = setWithout(&.{.wide_arithmetic});
+    const all: Set = .{};
+
+    for ([_][]const u8{
+        "(module (func (param i64 i64 i64 i64) (result i64 i64) (i64.add128 (local.get 0) (local.get 1) (local.get 2) (local.get 3))))",
+        "(module (func (param i64 i64 i64 i64) (result i64 i64) (i64.sub128 (local.get 0) (local.get 1) (local.get 2) (local.get 3))))",
+        "(module (func (param i64 i64) (result i64 i64) (i64.mul_wide_s (local.get 0) (local.get 1))))",
+        "(module (func (param i64 i64) (result i64 i64) (i64.mul_wide_u (local.get 0) (local.get 1))))",
+    }) |src| {
+        std.testing.expectEqual(@as(?Feature, .wide_arithmetic), try needs(src, off)) catch |e| {
+            std.debug.print("not gated: {s}\n", .{src});
+            return e;
+        };
+        try std.testing.expectEqual(@as(?Feature, null), try needs(src, all));
+    }
+
+    // ⚠️ **The layering is reported by `incoherent`, not repaired.** Every one of these returns
+    // two i64s, so wide-arithmetic without multi-value describes nothing — but the engine says so
+    // rather than quietly switching multi-value back on, which would accept modules the embedder
+    // meant to refuse.
+    var bad: Set = .{};
+    bad.set(.multi_value, false);
+    try std.testing.expectEqual(@as(?[2]Feature, .{ .wide_arithmetic, .multi_value }), bad.incoherent());
+    // With BOTH off the set is coherent again, and the module is refused for the outer reason
+    // it hits first — multi-value, which its result arity needs before any instruction is read.
+    const both = setWithout(&.{ .wide_arithmetic, .multi_value });
+    try std.testing.expect(both.incoherent() == null);
+    try std.testing.expectEqual(@as(?Feature, .multi_value), try needs(
+        "(module (func (param i64 i64) (result i64 i64) (i64.mul_wide_u (local.get 0) (local.get 1))))",
+        both,
+    ));
+
+    // No false positives: plain i64 arithmetic still loads with the flag off.
+    try std.testing.expectEqual(@as(?Feature, null), try needs(
+        "(module (func (param i64 i64) (result i64) (i64.add (local.get 0) (local.get 1))))",
+        off,
+    ));
 }

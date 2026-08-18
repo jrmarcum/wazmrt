@@ -2353,6 +2353,12 @@ const Frame = struct {
     fn popI32(self: *Frame) i32 {
         return asI32(self.pop());
     }
+    /// Assemble a 128-bit value from its two i64 halves. `lo` is the LOW 64 bits — see the
+    /// wide-arithmetic arms in `step` for why that order is load-bearing and untypeable.
+    fn join128(lo: i64, hi: i64) u128 {
+        return (@as(u128, @as(u64, @bitCast(hi))) << 64) | @as(u128, @as(u64, @bitCast(lo)));
+    }
+
     fn pushI64(self: *Frame, v: i64) Error!void {
         try self.pushU64(i64Value(v));
     }
@@ -3491,6 +3497,45 @@ const Frame = struct {
             .i64_le_u => try self.cmpI64(.le_u),
             .i64_ge_s => try self.cmpI64(.ge_s),
             .i64_ge_u => try self.cmpI64(.ge_u),
+            // Wide arithmetic (0xFC 0x13..0x16).
+            //
+            // ⚠️ **THE HALVES TRAVEL AS `(lo, hi)` WITH `lo` DEEPEST, AND NOTHING IN THE TYPE
+            // SYSTEM CAN CHECK IT.** Every operand and every result is an i64, so swapping the
+            // two halves validates cleanly, passes every arity and type test, and returns wrong
+            // numbers. `wide-arithmetic.wast` pins it: `(1,2)+(3,4) = (4,6)`, which is
+            // `{hi:2,lo:1} + {hi:4,lo:3} = {hi:6,lo:4}`. Popping is therefore hi-then-lo per
+            // operand, and pushing is lo-then-hi.
+            //
+            // Zig's native `u128`/`i128` do the arithmetic, so there is no carry chain to get
+            // wrong — the only real decisions here are the operand order above and the
+            // signedness of the multiply below.
+            .i64_add128, .i64_sub128 => {
+                const b_hi = self.popI64();
+                const b_lo = self.popI64();
+                const a_hi = self.popI64();
+                const a_lo = self.popI64();
+                const a = join128(a_lo, a_hi);
+                const b = join128(b_lo, b_hi);
+                // Wrapping, like every other wasm integer op: 128-bit add/sub is defined
+                // modulo 2^128, not trapping.
+                const r = if (op == .i64_add128) a +% b else a -% b;
+                try self.pushI64(@bitCast(@as(u64, @truncate(r))));
+                try self.pushI64(@bitCast(@as(u64, @truncate(r >> 64))));
+            },
+            .i64_mul_wide_s, .i64_mul_wide_u => {
+                const b = self.popI64();
+                const a = self.popI64();
+                // 64x64 -> 128 cannot overflow, so the widening is exact; the signedness is the
+                // whole difference between the two opcodes. Done in 128 bits from the start —
+                // multiplying in 64 and widening afterwards would discard the high half, which is
+                // the only part these instructions exist to produce.
+                const r: u128 = if (op == .i64_mul_wide_s)
+                    @bitCast(@as(i128, a) * @as(i128, b))
+                else
+                    @as(u128, @as(u64, @bitCast(a))) * @as(u128, @as(u64, @bitCast(b)));
+                try self.pushI64(@bitCast(@as(u64, @truncate(r))));
+                try self.pushI64(@bitCast(@as(u64, @truncate(r >> 64))));
+            },
             // i64 binary
             .i64_add => try self.binI64(.add),
             .i64_sub => try self.binI64(.sub),
@@ -6507,4 +6552,71 @@ test "D2: a descriptor link changes MODULE-LOCAL canonical identity too" {
     try std.testing.expect(m.canonOf(1) != m.canonOf(3));
     // Nominal subtyping must not quietly relate them either — neither declares the other.
     try std.testing.expect(!m.isSubtype(0, 2) and !m.isSubtype(2, 0));
+}
+
+test "wide-arithmetic: the (lo, hi) operand order, which NO type check can catch" {
+    // 🔒 **THE BY-CONSTRUCTION WRONG-ANSWER TEST.** Every operand and every result of these four
+    // is an i64, so transposing the halves validates cleanly, satisfies every arity check, and
+    // returns wrong numbers. The values below are chosen so `lo` and `hi` are never equal and
+    // never symmetric — a swapped implementation cannot pass any of them.
+    //
+    // ⚠️ The spec's own file pins the convention: `(1,2)+(3,4) = (4,6)` is
+    // `{hi:2,lo:1} + {hi:4,lo:3} = {hi:6,lo:4}`. Operands are `(lo, hi)` with `lo` deepest.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const wat = @import("wat.zig");
+
+    const bytes = try wat.assemble(a,
+        \\(module
+        \\  (func (export "add") (param i64 i64 i64 i64) (result i64 i64)
+        \\    (i64.add128 (local.get 0) (local.get 1) (local.get 2) (local.get 3)))
+        \\  (func (export "sub") (param i64 i64 i64 i64) (result i64 i64)
+        \\    (i64.sub128 (local.get 0) (local.get 1) (local.get 2) (local.get 3)))
+        \\  (func (export "muls") (param i64 i64) (result i64 i64)
+        \\    (i64.mul_wide_s (local.get 0) (local.get 1)))
+        \\  (func (export "mulu") (param i64 i64) (result i64 i64)
+        \\    (i64.mul_wide_u (local.get 0) (local.get 1))))
+    );
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
+    defer destroy(&inst);
+
+    // CARRY out of the low half: 0xFFFF_FFFF_FFFF_FFFF + 1 wraps to 0 and carries into hi. A
+    // swapped implementation gets a different pair, and so does one that adds the halves
+    // independently — which is why the arm joins to a real u128 instead of chaining by hand.
+    {
+        const r = try inst.invoke("add", &.{ i64Value(-1), i64Value(0), i64Value(1), i64Value(0) });
+        defer std.testing.allocator.free(r);
+        try std.testing.expectEqual(@as(i64, 0), asI64(r[0])); // lo
+        try std.testing.expectEqual(@as(i64, 1), asI64(r[1])); // hi — the carry
+    }
+    // BORROW out of the low half: {hi:1, lo:0} − {hi:0, lo:1}.
+    {
+        const r = try inst.invoke("sub", &.{ i64Value(0), i64Value(1), i64Value(1), i64Value(0) });
+        defer std.testing.allocator.free(r);
+        try std.testing.expectEqual(@as(i64, -1), asI64(r[0])); // lo = 0xFFFF…F
+        try std.testing.expectEqual(@as(i64, 0), asI64(r[1])); // hi = 1 − 1 − borrow
+    }
+    // SIGNEDNESS is the whole difference between the two multiplies and it shows ONLY in the high
+    // half: both spellings agree on `lo`, so a test reading only `lo` would pass with either one
+    // implemented twice.
+    {
+        const s = try inst.invoke("muls", &.{ i64Value(-1), i64Value(2) });
+        defer std.testing.allocator.free(s);
+        try std.testing.expectEqual(@as(i64, -2), asI64(s[0])); // lo
+        try std.testing.expectEqual(@as(i64, -1), asI64(s[1])); // hi: sign-extended
+        const u = try inst.invoke("mulu", &.{ i64Value(-1), i64Value(2) });
+        defer std.testing.allocator.free(u);
+        try std.testing.expectEqual(@as(i64, -2), asI64(u[0])); // lo — IDENTICAL
+        try std.testing.expectEqual(@as(i64, 1), asI64(u[1])); // hi — and here is the difference
+    }
+    // A product that genuinely needs 128 bits: 2^63 × 2 = 2^64, entirely in the HIGH half.
+    // Multiplying in 64 bits and widening afterwards yields (0, 0).
+    {
+        const r = try inst.invoke("mulu", &.{ i64Value(std.math.minInt(i64)), i64Value(2) });
+        defer std.testing.allocator.free(r);
+        try std.testing.expectEqual(@as(i64, 0), asI64(r[0])); // lo
+        try std.testing.expectEqual(@as(i64, 1), asI64(r[1])); // hi = 1 → 2^64
+    }
 }

@@ -377,6 +377,28 @@ pub const Op = enum(u16) {
     br_on_cast_desc_eq = 0x104,
     br_on_cast_desc_eq_fail = 0x105,
 
+    // Wide arithmetic (`0xFC` prefix, sub-opcodes `0x13`–`0x16`). 128-bit add/sub and
+    // 64×64→128 multiply, each producing TWO i64 results — so every one of them needs
+    // multi-value, and none of them has an immediate.
+    //
+    // 🔑 **The sub-opcode numbers are READ OFF THE SPEC TESTSUITE, not inferred.**
+    // `wide-arithmetic.wast` contains a `(module binary …)` whose whole purpose is overlong
+    // LEB encodings of these four: `\fc\93\80\00`, `\fc\94\00`, `\fc\95\80\80\80\00`,
+    // `\fc\96\80\80\00` — which decode to 0x13, 0x14, 0x15, 0x16. ⚠️ **Our assembler is not
+    // an oracle for our decoder**: a self-consistent wrong number would have passed every
+    // text assertion in that file and still been wrong on the wire, so the number had to come
+    // from outside wazmrt. That module is now also a conformance test of these constants.
+    //
+    // ⚠️ **Operand and result order is (lo, hi), lo DEEPEST.** `i64.add128` takes
+    // `[a_lo a_hi b_lo b_hi]` and returns `[r_lo r_hi]`; the file pins it —
+    // `(1,2)+(3,4) = (4,6)` is `{hi:2,lo:1} + {hi:4,lo:3} = {hi:6,lo:4}`. Getting this
+    // backwards still type-checks (every operand is an i64) and every arity test still
+    // passes, which is exactly the shape of defect the corpus catches and unit tests do not.
+    i64_add128 = 0x106, // 0xFC 0x13: [i64 i64 i64 i64] -> [i64 i64]
+    i64_sub128 = 0x107, // 0xFC 0x14: [i64 i64 i64 i64] -> [i64 i64]
+    i64_mul_wide_s = 0x108, // 0xFC 0x15: [i64 i64] -> [i64 i64]
+    i64_mul_wide_u = 0x109, // 0xFC 0x16: [i64 i64] -> [i64 i64]
+
     // GC casts (0xFB prefix). ref.test/ref.cast carry a target reference type
     // (nullability + heap type); the null/non-null encodings collapse to one
     // internal tag distinguished by the decoded `RefType.nullable`.
@@ -451,6 +473,12 @@ pub fn fcSubOpcode(op: Op) ?u8 {
         .table_grow => 0x0f,
         .table_size => 0x10,
         .table_fill => 0x11,
+        // Wide arithmetic. The assembler emits through here, so these numbers and the decoder's
+        // are one list read twice — the producer/consumer pair this repo checks first.
+        .i64_add128 => 0x13,
+        .i64_sub128 => 0x14,
+        .i64_mul_wide_s => 0x15,
+        .i64_mul_wide_u => 0x16,
         else => null,
     };
 }
@@ -767,6 +795,8 @@ pub fn immediateKind(op: Op) ImmKind {
         0xcd => .gc_array_copy,
         // ref.test / ref.cast: a target reference type.
         0xee, 0xef, 0x103 => .ref_cast, // + custom-descriptors `ref.cast_desc_eq`
+        // Wide arithmetic (0xFC 0x13..0x16) — no immediates.
+        0x106, 0x107, 0x108, 0x109 => .none,
         // br_on_cast / br_on_cast_fail: a label + source & destination ref types.
         0xf9, 0xfa, 0x104, 0x105 => .br_cast, // + the `_desc_eq` pair
         else => .unsupported,
@@ -1238,6 +1268,13 @@ pub fn decodeBodyTracked(
                 0x0f => .{ .op = .table_grow, .imm = .{ .table = try r.readVarU32() } },
                 0x10 => .{ .op = .table_size, .imm = .{ .table = try r.readVarU32() } },
                 0x11 => .{ .op = .table_fill, .imm = .{ .table = try r.readVarU32() } },
+                // Wide arithmetic — no immediates. `readVarU32` already accepts the OVERLONG
+                // encodings `wide-arithmetic.wast` insists on, which is where these four numbers
+                // came from in the first place.
+                0x13 => .{ .op = .i64_add128, .imm = .none },
+                0x14 => .{ .op = .i64_sub128, .imm = .none },
+                0x15 => .{ .op = .i64_mul_wide_s, .imm = .none },
+                0x16 => .{ .op = .i64_mul_wide_u, .imm = .none },
                 else => return error.UnsupportedOpcode,
             };
             try list.append(a, imm);
@@ -1579,4 +1616,40 @@ test "R3: the six array bulk ops decode from their 0xFB sub-opcodes" {
     try std.testing.expectEqual(@as(?u8, 0x11), gcSubOpcode(.array_copy));
     try std.testing.expectEqual(@as(?u8, 0x12), gcSubOpcode(.array_init_data));
     try std.testing.expectEqual(@as(?u8, 0x13), gcSubOpcode(.array_init_elem));
+}
+
+test "wide-arithmetic: the encoding matches the SPEC's own bytes, both directions" {
+    // 🔑 **OUR ASSEMBLER IS NOT AN ORACLE FOR OUR DECODER**, and these four sub-opcode numbers are
+    // exactly the case that rule exists for: had `0x13`–`0x16` been guessed wrong, every text
+    // assertion in `wide-arithmetic.wast` would still have passed — the assembler would emit the
+    // wrong byte and the decoder would read it back — and the module would be wrong on the wire
+    // against every other runtime. The numbers come from the spec suite's own `(module binary …)`,
+    // whose overlong LEBs `\fc\93\80\00` / `\fc\94\00` / `\fc\95\80\80\80\00` / `\fc\96\80\80\00`
+    // decode to 19, 20, 21, 22.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Decode: the canonical single-byte sub-opcode.
+    for ([_]struct { sub: u8, op: Op }{
+        .{ .sub = 0x13, .op = .i64_add128 },
+        .{ .sub = 0x14, .op = .i64_sub128 },
+        .{ .sub = 0x15, .op = .i64_mul_wide_s },
+        .{ .sub = 0x16, .op = .i64_mul_wide_u },
+    }) |c| {
+        const ir = try decodeBody(a, &[_]u8{ 0xfc, c.sub, 0x0b });
+        try std.testing.expectEqual(c.op, ir[0].op);
+        try std.testing.expectEqual(Imm.none, ir[0].imm);
+        // ...and the OVERLONG encoding the corpus insists on decodes identically.
+        const long = try decodeBody(a, &[_]u8{ 0xfc, c.sub | 0x80, 0x80, 0x00, 0x0b });
+        try std.testing.expectEqual(c.op, long[0].op);
+    }
+    // Emit: `fcSubOpcode` is the same list read the other way, so a drift between the two
+    // would be a module wazmrt writes and cannot read.
+    try std.testing.expectEqual(@as(?u8, 0x13), fcSubOpcode(.i64_add128));
+    try std.testing.expectEqual(@as(?u8, 0x14), fcSubOpcode(.i64_sub128));
+    try std.testing.expectEqual(@as(?u8, 0x15), fcSubOpcode(.i64_mul_wide_s));
+    try std.testing.expectEqual(@as(?u8, 0x16), fcSubOpcode(.i64_mul_wide_u));
+    // They are `0x100`+ internal tags, so no raw wire byte can ever name one.
+    try std.testing.expectEqual(@as(?u8, null), wireByte(.i64_add128));
 }

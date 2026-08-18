@@ -1373,7 +1373,7 @@ test "F5: the runtime feature set is a subset of what was COMPILED IN, in every 
     // all four `-Dwat`/`-Dwasi` combinations, which is where a divergence would first appear.
     const all: wazmrt.features.Set = .{};
     try std.testing.expect(all.all());
-    try std.testing.expectEqual(@as(usize, 18), wazmrt.features.count);
+    try std.testing.expectEqual(@as(usize, 19), wazmrt.features.count);
 }
 
 test "--features: a long list does not overflow anything (regression)" {
