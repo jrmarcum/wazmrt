@@ -33,6 +33,11 @@ pub const Reader = @import("Reader.zig");
 pub const Module = @import("Module.zig");
 pub const opcode = @import("opcode.zig");
 pub const validate = @import("validate.zig").validate;
+/// `validate`, judged by a specific proposal ERA — **and the only entry point that gates**.
+/// The feature check lives INSIDE it (F1r), so an embedder's restricted set filters which
+/// proposals may appear *and* selects the typing rules that go with them. `validate` is this
+/// with the all-features default, which short-circuits the gate entirely.
+pub const validateWith = @import("validate.zig").validateWith;
 /// Where the last `validate` failure was and what it was about — see `FailureSite`. A side channel
 /// because a Zig error set carries no payload, so `error.TypeMismatch` alone cannot say which types.
 pub const lastFailureSite = @import("validate.zig").lastFailureSite;

@@ -158,12 +158,37 @@ fn containsPathSegment(haystack: []const u8, needle: []const u8) bool {
     return std.mem.indexOf(u8, haystack, needle) != null;
 }
 
+/// A proposal survives only if BOTH sets grant it. See `runScriptWith` for why this is an
+/// intersection and not a replacement.
+fn intersect(a: features.Set, b: features.Set) features.Set {
+    var out: features.Set = .{};
+    for (0..features.count) |i| {
+        const f: features.Feature = @enumFromInt(@as(u8, @intCast(i)));
+        out.set(f, a.has(f) and b.has(f));
+    }
+    return out;
+}
+
 /// Parse and run a whole `.wast` source, returning pass/fail counts.
 ///
 /// `path` is the file the source came from, used ONLY to pick the era feature set
 /// (`featuresForPath`); pass `null` for an inline source. It is a required parameter rather than a
 /// defaulted one on purpose — **a defaulted policy is a policy nobody reviewed.**
 pub fn runScript(gpa: std.mem.Allocator, src: []const u8, path: ?[]const u8) Error!Summary {
+    return runScriptWith(gpa, src, path, .{});
+}
+
+/// `runScript`, narrowed further by a set the CALLER chose — the CLI's `--features`.
+///
+/// 🔒 **The two sets INTERSECT; `limit` can only ever take features away.** A `.wast` runs the
+/// modules it contains, so a CLI restriction that stopped at `.wasm` would be sidestepped by
+/// wrapping the module in a script — the same bypass this file's caller already closed once for
+/// the verify gate, and the attacker picks the extension. Intersecting (rather than replacing)
+/// keeps the era policy intact underneath: `proposals/threads/` is still judged without
+/// multi-memory even if the caller asked for everything, because a snapshot's own era is a fact
+/// about the file and not a preference the command line can raise. Same shape as `--verify`,
+/// which raises strictness and never lowers it.
+pub fn runScriptWith(gpa: std.mem.Allocator, src: []const u8, path: ?[]const u8, limit: features.Set) Error!Summary {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     // One store for the whole script: every module a `.wast` file builds can be
@@ -175,7 +200,7 @@ pub fn runScript(gpa: std.mem.Allocator, src: []const u8, path: ?[]const u8) Err
         .a = arena.allocator(),
         .msg_a = gpa,
         .store = &store,
-        .features = featuresForPath(path),
+        .features = intersect(featuresForPath(path), limit),
     };
     // Guest linear memory is PAGE-ALLOCATOR owned, so the arena above does NOT
     // reclaim it — every `(memory N)` in every module, plus every `memory.grow`,
@@ -381,9 +406,10 @@ const Runner = struct {
     /// a module both valid and invalid within one file.
     ///
     /// ⚠️ The gate runs BEFORE type validation, so the refusal names the proposal rather than
-    /// surfacing as some type error deep inside a feature this era never had.
+    /// surfacing as some type error deep inside a feature this era never had. 🆕 **F1r moved that
+    /// gate INSIDE `validateWith`,** so this is now a single call — and the ordering it relied on
+    /// is a property of the callee rather than of every caller remembering it.
     fn validateEra(self: *Runner, m: *const Module) !void {
-        if (try features.firstViolation(self.a, m, self.features)) |_| return error.DisabledProposal;
         try validateWith(self.a, m, self.features);
     }
 

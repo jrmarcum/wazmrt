@@ -577,6 +577,55 @@
 # Corpus 63,731/2/144 -> **63,732 passed / 0 FAILED / 144 skipped**. The only remaining baseline
 # entry is `annotations.wast`, a runner-lex gap on an untargeted proposal.
 
-wazmrt.exe  978944
-wazmrt.lib  1046522
+# RAISED 2026-08-18 by TRACK F — feature ENFORCEMENT completed (F1r, the two missing gates, F5-CLI, F5).
+#
+#   artifact       before         after       delta
+#   wazmrt.exe    978,944       984,576      +5,632
+#   wazmrt.lib  1,046,522     1,047,720      +1,198
+#   wazmrt.dll    900,608       900,608           0
+#
+# 🔑 **The DLL did not move at all, and that is the number that says where the bytes went.** The
+# whole +5.6 KB of the exe is the CLI's `--features` surface — the list parser, its diagnostics and
+# the help section — and the embed artifact does not contain `main.zig`. An embedder pays nothing
+# for a front-end flag, which is the split Track 2c exists to preserve.
+#
+# ⚠️ **The exe was 985,088 for one measurement and this number is 512 LOWER — read why before
+# treating a sub-KB delta as noise.** The first `--features` parser buffered its items into a stack
+# array sized `features.count * 2` and never bounded the index; every item has to be a valid
+# proposal name to be stored, but nothing stops a caller repeating one, so a long list wrote off the
+# end — a panic under `zig build test`, a stack smash in THIS ReleaseSmall build. Re-splitting the
+# string instead of buffering it removed the array, the bound and 512 bytes. **The fix for a
+# memory-safety bug came out smaller than the bug**, and the CLI is now in `zig build test-safe`
+# for exactly the reason that step exists.
+#
+# The lib's +1,198 is the engine half, and it is small because the walk it extends was already
+# there: `firstViolation` gained a type-section pass (`(exact $t)` in composite types, struct
+# fields, table/global types and instruction immediates; `(descriptor $d)`/`(describes $s)` links;
+# exact func imports), one more `Feature` member, and the fold of the gate INTO `validateWith`.
+# The DLL's 0 says the same thing from the other side: the engine growth is under ReleaseSmall's
+# noise floor for that artifact.
+#
+# What shipped, and two of the four were HOLES rather than features:
+#
+#   - F1r — the gate moved INSIDE `validateWith`. It used to sit beside each caller, so a new
+#     entry point calling `validate` alone inherited no gate. It also closes a shipped defect the
+#     two-step could not see: `capi.zig` gated with the engine's set and then validated with ALL
+#     features, so with `custom_descriptors` off, `br_on_cast` was still TYPED by the relaxed
+#     custom-descriptors rule.
+#   - `custom_descriptors` was knowingly PARTIAL — it gated instructions, and its three type-level
+#     formers live in the type section, so a module using only the type syntax loaded with the bit
+#     off.
+#   - `custom_page_sizes` did not exist. Track P shipped the proposal with no `Feature` member at
+#     all, so `wazmrt_config_all_features(cfg, false)` still accepted byte-paged memories. **A
+#     proposal that ships without a bit here is not enabled-by-default; it is unrefusable.**
+#   - F5-CLI — `--features <list>`, applying to `.wasm`, `.wat` AND `.wast` (a restriction that
+#     stopped at `.wasm` would be sidestepped by wrapping the module in a script, the identical
+#     bypass this path already closed once for the verify gate).
+#
+# Corpus unchanged at 63,732 passed / 0 failed / 144 skipped. Unit tests 719 -> 734, and 7 of the
+# new ones are the CLI's FIRST reachable tests — `main.zig` had no test target until `--features`
+# put a policy parser in it.
+
+wazmrt.exe  984576
+wazmrt.lib  1047720
 wazmrt.dll  900608

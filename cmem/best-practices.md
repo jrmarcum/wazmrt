@@ -513,6 +513,70 @@ module, era)` takes the parameter and `validate` delegates to it with the defaul
 not wrong when written — it assumed the only shape was changing the existing signature. — F1r/D4,
 `roadmap.md`
 
+**AN ENFORCEMENT ARM THAT RUNS *BESIDE* THE THING IT CONSTRAINS ENFORCES ONLY WHAT ITS CALLER
+REMEMBERED TO ASK FOR.** The feature gate sat next to `validate`: every entry point ran
+`firstViolation` and then `validate` by hand. The obvious cost is the one the roadmap named — a new
+entry point inherits no gate. The cost nobody named is the one that had already shipped: `capi.zig`
+gated with the embedder's feature set and then validated with **all** features, so the set decided
+which proposals were ADMISSIBLE while the all-features rules decided what they MEANT. With
+`custom_descriptors` off, `br_on_cast` was still typed by the relaxed custom-descriptors rule. No
+gating test could see it, because that instruction exists either way and was never refused. **When
+two calls must agree, make them one call — "kept in step" is a property of the last person to
+edit.** — F1r, `roadmap.md`
+
+**REFUSING THE OPCODES A PROPOSAL ADDS IS NOT THE SAME AS REFUSING THE PROPOSAL.** `custom_descriptors`
+gated its six new instructions and was recorded as "partially enforced" for one known reason — its
+type-level formers live in the type section, which the instruction walk never visits. The walk was
+short by more than that: the proposal also adds an `exact` prefix to heap types that **pre-existing
+GC instructions** carry, so `ref.cast (ref (exact $t))` passed a gate that had already approved
+`ref.cast`. Enumerate what a proposal ADDS TO existing constructs, not only what it introduces. —
+Track F, `roadmap.md`
+
+**A PROPOSAL THAT SHIPS WITHOUT A GATE IS NOT "ENABLED BY DEFAULT" — IT IS UNREFUSABLE.** Track P
+landed custom-page-sizes end to end with a careful checklist: every hardcoded `65536` enumerated, a
+byte-granularity out-of-bounds test demanded, its own security item named. It added no
+`features.Feature` member, so `wazmrt_config_all_features(cfg, false)` — every switch the enum
+offers, off — still accepted a byte-paged memory. ⚠️ **A per-proposal checklist cannot ask this
+question about itself**; it lives one level up. Put "does it have a gate, and is that gate tested?"
+in the deliverables of every proposal track, and when scoping a track that claims a gate exists,
+**grep for the gate** — the same discipline that already caught work recorded as TODO that was
+already done. — Track P/F, `roadmap.md`
+
+**A SECURITY CONTROL WHOSE PARSER IS ONLY EVER EXERCISED BY HAND IS A CONTROL NOBODY CHECKED.**
+`main.zig` had no test target for its entire life — `root.zig` does not import it, so nothing in the
+CLI was reachable from the module tests. That was untidy while the CLI only printed section
+summaries; it stopped being untidy the moment `--features` put a policy parser there. **The same
+gap, in the same repo, previously shipped a double free through the C ABI.** When a front end grows
+its first decision, give it its first test target in the same commit. — F5, `build.zig`
+
+**AN AMBIGUOUS INPUT SHAPE IS REFUSED, NOT RESOLVED.** `--features gc,-simd` can mean "MVP plus gc,
+minus simd" or "everything minus simd, plus gc". Both readings are defensible, so the parser refuses
+it and names the two unambiguous spellings. Choosing one would have been a precedence rule nobody
+reviewed — the same objection that made `runScript`'s era parameter required rather than defaulted.
+⚠️ And the mirror rule for the same parser: **an unrecognised item is an ERROR, never a skip.**
+Silently ignoring `--features mvp,sim` leaves the user believing they restricted something. — F5-CLI,
+`roadmap.md`
+
+**A LIST WRITTEN OUT A THIRD TIME IS A LIST THAT WILL DRIFT; DERIVE IT.** `features.Feature` already
+had two hand-written copies (`capi.Feature`, `wazmrt.h`) and both drifted — shipping a switch the
+header advertised that silently did nothing. The CLI would have been the fourth. It parses names
+with `stringToEnum` over the enum and prints them with `@tagName`, so no proposal list appears in
+`main.zig` at all. **A comptime pin makes drift detectable; deriving makes it unrepresentable —
+prefer the second where the shape allows it.** — F5-CLI, `roadmap.md`
+
+**A BUFFER SIZED FROM A TYPE IS NOT SIZED FROM THE INPUT — AND "EVERY ELEMENT IS VALIDATED" IS NOT
+"THE COUNT IS BOUNDED".** `--features` read its items into a `[features.count * 2]` stack array and
+never bounded the index. Every item had to be a valid proposal name to be stored, which is exactly
+what made it read as safe — but nothing stops a caller *repeating* one, so `--features simd,simd,…`
+wrote off the end: a panic under `zig build test`, a stack smash in the shipped ReleaseSmall CLI,
+in the one binary that parses untrusted argv. `features.count` bounds how many DISTINCT proposals
+exist, not how many items someone may type. **Rewriting it to make two passes over the string
+removed the array, the bound and 512 bytes** — the fix for a memory-safety bug came out smaller
+than the bug. ⚠️ **And the gate that would have caught it existed and did not cover the file:**
+`test-safe`'s whole stated purpose is "a bug that only manifests in an optimized build", and
+`main.zig` was not in it. **When a front end starts parsing untrusted input, adding it to `test` is
+half the job — it belongs in the memory-safety gate too.** — F5-CLI, `roadmap.md`
+
 ## 5. Recording what you found
 
 **"Update the project memory" means AUDIT for stale live claims, not edit the files you happened to

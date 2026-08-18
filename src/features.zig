@@ -54,15 +54,33 @@ pub const Feature = enum(u8) {
     /// no single answer that satisfies both files, which is exactly the situation
     /// `wast.featuresForPath` was built for (F4, `proposals/threads`).
     ///
-    /// ⚠️ **Partially enforced, and say so plainly:** this gates the six D3/D4
-    /// INSTRUCTIONS and the `br_on_cast` rule. It does NOT gate the type-level
-    /// formers — `(exact $t)`, `(descriptor $d)`, `(describes $s)` — because
-    /// `check` walks instructions and those appear in the type section. A module
-    /// using only the type syntax is still accepted with this bit off. Closing
-    /// that needs a type-section pass, which belongs with F5.
+    /// ✅ **FULLY enforced as of Track F.** It gates the six D3/D4 INSTRUCTIONS, the
+    /// `br_on_cast` typing rule, **and** the three type-level formers — `(exact $t)`,
+    /// `(descriptor $d)`, `(describes $s)` — wherever they appear: composite types,
+    /// struct fields, table/global types, an EXACT func import (descriptor kind
+    /// `0x20`), and the exactness carried in instruction immediates.
+    ///
+    /// ⚠️ It was knowingly partial until then, and the reason is worth keeping: the
+    /// walk only visited INSTRUCTIONS, and these formers live in the TYPE SECTION, so
+    /// a module using nothing but the type syntax was accepted with the bit off. **A
+    /// proposal is not gated when its instructions are gated — it is gated when
+    /// everything that makes a module NEED it is.** See `firstViolation`'s type pass.
     ///
     /// Layered on `gc` — see `incoherent`.
     custom_descriptors = 16,
+    /// custom-page-sizes: `(memory 1 (pagesize 1))` — a memory declares its own page size,
+    /// byte-granular instead of the fixed 64 KiB.
+    ///
+    /// ⚠️ **This bit was MISSING until Track F, and the proposal shipped without it.**
+    /// Track P landed custom-page-sizes end to end — decoder, validator, every bounds
+    /// check — and added no way to refuse it, so an embedder who turned off literally
+    /// every switch in this enum still accepted byte-paged memories. **A proposal that
+    /// ships without a bit here is not "enabled by default"; it is unrefusable**, and the
+    /// only thing that would have caught it is the habit of grepping for the gate as part
+    /// of landing the feature.
+    ///
+    /// Layered on nothing — it extends core memories, so it stands alone in `incoherent`.
+    custom_page_sizes = 17,
 
     pub fn name(self: Feature) []const u8 {
         return @tagName(self);
@@ -200,6 +218,53 @@ fn require(fs: Set, f: ?Feature, found: *?Feature) Error!void {
     return error.DisabledProposal;
 }
 
+/// Every proposal one value type needs — its FAMILY first, then the custom-descriptors
+/// `exact` former layered on top.
+///
+/// 🔑 **Two requirements, in layering order, and the order is the whole point.** A
+/// `(ref (exact $t))` needs GC *and* custom-descriptors; reporting whichever happens to be
+/// checked first would tell an embedder who disabled GC that they are missing
+/// custom-descriptors. `valTypeFeature` alone could not say this — exactness is a BIT on the
+/// value type, not a member of its family, so it has no place in a switch over the families.
+fn requireValType(fs: Set, vt: types.ValType, found: *?Feature) Error!void {
+    try require(fs, valTypeFeature(vt), found);
+    if (vt.isExact()) try require(fs, .custom_descriptors, found);
+}
+
+/// `requireValType` for a struct field / array element. Packed fields (`i8`/`i16`) are GC's
+/// own storage types and carry no value type to inspect; the enclosing composite already
+/// required `.gc`.
+fn requireStorage(fs: Set, st: Module.StorageType, found: *?Feature) Error!void {
+    switch (st) {
+        .val => |v| try requireValType(fs, v, found),
+        .i8, .i16 => {},
+    }
+}
+
+/// The custom-descriptors exactness carried inside an INSTRUCTION immediate.
+///
+/// ⚠️ **The instructions themselves are not the whole of it.** `ref.cast`, `br_on_cast` and
+/// `ref.null` all exist without custom-descriptors and are gated as `.gc` / `.reference_types`;
+/// what the proposal adds is an `exact` prefix on the heap type they carry. A gate that only
+/// asked "is this opcode allowed" would let `ref.cast (ref (exact $t))` through with the bit
+/// off — refusing the *opcodes* a proposal adds is not the same as refusing the proposal.
+fn immIsExact(imm: opcode.Imm) bool {
+    return switch (imm) {
+        .ref_type, .ref_cast => |rt| rt.exact,
+        .br_cast => |bc| bc.src.exact or bc.dst.exact,
+        .block_type => |bt| switch (bt) {
+            .ref => |rt| rt.exact,
+            .value => |v| v.isExact(),
+            .empty, .type_index => false,
+        },
+        .select_types => |ts| blk: {
+            for (ts) |t| if (t.isExact()) break :blk true;
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
 /// The proposal a module needs but was not granted, or null if it is within its budget.
 ///
 /// Returns the offending feature rather than just failing, so the caller can name it — "this
@@ -214,12 +279,34 @@ pub fn firstViolation(gpa: std.mem.Allocator, module: *const Module, fs: Set) !?
     // are GC.
     for (module.comp_types) |ct| switch (ct) {
         .func => |ft| {
-            for (ft.params) |p| require(fs, valTypeFeature(p), &found) catch return found;
-            for (ft.results) |r| require(fs, valTypeFeature(r), &found) catch return found;
+            for (ft.params) |p| requireValType(fs, p, &found) catch return found;
+            for (ft.results) |r| requireValType(fs, r, &found) catch return found;
             // Multi-value: more than one result is the proposal's whole content.
             if (ft.results.len > 1) require(fs, .multi_value, &found) catch return found;
         },
-        .@"struct", .array => require(fs, .gc, &found) catch return found,
+        // ⚠️ The FIELDS are walked too, not just the composite kind. `.gc` alone left a
+        // `(struct (field (ref (exact $t))))` accepted with custom-descriptors off whenever GC
+        // was on — the arm answered the question "is this a GC form?" when the question is
+        // "what does this type need?".
+        .@"struct" => |fields| {
+            require(fs, .gc, &found) catch return found;
+            for (fields) |f| requireStorage(fs, f.storage, &found) catch return found;
+        },
+        .array => |f| {
+            require(fs, .gc, &found) catch return found;
+            requireStorage(fs, f.storage, &found) catch return found;
+        },
+    };
+
+    // --- custom-descriptors type-level formers ---------------------------------------------
+    // `(descriptor $d)` and `(describes $s)` are clauses on a TYPE, so nothing in the
+    // instruction walk below can see them. A module that only declares a descriptor pair —
+    // never executing one D3/D4 instruction — used to load with `custom_descriptors` off.
+    for (module.descriptors) |d| if (d != null) {
+        require(fs, .custom_descriptors, &found) catch return found;
+    };
+    for (module.describes) |d| if (d != null) {
+        require(fs, .custom_descriptors, &found) catch return found;
     };
 
     // --- memories ------------------------------------------------------------------------
@@ -227,6 +314,12 @@ pub fn firstViolation(gpa: std.mem.Allocator, module: *const Module, fs: Set) !?
     for (module.memories) |m| {
         if (m.limits.is64) require(fs, .memory64, &found) catch return found;
         if (m.limits.shared) require(fs, .threads, &found) catch return found;
+        // custom-page-sizes. 16 is the fixed 64 KiB page every wasm before the proposal had, and
+        // `Limits.page_size_log2` defaults to it — so `!= 16` is exactly "this memory declared
+        // its own page size". Tested on the whole INDEX SPACE, imports included, for the reason
+        // `module.tables` is: an IMPORTED byte-paged memory needs the proposal just as much, and
+        // counting only defined memories would gate the easy half.
+        if (m.limits.page_size_log2 != 16) require(fs, .custom_page_sizes, &found) catch return found;
     }
 
     // --- tables and globals --------------------------------------------------------------
@@ -234,14 +327,18 @@ pub fn firstViolation(gpa: std.mem.Allocator, module: *const Module, fs: Set) !?
     // one test covers all three spellings the spec asserts on (import+import, import+defined,
     // defined+defined). Counting only defined tables would pass two of the three.
     if (module.tables.len > 1) require(fs, .multi_table, &found) catch return found;
-    for (module.tables) |t| require(fs, valTypeFeature(t.element), &found) catch return found;
-    for (module.globals) |g| require(fs, valTypeFeature(g.content), &found) catch return found;
+    for (module.tables) |t| requireValType(fs, t.element, &found) catch return found;
+    for (module.globals) |g| requireValType(fs, g.content, &found) catch return found;
 
     // --- tags ----------------------------------------------------------------------------
     if (module.tags.len > 0) require(fs, .exceptions, &found) catch return found;
-    for (module.imports) |im| if (im.type.kind() == .tag) {
-        require(fs, .exceptions, &found) catch return found;
-    };
+    for (module.imports) |im| {
+        if (im.type.kind() == .tag) require(fs, .exceptions, &found) catch return found;
+        // custom-descriptors: an EXACT func import (descriptor kind `0x20`) demands type
+        // EQUALITY where an ordinary import accepts a subtype. It is a link-time rule with no
+        // instruction and no value type of its own, so neither walk reaches it.
+        if (im.exact) require(fs, .custom_descriptors, &found) catch return found;
+    }
 
     // --- function bodies -------------------------------------------------------------------
     // Decoded here rather than reusing the validator's pass: this runs ONLY when something is
@@ -251,6 +348,8 @@ pub fn firstViolation(gpa: std.mem.Allocator, module: *const Module, fs: Set) !?
         defer opcode.freeBody(gpa, instrs);
         for (instrs) |instr| {
             require(fs, instrFeature(instr), &found) catch return found;
+            // The opcode's own proposal is only half of it — see `immIsExact`.
+            if (immIsExact(instr.imm)) require(fs, .custom_descriptors, &found) catch return found;
         }
     }
 
@@ -287,3 +386,135 @@ comptime {
 // they collide with Zig keywords. A grep for `^    [a-z_]` misses all four — which is exactly how
 // a hand-audit of this enum goes wrong, and why the count above comes from `@typeInfo` rather
 // than from a text search.
+
+// =========================================================================================
+// Tests. These live here rather than in `capi.zig` (where the four original gating tests are)
+// because every case below turns on a piece of TYPE SYNTAX, and hand-encoding a descriptor rec
+// group as a byte array would make the test unreadable at exactly the point it has to be read.
+// =========================================================================================
+
+/// Everything on except the named proposals. Dependents are the caller's job — `Set.incoherent`
+/// reports an unlayered set rather than repairing it, and a test that repaired it here would be
+/// asserting against a config the engine would refuse.
+fn setWithout(off: []const Feature) Set {
+    var s: Set = .{};
+    for (off) |f| s.set(f, false);
+    return s;
+}
+
+/// Assemble `src`, decode it, and answer which proposal it needs that `fs` does not grant.
+fn needs(src: []const u8, fs: Set) !?Feature {
+    const wat = @import("wat.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const bin = try wat.assemble(arena.allocator(), src);
+    var m = try Module.decode(std.testing.allocator, bin);
+    defer m.deinit();
+    return firstViolation(std.testing.allocator, &m, fs);
+}
+
+test "gating: custom_descriptors covers the TYPE-LEVEL formers, not only its instructions" {
+    // ⚠️ REGRESSION TEST FOR A KNOWINGLY PARTIAL GATE. `firstViolation` walked instructions, and
+    // `(exact $t)` / `(descriptor $d)` / `(describes $s)` live in the TYPE SECTION — so every
+    // module below, none of which executes a single D3/D4 instruction, loaded with the bit off.
+    //
+    // 🔑 GC stays ON throughout. That is the whole point: with GC off these would be refused
+    // anyway, and the test would pass while proving nothing about `custom_descriptors`.
+    const off = setWithout(&.{.custom_descriptors});
+    const all: Set = .{};
+
+    const cases = [_][]const u8{
+        // `(exact $t)` in a function signature — a parameter, then a result.
+        "(module (type $s (struct)) (type (func (param (ref (exact $s))))))",
+        "(module (type $s (struct)) (type (func (result (ref (exact $s))))))",
+        // ... in a STRUCT FIELD and an ARRAY ELEMENT. Reached only because the composite arms
+        // now walk their fields; requiring `.gc` for the kind alone stopped at the container.
+        "(module (type $s (struct)) (type (struct (field (ref (exact $s))))))",
+        "(module (type $s (struct)) (type (array (ref (exact $s)))))",
+        // ... in an imported GLOBAL's type and an imported TABLE's element type.
+        "(module (type $s (struct)) (import \"a\" \"b\" (global (ref null (exact $s)))))",
+        "(module (type $s (struct)) (import \"a\" \"b\" (table 1 (ref null (exact $s)))))",
+        // A `(descriptor $d)`/`(describes $s)` pair: no `exact` anywhere, no instruction at all.
+        "(module (rec (type $a (sub (descriptor $a.d) (struct))) (type $a.d (sub (describes $a) (struct)))))",
+        // An EXACT FUNC IMPORT (descriptor kind 0x20) — a link-time rule with neither an
+        // instruction nor a value type of its own, so neither walk could reach it.
+        "(module (type $f (func)) (import \"m\" \"n\" (func (exact (type $f)))))",
+        // And exactness carried in an INSTRUCTION IMMEDIATE. `ref.test` exists without
+        // custom-descriptors and is gated as `.gc`; the `exact` prefix on its target is the
+        // proposal. A gate that only asked "is this opcode allowed" let this through.
+        "(module (type $s (struct)) (func (param anyref) (result i32) (ref.test (ref (exact $s)) (local.get 0))))",
+    };
+    for (cases) |src| {
+        std.testing.expectEqual(@as(?Feature, .custom_descriptors), try needs(src, off)) catch |e| {
+            std.debug.print("not gated: {s}\n", .{src});
+            return e;
+        };
+        // The same bytes are fine with the bit on — so the refusal is the gate, not the module.
+        try std.testing.expectEqual(@as(?Feature, null), try needs(src, all));
+    }
+}
+
+test "gating: custom_descriptors has NO false positives on plain GC" {
+    // The failure mode that would make the new type pass unusable: refusing GC modules that
+    // never touch a descriptor. Every one of these must load with `custom_descriptors` off.
+    const off = setWithout(&.{.custom_descriptors});
+    const cases = [_][]const u8{
+        "(module (type $s (struct (field i32))) (func (result (ref $s)) (struct.new_default $s)))",
+        "(module (type $a (array (mut i32))) (func (result (ref $a)) (array.new_default $a (i32.const 1))))",
+        "(module (type $s (struct)) (func (param anyref) (result i32) (ref.test (ref $s) (local.get 0))))",
+        "(module (type $s (struct)) (global (ref null $s) (ref.null $s)))",
+    };
+    for (cases) |src| {
+        std.testing.expectEqual(@as(?Feature, null), try needs(src, off)) catch |e| {
+            std.debug.print("false positive: {s}\n", .{src});
+            return e;
+        };
+    }
+}
+
+test "gating: an exact ref reports the LAYER it is missing — gc before custom_descriptors" {
+    // `requireValType` asks for the family first and the `exact` former second, and the order is
+    // observable. An embedder who turned off GC has not "forgotten custom-descriptors"; telling
+    // them so would name a switch that is not the one they touched.
+    const src = "(module (type $s (struct)) (type (func (param (ref (exact $s))))))";
+    // A coherent "no GC" set: `Set.incoherent` requires custom_descriptors to fall with it.
+    try std.testing.expectEqual(@as(?Feature, .gc), try needs(src, setWithout(&.{ .gc, .custom_descriptors })));
+    try std.testing.expectEqual(@as(?Feature, .custom_descriptors), try needs(src, setWithout(&.{.custom_descriptors})));
+}
+
+test "gating: custom_page_sizes — the proposal that shipped with no switch at all" {
+    // ⚠️ REGRESSION TEST FOR AN UNREFUSABLE PROPOSAL. Track P landed custom-page-sizes with no
+    // `Feature` member, so `wazmrt_config_all_features(cfg, false)` — every switch in the enum
+    // off — still accepted a byte-paged memory. There was nothing to turn off.
+    const off = setWithout(&.{.custom_page_sizes});
+    const all: Set = .{};
+
+    const paged = [_][]const u8{
+        "(module (memory 1 (pagesize 1)))",
+        // The IMPORTED half. `module.memories` is the whole index space, imports first, and a
+        // gate that counted only defined memories would cover exactly half the spellings.
+        "(module (memory (import \"m\" \"n\") 0 (pagesize 1)))",
+    };
+    for (paged) |src| {
+        std.testing.expectEqual(@as(?Feature, .custom_page_sizes), try needs(src, off)) catch |e| {
+            std.debug.print("not gated: {s}\n", .{src});
+            return e;
+        };
+        try std.testing.expectEqual(@as(?Feature, null), try needs(src, all));
+    }
+
+    // No false positives: an ordinary 64 KiB memory is MVP and must survive with EVERY switch
+    // off, defined or imported. `Limits.page_size_log2` defaults to 16, so a gate written as
+    // "the field is set" rather than "the field is not 16" would have refused both of these.
+    var nothing: Set = .{};
+    for (0..count) |i| nothing.set(@enumFromInt(@as(u8, @intCast(i))), false);
+    for ([_][]const u8{
+        "(module (memory 1))",
+        "(module (memory (import \"m\" \"n\") 0))",
+    }) |src| {
+        std.testing.expectEqual(@as(?Feature, null), try needs(src, nothing)) catch |e| {
+            std.debug.print("false positive: {s}\n", .{src});
+            return e;
+        };
+    }
+}

@@ -124,6 +124,13 @@ pub const Error = Module.Error || error{
     /// offset as `u64` (memory64), so this ceiling — which only a 64-bit memory
     /// may exceed — is a validation rule.
     InvalidMemArgOffset,
+    /// The module uses a proposal this feature set does not grant (F1r). **Which**
+    /// proposal is in `lastFailureSite().disabled_proposal` — a Zig error set carries
+    /// no payload, which is the same reason `FailureSite` exists at all.
+    ///
+    /// ⚠️ Unreachable from `validate`: its all-features default short-circuits the
+    /// gate, so no existing caller can suddenly start seeing this.
+    DisabledProposal,
 };
 
 /// Where the last validation failure was, and what it was about.
@@ -152,6 +159,11 @@ pub const FailureSite = struct {
     /// For a type mismatch: what the instruction required, and what was on the stack.
     expected: ?V = null,
     found: ?V = null,
+    /// For `error.DisabledProposal`: WHICH proposal the module needed and this era did
+    /// not grant. "this module uses gc" is actionable; "invalid module" is not — which is
+    /// why `features.firstViolation` returns the feature rather than a bare failure, and
+    /// why that answer needs somewhere to live once the gate moved inside `validateWith`.
+    disabled_proposal: ?features.Feature = null,
 };
 
 threadlocal var site: FailureSite = .{};
@@ -180,6 +192,27 @@ pub fn validateWith(gpa: std.mem.Allocator, module: *const Module, era: features
     // Cleared on ENTRY, not on success: a module-level failure below must report "no location"
     // rather than inherit the previous module's.
     site = .{};
+
+    // 🔑 **F1r — THE FEATURE GATE LIVES HERE, not beside each caller.** It used to sit outside:
+    // every entry point performed `firstViolation` then `validate` by hand, and a NEW entry point
+    // that called `validate` alone inherited no gate and nothing failed — the "three of the four
+    // do X" shape `design-decisions.md` names. Inside, the two questions are one call and cannot
+    // come apart.
+    //
+    // ⚠️ It also closes a live defect the two-step could not see. `capi.zig` gated with the
+    // engine's set and then validated with `validate` — i.e. with ALL features — so with
+    // `custom_descriptors` off, `br_on_cast` was still TYPED by the relaxed custom-descriptors
+    // rule. A feature set is not only a filter on which instructions may appear; it can change
+    // what an existing instruction MEANS, and gating separately from typing gets that half wrong
+    // silently. **An enforcement arm that runs beside the thing it constrains, rather than
+    // inside it, enforces only what its caller remembered to ask for.**
+    //
+    // Costs nothing on the default path: `firstViolation` short-circuits on `Set.all()`, which is
+    // what `validate`'s `.{}` produces.
+    if (try features.firstViolation(gpa, module, era)) |f| {
+        site.disabled_proposal = f;
+        return error.DisabledProposal;
+    }
 
     if (module.functions.len != module.code.len) return error.CountMismatch;
 
@@ -2651,4 +2684,74 @@ test "validator: br_on_non_null accepts any reference label type" {
             try std.testing.expectError(error.TypeMismatch, validate(gpa, &m));
         }
     }
+}
+
+test "F1r: the feature gate lives INSIDE validateWith — one call, not two" {
+    // ⚠️ INVERSION TEST FOR THE F1r ARM. Comment out the `firstViolation` block at the top of
+    // `validateWith` and the first expectation below fails: nothing else in the validator looks
+    // at `era` for anything but typing, so the module is accepted whole.
+    //
+    // The shape this closes is `design-decisions.md`'s "three of the four do X": every entry
+    // point used to run `firstViolation` and then `validate` by hand, and a new one that called
+    // `validate` alone inherited no gate at all — silently, because a missing refusal looks
+    // exactly like a module that was fine.
+    const gpa = std.testing.allocator;
+    const wat = @import("wat.zig");
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A `v128` PARAMETER and no SIMD instruction anywhere: the module needs the proposal
+    // without executing any of it.
+    var m = try Module.decode(a, try wat.assemble(a, "(module (type (func (param v128))))"));
+    defer m.deinit();
+
+    var era: features.Set = .{};
+    era.set(.simd, false);
+    era.set(.relaxed_simd, false); // layered on simd — `Set.incoherent` refuses the pair split
+    try std.testing.expectError(error.DisabledProposal, validateWith(a, &m, era));
+    // And it says WHICH proposal. A bare `error.DisabledProposal` would tell an embedder that
+    // something is switched off without saying what to switch on.
+    try std.testing.expectEqual(@as(?features.Feature, .simd), lastFailureSite().disabled_proposal);
+
+    // The same module under the all-features default is valid — so the refusal is the era, not
+    // the module. This is also what makes the gate free for everyone who never restricts:
+    // `Set.all()` short-circuits `firstViolation` before it walks anything.
+    try validate(a, &m);
+    try std.testing.expectEqual(@as(?features.Feature, null), lastFailureSite().disabled_proposal);
+}
+
+test "F1r: a restricted era selects the TYPING RULES too, not only the admissible instructions" {
+    // 🔒 THE DEFECT THIS CLOSES, AND IT WAS SHIPPED. `capi.zig` gated with the engine's feature
+    // set and then validated with `validate` — i.e. with EVERY feature on. So the set decided
+    // which proposals were admissible while the all-features rules decided what they MEANT.
+    //
+    // `br_on_cast` is the case that makes the difference observable, and the only one today: the
+    // instruction exists with or without custom-descriptors, so no amount of instruction gating
+    // can see the disagreement. Without the proposal the branch must be a DOWNCAST
+    // (`rt2 <: rt1`); with it, `rt1` and `rt2` need only share a top type. `br_on_cast 0 eqref
+    // anyref` is therefore `assert_invalid` in the core testsuite and a VALID module in
+    // `proposals/custom-descriptors/br_on_cast.wast` — the corpus states the conflict outright.
+    //
+    // ⚠️ A `--features` test that only checks "the instruction was refused" cannot catch this.
+    const gpa = std.testing.allocator;
+    const wat = @import("wat.zig");
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const src = "(module (func (result anyref) (br_on_cast 0 eqref anyref (unreachable))))";
+    var m = try Module.decode(a, try wat.assemble(a, src));
+    defer m.deinit();
+
+    // With the proposal: valid, by the relaxed same-top-type rule.
+    var on: features.Set = .{};
+    try validateWith(a, &m, on);
+
+    // Without it: a type error, NOT a `DisabledProposal`. There is no gated instruction here to
+    // refuse — the module is simply ill-typed in an era that lacks the rule, which is exactly
+    // why the gate and the typing have to come from the same feature set.
+    on.set(.custom_descriptors, false);
+    try std.testing.expectError(error.TypeMismatch, validateWith(a, &m, on));
+    try std.testing.expectEqual(@as(?features.Feature, null), lastFailureSite().disabled_proposal);
 }

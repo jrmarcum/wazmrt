@@ -242,9 +242,18 @@ typedef enum {
     WAZMRT_FEATURE_MULTI_TABLE               = 15,
     /* custom-descriptors. ⚠️ Unlike every other entry, disabling this changes the TYPING of an
      * instruction that exists either way: `br_on_cast` requires a downcast without it and only a
-     * shared top type with it. Gates the six descriptor instructions; does NOT gate the type-level
-     * `(exact $t)` / `(descriptor $d)` / `(describes $s)` syntax. Requires GC. */
-    WAZMRT_FEATURE_CUSTOM_DESCRIPTORS        = 16
+     * shared top type with it. Gates the six descriptor instructions, the `br_on_cast` rule, AND
+     * the type-level `(exact $t)` / `(descriptor $d)` / `(describes $s)` formers wherever they
+     * appear — composite types, struct fields, table/global types, an exact func import, and the
+     * exactness inside instruction immediates. (The formers were NOT gated before Track F; a
+     * module using only the type syntax loaded with this bit off.) Requires GC. */
+    WAZMRT_FEATURE_CUSTOM_DESCRIPTORS        = 16,
+    /* custom-page-sizes: `(memory 1 (pagesize 1))`, a byte-granular memory instead of the fixed
+     * 64 KiB page. ⚠️ Added in Track F; the proposal shipped before it existed, so every release
+     * up to then accepted byte-paged memories even with `wazmrt_config_all_features(cfg, false)`.
+     * Gates any memory in the index space — imported ones included — whose declared page size is
+     * not 64 KiB. Requires nothing: it extends core memories. */
+    WAZMRT_FEATURE_CUSTOM_PAGE_SIZES         = 17
 } wazmrt_feature_t;
 
 wazmrt_config_t *wazmrt_config_new(void);

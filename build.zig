@@ -305,6 +305,25 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(capi_tests).step);
 
+    // The CLI needs its own test target for the same reason the C ABI does: `root.zig` does not
+    // import `main.zig` either, so nothing in it was reachable from `mod_tests` — the front end
+    // had ZERO tests for its whole life, exactly the gap this file records the previous C ABI
+    // dying of. It stopped being merely untidy when F5-CLI put a POLICY PARSER there:
+    // `--features` decides how much of the WebAssembly language wazmrt will accept, and a
+    // security control whose parser is only ever exercised by hand is a control nobody checked.
+    const cli_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wazmrt", .module = mod },
+                .{ .name = "build_options", .module = cli_options.createModule() },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(cli_tests).step);
+
     // ---- Security gate (`zig build test-security`) -------------------------
     // The sandbox-escape tests SKIP when the harness cannot create a symlink. ⚠️ On the dev machine
     // that is NOT a privilege problem — Developer Mode is on. `std.testing.tmpDir` puts its scratch
@@ -360,9 +379,25 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = .ReleaseSafe,
         }) });
+        // 🔒 **And the CLI, since Track F — it earned its place here immediately.** The stated
+        // reason for this step is "a memory-safety bug that only manifests in an optimized build",
+        // and `--features`'s first draft was exactly that: an unbounded write into a stack array
+        // sized from `features.count`, reachable by repeating a valid proposal name on the command
+        // line. Debug caught it as a panic; ReleaseSmall is the build that ships. **A front end
+        // that parses untrusted argv belongs in the memory-safety gate, not only in `test`.**
+        const cli_tests_safe = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .imports = &.{
+                .{ .name = "wazmrt", .module = mod },
+                .{ .name = "build_options", .module = cli_options.createModule() },
+            },
+            .target = target,
+            .optimize = .ReleaseSafe,
+        }) });
         const test_safe_step = b.step("test-safe", "Run the test suite under ReleaseSafe (optimized + safety checks kept)");
         test_safe_step.dependOn(&b.addRunArtifact(mod_tests_safe).step);
         test_safe_step.dependOn(&b.addRunArtifact(capi_tests_safe).step);
+        test_safe_step.dependOn(&b.addRunArtifact(cli_tests_safe).step);
     }
 
     // ---- Bake-off harness (`zig build bakeoff -Dcorpus=<dir>`) -------------

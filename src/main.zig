@@ -79,7 +79,48 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
         return 0;
     }
 
-    const path = args[1];
+    // `--features <list>` (F5-CLI) — the accepted WebAssembly LANGUAGE, restricted.
+    //
+    // ⚠️ **It sits BEFORE the module path, and it is the only wazmrt flag that does.** Every
+    // other one trails the path, in the leading run `flagRegion` carves out of the guest's argv
+    // — and that position cannot work here. In run mode the export name must be `args[2]`
+    // (`wazmrt add.wasm add 2 3`), so a trailing flag region is empty and everything after the
+    // export belongs to the guest. Moving the export selector to *after* a flag region would
+    // silently change which mode `wazmrt prog.wasm --dir .:/ add 2 3` picks, for a module that
+    // exports both `add` and `_start`. A leading flag adds a position that was previously an
+    // error ("cannot read '--features'") and changes no existing parse.
+    //
+    // 🔒 It is also why the flag is NOT in `flagRegion`'s lists: a guest argv that happens to
+    // read `--features mvp` must never narrow the language wazmrt accepts, the same reasoning
+    // that put `--no-verify` there in the first place.
+    var argi: usize = 1;
+    var cli_features: wazmrt.features.Set = .{};
+    while (argi < args.len) {
+        const spec: []const u8 = if (std.mem.eql(u8, args[argi], "--features") and argi + 1 < args.len) blk: {
+            argi += 2;
+            break :blk args[argi - 1];
+        } else if (std.mem.startsWith(u8, args[argi], "--features=")) blk: {
+            argi += 1;
+            break :blk args[argi - 1]["--features=".len..];
+        } else break;
+        cli_features = parseFeatures(spec, cli_features, out) catch return exit_failure;
+    }
+    if (argi >= args.len) {
+        try out.print("error: --features given with no module\n", .{});
+        return exit_failure;
+    }
+    // ⚠️ Reported, never repaired — the C ABI's rule, and for its reason: silently enabling a
+    // dependency accepts modules the user meant to refuse. `wazmrt_engine_new_with_config` fails
+    // on the same set, so the two front ends agree on what a coherent restriction is.
+    if (cli_features.incoherent()) |pair| {
+        try out.print("error: --features: '{s}' is layered on '{s}' and cannot be enabled without it\n", .{ pair[0].name(), pair[1].name() });
+        return exit_failure;
+    }
+
+    const path = args[argi];
+    // Everything after the module path: the export selector, the WASI flags, the guest's argv.
+    // With no leading `--features` this is exactly the `args[2..]` it replaced.
+    const rest = args[argi + 1 ..];
     var bytes: []const u8 = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 << 20)) catch |e| {
         try out.print("error: cannot read '{s}': {s}\n", .{ path, @errorName(e) });
         return exit_failure;
@@ -99,11 +140,18 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
         // script runs is *contained in* those bytes, so authorizing the script
         // authorizes exactly what it can execute — the same
         // hash-what-you-execute property `verifyGate` has for a module.
-        if (!(try verifyGate(arena, io, out, bytes, path, args[2..]))) return exit_failure;
+        if (!(try verifyGate(arena, io, out, bytes, path, rest))) return exit_failure;
 
         // `path` is passed for the ERA POLICY, not for I/O: a script under `proposals/threads/`
         // is judged by that snapshot's feature set. See `wast.featuresForPath`.
-        const s = wazmrt.wast.runScript(arena, bytes, path) catch |e| {
+        //
+        // 🔒 **`--features` reaches HERE too, and it has to.** A `.wast` instantiates and invokes
+        // the modules it contains, so a restriction that covered `.wasm` and not `.wast` could be
+        // stepped around by wrapping the module in a script — the identical bypass this path
+        // already had once for the verify gate, and the attacker picks the extension. The two
+        // sets INTERSECT: an era already narrower than the request stays narrower, and the CLI
+        // flag can only ever take features away.
+        const s = wazmrt.wast.runScriptWith(arena, bytes, path, cli_features) catch |e| {
             try out.print("error: cannot run '{s}': {s}\n", .{ path, @errorName(e) });
             return exit_failure;
         };
@@ -136,9 +184,9 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
     // in-memory `bytes` (exactly what we execute — TOCTOU-safe) are hashed and
     // checked against the root-owned pin DB per the enforcement policy. The
     // summarize path below never executes, so it is never gated.
-    const will_execute = (args.len >= 3 and findExport(&module, args[2]) != null) or
+    const will_execute = (rest.len >= 1 and findExport(&module, rest[0]) != null) or
         findExport(&module, "_start") != null;
-    if (will_execute and !(try verifyGate(arena, io, out, bytes, path, args[2..]))) return exit_failure;
+    if (will_execute and !(try verifyGate(arena, io, out, bytes, path, rest))) return exit_failure;
 
     // §4.5.1 defines instantiation only for a VALID module, so nothing executes before validation.
     // Both execute paths — `<module> <export>` and the WASI `_start` command — used to skip this
@@ -154,7 +202,10 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
     // Placed AFTER the pin gate deliberately: authorization first, so an unauthorized module is
     // refused as unauthorized rather than having its contents inspected and reported on.
     if (will_execute) {
-        wazmrt.validate(arena, &module) catch |e| {
+        // `validateWith`, not `validate`: the feature set gates AND selects the typing rules in
+        // one call (F1r). Passing `.{}` here — the all-features default — is what the CLI did
+        // before `--features` existed, so an unrestricted run is byte-for-byte the same work.
+        wazmrt.validateWith(arena, &module, cli_features) catch |e| {
             try out.print("error: '{s}' is not a valid module", .{path});
             try printInvalidity(out, e);
             return exit_failure;
@@ -164,14 +215,14 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
     // Run mode: `wazmrt <module.wasm> <export> [args...]` — invoke and print.
     // A trailing arg only selects an export if it actually names one; otherwise
     // it belongs to the WASI command below (`--dir …`, guest argv, …).
-    if (args.len >= 3 and findExport(&module, args[2]) != null) {
-        return try runFunction(arena, out, &module, args[2], args[3..]);
+    if (rest.len >= 1 and findExport(&module, rest[0]) != null) {
+        return try runFunction(arena, out, &module, rest[0], rest[1..]);
     }
 
     // WASI command: `wazmrt <module.wasm> [--dir <host>[:<guest>]]... [args...]`
     // runs `_start` with the `wasi_snapshot_preview1` host imports wired up.
     if (findExport(&module, "_start")) |start_index| {
-        const code = runWasi(arena, io, out, &module, path, start_index, args[2..]) catch |e| {
+        const code = runWasi(arena, io, out, &module, path, start_index, rest) catch |e| {
             if (e != AlreadyReported) try out.print("trap: {s}\n", .{@errorName(e)});
             return exit_failure; // a trap is a failed run
         };
@@ -213,9 +264,11 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
         try out.print("  bodies decoded: {d}/{d}\n", .{ ok, module.code.len });
     }
 
-    wazmrt.validate(arena, &module) catch |e| {
+    wazmrt.validateWith(arena, &module, cli_features) catch |e| {
         // Same report as the execute paths above, so the two never drift into saying different
-        // things about the same module.
+        // things about the same module — `--features` included. A restriction that applied only
+        // to the paths that RUN would let `wazmrt --features mvp mod.wasm` print "validation: OK"
+        // for a module the very next invocation refuses.
         try out.print("  validation: FAILED", .{});
         try printInvalidity(out, e);
         return exit_failure; // the inspect path reports invalidity in its status
@@ -224,6 +277,119 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
     return 0;
 }
 
+/// One item of a `--features` list: a proposal and whether it is being added or removed. `null`
+/// for an `all` / `mvp` / `none` SEED, which replaces the whole set rather than editing it.
+const FeatureItem = struct { f: ?wazmrt.features.Feature, on: bool };
+
+/// Classify one already-trimmed item, or report why it is not one.
+///
+/// ⚠️ **An unrecognised name is an ERROR, never a skip.** Ignoring it would leave the user
+/// believing they had restricted something: `--features mvp,sim` would silently be `mvp`, and
+/// `--features -simd2` would silently be `all`. A security control that quietly drops what it was
+/// told is worse than no control.
+fn parseFeatureItem(item: []const u8, first: bool, out: *Io.Writer) !FeatureItem {
+    if (item.len == 0) {
+        try out.print("error: --features: empty item\n", .{});
+        return error.BadFeatures;
+    }
+    // `none` is accepted alongside `mvp`: both name "the WebAssembly 1.0 core", and a user who
+    // types the other one means the same thing. Seeds are positional — only the first item can
+    // replace the set, because "everything, then nothing, then gc" is not a list anyone means.
+    if (first and (std.mem.eql(u8, item, "all") or std.mem.eql(u8, item, "mvp") or std.mem.eql(u8, item, "none")))
+        return .{ .f = null, .on = std.mem.eql(u8, item, "all") };
+
+    const on = item[0] != '-';
+    const name = if (item[0] == '-' or item[0] == '+') item[1..] else item;
+    if (name.len == 0) {
+        try out.print("error: --features: '{s}' names no proposal\n", .{item});
+        return error.BadFeatures;
+    }
+    const f = std.meta.stringToEnum(wazmrt.features.Feature, name) orelse {
+        try out.print("error: --features: unknown proposal '{s}'\n", .{name});
+        try out.print("  known: all, mvp", .{});
+        for (0..wazmrt.features.count) |i| {
+            const known: wazmrt.features.Feature = @enumFromInt(@as(u8, @intCast(i)));
+            try out.print(", {s}", .{known.name()});
+        }
+        try out.print("\n", .{});
+        return error.BadFeatures;
+    };
+    return .{ .f = f, .on = on };
+}
+
+/// Every proposal off — the `mvp` seed, and the base an all-additive list is applied to.
+fn noFeatures() wazmrt.features.Set {
+    var s: wazmrt.features.Set = .{};
+    for (0..wazmrt.features.count) |i| s.set(@enumFromInt(@as(u8, @intCast(i))), false);
+    return s;
+}
+
+/// Parse one `--features` list onto `base`, or report why it cannot be parsed.
+///
+/// Grammar: comma-separated items, each a proposal name, optionally signed `+name` / `-name`.
+/// Two seeds may lead the list: `all` (everything on) and `mvp` / `none` (everything off).
+///
+/// 🔑 **THE SEED IS EXPLICIT OR IT IS INFERRED FROM ONE UNAMBIGUOUS SHAPE, AND MIXING IS AN
+/// ERROR.** `--features simd,gc` means "these and nothing else"; `--features -simd` means
+/// "everything but this". Both readings are obvious in isolation and neither is obvious for
+/// `--features gc,-simd`, so that spelling is refused rather than resolved by a precedence rule
+/// nobody asked for — *a defaulted policy is a policy nobody reviewed*. Say `mvp,gc` or
+/// `all,-simd` and the question does not arise.
+///
+/// ⚠️ **The names come from `@tagName`, not from a list written here.** The C ABI's copy of this
+/// enum drifted from the engine's once and shipped a switch that silently did nothing; the CLI
+/// would have been the FOURTH hand-written spelling of the same list. Deriving it means the build
+/// cannot produce a CLI that offers a different set of proposals than it enforces.
+///
+/// 🔒 **TWO PASSES OVER THE STRING, AND NO BUFFER — THIS IS A FIXED BUG, NOT A STYLE CHOICE.**
+/// The first version read the items into a `[count * 2]` array so the seed could be applied before
+/// them, and never bounded `n`: every item has to be a VALID proposal name to be stored, but
+/// nothing stops a caller repeating one, so `--features simd,simd,…` past 36 entries wrote off the
+/// end of a stack array. Under `zig build test` that is a panic; in the SHIPPED ReleaseSmall CLI
+/// it is a stack smash reachable from the command line. Re-splitting the string costs nothing and
+/// removes the bound entirely. **A buffer sized from a type is not sized from the input.**
+fn parseFeatures(spec: []const u8, base: wazmrt.features.Set, out: *Io.Writer) !wazmrt.features.Set {
+    // --- pass 1: validate every item, and decide the seed ---------------------------------
+    var set = base;
+    var seeded = false;
+    var saw_add = false;
+    var saw_sub = false;
+    var n: usize = 0;
+    var scan = std.mem.splitScalar(u8, spec, ',');
+    while (scan.next()) |raw| {
+        const item = try parseFeatureItem(std.mem.trim(u8, raw, " \t"), n == 0, out);
+        n += 1;
+        if (item.f == null) {
+            set = if (item.on) .{} else noFeatures();
+            seeded = true;
+            continue;
+        }
+        if (item.on) saw_add = true else saw_sub = true;
+    }
+    if (n == 0) {
+        try out.print("error: --features: empty list\n", .{});
+        return error.BadFeatures;
+    }
+    if (!seeded and saw_add and saw_sub) {
+        try out.print(
+            "error: --features: '{s}' both adds and removes with no seed — say 'mvp,<added>' or 'all,-<removed>'\n",
+            .{spec},
+        );
+        return error.BadFeatures;
+    }
+    // An unseeded list takes the only seed its shape can mean: bare names are the WHOLE language
+    // asked for, so start from nothing; `-name` items describe subtractions from the default.
+    if (!seeded and saw_add) set = noFeatures();
+
+    // --- pass 2: apply, now that the seed underneath them is settled -----------------------
+    var apply = std.mem.splitScalar(u8, spec, ',');
+    var i: usize = 0;
+    while (apply.next()) |raw| : (i += 1) {
+        const item = try parseFeatureItem(std.mem.trim(u8, raw, " \t"), i == 0, out);
+        if (item.f) |f| set.set(f, item.on);
+    }
+    return set;
+}
 /// True if `arg` is either the short or long spelling of a flag.
 fn isFlag(arg: []const u8, short: []const u8, long: []const u8) bool {
     return std.mem.eql(u8, arg, short) or std.mem.eql(u8, arg, long);
@@ -234,7 +400,7 @@ fn printUsage(out: *Io.Writer, prog: []const u8) !void {
     try out.print(
         \\wazmrt {s} — a WebAssembly runtime (decode, validate, execute; WASI preview 1)
         \\
-        \\usage: {s} <module.wasm|.wat|.wast> [export] [args...]
+        \\usage: {s} [--features <list>] <module.wasm|.wat|.wast> [export] [args...]
         \\       {s} <pin|keygen|sign> ...
         \\
         \\Run '{s} --help' for the full list of options and subcommands.
@@ -304,6 +470,21 @@ fn printHelp(out: *Io.Writer, prog: []const u8) !void {
         \\      Sign a module with the private key, appending a "signature" custom section.
         \\      The signed module still runs anywhere; wazmrt authenticates it when the
         \\      matching root key is embedded (-Droot-key).
+        \\
+        \\FEATURE FLAGS (the WebAssembly language wazmrt will accept)
+        \\  --features <list>           restrict the accepted proposals; goes BEFORE the module
+        \\      A comma-separated list. Two seeds may lead it: `all` (everything, the default)
+        \\      and `mvp` (nothing but WebAssembly 1.0). Items are proposal names, optionally
+        \\      signed: `gc` adds, `-gc` removes.
+        \\        --features mvp                       WebAssembly 1.0 and nothing else
+        \\        --features simd,bulk_memory          MVP plus these two (bare names imply `mvp`)
+        \\        --features -threads,-memory64        everything except these (`-` implies `all`)
+        \\      Adding and removing without a seed is refused — `mvp,gc` or `all,-gc` says which
+        \\      you meant. A proposal layered on another cannot be kept without it (gc needs
+        \\      function_references, and so on); that is reported, never silently repaired.
+        \\      A module needing an excluded proposal is INVALID and is refused before it runs,
+        \\      `.wast` scripts included. The flag can only ever narrow: a spec-testsuite
+        \\      snapshot already judged by an older era stays at that era.
         \\
         \\OPTIONS
         \\  -h, --help                  show this help and exit
@@ -767,6 +948,13 @@ fn verifyGate(
 /// "validation: FAILED"). One formatter, so the two can never say different things about one module.
 fn printInvalidity(out: *Io.Writer, e: anyerror) !void {
     const site = wazmrt.lastFailureSite();
+    // A proposal the user themself refused is reported by NAME and first. Falling through to
+    // "is not a valid module: DisabledProposal" would describe their own `--features` as a defect
+    // in the module — the same reason `capi.zig`'s `diagnose` leads with it.
+    if (site.disabled_proposal) |f| {
+        try out.print(": uses the '{s}' proposal, which --features excludes\n", .{f.name()});
+        return;
+    }
     if (site.offset) |off| try out.print(" at offset {d}", .{off});
     if (site.func_index) |fi| try out.print(" (function {d})", .{fi});
     if (site.expected != null and site.found != null) {
@@ -1075,4 +1263,154 @@ fn runFunction(
     }
     try out.print("\n", .{});
     return 0;
+}
+
+// =========================================================================================
+// Tests. The CLI had none at all until F5-CLI put a POLICY PARSER in it — see `build.zig`'s
+// `cli_tests` for why that stopped being acceptable.
+// =========================================================================================
+
+/// `parseFeatures` against a throwaway writer: the diagnostics are checked by the CLI's own
+/// behaviour, and the tests below are about the SET it produces.
+fn parseInto(spec: []const u8, base: wazmrt.features.Set) !wazmrt.features.Set {
+    var buf: [1024]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    return parseFeatures(spec, base, &w);
+}
+
+fn parseFails(spec: []const u8) !void {
+    var buf: [1024]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    try std.testing.expectError(error.BadFeatures, parseFeatures(spec, .{}, &w));
+    // A refusal that says nothing is a refusal the user cannot act on.
+    try std.testing.expect(w.buffered().len > 0);
+}
+
+test "--features: the seed is explicit, or inferred from ONE unambiguous shape" {
+    const F = wazmrt.features.Feature;
+
+    // Bare names mean "these and nothing else" — the seed is MVP.
+    const only = try parseInto("simd,bulk_memory", .{});
+    try std.testing.expect(only.has(.simd) and only.has(.bulk_memory));
+    try std.testing.expect(!only.has(.gc) and !only.has(.threads) and !only.has(.custom_page_sizes));
+
+    // Signed names mean "everything except these" — the seed is ALL.
+    const except = try parseInto("-threads,-memory64", .{});
+    try std.testing.expect(!except.has(.threads) and !except.has(.memory64));
+    try std.testing.expect(except.has(.simd) and except.has(.gc));
+
+    // Explicit seeds say it outright, and then either sign is unambiguous.
+    try std.testing.expect((try parseInto("all", .{})).all());
+    const mvp = try parseInto("mvp", .{});
+    for (0..wazmrt.features.count) |i| try std.testing.expect(!mvp.has(@as(F, @enumFromInt(@as(u8, @intCast(i))))));
+    try std.testing.expect(std.meta.eql(try parseInto("none", .{}), mvp));
+    const seeded = try parseInto("mvp,gc,function_references,reference_types", .{});
+    try std.testing.expect(seeded.has(.gc) and !seeded.has(.simd));
+    const trimmed = try parseInto("all,-simd,-relaxed_simd", .{});
+    try std.testing.expect(!trimmed.has(.simd) and trimmed.has(.gc));
+
+    // ⚠️ Mixing signs WITHOUT a seed is refused rather than resolved. Both readings of
+    // `gc,-simd` are defensible and neither is obvious, so picking one would be a precedence
+    // rule nobody reviewed — the same objection that made `runScript`'s `path` a required
+    // parameter instead of a defaulted one.
+    try parseFails("gc,-simd");
+    // ...and with a seed the identical items are fine, because now the question has an answer.
+    const mixed = try parseInto("all,-simd,-relaxed_simd,gc", .{});
+    try std.testing.expect(mixed.has(.gc) and !mixed.has(.simd));
+}
+
+test "--features: a name that is not a proposal is refused, not ignored" {
+    // 🔒 THE FAILURE MODE THIS EXISTS TO PREVENT. Skipping an unrecognised item would leave the
+    // user believing they had restricted something — `--features mvp,sim` would silently be
+    // `mvp`, and a typo in the OTHER direction (`--features -simd2`) would silently be `all`.
+    // A security control that quietly ignores what it was told is worse than no control.
+    try parseFails("simd2");
+    try parseFails("-nope");
+    try parseFails("mvp,gc,typo");
+    try parseFails("");
+    try parseFails("simd,,gc");
+    try parseFails("-");
+}
+
+test "--features: names come from the ENUM, so the CLI cannot offer a different list" {
+    // ⚠️ The CLI would have been the FOURTH hand-written spelling of `features.Feature`, after
+    // the engine, `capi.Feature` and `wazmrt.h` — and the two that were hand-written are exactly
+    // the two that drifted and shipped a switch which silently did nothing. Every name is
+    // accepted here without any of them being written down in `main.zig`.
+    for (0..wazmrt.features.count) |i| {
+        const f: wazmrt.features.Feature = @enumFromInt(@as(u8, @intCast(i)));
+        const on = try parseInto(f.name(), .{});
+        try std.testing.expect(on.has(f));
+        var buf: [64]u8 = undefined;
+        const off = try parseInto(try std.fmt.bufPrint(&buf, "-{s}", .{f.name()}), .{});
+        try std.testing.expect(!off.has(f));
+    }
+}
+
+test "--features: successive flags COMPOSE onto each other" {
+    // `--features mvp --features simd` is one conversation, not two: each list is parsed onto
+    // the set the previous one produced, so a later item cannot be silently dropped.
+    const a = try parseInto("mvp", .{});
+    const b = try parseInto("simd", a);
+    // `simd` is bare, so it re-seeds to MVP and adds — the shape rule does not change because
+    // the base did. What composes is the BASE, not the seed inference.
+    try std.testing.expect(b.has(.simd));
+    const c = try parseInto("-gc,-custom_descriptors", .{});
+    const d = try parseInto("-simd,-relaxed_simd", c);
+    try std.testing.expect(!d.has(.gc) and !d.has(.simd) and d.has(.threads));
+}
+
+test "F5: the runtime feature set is a subset of what was COMPILED IN, in every build" {
+    // The Track 2c composition rule, stated once and pinned once. `-Dwat`/`-Dwasi` gate FRONT
+    // ENDS (the text assembler, the WASI host); `--features` gates the wasm LANGUAGE. They are
+    // orthogonal today — no proposal in `features.Feature` is compile-time removable — so the
+    // subset relation holds because the compiled-in set is always the whole enum.
+    //
+    // ⚠️ That is a fact about today's code, not a law, which is why it is asserted rather than
+    // assumed: a proposal that ever became `-D`-gated would make `Set.all()` mean different
+    // things in different builds, and `--features simd` would then succeed in a build that
+    // cannot honour it. `zig build features` compiles the same assertion in `capi.zig` across
+    // all four `-Dwat`/`-Dwasi` combinations, which is where a divergence would first appear.
+    const all: wazmrt.features.Set = .{};
+    try std.testing.expect(all.all());
+    try std.testing.expectEqual(@as(usize, 18), wazmrt.features.count);
+}
+
+test "--features: a long list does not overflow anything (regression)" {
+    // 🔒 REGRESSION TEST FOR A STACK SMASH THIS PARSER SHIPPED IN ITS FIRST DRAFT. The items were
+    // read into a `[features.count * 2]` array so the seed could be applied underneath them, and
+    // `n` was never bounded. Every item must be a VALID proposal name to be stored — which is
+    // exactly what made it look safe — but nothing stops a caller REPEATING one. Past 36 entries
+    // it wrote off the end of a stack array: a panic under `zig build test`, and in the shipped
+    // ReleaseSmall CLI a stack write reachable from the command line.
+    //
+    // ⚠️ **A buffer sized from a TYPE is not sized from the INPUT.** The fix re-splits the string
+    // instead of buffering it, so there is no bound left to exceed.
+    var buf: [4096]u8 = undefined;
+    var spec: std.ArrayList(u8) = .empty;
+    defer spec.deinit(std.testing.allocator);
+    try spec.appendSlice(std.testing.allocator, "mvp");
+    for (0..500) |_| try spec.appendSlice(std.testing.allocator, ",simd");
+
+    var w: Io.Writer = .fixed(&buf);
+    const set = try parseFeatures(spec.items, .{}, &w);
+    try std.testing.expect(set.has(.simd));
+    try std.testing.expect(!set.has(.gc));
+
+    // The same length on the failing path — the error must be reported, not reached by walking
+    // off the end of something first.
+    var spec2: std.ArrayList(u8) = .empty;
+    defer spec2.deinit(std.testing.allocator);
+    for (0..500) |_| try spec2.appendSlice(std.testing.allocator, "simd,");
+    try spec2.appendSlice(std.testing.allocator, "nosuchproposal");
+    var w2: Io.Writer = .fixed(&buf);
+    try std.testing.expectError(error.BadFeatures, parseFeatures(spec2.items, .{}, &w2));
+}
+
+test "--features: a seed is POSITIONAL — only the first item can replace the set" {
+    // `mvp,gc,all` would otherwise mean "nothing, then gc, then everything", which is not a list
+    // anyone writes on purpose. `all` in a later position is an unknown proposal name and is
+    // refused, so the intent has to be stated once and at the front.
+    try parseFails("mvp,gc,all");
+    try parseFails("simd,mvp");
 }

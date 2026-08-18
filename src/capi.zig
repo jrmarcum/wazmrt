@@ -184,6 +184,7 @@ const Feature = enum(c_int) {
     tail_call = 14,
     multi_table = 15,
     custom_descriptors = 16,
+    custom_page_sizes = 17,
     _,
 
     /// Bound DERIVED from `features.count`, never written out again: the literal that used to sit
@@ -219,14 +220,47 @@ comptime {
     }
 }
 
+// ⚠️ F5 COMPOSITION PIN — the runtime feature set vs. Track 2c's COMPTIME gating.
+//
+// `-Dwat` / `-Dwasi` strip FRONT ENDS (the text assembler, the WASI host); a feature set
+// restricts the wasm LANGUAGE. The rule between them is that **a runtime feature set can only
+// ever be a SUBSET of what was compiled in** — an embedder must never be able to enable a
+// proposal this build cannot honour.
+//
+// Today that holds because no proposal is compile-time removable: the default `Set` grants the
+// whole enum in every configuration, so the subset relation is total. The assertion is here
+// rather than in a unit test because `zig build features` compiles THIS FILE in all four
+// `-Dwat`/`-Dwasi` combinations, which is the only place a build-dependent feature set would
+// show up — and it would otherwise show up as `wazmrt_config_set_feature` returning true for a
+// switch the build cannot back.
+//
+// If this fires: a proposal has become build-dependent. Decide what `set_feature` should answer
+// for it in a build that lacks it — refusing loudly, as `wazmrt_module_new_wat` does for `-Dwat`,
+// is this codebase's rule — and write that down before touching the assertion.
+comptime {
+    const all: root.features.Set = .{};
+    if (!all.all()) @compileError(
+        "the default feature set does not grant every proposal in this build configuration. A " ++
+            "runtime feature set may only ever be a SUBSET of what was compiled in; a proposal " ++
+            "that is compile-time removable needs an explicit answer from wazmrt_config_set_feature.",
+    );
+}
+
 /// A template `wazmrt_engine_new_with_config` copies. The embedder keeps ownership.
 ///
-/// ⚠️ **All five ceilings are enforced; per-proposal gating is not yet.** The three that used to
-/// be compile-time constants in `interp.zig` became per-instance fields in step 2e-b, so they now
-/// do what they say. What remains unimplemented is feature gating, and rather than accept a
-/// request to disable a proposal and ignore it — which would hand an embedder a *security control
-/// that controls nothing* — `set_feature(…, false)` returns false and `all_features(…, false)`
-/// makes `wazmrt_engine_new_with_config` fail.
+/// ⚠️ **All five ceilings AND per-proposal gating are enforced.** The three ceilings that used to
+/// be compile-time constants in `interp.zig` became per-instance fields in step 2e-b, so they do
+/// what they say; the feature set became a real refusal on 2026-08-11 and was completed by Track F
+/// (2026-08-18), which folded the gate into `validateWith` so the SAME call decides which
+/// proposals may appear and which typing rules apply to them.
+///
+/// 🎓 **This comment claimed the opposite for a week after it stopped being true**, describing
+/// gating as unimplemented and `set_feature(…, false)` as returning false — while the code six
+/// lines below honoured it and four tests asserted so. It is left in the record as the third
+/// instance of one failure: *a status written from an argument rather than from the code.* The
+/// argument it preserved is still right, and is why the switch was made to work rather than made
+/// to lie: accepting a request to disable a proposal and ignoring it hands an embedder a
+/// **security control that controls nothing**.
 pub const Config = struct {
     /// 0 means "leave at the default", per the header.
     max_memory_bytes: u64 = 0,
@@ -731,14 +765,14 @@ export fn wazmrt_module_new(
     errdefer m.deinit();
 
     // A disabled proposal makes the module INVALID — refused wholly, before anything executes.
-    // Checked before type validation because "you disabled this" is a better answer than a type
-    // error deep inside a feature the embedder never wanted to allow.
-    if (root.features.firstViolation(alloc, &m, eng.features) catch null) |f| {
-        m.deinit();
-        return errorf("module uses the '{s}' proposal, which this engine has disabled", .{f.name()});
-    }
-
-    root.validate(alloc, &m) catch |err| {
+    //
+    // 🔑 **One call, not two (F1r).** This used to gate with `firstViolation` and then validate
+    // with `root.validate` — i.e. with EVERY feature on — so the engine's set chose which
+    // proposals were admissible while the all-features rules chose what they MEANT. With
+    // `custom_descriptors` off, `br_on_cast` was still typed by the relaxed custom-descriptors
+    // rule, and no gating test could see it because the instruction is present either way.
+    // `validateWith` gates and types from the same set, so the two cannot disagree.
+    root.validateWith(alloc, &m, eng.features) catch |err| {
         // The wasmtime-shaped diagnostic: offset + function + expected/found, matched
         // byte-for-byte against wasmtime 47 so the two tools can be compared directly.
         const site = root.lastFailureSite();
@@ -761,6 +795,12 @@ export fn wazmrt_module_new(
 /// owned string; **the wording must stay identical** — one module must not be described two
 /// different ways depending on which entry point refused it.
 fn diagnose(err: anyerror, site: root.FailureSite) ?*Error {
+    // A refused proposal is reported FIRST and by NAME. "you disabled this" is actionable;
+    // letting it fall through to the generic "invalid module: DisabledProposal" would tell the
+    // embedder that the module is broken when what actually happened is that they refused it.
+    if (site.disabled_proposal) |f| {
+        return errorf("module uses the '{s}' proposal, which this engine has disabled", .{f.name()});
+    }
     // `ValType` is NON-EXHAUSTIVE, so `@tagName` is undefined on a value outside its fields;
     // `tagName` returns null instead and we fall back to the bare error name.
     if (site.expected != null and site.found != null) {
@@ -792,9 +832,9 @@ export fn wazmrt_module_validate(e: ?*Engine, bytes: ?[*]const u8, len: usize) b
     var m = Module.decode(alloc, src) catch return false;
     defer m.deinit();
     // Must answer the same question `wazmrt_module_new` does, gating included — a `validate` that
-    // said yes to a module `new` would refuse is worse than not having it.
-    if ((root.features.firstViolation(alloc, &m, eng.features) catch null) != null) return false;
-    root.validate(alloc, &m) catch return false;
+    // said yes to a module `new` would refuse is worse than not having it. Sharing ONE call is
+    // what makes that true by construction rather than by two sites being kept in step.
+    root.validateWith(alloc, &m, eng.features) catch return false;
     return true;
 }
 

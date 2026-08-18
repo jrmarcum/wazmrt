@@ -852,6 +852,33 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
     conformance remain (deferred §6.1). The **legacy** `try`/`catch`/`catch_all`/`delegate`/`rethrow`
     form (older LLVM) is a distinct encoding and stays out of scope.
 
+- **`--features` — the CLI's feature list (Track F, 2026-08-18). Four decisions, each because the
+  obvious alternative is wrong in a way that would not show up until someone relied on it.**
+  - **It goes BEFORE the module path.** Every other wazmrt flag trails it, inside the leading run
+    `flagRegion` carves out of the guest's argv — and that position cannot express this flag. In run
+    mode the export name must be `args[2]` (`wazmrt add.wasm add 2 3`) and everything after it is the
+    guest's. The alternative, moving the export selector to *after* a flag region, would silently
+    change which mode `wazmrt prog.wasm --dir .:/ add 2 3` picks for a module exporting both `add`
+    and `_start`. A leading flag occupies a position that was previously only an error.
+    🔒 **It is deliberately NOT added to `flagRegion`'s lists**, so a guest argv reading
+    `--features mvp` can never narrow the language wazmrt accepts — the reasoning that put
+    `--no-verify` there after `wazmrt prog.wasm install --yes` was found to disable verification.
+  - **The set can only ever NARROW; on `.wast` it INTERSECTS with the era.** `--verify` raises
+    strictness and never lowers it, and this is the same rule. A `.wast` under `proposals/threads/`
+    stays judged by its own era even if the command line asks for everything, because a snapshot's
+    era is a fact about the file rather than a preference.
+  - **An ambiguous list is REFUSED, not resolved.** `--features gc,-simd` can mean "MVP plus gc minus
+    simd" or "everything minus simd plus gc". Both readings are defensible, so the parser names the
+    two unambiguous spellings (`mvp,gc` / `all,-simd`) instead of inventing a precedence rule — *a
+    defaulted policy is a policy nobody reviewed*, the same objection that made `runScript`'s era
+    parameter required. ⚠️ **Its mirror: an unrecognised item is an ERROR, never a skip.** Quietly
+    dropping `--features mvp,sim` would leave the user believing they had restricted something.
+  - **The names are DERIVED from the enum, never listed.** `features.Feature` already had two
+    hand-written copies (`capi.Feature`, `include/wazmrt.h`) and both drifted, shipping a switch the
+    header advertised that silently did nothing. The CLI parses with `stringToEnum` and prints with
+    `@tagName`, so a third copy does not exist. **A comptime pin makes drift detectable; deriving
+    makes it unrepresentable — prefer the second wherever the shape allows it.**
+
 ## Zig 0.16 API notes (this project targets 0.16.0)
 
 The 0.16 stdlib differs from older docs — verified against the installed stdlib this session:

@@ -163,6 +163,41 @@ see `known-issues.md` on why they had drifted.)*
 
 ## What holds today (shipped, verified)
 
+- **The accepted WebAssembly LANGUAGE is itself a control, and it is reachable from both front ends
+  (Track F, 2026-08-18).** An embedder restricts it with `wazmrt_config_set_feature` /
+  `wazmrt_config_all_features`; a CLI user with `wazmrt --features <list> <module>`. A module that
+  needs an excluded proposal is **INVALID** — refused wholly, before instantiation — rather than
+  trapping part-way through, because an embedder disables a proposal to say "I will not run guests
+  that need this", and a check that fires mid-execution has already run some of the guest.
+  - 🔒 **This is TCB reduction, not conformance.** `--features mvp` means the guest cannot reach
+    wazmrt's GC allocator, its SIMD paths, its atomics, or its exception machinery *at all* — a
+    smaller accepted language is less of our own code reachable by untrusted input.
+  - 🔑 **The gate lives INSIDE `validate.validateWith`**, so one call decides which proposals may
+    appear *and* which typing rules apply to them. It used to sit beside each caller, and that had
+    already cost something real: `capi.zig` gated with the embedder's set and then validated with
+    ALL features, so with `custom_descriptors` off, `br_on_cast` kept its relaxed typing. **An
+    enforcement arm that runs beside the thing it constrains enforces only what its caller
+    remembered to ask for.**
+  - 🔒 **It covers `.wast` as well as `.wasm`/`.wat`.** A `.wast` instantiates and invokes the
+    modules it contains, so a restriction stopping at `.wasm` is sidestepped by wrapping the module
+    in a script — **the identical bypass this CLI path already closed once for the verify gate, and
+    the attacker chooses the extension.** The CLI set INTERSECTS the era set: it can only ever take
+    features away, never grant them.
+  - ⚠️ **An incoherent restriction is REPORTED, never repaired.** Keeping `gc` while refusing
+    `function_references` describes no wasm that ever existed; silently enabling the dependency
+    would accept modules the operator meant to refuse. Both front ends fail on the same sets.
+  - ⚠️ **Coverage is compiler-pinned, in three places, because it drifted twice.** The `Op` count is
+    pinned so a new opcode cannot default to "MVP core, always allowed"; `capi.Feature` is compared
+    to `features.Feature` name-by-name and value-by-value; and the CLI derives its names from
+    `@tagName` so no fourth copy exists. **The two lists that were written by hand are exactly the
+    two that drifted** — shipping a switch the header advertised that silently did nothing.
+  - 🚨 **AND THE HOLE THIS CLOSED, WHICH IS THE PART TO GENERALISE: custom-page-sizes shipped with
+    no switch at all.** Track P landed the proposal end to end, with a checklist that enumerated
+    every hardcoded `65536` and named its own memory-safety item — and no `features.Feature` member,
+    so `wazmrt_config_all_features(cfg, false)` still accepted a byte-paged memory. **A proposal
+    that ships without a gate is not "enabled by default"; it is unrefusable.** Ask of every
+    proposal wazmrt adds: *can it be turned off, and is there a test that proves it?*
+
 - **A guest cannot execute anything.** Verified against the full WASI preview-1 surface (45 functions):
   there is **no `proc_exec`, no `spawn`, no `fork`, no `system`**. `proc_exit` terminates *self*. This is
   absent from the *specification*, not a wazmrt choice.

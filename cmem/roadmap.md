@@ -1203,9 +1203,11 @@ compatibility, at a fraction of the footprint, faster on anything not precompile
 > D1–D5) both shipped, F3+F4 cleared the era-pinned 8, and the final pass closed the last two
 > defects. **The corpus is at 0 failures / 63,732 passing / 144 skipped across all 284 files.**
 >
-> 🎯 **What is left of this section is Track F's remainder — F5-CLI and F5 — and it is the ONLY
-> open work here.** Read the Track F entry below; two of its own notes are stale in F's favour and
-> are corrected there.
+> ✅ **AND TRACK F CLOSED IT COMPLETELY ON 2026-08-18 — there is no open work left in this
+> section.** F1r, F5-CLI and F5 shipped, and the track found TWO GATES THAT DID NOT EXIST on the
+> way: `custom_descriptors` was knowingly partial (instructions gated, its three type-level
+> formers not), and **`custom_page_sizes` had no `Feature` member at all** — Track P landed the
+> proposal and nothing could refuse it. Read the Track F entry below.
 >
 > ⚠️ **The recommended order was F → P → D and the work went P → D → (F).** That was the owner's
 > call and it cost nothing, because the premise for "F first" turned out to be false: F's security
@@ -1236,7 +1238,7 @@ the 89 and treating it as uniform would rank the tracks wrong.**
 **Recommended order: F → P → D.** F is the security item; P is small and proves the limits plumbing;
 D is the largest feature since GC.
 
-### 🎯 Track F — feature ENFORCEMENT. **THE ONLY OPEN TRACK. Hand this to a fresh session.**
+### ✅ Track F — feature ENFORCEMENT. **COMPLETE 2026-08-18 (F1r, F5-CLI, F5 + two missing gates).**
 
 🚨 **CORRECTED 2026-08-17 — F1, F2a AND F2b ARE ALREADY SHIPPED. The blocker statement below was
 FALSE when written, and this file contradicted itself two sections up:** the change-series table
@@ -1265,7 +1267,130 @@ Module)` takes no feature set; `features.zig`'s `require(fs, …)` walk only com
 feature a module needs, for `zig build features` to report. Nothing enforces anything, so features
 today are DESCRIPTIVE.~~ *(The walk is not merely computed — it is wired as a rejection.)*
 
-**What genuinely remains in Track F:**
+**What genuinely remained in Track F — ✅ ALL OF IT SHIPPED 2026-08-18.**
+
+> 🏁 **TRACK F IS COMPLETE.** Gates: corpus **63,732 passed / 0 failed / 144 skipped** (unchanged,
+> 0 regressions), unit **734** (719 + 15, from an NTFS cwd), `test-safe` **734/734 — and the CLI is
+> now IN that gate**, `test-security` 3/3, `zig build features` green across
+> all four `-Dwat`/`-Dwasi` combinations, size gate EXACT at exe 984,576 / lib 1,047,720 / dll
+> 900,608 (+5,632 / +1,198 / **0** — the whole exe delta is the CLI flag, which no embedder
+> carries).
+>
+> 🎓 **THE LESSON OF THE WHOLE TRACK, AND IT IS NOT ABOUT FEATURES: TWO OF THE FOUR ITEMS WERE
+> HOLES NOBODY HAD SCOPED, AND BOTH WERE FOUND THE SAME WAY — BY GREPPING FOR THE GATE INSTEAD OF
+> READING THE ROADMAP.** The written scope was F1r + F5-CLI + F5. What the code said was that
+> `custom_descriptors` gated instructions and not its own type syntax (this file DID record that,
+> in F's favour), and that **`custom_page_sizes` had no `Feature` member at all**. The second one
+> was in nobody's notes: Track P shipped custom-page-sizes end to end — decoder, validator, every
+> bounds check, its own security checkpoint — and added no way to refuse it. ⚠️ **A proposal that
+> ships without a bit in `features.Feature` is not "enabled by default"; it is UNREFUSABLE**, and
+> `wazmrt_config_all_features(cfg, false)` — every switch the enum offers, off — still accepted a
+> byte-paged memory. *This is the same rule this file already states as "before scoping a track,
+> grep for the thing you are about to build", applied in the other direction: **also grep for the
+> gate you are about to claim exists.***
+
+- ✅ **F1r — DONE. The gate moved INSIDE `validateWith`.** `validateWith(gpa, module, era)` now
+  runs `features.firstViolation` at its top and returns `error.DisabledProposal`, with the feature
+  itself in `lastFailureSite().disabled_proposal` (a Zig error set carries no payload — the same
+  reason `FailureSite` exists). `validate` still delegates with `.{}`, whose `Set.all()`
+  short-circuits the walk, so the default path costs nothing and no existing caller can start
+  seeing the new error. `capi.zig` and `wast.Runner.validateEra` each collapsed from two calls to
+  one.
+  🔒 **It closed a SHIPPED DEFECT that the two-step could not see, and this is the part worth
+  re-reading.** `capi.zig` gated with the engine's feature set and then validated with
+  `root.validate` — *i.e. with every feature on*. So the embedder's set chose which proposals were
+  ADMISSIBLE while the all-features rules chose what they MEANT: with `custom_descriptors` off,
+  `br_on_cast` was still typed by the relaxed custom-descriptors rule. No gating test could catch
+  it, because the instruction exists either way and was never refused. **An enforcement arm that
+  runs BESIDE the thing it constrains, rather than inside it, enforces only what its caller
+  remembered to ask for** — and the caller here remembered the half that has a test.
+- ✅ **The `custom_descriptors` type pass — DONE.** `firstViolation` gained a type-section walk:
+  `(exact $t)` in composite types, **struct fields and array elements** (the `.@"struct"`/`.array`
+  arms required `.gc` for the KIND and never looked at the contents), table element types, global
+  types, an **exact func import** (descriptor kind `0x20` — a link-time rule with neither an
+  instruction nor a value type of its own), the `(descriptor $d)`/`(describes $s)` links, and the
+  exactness carried in **instruction immediates** (`ref.null` / `ref.test` / `ref.cast` /
+  `br_on_cast` / typed `select` / block types).
+  ⚠️ **That last one is the one a scoping note would have missed.** The six D3/D4 opcodes were
+  already gated; what the proposal ALSO adds is an `exact` prefix on heap types that pre-existing
+  GC instructions carry. **Refusing the opcodes a proposal adds is not the same as refusing the
+  proposal.** `requireValType` asks for the FAMILY first and the `exact` former second, so an
+  embedder who turned off GC is told `gc` and not `custom_descriptors`.
+- ✅ **`custom_page_sizes = 17` — NEW, and it is the hole above.** Gates any memory in the index
+  space, **imports included**, whose `page_size_log2 != 16`. Layered on nothing (it extends core
+  memories). The two comptime pins did their job: adding the member broke the build until
+  `capi.Feature` and `wazmrt.h` matched it name-for-name.
+- ✅ **F5-CLI — DONE. `wazmrt --features <list> <module>`.**
+  - **It sits BEFORE the module path, the only wazmrt flag that does, and the reason is written at
+    the parse site.** Every other flag trails the path inside `flagRegion`'s leading run — and that
+    position cannot work here, because in run mode the export name must be `args[2]`
+    (`wazmrt add.wasm add 2 3`) and everything after it belongs to the guest. Moving the export
+    selector to after a flag region would silently change which mode
+    `wazmrt prog.wasm --dir .:/ add 2 3` picks for a module exporting both `add` and `_start`. A
+    leading flag occupies a position that was previously just an error.
+  - 🔒 **Deliberately NOT in `flagRegion`'s lists**: a guest argv reading `--features mvp` must
+    never narrow the language wazmrt accepts — the reasoning that put `--no-verify` there.
+  - 🔒 **It reaches `.wast` too, via `wast.runScriptWith`.** A `.wast` instantiates and invokes the
+    modules it contains, so a restriction covering `.wasm` and not `.wast` is sidestepped by
+    wrapping the module in a script — **the identical bypass this path already closed once for the
+    verify gate, and the attacker picks the extension.** The two sets INTERSECT: `--features` can
+    only ever take features away, so a snapshot already judged by an older era stays there. Same
+    shape as `--verify`, which raises strictness and never lowers it.
+  - **Grammar, and the one place it refuses rather than decides:** comma-separated names, optional
+    `all`/`mvp`/`none` seed, `name` adds and `-name` removes. An unseeded list takes the only seed
+    its shape can mean — bare names imply `mvp`, signed names imply `all` — and **mixing signs with
+    no seed is an ERROR**, because both readings of `gc,-simd` are defensible and picking one would
+    be a precedence rule nobody reviewed. An unknown name is refused, never skipped: silently
+    ignoring an item leaves the user believing they restricted something.
+  - **Names come from `@tagName`, not from a list in `main.zig`.** The CLI would have been the
+    FOURTH hand-written spelling of `features.Feature` — and the two that were hand-written
+    (`capi.Feature`, `wazmrt.h`) are exactly the two that drifted and shipped a switch that did
+    nothing. Deriving them makes the drift unrepresentable rather than merely pinned.
+  - Applies on **every** path that validates, the summarize path included: `wazmrt --features mvp
+    mod.wasm` printing "validation: OK" for a module the next invocation refuses would be worse
+    than not having the flag.
+- 🐛 **FOUND AND FIXED INSIDE F5-CLI — a stack smash in the flag parser's own first draft, and it
+  is the most instructive thing in the track.** `parseFeatures` buffered its items into
+  `[features.count * 2]` so the seed could be applied underneath them, and never bounded the index.
+  **Every item has to be a VALID proposal name to be stored — which is exactly what made it look
+  safe — but nothing stops a caller repeating one**, so `--features simd,simd,…` past 36 entries
+  wrote off the end of a stack array. Under `zig build test` that is a panic; in the SHIPPED
+  ReleaseSmall CLI it is a stack write reachable from the command line, in the one binary that
+  parses untrusted argv.
+  **Fix:** two passes over the string instead of one pass plus a buffer — pass 1 validates every
+  item and settles the seed, pass 2 applies. There is no array left, so there is no bound to
+  exceed, and the exe came out **512 bytes SMALLER**.
+  🎓 **Three rules, and the last one is the reason this is written up rather than just fixed:**
+  **(1) A buffer sized from a TYPE is not sized from the INPUT** — `features.count` bounds how many
+  DISTINCT proposals exist, not how many items a user may type. **(2) "Every element is validated"
+  is not "the count is bounded"** — validation constrained what could be written and said nothing
+  about how much. **(3) The gate that would have caught it existed and did not cover this file.**
+  `zig build test-safe`'s stated purpose is "a memory-safety bug that only manifests in an
+  optimized build", and `main.zig` was not in it, because until this track the CLI had no test
+  target at all. It is in it now. ⚠️ **When a front end starts parsing untrusted input, adding it
+  to `test` is half the job — it belongs in the memory-safety gate too.**
+- ✅ **F5 — DONE.** The C-ABI setter already existed. What F5 actually needed was the composition
+  rule with Track 2c's comptime gating, **and a test target for the CLI at all**:
+  - **The rule, stated once:** `-Dwat`/`-Dwasi` gate FRONT ENDS; a feature set gates the wasm
+    LANGUAGE; **a runtime feature set can only ever be a SUBSET of what was compiled in.** It holds
+    vacuously today — no proposal is compile-time removable — so it is *asserted* rather than
+    assumed: a `comptime` block in `capi.zig` requires the default `Set` to grant the whole enum,
+    and `zig build features` compiles that file in all four combinations, which is the only place a
+    build-dependent feature set would first appear. Inversion-checked: flipping it reddens all four.
+  - 🆕 **`main.zig` now has a test target (`cli_tests` in `build.zig`), and it never had one.**
+    `root.zig` does not import it, so nothing in the CLI was reachable from `mod_tests` — the same
+    gap this repo already records the previous C ABI dying of (#21's double free shipped that way).
+    It stopped being merely untidy the moment `--features` put a **policy parser** in the front
+    end: a security control whose parser is only ever exercised by hand is a control nobody
+    checked. 5 tests, covering seed inference, the refusal of mixed signs, the refusal (not the
+    skipping) of unknown names, enum-derived name coverage, and the subset rule.
+
+⚠️ **Every arm was inversion-tested** — commented out, watched a named test fail, restored, and the
+build confirmed to still SUCCEED first (the R9 rule). Seven arms, seven distinct failures.
+
+*(The original scoping notes for F1r / F5-CLI / F5 follow, preserved because their reasoning is the
+instructive part — including the two that were already stale in F's favour when written.)*
+
 
 > 🆕 **UPDATED 2026-08-17 after Tracks D3/D4 — TWO of the notes below are now stale, both in F's
 > favour. Read this before costing F1r.**
@@ -1359,7 +1484,21 @@ today are DESCRIPTIVE.~~ *(The walk is not merely computed — it is wired as a 
 restore. **And assert the BUILD SUCCEEDED before reading an inversion's silence**: two of R9's eight
 inversions reported no failing test because commenting the check out left a Zig parameter unused.
 
-### Track P — custom-page-sizes (2 assertions, 1 file). Small, and the one with a memory-safety edge
+### ✅ Track P — custom-page-sizes. **SHIPPED 2026-08-17; its GATE landed 2026-08-18 (Track F)**
+
+> ⚠️ **CORRECTED 2026-08-18 — this header was unmarked while the section above it said P had
+> shipped. That is the fourth instance of the one failure this file keeps recording: a status
+> written from the scoping argument rather than from the code.** P1–P4 all landed on 2026-08-17.
+>
+> 🚨 **AND THE SCOPE ITSELF WAS SHORT ONE ITEM. P shipped with NO `features.Feature` member**, so
+> nothing could refuse a byte-paged memory — `wazmrt_config_all_features(cfg, false)`, every switch
+> the enum offers turned off, still accepted `(memory 1 (pagesize 1))`. Track F added
+> `custom_page_sizes = 17`. **Note what the P4 checklist below did and did not ask for:** it
+> enumerated every hardcoded `65536`, demanded a byte-granularity out-of-bounds test, and named its
+> own security item — a careful list, and none of it asks whether the proposal can be TURNED OFF.
+> **A proposal that ships without a bit in `features.Feature` is not "enabled by default"; it is
+> unrefusable.** Add "does it have a gate, and is that gate tested?" to the deliverables of every
+> future proposal track — it is the one question a per-proposal checklist cannot ask itself.
 
 A memory declares its own page size — `(memory 1 (pagesize 1))`, byte-granular instead of the fixed
 64 KiB. Already recognised and refused by name (`UnsupportedProposal`), so the parse site exists.

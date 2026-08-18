@@ -326,8 +326,22 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
   *exactly* its ceiling; the file was two builds old. **An exactly-zero delta is a timestamp check
   waiting to happen.**
 
-**Unit tests: 715/715** (`zig build test --summary all`, 2026-08-17 end of day, from an NTFS cwd —
-`test-safe` 715/715, `test-security` 3/3). The day's additions: F3+F4 added 5 (era policy ×3,
+**Unit tests: 734/734** (`zig build test --summary all`, 2026-08-18 after Track F, from an NTFS cwd —
+`test-safe` green, `test-security` 3/3). 🆕 **THREE test binaries now, not two.** Track F added
+`cli_tests` in `build.zig`: `root.zig` does not import `main.zig`, so the CLI had **no reachable
+tests at all** for its whole life — the same gap this file records the previous C ABI dying of. It
+stopped being acceptable when `--features` put a *policy parser* in the front end.
+
+Track F's 13: **5 in the CLI** (seed inference for `--features`, the refusal of mixed signs with no
+seed, unknown names refused rather than skipped, every enum name accepted without any of them being
+written in `main.zig`, and the runtime-set-⊆-compiled-in rule), **4 in `features.zig`** (the
+custom-descriptors TYPE-level formers in nine spellings, the no-false-positives control on plain GC,
+the gc-before-custom_descriptors layering order, and `custom_page_sizes` on defined *and imported*
+memories with an every-switch-off control), and **2 in `validate.zig` × 2 targets** (the gate is
+inside `validateWith`; a restricted era selects the TYPING rules too — the half the shipped two-step
+got wrong and no instruction-gating test could see).
+*(Superseded: 715/715 at 2026-08-17 end of day, and 709, 691, 667 and 651 earlier that day.)* The
+2026-08-17 additions: F3+F4 added 5 (era policy ×3,
 multi_table gating, the every-feature-settable regression test), the skip-scoring split added 1,
 and **Track D2 added 8** — the three type-identity keys (`canonicalizeTypes`, `interp.groupKey`,
 `typematch.eqMember`) each with a wrong-answer test and a control arm, the emitted BYTES, the
@@ -338,8 +352,7 @@ answer wrong), exactness propagation in `ref.get_desc` both ways, the exact desc
 allocator/type agreement on both validator paths, the emitted BYTES for all three opcodes, the
 distinct `NullDescriptor` trap, the cross-instance EXACT cast, the funcref import-chain walk, and
 regression tests for the three shipped defects D3 uncovered.
-*(Superseded: 709, 691, 667 and 651 earlier the same day.)*
-⚠️ **From this repo's own `D:` cwd the same run reads 711/715 (4 skipped)** — `std.testing.tmpDir`
+⚠️ **From this repo's own `D:` cwd the same run reads 730/734 (4 skipped)** — `std.testing.tmpDir`
 scratches under `.zig-cache/tmp` relative to the CWD, which exFAT cannot give symlinks, and
 redirecting the zig cache does NOT reach it. Quote NTFS numbers.
 *(Superseded: 633 earlier the same day; 631, labelled "final" on 2026-08-14. Below is that entry,
@@ -888,11 +901,19 @@ quoting the pass count.
 
 - **From an NTFS cwd: `zig build test` = 510/510, `test-safe` = 510/510, `test-security` = 3/3, all
   ZERO skips.** From the D: (exFAT) repo the same runs report 4 skips.
-- **TWO test binaries: `mod_tests` and `capi_tests`** (`src/capi.zig`). It was briefly three —
-  `cabi_tests` died with `src/wasm_c_api.zig` on 2026-08-11. ⚠️ **That is why the printed total FELL
-  from 763 to 510 without losing a single distinct test**: each binary imports `root.zig` and re-runs
-  the core suite, so the printed number is a multiple of the real one. **Never quote the printed
-  number as a distinct-test count.**
+- **THREE test binaries: `mod_tests`, `capi_tests` (`src/capi.zig`) and — since Track F, 2026-08-18 —
+  `cli_tests` (`src/main.zig`).** It was briefly three before too; `cabi_tests` died with
+  `src/wasm_c_api.zig` on 2026-08-11. ⚠️ **That is why the printed total FELL
+  from 763 to 510 without losing a single distinct test**: `mod_tests` and `capi_tests` each import
+  `root.zig` and re-run the core suite, so the printed number is a multiple of the real one.
+  **Never quote the printed number as a distinct-test count.** (`cli_tests` does NOT re-run the core
+  suite — `main.zig` imports `wazmrt` as a *module*, not as a source file — so its 5 are 5.)
+  🆕 **Why `cli_tests` exists at all, stated plainly because the gap lasted the CLI's whole life:**
+  `root.zig` does not import `main.zig`, so **nothing in the front end was reachable from any test
+  target** — precisely the shape that let the previous C ABI ship a double free with no reachable
+  tests. It was tolerable while the CLI only printed section summaries and delegated every decision;
+  it stopped being tolerable when `--features` put a **policy parser** there. ⚠️ **Any front end
+  that grows its first real decision needs its first test target in the same commit.**
 - **`zig build c-smoke` is now `zig build capi-smoke`**, and its link-time symbol gate is
   `tests/wazmrt_abi_symbols.c` — **generated from the header**, so it cannot drift by typo.
   `zig build ffi-demo` now runs `examples/deno_ffi_capi.mjs`.

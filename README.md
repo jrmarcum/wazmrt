@@ -35,7 +35,7 @@ compliance process, and for the ledger of any reused code.
 > official WebAssembly spec testsuite (positive assertions plus
 > `assert_invalid`/`assert_malformed`/`assert_trap`/`assert_unlinkable`, and the
 > `(module definition …)`/`(module instance …)` script forms) — **284 files,
-> 63,732 assertions passing, ZERO failing** as of 2026-08-17, covering every
+> 63,732 assertions passing, ZERO failing** as of 2026-08-18, covering every
 > proposal wazmrt targets up to and including WasmGC's **custom-descriptors**
 > (`(exact $t)`, descriptors, and the descriptor casts). Failures are reported with the **source line** of the assertion
 > that produced them. It runs a module's **start function** at instantiation, embeds
@@ -243,6 +243,32 @@ cannot run in one and trap in another.
 > cannot **create** a link whose target obviously escapes (absolute, or climbing
 > above its own directory) — `ENOTCAPABLE`. wazmrt would contain it anyway; the
 > point is not to leave a trap for whatever reads that directory next.
+
+### Restricting the accepted language (`--features`)
+
+wazmrt accepts every proposal it implements by default. `--features` narrows
+that, and a module needing an excluded proposal is **invalid** — refused before
+anything runs, rather than trapping part-way through:
+
+```sh
+wazmrt --features mvp prog.wasm              # WebAssembly 1.0 and nothing else
+wazmrt --features simd,bulk_memory prog.wasm # MVP plus these two
+wazmrt --features -threads,-memory64 prog.wasm  # everything except these
+```
+
+Bare names imply the `mvp` seed, `-name` items imply `all`; mixing the two
+without an explicit `all`/`mvp` seed is refused rather than resolved, and an
+unknown name is an error rather than a silently-skipped item. A proposal layered
+on another (`gc` needs `function_references`, and so on) cannot be kept without
+it — that is reported, never silently repaired.
+
+This is a smaller trusted computing base, not just conformance: `--features mvp`
+means a guest cannot reach wazmrt's GC allocator, SIMD paths, atomics or
+exception machinery at all. It applies to `.wasm`, `.wat` **and `.wast`** — a
+restriction that stopped at `.wasm` could be stepped around by wrapping the
+module in a script. The flag goes *before* the module path, so it never collides
+with a guest's own argv. Embedders get the same control through
+`wazmrt_config_set_feature` / `wazmrt_config_all_features` (see *Embedding*).
 
 ### Verifying modules (pin database + signatures)
 
