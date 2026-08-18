@@ -707,6 +707,21 @@ the best available summary of what the replacement rules have to cover, and one 
 security half (the unvalidated-run-path defence) that had to survive the change verbatim. — Track
 L, `validate.zig` / `interp.zig` / `wat.zig`
 
+**A CORRECTION IS A DATED CLAIM TOO.** A note added on 2026-08-18 to mark a by-design list stale
+said "only `legacy/try_delegate` is still refused" — and was itself stale within the hour, because
+`delegate` shipped that afternoon. **Marking something stale does not make the marker permanent**;
+a correction states what was true when it was written, exactly like the thing it corrects. Give
+corrections dates, and re-read them in the same sweep as the claims they annotate. — the 2026-08-18
+audit, `known-issues.md`
+
+**AN "OUT OF SCOPE" LINE IS THE SAME KIND OF CLAIM AS A "BY DESIGN" LIST, AND DECAYS THE SAME WAY.**
+`design-decisions.md`'s EH invariant read "the legacy `try`/`catch`/`catch_all`/`delegate`/`rethrow`
+form stays out of scope" while all five were implemented — the scope moved in two stages (Phase 6.3,
+then Track L) and nobody re-read the invariant after either. ⚠️ **Scope invariants are the entries
+least likely to be checked, because nothing fails a build over them and they read as decisions
+rather than as facts.** Re-read them whenever a track closes. — the 2026-08-18 audit,
+`design-decisions.md`
+
 ## 5. Recording what you found
 
 **"Update the project memory" means AUDIT for stale live claims, not edit the files you happened to

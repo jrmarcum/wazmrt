@@ -123,13 +123,14 @@ by its first-failure text:
   refs and descriptors), `wide-arithmetic` (2: `UnknownInstr`), `legacy/try_delegate` (1:
   `UnsupportedInstr` — `delegate` is *deliberately* refused because nothing routes it). **Refusing to
   build a module you do not implement is the correct behaviour; no action.**
-  > ⚠️ **STALE 2026-08-18 — TWO of the three named here are now IMPLEMENTED**: custom-descriptors
-  > (Track D, 2026-08-17) and wide-arithmetic (2026-08-18). **Only `legacy/try_delegate` is still
-  > refused**, and it is the one entry here that was never a scope question — it is SD-3, a
-  > deliberate refusal. Left in place because the classification method is what this section is
-  > for; the list is a 2026-08-11 snapshot. 🎓 **"By design" ages badly by definition** — every
-  > line of it is a statement about scope on one date, so a by-design list needs its date read
-  > as loudly as its contents.
+  > ⚠️ **STALE 2026-08-18 — ALL THREE named here are now IMPLEMENTED**: custom-descriptors (Track
+  > D, 2026-08-17), wide-arithmetic and legacy `delegate` (Track L), both 2026-08-18. Nothing on
+  > this by-design list is still by design. Left in place because the classification method is
+  > what this section is for; the list is a 2026-08-11 snapshot.
+  > 🎓 **"By design" ages badly by definition** — every line of it is a statement about scope on
+  > one date, so a by-design list needs its date read as loudly as its contents. ⚠️ **And this
+  > note is itself the proof: written earlier on 2026-08-18 saying "only `legacy/try_delegate` is
+  > still refused", it was stale within the hour.** A correction is a dated claim too.
 - **62 are DEFECTS.** They are listed below in priority order.
 
 ⚠️ **The pattern that matters: every HIGH item is wazmrt being TOO PERMISSIVE, not too strict.** The
@@ -321,7 +322,10 @@ drift. **This is the pattern the three producer/consumer blind spots lacked: a m
 fails closed when a new case appears.**
 
 **Still open:** `return_call_ref.wast` 1 and `legacy/try_catch.wast` 1, both cross-module type/tag
-identity (see the GC section). `try_delegate.wast` remains the deliberate `delegate` refusal.
+identity (see the GC section). ⚠️ *(This sentence also read "`try_delegate.wast` remains the
+deliberate `delegate` refusal" — **it is not; `delegate` shipped 2026-08-18 and that file is
+25\/0\/0.** And the two "still open" items above it are from an older snapshot; the corpus has had
+zero failures since 2026-08-17.)*
 
 #### The original misdiagnosis (kept — it is the lesson)
 
@@ -1314,12 +1318,19 @@ Debug AND ReleaseSafe; c-smoke 319/319.
 
 **Still open — every targeted proposal is now implemented; only two non-feature items remain:**
 - **#8** (upstream Zig 0.16 Windows `Io`) — cannot fix here; only an upstream fix helps.
-- **Runtime `delegate` routing** stays deliberately unimplemented (refused everywhere, per above — no oracle).
-- Out-of-scope `.wast` harness command forms (`module definition`/`module instance` module-linking) — not a
-  bug, not in scope.
+- ✅ ~~**Runtime `delegate` routing** stays deliberately unimplemented (refused everywhere — no
+  oracle).~~ **SHIPPED 2026-08-18 (Track L).** The oracle existed all along — wabt's interpreter,
+  one sibling directory away — and SD-3's own reopen condition asked for exactly that.
+- ✅ ~~Out-of-scope `.wast` harness command forms (`module definition`/`module instance`
+  module-linking) — not a bug, not in scope.~~ **Implemented 2026-08-13 (R2)**; the cross-instance
+  descriptor tests depend on them.
+- 🎯 **What is actually left: `annotations.wast` does not PARSE** (custom-annotations — roadmap
+  Track A), and the two remaining Standing Deltas. ⚠️ **This list said "only two non-feature items
+  remain" and both of them had already closed** — a "still open" list decays exactly like a
+  "by design" one.
 
 > ⚠️ **SUPERSEDED 2026-08-17 — read the STANDING DELTAS section at the top of this file instead.**
-> Two of the three above are now **SD-2** and **SD-3** and carry a reopen condition, which this list
+> Two of the three above became **SD-2** and **SD-3** and carry a reopen condition, which this list
 > never did. The third line was wrong by omission rather than by fact: `module definition` /
 > `module instance` were implemented on 2026-08-13 (R2) and are exercised by the cross-instance tests
 > D3 and D4 depend on — "not in scope" outlived its own truth by four days. And "every targeted

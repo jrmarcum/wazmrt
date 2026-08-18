@@ -193,11 +193,11 @@ CLOSED, AND SO IS EVERYTHING AFTER IT.** R1–R5, R7, R9 and R10 are done, R6 wa
 by R5, the singleton batch took the remainder, and the bottom-type lattice took the last of it —
 corpus is **104 failures / 62,889 passing / 951 skipped** (measured 2026-08-14).
 
-🏁 **THE WHOLE CORPUS IS AT ZERO FAILURES — every core file AND every proposal file.** Corpus **0 failures / 63,870 passing / ZERO skipped** (2026-08-17 end of day). The baseline holds ONE line: `annotations.wast`, a runner-lex gap on untargeted custom-annotations. ✅ **TRACK D (custom-descriptors) IS COMPLETE — D1–D5 all ship**, and TRACK P before it. ✅ **The last two — baseline group 4, the first entries that were wazmrt DEFECTS rather than untargeted proposals — were closed the same day the group was created:** EXACT function imports end to end (descriptor kind `0x20`, `(exact <typeuse>)` in the text, link-time type EQUALITY, and the linker resolving an export through import chains to its DEFINING instance), and `(ref …)` taking exactly one heap type. Deliberate deviations remain ZERO. ⚠️ D2/D3/D4 each dropped the pass and grand-total columns for correct reasons; see testing.md before reading that as a regression. *(Superseded: 4 / 63,391 / 497; 16 / 63,315 / 578; 53 / 63,344 / 515.)* The 8 era-pinned `proposals/threads` assertions CLOSED via F3+F4, and the skip total fell 965 → 673 via the skip-scoring split; both same day. *(Superseded: 89 failures / 62,890 passing / 965 skipped.)* ⚠️ **14 of the previously-reported 104 were a SCORING BUG** — a bare `(module …)` build failure never consulted `isOurLimitation`, so our own gaps were counted as defects here while scoring as skips everywhere else. `delegate` was one of them, never a deviation; `anyfunc`, the last real one, was closed 2026-08-17. *(Superseded:)* 90 failures / 62,889 passing; 89 non-defects + ONE deliberate deviation; LIVE SPLIT: 102 by design + 2 recorded deliberate
+🏁 **THE WHOLE CORPUS IS AT ZERO FAILURES — every core file AND every proposal file.** Corpus **0 failures / 63,870 passing / ZERO skipped** (2026-08-18). The baseline holds ONE line: `annotations.wast`, a runner-lex gap on untargeted custom-annotations. ✅ **TRACK D (custom-descriptors) IS COMPLETE — D1–D5 all ship**, and TRACK P before it. ✅ **The last two — baseline group 4, the first entries that were wazmrt DEFECTS rather than untargeted proposals — were closed the same day the group was created:** EXACT function imports end to end (descriptor kind `0x20`, `(exact <typeuse>)` in the text, link-time type EQUALITY, and the linker resolving an export through import chains to its DEFINING instance), and `(ref …)` taking exactly one heap type. Deliberate deviations remain ZERO. ⚠️ D2/D3/D4 each dropped the pass and grand-total columns for correct reasons; see testing.md before reading that as a regression. *(Superseded: 4 / 63,391 / 497; 16 / 63,315 / 578; 53 / 63,344 / 515.)* The 8 era-pinned `proposals/threads` assertions CLOSED via F3+F4, and the skip total fell 965 → 673 via the skip-scoring split; both same day. *(Superseded: 89 failures / 62,890 passing / 965 skipped.)* ⚠️ **14 of the previously-reported 104 were a SCORING BUG** — a bare `(module …)` build failure never consulted `isOurLimitation`, so our own gaps were counted as defects here while scoring as skips everywhere else. `delegate` was one of them, never a deviation; `anyfunc`, the last real one, was closed 2026-08-17. *(Superseded:)* 90 failures / 62,889 passing; 89 non-defects + ONE deliberate deviation; LIVE SPLIT: 102 by design + 2 recorded deliberate
 deviations** — `anyfunc` (`obsolete-keywords.wast`, the pre-standard spelling of `funcref`, kept
 because two real `.wat` inputs use it) and `delegate` (`legacy/try_delegate.wast`, refused loudly
-because no oracle exists to route it). 🧭 **`delegate` is now SD-3 in `known-issues.md`'s STANDING
-DELTAS section** — same decision, but carrying a reopen condition, which this line never did.
+because no oracle exists to route it). ✅ **BOTH ARE CLOSED: `anyfunc` on 2026-08-17, and `delegate` SHIPPED 2026-08-18 (Track L) — deliberate deviations are ZERO.** *(Historically: `delegate` became SD-3 in `known-issues.md`'s STANDING
+DELTAS section, carrying a reopen condition this line never did — and that condition is what closed it: pricing SD-3 prompted a re-test, the condition had been met all along, and the instruction shipped.)*
 **There are no undiagnosed failures left**, which changes what
 this list is for: it is now a record, not a work queue. The remaining work is elsewhere — Track 3's
 residual and the PROPOSED Tracks F / P / D at the top of this file. *(Corrected 2026-08-17: this
@@ -1484,6 +1484,90 @@ instructive part — including the two that were already stale in F's favour whe
 restore. **And assert the BUILD SUCCEEDED before reading an inversion's silence**: two of R9's eight
 inversions reported no failing test because commenting the check out left a Zig parameter unused.
 
+### 🎯 Track A — custom-annotations. **SCOPED 2026-08-18. The LAST baseline entry, and it is a LEXER track**
+
+`annotations.wast` is the only line left in `tools/conformance-baseline.txt`, and it is a **runner
+error, not a failure**: the file dies at `parseAll` with `ReservedToken`, so all 71 of its commands
+go unrun. That is why it has never appeared in the failure column and why its size has never been
+priced.
+
+**What is actually in the file — measured, not estimated:**
+
+| | count | note |
+| --- | --- | --- |
+| `(module …)` with valid annotations | **7** | must be ACCEPTED — annotations carry no semantics |
+| `assert_malformed` | **64** | 32 "illegal character", 7 "empty annotation id", 4 "unclosed annotation", 4 "unexpected token", 2 "unclosed string", 2 "empty identifier", 2 "unknown operator", 1 other |
+
+**The proposal in one line:** `(@id …)` is a syntactic element a conforming implementation
+**ignores**. So "implementing custom-annotations" means *lexing and discarding* them — there is no
+new instruction, no new type, no ABI surface, and nothing to execute.
+
+#### Where it actually breaks, and it is narrower than it looks
+
+`@` is already an `idchar`, so `(@a)` **lexes today** — it parses as a one-atom list and then dies
+in `wat.zig` as `BadModuleField`. The lexer only fails on what appears INSIDE an annotation:
+
+```
+(module (@a))            → BadModuleField   (parses; rejected later)
+(module (@"a"))          → ReservedToken    (atom `@` abutting a string)
+(module (@a , ; ] [))    → UnexpectedChar   (`;` is a comment-starter)
+(module (@a x")"y))      → ReservedToken    (atom-string-atom with no separator)
+```
+
+🔑 **So the trigger is exact: a list whose first atom starts with `@`.** Everything after it, up to
+the matching `)`, is opaque. That narrowness is the whole reason this is tractable.
+
+#### The work
+
+- **A1 — `sexpr.zig`: annotation mode.** On opening a list whose leading atom begins `@`, consume
+  to the matching `)` in a mode where the RESERVED-TOKEN and UNEXPECTED-CHAR rules are relaxed and
+  everything else still applies. The corpus pins exactly which rules survive, and it is not "all"
+  or "none":
+  - **Parens must still balance** — `(@a (@(@(@(@)))))` is valid, and 4 assertions are "unclosed
+    annotation" (EOF inside one).
+  - **Strings are still strings** — `(@a ")" "(" x")"y)` is valid, so a paren inside a string must
+    not count; 2 assertions are "unclosed string".
+  - **Block comments still nest** — `(@a (;bla;) (; ) ;)` is valid.
+  - **The character class still applies** — 32 assertions are "illegal character" for raw control
+    bytes, and `\09`/`\0a`/`\0d` (tab/nl/cr) are explicitly ALLOWED. ⚠️ **This is the rule most
+    likely to be dropped by an implementation that treats annotation contents as "skip to the
+    closing paren"**, and it is half the file.
+  - **`(@)` with no id is malformed** ("empty annotation id", 7 assertions) — *but only at
+    annotation position*: `(@a … (@) …)` is valid, because inside an annotation it is just tokens.
+    **That asymmetry is the single subtlest rule in the track.**
+- **A2 — the parser drops them.** Annotations may appear anywhere a token may, so they must vanish
+  before `wat.zig`/`wast.zig` ever see them. Dropping at the `sexpr` layer means neither consumer
+  needs to know they exist.
+- **A3 — a `custom_annotations` feature bit?** ⚠️ **Decide explicitly and write the answer down** —
+  Track P shipped a proposal with no gate and that is exactly how it became unrefusable. The
+  argument for "no bit": annotations are *ignored*, so there is no behaviour to refuse and nothing
+  an attacker gains. The argument for one: the same was true of custom-page-sizes' page field until
+  it wasn't. **Whichever way, this must be a recorded decision rather than an omission.**
+- **A4 — remove the baseline entry.** `tools/conformance-baseline.txt` drops to zero lines, and the
+  `-Dbaseline` gate then means "no regressions from a clean sheet".
+
+#### Risk — and it is the highest-blast-radius track left
+
+🚨 **`sexpr.zig` is the foundation of BOTH `wat.zig` and `wast.zig`.** Every one of the 284 corpus
+files, every `.wat` the CLI assembles, and every unit test that assembles text goes through this
+lexer. Track L could not regress anything because its changed paths were unreachable; **this one is
+the opposite — its changed paths are on every text input there is.**
+
+Mitigations, in the order they matter:
+1. **The trigger is a single condition** (`(` followed by an atom starting `@`). Nothing outside an
+   annotation should reach the new code, and that is testable directly: assemble the whole corpus
+   before and after and diff all three totals.
+2. **`ReservedToken` and `UnexpectedChar` must keep firing outside annotations.** `sexpr.zig`'s own
+   tests already pin `(func $"a"x)` and the lone-`;` hang (a 12-byte input that once took the CLI to
+   10 GB RSS) — **run those inversions deliberately; the `;` case is the one a relaxed lexer would
+   silently reopen.**
+3. The fuzz target (`src/fuzz.zig`) already drives `wat.assemble` on mutated input and asserts its
+   own coverage. **Extend its seeds with annotated modules** before trusting the change.
+
+**Cost:** larger than Track L and smaller than wide-arithmetic — one file, no ABI, no execution
+semantics, but the fiddliest rule set in the repo and the widest blast radius. **The 64 malformed
+assertions are the specification; write them as the test list first and implement against it.**
+
 ### ✅ Track L — legacy `delegate`. **SHIPPED 2026-08-18. The corpus is at ZERO SKIPS and ZERO FAILURES**
 
 > 🏁 **DONE, and the scope below was accurate: ~512 bytes, no ABI surface, four inversion-tested
@@ -2339,7 +2423,7 @@ final-component `path_open` TOCTOU tied to std bug #18. See #17.
 > `throwException` searches the label stack innermost-out); `exnref` values box into `Instance.exn_store`.
 > 6 hand-built binary tests cover catch / catch_all / catch_ref / throw_ref / cross-frame catch / uncaught
 > (→ trap). **6.1 (also DONE 2026-07-17):** the WAT assembler + `.wast` runner — see the §6 detail
-> below. Legacy `try`/`catch`/`delegate` stays out of scope.
+> below. ⚠️ *(This line read "Legacy `try`\/`catch`\/`delegate` stays out of scope" — **all of legacy EH is now implemented**: `try`\/`catch`\/`catch_all`\/`rethrow` in Phase 6.3, `delegate` on 2026-08-18.)*
 >
 > **Phase 5 delivered (DONE 2026-07-17):** `src/pin.zig` (pure logic — SHA-256, content-addressed
 > plaintext pin-DB parse, `# mode:` policy directive, `stricter`, and the pure `decide()` matrix) +

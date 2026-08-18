@@ -849,8 +849,15 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   - **Exception handling — IN SCOPE; CORE BUILT 2026-07-17 (Phase 6).** The standardized **exnref**
     proposal (`try_table`/`throw`/`throw_ref` + `tag` section, `exnref` heap type) — decode + validate +
     execute all done (see the EH invariant above and `roadmap.md` §6). Only the WAT assembler + `.wast`
-    conformance remain (deferred §6.1). The **legacy** `try`/`catch`/`catch_all`/`delegate`/`rethrow`
-    form (older LLVM) is a distinct encoding and stays out of scope.
+    conformance remain (deferred §6.1).
+    ⚠️ **CORRECTED 2026-08-18 — this invariant read "The **legacy** `try`/`catch`/`catch_all`/
+    `delegate`/`rethrow` form (older LLVM) is a distinct encoding and STAYS OUT OF SCOPE."**
+    Legacy EH is now fully implemented — decode, validate, assemble and execute — with the whole of
+    `legacy/` at zero failures and zero skips. The scope moved in stages nobody re-read this line
+    after: `try`/`catch`/`catch_all`/`rethrow` landed in Phase 6.3, and `delegate` on 2026-08-18
+    (Track L). 🎓 **An "out of scope" line is the same kind of claim as a "by design" list — a
+    statement about one date that nothing will ever fail a build over.** Re-read the scope
+    invariants whenever a track closes.
 
 - **`--features` — the CLI's feature list (Track F, 2026-08-18). Four decisions, each because the
   obvious alternative is wrong in a way that would not show up until someone relied on it.**

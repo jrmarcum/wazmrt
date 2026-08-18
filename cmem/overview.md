@@ -161,7 +161,10 @@ needed a *toolchain* DLL (`libunwind.dll`) while every dev-box test passed, and 
   commands"~~ — `module definition` / `module instance` were implemented 2026-08-13 (R2) and are
   what the cross-instance descriptor tests depend on.
   **What genuinely remains: TWO STANDING DELTAS** (see `known-issues.md` — ⚠️ **SD-3 was RETIRED 2026-08-18**: pricing it prompted a re-test of its reopen condition, the condition had been met all along, and `delegate` shipped as Track L), and nothing else
-  in the corpus — Track F closed 2026-08-18, and the 144 skips it left are down to **ZERO**.
+  in the corpus — Track F closed 2026-08-18, and the 144 skips it left are down to **ZERO** — plus
+  **one file that does not RUN**: `annotations.wast` dies in the lexer, so its 71 commands are
+  invisible in all three totals. **A clean corpus is not the same as "everything ran."** Scoped as
+  roadmap **Track A** (custom-annotations).
   ⚠️ *(This line previously named "Track F's remainder", then "25 skips"; both are done.)*
 - **Text toolchain (working).** `sexpr.zig` + `wat.zig` (WAT→wasm binary) + `wast.zig` (WAST script
   runner) — `wazmrt <file.wast>` **runs the official spec testsuite** (thousands of assertions pass; see

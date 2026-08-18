@@ -91,6 +91,15 @@ every snapshot below it is older and kept as history. *(Superseded: 63,732 / 0 /
 **All 284 files run clean.** The last 25 were legacy `delegate` (SD-3), shipped as Track L the same
 day the delta was priced — see `known-issues.md` for why pricing it is what closed it.
 
+⚠️ **ONE FILE IS STILL NOT RUN AT ALL, AND IT IS NOT IN ANY OF THOSE THREE COLUMNS.**
+`annotations.wast` is a **runner error**: it dies in `sexpr.parseAll` with `ReservedToken`, so all
+**71** of its commands (7 modules + 64 `assert_malformed`) go unexecuted and contribute nothing to
+passed/failed/skipped. It is the only line left in `tools/conformance-baseline.txt`.
+🔑 **A "0 failed / 0 skipped" corpus is not the same as "everything ran"** — a file that fails to
+PARSE is invisible in all three totals, which is exactly how this one has stayed unpriced while
+every other gap was measured. Scoped as roadmap **Track A**; it is a lexer track, and the 64
+malformed assertions are its specification.
+
 🎓 **The 144 skips of the morning came apart into four causes, and only ONE of them was the shape
 the total suggested:**
 
