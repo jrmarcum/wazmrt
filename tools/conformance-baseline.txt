@@ -130,9 +130,19 @@
 #
 #      **Corpus: 0 FAILURES across all 284 files.**
 #
-# `error annotations.wast` is the custom-annotations proposal: deliberately
-# exotic tokens the runner cannot lex. Untargeted — the last member of group 1.
+# ✅ **THE BASELINE IS EMPTY AS OF 2026-08-18. THERE ARE NO EXPECTED FAILURES LEFT.**
 #
-# ⚠️ Adding a line here to make the build green is the failure mode this file
-# invites. A new entry needs a group above, or it is a defect being hidden.
-error annotations.wast
+# The last line was `error annotations.wast` — the custom-annotations proposal, whose deliberately
+# exotic tokens the LEXER could not read, so the whole file was a runner error and its 71 commands
+# never ran. Track A implemented annotations (`(@id …)` is lexed and discarded) and it is now
+# 64 passed / 0 failed / 0 skipped.
+#
+# 🏁 **Corpus: 284 files, 63,934 assertions passed, ZERO failed, ZERO skipped, and ZERO files with
+# failures or errors.** The `-Dbaseline` gate now means what it says with nothing subtracted: any
+# non-zero column is a regression.
+#
+# ⚠️ **AN EMPTY BASELINE IS THE EASIEST FILE IN THE REPO TO QUIETLY RUIN.** Adding a line here to
+# make a build green is the failure mode this file has always invited, and there is no longer a
+# single legitimate entry to hide behind. A new line needs a GROUP above it explaining the class it
+# belongs to — and if the class is "a wazmrt defect", the honest move is the one 2026-08-17 made
+# with group 4: fix the two entries the same day rather than explain them a second time.

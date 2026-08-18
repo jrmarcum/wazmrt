@@ -74,6 +74,24 @@ pub const Error = error{
     /// string literal. The escapes `\t` / `\n` / `\r` are how those bytes are
     /// written; a literal tab or newline between the quotes is malformed.
     BadStringChar,
+    /// `(@` with no identifier: `(@)`, `(@ )`, `(@ x)`, `(@"")`, `(@(@a)x)`.
+    ///
+    /// 🔑 **The id must follow `@` with NO separator** — `annotid ::= '@' idchar+ | '@' string`.
+    /// A space makes the id empty rather than making the next token the id, which is why
+    /// `(@ x)` is malformed and not an annotation named `x`.
+    EmptyAnnotationId,
+    /// End of input inside an annotation — `(@x `, `(@x ()`, `(@x (y (z))`.
+    UnclosedAnnotation,
+    /// A raw control byte inside an annotation's contents. §6.2.1 limits source text to
+    /// printable characters plus tab/newline/carriage-return, and `annotations.wast` spends
+    /// **32 of its 64** malformed assertions on exactly this.
+    ///
+    /// ⚠️ **Enforced INSIDE ANNOTATIONS ONLY, deliberately.** The same rule holds for source
+    /// text at large, and wazmrt does not check it there — `parseAtom` consumes any byte that
+    /// is not a delimiter. Widening it is a separate change with a real blast radius (every
+    /// `.wat` input in existence goes through that loop), so it is recorded as an observation
+    /// rather than smuggled in behind an annotations feature. See `roadmap.md` Track A.
+    IllegalCharacter,
 } || std.mem.Allocator.Error;
 
 /// Cap on `(`-nesting. Real `.wat`/`.wast` nests a few dozen deep at most; this
@@ -108,6 +126,14 @@ pub fn parseAllWithLines(
     var counted: usize = 0;
     p.skipTrivia();
     while (p.pos < src.len) {
+        // A TOP-LEVEL annotation is dropped too — `.wast` scripts may carry them between
+        // commands, and a form that produces no value must not consume a `lines` entry either,
+        // or every later command's reported line number is off by one.
+        if (p.atAnnotation()) {
+            try p.skipAnnotation();
+            p.skipTrivia();
+            continue;
+        }
         if (lines) |l| {
             while (counted < p.pos) : (counted += 1) {
                 if (src[counted] == '\n') line += 1;
@@ -194,6 +220,97 @@ const Parser = struct {
         };
     }
 
+    /// **custom-annotations.** `(@id …)` is a syntactic element a conforming implementation
+    /// IGNORES — it carries no semantics, so the whole of "implementing" the proposal is lexing
+    /// one and throwing it away.
+    ///
+    /// 🔑 **THE TRIGGER IS `(` IMMEDIATELY FOLLOWED BY `@`, and the immediacy is a rule rather
+    /// than an optimisation.** `( @a)` — with a space — is NOT an annotation: it is an ordinary
+    /// list whose first token is the atom `@a`, and `annotations.wast` asserts it malformed as
+    /// "unknown operator" (which is `wat.zig`'s verdict, not the lexer's). Testing `peek(1)`
+    /// rather than skipping trivia first is what keeps those two apart.
+    fn atAnnotation(self: *Parser) bool {
+        return self.src[self.pos] == '(' and self.peek(1) == '@';
+    }
+
+    /// Consume `(@id …)` entirely. The contents are OPAQUE — reserved tokens, stray `;`, `]`,
+    /// `}`, unbalanced-looking text are all just characters — but four rules survive inside, and
+    /// the corpus spends its 64 malformed assertions pinning exactly which:
+    ///
+    ///   1. **Parens still balance** (4 assertions, "unclosed annotation").
+    ///   2. **Strings are still strings** (2, "unclosed string") — so a `)` inside `"…"` does
+    ///      not close anything, which `(@a ")" "(" x")"y)` relies on.
+    ///   3. **Comments still nest** — `(@a (;bla;) (; ) ;)` spans lines and closes later.
+    ///   4. **The character class still applies** (32 assertions, over HALF the file).
+    ///
+    /// ⚠️ **Rule 4 is the one an implementation that "skips to the matching paren" would drop**,
+    /// and it is the single largest group in the file. Tab, newline and carriage return are
+    /// explicitly ALLOWED; every other control byte and `0x7f` are not.
+    fn skipAnnotation(self: *Parser) Error!void {
+        self.depth += 1;
+        defer self.depth -= 1;
+        if (self.depth > max_depth) return error.NestingTooDeep;
+        self.pos += 2; // `(@`
+
+        // `annotid ::= '@' idchar+ | '@' string` — NO separator, and non-empty.
+        if (self.pos >= self.src.len) return error.UnclosedAnnotation;
+        if (self.src[self.pos] == '"') {
+            const s = try self.parseString();
+            if (s.len == 0) return error.EmptyAnnotationId;
+            // An annotation id is an IDENTIFIER, so it carries the identifier UTF-8 rule rather
+            // than the permissive string one — `(@"\ef")` is malformed.
+            if (!std.unicode.utf8ValidateSlice(s)) return error.BadIdentifier;
+        } else {
+            const start = self.pos;
+            while (self.pos < self.src.len and isIdChar(self.src[self.pos])) self.pos += 1;
+            if (self.pos == start) return error.EmptyAnnotationId;
+        }
+        return self.skipAnnotationBody();
+    }
+
+    /// The opaque remainder, up to and including the matching `)`. Shared by the annotation
+    /// itself and by any nested paren group inside it — a nested `(@y …)` needs no special case
+    /// here, because at this depth an annotation and a plain group are both just balanced text.
+    fn skipAnnotationBody(self: *Parser) Error!void {
+        while (true) {
+            self.skipTrivia(); // whitespace, `;;` line comments and nested `(; … ;)` blocks
+            if (self.pos >= self.src.len) return error.UnclosedAnnotation;
+            switch (self.src[self.pos]) {
+                ')' => {
+                    self.pos += 1;
+                    return;
+                },
+                '(' => {
+                    self.depth += 1;
+                    defer self.depth -= 1;
+                    if (self.depth > max_depth) return error.NestingTooDeep;
+                    self.pos += 1;
+                    try self.skipAnnotationBody();
+                },
+                // A string is still a string: its bytes are consumed by the string rules, so a
+                // `)` or `(` inside one cannot affect the balance.
+                '"' => _ = try self.parseString(),
+                else => {
+                    // Any other character is discarded, but the class is still enforced.
+                    //
+                    // 🔑 **PRINTABLE ASCII ONLY (0x20–0x7E), plus tab/newline/carriage-return.**
+                    // Not "idchars" — `(@a , ; ] [ }} }x{ ({) ,{{};}] ;)` is a VALID annotation
+                    // and none of `,[]{}` is an idchar. And not "any UTF-8" either: the corpus
+                    // asserts `(@a Heiße Würstchen)` and an emoji annotation MALFORMED even
+                    // though both are well-formed Unicode, alongside every bare `\80`–`\ff`
+                    // byte. ⚠️ **Three plausible rules — idchars, non-control, valid UTF-8 —
+                    // each pass most of the file and fail a different corner of it.** Only the
+                    // ASCII-printable reading satisfies all 64 assertions.
+                    const c = self.src[self.pos];
+                    if (c < 0x20 or c > 0x7e) {
+                        if (c != '\t' and c != '\n' and c != '\r') return error.IllegalCharacter;
+                    }
+                    self.pos += 1;
+                },
+            }
+        }
+    }
+
     fn parseList(self: *Parser) Error!Sexpr {
         self.depth += 1;
         defer self.depth -= 1;
@@ -206,6 +323,15 @@ const Parser = struct {
             if (self.src[self.pos] == ')') {
                 self.pos += 1;
                 break;
+            }
+            // Annotations may appear anywhere a token may, and are DROPPED here so neither
+            // `wat.zig` nor `wast.zig` ever learns they exist. Doing it at this layer is what
+            // makes `((@a)@b)` behave: the annotation vanishes and the remaining `@b` is an
+            // ordinary atom the assembler rejects as an unknown operator, which is the verdict
+            // the corpus asks for.
+            if (self.atAnnotation()) {
+                try self.skipAnnotation();
+                continue;
             }
             try items.append(self.a, try self.parseValue());
         }
@@ -427,4 +553,117 @@ test "reports an unterminated list" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     try std.testing.expectError(error.UnterminatedList, parseAll(arena.allocator(), "(module (func"));
+}
+
+test "custom-annotations: `(@id …)` is lexed and DISCARDED" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The annotation vanishes: the list holds only the real tokens.
+    {
+        const forms = try parseAll(a, "(module (@a x y z) (func))");
+        const items = forms[0].asList().?;
+        try std.testing.expectEqual(@as(usize, 2), items.len); // `module`, `(func)`
+        try std.testing.expectEqualStrings("module", items[0].atom);
+        try std.testing.expectEqualStrings("func", items[1].asList().?[0].atom);
+    }
+    // A TOP-LEVEL annotation is dropped without consuming a form slot — a `.wast` script may
+    // carry them between commands, and a phantom form would shift every later line number.
+    {
+        const forms = try parseAll(a, "(@a) (module) (@b x) (module)");
+        try std.testing.expectEqual(@as(usize, 2), forms.len);
+    }
+    // Contents are OPAQUE: reserved tokens, stray brackets and semicolons are just characters.
+    // Each of these is a VALID annotation in `annotations.wast`.
+    for ([_][]const u8{
+        "(module (@a , ; ] [ }} }x{ ({) ,{{};}] ;))",
+        "(module (@a (bla) () (5-g) (\"aa\" a) ($x) (bla bla) (x (y)) \")\" \"(\" x\")\"y))",
+        "(module (@a @ @x (@x) (@x y) (@) (@ x) (@(@(@(@))))))",
+        "(module (@\"a\") (@\"quoted id\"))",
+        "(module (@a 0x 8q 0xfa #4g0-.@f#^&@#$*0sf -- @#))",
+    }) |src| {
+        _ = parseAll(a, src) catch |e| {
+            std.debug.print("rejected a valid annotation: {s} -> {s}\n", .{ src, @errorName(e) });
+            return e;
+        };
+    }
+    // 🔑 A `)` INSIDE A STRING does not close the annotation, and a `(` inside one does not open
+    // anything — without the string rule surviving, the first case below eats the module's paren.
+    _ = try parseAll(a, "(module (@a \")\"))");
+    // ...and comments still nest, across lines.
+    _ = try parseAll(a,
+        \\(module (@a (;bla;) (; ) ;)
+        \\  ;; bla)
+        \\  ;; bla (@x
+        \\))
+    );
+}
+
+test "custom-annotations: the four rules that SURVIVE inside an annotation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // (1) The id must follow `@` with NO separator and be non-empty.
+    for ([_][]const u8{ "(@)", "(@ )", "(@ x)", "(@(@a)x)", "(@\"\")", "(@ \"a\")" }) |src| {
+        std.testing.expectError(error.EmptyAnnotationId, parseAll(a, src)) catch |e| {
+            std.debug.print("id rule missed: {s}\n", .{src});
+            return e;
+        };
+    }
+    // ⚠️ `( @a)` — one space — is NOT an annotation at all. It is a list holding the atom `@a`,
+    // which the ASSEMBLER rejects as an unknown operator. Testing `peek(1)` rather than skipping
+    // trivia first is the whole of that distinction.
+    {
+        const forms = try parseAll(a, "( @a)");
+        try std.testing.expectEqualStrings("@a", forms[0].asList().?[0].atom);
+    }
+    // (2) Parens must still balance.
+    for ([_][]const u8{ "(@x ", "(@x ()", "(@x (y (z))", "(@x (@y )" }) |src| {
+        try std.testing.expectError(error.UnclosedAnnotation, parseAll(a, src));
+    }
+    // (3) Strings must still terminate.
+    try std.testing.expectError(error.UnterminatedString, parseAll(a, "(@x \")"));
+    // (4) The character class: printable ASCII plus tab/nl/cr, and NOTHING else.
+    //     ⚠️ Not "non-control" and not "valid UTF-8" — both of those readings pass most of the
+    //     corpus and fail a different corner. `ß` and an emoji are well-formed Unicode and are
+    //     asserted MALFORMED; every bare 0x80–0xff byte likewise.
+    for ([_][]const u8{
+        "(@a \x00)", "(@a \x08)", "(@a \x0b)", "(@a \x1f)", "(@a \x7f)",
+        "(@a \x80)",  "(@a \xff)", "(@a Hei\xc3\x9fe)", // the last is valid UTF-8 and still illegal
+    }) |src| {
+        std.testing.expectError(error.IllegalCharacter, parseAll(a, src)) catch |e| {
+            std.debug.print("char rule missed: {any}\n", .{src});
+            return e;
+        };
+    }
+    // ...and the three whitespace characters that ARE allowed, plus a plain space.
+    for ([_][]const u8{ "(@a \x09)", "(@a \x0a)", "(@a \x0d)", "(@a \x20)" }) |src| {
+        _ = try parseAll(a, src);
+    }
+    // An annotation id given as a string carries the IDENTIFIER utf-8 rule, not the permissive
+    // string one.
+    try std.testing.expectError(error.BadIdentifier, parseAll(a, "(@\"\xef\")"));
+}
+
+test "custom-annotations did NOT relax the lexer outside annotations (regression)" {
+    // 🔒 **THE BLAST-RADIUS TEST.** `sexpr.zig` is the foundation of both `wat.zig` and
+    // `wast.zig`, so a lexer change is on every text input there is. These are the rules a
+    // relaxed lexer would silently reopen, and the first one is not hypothetical: a lone `;`
+    // once made `parseAtom` return an empty atom WITHOUT advancing `pos`, and `(module) ; x` —
+    // twelve bytes — hung the CLI at 10.4 GB RSS.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try std.testing.expectError(error.UnexpectedChar, parseAll(a, "(module) ; x"));
+    try std.testing.expectError(error.ReservedToken, parseAll(a, "(func $\"a\"x)"));
+    try std.testing.expectError(error.ReservedToken, parseAll(a, "(data\"a\")"));
+    try std.testing.expectError(error.EmptyIdentifier, parseAll(a, "(func $)"));
+    try std.testing.expectError(error.BadStringChar, parseAll(a, "(func $\"a\tb\")"));
+    // ⚠️ And the character class is NOT enforced outside an annotation — that is a deliberate
+    // scope limit, not an oversight. Widening it would touch every `.wat` in existence; it is
+    // recorded in `Error.IllegalCharacter` and in roadmap Track A as a separate decision.
+    _ = try parseAll(a, "(module \x01)");
 }

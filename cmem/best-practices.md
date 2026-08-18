@@ -732,6 +732,31 @@ a bake-off needs rivals by definition, so its "residuals" (another runtime, anot
 a harness inside someone else's project) all move *away* from that goal. Sort work by what it
 CHANGES before sorting it by priority. — owner's call 2026-08-18, `roadmap.md`
 
+**A "0 FAILED / 0 SKIPPED" CORPUS IS NOT "EVERYTHING RAN" — READ THE FILE-ERROR COUNT.**
+`annotations.wast` died in the LEXER, so all 71 of its commands contributed to none of the three
+usual columns and the score looked perfect with a whole file unexecuted. It stayed unpriced for
+exactly that reason while every other gap was being measured. **A parse failure is invisible in
+pass/fail/skip by construction**; the conformance runner prints "N file(s) with failures/errors" as
+a fourth number, and it is the only one that can catch this class. Quote all four. — Track A,
+`testing.md`
+
+**WHEN HALF A FILE TESTS ONE RULE, TAKE THE RULE FROM THE FAILURES, NOT FROM THE PLAUSIBLE VERSION
+OF IT.** 32 of `annotations.wast`'s 64 malformed assertions are the character class inside an
+annotation, and three readings each pass most of the file: "idchars only" (wrong — `,[]{}` are valid
+and none is an idchar), "non-control" (wrong — `Heiße Würstchen` and an emoji are asserted malformed
+though both are well-formed Unicode), "valid UTF-8" (wrong for the same two). The answer is
+printable ASCII plus tab/nl/CR. The first implementation used the non-control reading and scored
+**52/64 with every failure in that one corner** — which is the diagnostic: **a residue clustered in
+a single rule means the rule is wrong, not that the edge cases are exotic.** — Track A, `sexpr.zig`
+
+**A PROPOSAL THAT NEEDS NO GATE STILL NEEDS THE DECISION WRITTEN DOWN, WITH A REOPEN CONDITION.**
+custom-annotations got no feature bit, and that is correct — an annotation is discarded at the lexer,
+so nothing reaches the validator or interpreter and there is no behaviour to refuse. But Track P
+shipped custom-page-sizes with no bit *by omission* and that is precisely how it became
+unrefusable, so "there is nothing to gate" and "we forgot" have to be distinguishable afterwards.
+The recorded condition: **if annotations ever carry meaning to any consumer — read rather than
+dropped — they need a bit that day.** — Track A, `roadmap.md`
+
 ## 5. Recording what you found
 
 **"Update the project memory" means AUDIT for stale live claims, not edit the files you happened to

@@ -577,6 +577,63 @@
 # Corpus 63,731/2/144 -> **63,732 passed / 0 FAILED / 144 skipped**. The only remaining baseline
 # entry is `annotations.wast`, a runner-lex gap on an untargeted proposal.
 
+# RAISED 2026-08-18 by TRACK A — custom-annotations. **THE CORPUS IS NOW COMPLETELY CLEAN: 284
+# files, 63,934 passed, 0 failed, 0 skipped, and ZERO files with failures OR ERRORS. The
+# conformance baseline is EMPTY.**
+#
+#   artifact       before         after       delta
+#   wazmrt.exe    988,672       990,208      +1,536
+#   wazmrt.lib  1,052,150     1,053,320      +1,170
+#   wazmrt.dll    900,608       900,608           0
+#
+# `(@id …)` is a syntactic element a conforming implementation IGNORES, so the whole of the work is
+# lexing one and discarding it — no instruction, no type, no ABI, nothing to execute.
+#
+# 🔑 **A "0 FAILED / 0 SKIPPED" CORPUS WAS NOT "EVERYTHING RAN".** `annotations.wast` died in
+# `sexpr.parseAll` with `ReservedToken`, so all **71** of its commands (7 modules + 64
+# `assert_malformed`) contributed to NONE of the three columns. It was invisible in every total,
+# which is exactly how it stayed unpriced while every other gap was measured. The conformance
+# runner now reports **0 file(s) with failures/errors** — that fourth number is the one that says
+# everything ran.
+#
+# ⚠️ **THREE PLAUSIBLE READINGS OF THE CHARACTER RULE EACH PASS MOST OF THE FILE AND FAIL A
+# DIFFERENT CORNER OF IT.** 32 of the 64 assertions — over half — are about which characters may
+# appear inside an annotation, and the answer is **printable ASCII (0x20–0x7E) plus tab/newline/CR**:
+#   - NOT "idchars": `(@a , ; ] [ }} }x{ ({) ,{{};}] ;)` is VALID and none of `,[]{}` is an idchar.
+#   - NOT "non-control": `(@a Heiße Würstchen)` and an emoji annotation are asserted MALFORMED even
+#     though both are well-formed Unicode.
+#   - NOT "valid UTF-8": same two cases, plus every bare `\80`–`\ff` byte.
+# The first implementation used the non-control reading, passed 52 of 64, and the 12 failures were
+# all in that one corner. **When half a file tests one rule, get the rule from the failures rather
+# than from the plausible-sounding version of it.**
+#
+# The other three rules that survive inside an annotation, each pinned by its own assertions:
+# parens still balance (4, "unclosed annotation"), strings are still strings (2, "unclosed string" —
+# so `")"` does not close anything), and comments still nest across lines.
+# ⚠️ And the id must follow `@` with NO separator: `( @a)` — one space — is not an annotation at
+# all but a list holding the atom `@a`, which the ASSEMBLER refuses as an unknown operator. Testing
+# `peek(1)` instead of skipping trivia first is the whole of that distinction.
+#
+# 🔒 **HIGHEST BLAST RADIUS OF ANY TRACK SO FAR, AND THE OPPOSITE OF TRACK L's PROFILE.**
+# `sexpr.zig` underlies both `wat.zig` and `wast.zig`, so unlike `delegate` — whose changed paths
+# were unreachable while the refusal stood — this one is on every text input in existence. Guarded
+# by a dedicated regression test that re-asserts the rules a relaxed lexer would silently reopen,
+# **including the lone-`;` case: `(module) ; x`, twelve bytes, once hung the CLI at 10.4 GB RSS
+# because `parseAtom` returned an empty atom without advancing `pos`.** The corpus diff was read on
+# all four numbers, not just failures.
+#
+# 🎓 **AND AN INVERSION LIED, EXACTLY AS R9's DID.** Disabling the empty-annotation-id check made
+# `start` an unused local — a COMPILE error — so the test run produced no failures and the arm
+# looked untested. **Assert the build succeeded before reading an inversion's silence**; this is the
+# third session that rule has earned its place. Re-inverted as `… and false` so the local stays
+# live, and it fails the named test.
+#
+# ⚠️ **SCOPE LIMIT, RECORDED RATHER THAN SMUGGLED:** the character class is enforced INSIDE
+# ANNOTATIONS ONLY. The same rule holds for source text at large and wazmrt does not check it
+# there — `parseAtom` consumes any non-delimiter byte. Widening it would touch every `.wat` input
+# that exists, so it is a separate decision with its own blast radius, noted at
+# `Error.IllegalCharacter` and asserted as deliberate in the regression test.
+
 # RAISED 2026-08-18 by TRACK L — legacy `delegate`. **THE CORPUS IS NOW AT ZERO SKIPS AS WELL AS
 # ZERO FAILURES: 284 files, 63,870 passed / 0 failed / 0 SKIPPED.**
 #
@@ -767,6 +824,6 @@
 # new ones are the CLI's FIRST reachable tests — `main.zig` had no test target until `--features`
 # put a policy parser in it.
 
-wazmrt.exe  988672
-wazmrt.lib  1052150
+wazmrt.exe  990208
+wazmrt.lib  1053320
 wazmrt.dll  900608

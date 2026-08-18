@@ -83,7 +83,7 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
 
 ## 📊 CURRENT spec-testsuite score (2026-08-17) — EVERY CORE SPEC FILE IS AT ZERO
 
-**284 files — 63,870 assertions passed / 0 FAILED / ZERO SKIPPED**, and `zig build conformance -Dbaseline=tools/conformance-baseline.txt` reports **0 regressions**. This is the number to quote;
+**284 files — 63,934 assertions passed / 0 FAILED / ZERO SKIPPED / ZERO unrun**, and `zig build conformance -Dbaseline=tools/conformance-baseline.txt` reports **0 regressions**. This is the number to quote;
 every snapshot below it is older and kept as history. *(Superseded: 63,732 / 0 / 144 earlier on 2026-08-18; then same-day-2026-08-17: 63,731 / 2 / 144, 63,391 / 4 / 497, 63,315 / 16 / 578, 63,344 / 53 / 515, 63,190 / 81 / 673, 62,898 / 81 / 965.)*
 
 ### 🏁 THERE ARE NO SKIPS LEFT — 0 failed AND 0 skipped, 2026-08-18
@@ -91,14 +91,16 @@ every snapshot below it is older and kept as history. *(Superseded: 63,732 / 0 /
 **All 284 files run clean.** The last 25 were legacy `delegate` (SD-3), shipped as Track L the same
 day the delta was priced — see `known-issues.md` for why pricing it is what closed it.
 
-⚠️ **ONE FILE IS STILL NOT RUN AT ALL, AND IT IS NOT IN ANY OF THOSE THREE COLUMNS.**
-`annotations.wast` is a **runner error**: it dies in `sexpr.parseAll` with `ReservedToken`, so all
-**71** of its commands (7 modules + 64 `assert_malformed`) go unexecuted and contribute nothing to
-passed/failed/skipped. It is the only line left in `tools/conformance-baseline.txt`.
-🔑 **A "0 failed / 0 skipped" corpus is not the same as "everything ran"** — a file that fails to
-PARSE is invisible in all three totals, which is exactly how this one has stayed unpriced while
-every other gap was measured. Scoped as roadmap **Track A**; it is a lexer track, and the 64
-malformed assertions are its specification.
+✅ **AND EVERY FILE NOW RUNS — the baseline is EMPTY.** `annotations.wast` used to be a **runner
+error**: it died in `sexpr.parseAll` with `ReservedToken`, so all **71** of its commands (7 modules
++ 64 `assert_malformed`) went unexecuted and contributed nothing to passed/failed/skipped. Track A
+shipped custom-annotations and it is now 64/0/0.
+
+🔑 **READ THE FOURTH NUMBER: "0 file(s) with failures/errors".** A "0 failed / 0 skipped" corpus is
+NOT the same as "everything ran" — a file that fails to PARSE is invisible in all three of the
+usual columns, which is exactly how this one stayed unpriced while every other gap was measured.
+The runner prints the file count for this reason; quote it alongside the other three or a whole
+unrun file can hide behind a perfect score.
 
 🎓 **The 144 skips of the morning came apart into four causes, and only ONE of them was the shape
 the total suggested:**
@@ -383,7 +385,7 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
   *exactly* its ceiling; the file was two builds old. **An exactly-zero delta is a timestamp check
   waiting to happen.**
 
-**Unit tests: 752/752** (`zig build test --summary all`, 2026-08-18 after Track F, from an NTFS cwd —
+**Unit tests: 758/758** (`zig build test --summary all`, 2026-08-18 after Track F, from an NTFS cwd —
 `test-safe` green, `test-security` 3/3). 🆕 **THREE test binaries now, not two.** Track F added
 `cli_tests` in `build.zig`: `root.zig` does not import `main.zig`, so the CLI had **no reachable
 tests at all** for its whole life — the same gap this file records the previous C ABI dying of. It
