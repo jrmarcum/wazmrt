@@ -199,8 +199,7 @@ because two real `.wat` inputs use it) and `delegate` (`legacy/try_delegate.wast
 because no oracle exists to route it). ✅ **BOTH ARE CLOSED: `anyfunc` on 2026-08-17, and `delegate` SHIPPED 2026-08-18 (Track L) — deliberate deviations are ZERO.** *(Historically: `delegate` became SD-3 in `known-issues.md`'s STANDING
 DELTAS section, carrying a reopen condition this line never did — and that condition is what closed it: pricing SD-3 prompted a re-test, the condition had been met all along, and the instruction shipped.)*
 **There are no undiagnosed failures left**, which changes what
-this list is for: it is now a record, not a work queue. The remaining work is elsewhere — Track 3's
-residual and the PROPOSED Tracks F / P / D at the top of this file. *(Corrected 2026-08-17: this
+this list is for: it is now a record, not a work queue. ⚠️ *(Updated 2026-08-18: the work this sentence pointed at — "Track 3's residual and the PROPOSED Tracks F / P / D" — is gone. **F, P and D all shipped**, and Track 3 was reclassified as the **BAKE OFF, a COMPARE task rather than a fix task**. The only FIX task left in this file is **Track A**, custom-annotations.)* *(Corrected 2026-08-17: this
 line also named "the OPEN C-ABI externref hole" and Track 2c. **Both are CLOSED** — references cross
 the C ABI as checked handles since 2026-08-14 (`known-issues.md`), and Track 2c landed the same day.
 `-Dgc=false`-style PER-PROPOSAL comptime gating was never part of 2c and is still open.)*
@@ -956,7 +955,7 @@ end to end, most of it because the binary is a fraction of the size"* — not *"
 would have been natural to bank that as engine speed; ~46 ms of it is there before either engine
 starts.
 
-**This is exactly what the remaining Track 3 item is for.**
+**This is exactly what the remaining BAKE OFF is for (a COMPARE task, not a fix task).**
 
 ### ✅ TRACK 3 IS COMPLETE (2026-08-14) — the engine pipeline, spawn excluded: **20–55×**
 
@@ -1003,7 +1002,7 @@ its scope.
 
 *(Superseded — the scope this was planned from:)*
 
-### 📋 the original plan — Track 3's last item: the in-process breakdown
+### 📋 the original plan — the BAKE OFF`s last compare item: the in-process breakdown
 
 **The question it answers, which nothing else can:** of wazmrt's ~2.9 ms of wasm work on a 2 MB
 module, how much is decode, how much validate, how much instantiate — and how does each compare to
@@ -1085,9 +1084,33 @@ now takes the feature string and refuses anything but `wat,wasi`, the same shape
 ReleaseSmall check. **A gate that measures "whatever is on disk" needs to know what produced it.**
 
 ### What is left after Track 1 (2026-08-11)
-- **Track 3 — the bake-off harness.** ✅ **FIRST CUT LANDED 2026-08-14 — see below.** Still open:
-  wasmrt (the Rust competitor) as a fourth entrant, rsxtk's corpus, and an IN-PROCESS
-  decode/validate/instantiate breakdown (which needs a Rust-side harness to be comparable).
+- 📊 **THE BAKE OFF (formerly "Track 3") — RECLASSIFIED 2026-08-18: this is a COMPARE task, not a
+  FIX task, and it does not belong in the "what is left to fix" queue.** Owner's call, and the
+  distinction is one this file did not previously have a word for:
+
+  > **A FIX TASK changes wazmrt. A COMPARE TASK measures it against something else.** A compare
+  > task can never be "done" — rivals ship new versions, corpora grow — so tracking it beside real
+  > work makes the fix queue look permanently non-empty. It is scheduled when a NUMBER is wanted,
+  > not when a gap is found.
+
+  ⚠️ **And it is the one item that structurally CANNOT be self-contained.** wazmrt ships with zero
+  external dependencies — binaries import only `ntdll`/`KERNEL32`, `third_party/` holds no code,
+  `build.zig.zon` has an empty `.dependencies`, and every correctness gate (`test`, `test-safe`,
+  `test-security`, `features`, `size`, `capi-smoke`) needs nothing but Zig. **A bake-off needs
+  rivals by definition**: deno to drive it, plus wasmtime / wasmer / wazero / wasmrt binaries.
+  Its residuals would deepen that rather than reduce it — "rsxtk's corpus" is a different tree
+  entirely, and the in-process breakdown needs a harness written inside the *Rust* projects.
+
+  **State, re-measured 2026-08-18 rather than copied:** the harness exists and works
+  (`tools/bakeoff.mjs`, `tools/phases.mjs`). ⚠️ **The old residual line said "still open: wasmrt as
+  a fourth entrant" and that is STALE — the entrant is already wired** (`bakeoff.mjs`, and the
+  sibling binary was built 2026-08-14). What is genuinely absent is only that **no recorded
+  measurement includes a `wasmrt` row**; the published table is wazmrt / wasmtime ×3 / wasmer.
+  Anyone wanting that row runs one command and needs nothing new.
+
+  🎓 **Sixth stale scope line found in one day, and the same species as the other five** — a
+  statement about scope that no gate prints and nothing fails a build over. See the rules in
+  `best-practices.md` §5.
 - **wasmtk branch `test/cross-runtime-wazmrt-wasmrt`** (`72cf256ffad`) — the 5-runtime portability gate,
   deliberately unmerged pending the runtime decision.
 

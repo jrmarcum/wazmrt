@@ -722,6 +722,16 @@ least likely to be checked, because nothing fails a build over them and they rea
 rather than as facts.** Re-read them whenever a track closes. — the 2026-08-18 audit,
 `design-decisions.md`
 
+**A FIX TASK CHANGES THE CODE; A COMPARE TASK MEASURES IT AGAINST SOMETHING ELSE — DO NOT KEEP THEM
+IN ONE QUEUE.** The bake-off sat in the roadmap's remaining-work list for days as "Track 3, still
+open", which made the fix queue look permanently non-empty. **A compare task can never be done:**
+rivals ship new versions and corpora grow, so its residuals regenerate by construction. It is
+scheduled when a NUMBER is wanted, not when a gap is found. ⚠️ **It is also the only kind of task
+that can pull external dependencies into a self-contained project** — wazmrt ships with none, and
+a bake-off needs rivals by definition, so its "residuals" (another runtime, another tree's corpus,
+a harness inside someone else's project) all move *away* from that goal. Sort work by what it
+CHANGES before sorting it by priority. — owner's call 2026-08-18, `roadmap.md`
+
 ## 5. Recording what you found
 
 **"Update the project memory" means AUDIT for stale live claims, not edit the files you happened to
