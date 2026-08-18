@@ -2308,17 +2308,30 @@ fn emitFoldedTry(ctx: *Ctx, l: []const Sexpr) Error!void {
     try ctx.labels.append(ctx.a, label);
     try emitSeq(ctx, do_form[1..]);
 
-    // A `(delegate $l)` forwards an exception to an enclosing try in place of
-    // running local handlers. The RUNTIME does not implement that routing —
-    // `precomputeControlFlow` records the delegate label but `throwException`
-    // never consults it, so a delegated exception unwinds as if the delegate
-    // weren't there. Emitting it would assemble a module that VALIDATES yet
-    // silently mis-routes at run time, which is exactly the "bytes don't match
-    // the source" failure this assembler refuses elsewhere. Reject loudly until
-    // the interpreter routes it. (No corpus file uses it; `catch`/`catch_all`/
-    // `rethrow` are fully supported.)
+    // `(delegate $l)` forwards an exception to an enclosing try INSTEAD of running this try's
+    // own handlers, and it replaces the closing `end` rather than sitting alongside one.
+    //
+    // 🔑 **THE LABEL IS RESOLVED WITH THIS TRY'S OWN LABEL POPPED, and that is the whole of the
+    // "historically inconsistent arithmetic" the refusal used to cite.** `delegate 0` on a try
+    // sitting directly in a function body means the CALLER, not this try — so the operand counts
+    // from the scope OUTSIDE the try. wabt spells the same rule as
+    // `GetNearestTryLabel(depth + 1)`; popping first is that `+ 1`. The corpus pins both ends:
+    // `(func (try (do …) (delegate 0)))` is `delegate-to-caller-trivial`, and
+    // `(func (try (do) (delegate 1)))` is `assert_invalid` "unknown label" because there is
+    // nothing beyond the function body.
     if (j < l.len) if (l[j].asList()) |d| {
-        if (d.len != 0 and eqAtom(d[0], "delegate")) return error.UnsupportedInstr;
+        if (d.len != 0 and eqAtom(d[0], "delegate")) {
+            // `(delegate)` with no operand is MALFORMED, and so is anything following the
+            // delegate — it terminates the try, so there is no room for a second clause.
+            // `legacy/try_delegate.wast` asserts both.
+            if (d.len != 2) return error.BadImmediate;
+            if (j + 1 != l.len) return error.BadImmediate;
+            _ = ctx.labels.pop(); // resolve OUTSIDE the try — see above
+            const target = try resolveLabel(ctx, d[1]);
+            try ctx.out.append(ctx.a, @intFromEnum(Op.delegate));
+            try uleb(ctx.a, ctx.out, target);
+            return; // `delegate` replaces `end`; the label is already popped
+        }
     };
 
     // §6.5.x (legacy EH): `(try (do …) (catch $t …)* (catch_all …)?)` — AT MOST
@@ -6684,11 +6697,24 @@ test "legacy folded try assembles, validates, and runs (catch + catch_all + reth
         try std.testing.expectError(error.StackUnderflow, validate(a, &m));
     }
 
-    // `delegate` is rejected at assembly: the interpreter records its label but
-    // never routes an exception through it, so emitting it would produce a module
-    // that validates yet mis-runs.
-    try std.testing.expectError(error.UnsupportedInstr, assemble(a,
-        "(module (tag $t) (func (try (do (nop)) (delegate 0))))"));
+    // 🆕 **`delegate` ASSEMBLES since 2026-08-18** — it used to be rejected here because the
+    // interpreter would not route it. It does now. What the assembler still owes is the GRAMMAR,
+    // and `try_delegate.wast` asserts every one of these malformed:
+    _ = try assemble(a, "(module (tag $t) (func (try (do (nop)) (delegate 0))))");
+    // `(delegate)` with no operand...
+    try std.testing.expectError(error.BadImmediate, assemble(a,
+        "(module (func (try (do) (delegate) (delegate 0))))"));
+    // ...a delegate AFTER a catch or catch_all — it terminates the try, so nothing may precede
+    // it and nothing may follow. ⚠️ These two were already passing before delegate was
+    // implemented, via this same error; the point of keeping them here is that widening the
+    // parser must not have made them legal.
+    try std.testing.expectError(error.BadImmediate, assemble(a,
+        "(module (tag $t) (func (try (do) (catch $t) (delegate 0))))"));
+    try std.testing.expectError(error.BadImmediate, assemble(a,
+        "(module (func (try (do) (catch_all) (delegate 0))))"));
+    // ...and nothing may follow a delegate either.
+    try std.testing.expectError(error.BadImmediate, assemble(a,
+        "(module (tag $t) (func (try (do) (delegate 0) (catch $t))))"));
 }
 
 test "legacy EH: a raw throw inside a catch handler propagates to the OUTER try, not a loop" {

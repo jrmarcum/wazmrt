@@ -577,6 +577,52 @@
 # Corpus 63,731/2/144 -> **63,732 passed / 0 FAILED / 144 skipped**. The only remaining baseline
 # entry is `annotations.wast`, a runner-lex gap on an untargeted proposal.
 
+# RAISED 2026-08-18 by TRACK L — legacy `delegate`. **THE CORPUS IS NOW AT ZERO SKIPS AS WELL AS
+# ZERO FAILURES: 284 files, 63,870 passed / 0 failed / 0 SKIPPED.**
+#
+#   artifact       before         after       delta
+#   wazmrt.exe    988,160       988,672        +512
+#   wazmrt.lib  1,051,814     1,052,150        +336
+#   wazmrt.dll    900,608       900,608           0
+#
+# 🔑 **512 bytes for a whole instruction, because almost all of it already existed.** `Op.delegate`
+# was already declared (0x18), already had its `.label` immediate kind, and was already classified
+# as `.exceptions` — so Track L touched NO ABI surface at all: no Op-count pin, no feature bit, no
+# `capi.Feature`, no `wazmrt.h`, no `Set.incoherent` pair. Contrast wide-arithmetic, which needed
+# every one of those. **Scope the blast radius before scoping the work: "one instruction" said
+# nothing, and "does it need a new Op / feature / ABI entry?" said everything.**
+#
+# Three refusal sites became three rules:
+#   - `wat.zig` emitted `UnsupportedInstr` → now emits `delegate` + a label resolved with the try's
+#     OWN label popped (that pop is wabt's `GetNearestTryLabel(depth + 1)`), and enforces the
+#     grammar the corpus asserts: `(delegate)` with no operand, a delegate after a `catch`, and
+#     anything following a delegate are all malformed.
+#   - `validate.zig` returned `UnsupportedOpcode` → now closes the try like `end` and requires the
+#     frame to be a `try_legacy`, with the label bounded by the scope OUTSIDE it.
+#   - `interp.zig` bailed with `UnsupportedInstruction` → now resumes the unwind at `d + 1 + dl`.
+#
+# 🔒 **THE RISK THAT MATTERED WAS NOT IN THE LAYER ANYONE WOULD GUESS.** The blanket validator
+# refusal was masking a missing rule: the assembler ACCEPTS a bare `(func (delegate 0))` — it is an
+# ordinary mnemonic with a label immediate — and the spec calls that malformed. Removing the
+# refusal without adding the enclosing-frame check would have converted a spec malformation into
+# an accept-invalid. **A blanket refusal can hide a missing rule; deleting it is what reveals the
+# rule was never written.** Checked BEFORE the interpreter was touched, which is why it cost
+# nothing.
+#
+# The second risk was measured and did not fire: `(try (do) (catch $e) (delegate 0))` and its
+# `catch_all` twin were already PASSING via `BadImmediate`, and widening the parser must not make
+# them legal. Both still rejected, and now pinned by name in `wat.zig`'s tests.
+#
+# ⚠️ **The unwind cursor is monotonic BY CONSTRUCTION and that is the security property**: a
+# delegate resumes at `d + 1 + dl`, strictly greater than `d`, so the scan can only move outward
+# and cannot loop on a hostile binary — the defence the old blanket bail used to provide. An
+# out-of-range depth lands past the end and leaves the function as an uncaught exception.
+#
+# 🎓 **THREE TESTS ASSERTED THE REFUSAL AND WERE REPLACED, NOT DELETED.** A test that asserts a
+# refusal is a test of a DECISION, and it expires with the decision — but the reasoning in it is
+# usually the best summary of what the new rules have to cover, so it should be rewritten in
+# place. The interpreter one kept its security half verbatim as a second test.
+
 # RAISED 2026-08-18 by WIDE-ARITHMETIC — a whole proposal for 3 KB, and 109 of the 134 skips.
 #
 #   artifact       before         after       delta
@@ -721,6 +767,6 @@
 # new ones are the CLI's FIRST reachable tests — `main.zig` had no test target until `--features`
 # put a policy parser in it.
 
-wazmrt.exe  988160
-wazmrt.lib  1051814
+wazmrt.exe  988672
+wazmrt.lib  1052150
 wazmrt.dll  900608

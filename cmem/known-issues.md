@@ -13,7 +13,7 @@ Line numbers are hints (they drift) — the function/construct name is the durab
 
 ---
 
-## 🧭 STANDING DELTAS (2026-08-17) — the three that are NOT going to close
+## 🧭 STANDING DELTAS — ⚠️ **TWO, not three: SD-3 was RETIRED 2026-08-18** (`delegate` shipped)
 
 **A Standing Delta is a known, understood difference between wazmrt and some reference, which stays
 open because closing it is not ours to do or not answerable.** They are distinguished from every
@@ -51,48 +51,43 @@ handling: a large, error-prone, Windows-specific lift out of all proportion to `
 **Reopens when:** Zig implements `Dir.hardLink` on Windows — so **recheck on every Zig upgrade**,
 along with the other two holes in that family.
 
-### SD-3 — runtime `delegate` routing is unimplemented ⚠️ **REOPEN CONDITION MET 2026-08-18**
+### ✅ SD-3 — RETIRED 2026-08-18. `delegate` is implemented; **there are only TWO Standing Deltas**
 
-The legacy exception-handling `delegate` instruction is refused everywhere rather than executed.
+**The legacy exception-handling `delegate` instruction executes.** Track L shipped it the same day
+the delta was priced, and the corpus went to **63,870 passed / 0 failed / 0 SKIPPED** — zero skips
+as well as zero failures, across all 284 files.
 
-📊 **ITS COST, MEASURED 2026-08-18: **ALL 25** of the corpus`s remaining skips — the only cause left** — `legacy/try_delegate.wast`
-(24) and `legacy/rethrow.wast` (1). The entry stood for a day without a number, which is precisely
-what makes "what is left to fix" get re-derived: **a Standing Delta that does not quantify itself
-still costs a re-investigation to price.** Give every one of them a measured cost alongside its
-reopen condition.
+🎓 **THE LIFE OF THIS ENTRY IS THE LESSON, AND IT IS NOT ABOUT EXCEPTION HANDLING.** It ran:
 
-🚨 **ITS REOPEN CONDITION IS ALREADY MET — FOUND 2026-08-18, AND THE ENTRY HAD NOT NOTICED.**
-The condition read *"an oracle appears — a reference implementation whose `delegate` routing we can
-differentially check against."* **wabt's interpreter is one, and it is IN THIS TREE**:
-`wabt-ts/upstream/src/interp/interp.cc` (the unwind) and `binary-reader-interp.cc` (the label
-resolution). wabt is the WebAssembly Binary Toolkit — the canonical tooling for exactly the legacy
-encoding wasmtime and V8 dropped, which is *why* it still implements it.
+1. **A refusal with a good reason** — `delegate` can skip handlers, we could not verify the label
+   arithmetic, and a guessed implementation would be a wrong answer wearing a feature's clothes.
+   All true.
+2. **Promoted to a named Standing Delta** carrying a reopen condition: *"an oracle appears — a
+   reference implementation whose routing we can differentially check against."*
+3. **Priced** (2026-08-18): 25 skips, the last cause in the corpus.
+4. **The pricing prompted a re-test of the condition** — and it had been met the whole time. wabt's
+   interpreter implements exactly this routing and sits one sibling directory away
+   (`wabt-ts/upstream/src/interp/`), because wabt is the canonical tooling for precisely the legacy
+   encoding wasmtime and V8 dropped.
+5. **Implemented in one pass**, ~512 bytes, four inversion-tested arms.
 
-🎓 **THE LESSON, AND IT IS ABOUT THE DEVICE ITSELF: A REOPEN CONDITION IS NOT SELF-CHECKING.**
-This file's own rule says an entry that loses its reopen condition "has become an excuse" — but an
-entry that *keeps* one and is never re-tested against it is the same thing more slowly. The
-condition was written on 2026-08-17 and was false the day it was written; the oracle was a sibling
-directory away the whole time. **Re-test every Standing Delta's condition when you price it, not
-when you remember to** — pricing SD-3 (the 25 skips above) is what finally prompted the look.
+⚠️ **The condition was false the day it was written, and nothing about the entry could notice.** A
+Standing Delta is a *durable* claim, so it needs a durable habit: **re-test the reopen condition
+whenever you price the entry** — those are the two moments anyone looks at it, and pricing is the
+one that already involves reading the code. "We cannot" and "we have chosen not to" are different
+claims and only the first one ages.
 
-**The routing rule, now pinned rather than guessed** (`GetNearestTryLabel(depth + 1)` +
-`delegate_handler_index`): `delegate d` resumes the handler search at label depth `d + 1` — one
-outside the delegating try itself — and scans OUTWARD for the nearest enclosing **legacy `try`**,
-skipping blocks and loops. If none remains, the exception goes to the caller. That is eight lines
-of specification, and it accounts for every case in `try_delegate.wast`, including
-`delegate-to-block` (the intervening `block` is skipped because it is not a try) and
-`delegate-to-caller-trivial`.
+**What the routing turned out to be** — eight lines, once read off wabt rather than inferred:
+`delegate d` resumes the handler search at label depth `d + 1` (one outside the delegating try) and
+scans outward; blocks and loops in between contribute nothing, so a plain linear resume *is* wabt's
+"nearest enclosing try". Past the outermost frame, the exception leaves the function. Full write-up
+and the risk analysis in `roadmap.md` → Track L.
 
-**What was true, and still is:** `delegate` is legacy EH; `try_table` replaced it and is fully
-implemented; a *guessed* implementation would be a wrong answer wearing a feature's clothes. What
-changed is only that it no longer has to be guessed.
-
-⚠️ **Whether to close it is an OWNER DECISION, not a conformance-pass side effect** — the same
-standing `anyfunc` has in this file. Reversing a deliberate refusal is a scope change: it adds an
-instruction wazmrt can mis-route, in exchange for 25 skips and one legacy encoding. The scope of
-the work is written up in `roadmap.md`; **this entry stays open until that decision is made**, and
-its "why" is now "the owner has not chosen to", which is honest, rather than "we cannot", which is
-no longer true.
+🔒 **And the risk that mattered was not in the layer anyone would have guessed:** the blanket
+validator refusal was masking a MISSING RULE. The assembler accepts a bare `(func (delegate 0))`,
+which the spec calls malformed; removing the refusal without adding the enclosing-frame check would
+have turned a malformation into an accept-invalid. **A blanket refusal can hide a missing rule —
+deleting it is what reveals the rule was never written.**
 
 ### Not a Standing Delta, and the distinction matters
 

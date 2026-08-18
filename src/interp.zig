@@ -2505,14 +2505,27 @@ const Frame = struct {
             // Legacy `try`: a matching inline handler runs INSIDE the try (the try
             // label stays on the stack for `rethrow`/`br`).
             if (label.legacy) |lt| {
-                // `delegate` re-raises the exception "at label l", which can skip
-                // handlers this normal outward unwind would otherwise run. We do
-                // not implement that routing (no reference impl remains to verify
-                // its label arithmetic — see `validate`), and the validator now
-                // rejects `delegate`. This is the defense for the UNVALIDATED run
-                // path: a hand-crafted binary that reaches a delegating try while
-                // unwinding traps loudly rather than silently mis-routing.
-                if (lt.delegate != null) return error.UnsupportedInstruction;
+                // 🔑 **`delegate dl` — re-raise "at label dl", SKIPPING every handler between
+                // here and there, including this try's own.** The routing rule, taken from wabt's
+                // interpreter (`GetNearestTryLabel(depth + 1)` + `delegate_handler_index`) rather
+                // than inferred: resume the search **one frame outside this try** and go `dl`
+                // further out; if that lands past the outermost frame, the exception leaves this
+                // function entirely. Blocks and loops in between contribute nothing, so simply
+                // resuming the linear scan there *is* wabt's "nearest enclosing try" — a non-try
+                // label has no handlers to offer.
+                //
+                // 🔒 **`resume_at` is STRICTLY GREATER than `d`** (it is `d + 1 + dl`), so the
+                // cursor only ever moves outward and this cannot loop — which is also the whole
+                // of the defence for the UNVALIDATED run path that the old blanket refusal
+                // provided. An out-of-range `dl` from a hand-crafted binary lands past the end
+                // and propagates to the caller instead of indexing off the label stack.
+                if (lt.delegate) |dl| {
+                    const resume_at = std.math.add(usize, d + 1, dl) catch
+                        return null; // an absurd depth cannot name a frame — leave the function
+                    if (resume_at >= self.labels.items.len) return null; // no enclosing try: caller
+                    d = resume_at - 1; // the loop's `d += 1` lands exactly on `resume_at`
+                    continue;
+                }
                 // A throw from WITHIN this try's own catch handler must propagate
                 // OUTWARD, not re-match the same handler: once a handler is entered
                 // (`caught` set) we are past the `catch` clause, outside the try's
@@ -5760,14 +5773,87 @@ test "legacy EH: catch_all catches any tag" {
     try std.testing.expectEqual(@as(i32, 5), asI32(r[0]));
 }
 
-test "legacy EH: a delegate reached while unwinding TRAPS instead of mis-routing" {
-    // `delegate` re-raises "at label l", which can skip intermediate handlers.
-    // We do not implement that routing (no reference impl remains to verify the
-    // label arithmetic), the validator rejects it, and the assembler cannot emit
-    // it. This is the defense for the UNVALIDATED run path: when an exception
-    // actually unwinds into a delegating try, trap loudly rather than silently
-    // propagate as if the delegate weren't there (which can leak past a handler
-    // the delegate meant to skip). `(func (try (do (throw 0)) (delegate 0)))`.
+test "legacy EH: `delegate` SKIPS the handlers it is supposed to skip — the by-construction test" {
+    // 🎓 **REPLACES "a delegate reached while unwinding TRAPS instead of mis-routing".** That test
+    // asserted the refusal; the refusal is gone, so it is replaced rather than deleted — and its
+    // security half survives as the last case below, because the unvalidated run path still needs
+    // a defence.
+    //
+    // 🔒 **THE WRONG-ANSWER SHAPE HERE IS AN OFF-BY-ONE THAT STILL CATCHES SOMETHING.** Every
+    // routing bug in `delegate` produces a caught exception — just the wrong handler's — so an
+    // arity or type check can never see it, and a test with one handler would pass with almost
+    // any arithmetic. Each try below therefore returns a DIFFERENT number, so every possible
+    // off-by-one lands on a distinguishable answer.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const wat = @import("wat.zig");
+
+    const bytes = try wat.assemble(a,
+        \\(module
+        \\  (tag $e)
+        \\  ;; THREE nested trys, each with a distinct result. The innermost delegates OUT to the
+        \\  ;; outermost, so the MIDDLE handler (2) must never run: 3 is the only right answer,
+        \\  ;; and 2 is exactly what an off-by-one produces.
+        \\  (func (export "skip") (result i32)
+        \\    (try $t (result i32)
+        \\      (do (try (result i32)
+        \\            (do (try (result i32) (do (throw $e) (i32.const 1)) (delegate $t)))
+        \\            (catch $e (i32.const 2))))
+        \\      (catch $e (i32.const 3))))
+        \\  ;; delegate 0 from a try directly in the body names the CALLER — nothing here catches.
+        \\  (func (export "to-caller") (try (do (throw $e)) (delegate 0)))
+        \\  ;; ...and one further out is still the caller, skipping the enclosing catch_all.
+        \\  (func (export "to-caller-skipping")
+        \\    (try (do (try (do (throw $e)) (delegate 1))) (catch_all)))
+        \\  ;; A BLOCK between the delegate and its target is not a try and must be stepped over,
+        \\  ;; landing on the outer try's catch_all → 1.
+        \\  (func (export "over-block") (result i32)
+        \\    (try (result i32)
+        \\      (do (block (try (do (throw $e)) (delegate 0))) (i32.const 0))
+        \\      (catch_all (i32.const 1))))
+        \\  ;; Control: the SAME nesting with no delegate must reach the middle handler (2). If
+        \\  ;; this and "skip" ever agree, the delegate stopped doing anything.
+        \\  (func (export "control") (result i32)
+        \\    (try (result i32)
+        \\      (do (try (result i32)
+        \\            (do (try (result i32) (do (throw $e) (i32.const 1)) (catch_all (i32.const 9))))
+        \\            (catch $e (i32.const 2))))
+        \\      (catch $e (i32.const 3)))))
+    );
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
+    defer destroy(&inst);
+
+    {
+        const r = try inst.invoke("skip", &.{});
+        defer std.testing.allocator.free(r);
+        try std.testing.expectEqual(@as(i32, 3), asI32(r[0])); // NOT 2 — the middle was skipped
+    }
+    {
+        const r = try inst.invoke("over-block", &.{});
+        defer std.testing.allocator.free(r);
+        try std.testing.expectEqual(@as(i32, 1), asI32(r[0]));
+    }
+    {
+        // The control proves the nesting itself would have caught at 2 without the delegate.
+        const r = try inst.invoke("control", &.{});
+        defer std.testing.allocator.free(r);
+        try std.testing.expectEqual(@as(i32, 9), asI32(r[0]));
+    }
+    // Delegating past every enclosing try leaves the function: the exception is uncaught.
+    try std.testing.expectError(error.UncaughtException, inst.invoke("to-caller", &.{}));
+    try std.testing.expectError(error.UncaughtException, inst.invoke("to-caller-skipping", &.{}));
+}
+
+test "legacy EH: an out-of-range delegate depth cannot walk off the label stack" {
+    // 🔒 **THE UNVALIDATED-RUN-PATH DEFENCE, inherited from the test this replaced.** The
+    // validator rejects a delegate whose label does not exist, so this binary is hand-built to
+    // reach the interpreter with one that does not. It must leave the function as an uncaught
+    // exception — never index past the label stack, and never loop.
+    //
+    // The cursor is what makes that safe by construction: a delegate resumes at `d + 1 + dl`,
+    // which is STRICTLY greater than `d`, so the scan can only move outward and must terminate.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -5777,17 +5863,17 @@ test "legacy EH: a delegate reached while unwinding TRAPS instead of mis-routing
         .{ .id = 13, .body = &.{ 0x01, 0x00, 0x00 } }, //       one tag, type 0
         .{ .id = 7, .body = &.{ 0x01, 0x01, 'f', 0x00, 0x00 } }, // export "f" func 0
         .{ .id = 10, .body = try ehCode(a, &.{&.{
-            0x00, //          0 locals
-            0x06, 0x40, //    try (void)
-            0x08, 0x00, //    throw 0
-            0x18, 0x00, //    delegate 0 (terminates the try)
-            0x0b, //          end func
+            0x00, //                0 locals
+            0x06, 0x40, //          try (void)
+            0x08, 0x00, //          throw 0
+            0x18, 0x7f, //          delegate 127  ← names no frame that exists
+            0x0b, //                end func
         }}) },
     });
     var inst: Instance = undefined;
     try instantiate(&inst, bytes);
     defer destroy(&inst);
-    try std.testing.expectError(error.UnsupportedInstruction, inst.invoke("f", &.{}));
+    try std.testing.expectError(error.UncaughtException, inst.invoke("f", &.{}));
 }
 
 test "legacy EH: rethrow from an inner catch propagates to an outer catch" {

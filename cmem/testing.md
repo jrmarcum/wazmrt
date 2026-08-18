@@ -83,10 +83,29 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
 
 ## 📊 CURRENT spec-testsuite score (2026-08-17) — EVERY CORE SPEC FILE IS AT ZERO
 
-**284 files — 63,846 assertions passed / 0 FAILED / 25 skipped**, and `zig build conformance -Dbaseline=tools/conformance-baseline.txt` reports **0 regressions**. This is the number to quote;
+**284 files — 63,870 assertions passed / 0 FAILED / ZERO SKIPPED**, and `zig build conformance -Dbaseline=tools/conformance-baseline.txt` reports **0 regressions**. This is the number to quote;
 every snapshot below it is older and kept as history. *(Superseded: 63,732 / 0 / 144 earlier on 2026-08-18; then same-day-2026-08-17: 63,731 / 2 / 144, 63,391 / 4 / 497, 63,315 / 16 / 578, 63,344 / 53 / 515, 63,190 / 81 / 673, 62,898 / 81 / 965.)*
 
-### 🔍 WHERE THE REMAINING 25 SKIPS ARE — measured 2026-08-18, and there is only ONE cause left
+### 🏁 THERE ARE NO SKIPS LEFT — 0 failed AND 0 skipped, 2026-08-18
+
+**All 284 files run clean.** The last 25 were legacy `delegate` (SD-3), shipped as Track L the same
+day the delta was priced — see `known-issues.md` for why pricing it is what closed it.
+
+🎓 **The 144 skips of the morning came apart into four causes, and only ONE of them was the shape
+the total suggested:**
+
+| cause | skips | what it actually was |
+| --- | --- | --- |
+| wide-arithmetic not implemented | 109 | a whole (small) proposal — 4 instructions, ~3 KB |
+| legacy `delegate` | 25 | one instruction, ~512 B — a refusal, not a gap |
+| `isOurLimitation` over-claiming | 7 | ⚠️ only TWO were scoring bugs; the other two rejected VALID modules |
+| §6.6.13's abbreviated module | 3 | a `.wast` runner gap |
+
+🔑 **Cascades dominated both big numbers.** 99 of wide-arithmetic's 109 and 23 of delegate's 24
+were `assert_return`s against a module that would not build. **Rank by the MODULE count, not the
+skip count** — the same lesson as "rank by assertions unblocked", read in the other direction.
+
+*(Historical, the measurement that made the above possible:)*
 
 Every skip site in the runner was instrumented, all 284 files re-run, and the probe reverted. The
 144 skips of 2026-08-17 reduced to four causes; three are now closed and **all 25 that remain are a
@@ -355,7 +374,7 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
   *exactly* its ceiling; the file was two builds old. **An exactly-zero delta is a timestamp check
   waiting to happen.**
 
-**Unit tests: 750/750** (`zig build test --summary all`, 2026-08-18 after Track F, from an NTFS cwd —
+**Unit tests: 752/752** (`zig build test --summary all`, 2026-08-18 after Track F, from an NTFS cwd —
 `test-safe` green, `test-security` 3/3). 🆕 **THREE test binaries now, not two.** Track F added
 `cli_tests` in `build.zig`: `root.zig` does not import `main.zig`, so the CLI had **no reachable
 tests at all** for its whole life — the same gap this file records the previous C ABI dying of. It

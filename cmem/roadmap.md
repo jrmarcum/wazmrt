@@ -193,7 +193,7 @@ CLOSED, AND SO IS EVERYTHING AFTER IT.** R1–R5, R7, R9 and R10 are done, R6 wa
 by R5, the singleton batch took the remainder, and the bottom-type lattice took the last of it —
 corpus is **104 failures / 62,889 passing / 951 skipped** (measured 2026-08-14).
 
-🏁 **THE WHOLE CORPUS IS AT ZERO FAILURES — every core file AND every proposal file.** Corpus **0 failures / 63,846 passing / 25 skipped** (2026-08-17 end of day). The baseline holds ONE line: `annotations.wast`, a runner-lex gap on untargeted custom-annotations. ✅ **TRACK D (custom-descriptors) IS COMPLETE — D1–D5 all ship**, and TRACK P before it. ✅ **The last two — baseline group 4, the first entries that were wazmrt DEFECTS rather than untargeted proposals — were closed the same day the group was created:** EXACT function imports end to end (descriptor kind `0x20`, `(exact <typeuse>)` in the text, link-time type EQUALITY, and the linker resolving an export through import chains to its DEFINING instance), and `(ref …)` taking exactly one heap type. Deliberate deviations remain ZERO. ⚠️ D2/D3/D4 each dropped the pass and grand-total columns for correct reasons; see testing.md before reading that as a regression. *(Superseded: 4 / 63,391 / 497; 16 / 63,315 / 578; 53 / 63,344 / 515.)* The 8 era-pinned `proposals/threads` assertions CLOSED via F3+F4, and the skip total fell 965 → 673 via the skip-scoring split; both same day. *(Superseded: 89 failures / 62,890 passing / 965 skipped.)* ⚠️ **14 of the previously-reported 104 were a SCORING BUG** — a bare `(module …)` build failure never consulted `isOurLimitation`, so our own gaps were counted as defects here while scoring as skips everywhere else. `delegate` was one of them, never a deviation; `anyfunc`, the last real one, was closed 2026-08-17. *(Superseded:)* 90 failures / 62,889 passing; 89 non-defects + ONE deliberate deviation; LIVE SPLIT: 102 by design + 2 recorded deliberate
+🏁 **THE WHOLE CORPUS IS AT ZERO FAILURES — every core file AND every proposal file.** Corpus **0 failures / 63,870 passing / ZERO skipped** (2026-08-17 end of day). The baseline holds ONE line: `annotations.wast`, a runner-lex gap on untargeted custom-annotations. ✅ **TRACK D (custom-descriptors) IS COMPLETE — D1–D5 all ship**, and TRACK P before it. ✅ **The last two — baseline group 4, the first entries that were wazmrt DEFECTS rather than untargeted proposals — were closed the same day the group was created:** EXACT function imports end to end (descriptor kind `0x20`, `(exact <typeuse>)` in the text, link-time type EQUALITY, and the linker resolving an export through import chains to its DEFINING instance), and `(ref …)` taking exactly one heap type. Deliberate deviations remain ZERO. ⚠️ D2/D3/D4 each dropped the pass and grand-total columns for correct reasons; see testing.md before reading that as a regression. *(Superseded: 4 / 63,391 / 497; 16 / 63,315 / 578; 53 / 63,344 / 515.)* The 8 era-pinned `proposals/threads` assertions CLOSED via F3+F4, and the skip total fell 965 → 673 via the skip-scoring split; both same day. *(Superseded: 89 failures / 62,890 passing / 965 skipped.)* ⚠️ **14 of the previously-reported 104 were a SCORING BUG** — a bare `(module …)` build failure never consulted `isOurLimitation`, so our own gaps were counted as defects here while scoring as skips everywhere else. `delegate` was one of them, never a deviation; `anyfunc`, the last real one, was closed 2026-08-17. *(Superseded:)* 90 failures / 62,889 passing; 89 non-defects + ONE deliberate deviation; LIVE SPLIT: 102 by design + 2 recorded deliberate
 deviations** — `anyfunc` (`obsolete-keywords.wast`, the pre-standard spelling of `funcref`, kept
 because two real `.wat` inputs use it) and `delegate` (`legacy/try_delegate.wast`, refused loudly
 because no oracle exists to route it). 🧭 **`delegate` is now SD-3 in `known-issues.md`'s STANDING
@@ -1201,13 +1201,13 @@ compatibility, at a fraction of the footprint, faster on anything not precompile
 
 > 🏁 **ALL 89 ARE CLOSED, same day.** Tracks **P** (custom-page-sizes) and **D** (custom-descriptors,
 > D1–D5) both shipped, F3+F4 cleared the era-pinned 8, and the final pass closed the last two
-> defects. **The corpus is at 0 failures / 63,846 passing / 25 skipped across all 284 files.**
+> defects. **The corpus is at 0 failures / 63,870 passing / ZERO skipped across all 284 files.**
 >
 > ✅ **AND TRACK F CLOSED IT COMPLETELY ON 2026-08-18 — there is no open work left in this
 > section.** F1r, F5-CLI and F5 shipped, and the track found TWO GATES THAT DID NOT EXIST on the
 > way: `custom_descriptors` was knowingly partial (instructions gated, its three type-level
 > formers not), and **`custom_page_sizes` had no `Feature` member at all** — Track P landed the
-> proposal and nothing could refuse it. Read the Track F entry below. *(The corpus then went to **63,846 passed / 0 failed / 25 skipped** as well — the skip-closing pass and wide-arithmetic followed the same day. All that is left is **Track L**, scoped further down: one instruction, and an owner decision before any of it.)*
+> proposal and nothing could refuse it. Read the Track F entry below. *(The corpus then went to **63,870 passed / 0 failed / ZERO SKIPPED** the same day — the skip-closing pass, wide-arithmetic and Track L followed. **There is no open track and no outstanding corpus gap.**)*
 >
 > ⚠️ **The recommended order was F → P → D and the work went P → D → (F).** That was the owner's
 > call and it cost nothing, because the premise for "F first" turned out to be false: F's security
@@ -1269,7 +1269,7 @@ today are DESCRIPTIVE.~~ *(The walk is not merely computed — it is wired as a 
 
 **What genuinely remained in Track F — ✅ ALL OF IT SHIPPED 2026-08-18.**
 
-> 🏁 **TRACK F IS COMPLETE.** Gates: corpus **63,846 passed / 0 failed / 25 skipped** (F itself was skip-neutral at 63,732/0/144;
+> 🏁 **TRACK F IS COMPLETE.** Gates: corpus **63,870 passed / 0 failed / ZERO skipped** (F itself was skip-neutral at 63,732/0/144;
 > 0 regressions), unit **750** (719 + 31, from an NTFS cwd — Track F 15, the skip-closing pass 10, wide-arithmetic 6), `test-safe` **750/750 — and the CLI is
 > now IN that gate**, `test-security` 3/3, `zig build features` green across
 > all four `-Dwat`/`-Dwasi` combinations, size gate EXACT at exe 984,576 / lib 1,047,720 / dll
@@ -1484,7 +1484,20 @@ instructive part — including the two that were already stale in F's favour whe
 restore. **And assert the BUILD SUCCEEDED before reading an inversion's silence**: two of R9's eight
 inversions reported no failing test because commenting the check out left a Zig parameter unused.
 
-### 🎯 Track L — legacy `delegate`. **SCOPED 2026-08-18. THE LAST 25 SKIPS, AND AN OWNER DECISION FIRST**
+### ✅ Track L — legacy `delegate`. **SHIPPED 2026-08-18. The corpus is at ZERO SKIPS and ZERO FAILURES**
+
+> 🏁 **DONE, and the scope below was accurate: ~512 bytes, no ABI surface, four inversion-tested
+> arms.** `legacy/try_delegate.wast` 2\/0\/24 → **25\/0\/0**; `legacy/rethrow.wast` 14\/0\/1 → **15\/0\/0**;
+> corpus **63,870 passed \/ 0 failed \/ 0 skipped**. SD-3 is retired.
+>
+> 🔒 **The predicted risk R1 was the one that mattered and it was checked BEFORE the interpreter
+> was touched, which is why it cost nothing.** The blanket validator refusal was masking a missing
+> rule: the assembler accepts a bare `(func (delegate 0))`, which the spec calls malformed. The
+> `.delegate` arm now requires its frame to be a `try_legacy`, the same rule `.catch_` carries.
+> **A blanket refusal can hide a missing rule; deleting it is what reveals the rule was never
+> written.** R2 (two passing assertions that must stay rejected) was measured and did not fire.
+>
+> *(The scope as written before the work is preserved below — it was the basis for the go-ahead.)*
 
 > ⚠️ **DO NOT START THIS WITHOUT THE OWNER'S CALL.** It reverses a Standing Delta (SD-3), and this
 > repo's own precedent is explicit: *"reversing it is an owner decision, not a conformance-pass side

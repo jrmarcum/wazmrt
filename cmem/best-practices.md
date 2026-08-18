@@ -682,6 +682,31 @@ current and is two-thirds wrong. **Date a by-design list as loudly as its conten
 whenever a track closes** — it is the section most likely to be stale and least likely to be
 checked, because nothing about it fails a build. — the 2026-08-18 audit, `known-issues.md`
 
+**A BLANKET REFUSAL CAN HIDE A MISSING RULE — DELETING IT IS WHAT REVEALS THE RULE WAS NEVER
+WRITTEN.** `delegate` was refused wholesale by the validator, and that one `return error` was also
+the only thing rejecting a BARE `(func (delegate 0))` — which the assembler happily emits, because
+`delegate` is an ordinary mnemonic with a label immediate, and which the spec calls malformed.
+Removing the refusal without adding the enclosing-frame rule would have converted a spec
+malformation into an accept-invalid. ⚠️ **Before removing a blanket refusal, enumerate what it is
+currently catching** — the set is always larger than the thing it was written for, and the extras
+have no other guard by definition. Checking it before touching the interpreter is why it cost
+nothing. — Track L, `validate.zig`
+
+**SCOPE THE BLAST RADIUS, NOT THE FEATURE.** "One instruction" said nothing useful about Track L's
+risk; *"does it need a new `Op`, a feature bit, or an ABI entry?"* said everything. `Op.delegate`
+already existed, already had its immediate kind, and was already classified — so the work touched
+no pin, no `capi.Feature`, no header, and could not regress any module that exists, because every
+path it changed was unreachable while the refusal stood. Wide-arithmetic, nominally the same size,
+touched all of those. **Ask what a change makes REACHABLE, not how many lines it is.** — Track L,
+`roadmap.md`
+
+**A TEST THAT ASSERTS A REFUSAL IS A TEST OF A DECISION, AND IT EXPIRES WITH THE DECISION.** Three
+tests asserted that `delegate` was rejected; all three were correct until the day they weren't.
+**Rewrite them in place rather than deleting them** — the reasoning in a refusal test is usually
+the best available summary of what the replacement rules have to cover, and one of the three had a
+security half (the unvalidated-run-path defence) that had to survive the change verbatim. — Track
+L, `validate.zig` / `interp.zig` / `wat.zig`
+
 ## 5. Recording what you found
 
 **"Update the project memory" means AUDIT for stale live claims, not edit the files you happened to

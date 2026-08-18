@@ -1107,18 +1107,33 @@ const FuncValidator = struct {
                 try self.pushCtrl(.catch_legacy, start, frame.end);
             },
             .delegate => {
-                // `delegate l` re-raises an exception "at label l", which can SKIP
-                // the handlers of trys between this one and the target. The
-                // interpreter records the label but `throwException` never routes
-                // through it, and there is no reference implementation left to
-                // validate the (subtle, historically-inconsistent) label
-                // arithmetic against — wasmtime and V8 dropped the legacy EH
-                // encoding for `try_table`. Rather than accept a construct we
-                // cannot correctly execute (the "validates yet mis-runs" trap the
-                // assembler already refuses by rejecting `delegate`), reject it
-                // here too, so text and binary paths agree. `try`/`catch`/
-                // `catch_all`/`rethrow` remain fully supported.
-                return error.UnsupportedOpcode;
+                // `delegate l` closes the try IN PLACE OF `end` and re-raises any exception from
+                // its body "at label l", SKIPPING the handlers of every try in between.
+                //
+                // ⚠️ **ONLY A `try` MAY BE CLOSED THIS WAY — never a `catch`**, which is the same
+                // frame rule `.catch_` above enforces and the reason three of this file's
+                // `assert_malformed`s exist: `(try (do) (catch $e) (delegate 0))` and its
+                // `catch_all` twin are malformed, and so is a BARE `(func (delegate 0))`.
+                //
+                // 🔒 **That last one is why this check is load-bearing rather than tidy.** The
+                // assembler ACCEPTS a bare `delegate` — it is an ordinary mnemonic with a label
+                // immediate — and until now the blanket refusal below was the only thing stopping
+                // it. Removing that refusal without adding this rule would have turned a spec
+                // malformation into an accept-invalid. **A blanket refusal can hide a missing
+                // rule; deleting it is what reveals the rule was never written.**
+                const frame = try self.popCtrl();
+                if (frame.kind != .try_legacy) return error.MismatchedCatch;
+                // The body still has to produce the try's results, exactly as `end` requires.
+                @memcpy(self.local_init, frame.init_snapshot);
+
+                // The label counts from the scope OUTSIDE the try — the frame is already popped,
+                // so `self.ctrls` is that scope. `(func (try (do) (delegate 1)))` is `unknown
+                // label` because depth 0 is the function body and there is nothing beyond it.
+                // ⚠️ `labelTypesAt` is NOT used: `delegate` does not branch and carries no values
+                // to its target, so the target's arity is irrelevant — only that it EXISTS.
+                if (instr.imm.label >= self.ctrls.items.len) return error.UnknownLabel;
+
+                try self.pushVals(frame.end);
             },
             .rethrow => {
                 // Re-raise the exception caught `l` levels out. `l` must resolve
@@ -2611,26 +2626,58 @@ test "validator: memory-touching ops require an in-range memory" {
     }
 }
 
-test "validator rejects legacy try/delegate (deprecated, no reference impl to verify routing)" {
-    // `delegate` re-raises "at label l", which can skip intermediate handlers.
-    // The interpreter records the label but never routes through it, and there is
-    // no reference implementation left to validate the label arithmetic against
-    // (wasmtime and V8 dropped the legacy EH encoding). We reject it rather than
-    // accept a construct we cannot correctly execute. The assembler already
-    // refuses `delegate`, so this binary is hand-built:
-    //   (func (try (do) (delegate 0)))  →  try_ 0x40  delegate 0  end
+test "validator: legacy `delegate` closes a TRY and only a try, and its label must exist" {
+    // 🎓 **REPLACES "validator rejects legacy try/delegate", which was correct until 2026-08-18.**
+    // That test asserted the refusal SD-3 stood on: "no reference implementation left to validate
+    // the label arithmetic against". wabt's interpreter is one and was in this tree the whole
+    // time. **A test that asserts a refusal is a test of a DECISION, and it expires with the
+    // decision** — replaced rather than deleted, so the rules that took its place are pinned in
+    // the same spot.
     const gpa = std.testing.allocator;
-    const bin = types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++ [_]u8{
-        0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type: () -> ()
-        0x03, 0x02, 0x01, 0x00, //             function: one func, type 0
-        0x0a, 0x08, 0x01, 0x06, 0x00, //       code: one body, size 6, 0 locals
-        0x06, 0x40, //                         try (empty block type)
-        0x18, 0x00, //                         delegate 0
-        0x0b, //                               end (function)
-    };
-    var m = try Module.decode(gpa, &bin);
-    defer m.deinit();
-    try std.testing.expectError(error.UnsupportedOpcode, validate(gpa, &m));
+    const wat = @import("wat.zig");
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A well-formed delegate validates: `delegate 0` on a try in a function body names the
+    // caller, which is the outermost thing a delegate may name.
+    {
+        var m = try Module.decode(a, try wat.assemble(a, "(module (func (try (do) (delegate 0))))"));
+        defer m.deinit();
+        try validate(a, &m);
+    }
+    // ...and one step further does not exist. `try_delegate.wast` asserts exactly this as
+    // "unknown label".
+    {
+        var m = try Module.decode(a, try wat.assemble(a, "(module (func (try (do) (delegate 1))))"));
+        defer m.deinit();
+        try std.testing.expectError(error.UnknownLabel, validate(a, &m));
+    }
+    // 🔒 **A BARE `delegate`, closing no try at all, and this is the arm that matters.** The
+    // ASSEMBLER accepts it — `delegate` is an ordinary mnemonic with a label immediate — so until
+    // the blanket `UnsupportedOpcode` was removed, nothing else was checking. Removing a refusal
+    // is what reveals the rule under it was never written; the spec calls this malformed.
+    {
+        var m = try Module.decode(a, try wat.assemble(a, "(module (func (delegate 0)))"));
+        defer m.deinit();
+        try std.testing.expectError(error.MismatchedCatch, validate(a, &m));
+    }
+    // The same rule from the BINARY side, hand-built so no assembler choice is in the way:
+    //   (func (block (delegate 0) end) end) — a delegate closing a `block`, not a `try`.
+    {
+        const bin = types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++ [_]u8{
+            0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type: () -> ()
+            0x03, 0x02, 0x01, 0x00, //             function: one func, type 0
+            0x0a, 0x09, 0x01, 0x07, 0x00, //       code: one body, size 7, 0 locals
+            0x02, 0x40, //                         block (empty block type)
+            0x18, 0x00, //                         delegate 0   ← closing a BLOCK
+            0x0b, //                               end
+            0x0b, //                               end (function)
+        };
+        var m = try Module.decode(a, &bin);
+        defer m.deinit();
+        try std.testing.expectError(error.MismatchedCatch, validate(a, &m));
+    }
 }
 
 test "validator: ref.func in a body requires the function to be declared (C.refs)" {
