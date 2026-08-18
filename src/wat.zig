@@ -45,7 +45,32 @@ pub const Error = sexpr.Error || error{
     /// the input is legacy, not nonsense, and the fix is one word.
     ObsoleteKeyword,
     UnknownInstr,
+    /// A `$name` that names nothing in its index space.
+    ///
+    /// ⚠️ **ON `wast.isOurLimitation`, and that is a JUDGEMENT rather than an oversight.** The
+    /// name tables are built from the module's own text and an unrecognised module field is a hard
+    /// `BadModuleField` (never a silent skip), so in today's code an unresolved name really does
+    /// mean the source referenced something it never bound — a verdict we could give. It stays
+    /// classed as ours because the *class* is not decidable in general: any future syntax the
+    /// parser learns to skip, or a proposal whose fields bind names we do not record, turns this
+    /// error into our gap without changing a line here. **Reclassifying it wholesale would bank
+    /// those as conformance PASSES silently, which is the one direction that cannot be noticed.**
+    /// See `UnknownLabelName` for the sub-case that IS decidable, and split further the same way —
+    /// at a producer whose scope wazmrt fully controls — rather than moving this one.
     UnknownIdentifier,
+    /// A `$name` in a BRANCH TARGET that matches no enclosing block label.
+    ///
+    /// 🔑 **Split out of `UnknownIdentifier` for the reason `BadLaneIndex` was split out of
+    /// `UnsupportedOpcode`: this sub-case is decidable and the parent is not.** A label scope is
+    /// built entirely from block nesting that the assembler parses structurally — no module field,
+    /// no proposal, and nothing wazmrt might fail to record can introduce a label it cannot see.
+    /// So an unmatched label reference can only ever mean the MODULE is wrong; there is no reading
+    /// under which it means wazmrt is incomplete, which is exactly the test the other split used.
+    ///
+    /// **Kept OFF `wast.isOurLimitation`**, where the parent sits. `token.wast` asserts
+    /// `(br_table $l0)` malformed ("unknown label") and `(br_table $"l"0)` malformed ("unknown
+    /// operator"); wazmrt refused both correctly and banked both as SKIPS.
+    UnknownLabelName,
     BadImmediate,
     UnsupportedInstr,
     /// `(pagesize N)` where N is not a power of two, so no log2 encoding exists — MALFORMED text.
@@ -772,10 +797,10 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // exprs/offsets) BEFORE the type section, mirroring the function-body path, so
     // any signature they might intern lands in section 1. Const-exprs can't intern
     // a signature today, but this keeps the invariant structural, not incidental.
-    const global_pay = try encodeGlobalSection(a, globals.items, &sigs, type_names.items, global_names.items, func_names.items);
-    const table_pay = try encodeTableSection(a, tables.items, &sigs, type_names.items, global_names.items, func_names.items);
-    const elem_pay = try encodeElementSection(a, elems.items, &sigs, type_names.items, global_names.items, func_names.items);
-    const data_pay = try encodeDataSection(a, datas.items, &sigs, type_names.items, global_names.items, func_names.items);
+    const global_pay = try encodeGlobalSection(a, globals.items, &sigs, type_names.items, global_names.items, func_names.items, elem_names.items, data_names.items);
+    const table_pay = try encodeTableSection(a, tables.items, &sigs, type_names.items, global_names.items, func_names.items, elem_names.items, data_names.items);
+    const elem_pay = try encodeElementSection(a, elems.items, &sigs, type_names.items, global_names.items, func_names.items, elem_names.items, data_names.items);
+    const data_pay = try encodeDataSection(a, datas.items, &sigs, type_names.items, global_names.items, func_names.items, elem_names.items, data_names.items);
 
     var out: List(u8) = .empty;
     try out.appendSlice(a, &.{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 }); // header
@@ -999,14 +1024,14 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
 /// Encode the global section (6) payload: `(valtype, mut, init-const-expr)` per
 /// global. Const-exprs are encoded here (pre-type-section) so any interning lands
 /// in section 1.
-fn encodeGlobalSection(a: std.mem.Allocator, globals: []const GlobalDef, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8) Error![]const u8 {
+fn encodeGlobalSection(a: std.mem.Allocator, globals: []const GlobalDef, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, elem_names: []const ?[]const u8, data_names: []const ?[]const u8) Error![]const u8 {
     if (globals.len == 0) return &.{};
     var s: List(u8) = .empty;
     try uleb(a, &s, globals.len);
     for (globals) |g| {
         try emitValType(a, &s, g.valtype);
         try s.append(a, if (g.mutable) 0x01 else 0x00);
-        try emitConstExpr(a, &s, sigs, type_names, global_names, func_names, g.init);
+        try emitConstExpr(a, &s, sigs, type_names, global_names, func_names, elem_names, data_names, g.init);
     }
     return s.items;
 }
@@ -1016,7 +1041,7 @@ fn encodeGlobalSection(a: std.mem.Allocator, globals: []const GlobalDef, sigs: *
 /// `0x40 0x00 tabletype expr` (function-references) — the only encoding in which
 /// a NON-NULLABLE element type has a starting value, and therefore the only one
 /// the validator can accept for such a table.
-fn encodeTableSection(a: std.mem.Allocator, tables: []const TableDef, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8) Error![]const u8 {
+fn encodeTableSection(a: std.mem.Allocator, tables: []const TableDef, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, elem_names: []const ?[]const u8, data_names: []const ?[]const u8) Error![]const u8 {
     if (tables.len == 0) return &.{};
     var s: List(u8) = .empty;
     try uleb(a, &s, tables.len);
@@ -1025,7 +1050,7 @@ fn encodeTableSection(a: std.mem.Allocator, tables: []const TableDef, sigs: *Lis
         try emitValType(a, &s, t.elem); // element reftype
         try emitLimits(a, &s, t.min, t.max, false, t.is64, 16);
         if (t.init) |init_expr| {
-            try emitConstExpr(a, &s, sigs, type_names, global_names, func_names, &[_]Sexpr{init_expr});
+            try emitConstExpr(a, &s, sigs, type_names, global_names, func_names, elem_names, data_names, &[_]Sexpr{init_expr});
         }
     }
     return s.items;
@@ -1033,7 +1058,7 @@ fn encodeTableSection(a: std.mem.Allocator, tables: []const TableDef, sigs: *Lis
 
 /// Encode the element section (9) payload — all 8 flag variants
 /// (active/passive/declarative × func-index/const-expr forms).
-fn encodeElementSection(a: std.mem.Allocator, elems: []const ElemDef, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8) Error![]const u8 {
+fn encodeElementSection(a: std.mem.Allocator, elems: []const ElemDef, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, elem_names: []const ?[]const u8, data_names: []const ?[]const u8) Error![]const u8 {
     if (elems.len == 0) return &.{};
     var s: List(u8) = .empty;
     try uleb(a, &s, elems.len);
@@ -1060,7 +1085,7 @@ fn encodeElementSection(a: std.mem.Allocator, elems: []const ElemDef, sigs: *Lis
         if (as_expr) flag |= 0b100;
         try s.append(a, flag);
         if (explicit_table) try uleb(a, &s, e.table_index);
-        if (e.mode == .active) try emitOffsetExpr(a, &s, sigs, type_names, global_names, func_names, e.offset_form, e.is64);
+        if (e.mode == .active) try emitOffsetExpr(a, &s, sigs, type_names, global_names, func_names, elem_names, data_names, e.offset_form, e.is64);
         // The leading kind byte: elemkind (0x00) for non-flag-0 func-index
         // variants, reftype for non-flag-4 const-expr variants.
         if (!as_expr and flag != 0) {
@@ -1090,7 +1115,7 @@ fn encodeElementSection(a: std.mem.Allocator, elems: []const ElemDef, sigs: *Lis
 
 /// Encode the data section (11) payload: active (flag 0x00, offset const-expr) or
 /// passive (flag 0x01) segments, memory 0.
-fn encodeDataSection(a: std.mem.Allocator, datas: []const DataSeg, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8) Error![]const u8 {
+fn encodeDataSection(a: std.mem.Allocator, datas: []const DataSeg, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, elem_names: []const ?[]const u8, data_names: []const ?[]const u8) Error![]const u8 {
     if (datas.len == 0) return &.{};
     var s: List(u8) = .empty;
     try uleb(a, &s, datas.len);
@@ -1099,12 +1124,12 @@ fn encodeDataSection(a: std.mem.Allocator, datas: []const DataSeg, sigs: *List(S
             try s.append(a, 0x01); // passive
         } else if (seg.mem_index == 0) {
             try s.append(a, 0x00); // active, memory 0
-            try emitOffsetExpr(a, &s, sigs, type_names, global_names, func_names, seg.offset_form, false);
+            try emitOffsetExpr(a, &s, sigs, type_names, global_names, func_names, elem_names, data_names, seg.offset_form, false);
         } else {
             // active, explicit memory index (multi-memory)
             try s.append(a, 0x02);
             try uleb(a, &s, seg.mem_index);
-            try emitOffsetExpr(a, &s, sigs, type_names, global_names, func_names, seg.offset_form, false);
+            try emitOffsetExpr(a, &s, sigs, type_names, global_names, func_names, elem_names, data_names, seg.offset_form, false);
         }
         try uleb(a, &s, seg.bytes.len);
         try s.appendSlice(a, seg.bytes);
@@ -1585,12 +1610,12 @@ fn parseImport(a: std.mem.Allocator, items: []const Sexpr, global_imports: *List
 /// Emit an active segment's offset const-expr + `end`. Unwraps `(offset …)`,
 /// accepts a folded const-expr (`(i32.const N)` / `(global.get $g)`), and emits
 /// an implicit `i32.const 0` when no offset form is present.
-fn emitOffsetExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, form: ?Sexpr, is64: bool) Error!void {
+fn emitOffsetExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, elem_names: []const ?[]const u8, data_names: []const ?[]const u8, form: ?Sexpr, is64: bool) Error!void {
     if (form) |f| {
         if (f.asList()) |l| {
-            if (l.len != 0 and eqAtom(l[0], "offset")) return emitConstExpr(a, out, sigs, type_names, global_names, func_names, l[1..]);
+            if (l.len != 0 and eqAtom(l[0], "offset")) return emitConstExpr(a, out, sigs, type_names, global_names, func_names, elem_names, data_names, l[1..]);
         }
-        return emitConstExpr(a, out, sigs, type_names, global_names, func_names, &[_]Sexpr{f});
+        return emitConstExpr(a, out, sigs, type_names, global_names, func_names, elem_names, data_names, &[_]Sexpr{f});
     }
     // The IMPLICIT offset takes the target's index type — `i64.const 0` for a
     // 64-bit table/memory. See `ElemDef.is64`.
@@ -1615,8 +1640,16 @@ fn emitElementExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), type_
 }
 
 /// Emit a constant init expression (a sequence of instruction forms) + `end`.
-fn emitConstExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, exprs: []const Sexpr) Error!void {
-    var ctx: Ctx = .{ .a = a, .out = out, .local_names = &.{}, .func_names = func_names, .sigs = sigs, .type_names = type_names, .global_names = global_names };
+fn emitConstExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, elem_names: []const ?[]const u8, data_names: []const ?[]const u8, exprs: []const Sexpr) Error!void {
+    // 🔑 **`elem_names` and `data_names` belong here even though no CONSTANT expression may use
+    // them.** `array.new_data $t $d` / `array.new_elem $t $e` are not const-exprs, and the spec
+    // asks for them to be refused with "constant expression required" — a VALIDATOR verdict. With
+    // the tables missing, `resolveByName` searched an empty slice and the ASSEMBLER refused first,
+    // with `UnknownIdentifier`: our own gap, so `array.wast`'s two assertions were banked as skips
+    // instead of passes. **A producer that cannot express a construct cannot let the consumer
+    // judge it** — the mirror of the rule `readBlockType` records, and the reason the fix is to
+    // emit the bytes rather than to keep guessing at the verdict up here.
+    var ctx: Ctx = .{ .a = a, .out = out, .local_names = &.{}, .func_names = func_names, .sigs = sigs, .type_names = type_names, .global_names = global_names, .elem_names = elem_names, .data_names = data_names };
     try emitSeq(&ctx, exprs);
     try out.append(a, @intFromEnum(Op.end));
 }
@@ -2869,7 +2902,9 @@ fn resolveLabel(ctx: *Ctx, s: Sexpr) Error!u32 {
                 if (std.mem.eql(u8, nm, atom)) return @intCast(ctx.labels.items.len - 1 - k);
             }
         }
-        return error.UnknownIdentifier;
+        // Not `UnknownIdentifier`: a label scope is entirely ours to know, so this is a verdict
+        // on the module rather than a gap in wazmrt. See `Error.UnknownLabelName`.
+        return error.UnknownLabelName;
     }
     return parseIndex(s);
 }
@@ -8283,5 +8318,55 @@ test "an EXACT function import is descriptor kind 0x20, and only in an import" {
         try out.appendSlice(a, &.{ 0x03, 0x02, 0x01, 0x00 }); // func section: one func, type 0
         try out.appendSlice(a, &.{ 0x07, 0x04, 0x01, 0x00, 0x20, 0x00 }); // export "" kind 0x20 idx 0
         try std.testing.expectError(error.UnknownExternKind, Module.decode(a, out.items));
+    }
+}
+
+test "an unknown LABEL is a verdict, not a gap — and it is off isOurLimitation" {
+    // 🔒 REGRESSION TEST FOR A MIS-SCORING, THIRD OF ITS KIND. `token.wast` asserts
+    // `(br_table $l0)` malformed ("unknown label") and `(br_table $\"l\"0)` malformed ("unknown
+    // operator"). wazmrt refused BOTH correctly and banked both as SKIPS, because `resolveLabel`
+    // answered `UnknownIdentifier` — an error `wast.isOurLimitation` classes as our gap, since in
+    // general a name we cannot resolve might be one we failed to record.
+    //
+    // A label cannot be that: its scope comes entirely from block nesting the assembler parses
+    // structurally, so there is no construct — present or future — that binds a label wazmrt
+    // cannot see. Same test `BadLaneIndex` passed when it was split out of `UnsupportedOpcode`.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try std.testing.expectError(error.UnknownLabelName, assemble(a, "(module (func (block $l (i32.const 0) (br_table $l0))))"));
+    try std.testing.expectError(error.UnknownLabelName, assemble(a, "(module (func (block $l (br $nope))))"));
+    // A label that IS in scope still resolves — the refusal is the name, not the construct.
+    _ = try assemble(a, "(module (func (block $l (i32.const 0) (br_table $l $l))))");
+    // ⚠️ And the parent error must stay put: an unknown FUNCTION name is still `UnknownIdentifier`,
+    // because that space can in principle be short a name wazmrt failed to record.
+    try std.testing.expectError(error.UnknownIdentifier, assemble(a, "(module (func (call $nope)))"));
+}
+
+test "array.new_data/new_elem reach the VALIDATOR from a const-expr instead of dying in the assembler" {
+    // 🔒 REGRESSION TEST FOR A PRODUCER THAT REFUSED WHAT ONLY THE CONSUMER MAY JUDGE.
+    // `emitConstExpr` built its `Ctx` without `elem_names`/`data_names`, so `$d` was looked up in
+    // an EMPTY table and the assembler answered `UnknownIdentifier` — our gap, scored as a skip.
+    // Neither instruction is a constant expression, and `array.wast` asks for exactly that verdict
+    // ("constant expression required"), which only the validator can give. The fix is to EMIT the
+    // bytes and let it.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    for ([_][]const u8{
+        \\(module (type $b (array i8)) (data $d "\00\01\02")
+        \\  (global (ref $b) (array.new_data $b $d (i32.const 1) (i32.const 1))))
+        ,
+        \\(module (type $b (array i8)) (type $v (array (ref $b))) (elem $e (ref $b) (ref.null $b))
+        \\  (global (ref $v) (array.new_elem $v $e (i32.const 0) (i32.const 1))))
+    }) |src| {
+        // Assembles now...
+        const bin = try assemble(a, src);
+        var m = try Module.decode(a, bin);
+        defer m.deinit();
+        // ...and is refused at the layer that can say why.
+        try std.testing.expectError(error.ConstantExpressionRequired, validate(a, &m));
     }
 }

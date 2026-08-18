@@ -83,8 +83,31 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
 
 ## 📊 CURRENT spec-testsuite score (2026-08-17) — EVERY CORE SPEC FILE IS AT ZERO
 
-**284 files — 63,732 assertions passed / 0 FAILED / 144 skipped**, and `zig build conformance -Dbaseline=tools/conformance-baseline.txt` reports **0 regressions**. This is the number to quote;
-every snapshot below it is older and kept as history. *(Superseded same day: 63,731 / 2 / 144, then 63,391 / 4 / 497, then 63,315 / 16 / 578, then 63,344 / 53 / 515, then 63,190 / 81 / 673, then 62,898 / 81 / 965.)*
+**284 files — 63,739 assertions passed / 0 FAILED / 134 skipped**, and `zig build conformance -Dbaseline=tools/conformance-baseline.txt` reports **0 regressions**. This is the number to quote;
+every snapshot below it is older and kept as history. *(Superseded: 63,732 / 0 / 144 earlier on 2026-08-18; then same-day-2026-08-17: 63,731 / 2 / 144, 63,391 / 4 / 497, 63,315 / 16 / 578, 63,344 / 53 / 515, 63,190 / 81 / 673, 62,898 / 81 / 965.)*
+
+### 🔍 WHERE THE REMAINING 134 SKIPS ARE — measured 2026-08-18, not estimated
+
+Every skip site in the runner was instrumented, all 284 files re-run, and the probe reverted. **The
+skips live in 6 files and reduce to three causes**, so "what is left" no longer needs re-deriving:
+
+| cause | files | skips | ours? |
+| --- | --- | --- | --- |
+| **wide-arithmetic not implemented** | `proposals/wide-arithmetic/` | **109** | untargeted proposal — a real gap |
+| **legacy `try`/`delegate`/`rethrow`** | `legacy/try_delegate`, `legacy/rethrow` | **25** | SD-3, a deliberate refusal |
+
+🔑 **Only ~34 of the wide-arithmetic 109 are direct.** Ten modules fail to assemble
+(`i64.add128`/`sub128`/`mul_wide_s`/`mul_wide_u`) and 99 `assert_return`s against them cascade into
+`NoTarget`. **A skip total is dominated by CASCADES, so ranking work by it without asking how many
+MODULES are behind them over-counts** — the same shape as "rank by assertions unblocked", read in
+the other direction.
+
+⚠️ **SD-3's 25 are the standing delta's measured cost, which the entry itself never quantified.**
+Closing them means implementing `delegate` routing, which has no oracle to check against.
+
+*(The third cause was `isOurLimitation` over-claiming — 7 skips — closed 2026-08-18 along with
+§6.6.13's abbreviated module, 3 more. See the size-ceilings entry for what each one was; two of
+the four were not scoring bugs at all but decoder/assembler gaps that rejected VALID modules.)*
 
 ✅ **EVERY TARGETED PROPOSAL NOW SHIPS. Track D (custom-descriptors) is COMPLETE — D1 through D5,
 all on 2026-08-17** — and Track P before it. ⚠️ **NOT "no untargeted proposal left"** — `custom-annotations` still is one (`annotations.wast`, a runner-lex gap, baseline group 1). What closed is the last untargeted proposal that the corpus scored as FAILURES.
@@ -326,7 +349,7 @@ zig build conformance -Doptimize=ReleaseFast -Dfailures=600 \
   *exactly* its ceiling; the file was two builds old. **An exactly-zero delta is a timestamp check
   waiting to happen.**
 
-**Unit tests: 734/734** (`zig build test --summary all`, 2026-08-18 after Track F, from an NTFS cwd —
+**Unit tests: 744/744** (`zig build test --summary all`, 2026-08-18 after Track F, from an NTFS cwd —
 `test-safe` green, `test-security` 3/3). 🆕 **THREE test binaries now, not two.** Track F added
 `cli_tests` in `build.zig`: `root.zig` does not import `main.zig`, so the CLI had **no reachable
 tests at all** for its whole life — the same gap this file records the previous C ABI dying of. It

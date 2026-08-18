@@ -577,6 +577,52 @@
 # Corpus 63,731/2/144 -> **63,732 passed / 0 FAILED / 144 skipped**. The only remaining baseline
 # entry is `annotations.wast`, a runner-lex gap on an untargeted proposal.
 
+# RAISED 2026-08-18 by the SKIP-CLOSING PASS (steps 2 and 3 of the 144): 144 -> 134 skipped,
+# 63,732 -> 63,739 passed, 0 failed throughout, 0 regressions.
+#
+#   artifact       before         after       delta
+#   wazmrt.exe    984,576       987,136      +2,560
+#   wazmrt.lib  1,047,720     1,049,686      +1,966
+#   wazmrt.dll    900,608       900,608           0
+#
+# The DLL is flat again, and again that is the informative number: everything here is decoder,
+# assembler and runner, none of which the embed artifact carries more of than it already did.
+#
+# ⚠️ **TWO OF THE FOUR ITEMS WERE NOT SCORING BUGS AT ALL — they rejected VALID modules**, which is
+# why this pass is worth more than the 10 skips suggests:
+#
+#   - `select_t` decoded ONE BYTE per result type, so `(select (result (ref null $t)) …)` — a
+#     perfectly valid module — failed with `UnsupportedOpcode`, and the heap type was left in the
+#     stream. `readBlockType`, one function above it, had already been fixed for exactly this and
+#     carries the note "a workaround in the producer for a gap in the consumer does not stay
+#     cosmetic". The vector form was never revisited. `Imm.select_types` is now
+#     `[]const SelectType`, unresolved like `BlockType`, and the validator resolves it where the
+#     module is in hand — which is also what makes `(select (result (ref 1)))` report the spec's
+#     "unknown type" instead of dying in the decoder.
+#   - `emitConstExpr` built its `Ctx` without `elem_names`/`data_names`, so `array.new_data $t $d`
+#     in a global initializer was refused by the ASSEMBLER with `UnknownIdentifier`. Neither
+#     instruction is a constant expression and the spec asks for "constant expression required" —
+#     a VALIDATOR verdict. A producer that cannot express a construct cannot let the consumer
+#     judge it.
+#
+# The other two are the third and fourth instances of one scoring pattern (`UnknownInstr` was the
+# first, `BadLaneIndex` the second): **an error that conflates "your input is bad" with "we are
+# incomplete" cannot be scored correctly by any caller.**
+#
+#   - `UnknownLabelName`, split out of `UnknownIdentifier`. A label scope comes entirely from block
+#     nesting the assembler parses structurally, so an unmatched label can only mean the module is
+#     wrong. The parent stays classed as ours — see its doc comment for why that is a judgement.
+#   - `IllegalOpcode`, split out of `UnsupportedOpcode`, for `0xFF` **and only `0xFF`**: the spec
+#     documents it as never an instruction or prefix, so no proposal can ever assign it. The
+#     neighbouring unassigned ranges stay `UnsupportedOpcode`, because a proposal may take one and
+#     on that day wazmrt is the incomplete party. Split what the spec makes permanent, not what
+#     today's opcode table happens to leave empty.
+#
+# Plus §6.6.13's ABBREVIATED MODULE in the `.wast` runner (`inline-module.wast`, 3 skips): a script
+# that is nothing but module fields is one module with the wrapper left off. The trigger requires
+# EVERY top-level form to be a module field rather than testing only the first — an unrecognised
+# command must not be able to reinterpret a whole file of assertions as one bogus module.
+
 # RAISED 2026-08-18 by TRACK F — feature ENFORCEMENT completed (F1r, the two missing gates, F5-CLI, F5).
 #
 #   artifact       before         after       delta
@@ -626,6 +672,6 @@
 # new ones are the CLI's FIRST reachable tests — `main.zig` had no test target until `--features`
 # put a policy parser in it.
 
-wazmrt.exe  984576
-wazmrt.lib  1047720
+wazmrt.exe  987136
+wazmrt.lib  1049686
 wazmrt.dll  900608

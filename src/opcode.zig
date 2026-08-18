@@ -413,6 +413,22 @@ pub const HeapType = union(enum) {
 /// there is nothing for "exactly this" to bind to, and both readers reject the combination.
 pub const RefType = struct { nullable: bool, heap: HeapType, exact: bool = false };
 
+/// One entry of a typed `select`'s result vector: a single-byte valtype the decoder can resolve on
+/// its own, or a multi-byte `(ref null? ht)` that cannot be resolved without the module.
+///
+/// 🔑 **This union exists because the select decoder read ONE BYTE per type and rejected anything
+/// else.** Its comment even said "a single byte can't encode a concrete `(ref $t)`" — true, and it
+/// was being used to justify the check rather than read as the reason the check was wrong. The
+/// vector may CONTAIN one; the byte just is not the whole of it. So
+/// `(select (result (ref null $t)) …)` — a valid module — failed to decode with
+/// `UnsupportedOpcode`, and `ref.wast`'s `(select (result (ref 1)))`, which must be refused as
+/// "unknown type", was refused for our reason instead and banked as a skip. **The same gap
+/// `readBlockType` was fixed for, in the sibling function, left standing in the vector form.**
+pub const SelectType = union(enum) {
+    value: types.ValType,
+    ref: RefType,
+};
+
 /// The `0xFC` sub-opcode for an internal saturating-truncation / bulk-memory /
 /// table-op tag, or null for a normal op.
 pub fn fcSubOpcode(op: Op) ?u8 {
@@ -563,7 +579,14 @@ pub const Imm = union(enum) {
     f32: u32,
     f64: u64,
     /// Result types of a typed `select` (`0x1c`).
-    select_types: []const types.ValType,
+    ///
+    /// ⚠️ **Not `[]const ValType`, and the reason is the same one `readBlockType` records one
+    /// function below.** `(ref null ht)` = `0x63 ht` and `(ref ht)` = `0x64 ht` are ordinary
+    /// valtypes and therefore ordinary `select` result types, but a concrete heap index cannot
+    /// become a `ValType` here: picking its family head needs the module's composite kinds, which
+    /// the body decoder does not have. `BlockType` solved this by staying UNRESOLVED; this is the
+    /// same answer for the same reason, in the vector form.
+    select_types: []const SelectType,
     /// Heap type of `ref.null` (`0xd0`) — abstract head or a concrete type index;
     /// the validator resolves it to a (possibly concrete) nullable value type.
     /// `ref.null <heaptype>`. Carries exactness because the heap-type grammar
@@ -1267,6 +1290,12 @@ pub fn decodeBodyTracked(
         // **Adding a tag below `0x100` re-opens it. Do not.**
         if (b0 == 0x16 or b0 == 0x17 or
             (b0 >= 0xc5 and b0 <= 0xcf) or (b0 >= 0xd7 and b0 <= 0xfa)) return error.UnsupportedOpcode;
+        // ⚠️ `0xFF` gets its OWN error, and the distinction is not cosmetic. Everything the guard
+        // above refuses is *unassigned today*; `0xFF` is reserved by the spec **forever**, so it
+        // is the one byte where "not an opcode" cannot also mean "wazmrt is behind". See
+        // `types.DecodeError.IllegalOpcode` — it is off `wast.isOurLimitation` for that reason
+        // and `UnsupportedOpcode` must stay on it.
+        if (b0 == 0xff) return error.IllegalOpcode;
         const op: Op = @enumFromInt(b0);
         const imm: Imm = switch (immediateKind(op)) {
             .none => .none,
@@ -1298,14 +1327,26 @@ pub fn decodeBodyTracked(
             .f64c => .{ .f64 = try r.readF64Bits() },
             .select_types => blk: {
                 const n = try r.readVecLen();
-                const tys = try a.alloc(types.ValType, n);
+                const tys = try a.alloc(SelectType, n);
                 for (tys) |*t| {
-                    t.* = @enumFromInt(try r.readByte());
-                    // #6: reject an unknown value-type byte rather than silently
-                    // building a bogus `ValType`. (A single byte can't encode a
-                    // concrete `(ref $t)` — bit 31 is clear — so `isValid` is
-                    // exactly the abstract/numeric set here.)
-                    if (!t.isValid()) return error.UnsupportedOpcode;
+                    // ⚠️ **The MULTI-BYTE valtypes first, exactly as `readBlockType` does.**
+                    // `(ref null ht)` = `0x63 ht` and `(ref ht)` = `0x64 ht`; reading one byte and
+                    // stopping left the heap type in the stream and answered `UnsupportedOpcode`
+                    // for a VALID module. `0x63`/`0x64` are unambiguous here because no
+                    // single-byte valtype uses either code.
+                    const first = try r.peekByte();
+                    if (first == 0x63 or first == 0x64) {
+                        _ = try r.readByte();
+                        const he = try readHeapTypeExact(&r);
+                        t.* = .{ .ref = .{ .nullable = first == 0x63, .heap = he.heap, .exact = he.exact } };
+                        continue;
+                    }
+                    // #6: reject an unknown value-type byte rather than silently building a bogus
+                    // `ValType`. Every remaining form IS one byte, so `isValid` is exactly the
+                    // abstract/numeric set here.
+                    const v: types.ValType = @enumFromInt(try r.readByte());
+                    if (!v.isValid()) return error.UnsupportedOpcode;
+                    t.* = .{ .value = v };
                 }
                 break :blk .{ .select_types = tys };
             },
@@ -1390,7 +1431,37 @@ test "#6: select_t rejects an invalid value-type byte at decode" {
     // A valid typed select (i32 = 0x7f) still decodes.
     const ok = try decodeBody(a, &[_]u8{ 0x1c, 0x01, 0x7f, 0x0b });
     try std.testing.expectEqual(Op.select_t, ok[0].op);
-    try std.testing.expectEqual(types.ValType.i32, ok[0].imm.select_types[0]);
+    try std.testing.expectEqual(types.ValType.i32, ok[0].imm.select_types[0].value);
+}
+
+test "select_t decodes the MULTI-BYTE ref valtypes, which it used to refuse" {
+    // 🔒 REGRESSION TEST FOR A DECODER GAP THAT REJECTED VALID MODULES. The loop read exactly one
+    // byte per result type, so `(ref null $t)` = `0x63 ht` and `(ref $t)` = `0x64 ht` came back as
+    // `UnsupportedOpcode` — and the heap type was left in the stream, so the failure was not even
+    // at the right place. It is the same gap `readBlockType` above was fixed for; only the vector
+    // form was left behind. ⚠️ **When a decoder is taught a multi-byte form, grep for every OTHER
+    // site that reads that grammar** — a fix applied at one of two call sites is half a fix.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // select_t, 1 type, `0x63 0x00` = (ref null <type 0>).
+    const nullable = try decodeBody(a, &[_]u8{ 0x1c, 0x01, 0x63, 0x00, 0x0b });
+    try std.testing.expectEqual(Op.select_t, nullable[0].op);
+    try std.testing.expect(nullable[0].imm.select_types[0] == .ref);
+    try std.testing.expect(nullable[0].imm.select_types[0].ref.nullable);
+    try std.testing.expectEqual(@as(u32, 0), nullable[0].imm.select_types[0].ref.heap.concrete);
+
+    // `0x64 0x01` = (ref <type 1>), non-nullable. The index is NOT range-checked here — that is
+    // the validator's job, and it is what turns `(select (result (ref 1)))` in a module with no
+    // such type into the spec's "unknown type" rather than a decode failure.
+    const non_null = try decodeBody(a, &[_]u8{ 0x1c, 0x01, 0x64, 0x01, 0x0b });
+    try std.testing.expect(!non_null[0].imm.select_types[0].ref.nullable);
+    try std.testing.expectEqual(@as(u32, 1), non_null[0].imm.select_types[0].ref.heap.concrete);
+
+    // An abstract head still takes the single-byte path: `0x70` = funcref.
+    const abstract = try decodeBody(a, &[_]u8{ 0x1c, 0x01, 0x70, 0x0b });
+    try std.testing.expectEqual(types.ValType.funcref, abstract[0].imm.select_types[0].value);
 }
 
 test "decodes a SIMD (0xFD) op: v128.const" {
@@ -1404,9 +1475,15 @@ test "decodes a SIMD (0xFD) op: v128.const" {
     try std.testing.expectEqual(@as(u128, 1 | (2 << 32) | (3 << 64) | (4 << 96)), instrs[0].imm.simd.bytes);
 }
 
-test "rejects a genuinely unknown opcode" {
-    const body = [_]u8{0xff}; // 0xff is not a defined opcode or prefix
-    try std.testing.expectError(error.UnsupportedOpcode, decodeBody(std.testing.allocator, &body));
+test "rejects a genuinely unknown opcode, and 0xff by its OWN error" {
+    // 🔑 The two halves are deliberately different errors. `0xff` is reserved by the spec
+    // FOREVER — no proposal can ever assign it — so refusing it is a verdict on the module and
+    // scores as a conformance pass (`binary.wast`: "illegal opcode ff"). An unassigned byte like
+    // `0x27` is merely unassigned TODAY; if a proposal takes it, wazmrt is the incomplete party,
+    // so it stays `UnsupportedOpcode` and `wast.isOurLimitation` keeps scoring it as our gap.
+    // **The asymmetry is the point: split what the spec makes permanent, not what is empty now.**
+    try std.testing.expectError(error.IllegalOpcode, decodeBody(std.testing.allocator, &[_]u8{0xff}));
+    try std.testing.expectError(error.UnsupportedOpcode, decodeBody(std.testing.allocator, &[_]u8{0x27}));
 }
 
 test "rejects raw internal-tag bytes that are not real single-byte opcodes" {

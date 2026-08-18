@@ -441,4 +441,21 @@ pub const DecodeError = error{
     /// "we are incomplete" cannot be scored correctly by ANY caller.** The distinction is known
     /// here and nowhere upstream, so it has to be made here.
     BadLaneIndex,
+    /// The byte `0xFF` in an instruction position. **The specification documents it as a value
+    /// that will never be used as an instruction or as an instruction-prefix opcode**, so no
+    /// future proposal can assign it.
+    ///
+    /// 🔑 **Second split out of `UnsupportedOpcode`, on the same test as `BadLaneIndex`: is there
+    /// any reading under which this means WAZMRT is incomplete?** For `0xFF` there is not, and
+    /// that is a fact about the spec rather than about our coverage — which is exactly what makes
+    /// it separable. Reported as `UnsupportedOpcode`, `binary.wast`'s "illegal opcode ff"
+    /// assertion (and its custom-descriptors copy) scored as skips.
+    ///
+    /// ⚠️ **Deliberately ONLY `0xFF`.** The neighbouring unassigned ranges — `0xC5`–`0xCF` and
+    /// `0xD7`–`0xFA`, which `decodeBody`'s frozen guard also refuses — are *currently* unassigned,
+    /// not permanently reserved. A future proposal may take one, and on that day wazmrt would be
+    /// the incomplete party, so `UnsupportedOpcode` is the honest answer for them. **The size of
+    /// the claim is the whole point: split what the spec makes permanent, not what today's
+    /// opcode table happens to leave empty.**
+    IllegalOpcode,
 };

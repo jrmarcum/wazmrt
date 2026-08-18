@@ -215,6 +215,13 @@ pub fn runScriptWith(gpa: std.mem.Allocator, src: []const u8, path: ?[]const u8,
     }
     var lines: std.ArrayList(u32) = .empty;
     const forms = try sexpr.parseAllWithLines(r.a, src, &lines);
+    // §6.6.13's abbreviated module — a script that is nothing but module FIELDS. Checked before
+    // the command loop because it is a property of the WHOLE script, not of any one form.
+    if (Runner.isInlineModule(forms)) {
+        r.line = lines.items[0];
+        try r.inlineModule(forms);
+        return r.summary;
+    }
     for (forms, 0..) |cmd, i| {
         r.line = lines.items[i];
         try r.command(cmd);
@@ -286,7 +293,37 @@ const Runner = struct {
     fn command(self: *Runner, cmd: Sexpr) Error!void {
         const kw = cmd.keyword() orelse return error.BadCommand;
         if (std.mem.eql(u8, kw, "module")) {
+            return self.moduleCommand(cmd.asList().?);
+        } else if (std.mem.eql(u8, kw, "assert_return")) {
+            try self.assertReturn(cmd.asList().?);
+        } else if (std.mem.eql(u8, kw, "assert_trap")) {
+            try self.assertTrap(cmd.asList().?);
+        } else if (std.mem.eql(u8, kw, "assert_exhaustion")) {
+            try self.assertExhaustion(cmd.asList().?);
+        } else if (std.mem.eql(u8, kw, "assert_exception")) {
+            try self.assertException(cmd.asList().?);
+        } else if (std.mem.eql(u8, kw, "assert_invalid") or std.mem.eql(u8, kw, "assert_malformed")) {
+            try self.assertRejected(cmd.asList().?);
+        } else if (std.mem.eql(u8, kw, "assert_unlinkable")) {
+            try self.assertUnlinkable(cmd.asList().?);
+        } else if (std.mem.eql(u8, kw, "register")) {
+            // (register "name" $id?) — expose a module's exports under "name":
+            // the `$id`-named module if given, else the current module.
             const list = cmd.asList().?;
+            const target = if (list.len > 2 and isId(list[2])) self.module_names.get(list[2].atom) else self.current;
+            if (target) |inst| try self.modules.put(self.a, try asStr(try nth(list, 1)), inst);
+        } else if (std.mem.eql(u8, kw, "invoke") or std.mem.eql(u8, kw, "get")) {
+            _ = self.runAction(cmd) catch |e| self.fail("action failed: {s}", .{@errorName(e)});
+        } else {
+            self.summary.skipped += 1; // (module quote …), assert_exception, …
+        }
+    }
+
+    /// The `(module …)` command, factored out so §6.6.13's ABBREVIATED form can reach exactly the
+    /// same path — see `inlineModule`. A second copy of this arm would be a second place for the
+    /// `isOurLimitation` scoring rule below to be got wrong.
+    fn moduleCommand(self: *Runner, list: []const Sexpr) Error!void {
+        {
             // `(module definition $M …)` DEFINES without instantiating, and
             // `(module instance $I $M)` instantiates a definition — the pair
             // `instance.wast` uses to check that instantiation is generative
@@ -320,29 +357,45 @@ const Runner = struct {
             // Track by textual `$name` (`(module $M …)`) for later `$M` references.
             if (self.current) |inst| if (list.len > 1 and isId(list[1]))
                 try self.module_names.put(self.a, list[1].atom, inst);
-        } else if (std.mem.eql(u8, kw, "assert_return")) {
-            try self.assertReturn(cmd.asList().?);
-        } else if (std.mem.eql(u8, kw, "assert_trap")) {
-            try self.assertTrap(cmd.asList().?);
-        } else if (std.mem.eql(u8, kw, "assert_exhaustion")) {
-            try self.assertExhaustion(cmd.asList().?);
-        } else if (std.mem.eql(u8, kw, "assert_exception")) {
-            try self.assertException(cmd.asList().?);
-        } else if (std.mem.eql(u8, kw, "assert_invalid") or std.mem.eql(u8, kw, "assert_malformed")) {
-            try self.assertRejected(cmd.asList().?);
-        } else if (std.mem.eql(u8, kw, "assert_unlinkable")) {
-            try self.assertUnlinkable(cmd.asList().?);
-        } else if (std.mem.eql(u8, kw, "register")) {
-            // (register "name" $id?) — expose a module's exports under "name":
-            // the `$id`-named module if given, else the current module.
-            const list = cmd.asList().?;
-            const target = if (list.len > 2 and isId(list[2])) self.module_names.get(list[2].atom) else self.current;
-            if (target) |inst| try self.modules.put(self.a, try asStr(try nth(list, 1)), inst);
-        } else if (std.mem.eql(u8, kw, "invoke") or std.mem.eql(u8, kw, "get")) {
-            _ = self.runAction(cmd) catch |e| self.fail("action failed: {s}", .{@errorName(e)});
-        } else {
-            self.summary.skipped += 1; // (module quote …), assert_exception, …
         }
+    }
+
+    /// §6.6.13 — **the `(module …)` wrapper may be omitted when the script IS a single module.**
+    /// `inline-module.wast` is the whole test and it is one line: `(func) (memory 0) (func
+    /// (export "f"))`. The dispatcher above saw three commands named `func`, `memory` and `func`,
+    /// recognised none of them, and banked three skips.
+    ///
+    /// ⚠️ **The trigger is "EVERY top-level form is a module field", not "the first one is not a
+    /// command", and the difference is a fail-safe.** Keying on the first form would make any
+    /// future command keyword this runner does not know turn its whole script into a bogus module
+    /// — a file of assertions silently reinterpreted as one malformed module. Requiring all of
+    /// them means an unrecognised form leaves the script on the ordinary path, where it is scored
+    /// as the skip it always was. **When a heuristic decides how to read an entire file, pick the
+    /// direction whose failure is a no-op.**
+    fn isInlineModule(forms: []const Sexpr) bool {
+        if (forms.len == 0) return false;
+        for (forms) |f| {
+            const kw = f.keyword() orelse return false;
+            var ok = false;
+            for ([_][]const u8{
+                "type", "import", "func",  "table", "memory", "global",
+                "export", "start", "elem", "data",  "rec",    "tag",
+            }) |field| {
+                if (std.mem.eql(u8, kw, field)) ok = true;
+            }
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    /// Run a script that is one abbreviated module: synthesise the wrapper and hand it to the
+    /// ordinary module path, so the era gate, the `isOurLimitation` scoring and the `$name`
+    /// tracking are the same code rather than the same intent.
+    fn inlineModule(self: *Runner, fields: []const Sexpr) Error!void {
+        const list = try self.a.alloc(Sexpr, fields.len + 1);
+        list[0] = .{ .atom = "module" };
+        @memcpy(list[1..], fields);
+        try self.moduleCommand(list);
     }
 
     /// `(module definition $M <fields>)` — assemble and remember, WITHOUT
@@ -2712,4 +2765,64 @@ test "an EXACT function import demands the type itself, through a re-export chai
     // BUILD are the control — without them "always refuse" would pass the first two.
     try std.testing.expectEqual(@as(usize, 2), s.passed);
     try std.testing.expectEqual(@as(usize, 0), s.failed);
+}
+
+test "the abbreviated module (§6.6.13) — a script that is nothing but module FIELDS" {
+    // 🔒 REGRESSION TEST. `inline-module.wast` is one line and the whole file:
+    // `(func) (memory 0) (func (export "f"))`. The command dispatcher saw three commands named
+    // `func`, `memory` and `func`, recognised none, and banked three skips — a runner gap
+    // reported as though the spec had asked us something we declined to answer.
+    const gpa = std.testing.allocator;
+    {
+        var s = try runScript(gpa, "(func) (memory 0) (func (export \"f\"))", null);
+        defer s.deinit(gpa);
+        // One module, built. No assertions in the file, so nothing to pass — the point is that
+        // nothing is SKIPPED any more.
+        try std.testing.expectEqual(@as(usize, 0), s.skipped);
+        try std.testing.expectEqual(@as(usize, 0), s.failed);
+    }
+    // The fields really do become ONE module: a `(func (export "f"))` here is callable, which it
+    // would not be if each form had been read as a module of its own.
+    {
+        var s = try runScript(gpa,
+            \\(func (export "f") (result i32) (i32.const 7))
+            \\(memory 0)
+        , null);
+        defer s.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 0), s.skipped);
+    }
+}
+
+test "the abbreviated-module trigger FAILS SAFE on anything that is not a module field" {
+    // ⚠️ The trigger is "every top-level form is a module field", not "the first one is not a
+    // command". Keying on the first form would let a command keyword this runner does not know
+    // reinterpret its entire script as one bogus module — turning a file of assertions into a
+    // single malformed-module failure. **When a heuristic decides how to read a whole file, the
+    // direction whose failure is a no-op is the one to pick.**
+    const gpa = std.testing.allocator;
+
+    // A real script is untouched: `(module …)` plus an assertion, both scored normally.
+    {
+        var s = try runScript(gpa,
+            \\(module (func (export "f") (result i32) (i32.const 1)))
+            \\(assert_return (invoke "f") (i32.const 1))
+        , null);
+        defer s.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 1), s.passed);
+        try std.testing.expectEqual(@as(usize, 0), s.failed);
+    }
+    // Module fields MIXED with an unknown command stay on the ordinary path — the unknown form is
+    // the skip it always was, and the fields are not silently welded into a module.
+    {
+        var s = try runScript(gpa, "(func) (totally_not_a_command)", null);
+        defer s.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 2), s.skipped);
+        try std.testing.expectEqual(@as(usize, 0), s.failed);
+    }
+    // An empty script is not a module.
+    {
+        var s = try runScript(gpa, "", null);
+        defer s.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 0), s.skipped);
+    }
 }

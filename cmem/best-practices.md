@@ -577,6 +577,58 @@ than the bug. ⚠️ **And the gate that would have caught it existed and did no
 `main.zig` was not in it. **When a front end starts parsing untrusted input, adding it to `test` is
 half the job — it belongs in the memory-safety gate too.** — F5-CLI, `roadmap.md`
 
+**A SKIP TOTAL IS DOMINATED BY CASCADES — ASK HOW MANY MODULES ARE BEHIND IT BEFORE RANKING THE
+WORK.** The 144 remaining skips looked like five separate problems. Instrumenting every skip site
+and re-running all 284 files showed 109 of them were ONE untargeted proposal, and only ~34 of those
+were direct: ten modules fail to assemble and 99 `assert_return`s against them cascade into
+`NoTarget`. **This is "rank by assertions unblocked" read in the other direction** — the same
+cascade that makes a small fix worth hundreds of passes makes a skip total a poor size estimate.
+Measure the causes, not the column. — the 144, `testing.md`
+
+**WHEN A SKIP HAS NO RECORDED REASON, INSTRUMENT IT — DO NOT REASON ABOUT IT.** The runner counts
+skips without saying why, so "what is left" had been re-derived from the source of each `.wast`
+file more than once. A throwaway probe (`@src().line` at every skip site plus the error name, run
+over the corpus, reverted) produced the whole breakdown in one pass — **and it overturned the
+scoping I had written from reading the files: two of the four cases I had classified as SCORING
+bugs turned out to be decoder and assembler gaps that rejected VALID modules.** A wrong diagnosis
+that agrees with the evidence you *chose to look at* is the expensive kind. — the 144,
+`testing.md`
+
+**A PRODUCER THAT CANNOT EXPRESS A CONSTRUCT CANNOT LET THE CONSUMER JUDGE IT.** `emitConstExpr`
+built its context without the element/data name tables, so `array.new_data $t $d` in a global
+initializer was refused by the ASSEMBLER as an unknown identifier. Neither instruction is a
+constant expression, and the spec asks for "constant expression required" — a verdict only the
+validator can give. The fix is to emit the bytes and let it. **This is the mirror of the rule
+`readBlockType` already records** ("a workaround in the producer for a gap in the consumer does not
+stay cosmetic"): each layer must be able to reach the layer that owns the verdict. — the 144,
+`known-issues.md`
+
+**WHEN A DECODER LEARNS A MULTI-BYTE FORM, GREP FOR EVERY OTHER SITE THAT READS THAT GRAMMAR.**
+`readBlockType` was taught `(ref null? ht)` = `0x63/0x64 ht`, with a comment explaining exactly why
+one byte is not enough. The `select` result vector, one function below it, kept reading a single
+byte per type — so a valid `(select (result (ref null $t)) …)` failed to decode, and the heap type
+was left in the stream. **A fix applied at one of two call sites is half a fix, and the half that
+was fixed carries the documentation that makes the other half look considered.** — the 144,
+`known-issues.md`
+
+**SPLIT WHAT THE SPEC MAKES PERMANENT, NOT WHAT TODAY'S TABLE HAPPENS TO LEAVE EMPTY.** `0xFF` is
+documented as never an instruction or prefix, so refusing it is a verdict and now has its own error
+(`IllegalOpcode`). The neighbouring unassigned ranges look identical from inside the decoder and
+are NOT the same thing: a proposal may take one, and on that day wazmrt is the incomplete party, so
+they keep the ambiguous `UnsupportedOpcode`. ⚠️ **The same restraint applied to `UnknownIdentifier`:
+only the LABEL case was split out, because a label scope is built from block nesting wazmrt fully
+controls, while the other index spaces could in principle be short a name a future parser silently
+skips.** A too-wide split banks our own gaps as conformance passes — **the one direction that
+cannot be noticed afterwards.** — the 144, `types.zig`
+
+**WHEN A HEURISTIC DECIDES HOW TO READ AN ENTIRE FILE, PICK THE DIRECTION WHOSE FAILURE IS A
+NO-OP.** §6.6.13 lets a `.wast` script drop the `(module …)` wrapper when it is a single module.
+The obvious trigger — "the first form is not a command keyword" — would let any future command this
+runner does not know reinterpret its whole script as one bogus module, turning a file of assertions
+into a single malformed-module failure. Requiring EVERY top-level form to be a module field fails
+the other way: an unrecognised form leaves the script on the ordinary path and stays the skip it
+already was. — the 144, `wast.zig`
+
 ## 5. Recording what you found
 
 **"Update the project memory" means AUDIT for stale live claims, not edit the files you happened to

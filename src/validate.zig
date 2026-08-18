@@ -1283,11 +1283,20 @@ const FuncValidator = struct {
                 // operands must match it.
                 const tys = instr.imm.select_types;
                 if (tys.len != 1) return error.TypeMismatch; // invalid result arity
+                // A multi-byte `(ref null? ht)` is resolved HERE, where the module is in hand —
+                // the decoder cannot pick a concrete index's family head. This is also what makes
+                // `(select (result (ref 1)))` in a module with no such type report the "unknown
+                // type" the spec asks for (`refHead` → `IndexOutOfRange`) instead of dying in the
+                // decoder as an unsupported opcode.
+                const st: V = switch (tys[0]) {
+                    .value => |v| v,
+                    .ref => |rt| try refTypeValType(self.module, rt),
+                };
                 _ = try self.popExpect(.i32);
-                _ = try self.popExpect(tys[0]);
-                _ = try self.popExpect(tys[0]);
-                if (self.widths) |w| w[self.pc] = if (tys[0] == .v128) 2 else 1;
-                try self.pushValT(tys[0]);
+                _ = try self.popExpect(st);
+                _ = try self.popExpect(st);
+                if (self.widths) |w| w[self.pc] = if (st == .v128) 2 else 1;
+                try self.pushValT(st);
             },
             .simd => {
                 // A memory-touching `0xFD` op needs a memory to exist, and its

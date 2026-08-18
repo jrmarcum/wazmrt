@@ -257,8 +257,10 @@ fn immIsExact(imm: opcode.Imm) bool {
             .value => |v| v.isExact(),
             .empty, .type_index => false,
         },
+        // Only the MULTI-BYTE arm can carry `exact`: a single-byte valtype names an abstract
+        // head or a number, and there is no concrete type for "exactly this" to bind to.
         .select_types => |ts| blk: {
-            for (ts) |t| if (t.isExact()) break :blk true;
+            for (ts) |t| if (t == .ref and t.ref.exact) break :blk true;
             break :blk false;
         },
         else => false,

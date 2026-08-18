@@ -55,6 +55,12 @@ along with the other two holes in that family.
 
 The legacy exception-handling `delegate` instruction is refused everywhere rather than executed.
 
+📊 **ITS COST, MEASURED 2026-08-18: 25 of the corpus's 134 remaining skips** — `legacy/try_delegate.wast`
+(24) and `legacy/rethrow.wast` (1). The entry stood for a day without a number, which is precisely
+what makes "what is left to fix" get re-derived: **a Standing Delta that does not quantify itself
+still costs a re-investigation to price.** Give every one of them a measured cost alongside its
+reopen condition.
+
 **Why it stays open:** it is a **deliberate refusal, not a gap.** `delegate` is legacy EH, the
 proposal that replaced it (`try_table`) is fully implemented, and **there is no oracle** — nothing to
 check a routing implementation against, since the corpus files that use it are themselves legacy. A
