@@ -160,7 +160,7 @@ needed a *toolchain* DLL (`libunwind.dll`) while every dev-box test passed, and 
   target list of its own date. ~~"what remains is … out-of-scope `.wast` module-linking harness
   commands"~~ — `module definition` / `module instance` were implemented 2026-08-13 (R2) and are
   what the cross-instance descriptor tests depend on.
-  **What genuinely remains: the three STANDING DELTAS** (see `known-issues.md`), and nothing else
+  **What genuinely remains: the three STANDING DELTAS** (see `known-issues.md` — ⚠️ **SD-3`s reopen condition turns out to be already met**, so it is an owner decision now rather than a limitation; scoped as roadmap **Track L**), and nothing else
   in the corpus — Track F closed 2026-08-18, and the last 144 skips are down to **25, all of them
   SD-3's legacy `try`/`delegate`/`rethrow`**. ⚠️ *(This line previously named "Track F's remainder";
   Track F is complete.)*

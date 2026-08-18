@@ -51,32 +51,59 @@ handling: a large, error-prone, Windows-specific lift out of all proportion to `
 **Reopens when:** Zig implements `Dir.hardLink` on Windows — so **recheck on every Zig upgrade**,
 along with the other two holes in that family.
 
-### SD-3 — runtime `delegate` routing is deliberately unimplemented
+### SD-3 — runtime `delegate` routing is unimplemented ⚠️ **REOPEN CONDITION MET 2026-08-18**
 
 The legacy exception-handling `delegate` instruction is refused everywhere rather than executed.
 
-📊 **ITS COST, MEASURED 2026-08-18: 25 of the corpus's 134 remaining skips** — `legacy/try_delegate.wast`
+📊 **ITS COST, MEASURED 2026-08-18: **ALL 25** of the corpus`s remaining skips — the only cause left** — `legacy/try_delegate.wast`
 (24) and `legacy/rethrow.wast` (1). The entry stood for a day without a number, which is precisely
 what makes "what is left to fix" get re-derived: **a Standing Delta that does not quantify itself
 still costs a re-investigation to price.** Give every one of them a measured cost alongside its
 reopen condition.
 
-**Why it stays open:** it is a **deliberate refusal, not a gap.** `delegate` is legacy EH, the
-proposal that replaced it (`try_table`) is fully implemented, and **there is no oracle** — nothing to
-check a routing implementation against, since the corpus files that use it are themselves legacy. A
-refusal is honest; a guessed implementation would be a wrong answer wearing a feature's clothes.
-⚠️ Note this is why `legacy/try_delegate.wast` refuses to build, which is CORRECT behaviour and must
-not be "fixed" by relaxing the refusal.
-**Reopens when:** an oracle appears — a reference implementation whose `delegate` routing we can
-differentially check against — or a real guest needs it.
+🚨 **ITS REOPEN CONDITION IS ALREADY MET — FOUND 2026-08-18, AND THE ENTRY HAD NOT NOTICED.**
+The condition read *"an oracle appears — a reference implementation whose `delegate` routing we can
+differentially check against."* **wabt's interpreter is one, and it is IN THIS TREE**:
+`wabt-ts/upstream/src/interp/interp.cc` (the unwind) and `binary-reader-interp.cc` (the label
+resolution). wabt is the WebAssembly Binary Toolkit — the canonical tooling for exactly the legacy
+encoding wasmtime and V8 dropped, which is *why* it still implements it.
+
+🎓 **THE LESSON, AND IT IS ABOUT THE DEVICE ITSELF: A REOPEN CONDITION IS NOT SELF-CHECKING.**
+This file's own rule says an entry that loses its reopen condition "has become an excuse" — but an
+entry that *keeps* one and is never re-tested against it is the same thing more slowly. The
+condition was written on 2026-08-17 and was false the day it was written; the oracle was a sibling
+directory away the whole time. **Re-test every Standing Delta's condition when you price it, not
+when you remember to** — pricing SD-3 (the 25 skips above) is what finally prompted the look.
+
+**The routing rule, now pinned rather than guessed** (`GetNearestTryLabel(depth + 1)` +
+`delegate_handler_index`): `delegate d` resumes the handler search at label depth `d + 1` — one
+outside the delegating try itself — and scans OUTWARD for the nearest enclosing **legacy `try`**,
+skipping blocks and loops. If none remains, the exception goes to the caller. That is eight lines
+of specification, and it accounts for every case in `try_delegate.wast`, including
+`delegate-to-block` (the intervening `block` is skipped because it is not a try) and
+`delegate-to-caller-trivial`.
+
+**What was true, and still is:** `delegate` is legacy EH; `try_table` replaced it and is fully
+implemented; a *guessed* implementation would be a wrong answer wearing a feature's clothes. What
+changed is only that it no longer has to be guessed.
+
+⚠️ **Whether to close it is an OWNER DECISION, not a conformance-pass side effect** — the same
+standing `anyfunc` has in this file. Reversing a deliberate refusal is a scope change: it adds an
+instruction wazmrt can mis-route, in exchange for 25 skips and one legacy encoding. The scope of
+the work is written up in `roadmap.md`; **this entry stays open until that decision is made**, and
+its "why" is now "the owner has not chosen to", which is honest, rather than "we cannot", which is
+no longer true.
 
 ### Not a Standing Delta, and the distinction matters
 
-- **The 2 conformance failures** (`exact-func-import.wast`, `exact.wast`) are **baseline group 4**:
-  wazmrt defects, diagnosed, cheap, and *ours to fix*. They are debts, not deltas.
 - **`annotations.wast`** (runner error) is an untargeted proposal — baseline group 1. It closes the
-  moment custom-annotations is targeted, so it has an owner: us, later.
+  moment custom-annotations is targeted, so it has an owner: us, later. It is the ONLY baseline
+  entry left.
 - **Out-of-scope `.wast` harness command forms** are neither: not a bug, not in scope, no delta.
+- ⚠️ *(CORRECTED 2026-08-18: this list also named "the 2 conformance failures
+  (`exact-func-import.wast`, `exact.wast`), baseline group 4". **Both were fixed on 2026-08-17 and
+  the corpus has had zero failures since.** The distinction they illustrated — a debt is not a
+  delta — is why the bullet is corrected here rather than deleted.)*
 
 ---
 
@@ -101,6 +128,13 @@ by its first-failure text:
   refs and descriptors), `wide-arithmetic` (2: `UnknownInstr`), `legacy/try_delegate` (1:
   `UnsupportedInstr` — `delegate` is *deliberately* refused because nothing routes it). **Refusing to
   build a module you do not implement is the correct behaviour; no action.**
+  > ⚠️ **STALE 2026-08-18 — TWO of the three named here are now IMPLEMENTED**: custom-descriptors
+  > (Track D, 2026-08-17) and wide-arithmetic (2026-08-18). **Only `legacy/try_delegate` is still
+  > refused**, and it is the one entry here that was never a scope question — it is SD-3, a
+  > deliberate refusal. Left in place because the classification method is what this section is
+  > for; the list is a 2026-08-11 snapshot. 🎓 **"By design" ages badly by definition** — every
+  > line of it is a statement about scope on one date, so a by-design list needs its date read
+  > as loudly as its contents.
 - **62 are DEFECTS.** They are listed below in priority order.
 
 ⚠️ **The pattern that matters: every HIGH item is wazmrt being TOO PERMISSIVE, not too strict.** The

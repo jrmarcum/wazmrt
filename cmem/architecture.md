@@ -81,7 +81,7 @@ the whole pipeline and **runs the official spec testsuite** (`wazmrt <file.wast>
 | `Reader.zig` | Allocation-free cursor (file-as-`@This()` struct): `readByte`/`readBytes`/`readU32Le`, spec-correct unsigned + signed LEB (`readVarU32`/`readVarI32`/`readVarI64` reject over-long / integer-too-large), `skipLeb`, float-bit reads. Bounds-checked. |
 | `Module.zig` | `decode(gpa, bytes) → Module`; arena-owned; `FuncType`/`Limits`/`TableType`/`MemoryType`/`GlobalType`/`Extern`, `Import`/`Export` (resolved `Extern`), `Local`/`Code`, `func_types`/`functions`/`code`/`globals`/`memories`/`data`/`sections`; `funcType`/`importedFuncCount`/`section` helpers. **GC/custom-descriptors type-section state, all parallel to `comp_types`:** `supertypes`, `type_finals`, `descriptors`/`describes` (the `0x4d`/`0x4c` links, read via `descriptorOf`/`describesOf`), `rec_start`/`rec_len`, and `canon` from `canonicalizeTypes`. 🔒 **Type identity is decided in THREE places and every one of them must fold in the same fields** — `Module.canonicalizeTypes` (module-local), `interp.groupKey` (store-wide), `typematch.eqMember` (cross-module/import). A field added to one and missed in the others is a silent wrong answer, which is what D2 found for the descriptor links. |
 | `opcode.zig` | The shared instruction authority: `Op` enum (core-MVP 0x00–0xC4 + `table.get`/`.set` 0x25/26 + reference types 0xD0–D2 + `0xFC` table ops via internal tags/`fcSubOpcode`), `Imm`/`Instr`, `immediateKind`, `decodeBody`. 🔑 **`Op` is `enum(u16)` (widened by D4) and every internal tag added from D4 onward lives ABOVE `0xff`** (`0x100`+), so `@enumFromInt(b0)` on a wire byte can never name one. Pre-widening tags (`0x16`/`0x17`, `0xc5..0xcf`, `0xd7..0xfa`) keep their byte values because `immediateKind`/`simpleSig` switch on those literals — they are still covered by `decodeBody`'s raw-byte guard, which is now **FROZEN**: it lists exactly those and nothing added later can need an entry. That guard has been wrong three times (R3, R10, and a fourth arm D3 added then removed once an inversion showed it redundant), which is why the class is now closed by construction instead of by enumeration. **Never add a tag below `0x100`.** `opcode.wireByte(op) ?u8` is how the emitters ask for a one-byte encoding — a checked question rather than a truncating `@intFromEnum`. |
-| `validate.zig` | `validate(gpa, module)`: spec Appendix type-check over the IR (value + control-frame stacks) + module-level const-expr / element / select / alignment / memory-presence checks. |
+| `validate.zig` | `validateWith(gpa, module, era)`: spec Appendix type-check over the IR (value + control-frame stacks) + module-level const-expr / element / select / alignment / memory-presence checks — **and the per-proposal gate, which lives INSIDE it (Track F, 2026-08-18) so one call decides which proposals may appear *and* which typing rules apply to them.** `validate(gpa, module)` is this with the all-features default, which short-circuits the gate entirely. |
 | `interp.zig` | `Instance` (init/deinit/invoke), the switch interpreter (`Frame`, `execNumeric`/`execFloat`/`execMemory`), `Value` (u64) helpers. |
 | `sexpr.zig` / `wat.zig` / `wast.zig` | Text toolchain: S-expression parser / WAT-text assembler / WAST script runner (runs the spec testsuite). |
 | `wasi.zig` | WASI preview 1 (`wasi_snapshot_preview1`) as native `HostFunc`s over the interpreter's memory (no interp changes): stdio, args/environ, clocks, `poll_oneoff`, random, `proc_exit`, and the **sandboxed filesystem** — `--dir` preopens, a host-fd table, and the security-critical **handle-stack path resolver** `walkFull` that follows symlinks while keeping escape impossible by construction (see `cmem/security-model.md`). The CLI wires it for `_start` command modules. |
@@ -161,9 +161,16 @@ concentrated every C-ABI audit finding this project has ever had.
   context its own engine; they share nothing.
 - **All five resource ceilings are enforced** (memory, table elements, GC objects, exception boxes,
   call depth), re-checked by the interpreter at run time rather than only at instantiation.
-- **Per-proposal gating is real** (`src/features.zig`): a disabled proposal makes a module INVALID at
-  `wazmrt_module_new` *and* `wazmrt_module_validate`. Gating inspects types as well as code, because a
-  module can need a proposal without executing one of its instructions.
+- **Per-proposal gating is real** (`src/features.zig`, 19 proposals): a disabled proposal makes a
+  module INVALID at `wazmrt_module_new` *and* `wazmrt_module_validate`, **and on the CLI via
+  `--features` (Track F)**. Gating inspects types as well as code, because a module can need a
+  proposal without executing one of its instructions — and since Track F it also inspects the
+  TYPE SECTION (custom-descriptors' `(exact $t)` / `(descriptor $d)` / `(describes $s)` formers)
+  and the exactness carried in instruction immediates.
+  🔑 **The gate lives inside `validate.validateWith`, not beside its callers.** It used to sit
+  outside, and that cost more than a missing gate on some future entry point: `capi.zig` gated
+  with the embedder's set and then validated with ALL features, so a restricted set chose which
+  proposals were admissible while the all-features rules chose what they MEANT.
 - **Deliberately absent, and additive later without moving `WAZMRT_ABI_VERSION`:** tables, multi-value
   returns, host-side imported memories/tables. No surveyed consumer needs them and an unused symbol is
   pure size. `wazmrt_caller_get_memory` exists but always returns false — a durable memory handle must

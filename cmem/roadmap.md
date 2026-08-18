@@ -1207,7 +1207,7 @@ compatibility, at a fraction of the footprint, faster on anything not precompile
 > section.** F1r, F5-CLI and F5 shipped, and the track found TWO GATES THAT DID NOT EXIST on the
 > way: `custom_descriptors` was knowingly partial (instructions gated, its three type-level
 > formers not), and **`custom_page_sizes` had no `Feature` member at all** — Track P landed the
-> proposal and nothing could refuse it. Read the Track F entry below.
+> proposal and nothing could refuse it. Read the Track F entry below. *(The corpus then went to **63,846 passed / 0 failed / 25 skipped** as well — the skip-closing pass and wide-arithmetic followed the same day. All that is left is **Track L**, scoped further down: one instruction, and an owner decision before any of it.)*
 >
 > ⚠️ **The recommended order was F → P → D and the work went P → D → (F).** That was the owner's
 > call and it cost nothing, because the premise for "F first" turned out to be false: F's security
@@ -1483,6 +1483,102 @@ instructive part — including the two that were already stale in F's favour whe
 ⚠️ **Every enforcement arm needs an inversion test** — comment the check out, watch a test fail,
 restore. **And assert the BUILD SUCCEEDED before reading an inversion's silence**: two of R9's eight
 inversions reported no failing test because commenting the check out left a Zig parameter unused.
+
+### 🎯 Track L — legacy `delegate`. **SCOPED 2026-08-18. THE LAST 25 SKIPS, AND AN OWNER DECISION FIRST**
+
+> ⚠️ **DO NOT START THIS WITHOUT THE OWNER'S CALL.** It reverses a Standing Delta (SD-3), and this
+> repo's own precedent is explicit: *"reversing it is an owner decision, not a conformance-pass side
+> effect"* (`anyfunc`, R9). The work below is scoped so the decision can be priced, not so it can be
+> started quietly.
+
+**The whole of the corpus's remaining 25 skips is ONE instruction.** Legacy `try` / `catch` /
+`catch_all` / `rethrow` are fully implemented and pass — `legacy/rethrow.wast` is 14 passed / 0
+failed / 1 skipped. Only `delegate` is refused, and:
+
+| file | passed | skipped | why |
+| --- | --- | --- | --- |
+| `legacy/try_delegate.wast` | 2 | **24** | its ONE module uses `delegate` → won't build → 20 assertions cascade to `NoTarget`, 3 negatives unjudgeable |
+| `legacy/rethrow.wast` | 14 | **1** | one `assert_invalid` whose module contains a `delegate` |
+
+🔑 **23 of the 24 are a cascade off a single unbuildable module** — the same shape wide-arithmetic
+had. Judge the size by the MODULE count (one), not the skip count.
+
+#### The premise changed: there IS an oracle, and it is in this tree
+
+SD-3's stated reason was "no reference implementation to check the label arithmetic against". **wabt
+implements it** — `wabt-ts/upstream/src/interp/interp.cc` (unwind) and `binary-reader-interp.cc`
+(resolution) — and wabt is the canonical tooling for precisely the legacy encoding wasmtime and V8
+dropped. The rule, read off it rather than inferred:
+
+> `delegate d` resumes the handler search at label depth **`d + 1`** — one outside the delegating
+> try itself — and scans OUTWARD for the nearest enclosing **legacy `try`**, skipping blocks and
+> loops. If none remains, the exception propagates to the caller.
+
+That accounts for every case in the file, including `delegate-to-block` (the intervening `block` is
+skipped because it is not a try) and `delegate-to-caller-trivial` (no enclosing try → caller).
+
+#### The work, by layer. Three of the four already exist in part.
+
+- **L1 — assembler (`wat.zig`, ~2321).** One `return error.UnsupportedInstr` to remove, plus emitting
+  `Op.delegate` with the resolved label. **The label machinery is already shared** — the doc comment
+  at the legacy-`try` parser says a `$label`/`rethrow`/`delegate` operand already resolves against
+  the same depth stack. Must also accept the FLAT form (`try_ bt … delegate l`, where `delegate`
+  replaces `end`), which the parser already anticipates.
+  ⚠️ **Four `assert_malformed`s constrain the grammar and are cheap to satisfy but easy to miss**:
+  a bare `(delegate 0)` with no try, a `delegate` *after* a `catch` or `catch_all`, and `(delegate)`
+  with no operand must all be malformed.
+- **L2 — validator (`validate.zig`, ~1109).** Replace the `return error.UnsupportedOpcode` with the
+  real rule: `delegate` CLOSES the try in place of `end`, and its label must resolve **in the scope
+  outside the try** (the `+1`). `try_delegate.wast` pins the boundary: `(func (try (do)
+  (delegate 1)))` is `assert_invalid` "unknown label", because depth 0 is the function level and
+  there is nothing beyond it.
+- **L3 — interpreter (`interp.zig`) — THE ONLY REAL WORK.** The plumbing already exists:
+  `precomputeControlFlow` records `LegacyTry.delegate: ?u32` per try (~2254), and `throwException`
+  currently bails on it (`if (lt.delegate != null) return error.UnsupportedInstruction`, ~2515).
+  What is missing is the outward scan above.
+  ⚠️ **wabt's shape is NOT wazmrt's and must not be transliterated.** wabt keeps a flat handler
+  vector with byte offsets and jumps by index (`handlers.rend() - delegate_handler_index - 1`);
+  wazmrt walks a control-label stack. **Port the RULE, not the loop** — the same caution R2's
+  entity model needed.
+  🔒 **Keep the unvalidated-run-path defence.** The current bail is also the guard that stops a
+  hand-crafted binary from mis-routing; whatever replaces it must trap loudly on an out-of-range
+  delegate depth rather than index off the end of the label stack, exactly as the `hardening` tests
+  require elsewhere.
+- **L4 — tests.** The corpus's **20 positive assertions are the behavioural oracle** and are the
+  point of the exercise: `delegate-skip` (a middle handler must NOT run), `delegate-to-block`,
+  `delegate-to-catch`, `delegate-to-caller-{trivial,skipping}`, `delegate-merge`. ⚠️ **Add a
+  by-construction wrong-answer test anyway**: an off-by-one in the `+1` still catches *an*
+  exception, just the wrong handler's — a wrong answer that every arity and type check accepts, the
+  same shape as D1's exactness bug and wide-arithmetic's `(lo, hi)`. Nest three trys with
+  distinguishable results so each possible off-by-one produces a different number.
+  🆕 **And a differential run against wabt is now possible** — that is what the oracle buys, and it
+  is worth more than the 25.
+- **L5 — the record.** Inverting the two existing tests that assert the REFUSAL (`validate.zig`'s
+  "validator rejects legacy try/delegate", and the assembler's) — they are correct today and must be
+  replaced, not deleted, with tests for the new behaviour. And SD-3 itself has to be retired.
+
+**Cost:** small — one instruction, machinery in place, ~8 lines of specification. **Size:** expect
+under 1 KB; no new types, no new sections, one interpreter loop.
+
+#### The argument AGAINST doing it, stated fairly
+
+- It adds an instruction wazmrt can **mis-route**, in exchange for a legacy encoding the two largest
+  runtimes have dropped. A refusal cannot produce a wrong answer; a routing bug can — and the
+  failure mode is "the wrong `catch` runs", which is silent.
+- No real guest has asked for it. Every toolchain still emitting legacy EH is old LLVM.
+- 🔑 **The 25 are not evidence for doing it.** They are the *price* of the refusal, and the whole
+  point of naming a Standing Delta is that a skip count is not by itself an argument. **Conformance
+  numbers are the reason to be honest about the cost, not the reason to change the decision.**
+
+#### The argument FOR
+
+- The premise the refusal was written on is no longer true: the arithmetic can be checked.
+- wazmrt already implements the *hard* parts of legacy EH (`try`/`catch`/`catch_all`/`rethrow` all
+  execute correctly). `delegate` is the last member of a family that is otherwise complete — and a
+  proposal implemented "except one instruction" is the shape this repo has been bitten by three
+  times (memory64/table64, `return_call_ref`, GC-P3's six array ops).
+- It would take the corpus to **zero skips as well as zero failures**, which no baseline entry
+  except `annotations.wast` would then remain against.
 
 ### ✅ Track P — custom-page-sizes. **SHIPPED 2026-08-17; its GATE landed 2026-08-18 (Track F)**
 

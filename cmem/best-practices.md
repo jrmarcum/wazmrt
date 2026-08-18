@@ -663,6 +663,25 @@ repairing it — but it means the helper's dependent-switch is part of `Set.inco
 **Whenever `incoherent` gains a pair, grep for the helpers that construct partial sets.** —
 wide-arithmetic, `capi.zig`
 
+**A REOPEN CONDITION IS NOT SELF-CHECKING — RE-TEST IT WHEN YOU PRICE THE ENTRY.** This project
+already requires every Standing Delta to carry the condition that would reopen it, on the grounds
+that "an entry that loses it has become an excuse". SD-3's condition read *"an oracle appears — a
+reference implementation whose `delegate` routing we can differentially check against"*. **It was
+false the day it was written**: wabt's interpreter implements exactly that routing and lives one
+sibling directory away, and wabt is the canonical tooling for precisely the legacy encoding
+wasmtime and V8 dropped — which is *why* it still has it. The look only happened because the entry
+was being given a measured cost. ⚠️ **An entry that keeps its condition and is never re-tested
+against it is an excuse more slowly.** Price a delta and re-test its condition in the same pass;
+"we cannot" and "we have chosen not to" are different claims and only one of them ages. — SD-3,
+`known-issues.md`
+
+**"BY DESIGN" AGES BADLY BY DEFINITION.** A by-design list is a statement about SCOPE on one date,
+so every line of it expires the moment the scope moves. `known-issues.md`'s 2026-08-11 triage named
+three untargeted proposals; two of the three shipped within a week, leaving a list that reads as
+current and is two-thirds wrong. **Date a by-design list as loudly as its contents, and re-read it
+whenever a track closes** — it is the section most likely to be stale and least likely to be
+checked, because nothing about it fails a build. — the 2026-08-18 audit, `known-issues.md`
+
 ## 5. Recording what you found
 
 **"Update the project memory" means AUDIT for stale live claims, not edit the files you happened to
