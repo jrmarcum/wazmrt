@@ -16,10 +16,10 @@ and revised without wading through one giant file. Keep files small and single-t
 | gate | value | note |
 | --- | --- | --- |
 | conformance | **284 files · 63,934 passed · 0 failed · 0 skipped · 0 unrun** | baseline file is **EMPTY** |
-| unit tests | **764/764** | from an NTFS cwd; a `D:` cwd loses 4 to exFAT symlinks |
-| `test-safe` | 764/764 | ReleaseSafe — optimized, safety checks KEPT |
+| unit tests | **765/765** | from an NTFS cwd; a `D:` cwd loses 4 to exFAT symlinks |
+| `test-safe` | 765/765 | ReleaseSafe — optimized, safety checks KEPT |
 | `test-security` | 3/3 | from an NTFS cwd |
-| **`test-shipped`** | **764/764** | 🆕 Track H — **ReleaseSmall, the config that SHIPS** (checks off) |
+| **`test-shipped`** | **765/765** | 🆕 Track H — **ReleaseSmall, the config that SHIPS** (checks off) |
 | `features` | green | all four `-Dwat`/`-Dwasi` combinations |
 | size (ReleaseSmall) | exe **991,744** · lib **1,053,908** · dll **900,608** | all three EXACT; both Track H moves cost the **dll 0 bytes** |
 
@@ -77,7 +77,7 @@ one site of two read a different variable. *"Three of the four do X"*, for the f
 ceiling had NO test at all before this.**
 
 📊 **Final gates:** conformance 284 files · 63,934 · 0 · 0 · 0 (baseline still EMPTY) · `test`
-**764/764** in Debug, ReleaseSafe **and ReleaseSmall** · `test-security` 3/3 · `features` + `capi-smoke`
+**765/765** in Debug, ReleaseSafe **and ReleaseSmall** · `test-security` 3/3 · `features` + `capi-smoke`
 green · size exe **991,744** / lib **1,053,908** / dll **900,608**, all EXACT. **Both size moves in this
 track cost the DLL — the artifact embedders link — ZERO bytes.**
 

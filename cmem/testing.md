@@ -87,9 +87,9 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
 | gate | result |
 | --- | --- |
 | conformance | **284 files · 63,934 passed · 0 failed · 0 skipped · 0 file-errors** (baseline still EMPTY) |
-| `test` (Debug) | **764/764** (was 758 — +4 iteration budget, +1 GC ceiling, +1 refill) |
-| `test-safe` (ReleaseSafe) | 764/764 |
-| **`test-shipped` (ReleaseSmall — the config that ships)** | 764/764 |
+| `test` (Debug) | **765/765** — was 758. **+4** iteration budget (2 tests, and `interp.zig`'s tests run in *both* the module and capi binaries), **+2** GC ceiling (1 test × 2), **+1** misplaced-flag warning (CLI binary only) |
+| `test-safe` (ReleaseSafe) | 765/765 |
+| **`test-shipped` (ReleaseSmall — the config that ships)** | 765/765 |
 | `test-security` | 3/3 from an NTFS cwd |
 | `features` · `capi-smoke` | green |
 | size (ReleaseSmall) | exe **991,744** · lib **1,053,908** · dll **900,608** — all three EXACT |

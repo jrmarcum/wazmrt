@@ -45,6 +45,7 @@ test; now make it hold up against things we do not test."*
 | **H4** — re-measure the baselines | ✅ size **and** speed, so Track O is unblocked |
 | **H5** — fuzz coverage | ✅ **execution is fuzzed for the first time**, inversion-proven |
 | **H6** — SD-2 reopen condition | ✅ re-tested at the source; stays open |
+| **H7** — misplaced-flag warning | ✅ **added AFTER the track shipped** — found by cross-coordination; fail-open flags now warn; **zero bytes** |
 
 🎓 **THE TRACK'S LESSON, and it is not about any one bug: the two most valuable findings were holes in
 the GATE SET, not in the code.** The corpus had never run in the config that ships, and the
@@ -92,6 +93,56 @@ how the two should be tied together.
 correct when written and false for as long as it took to read it again. **The note that explains a
 refusal is the thing to re-read when the limitation is lifted** — nothing else points at it.
 
+
+##### ✅ H7 — a MISPLACED wazmrt flag is no longer silent (found by cross-coordination, 2026-08-19)
+
+**Track H was already committed when the sibling's annex found this**, and it is the clearest argument
+for the coordination cadence existing at all: **nothing in wazmrt's own gate set was ever going to
+report it.** Every suite passed, the corpus passed, the sizes were EXACT — and a flag the user typed
+was being thrown away without a word.
+
+**The defect.** wazmrt flags are recognised only in the **leading run** after the module path
+(`flagRegion`). That protection is deliberate and correct: it exists so a guest's own `--no-verify` can
+never be mistaken for the host's. ⚠️ **The inverse direction had never been considered.** A flag placed
+after the first non-flag argument is handed to the guest as argv and **never applies**, silently:
+
+```
+wazmrt spin.wat guestarg --max-iterations 1000
+  → ran under the DEFAULT 1<<30 budget. No error, no warning.
+```
+
+**It splits by flag, and that split is why it needed fixing rather than documenting:**
+
+| misplaced | consequence | direction |
+| --- | --- | --- |
+| `--no-verify`, `--yes` | verification stays ON | ✅ fail-closed — the case the design was built for |
+| `--dir`, `--ro-dir` | no preopen; guest gets `BADF` everywhere | ✅ fail-closed, but reads as a guest bug |
+| `--max-iterations`, `--max-memory`, `--max-table-elems` | the **default (higher)** ceiling applies | ⚠️ **fail-OPEN** |
+| `--verify`, `--pins` | runs under the **default** policy, not the stricter one requested | ⚠️ **fail-OPEN** |
+
+The last two rows are a user hardening an untrusted workload who asks for a restriction, gets no error,
+and runs without it. It also contradicts a rule already written in `interop.md` §3.5: *"an override
+that would have blocked prints a warning — never silently unverified."*
+
+**The fix: WARN, do not refuse.** A guest may legitimately take one of these spellings as its own
+argument (`wazmrt tool.wasm build --dir src` is a plausible real command), so erroring would break valid
+invocations to catch a typo. ⚠️ **Nothing after an explicit `--` is examined** — there the user has
+*said* the rest belongs to the guest, and warning would punish the correct spelling.
+
+🔒 **One flag list, hoisted to file scope**, shared by `flagRegion` and `warnMisplacedFlags`. A second
+copy would drift into "parsed but never warned about", which is the same failure wearing a new hat.
+
+✅ **Inversion-tested** (disabling the warning fails the test) and the silent directions are asserted
+too — correct placement, after `--`, and look-alike guest arguments must all stay quiet. **Six
+assertions, three of them negative**, because a warning that fires on everything is as useless as one
+that never fires.
+
+📏 **Cost: ZERO bytes.** All three ceilings unchanged and still EXACT.
+
+🎓 **THE LESSON, and it is about the METHOD, not the flag: I shipped the defect myself, hours earlier.**
+`--max-iterations` was added in H3 and is the flag the demonstration uses. A hardening track audited
+the interpreter, the ceilings, the casts and the fuzzer — and did not audit **the surface it had just
+added to**. *A change's own new surface is the one place the audit that produced it will not look.*
 ##### 📊 H4 — the baselines Track O was blocked on
 
 | metric | value |

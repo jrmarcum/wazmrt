@@ -324,6 +324,30 @@ on modules that were fine. Check whether the mirror half exists before shipping 
 
 ## 4. Tests and gates
 
+**A CHANGE'S OWN NEW SURFACE IS THE ONE PLACE THE AUDIT THAT PRODUCED IT WILL NOT LOOK.** Track H
+audited the interpreter, the ceilings, every unchecked cast and the fuzzer — and shipped a CLI flag
+(`--max-iterations`) that is **silently discarded** when written after a guest argument. The defect was
+found hours later, by the *sibling project's* measurements, using the very flag the track had just
+added. ⚠️ The audit's attention follows the code it set out to review; the code it *writes on the way*
+inherits none of it. **Before closing a hardening pass, re-run its own checklist against whatever the
+pass itself added.** — Track H7, 2026-08-19
+
+**A one-directional protection has a second direction, and it is not automatically safe.** wazmrt only
+recognises host flags in the leading run after the module path, so a guest's `--no-verify` can never be
+mistaken for the host's — a real protection, deliberately built, fail-closed. **The inverse case had
+never been asked:** a *host* flag written after a guest argument is silently donated to the guest. For
+`--no-verify` that is still fail-closed; for `--verify`, `--pins` and every `--max-*` it is
+**fail-OPEN** — the user asked for a restriction, got no error, and ran without it. 🎓 **When you write
+a rule that discards input in one direction, enumerate what the same rule does to the other.**
+— Track H7, 2026-08-19
+
+**A warning that fires on everything is as useless as one that never fires — assert the SILENCE too.**
+The misplaced-flag warning has six assertions and **three are negative**: correct placement stays
+quiet, anything after an explicit `--` stays quiet (the user *said* it was the guest's), and a
+look-alike guest argument (`--verifyx`) is not ours. Without those, the natural over-fix — warn on
+anything starting with `--` — passes the positive tests and makes the tool cry wolf on every legitimate
+guest argv. — Track H7, 2026-08-19
+
 **A comment that explains a REFUSAL is the thing to re-read when the limitation is lifted — nothing
 else points at it.** `fuzz.zig` refused to fuzz execution and said exactly why: *"the interpreter has no
 instruction/fuel limit, so a fuzzed infinite loop would hang the fuzzer."* The moment H3 added the

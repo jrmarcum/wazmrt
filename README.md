@@ -203,6 +203,14 @@ environment variable visible to the guest; the guest's environment is otherwise
 empty. All preopen/`--env` flags are consumed by wazmrt; everything after `--`
 (or the first non-flag) is the guest's `argv`.
 
+**wazmrt's own flags must directly follow the module path.** Anything after the
+first non-flag argument belongs to the guest — including something that looks
+like a wazmrt flag. That rule is what stops a guest's own `--no-verify` from
+being mistaken for yours, but it cuts both ways: a flag you write too late is
+handed to the guest and does **not** apply. wazmrt now prints a warning naming
+the flag when that happens, rather than ignoring it silently. Use `--` when you
+mean to pass one of these spellings to the guest on purpose.
+
 A guest's linear memory is capped at **1 GiB** by default — a module declares its
 own memory size, and a few bytes can ask for gigabytes. Raise or lower it with
 `--max-memory <size>` (`512M`, `2G`, or a plain byte count); a module that asks

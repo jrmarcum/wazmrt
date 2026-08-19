@@ -145,6 +145,12 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
             break;
         }
     }
+    // ⚠️ Before anything is read or run: say so if a wazmrt flag was written
+    // where only the guest will see it. Placed here so it covers EVERY mode —
+    // run, WASI, `.wast` and summarize — rather than the one that happened to
+    // notice. See `warnMisplacedFlags`.
+    try warnMisplacedFlags(out, rest);
+
     var bytes: []const u8 = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 << 20)) catch |e| {
         try out.print("error: cannot read '{s}': {s}\n", .{ path, @errorName(e) });
         return exit_failure;
@@ -754,9 +760,19 @@ fn defaultPinsPath() []const u8 {
 /// searched and `--yes`/`--no-verify` anywhere in it silently disabled
 /// verification. This mirrors exactly the run `runWasi` consumes, so the two
 /// agree on where our flags stop and the guest's argv begins.
+/// Every wazmrt flag that takes a VALUE, and every one that does not.
+///
+/// 🔒 **One list, at file scope, because `warnMisplacedFlags` needs the same
+/// names `flagRegion` recognises.** A second copy would drift — *a list written
+/// out a second time is a list that will drift* is a rule this project has paid
+/// for repeatedly, and a drifted copy here would mean a flag that is parsed but
+/// never warned about, or warned about but not parsed.
+const flags_with_value = [_][]const u8{ "--dir", "--ro-dir", "--env", "--verify", "--pins", "--max-memory", "--max-table-elems", "--max-iterations" };
+const flags_bare = [_][]const u8{ "--no-verify", "--yes" };
+
 fn flagRegion(rest: []const []const u8) []const []const u8 {
-    const two = [_][]const u8{ "--dir", "--ro-dir", "--env", "--verify", "--pins", "--max-memory", "--max-table-elems", "--max-iterations" };
-    const one = [_][]const u8{ "--no-verify", "--yes" };
+    const two = flags_with_value;
+    const one = flags_bare;
     var i: usize = 0;
     outer: while (i < rest.len) {
         if (std.mem.eql(u8, rest[i], "--")) break;
@@ -787,6 +803,50 @@ fn parseSize(s: []const u8) ?usize {
     const digits = if (mult == 1) s else s[0 .. s.len - 1];
     const n = std.fmt.parseInt(usize, digits, 10) catch return null;
     return std.math.mul(usize, n, mult) catch null;
+}
+
+/// ⚠️ **Warn when a wazmrt flag was written where the GUEST will receive it.**
+///
+/// wazmrt flags are recognised only in the LEADING run after the module path
+/// (`flagRegion`), which exists so a guest's own `--no-verify` can never be
+/// mistaken for the host's. **That protection is one-directional, and the other
+/// direction is what this function covers**: a flag placed after the first
+/// non-flag argument is silently handed to the guest as argv and never applies.
+///
+/// 🔒 **Found by cross-project coordination, 2026-08-19** (`interop.md` §2.1m
+/// F3 raised the mirror case in wasmrt). The split by flag is what makes it
+/// worth a warning rather than a note:
+///
+///   - `--no-verify` / `--yes` dropped ⇒ verification stays ON — **fail-closed**,
+///     and precisely the case `flagRegion` was built for.
+///   - `--dir` / `--ro-dir` dropped ⇒ no preopen — fail-closed, but the guest
+///     just gets `BADF` everywhere, which reads as a guest bug.
+///   - ⚠️ **`--verify` / `--pins` / `--max-*` dropped ⇒ the DEFAULT applies.**
+///     A user hardening an untrusted workload asked for a restriction, got no
+///     error, and ran without it. **That direction is fail-OPEN**, and it is why
+///     this is a warning and not a comment.
+///
+/// **Warn, do not refuse.** A guest may legitimately take one of these spellings
+/// as its own argument (`wazmrt tool.wasm build --dir src` is a plausible real
+/// command), so erroring would break valid invocations to catch a typo. ⚠️
+/// Nothing after an explicit `--` is examined: there the user has *said* the rest
+/// belongs to the guest, and warning would punish the correct spelling.
+fn warnMisplacedFlags(out: *Io.Writer, rest: []const []const u8) !void {
+    const guest = rest[flagRegion(rest).len..];
+    for (guest) |a| {
+        if (std.mem.eql(u8, a, "--")) break; // explicit hand-off; the user meant it
+        const known = for (flags_with_value) |f| {
+            if (std.mem.eql(u8, a, f)) break true;
+        } else for (flags_bare) |f| {
+            if (std.mem.eql(u8, a, f)) break true;
+        } else false;
+        if (!known) continue;
+        try out.print(
+            "warning: '{s}' came after a non-flag argument, so it was passed to the GUEST and did NOT apply\n" ++
+                "  wazmrt flags must directly follow the module path; use '--' to pass one to the guest on purpose\n",
+            .{a},
+        );
+    }
 }
 
 fn hasFlag(rest: []const []const u8, name: []const u8) bool {
@@ -1457,4 +1517,60 @@ test "--features: a seed is POSITIONAL — only the first item can replace the s
     // refused, so the intent has to be stated once and at the front.
     try parseFails("mvp,gc,all");
     try parseFails("simd,mvp");
+}
+
+/// `warnMisplacedFlags` against a throwaway writer; returns what it printed.
+fn misplacedWarnings(rest: []const []const u8) ![]const u8 {
+    const S = struct {
+        var buf: [2048]u8 = undefined;
+    };
+    var w: Io.Writer = .fixed(&S.buf);
+    try warnMisplacedFlags(&w, rest);
+    return w.buffered();
+}
+
+test "a wazmrt flag written where only the GUEST sees it is warned about" {
+    // 🔒 **Found by cross-project coordination, 2026-08-19** (`interop.md` §2.1m
+    // F3 raised the mirror case in wasmrt). wazmrt flags are recognised only in
+    // the LEADING run after the module path — a protection built so a guest's own
+    // `--no-verify` is never mistaken for the host's. **The inverse was never
+    // considered:** a flag placed after the first non-flag argument is handed to
+    // the guest and never applies, and for `--verify` / `--pins` / `--max-*` that
+    // direction is **fail-OPEN** — the user asked for a restriction, got no error,
+    // and ran without it.
+    //
+    // ⚠️ Demonstrated with `--max-iterations`, a flag added earlier the same day:
+    // `wazmrt spin.wat guestarg --max-iterations 1000` ran under the DEFAULT
+    // 1<<30 budget and said nothing.
+
+    // The reported case: a value-taking flag after a non-flag argument.
+    {
+        const w = try misplacedWarnings(&.{ "guestarg", "--max-iterations", "1000" });
+        try std.testing.expect(std.mem.indexOf(u8, w, "--max-iterations") != null);
+        try std.testing.expect(std.mem.indexOf(u8, w, "did NOT apply") != null);
+    }
+    // The fail-open security case.
+    {
+        const w = try misplacedWarnings(&.{ "guestarg", "--verify", "enforce" });
+        try std.testing.expect(std.mem.indexOf(u8, w, "--verify") != null);
+    }
+    // A bare flag counts too — `--no-verify` dropped is fail-CLOSED, but the user
+    // still asked for something they did not get, and silence is what this fixes.
+    {
+        const w = try misplacedWarnings(&.{ "guestarg", "--no-verify" });
+        try std.testing.expect(std.mem.indexOf(u8, w, "--no-verify") != null);
+    }
+
+    // ---- and the directions that must stay SILENT, which is half the point ----
+
+    // Correct placement: the flag is in the leading run, so it applies.
+    try std.testing.expectEqual(@as(usize, 0), (try misplacedWarnings(&.{ "--max-iterations", "1000", "guestarg" })).len);
+    // ⚠️ After an explicit `--` the user SAID the rest is the guest's. Warning
+    // there would punish the correct spelling for passing a flag on purpose.
+    try std.testing.expectEqual(@as(usize, 0), (try misplacedWarnings(&.{ "--", "--max-iterations", "1000" })).len);
+    try std.testing.expectEqual(@as(usize, 0), (try misplacedWarnings(&.{ "guestarg", "--", "--verify" })).len);
+    // A guest argument that merely LOOKS flag-ish is not one of ours.
+    try std.testing.expectEqual(@as(usize, 0), (try misplacedWarnings(&.{ "guestarg", "--max-iterations-ish", "--verifyx" })).len);
+    // No arguments at all.
+    try std.testing.expectEqual(@as(usize, 0), (try misplacedWarnings(&.{})).len);
 }
