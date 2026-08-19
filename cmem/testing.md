@@ -189,6 +189,45 @@ you have to remember is not a gate** — the same argument that put the CLI into
 ⚠️ **Conformance takes `-Doptimize` too**, and running the corpus in the shipped mode is cheap. It
 belongs in any pass that touches the interpreter, not only in a release.
 
+## 📊 THE NAMED-MODULE STARTUP BASELINE (2026-08-19, late) — **it SUPERSEDES H4's speed row**
+
+**H4's speed row recorded no module set, and that made it unusable as Track O's referee.** Re-measured
+with `zig build bench -- hash <files>` (ReleaseFast bench binary, one box, **4 runs**, ranges not
+medians). ⚠️ **Quote the module WITH the number** — that is the whole point of this section.
+
+| module | bytes | decode | validate Δ | instantiate Δ | cold start | dec+val share |
+| --- | --- | --- | --- | --- | --- | --- |
+| toy — what `zig build bench` emits | 70 | 0.54–0.66 µs | 0.78–1.23 µs | ~0.0 µs | **1.39–1.62 µs** | ~98% |
+| `examples/hello_compiled.zig`, ReleaseSmall | 46,796 | 26.3–27.8 µs | 707–733 µs | 304–376 µs | **1,060–1,111 µs** | **66–71%** |
+| `examples/wasi_files.zig`, Debug | 1,407,315 | 136–150 µs | 3,082–3,516 µs | 1,658–2,342 µs | **5,142–5,619 µs** | **58–69%** |
+
+*(Reproduce: `zig build-exe examples/<f>.zig -target wasm32-wasi -O <mode> -femit-bin=<f>.wasm`, then
+`zig build bench -- hash toy.wasm <f>.wasm`. `bench <path>` alone writes the 70-byte toy module.)*
+
+🔑 **H4's row was TOY-SCALE.** Its decode (0.56–0.58 µs) and decode+instantiate (1.23–2.56 µs) both sit
+inside the toy module's measured ranges; only its validate delta (0.46–0.81 µs) reproduces low. **So
+`4 336–6 772×` is wasmtime's fixed compile-and-write floor divided by ~70 bytes, and it is not an engine
+ratio.** Track 3's `20–55×` on real modules (2026-08-14) is the comparable figure. ⚠️ This is the *same*
+correction this file has carried since 2026-07-16 under "Cold-start reality check", re-learned at a
+different altitude: **the sub-µs pipeline numbers are a microbenchmark, not a script.**
+
+📏 **Noise floor on this box — Track O needs it:** run-to-run spread is **3–6%** on the 46 KB module and
+**9–13%** on the 1.4 MB one. **A sub-10% single-run delta is noise**; an optimization claiming one must
+show repeats.
+
+⚠️ **The toy module is a different SHAPE, not just a smaller one** — ~98% of its cold start is
+decode+validate versus 58–71% for a real guest, and its instantiate is ~0.0 µs versus 304–2,342 µs. **An
+optimization ranked on it is ranked on a workload with nothing to instantiate.** ⚠️ The 1.4 MB guest is
+a **Debug** build (function-heavy, unoptimized) and flatters any decode/validate lever; the 46 KB
+ReleaseSmall guest is the honest shipping shape.
+
+🔍 **What the measurement found, now Track O's lead candidate:** **every function body is decoded to IR
+2–3× and the IR is discarded in between** — `validate.zig:632`/`:682`, again at `interp.zig:1362` for
+every function at instantiate, and a third time at `features.zig:363` when gating is on. The 2026-07-16
+note in this file (*"instantiate eagerly `decodeBody`s every function even ones never called"*) is
+**still true**, and instantiate is 304–376 µs / 1.7–2.3 ms on the two real modules — invisible on the
+toy module, which is why nothing chased it. Details + the B-vs-O placement: `roadmap.md`, Track O.
+
 ## 📊 CURRENT spec-testsuite score (2026-08-17) — EVERY CORE SPEC FILE IS AT ZERO
 
 **284 files — 63,934 assertions passed / 0 FAILED / ZERO SKIPPED / ZERO unrun**, and `zig build conformance -Dbaseline=tools/conformance-baseline.txt` reports **0 regressions**. This is the number to quote;

@@ -87,6 +87,41 @@ working its T9i** (the same iteration budget) and has Track-H-equivalent ground 
 sitting still because the sibling is catching up is the cadence working, not a stall.** Track **B**
 (bug hunt, `1.0.2`) starts when the owner says both sides are level.
 
+
+### 📌 SESSION ADDENDUM — 2026-08-19, late. **No code changed. Track O's first item is now DEFINED, and H4's speed row is superseded.**
+
+A `.cwasm` question turned into a baseline audit. **Nothing in `src/` was touched**; four cmem files were.
+
+- ❌ **Ingesting wasmtime `.cwasm` is REFUSED and written down** (`design-decisions.md`) so it is not
+  re-litigated: it is not a format but wasmtime's internals on disk (Cranelift native code for one ISA +
+  version-locked private sections), and loading one breaks three invariants at once — mapping supplied
+  machine code inverts the validate/pin/sign stance, `wasm32-freestanding` cannot map W^X pages at all,
+  and "zero third-party, self-owned" ends when an unstable external layout must be tracked. It is also
+  the format **rsxtk already dropped as non-portable** (Decision 2), which is *why* the consumer regime
+  is un-precompiled `.wasm`.
+- 🔑 **H4's speed row was TOY-SCALE and is SUPERSEDED** by a named-module baseline in `testing.md`.
+  H4 re-measured startup *specifically* so Track O could price proposals against it, and recorded the
+  numbers **without the module set**; they reproduce on the 70-byte module `zig build bench` emits. So
+  **`4 336–6 772×` is wasmtime's fixed compile-and-write floor divided by ~70 bytes, not an engine
+  ratio** — Track 3's `20–55×` is the comparable figure. ⚠️ **Do not quote the H4 ratio.**
+- 📏 **New, and Track O needs it: the noise floor.** 3–6% run-to-run on the 46 KB guest, 9–13% on the
+  1.4 MB one → **a sub-10% single-run delta is noise, and a proposal claiming one must show repeats.**
+- 🔍 **Track O's lead candidate, found by the measurement, not by reading: every function body is decoded
+  to IR 2–3× and the IR is thrown away in between** (`validate.zig:632`/`:682` → `interp.zig:1362` →
+  `features.zig:363`). Instantiate is **304–376 µs / 1.7–2.3 ms** on the two real modules and ~0.0 µs on
+  the toy one — which is exactly why nobody chased it, though `testing.md` has named the symptom since
+  2026-07-16. **It stays in O, not B** (a redundancy with a memory trade-off is not a defect, and the
+  `measure → find → optimize → attack` order forbids optimizing before the bug hunt); **B-a carries a
+  pointer to it.** The pre-validated IR-cache idea is filed BELOW it — a startup lever worth 58–71% of
+  cold start that moves **zero** ns/loop-iter, blocked on trust, not effort.
+- 🎓 **The rule this cost the most to learn** (`best-practices.md`, 3 added): *a baseline that does not
+  name its corpus cannot referee anything* — and its sibling, *a single run that matches a recorded
+  number to two decimals is a coincidence you can afford to check.* The first pass of this audit claimed
+  a two-decimal match on one run; four runs moved the validate delta outside H4's range. Right in kind,
+  wrong in precision.
+
+⚠️ **The hold is UNCHANGED** — this was a review, not a track. Track **B** still starts when the owner
+says both sides are level.
 📐 **Version cadence from here — every component is a single digit** (`releasing.md`): `+0.0.1` per
 shipped track, `x.y.9` → `x.(y+1).0`, `x.9.9` → `(x+1).0.0`, and **a breaking change takes the next major
 immediately** from wherever the ladder stands. ⚠️ `abi_version` (2) is a **separate** number.

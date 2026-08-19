@@ -152,6 +152,16 @@ added to**. *A change's own new surface is the one place the audit that produced
 | steady state | **34.62 ns/loop-iter (~231 Mops/s)** |
 | cold start | **3.51 µs/run** |
 
+⛔ **SUPERSEDED 2026-08-19 (late) — THIS ROW WAS MEASURED ON A TOY-SCALE MODULE; DO NOT QUOTE THE
+RATIO.** The row names no module set, and its decode / +instantiate figures reproduce on the **70-byte**
+module `zig build bench` emits. `4 336–6 772×` is therefore **wasmtime's fixed compile-and-write floor
+divided by ~70 bytes**, not an engine ratio; Track 3's **20–55×** on real modules (2026-08-14) is the
+comparable number, and `3.51 µs` is the microbenchmark cold start this repo has warned about since
+2026-07-16, not a script's. ➡️ **Use the named-module baseline in `testing.md` ("THE NAMED-MODULE
+STARTUP BASELINE")** — 46 KB ReleaseSmall guest: cold start **1,060–1,111 µs**, 66–71% of it
+decode+validate. 🎓 *A baseline that does not name its corpus cannot referee anything* — and this one
+existed **solely** to referee Track O.
+
 ⚠️ **Read the ratio with its caveat, which the tool prints and which must travel with the number:** the
 two sides are different *shapes* — wasmtime emits native code, wazmrt a validated IR — so the ratio
 says how fast each reaches something runnable, and wasmtime pays it once then wins in a hot loop.
@@ -536,6 +546,71 @@ has not earned its complexity.**
   slowest-starting configuration proves nothing and dies on first contact with anyone who checks.
 - ⚠️ **~90% of the CLI benchmark is process spawn.** Measure the engine pipeline with spawn excluded
   (`zig build phases`), or the number is about Windows, not about wazmrt.
+
+- ✅ **RESOLVED BY MEASUREMENT 2026-08-19 — H4's baseline row was measured on a TOY-SCALE module, not on
+  anything a consumer runs.** The row recorded no module set and disagreed ~100× with Track 3's. Re-ran
+  `bench hash` **4×** on the 70-byte module `zig build bench` emits:
+
+  | | measured (4 runs) | H4's row | verdict |
+  | --- | --- | --- | --- |
+  | decode | 0.54–0.66 µs | 0.56–0.58 µs | ✅ contains it |
+  | decode+instantiate | 1.39–1.62 µs | 1.23–2.56 µs | ✅ inside |
+  | validate Δ | 0.78–1.23 µs | 0.46–0.81 µs | ◐ **overlaps only at the top** |
+
+  ⚠️ **CORRECTION to the first pass of this entry, which claimed "three of three, the first to two
+  decimals":** one run looked like an exact match and four runs do not. The validate delta reproduces
+  *above* H4's range, so the row is **toy-SCALE — not provably this exact module.** The conclusion is
+  unchanged and is the part that matters: **`4 336–6 772×` is wasmtime's fixed compile-and-write floor
+  divided by a ~70-byte module and must never be quoted as an engine ratio.** `testing.md` has carried
+  the standing correction for that range since 2026-07-16 (*"quote ~4.4 ms as a real script's cold
+  start, not 0.8 µs"*) and `bench/bench.zig:38` says it in the source. 🎓 *A single run that matches a
+  recorded number to two decimals is a coincidence you can afford to check.*
+
+  🎯 **First O item: supersede the H4 row with a NAMED module set.** Same box, ReleaseFast bench binary,
+  4 runs, ranges not medians:
+
+  | module | bytes | decode | validate Δ | instantiate Δ | cold start | dec+val share |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | toy (`bench`-emitted) | 70 | 0.54–0.66 µs | 0.78–1.23 µs | ~0.0 µs | **1.39–1.62 µs** | ~98% |
+  | `hello_compiled.zig`, ReleaseSmall | 46,796 | 26.3–27.8 µs | 707–733 µs | 304–376 µs | **1,060–1,111 µs** | **66–71%** |
+  | `wasi_files.zig`, Debug | 1,407,315 | 136–150 µs | 3,082–3,516 µs | 1,658–2,342 µs | **5,142–5,619 µs** | **58–69%** |
+
+  ⚠️ **Run-to-run spread is 3–6% on the 46 KB module and 9–13% on the 1.4 MB one**, so on this box a
+  **sub-10% single-run delta is noise** — an O proposal claiming one must show repeats. ⚠️ The 1.4 MB
+  guest is a **Debug** build (unoptimized, function-heavy), which flatters any decode/validate lever;
+  the 46 KB ReleaseSmall guest is the honest shipping shape.
+
+  🎓 **The toy module is not merely small, it is a DIFFERENT SHAPE**: ~98% of its cold start is
+  decode+validate against 58–71% for a real guest, and its instantiate is ~0.0 µs against 304–2,342 µs.
+  **An optimization ranked on it is ranked on a workload with nothing to instantiate.**
+
+- 🔍 **THE CANDIDATE THE MEASUREMENT FOUND — every function body is decoded to IR 2–3×, and the IR is
+  thrown away in between.** `validate.zig:632`/`:682` calls `opcode.decodeBody` per function;
+  `interp.zig:1362` calls it **again** for every function at instantiate; `features.zig:363` calls it a
+  **third** time when feature gating is on. The 2026-07-16 note (*"instantiate eagerly `decodeBody`s
+  every function even ones never called — a candidate lazy-decode optimization"*) is **still true**, and
+  the table above is where it shows up: instantiate is **304–376 µs / 1.7–2.3 ms** on the two real
+  modules, not the rounding error the toy module makes it look like. Two variants to price: **(a) hand
+  validate's IR to instantiate** instead of re-decoding it, and **(b) decode bodies lazily**, only for
+  functions actually called. ⭐ **This ranks ABOVE the IR cache below it**: same cost attacked with **no
+  new format, no trust boundary, no serializer bytes**, and no emitter-asymmetry hazard. ⚠️ Price the
+  memory trade — keeping validate's IR raises peak footprint, which is an H2 ceiling question as well as
+  a speed one. 🔗 **Stays in O rather than B** (considered and rejected 2026-08-19): it is a redundancy
+  with a **trade-off**, not a defect — nothing computes a wrong answer — and the ladder's order is
+  load-bearing, so moving it into B would optimize code **before** the bug hunt that may change it.
+  **B-a should carry a pointer to it**, because B-a audits the same decode paths.
+
+- ◐ **Lower-ranked candidate — a pre-validated IR cache (a wazmrt-native `.cwasm` analogue).** Serialize
+  the decoded+validated IR; load becomes mmap + fixups + instantiate. ⚠️ **It is a STARTUP lever that
+  moves ZERO ns/loop-iter** — it was raised as a run-speed idea and is not one. **Measured ceiling:
+  66–71% of cold start** on the 46 KB ReleaseSmall guest (~0.71 ms of ~1.09 ms), 58–69% on the 1.4 MB
+  Debug one — *higher than the ~35% an earlier reading of Track 3 suggested*, so the idea scores better
+  than it first did. 🔒 **Its blocker is trust, not effort** — an unvalidated IR file feeds the
+  untyped-`u64` interpreter in a build with the safety checks off, so the only honest form is
+  authenticated (`sign.zig`/`pin.zig`), and re-validating on load deletes the payoff. It is also **Track
+  B-a's emitter-asymmetry class** with output nobody eyeballs. **Ingesting wasmtime's own `.cwasm` is
+  refused outright — see `design-decisions.md`.** ⚠️ **Do not price this before the double-decode item**:
+  if (a)/(b) land, the cache's remaining ceiling shrinks, and the two overlap.
 
 **Gate:** for each accepted change, a measured before/after on the artifact(s) it targets; the full gate
 set green with counts diffed; ceilings updated with the reason recorded. **Reject anything that trades a

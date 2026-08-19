@@ -780,6 +780,32 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
     Exotic middle for the compile-to-wasm mode: emit specialized *wasm* for hot regions and let the host
     engine JIT it — very speculative.
 
+- **Native precompiled artifacts (`.cwasm`-style) — REFUSED as an INGEST format; the cache variant is a
+  Track O candidate (asked + answered 2026-08-19).** The question was raised as a *run-speed* idea, and
+  the first correction is that it is not one: a precompiled artifact buys **startup**, not throughput.
+  - ❌ **Ingesting wasmtime `.cwasm` is not on the table.** It is not a format, it is wasmtime's
+    internals on disk — an ELF of Cranelift-emitted native code for one ISA plus private sections
+    (`.wasmtime.info`/`.wasmtime.engine`/addr-map/traps), version-locked *by design* because the layout
+    is unstable internal detail. Loading one means implementing the contract that code was compiled
+    against: the `VMContext` field offsets, the builtin/libcall table, guard-page bounds checks with
+    signal/SEH trap handling, stack-probe overflow, unwind registration, wasmtime's store + GC model —
+    then chasing all of it every release. **Three invariants die on contact**: mapping supplied machine
+    code as executable inverts the validate-everything + pin/sign stance; `wasm32-freestanding`
+    self-hosting cannot map W^X pages at all; and "zero third-party, self-owned" ends the moment an
+    unstable external layout is tracked. ⚠️ It is also the format **rsxtk already dropped as
+    non-portable** (`roadmap.md`, Decision 2) — which is *why* the consumer regime is un-precompiled
+    `.wasm`.
+  - ◐ **A wazmrt-native pre-validated IR cache is buildable** — serialize the decoded+validated IR so
+    load is mmap + fixups + instantiate. It is a **Track O candidate, priced there**, and it is a
+    startup lever only: it moves **zero** ns/loop-iter. 🔒 **Its blocker is trust, not effort.** Skipping
+    validation makes the cache a trusted input, and the interpreter's untyped `u64` slots are safe only
+    *because* validation proved the types — an unvalidated IR file is a memory-safety hole in a
+    `ReleaseSmall` build with the safety checks off. Re-validating on load deletes the entire payoff, so
+    the only honest form is an **authenticated** cache, which is what `sign.zig` (Ed25519) and `pin.zig`
+    (SHA-256 content addressing) already exist to do. ⚠️ It is also the **emitter-asymmetry bug class**
+    Track B-a is already chartered for (*the parser records facts, the emitter reconstructs from a
+    SUBSET*) — with output no human ever eyeballs.
+
 - **Proposal scope (owner, 2026-07-13; GC-priority note 2026-07-13).** Track the core spec + the
   proposals that are (or are becoming) browser-standard; defer the rest until they are, mirroring wasmtk.
   - **STATUS 2026-07-27 — every in-scope proposal is now BUILT.** The dated slices below trace the

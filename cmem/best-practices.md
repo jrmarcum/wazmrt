@@ -1182,3 +1182,24 @@ docs, before adopting anything. — `design-decisions.md`, the adoption checklis
 **Prefer a hard abort to a silent stub.** Unhandled input that emits a placeholder instead of erroring
 is the worst failure mode in this codebase's taxonomy — and a disabled proposal must be rejected
 loudly, never silently ignored. — the audit trigger, `INDEX.md`
+
+**A baseline that does not name its corpus cannot referee anything.** H4 re-measured the startup
+numbers *specifically* so Track O could state every proposal as a delta against them — and recorded the
+figures without the module set. They turned out to be toy-scale, ~100× off the same metric measured on
+real modules five days earlier, and nothing in the gate set could see the difference because a number
+with no corpus attached looks exactly like a number with one. **Record the input beside the result, or
+the measurement expires the moment its author forgets what they ran.** — Track O, `testing.md`
+
+**A single run that matches a recorded number to two decimals is a coincidence you can afford to
+check.** One `bench hash` pass reproduced H4's decode figure exactly and the conclusion was written as
+"three of three, the first to two decimals". Four runs put the validate delta *outside* H4's range: the
+identification was right in kind (toy-scale) and wrong in precision. **The cheap repeat is what
+separates the claim you can publish from the one that dies on someone else's box** — and it costs one
+command. — 2026-08-19, `roadmap.md` Track O
+
+**A cost invisible on the benchmark module is a cost nobody will ever chase.** Function bodies have been
+decoded to IR 2–3× since the interpreter existed (`validate.zig` → `interp.zig` → `features.zig`), and
+the 2026-07-16 note in `testing.md` even names the symptom. It stayed unchased because the default bench module is 70
+bytes, where instantiate is ~0.0 µs; on a real 46 KB guest it is 304–376 µs, a third of cold start.
+**Pick the benchmark module before trusting the ranking it produces** — a microbenchmark does not merely
+shrink the workload, it changes its SHAPE. — 2026-08-19, `testing.md`
