@@ -228,6 +228,22 @@ host stack, so this bound is what keeps a runaway or deeply recursive module fro
 overflowing it; the limit is deliberately the same in every build so a program
 cannot run in one and trap in another.
 
+A guest that never returns is stopped too. Execution is capped at **1 Gi
+iterations** per call, after which it traps with `IterationLimitExceeded` and
+wazmrt prints the ceiling and how to change it. **One iteration is one loop
+back-edge or one tail call** — between them they cover every way a guest can run
+unboundedly, since recursion is already bounded by the call-depth limit above and
+a `return_call` reuses its frame rather than growing depth. Raise it, lower it, or
+switch it off with `--max-iterations <count>` (`0` = no limit).
+
+The cap is a *count*, not a time limit, and deliberately so: a wall-clock deadline
+would make the same module trap on a slow machine and finish on a fast one. Note
+what it does and does not claim — it bounds non-termination rather than detecting
+it, so a legitimately long-running module trips the same trap, and raising the
+ceiling is the right answer when it does. The default is roughly a thousand times
+the heaviest workload in the WebAssembly spec suite (a million-hop tail-call
+chain), so ordinary programs never approach it.
+
 > **Scope of the sandbox.** Containment is enforced two ways: **lexically** (a
 > guest cannot name a path outside its preopens) and **through the filesystem**
 > — path resolution walks one component at a time through directory handles

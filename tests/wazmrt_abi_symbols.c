@@ -26,6 +26,7 @@ const void *const wazmrt_abi_symbols[] = {
     (const void *)&wazmrt_config_new,
     (const void *)&wazmrt_config_set_feature,
     (const void *)&wazmrt_config_set_max_call_depth,
+    (const void *)&wazmrt_config_set_max_iterations,
     (const void *)&wazmrt_config_set_max_exception_boxes,
     (const void *)&wazmrt_config_set_max_gc_objects,
     (const void *)&wazmrt_config_set_max_memory_bytes,

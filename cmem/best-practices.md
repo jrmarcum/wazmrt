@@ -324,6 +324,101 @@ on modules that were fine. Check whether the mirror half exists before shipping 
 
 ## 4. Tests and gates
 
+**A comment that explains a REFUSAL is the thing to re-read when the limitation is lifted — nothing
+else points at it.** `fuzz.zig` refused to fuzz execution and said exactly why: *"the interpreter has no
+instruction/fuel limit, so a fuzzed infinite loop would hang the fuzzer."* The moment H3 added the
+budget, that paragraph became false — and nothing pointed from the new feature back to the refusal it
+invalidated. ⚠️ **A refusal outlives its cause silently**, because the code still works and no test
+fails. **When you remove a limitation, grep for the notes that named it** (`grep -rn "no .* limit"`,
+the feature's own name); the exclusions written around it are the payoff you are owed. — Track H5,
+2026-08-19
+
+**When a comment explains why a check is weak, verify the explanation before trusting it.** The
+const-expr GC allocator checked `default_max_gc_objects` instead of the instance's configured ceiling,
+under the comment *"a test helper with no Instance in hand, so it checks the default directly."* The
+first clause was false — it runs during real instantiation from three call sites — and the second
+clause is what made it look deliberate. 🎓 **A wrong reason attached to a real weakness is worse than
+no comment**, because it converts "why is this like that?" into "someone already thought about it".
+The check is cheap: grep the function's callers. — Track H2, 2026-08-19
+
+**A configurable ceiling with no test is a preference, not a control.** `max_gc_objects` was settable
+through the C ABI, documented in the header, threaded into the instance — and enforced on only one of
+its two allocation paths, for as long as it had existed, because **nothing had ever asserted it binds
+anything**. ⚠️ The general form: *for every knob an embedder can turn, there must be one test that
+turns it and one that proves the other side* — set it low and see the refusal, set it high and see the
+success. A knob tested in only one direction can be implemented as `return error` and still pass.
+— Track H2, 2026-08-19
+
+**Enumerate the SHAPES a limit must cover, then write one test per shape in one test.** Non-termination
+has two shapes (loop back-edge, tail call) and the GC ceiling has two paths (run-time, const-expr). In
+both cases the obvious one was already handled and the second was not — and in both cases a test
+covering only the obvious one **passes forever** while the gap stays open. Naming both shapes inside a
+single test is what makes deleting one of them fail loudly. — Track H, 2026-08-19
+
+
+**A limit needs a test for EVERY shape of the thing it limits — enumerate the shapes first.** The
+iteration budget stops a guest that never returns, and there are exactly **two** ways to never return:
+a loop back-edge and a **tail call**. A back-edge counter alone looks complete, passes an obvious test,
+and still hangs on `(func $f (return_call $f))` — because a local `return_call` reuses the native frame
+by design, so it makes no backward branch and grows no call depth for `max_call_depth` to catch. ⚠️ The
+failure mode is the nasty one: delete the second tick and **the first test keeps passing**, which is
+exactly what "the tests still pass" looks like after a gate has been quietly removed. Write the test so
+it names both shapes. — Track H3, 2026-08-19
+
+**Pick a ceiling by LOWERING it until the corpus breaks, then read what broke.** The iteration
+default was not chosen, it was bracketed: green at `1<<20`, 11 failures at `1<<18` — *only* the three
+`return_call*` files — and 36 across 8 files at `1<<14`. That named the heaviest legitimate workload in
+the suite (a million-hop tail-call chain) instead of guessing at one, and it turned "the default is
+generous" into "the default is ~1000x the measured peak". **The number and the reason arrive in the
+same experiment**, and the failing runs are the more informative half. — Track H3, 2026-08-19
+
+**A new engine-resource error must be classified in `isRuntimeTrap` DELIBERATELY, and usually the
+answer is "not a trap".** `IterationLimitExceeded` is excluded, like `GcHeapExhausted` and
+`ExnStoreExhausted`: admitting it would let a module that merely LOOPS a lot satisfy an `assert_trap`
+meant for real trapping behaviour. The exclusion has a second, larger payoff — **it makes a conformance
+run a live measurement of the ceiling**, because a budget set too low fails loudly instead of banking
+the timeout as the expected trap. (`CallStackExhausted` IS admitted, and the asymmetry is the point:
+`call.wast`'s "runaway" cases exist to make a recursion cap fire; no spec test asks an engine to loop
+forever.) — Track H3, 2026-08-19
+
+**When one mechanism only DELIVERS a decision and another MAKES it, say so before comparing costs.**
+An epoch/interrupt flag and a fuel counter look like two points on a cost curve; they are not the same
+kind of thing. The flag needs an outside agent — a watchdog thread with a clock — to ever fire, and a
+single-threaded, clock-free, freestanding-capable runtime has no such agent, so the flag would never
+fire at all and the loop would still hang. **Check that a candidate mechanism closes the loop by itself
+before pricing its per-instruction overhead** — the cheaper option was not a weaker version of the
+answer, it was not an answer. — Track H3, 2026-08-19
+
+
+**A gate that exists only as a FLAG is not a gate.** `zig build test -Doptimize=ReleaseSmall` worked
+from the day the suite existed. Nobody had ever run it — the suite had only been executed in Debug and
+ReleaseSafe, and the corpus in Debug alone, so **the one configuration that actually ships was the one
+whose behaviour nobody had observed.** Making it `zig build test-shipped` cost four lines of
+`build.zig`. The tell: if the only thing standing between you and a check is remembering a flag, the
+check is not part of the gate set. — Track H, 2026-08-19
+
+**Test the configuration you SHIP, not only the one that catches bugs — they answer different
+questions.** `ReleaseSafe` asks *"does any input reach a bad cast, a bad index, an overflow, an
+`unreachable`?"* and answers by panicking. `ReleaseSmall` — checks off — asks *"does the distributed
+build BEHAVE the same?"*, and a miscompile, an optimizer-exposed UB, or a test that only passed because
+a safety check fired shows up **there and nowhere else**. Running one is not evidence about the other.
+— Track H, 2026-08-19
+
+**Count what the grep is MATCHING before you report a site count.** A sweep for `unreachable` returned
+91 hits and the real number was **14**: the other 77 were the wasm `unreachable` *instruction* inside
+test source strings, plus the identifier `is_unreachable`. A raw grep count is a search result, not an
+inventory — and a "91 sites to audit" figure would have made a one-hour sweep look like a week's work,
+which is how a track gets descoped for a fictional reason. — Track H, 2026-08-19
+
+**Before flagging `@enumFromInt` on untrusted bytes, check whether the target enum is NON-EXHAUSTIVE.**
+With a trailing `_,` the cast is *defined* for every input value and there is nothing to fix; without
+it, an unexpected byte is UB in the shipped build. wazmrt's wire-facing enums (`SectionId`,
+`ExternKind`, `ValType`, `Op`, and the C-ABI `Feature`) are all non-exhaustive on purpose, which is why
+a module with import kind `0x05` reports `UnknownExternKind` instead of panicking. **The audit question
+is not "is there a cast?" but "what does the target type permit?"** — and the confirmation is one
+malformed input through the real binary, not an argument. — Track H, 2026-08-19
+
+
 **When you start REFUSING something, check which bucket the refusal lands in.** Closing the
 `anyfunc` deviation looked like deleting one map entry. But `isRefType` also special-cased
 `anyfunc`; dropping it there too would have sent `(table 4 anyfunc)` down the func-index path, where

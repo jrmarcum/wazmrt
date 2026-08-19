@@ -29,12 +29,24 @@
 //! vendored as binaries, so the corpus needs no fixture files and stays honest
 //! about what the current assembler accepts.
 //!
-//! Instruction *execution* (`invoke` / `_start`) is intentionally NOT fuzzed
-//! here: the interpreter has no instruction/fuel limit, so a fuzzed infinite
-//! loop (`(loop br 0)`) would hang the fuzzer. The execution path's memory
-//! safety is covered instead by the crafted `test "hardening: …"` cases in
-//! `interp.zig`. `Instance.init` runs no guest instructions (the start function
-//! is a separate `runStart` call), so instantiation is bounded and safe to fuzz.
+//! ▶️ **Instruction EXECUTION is fuzzed too, since Track H5 (2026-08-19).**
+//! `_start` and every exported function are invoked on the mutated module under
+//! a small iteration budget.
+//!
+//! ⚠️ **This paragraph used to say the opposite**, and the reason it gave was
+//! real: *"the interpreter has no instruction/fuel limit, so a fuzzed infinite
+//! loop (`(loop br 0)`) would hang the fuzzer."* **H3 removed that reason** — a
+//! runaway guest now traps `IterationLimitExceeded` — so the exclusion became a
+//! workaround for a limitation that no longer existed. 🎓 *A refusal outlives
+//! its cause silently; the note that explains one is the thing to re-read when
+//! the cause is removed.*
+//!
+//! 🎯 **Why the interpreter is the most valuable target here:** it is where the
+//! guest-controlled `@intCast`s, slice indices and arithmetic live, and in the
+//! SHIPPED `ReleaseSmall` build every one of those safety checks is compiled
+//! out. Mutated modules under a checked build reach sites no hand-written test
+//! enumerates — which is why this supplements, rather than replaces, the crafted
+//! `test "hardening: …"` cases in `interp.zig`.
 
 const std = @import("std");
 const Module = @import("Module.zig");
@@ -56,6 +68,13 @@ const seed_wat = [_][]const u8{
     "(module (func (export \"f\") (param i32) (result i32) (block (result i32) (loop (result i32) (br_if 1 (local.get 0)) (i32.const 3)))))",
     "(module (func (export \"f\") (result i32 i32) (i32.const 1) (i32.const 2)))",
     "(module (memory 1) (func (export \"f\") (result i32) (memory.grow (i32.const 1))))",
+    // ▶️ Track H5: two seeds that NEVER TERMINATE, one of each shape. They make
+    // the sweep's dependency on the iteration budget explicit and permanent —
+    // every run now invokes a guaranteed-runaway function and must come back.
+    // ⚠️ Delete the budget and this file hangs instead of failing, which is the
+    // loudest possible way to keep H3 and H5 tied together.
+    "(module (func (export \"spin\") (loop (br 0))))",
+    "(module (func $t (export \"tailspin\") (return_call $t)))",
 };
 
 /// Corrupt `buf` in place with `n` single-byte edits, never touching the 8-byte
@@ -78,6 +97,8 @@ fn mutate(rand: std.Random, buf: []u8, n: usize) void {
 const Reached = struct {
     decoded: usize = 0,
     instantiated: usize = 0,
+    /// Guest functions actually RUN to a result or a trap (Track H5, 2026-08-19).
+    executed: usize = 0,
     assembled: usize = 0,
 };
 
@@ -148,8 +169,59 @@ fn tryDecodeAndInstantiate(gpa: std.mem.Allocator, input: []const u8, r: *Reache
     if (instantiationTooBig(&m)) return;
     var inst: interp.Instance = undefined;
     inst.instantiate(gpa, &m) catch return;
-    inst.deinit(); // before m.deinit() (defer): the instance borrows the module
+    defer inst.deinit(); // before m.deinit() (defer): the instance borrows the module
     r.instantiated += 1;
+    execute(gpa, &m, &inst, r);
+}
+
+/// Iteration budget for a fuzzed invocation. Small on purpose: the point is that
+/// a mutated module which loops forever **returns** instead of hanging the
+/// fuzzer, and any real value here is arbitrary — 10k back-edges is far more
+/// than the seeds need and completes instantly.
+const fuzz_max_iterations: u64 = 10_000;
+
+/// ▶️ **EXECUTE the mutated module — added by Track H5, 2026-08-19.**
+///
+/// This is the half `fuzz.zig` refused to do until the iteration budget existed:
+/// the module doc used to say *"instruction execution is intentionally NOT
+/// fuzzed here: the interpreter has no instruction/fuel limit, so a fuzzed
+/// infinite loop would hang the fuzzer."* ✅ **H3 removed that reason** — a
+/// runaway now traps `IterationLimitExceeded`, so the interpreter is fuzzable.
+///
+/// 🎯 **Why this is worth more than the crafted `hardening:` cases it
+/// supplements:** the interpreter is where the guest-controlled `@intCast`s,
+/// slice indices and arithmetic live, and in the SHIPPED `ReleaseSmall` build
+/// every one of those checks is compiled out. Running mutated modules under a
+/// safety-checked build (`zig build test` / `test-safe`) is the mechanical way
+/// to reach sites no hand-written test enumerates.
+///
+/// Every error is expected and ignored — a trap, a budget exhaustion, or a
+/// refusal are all correct outcomes. **The only failure this can report is a
+/// crash, a panic, or a leak**, which is exactly the contract of this file.
+fn execute(gpa: std.mem.Allocator, m: *const Module, inst: *interp.Instance, r: *Reached) void {
+    // ⚠️ Bound the run BEFORE anything executes. Without this the first mutated
+    // `(loop (br 0))` hangs the sweep — the exact failure this target was
+    // blocked on for a month.
+    inst.max_iterations = fuzz_max_iterations;
+
+    // A mutated module may have grown a start function; `instantiate` does not
+    // run it, so this is a distinct entry point and worth its own call.
+    inst.runStart() catch {};
+
+    for (m.exports) |e| {
+        if (e.type.kind() != .func) continue;
+        const ft = m.funcType(e.index) orelse continue;
+        var slots: u32 = 0;
+        for (ft.params) |p| slots += interp.slotWidth(p);
+        // Zeroed arguments: a null ref, a 0 integer and a +0.0 float are all the
+        // zero bit pattern, so one buffer serves every signature.
+        const args = gpa.alloc(interp.Value, slots) catch return;
+        defer gpa.free(args);
+        @memset(args, 0);
+        const res = inst.invokeIndex(e.index, args) catch continue;
+        gpa.free(res);
+        r.executed += 1;
+    }
 }
 
 /// True if instantiating `m` would eagerly reserve an unreasonable amount of
@@ -323,4 +395,10 @@ test "fuzz: deterministic mutation sweep (runs every `zig build test`)" {
     try std.testing.expect(r.decoded > 100); // decoder accepted mutated modules
     try std.testing.expect(r.instantiated > 100); // …and instantiation ran
     try std.testing.expect(r.assembled > 10); // assembler ran to completion
+    // ▶️ …and guest code actually RAN (Track H5). ⚠️ This assertion is the whole
+    // reason the target cannot silently degrade back to fuzzing only the front
+    // half: without it, an `execute` that returned early on every input — or a
+    // future change that stopped calling it — would leave every other number
+    // here unchanged and the suite green.
+    try std.testing.expect(r.executed > 100);
 }

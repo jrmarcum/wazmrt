@@ -1,5 +1,556 @@
 # Roadmap
 
+## 🎯 THE 1.0 REVIEW PROGRAM — four tracks (owner, 2026-08-19). **THIS IS THE NEXT WORK.**
+
+**Ported from `wasmrt`'s T9–T12, which the owner scoped there on 2026-08-06** — the same four phases, in
+the same order, adapted to what is actually true of wazmrt. Read [`releasing.md`](releasing.md) for the
+version ladder these earn.
+
+| track | version | what it is | shape |
+| --- | --- | --- | --- |
+| **H** | `1.0.1` | **Hardening** — make the *shipped* configuration defensible, and re-measure the baselines | do the work |
+| **B** | `1.0.2` | **Bug hunt + code hygiene** — go looking for the unknown ones, across tested **and untested** paths | do the work |
+| **O** | `1.0.3` | **Optimization review** — measured options presented for a decision | **review + recommend** |
+| **S** | `1.0.4` | **Security review** — find the penetration surfaces, recommend the plugs | **review + recommend** |
+
+🔒 **The order is `measure → find → optimize → attack`, and it is deliberate.** Optimizing before the
+bug hunt tunes code that is about to change. Reviewing performance before H re-measures yields opinions
+instead of deltas. And a security review is only worth the paper it is written on if it examines the code
+that **ships** — an optimization can introduce a surface (a fast path that skips a bounds check), so
+auditing before O would audit code that is about to move. **S is last for that reason, not because it
+matters least.**
+
+⚠️ **O and S are REVIEW-AND-RECOMMEND phases: the deliverable is findings + costed options, presented for
+an owner decision — not a unilateral pass.** Several plausible changes in both trade against recorded
+invariants (zero dependencies, `ReleaseSmall`, the EXACT size ceilings, ABI 2, zero conformance
+failures), and those trades are the owner's to make. H and B fix; O and S propose.
+
+🧭 **The starting position is unusual and it changes what these tracks are.** wasmrt's T9 was a
+correctness punch-list because wasmrt still had one. **wazmrt does not:** the conformance baseline is
+EMPTY, 284 files run with zero failures, zero skips and zero unrun, and every in-scope proposal is
+implemented. So Track H is **not** "finish the features" — it is *"the code is correct on everything we
+test; now make it hold up against things we do not test."*
+
+---
+
+### ✅ Track H — Hardening. **COMPLETE 2026-08-19, shipped as `1.0.1`.**
+
+#### ✅ TRACK H IS COMPLETE — 2026-08-19. **All six items, and the best two findings were in the GATES, not the code.**
+
+| item | outcome |
+| --- | --- |
+| **H1** — ReleaseSmall safety sweep | ✅ 3 construct classes swept **in full**, zero defects; the un-fuzzed surfaces (C ABI 9, WASI 25) read individually and clean; the rest now covered **mechanically** by H5 |
+| **H2** — resource ceilings, per entry point | ✅ 6 ceilings × 11 allocation paths tabled — **1 real defect found and fixed** |
+| **H3** — execution bound | ✅ shipped, measured, contract row §3.7a |
+| **H4** — re-measure the baselines | ✅ size **and** speed, so Track O is unblocked |
+| **H5** — fuzz coverage | ✅ **execution is fuzzed for the first time**, inversion-proven |
+| **H6** — SD-2 reopen condition | ✅ re-tested at the source; stays open |
+
+🎓 **THE TRACK'S LESSON, and it is not about any one bug: the two most valuable findings were holes in
+the GATE SET, not in the code.** The corpus had never run in the config that ships, and the
+interpreter had never been fuzzed at all. Both were invisible to every existing gate *because* the
+gates were the thing that was wrong — a suite that passes cannot report the test nobody wrote.
+
+##### ✅ H2's finding — a configured ceiling that silently did not apply
+
+`max_gc_objects` had **two** enforcement sites that did not agree: the run path (`allocObject`) checked
+the instance's **configured** ceiling; the const-expr path (`evalConstGc`) checked
+`default_max_gc_objects` — **the constant** — under a comment calling it *"a test helper with no
+Instance in hand."*
+
+⚠️ **It is not a test helper.** It runs during real instantiation, from three call sites in
+`instantiateWithImports`, and it is what allocates the objects a **global or element initializer**
+creates. So an embedder hardening an untrusted workload with
+`wazmrt_config_set_max_gc_objects(cfg, small)` **had that ceiling ignored** for every such object — up
+to the 16 Mi default — and a module chooses how many initializers it has.
+
+**Fixed** by threading the ceiling through `ConstCtx`. **Inversion-tested**: reverting the one-line
+check makes the new test fail (and leak, which is the const-expr path unwinding), restoring it passes.
+🎓 **Nothing here computed a wrong answer — one site out of two simply read a different variable.**
+That is the *"three of the four do X"* shape, and it is the fourth time this project has hit it.
+⚠️ **The GC ceiling had NO test at all before this**; it was configurable, documented, and unverified.
+
+##### ✅ H5 — the interpreter is fuzzed now, and it was blocked on H3
+
+`fuzz.zig` covered decode / instantiate / assemble but **explicitly refused to execute**, with a stated
+reason: *"the interpreter has no instruction/fuel limit, so a fuzzed infinite loop would hang the
+fuzzer."* **H3 removed that reason.** `_start` and every export are now invoked on every mutated
+module under a 10 000-iteration budget.
+
+🎯 **This is the mechanical answer to most of H1's residual.** The interpreter is where the
+guest-controlled `@intCast`s, slice indices and arithmetic live, and in `ReleaseSmall` every one of
+those checks is compiled out — so running mutated modules under `test-safe` reaches sites no
+hand-written test enumerates. Clean on the first run, under both Debug and ReleaseSafe.
+
+⚠️ **Two seeds that NEVER TERMINATE are now in the corpus**, one per shape (`(loop (br 0))` and
+`(func $f (return_call $f))`), so the sweep's dependence on the budget is permanent and loud.
+✅ **Inversion-proven**: setting the fuzz budget to unlimited makes `zig build test` **hang** (killed at
+120 s); restoring it returns to green. **Delete H3 and this file stops finishing** — which is exactly
+how the two should be tied together.
+
+🎓 *A refusal outlives its cause silently.* The comment explaining why execution was excluded was
+correct when written and false for as long as it took to read it again. **The note that explains a
+refusal is the thing to re-read when the limitation is lifted** — nothing else points at it.
+
+##### 📊 H4 — the baselines Track O was blocked on
+
+| metric | value |
+| --- | --- |
+| engine pipeline, bytes → runnable (spawn excluded) | **4 336x – 6 772x** vs wasmtime (which also writes a `.cwasm`) |
+| wazmrt's own split | decode **0.56–0.58 µs** · validate **0.46–0.81 µs** · +instantiate **1.23–2.56 µs** |
+| steady state | **34.62 ns/loop-iter (~231 Mops/s)** |
+| cold start | **3.51 µs/run** |
+
+⚠️ **Read the ratio with its caveat, which the tool prints and which must travel with the number:** the
+two sides are different *shapes* — wasmtime emits native code, wazmrt a validated IR — so the ratio
+says how fast each reaches something runnable, and wasmtime pays it once then wins in a hot loop.
+
+#### ◐ IN PROGRESS — first pass 2026-08-19. **The shipped config had never been tested, and now it is.**
+
+**The single most useful thing this pass found is not a defect — it is a hole in the gate set.** Before
+today the suite had run in **Debug** and **ReleaseSafe**, and the conformance corpus in **Debug** only.
+**Nothing had ever executed either one in `ReleaseSmall`, which is the build that ships.** That is the
+exact shape of the premise this track is built on, sitting in the gates themselves.
+
+**Now measured — all four optimize modes, and they agree exactly:**
+
+| mode | unit suite | `test-security` | conformance corpus |
+| --- | --- | --- | --- |
+| Debug | 758/758 | 3/3 | 284 files · 63,934 passed · 0 failed · 0 skipped · 0 file-errors |
+| ReleaseSafe | 758/758 | — | **identical** |
+| **ReleaseSmall (ships)** | **758/758** | **3/3** | **identical** |
+| ReleaseFast | 758/758 | 3/3 | **identical** |
+
+*(All from an NTFS cwd, `ZIG_LOCAL_CACHE_DIR` on NTFS. Size gate re-run: exe 990,208 · lib 1,053,320 ·
+dll 900,608 — all three still EXACT, so the `1.0.0` version string cost nothing.)*
+
+🆕 **New gate: `zig build test-shipped`** — the suite under `ReleaseSmall`, alongside the existing
+`test-safe` (ReleaseSafe). They answer different questions and neither substitutes for the other:
+`test-safe` asks *"does any test input reach an out-of-range cast, an OOB index, an overflow or an
+`unreachable`?"* (it panics); `test-shipped` asks *"does the build we distribute BEHAVE the same?"* — a
+test that passes only because a safety check caught something, an optimizer-exposed UB, or a miscompile
+shows up there and **nowhere else in the gate set**. ✅ **Inversion-tested**: a deliberately failing test
+was injected, `test-shipped` reported `758/760 · 2 failed`, and the test was removed and the step
+re-confirmed green. ⚠️ **It was always possible to run this by hand (`zig build test
+-Doptimize=ReleaseSmall`) and nobody ever had — a flag you have to remember is not a gate.**
+
+##### H1 — the ReleaseSmall safety sweep: three classes swept ENTIRELY, zero defects
+
+Swept as tables, not read-throughs. **What was checked in full:**
+
+| class | sites | verdict |
+| --- | --- | --- |
+| **`@enumFromInt`** | **30 / 30** | ✅ clean. Every wire-byte target — `SectionId`, `ExternKind`, `ValType`, `Op` — is a **non-exhaustive** enum (`_,`), so an arbitrary byte is *defined* behaviour, not UB. The rest are in-range-by-construction (`for (0..count)`) or guarded (`wazmrt_config_set_feature` calls `f.valid()` first, and the C-ABI `Feature` enum is non-exhaustive too, so even the *parameter* is legal). **Verified dynamically as well:** a hand-built module with import kind `0x05` reports `UnknownExternKind` and does not panic. |
+| **Zig `unreachable`** | **14 / 14** | ✅ clean. The raw grep says 91; **77 of those are the wasm `unreachable` INSTRUCTION in test source strings** or the identifier `is_unreachable`. Of the 14 real ones, 2 are test-only helpers and 12 rest on local invariants that hold (`(sub - 0x1e) % 7` covers 0–6 exhaustively; `fieldByteSize` yields only 1/2/4/8; `.nearest` is handled above). |
+| **`@ptrCast(@alignCast(…))`** | **42 / 42** | ✅ clean. **36 are one idiom** — `const w: *Wasi = @ptrCast(@alignCast(ctx))`, recovering a **host-owned** context pointer wazmrt itself supplied. The guest cannot influence `ctx`. |
+
+**Spot-checked on the paths an adversary actually reaches, all clean and all *deliberately* so:**
+
+- **Linear-memory load/store** (`interp.zig` `load`/`store`/`memRange`): `std.math.add`/`mul`/`cast` in
+  `u64`, narrowed **only after** the bound holds. The overflow-wrap-past-the-bounds-check class — the
+  one that turns a checked access into an OOB write in a check-free build — **is not present.**
+- **WASI's guest-memory accessors** (`readU32`/`slice`/`arrayOffset`): a documented **widen-then-check**
+  discipline, in `u64`, narrowed after. The file's own comment names the two earlier passes that
+  established it.
+- **Handle resolution** (`Store.resolveGc` / `Store.resolve`): `if (biased == 0 or biased > len) return
+  null` before the index, so *"a stale or forged reference is a clean trap rather than a read of someone
+  else's object"* — its words, and they check out.
+
+⚠️ **NOT yet complete: ~147 residual `@intCast` sites** (194 total, 47 are `.len`/`.count` and
+allocation-bounded). Bucketed by file — `interp.zig` 58, `wasi.zig` 25, `wat.zig` 23, `capi.zig` 9,
+`validate.zig` 7, others 25 — and the interpreter's 58 were scanned and are dominated by
+**post-bounds-check narrowings** (`@intCast(slot)` after `if (slot >= len) return error…`) and
+`@mod`-guarded shift amounts. **They still need the table treatment**, and that is the next H1 step.
+
+**Two documented fragilities — not defects, and worth a defensive line each:**
+
+1. `types.zig:331` — `refHeap` switches a **2-bit** kind field (4 possible values) over **3** arms with
+   `else => unreachable`. Safe today only because `concreteRefEx` is the sole constructor and writes
+   0/1/2. One new constructor away from being UB in the shipped build.
+2. `interp.zig:3894` — `else => unreachable` closing the memory-op dispatch. Correct while the caller
+   pre-narrows `op`; a newly added memory opcode that misses an arm lands there.
+
+##### H4 — size half ✅ done (ceilings EXACT, above). Speed/startup baselines still to re-measure.
+
+##### H6 — ✅ done. **SD-2 re-tested at the SOURCE, not inferred from the version number**
+
+Zig is still **0.16.0**, but the point of the SD-3 habit is that a version number is not the condition.
+Read it directly: `lib/std/Io/Threaded.zig:9509` is still `if (is_windows) return
+error.OperationUnsupported;` — **the exact line the entry cites, unchanged.** SD-2 **stays open**,
+condition **not** met, verified 2026-08-19.
+
+##### ✅ H3 — DONE 2026-08-19. **The iteration budget: a guest that never returns now TRAPS.**
+
+**Owner decision, 2026-08-19:** *"we do not want an infinite loop on purpose or by accident by the
+user — we need an internal check mechanism, an error message to the user, and a break on
+occurrence."* The owner asked whether an epoch/interrupt flag delivers that; **it does not**, and
+that answer is the reason the design is what it is. An epoch flag only DELIVERS a decision someone
+else made — it needs a watchdog thread holding a clock to set it, and wazmrt is single-threaded,
+dependency-free, and targets `wasm32-freestanding`, which has neither threads nor a clock. Nothing
+would ever set the flag. **A count is self-detecting; a flag is not.** Full reasoning, including why
+a count beats a wall-clock deadline, is in `design-decisions.md`.
+
+🎯 **THE DESIGN POINT: there are TWO ways to run forever, and the obvious one is not the dangerous
+one.**
+
+| shape | ticks where | note |
+| --- | --- | --- |
+| loop back-edge | `Frame.branch`, on `label.is_loop` | rides a test that was already there |
+| **tail-call hop** | the `callFunction` trampoline | ⚠️ **the one a back-edge-only design misses.** A local `return_call` reuses the native frame *on purpose*, so it makes no backward branch and grows no depth — `max_call_depth` cannot see it. `(func $f (return_call $f))` would still have hung. |
+
+**The default was MEASURED by lowering it until the corpus broke**, not chosen:
+
+| budget | corpus result |
+| --- | --- |
+| `1 << 20` | ✅ 63,934 passed |
+| `1 << 18` | ❌ 11 failed — **only** `return_call`, `return_call_indirect`, `return_call_ref` |
+| `1 << 14` | ❌ 36 failed across 8 files (adds `memory_copy`/`copy64`/`fill`/`fill64`/`grow64`) |
+
+So the heaviest *legitimate* workload in the spec suite is the tail-call family — `return_call.wast`
+asks for **a million hops in one invocation** and fits under `1 << 20` with under 5% to spare. The
+default is `1 << 30`, ~1000x above the measured peak. ⚠️ **The corpus is a live gate on this number
+by design:** `wast.zig`'s `isRuntimeTrap` deliberately does **not** admit `IterationLimitExceeded`, so
+too tight a budget FAILS the run loudly instead of banking the timeout as the trap an `assert_trap`
+was asking for.
+
+**Shipped surface:** `--max-iterations <count>` on the CLI (`0` = unlimited) parsed once, before the
+mode dispatch, so it works in **both** run mode and WASI mode — a flag consumed inside `runWasi` like
+the other ceilings would have pushed `wazmrt m.wasm --max-iterations 100 myfunc` into WASI mode and
+the trap's own hint would have named a flag that did not work on the path that printed it.
+`wazmrt_config_set_max_iterations` in the C ABI (**additive — `abi_version` stays 2**; ⚠️ `0` there
+means *leave at default*, per that struct's convention, and `UINT64_MAX` means no limit). The trap
+message names the ceiling and the flag, and says *"did not terminate within N iterations"* — **not
+"infinite loop detected"**, because the budget bounds non-termination rather than proving it.
+
+✅ **Inversion-tested in both directions before anything else**: both shapes trap at a 1,000 budget;
+a 5,000-iteration loop returns `5000` under a 100,000 budget and traps under 1,000; `0` runs it
+unlimited; and a third test proves the budget **refills per top-level call** rather than draining
+across calls.
+
+📏 **Cost: exe +1,024 B, lib +512 B, dll +0.** The DLL — the artifact the `universalWasmLoader-*`
+ports link — **did not move at all**; the growth is CLI flag-parsing and the message string.
+Ceilings raised in the same change with the reason recorded (`tools/size-ceilings.txt`).
+
+🔓 **H5 is now unblocked** — execution was excluded from `fuzz.zig` only because a fuzzed
+`(loop br 0)` would hang the fuzzer, and it can no longer hang.
+
+##### 🤝 H3 IS A CONTRACT ROW NOW — and coordinating it surfaced work on BOTH sides
+
+**`interop.md` §3.7a, CONTRACT VERSION 5.** H3 was built while that file still said *"neither has one"*,
+which §1 rule 1 forbids (*coordinate BEFORE shipping a contract surface, not after*). ⚠️ **The breach is
+recorded in the contract rather than tidied away** — it is why the owner then made **`coordinate`** a
+one-word binding order (`INDEX.md`, and `interop.md` §1).
+
+**Verified by RUNNING both on the SAME BYTES** — one `.wasm` assembled by *wasmrt's own* `wasmrt wat`,
+holding both shapes:
+
+| runtime | `(loop (br 0))` | `(func $f (return_call $f))` |
+| --- | --- | --- |
+| **wazmrt** | traps `IterationLimitExceeded` | traps `IterationLimitExceeded` |
+| **wasmrt** | ⚠️ **hung** (killed at 10 s) | ⚠️ **hung** (killed at 10 s) |
+
+**Status ⚠️ DIVERGENT AND LIVE until wasmrt ships its T9i.** ⚠️ Until it does, **swapping wasmrt into a
+deployment silently removes this protection** — no error, the workload just never returns. Same failure
+shape as the pin-DB path risk: *a swap that disarms without saying so.*
+
+✅ **The two designs were written independently and agree** — `u64::MAX` filled at refill for
+"unlimited", the two `0` conventions (CLI `0` = unlimited, C ABI `0` = leave default), the error kept
+OUT of the `.wast` runner's spec-trap predicate, the refill/re-entry rule, and the message wording.
+Their plan fixes the same default (`1 << 30`) and re-runs the descent on their own corpus. 🎓 **That
+independent agreement is the evidence the contract is specific enough to build from**, which is the
+only thing it is for.
+
+🎯 **The contract's load-bearing clause is the UNIT, not the number** — *one loop back-edge or one
+tail-call hop*. Two runtimes with "a limit of `1<<30`" that count different things are not swappable:
+they would disagree only near the ceiling, which is exactly where nobody looks.
+
+##### 📉 The A/B/A throughput measurement — which THEIR plan caught us not doing
+
+wasmrt's T9i requires A/B/A benchmarking because wasmrt has a recorded case (T9a#7) of threading state
+through the same interpreter loop costing **3.6%**. **wazmrt had measured only size.** Now run —
+steady bench (`sum(1e6)` ×50, ReleaseFast), removing and restoring both tick sites:
+
+| | ns/loop-iter | Mops/s |
+| --- | --- | --- |
+| **A** — with the budget | 34.29 | 233 |
+| **B** — both ticks removed | **33.45** | **239** |
+| **A** — restored | 34.62 | 231 |
+
+**~3% on a tight loop.** A-to-A spread is ~1%, so the gap is above this box's noise — but ⚠️ **B is a
+single sample and deserves a repeat**, and the bench is back-edge-dominated, so this is nearer a worst
+case than a typical one. 🚦 **Track O inherits it**: the obvious response — ticking every *N*th
+back-edge — is ⚠️ **a CONTRACT change, not a local optimization**, because it alters the granularity of
+the unit. Neither project may do it unilaterally.
+
+🎓 **The method lesson, and it is the reason to coordinate at all: the sibling's plan audited ours.**
+Nothing in wazmrt's own gate set would have asked for this number — the size ceilings passed, the suite
+passed, the corpus passed. It took *another project's checklist for the same feature* to notice that a
+change in the hottest loop in the program had never been benchmarked.
+
+##### 🤝 What §2 now obliges WAZMRT to do (new work, not yet started)
+
+🔒 **Owner ruling recorded in §2:** *"The program will each be named separately wasmrt/wazmrt. That does
+not change. It is the CLI options that need to be in sync."* The working test: **take any invocation,
+change only the program name, and it must do the same thing under the other runtime.**
+
+| obligation | state |
+| --- | --- |
+| accept wasmrt's **subcommand spellings** — `run`, `wasi`, `wast` — alongside our extension dispatch | ⬜ not started |
+| grow **`wazmrt wat <file.wat> [-o out]`** (assemble text → binary); wasmrt has it, we do not | ⬜ not started |
+| `--dir` / `--ro-dir`: **accept BOTH separators** — prefer `::`, fall back to a single `:` when the spec has no `::` and the split is not a drive letter | ⬜ not started |
+
+⚠️ **One of these is a security-posture change, not a convenience:** adopting each other's run modes
+interacts with `will_execute`. `wazmrt prog.wasm` **runs** a WASI command where `wasmrt prog.wasm`
+**summarizes** it — so alignment makes the most casual invocation there is start executing code on one
+side or stop executing it on the other. 🔒 **The verification gate must land before or with that
+change, never after** (§2.1).
+
+##### 🔬 MEASURED 2026-08-19 (wasmrt's annex, `interop.md` §2.1m) — wazmrt's two gaps, both LOUD
+
+The sibling ran §4 check 5 for the first time: the same invocation through both binaries. **wazmrt has
+exactly two CLI gaps and both fail cleanly**, which is the favourable half of the finding and worth
+recording as a design result rather than a to-do:
+
+| invocation | wazmrt | wasmrt |
+| --- | --- | --- |
+| `<prog> add.wat add 2 3` | ✅ prints `5` | ⚠️⚠️ `rc=0`, prints the module SUMMARY — **export and both args silently ignored, exits SUCCESS** |
+| `<prog> run add.wat add 2 3` | ❌ `rc=1`, `error: cannot read 'run': FileNotFound` | ✅ prints `5` |
+| `<prog> --dir <spec> <module>` | ❌ `rc=1`, `error: cannot read '--dir': FileNotFound` | ✅ preopen parsed |
+| `<prog> <module> --dir <spec>` | ✅ | ⚠️⚠️ **no error — `--dir <spec>` goes to the GUEST as argv, so the sandbox is never granted** |
+
+🎯 **Same missing capability, opposite consequence — and that asymmetry is the finding.** A
+wasmrt-shaped command under wazmrt **fails and says why**; a wazmrt-shaped command under wasmrt
+**succeeds at the wrong thing**, and in the `--dir` case succeeds with **no preopen at all** — which
+presents to the guest as `BADF` on every path call and reads like a guest bug. 🎓 *Which direction to
+err in is a property of the consequence, not a house style.* wazmrt's flag-region parser (§2.4 — flags
+recognised only in the LEADING run) is what makes its failures loud, and it should stay that way when
+the subcommand spellings are added.
+
+**So wazmrt's alignment work is additive and low-risk**, while wasmrt's half of the same rows is a
+silent-wrong-output defect. Both are still required for swappability.
+
+| wazmrt obligation | measured evidence | state |
+| --- | --- | --- |
+| accept `run` / `wasi` / `wast` subcommand spellings | `run` → `cannot read 'run'` | ⬜ not started |
+| accept flags **before** the module path (keep the current position working too) | `--dir` first → `cannot read '--dir'` | ⬜ not started |
+| grow `wazmrt wat <file.wat> [-o out]` | absent | ⬜ not started |
+| `--dir`/`--ro-dir`: accept **both** separators | 🔻 F4 **corrected** the old claim — wasmrt fails LOUDLY (`errno 29`) on a single colon, it does **not** mis-preopen | ⬜ not started |
+
+⚠️ **Sequencing, unchanged:** these add front-end surface and one of them (`will_execute`) is a
+security-posture change, so they land **after** hardening — which is where they now are.
+
+**The premise, and it is the most load-bearing sentence in this section: `ReleaseSmall` disables Zig's
+runtime safety checks, and `ReleaseSmall` is what ships** (`design-decisions.md` — the same DLL under
+`ReleaseSafe` is 5.4× the size, which settled it). Therefore **wazmrt's own checks, `test-safe`,
+`src/fuzz.zig` and `test-security` ARE the memory-safety floor** — not a nice-to-have on top of one. Every
+item below follows from that.
+
+- **H1 — the ReleaseSmall safety sweep.** Enumerate every construct whose safety check *vanishes in the
+  shipped build* on a path reachable from guest-controlled or file-controlled data: `unreachable`,
+  `catch unreachable`, `@intCast`, `@truncate` used as a narrowing assumption, `@ptrCast`/`@alignCast`,
+  raw slice indexing, and `orelse unreachable`. Each one is then either (a) proven unreachable by a
+  check that runs in **all** optimize modes, or (b) converted to a returned error. ⚠️ **`zig build
+  test-safe` passing is not this proof** — it proves the *tested* paths are clean, and the whole point of
+  the exercise is the untested ones. **Method: the invariant sweep (see Track S) — a table of every site,
+  not a read-through.**
+
+- **H2 — resource ceilings, enumerated rather than assumed.** The C ABI exposes real per-engine ceilings
+  (`wazmrt_config_set_*`, `max_call_depth` default 512) and `sexpr.zig` refuses a `((((…`-bomb at depth
+  1024. **Table every allocation path and every recursion path, then check each honours its ceiling.**
+  The bug this looks for is the "three of the four do X" shape, which has already bitten this project
+  twice.
+
+- **H3 — 🚦 DECISION GATE: there is no instruction or fuel limit, so a hostile guest can hang the host.**
+  `src/fuzz.zig` states it outright, and it is why **execution is deliberately not fuzzed**: a fuzzed
+  `(loop br 0)` would hang the fuzzer. `max_call_depth` bounds *recursion*, nothing bounds *time*. The
+  embedder has no interrupt and no timeout. **This is an owner decision, not an implementation choice** —
+  a fuel counter is the classic answer and it costs a check in the hottest loop in the program, which
+  collides head-on with both the speed and the `ReleaseSmall` goals. Options to price: a fuel counter
+  (opt-in via config, so a trusting embedder pays nothing), an epoch/interrupt flag checked at back-edges
+  only, or an explicit "wazmrt does not bound execution; the embedder must" documented contract.
+  **Whatever is decided, it must be written down** — an undocumented unbounded loop is a surface Track S
+  will find anyway, and finding it twice costs more than deciding it once.
+
+- **H4 — re-measure everything Track O will be judged against.** Size (all three artifacts, EXACT against
+  `tools/size-ceilings.txt`), `decode → validate → instantiate` (a **first-class** metric since the
+  dev-loop decision), steady-state throughput, and cold start. **An optimization review without a
+  baseline is guesswork**; O cannot start until these numbers exist and are recorded so every proposal
+  can be stated as a delta. ⚠️ The last time nobody re-checked, the shipped artifacts **roughly doubled
+  in a month** while "smallest binary" was a stated goal. *A goal with no gate is a preference.*
+
+- **H5 — fuzz coverage, and what H3 unlocks.** `src/fuzz.zig` fuzzes decode/validate/instantiate and the
+  text front end; **execution is excluded only because of H3.** If H3 lands any bound, execution becomes
+  fuzzable and this item grows an `invoke` target. Also worth a pass: the `.wast` and `.wat` lexers (the
+  `annotations.wast` lexer death was found by a corpus count, not by a fuzzer) and the C ABI lifecycle
+  (that fuzz has already paid for itself — see `capi.zig`'s header comment).
+
+- **H6 — re-test the deferred entries' reopen conditions.** SD-2 (`path_link` ENOTSUP, upstream Zig) is
+  trigger-based: **re-check it on every Zig upgrade, and re-check it when PRICING it.** That habit is
+  what SD-3 taught — its condition had already been met on the day it was written and nobody looked.
+
+**Gate:** zero regressions on all gates in `releasing.md`'s checklist, with **counts diffed** rather than
+exit codes checked; the size ceilings still EXACT or moved deliberately with the reason recorded; H4's
+numbers written into `testing.md`; and every H1/H2 site either fixed or listed in `known-issues.md` with
+its `file:line` and why it was left.
+
+---
+
+### 🔍 Track B — Bug hunt + code hygiene. `1.0.2` `[ ]`
+
+**This is `INDEX.md`'s "look for code issues" trigger run as a scheduled task**, not a new process — read
+that trigger first; it is binding and already specifies the method (fan out parallel read-only
+investigators per category, consolidate, report `file:line` + one line + severity, fix the safe ones, and
+**keep the suite green by diffing the OUTPUT counts, not exit codes**). ⭐ Read `best-practices.md` first;
+~139 rules are in there and each was paid for.
+
+**Distinct from H on purpose: H works a list, B goes looking.**
+
+1. **Bugs.** Inverted logic, LEB off-by-ones, wrong-tagged union access, stack-order, missing bounds
+   checks. 🎯 **Hunt the silent-wrong-output class hardest.** A module that is *rejected* announces
+   itself; one that runs and answers wrongly does not — and every serious defect this project has found
+   was the second kind.
+2. **Fall-throughs (worst).** Unhandled input that emits a stub or a placeholder instead of erroring.
+   **Prefer a hard error over silent-wrong**, which is the standing rule.
+3. **Stale workarounds.** `TODO`, "for now", and anything written around a limitation that has since been
+   lifted. Tracks F, P, D, L and A all lifted limitations; the guards written around them may still be
+   in place. ⚠️ **A blanket refusal can hide a missing rule** — deleting legacy `delegate`'s revealed
+   that a bare `(func (delegate 0))` had never been checked.
+4. **Dead code.** ⚠️ **The C ABI changes this check.** ~77 exports are reached **only from C** and will
+   look unused to any Zig-side reachability judgement. **`tests/wazmrt_abi_symbols.c` is the authority on
+   what must exist** — grep-verify against it before deleting anything.
+5. **Missing documentation.** Consider making it mechanical rather than aspirational, on the public
+   surface at least. **A rule nobody has watched fail is not enforcement** — the same argument that
+   turned the ABI version into a real gate. The version-string drift in `releasing.md` (four copies, no
+   test) is a ready-made instance.
+
+#### B-a — The EMITTER audit: forms reconstructed from partial facts `[ ]`
+
+**A named sub-task because in `wasmrt` this exact mechanism produced FOUR defects and every one was found
+by accident** — by some *other* check happening to read a field the emitter had dropped. wazmrt has the
+same shape (`sexpr.zig` → `wat.zig` parse records facts; the emitter reconstructs the binary form from a
+**subset** of them), so the same audit applies and nothing has ever looked for it here directly.
+
+The failure is not a crash: the output is a **valid module — just not the module the text described.**
+It is the silent-wrong-output class arriving through the toolchain rather than the engine, which is why
+"the tests pass" says nothing about it. wasmrt's four dropped facts were an element-segment reftype,
+type finality (`sub` vs `sub final`), rec-group extent, and *that an instruction has an immediate at all*.
+
+**Two mechanical checks, not a read-through:**
+
+- **A round-trip property test.** Assemble text → decode the bytes → compare the decoded module against
+  what the **parser** recorded (type defs, finality, rec-group extents, segment modes and reftypes,
+  limits flags, memory indices, global mutability). **Any field the parser fills and the decoder cannot
+  recover is, by definition, a fact the emitter dropped.** Run it over the whole `.wast` corpus — it is a
+  strictly stronger statement than the conformance number, which only says the modules *behave*.
+- **A field-coverage sweep.** For every field the parser records, grep whether the emitter reads it. Two
+  of wasmrt's four were *unread fields*: the parser had the information and threw it away.
+
+**Then the shorthand review.** Every binary form with more than one legal encoding can recur this, because
+choosing the shorthand is only safe when it is semantics-preserving: element segments (8 flag forms),
+data segments (active / passive / active-with-memidx), limits flags (`shared`, `is64`, has-max), memargs
+(alignment, offset, the memory-index flag), block types (empty / valtype / typeidx), and table definitions
+(init-expr vs the inline `(elem …)` shorthand).
+
+**Gate:** the round-trip test exists and is green over the whole corpus; every parser-recorded field is
+either read by the emitter or documented as deliberately not emitted; suite and corpus counts do not
+regress. **Expect it to find something** — the mechanism is 4-for-4 in the sibling project.
+
+---
+
+### ⚡ Track O — Optimization review (a DISCUSSION, not a blind pass). `1.0.3` `[ ]`
+
+**Deliverable: options with measurements and trade-offs, then a decision.** Scope: faster and smaller,
+**judged at the artifact boundary** — the CLI exe, the static lib, the DLL, the freestanding `wasm32`
+build, and the C ABI's own call overhead. **A change that wins a microbenchmark and moves none of those
+has not earned its complexity.**
+
+- **Blocked on H4's baselines.** Non-negotiable: every proposal is stated as a delta against a recorded
+  number, or it is an opinion.
+- **The size gate is the referee.** Speed and `ReleaseSmall` genuinely pull against each other, so
+  **every optimization pays its way in measured bytes** against the ceilings. Reject on measured
+  bytes-per-percent, never on a prior assumption about which regime matters.
+- **Invariants that constrain what may be PROPOSED** (breaking one is a decision gate, not an
+  optimization): **zero third-party dependencies**, **`ReleaseSmall` as the shipped mode**, the **EXACT
+  size ceilings**, the **frozen C ABI at `abi_version() == 2`** (a boundary change bumps it *and* the
+  major version — see `releasing.md`), **zero conformance failures and an EMPTY baseline**, and the
+  per-proposal feature gating Track F built.
+- **Candidates to evaluate, not a commitment:** dispatch shape in `interp.zig`; **A → A.5**
+  (partial evaluation + superinstructions — the owner explicitly kept this in scope and it is largely a
+  *decode-time* transformation, so it can buy throughput at measurable size cost); **Option B** (register
+  machine) as the bigger bet, measured the same way; per-instruction decode cost against a denser IR;
+  allocation churn on hot paths; whether the C ABI marshals more than it must; and the parked
+  **`-Dgc=false`-style comptime per-proposal gating**, which is a *size* lever the size gate can price.
+- ⚠️ **Fairness rule for any comparative benchmark (binding): compare against wasmtime configured for
+  FAST START** (`OptLevel::None` or Winch), not only `OptLevel::Speed`. Beating a runtime in its
+  slowest-starting configuration proves nothing and dies on first contact with anyone who checks.
+- ⚠️ **~90% of the CLI benchmark is process spawn.** Measure the engine pipeline with spawn excluded
+  (`zig build phases`), or the number is about Windows, not about wazmrt.
+
+**Gate:** for each accepted change, a measured before/after on the artifact(s) it targets; the full gate
+set green with counts diffed; ceilings updated with the reason recorded. **Reject anything that trades a
+recorded invariant for a number** unless the owner takes that decision explicitly.
+
+---
+
+### 🔓 Track S — Security review: find the penetration surfaces, recommend the plugs. `1.0.4` `[ ]`
+
+**A review-and-recommend phase, like O** — findings + recommended mitigations **with their costs**,
+presented for a decision. **Do not unilaterally harden:** the obvious mitigations trade against zero
+dependencies, `ReleaseSmall` and the size ceilings, and those trades are the owner's.
+
+**Three distinct adversaries — conflating them is how a review misses things:**
+
+1. **A hostile GUEST module.** The main one; running untrusted code is wazmrt's entire job.
+2. **A hostile INPUT to the tooling** — a malformed `.wasm`/`.wat`/`.wast` fed to the decoder, validator
+   or text front end, **possibly never executed**. This adversary reaches the lexer and parser, which is
+   where the last unrun-file surprise lived.
+3. **A careless or hostile EMBEDDER** misusing the C ABI. Distinct from (1), and the only adversary that
+   meets handle lifetimes, ownership rules and raw pointers.
+
+#### S-a — The METHOD: sweep an INVARIANT across every entry point, never one site at a time
+
+**The bug is always "three of the four do X".** It is not a hypothesis — it is this project's record:
+
+| invariant | held at | missing at |
+| --- | --- | --- |
+| validate before executing | the C ABI, WASI, summarize | **three wazmrt entry points** (found via the sibling project, 2026-08-10) |
+| a value handle carries its issuing store | the C ABI, by design | core, until it was fixed |
+| a feature gate actually refuses | validate | **the CLI**, until Track F |
+
+So the method is **not** "audit file by file". It is: **name an invariant, enumerate EVERY entry point in
+a table, check the property at each.** One table per invariant. Candidates worth a table each:
+validation before execution; **bounds-checking every guest-derived index**; store/handle tagging on every
+C-ABI handle; **resource ceilings honoured on every allocation path** (shared with H2); the
+`-Dwat`/`-Dwasi` build combinations (a feature-gated arm that silently no-ops is the same class); and
+**pin/signature verification on every path that executes bytes**.
+
+#### S-b — The surfaces this project already knows about
+
+- 🔒 **`ReleaseSmall` ships without Zig's safety checks.** This is the single biggest input to the threat
+  model and it is a *decided* trade, not an oversight. S's job is to say what it costs and whether any
+  path needs a check that survives it — H1 is the inventory, S is the judgement.
+- ⚠️ **Unbounded execution (H3).** If H3 decided "the embedder must bound it", S records that as an
+  accepted risk **with the mitigation an embedder is expected to implement**, not as a silent gap.
+- **The WASI sandbox.** `test-security` must be **3/3 from an NTFS cwd** — ⚠️ **a SKIP here is a
+  FAILURE**, and this is exactly the track where a self-skipping escape test is worthless. Do not accept
+  a `D:`-cwd run's numbers as evidence about the sandbox; they are evidence about the filesystem.
+- **The verification path** (`pin.zig`, `sign.zig`). The TOCTOU window is closed by construction — the
+  gate hashes the **in-memory buffer it runs** and never re-reads the file. Confirm that property still
+  holds at every call site, and check what happens on the paths that **skip** verification.
+- **The C ABI's lifecycle rules.** Use-after-free and refcount defects have already been found here by a
+  lifecycle fuzz; the ABI-2 value-handle design exists *because* of them. Re-run that reasoning against
+  the current 77-function surface.
+- **The accepted LANGUAGE is a control** (`security-model.md`, Track F): a smaller accepted feature set is
+  a smaller TCB. Check the default set is the one the threat model wants, on **every** front end.
+
+**Gate:** every invariant table completed (no "spot-checked"); every finding written up with its
+adversary, its `file:line`, a concrete exploitation sketch, and a **costed** mitigation; `test-security`
+3/3 from NTFS with zero skips; `security-model.md` updated to describe the surfaces as reviewed, including
+the accepted risks and *why* they were accepted. **An accepted risk that is written down is a result; an
+unexamined one is the finding.**
+
+---
+
 ## 🏁 CURRENT PROGRAM (owner, 2026-08-11) — smallest + fastest-starting, and self-owned
 
 **The competitive frame, stated by the owner:** `wasmrt` (the Rust port) and `wazmrt` are **in

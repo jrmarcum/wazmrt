@@ -51,6 +51,34 @@ handling: a large, error-prone, Windows-specific lift out of all proportion to `
 **Reopens when:** Zig implements `Dir.hardLink` on Windows — so **recheck on every Zig upgrade**,
 along with the other two holes in that family.
 
+🔁 **RE-TESTED 2026-08-19 (Track H, H6) — condition still NOT met, and it was checked at the SOURCE.**
+Zig is still `0.16.0`, but a version number is not the condition and the SD-3 lesson below is exactly
+that: `lib/std/Io/Threaded.zig:9509` still reads `if (is_windows) return error.OperationUnsupported;` —
+**the same line this entry cites, unchanged.** SD-2 stays open. *(Method note: `hardLink` no longer
+appears in `Threaded.zig` under that name — the vtable entry is `dirHardLink`, and grepping for the
+public `Io.Dir.hardLink` spelling alone finds nothing and could easily be misread as "it's gone,
+therefore reopened". Follow the vtable, not the public name.)*
+
+
+### 🟡 H1-a / H1-b — two `unreachable`s that are safe TODAY by construction, not by check (Track H, 2026-08-19)
+
+**Neither is a defect and neither is reachable now.** They are logged because both are one edit away
+from being silent UB in the **shipped** build — `ReleaseSmall` compiles `unreachable` to nothing, so
+the failure mode is not a panic but undefined behaviour.
+
+| # | site | why it holds | what would break it |
+| --- | --- | --- | --- |
+| **H1-a** | `types.zig` — `refHeap` switches a **2-bit** kind field (4 possible values) over **3** arms with `else => unreachable` | `concreteRefEx` is the **only** constructor of a concrete ref and it writes 0/1/2 | any second constructor, or a future heap kind (`exn`, `cont`) taking a concrete form |
+| **H1-b** | `interp.zig` — `else => unreachable` closing the memory-op dispatch | the caller pre-narrows `op` to the memory set | a **new memory opcode** added to the set without an arm — the shape that has bitten this project four times as "the emitter dropped a fact nobody read" |
+
+**Deliberately NOT "fixed" by turning them into errors.** Both are genuine invariants, and converting a
+a real invariant into a runtime branch costs bytes in a build whose size is gated to the byte, for a case
+that cannot occur. ⚠️ **The cost of being wrong is asymmetric, though**, which is why they are written
+down rather than left implicit.
+
+**REOPEN CONDITION — check H1-a when adding any `RefHeap` variant or any second concrete-ref
+constructor; check H1-b when adding a memory opcode.** Both are grep-able in seconds: `concreteRefEx`
+and the memory-op switch respectively.
 ### ✅ SD-3 — RETIRED 2026-08-18. `delegate` is implemented; **there are only TWO Standing Deltas**
 
 **The legacy exception-handling `delegate` instruction executes.** Track L shipped it the same day

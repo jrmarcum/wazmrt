@@ -106,6 +106,61 @@ pub const default_max_memory_bytes: usize = 1 << 30;
 /// across all DEFINED tables (imported tables are host-supplied, already sized).
 pub const default_max_table_elems: usize = 1 << 27;
 
+/// Cap on guest ITERATIONS per top-level invocation — the backstop against a
+/// guest that never returns. Track H, 2026-08-19 (owner: *"we do not want an
+/// infinite loop on purpose or by accident"*).
+///
+/// **One iteration = one loop back-edge, or one tail-call hop.** Those are the
+/// only two ways a guest can execute unboundedly:
+///
+///   - **A loop back-edge** — every backward jump is a branch to a `loop` label,
+///     and `Frame.branch` already distinguishes those (`label.is_loop`) to decide
+///     how to pop the label stack, so the tick rides a test that was there anyway.
+///   - **A tail-call hop** — ⚠️ **the one a back-edge-only design misses.** A
+///     `return_call` to a locally-defined function deliberately REUSES the native
+///     frame (the trampoline in `callFunction`), so `(func $f (return_call $f))`
+///     never branches and never grows call depth: `max_call_depth` cannot see it.
+///
+/// Everything else is already bounded — recursion by `max_call_depth`, eager
+/// table/GC/memory allocation by their own ceilings, and every bulk op by the
+/// size of the thing it walks.
+///
+/// 🔒 **Why a COUNT and not a clock.** A wall-clock deadline makes a module trap
+/// on a slow machine and pass on a fast one; `default_max_call_depth` above
+/// records the same principle for the same reason — *a program must not trap in
+/// one build and run in another*. A count traps identically everywhere, keeps the
+/// conformance corpus reproducible, and needs neither a thread nor a clock, which
+/// matters because the `wasm32-freestanding` target has neither. (An
+/// epoch/interrupt flag, the other candidate, only DELIVERS a decision someone
+/// else made — with no watchdog to set it, it never fires.)
+///
+/// ⚠️ **This bounds non-termination; it does not detect an infinite loop.** That
+/// is not a thing that can be detected. The trap says the budget was exhausted,
+/// and the message must say that too.
+///
+/// **The number is MEASURED, not guessed** — the 284-file corpus was run at
+/// descending budgets until it broke (2026-08-19):
+///
+/// | budget | corpus |
+/// | --- | --- |
+/// | `1 << 20` (1,048,576) | ✅ 63,934 passed |
+/// | `1 << 18` (262,144) | ❌ 11 failed — **only** `return_call`, `return_call_indirect`, `return_call_ref` |
+/// | `1 << 14` (16,384) | ❌ 36 failed across 8 files (the tail-call trio + `memory_copy`/`fill`/`grow64`) |
+///
+/// So the heaviest LEGITIMATE workload the spec suite contains is the tail-call
+/// family — `return_call.wast` asks for **a million hops in one invocation**, and
+/// it fits under `1 << 20` with under 5% to spare. The default is therefore set
+/// ~1000x above that measured peak: high enough that no plausible real workload
+/// meets it, finite enough that a runaway still stops.
+///
+/// ⚠️ **The corpus is a live gate on this number, by design** — `wast.zig`'s
+/// `isRuntimeTrap` deliberately does NOT admit this error, so a budget set too low
+/// makes conformance FAIL loudly instead of banking the timeout as the trap an
+/// assertion was asking for.
+///
+/// `0` disables the budget (the counter is filled to `maxInt(u64)` instead).
+pub const default_max_iterations: u64 = 1 << 30;
+
 /// Cap on live GC objects per instance. There is no collector (a documented
 /// proposal-scope decision), so `struct.new`/`array.new` in a loop grows the
 /// heap for the whole instance lifetime — an unbounded host allocation driven
@@ -236,6 +291,11 @@ pub const Error = Module.Error || error{
     IntOverflow,
     /// Recursion exceeded the interpreter's call-depth limit.
     CallStackExhausted,
+    /// The guest exhausted its iteration budget — a loop or a tail-call chain
+    /// that ran past `max_iterations` without returning. See
+    /// `default_max_iterations`; this is the backstop against a guest that never
+    /// terminates, not a claim that an infinite loop was proved.
+    IterationLimitExceeded,
     /// No exported function with the requested name.
     UndefinedExport,
     /// Wrong number of arguments for the invoked function.
@@ -917,6 +977,15 @@ pub const Instance = struct {
     max_gc_objects: usize = default_max_gc_objects,
     max_exn_boxes: usize = default_max_exn_boxes,
     max_call_depth: usize = default_max_call_depth,
+    /// Iteration ceiling for one top-level invocation (`0` = unlimited). See
+    /// `default_max_iterations`.
+    max_iterations: u64 = default_max_iterations,
+    /// Live countdown for the invocation in flight, refilled from `max_iterations`
+    /// on TOP-LEVEL entry only. Re-entry (a host callback calling back in) shares
+    /// the remaining budget rather than restarting it — the same reasoning as
+    /// `reentry_depth`, and for the same reason: a guest that can refill its own
+    /// budget by bouncing through a host function has no budget.
+    iterations_left: u64 = 0,
     /// Ceiling on total defined-table entries, carried so `table.grow` enforces the
     /// same budget instantiation did.
     max_table_elems: usize,
@@ -1072,6 +1141,9 @@ pub const Instance = struct {
         max_gc_objects: usize = default_max_gc_objects,
         max_exn_boxes: usize = default_max_exn_boxes,
         max_call_depth: usize = default_max_call_depth,
+        /// Iteration ceiling per top-level invocation (`0` = unlimited). See
+        /// `default_max_iterations`.
+        max_iterations: u64 = default_max_iterations,
         /// Ceiling on total defined-table entries, summed over all defined tables
         /// and enforced again by `table.grow`. See `default_max_table_elems`.
         max_table_elems: usize = default_max_table_elems,
@@ -1405,6 +1477,7 @@ pub const Instance = struct {
                     .gc_heap = &gc_heap,
                     .gpa = gpa,
                     .store_slot = store_slot,
+                    .max_gc_objects = imports.max_gc_objects,
                 }, init_expr);
             }
         }
@@ -1515,6 +1588,7 @@ pub const Instance = struct {
                         .gc_heap = &gc_heap,
                         .gpa = gpa,
                         .store_slot = store_slot,
+                        .max_gc_objects = imports.max_gc_objects,
                     }, ie) catch |e| {
                         gpa.free(entries);
                         return e;
@@ -1563,6 +1637,7 @@ pub const Instance = struct {
                 .gc_heap = &gc_heap,
                 .gpa = gpa,
                 .store_slot = store_slot,
+                .max_gc_objects = imports.max_gc_objects,
             }, ex);
             dropped.* = elem.mode != .passive;
         }
@@ -1588,6 +1663,7 @@ pub const Instance = struct {
             .max_gc_objects = imports.max_gc_objects,
             .max_exn_boxes = imports.max_exn_boxes,
             .max_call_depth = imports.max_call_depth,
+            .max_iterations = imports.max_iterations,
             .tables = tables,
             .imported_tables = n_imported_tables,
             .elem_values = elem_values,
@@ -1734,6 +1810,17 @@ pub const Instance = struct {
         self.trap_len = 0;
         self.trap_depth = 0;
         self.pending_exn = null;
+
+        // Refill the iteration budget on TOP-LEVEL entry only. A re-entry (host
+        // callback calling back in) inherits whatever is left, for exactly the
+        // reason the depth budget is carried in below: a guest that can restart
+        // its own budget by bouncing through a host function does not have one.
+        // `0` means unlimited, and it is expressed by filling the counter rather
+        // than by branching in the hot path: the tick sites then have exactly one
+        // test each. maxInt(u64) back-edges is not reachable — at a billion a
+        // second it is ~584 years.
+        if (saved_depth == 0)
+            self.iterations_left = if (self.max_iterations == 0) std.math.maxInt(u64) else self.max_iterations;
 
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
@@ -2199,6 +2286,13 @@ pub const Instance = struct {
             try frame.run();
 
             if (frame.tail) |t| {
+                // TICK 2 of 2 for the iteration budget. ⚠️ **This is the tick a
+                // back-edge-only design misses.** A local `return_call` reuses this
+                // native frame by design, so a tail-call loop makes no backward
+                // branch and grows no call depth: without this, `(func $f
+                // (return_call $f))` runs forever past every other ceiling.
+                if (self.iterations_left == 0) return error.IterationLimitExceeded;
+                self.iterations_left -= 1;
                 cur_index = t.func_index;
                 cur_args = t.args;
                 continue;
@@ -2438,6 +2532,14 @@ const Frame = struct {
         if (from < label.stack_base) return error.StackUnderflow;
         std.mem.copyForwards(Value, self.vstack.items[label.stack_base..][0..label.arity], self.vstack.items[from..][0..label.arity]);
         self.vstack.shrinkRetainingCapacity(label.stack_base + label.arity);
+        // TICK 1 of 2 for the iteration budget (`default_max_iterations`). A
+        // branch to a LOOP label is a back-edge by construction — the label's
+        // target is the loop header — so this is every backward jump a guest can
+        // make, and it rides the `is_loop` test the next line needs anyway.
+        if (label.is_loop) {
+            if (self.inst.iterations_left == 0) return error.IterationLimitExceeded;
+            self.inst.iterations_left -= 1;
+        }
         // A loop-continue keeps the loop's own label; a forward exit pops it too.
         const keep = if (label.is_loop) self.labels.items.len - n else self.labels.items.len - (n + 1);
         self.labels.shrinkRetainingCapacity(keep);
@@ -4791,6 +4893,13 @@ const ConstCtx = struct {
     /// element initializer produces a funcref that names THAT instance. Null in
     /// the offset-only contexts, which cannot contain `ref.func`.
     store_slot: ?u32 = null,
+    /// 🔒 **The instance's CONFIGURED GC ceiling — H2, 2026-08-19.** Const-exprs
+    /// run before an `Instance` exists, so this path used to check
+    /// `default_max_gc_objects` directly and an embedder's lowered ceiling was
+    /// **silently ignored** for every object a global or element initializer
+    /// allocates. The default here preserves the old behaviour for the
+    /// offset-only contexts, which cannot allocate at all.
+    max_gc_objects: usize = default_max_gc_objects,
 };
 
 /// Evaluate a constant expression (§3.3.7, incl. the extended-const `i32`/`i64`
@@ -4886,11 +4995,18 @@ fn evalConstGc(ctx: ConstCtx, r: *Reader, stack: *[16]Value, sp: *usize) Error!v
     // instantiation is indistinguishable from one created at run time — which is
     // the property that keeps a global's initializer usable by an importer.
     const owner_slot = ctx.store_slot orelse return error.UnsupportedInstruction;
+    const cap = ctx.max_gc_objects;
     const alloc = struct {
-        fn f(h: *std.ArrayList(Instance.HeapObject), g: std.mem.Allocator, slot: u32, ti: u32, fields: []Value, desc: Value) Error!Value {
+        fn f(h: *std.ArrayList(Instance.HeapObject), g: std.mem.Allocator, slot: u32, ti: u32, fields: []Value, desc: Value, max: usize) Error!Value {
             const idx = h.items.len;
-            // A test helper with no Instance in hand, so it checks the default directly.
-            if (idx >= default_max_gc_objects) return error.GcHeapExhausted;
+            // 🔒 The INSTANCE's ceiling, threaded in via `ConstCtx` (H2,
+            // 2026-08-19). ⚠️ This used to read `default_max_gc_objects`
+            // directly, under a comment calling it "a test helper with no
+            // Instance in hand" — but this path runs during REAL instantiation
+            // (three call sites in `instantiateWithImports`), so an embedder that
+            // lowered `max_gc_objects` for untrusted code had that ceiling
+            // ignored for every object a global or element initializer allocates.
+            if (idx >= max) return error.GcHeapExhausted;
             try h.append(g, .{ .type_index = ti, .fields = fields, .descriptor = desc });
             return gcRefValue(slot, @intCast(idx));
         }
@@ -4924,7 +5040,7 @@ fn evalConstGc(ctx: ConstCtx, r: *Reader, stack: *[16]Value, sp: *usize) Error!v
                 for (fs, 0..) |f, k| obj[k] = packField(f.storage, stack[base + k]);
                 sp.* = base;
             } else for (fs, 0..) |f, k| obj[k] = if (f.storage.unpacked().isRef()) null_ref else 0;
-            try pushConst(stack, sp, try alloc(heap, gpa, owner_slot, ti, obj, desc));
+            try pushConst(stack, sp, try alloc(heap, gpa, owner_slot, ti, obj, desc, cap));
         },
         0x06, 0x07 => { // array.new / array.new_default
             const ti = try r.readVarU32();
@@ -4937,14 +5053,14 @@ fn evalConstGc(ctx: ConstCtx, r: *Reader, stack: *[16]Value, sp: *usize) Error!v
                 sp.* -= 2;
                 const obj = try arena.alloc(Value, len);
                 @memset(obj, init_v);
-                try pushConst(stack, sp, try alloc(heap, gpa, owner_slot, ti, obj, null_ref));
+                try pushConst(stack, sp, try alloc(heap, gpa, owner_slot, ti, obj, null_ref, cap));
             } else {
                 if (sp.* < 1) return error.StackUnderflow;
                 const len = @as(u32, @bitCast(asI32(stack[sp.* - 1])));
                 sp.* -= 1;
                 const obj = try arena.alloc(Value, len);
                 @memset(obj, if (f.storage.unpacked().isRef()) null_ref else 0);
-                try pushConst(stack, sp, try alloc(heap, gpa, owner_slot, ti, obj, null_ref));
+                try pushConst(stack, sp, try alloc(heap, gpa, owner_slot, ti, obj, null_ref, cap));
             }
         },
         0x08 => { // array.new_fixed <type> <n>
@@ -4956,7 +5072,7 @@ fn evalConstGc(ctx: ConstCtx, r: *Reader, stack: *[16]Value, sp: *usize) Error!v
             const base = std.math.sub(usize, sp.*, n) catch return error.StackUnderflow;
             for (0..n) |k| obj[k] = packField(f.storage, stack[base + k]);
             sp.* = base;
-            try pushConst(stack, sp, try alloc(heap, gpa, owner_slot, ti, obj, null_ref));
+            try pushConst(stack, sp, try alloc(heap, gpa, owner_slot, ti, obj, null_ref, cap));
         },
         0x1c => { // ref.i31 — tag the low 31 bits, non-null (no allocation)
             if (sp.* < 1) return error.StackUnderflow;
@@ -6704,5 +6820,165 @@ test "wide-arithmetic: the (lo, hi) operand order, which NO type check can catch
         defer std.testing.allocator.free(r);
         try std.testing.expectEqual(@as(i64, 0), asI64(r[0])); // lo
         try std.testing.expectEqual(@as(i64, 1), asI64(r[1])); // hi = 1 → 2^64
+    }
+}
+
+test "H3: the iteration budget stops BOTH shapes of non-termination" {
+    // 🔒 **THE INVERSION TEST FOR THE BUDGET, AND IT NEEDS TWO CASES, NOT ONE.**
+    // A guest can run forever in exactly two ways, and a design that ticks only
+    // the obvious one ships a limit with a hole in it:
+    //
+    //   1. a LOOP BACK-EDGE — the obvious one;
+    //   2. a TAIL CALL — `return_call` to a locally-defined function REUSES the
+    //      native frame on purpose (the trampoline in `callFunction`), so it
+    //      makes no backward branch and grows NO call depth. `max_call_depth`
+    //      cannot see it, and neither can a back-edge-only counter.
+    //
+    // ⚠️ Case 2 is the whole reason this test exists in this shape. If the tail
+    // tick is ever deleted, case 1 keeps passing and the runtime hangs on case 2
+    // — which is exactly what "the tests still pass" looks like when a gate has
+    // been quietly removed.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const wat = @import("wat.zig");
+
+    const bytes = try wat.assemble(a,
+        \\(module
+        \\  (func (export "spin") (result i32)
+        \\    (loop (br 0))
+        \\    (i32.const 42))
+        \\  (func $t (export "tailspin") (result i32)
+        \\    (return_call $t))
+        \\  (func (export "count") (param $n i32) (result i32)
+        \\    (local $i i32)
+        \\    (block $done
+        \\      (loop $again
+        \\        (br_if $done (i32.ge_s (local.get $i) (local.get $n)))
+        \\        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        \\        (br $again)))
+        \\    (local.get $i)))
+    );
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
+    defer destroy(&inst);
+
+    inst.max_iterations = 1000;
+    try std.testing.expectError(error.IterationLimitExceeded, inst.invoke("spin", &.{}));
+    try std.testing.expectError(error.IterationLimitExceeded, inst.invoke("tailspin", &.{}));
+
+    // The other direction, and it is not optional: a limit that traps everything
+    // is as broken as one that traps nothing. 5,000 back-edges under a 100,000
+    // budget must produce the ANSWER, not a trap.
+    inst.max_iterations = 100_000;
+    {
+        const r = try inst.invoke("count", &.{i32Value(5000)});
+        defer std.testing.allocator.free(r);
+        try std.testing.expectEqual(@as(i32, 5000), asI32(r[0]));
+    }
+    // ... and the same call under a budget SMALLER than the work must trap, which
+    // is what proves the counter is counting this loop and not something else.
+    inst.max_iterations = 1000;
+    try std.testing.expectError(error.IterationLimitExceeded, inst.invoke("count", &.{i32Value(5000)}));
+
+    // `0` = unlimited. Expressed by filling the counter to maxInt at refill, so
+    // the tick sites keep exactly one test each.
+    inst.max_iterations = 0;
+    {
+        const r = try inst.invoke("count", &.{i32Value(5000)});
+        defer std.testing.allocator.free(r);
+        try std.testing.expectEqual(@as(i32, 5000), asI32(r[0]));
+    }
+}
+
+test "H3: the budget REFILLS per top-level call and is not consumed cumulatively" {
+    // A budget that is spent once and never refilled would let the first call
+    // succeed and fail every later one — a runtime that gets slower and then
+    // stops, with no diagnosis. Three identical calls, each needing most of the
+    // budget, must all succeed.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const wat = @import("wat.zig");
+
+    const bytes = try wat.assemble(a,
+        \\(module
+        \\  (func (export "count") (param $n i32) (result i32)
+        \\    (local $i i32)
+        \\    (block $done
+        \\      (loop $again
+        \\        (br_if $done (i32.ge_s (local.get $i) (local.get $n)))
+        \\        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        \\        (br $again)))
+        \\    (local.get $i)))
+    );
+    var inst: Instance = undefined;
+    try instantiate(&inst, bytes);
+    defer destroy(&inst);
+
+    inst.max_iterations = 1200;
+    for (0..3) |_| {
+        const r = try inst.invoke("count", &.{i32Value(1000)});
+        defer std.testing.allocator.free(r);
+        try std.testing.expectEqual(@as(i32, 1000), asI32(r[0]));
+    }
+}
+
+test "H2: a CONFIGURED gc ceiling binds the const-expr path, not just the run path" {
+    // 🔒 **THE INVARIANT-SWEEP FINDING, 2026-08-19 (Track H2).** `max_gc_objects`
+    // had TWO enforcement sites and they did not agree: `Instance.allocObject`
+    // checked `self.max_gc_objects` (the embedder's configured value), while the
+    // const-expr allocator in `evalConstGc` checked `default_max_gc_objects` —
+    // the CONSTANT — under a comment calling it "a test helper with no Instance
+    // in hand". It is not a test helper: it runs during real instantiation, from
+    // three call sites in `instantiateWithImports`.
+    //
+    // ⚠️ **The consequence was a security control that silently did not apply.**
+    // An embedder hardening an untrusted workload with
+    // `wazmrt_config_set_max_gc_objects(cfg, small)` still allowed up to the
+    // 16 Mi default for every object a GLOBAL or ELEMENT initializer allocates —
+    // and a module chooses how many of those it has.
+    //
+    // 🎓 The shape is the one the sweep method predicts and that this project has
+    // now hit repeatedly: **"three of the four do X"**. Nothing here was a wrong
+    // computation; one site out of two simply read a different variable.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const wat = @import("wat.zig");
+
+    // Three objects, all allocated by GLOBAL INITIALIZERS — i.e. before any
+    // guest instruction runs, on the path that ignored the ceiling.
+    const bytes = try wat.assemble(a,
+        \\(module
+        \\  (type $s (struct))
+        \\  (global (ref $s) (struct.new $s))
+        \\  (global (ref $s) (struct.new $s))
+        \\  (global (ref $s) (struct.new $s)))
+    );
+
+    // Under a ceiling of 2, the third must be refused.
+    {
+        const m = try std.testing.allocator.create(Module);
+        defer std.testing.allocator.destroy(m);
+        m.* = try Module_decode(std.testing.allocator, bytes);
+        defer m.deinit();
+        var inst: Instance = undefined;
+        try std.testing.expectError(
+            error.GcHeapExhausted,
+            inst.instantiateWithImports(std.testing.allocator, m, .{ .max_gc_objects = 2 }),
+        );
+    }
+
+    // …and the other direction, so this cannot pass by refusing everything: the
+    // same module under a ceiling of 3 instantiates.
+    {
+        const m = try std.testing.allocator.create(Module);
+        defer std.testing.allocator.destroy(m);
+        m.* = try Module_decode(std.testing.allocator, bytes);
+        defer m.deinit();
+        var inst: Instance = undefined;
+        try inst.instantiateWithImports(std.testing.allocator, m, .{ .max_gc_objects = 3 });
+        inst.deinit();
     }
 }

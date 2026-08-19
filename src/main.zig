@@ -120,7 +120,31 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
     const path = args[argi];
     // Everything after the module path: the export selector, the WASI flags, the guest's argv.
     // With no leading `--features` this is exactly the `args[2..]` it replaced.
-    const rest = args[argi + 1 ..];
+    var rest = args[argi + 1 ..];
+
+    // `--max-iterations <n>` (Track H) is consumed HERE, before the mode dispatch,
+    // and not in `runWasi` alongside the other ceilings. Reason: run mode selects
+    // on `rest[0]` naming an export, so a flag left in place would silently push
+    // `wazmrt m.wasm --max-iterations 100 myfunc` into WASI mode — and the hint the
+    // trap prints would then name a flag that did not work on the path that
+    // printed it. One parse site, both paths. `0` = no limit.
+    var max_iterations: u64 = wazmrt.interp.default_max_iterations;
+    {
+        const region = flagRegion(rest);
+        var i: usize = 0;
+        while (i + 1 < region.len) : (i += 1) {
+            if (!std.mem.eql(u8, region[i], "--max-iterations")) continue;
+            max_iterations = parseSize(region[i + 1]) orelse {
+                try out.print("error: --max-iterations '{s}': expected a count like 1M or 100000 (0 = no limit)\n", .{region[i + 1]});
+                return exit_failure;
+            };
+            const spliced = try arena.alloc([:0]const u8, rest.len - 2);
+            @memcpy(spliced[0..i], rest[0..i]);
+            @memcpy(spliced[i..], rest[i + 2 ..]);
+            rest = spliced;
+            break;
+        }
+    }
     var bytes: []const u8 = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 << 20)) catch |e| {
         try out.print("error: cannot read '{s}': {s}\n", .{ path, @errorName(e) });
         return exit_failure;
@@ -216,13 +240,13 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
     // A trailing arg only selects an export if it actually names one; otherwise
     // it belongs to the WASI command below (`--dir …`, guest argv, …).
     if (rest.len >= 1 and findExport(&module, rest[0]) != null) {
-        return try runFunction(arena, out, &module, rest[0], rest[1..]);
+        return try runFunction(arena, out, &module, rest[0], rest[1..], max_iterations);
     }
 
     // WASI command: `wazmrt <module.wasm> [--dir <host>[:<guest>]]... [args...]`
     // runs `_start` with the `wasi_snapshot_preview1` host imports wired up.
     if (findExport(&module, "_start")) |start_index| {
-        const code = runWasi(arena, io, out, &module, path, start_index, rest) catch |e| {
+        const code = runWasi(arena, io, out, &module, path, start_index, rest, max_iterations) catch |e| {
             if (e != AlreadyReported) try out.print("trap: {s}\n", .{@errorName(e)});
             return exit_failure; // a trap is a failed run
         };
@@ -449,6 +473,8 @@ fn printHelp(out: *Io.Writer, prog: []const u8) !void {
         \\  --max-memory <size>         linear-memory ceiling for a WASI command (default 1G; e.g. 512M, 2G)
         \\                              the default ceiling applies to every run mode
         \\  --max-table-elems <count>   table-entry ceiling (default 128M; e.g. 1M, 100000)
+        \\  --max-iterations <count>    stop a guest that never returns (default 1G; 0 = no limit)
+        \\                              one iteration = one loop back-edge or one tail call
         \\  --                          end wazmrt flags; the rest is the guest's argv
         \\
         \\VERIFICATION FLAGS (authenticity — see the pin DB / signatures)
@@ -729,7 +755,7 @@ fn defaultPinsPath() []const u8 {
 /// verification. This mirrors exactly the run `runWasi` consumes, so the two
 /// agree on where our flags stop and the guest's argv begins.
 fn flagRegion(rest: []const []const u8) []const []const u8 {
-    const two = [_][]const u8{ "--dir", "--ro-dir", "--env", "--verify", "--pins", "--max-memory", "--max-table-elems" };
+    const two = [_][]const u8{ "--dir", "--ro-dir", "--env", "--verify", "--pins", "--max-memory", "--max-table-elems", "--max-iterations" };
     const one = [_][]const u8{ "--no-verify", "--yes" };
     var i: usize = 0;
     outer: while (i < rest.len) {
@@ -985,6 +1011,18 @@ fn printTrap(
     e: anyerror,
 ) !void {
     try out.print("trap: {s}\n", .{@errorName(e)});
+    // The iteration budget is the one trap whose name does not tell the user what
+    // to DO, and it is the one most likely to be hit by accident, so it gets a
+    // sentence. ⚠️ It says "did not terminate within", not "infinite loop": the
+    // budget bounds non-termination, it does not prove it — a legitimately
+    // long-running module trips the same trap and its owner needs to know that
+    // raising the ceiling is the right answer.
+    if (e == error.IterationLimitExceeded)
+        try out.print(
+            "  the guest did not terminate within {d} iterations (loop back-edges + tail calls)\n" ++
+                "  raise it with --max-iterations <n>, or --max-iterations 0 for no limit\n",
+            .{inst.max_iterations},
+        );
     const frames = inst.trapFrames();
     if (frames.len == 0) return; // never reached wasm code (bad arity, say)
 
@@ -1033,6 +1071,7 @@ fn runWasi(
     path: []const u8,
     start_index: u32,
     wasi_args: []const [:0]const u8,
+    max_iterations: u64,
 ) !u32 {
     const interp = wazmrt.interp;
 
@@ -1145,7 +1184,7 @@ fn runWasi(
     }
 
     var inst: interp.Instance = undefined;
-    try inst.instantiateWithImports(arena, module, .{ .funcs = funcs.items, .max_memory_bytes = max_memory, .max_table_elems = max_table_elems });
+    try inst.instantiateWithImports(arena, module, .{ .funcs = funcs.items, .max_memory_bytes = max_memory, .max_table_elems = max_table_elems, .max_iterations = max_iterations });
     defer inst.deinit();
     wasi.memory = inst.memory0(); // module memory now exists
 
@@ -1173,6 +1212,7 @@ fn runFunction(
     module: *const wazmrt.Module,
     name: []const u8,
     arg_strings: []const [:0]const u8,
+    max_iterations: u64,
 ) !u8 {
     const interp = wazmrt.interp;
 
@@ -1221,6 +1261,10 @@ fn runFunction(
         return exit_failure;
     };
     defer inst.deinit();
+    // `instantiate` takes no options (that is `instantiateWithImports`), so the
+    // iteration ceiling is applied to the built instance. It is read at each
+    // top-level `invokeIndex`, so setting it here is in time.
+    inst.max_iterations = max_iterations;
 
     inst.runStart() catch |e| {
         try out.print("trap: start: ", .{});

@@ -1212,11 +1212,20 @@ fn isRuntimeTrap(e: anyerror) bool {
         error.CallStackExhausted,
         error.UncaughtException, // an uncaught exception traps (EH proposal)
         => true,
-        // Deliberately NOT listed: `error.GcHeapExhausted` and
-        // `error.ExnStoreExhausted`. Both are OUR resource caps, not §4.2 traps —
+        // Deliberately NOT listed: `error.GcHeapExhausted`,
+        // `error.ExnStoreExhausted` and — added with the budget itself, Track H —
+        // `error.IterationLimitExceeded`. All are OUR resource caps, not §4.2 traps —
         // admitting them here would let a module that merely allocates a lot (or
-        // catches a lot) satisfy an `assert_trap` meant for real trapping
-        // behaviour, which is exactly what this filter prevents.
+        // catches a lot, or LOOPS a lot) satisfy an `assert_trap` meant for real
+        // trapping behaviour, which is exactly what this filter prevents.
+        // ⚠️ The budget's exclusion is load-bearing in a second way: it makes a
+        // conformance run a real measurement of the ceiling. If the corpus ever
+        // exhausts the budget, the run FAILS loudly instead of banking the
+        // timeout as the trap the assertion was asking for.
+        // *(`CallStackExhausted` IS listed, and the difference is deliberate:
+        // `call.wast`'s "runaway"/"mutual-runaway" cases exist precisely to make
+        // an engine's recursion cap fire. No spec test asks a compliant engine to
+        // loop forever, so there is no equivalent reason to admit this one.)*
         else => false,
     };
 }

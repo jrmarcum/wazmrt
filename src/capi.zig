@@ -269,6 +269,7 @@ pub const Config = struct {
     max_gc_objects: u64 = 0,
     max_exception_boxes: u64 = 0,
     max_call_depth: u32 = 0,
+    max_iterations: u64 = 0,
     features: root.features.Set = .{},
 };
 
@@ -334,6 +335,18 @@ export fn wazmrt_config_set_max_call_depth(c: ?*Config, n: u32) void {
     };
 }
 
+/// Iteration ceiling per top-level call — the backstop against a guest that never
+/// returns (one iteration = one loop back-edge or one tail-call hop). ⚠️ **`0`
+/// here means "leave at the default"**, like every other ceiling on this struct —
+/// it does NOT mean unlimited. An embedder that genuinely wants no limit passes
+/// `UINT64_MAX`, which needs no special case: the counter is a `u64` countdown, so
+/// that is ~584 years of iterations at a billion a second.
+export fn wazmrt_config_set_max_iterations(c: ?*Config, n: u64) void {
+    if (c) |cfg| if (n != 0) {
+        cfg.max_iterations = n;
+    };
+}
+
 /// Holds the configuration shared by the stores made from it, and must outlive them.
 pub const Engine = struct {
     /// Distinguishes stores made from different engines in diagnostics; not a security
@@ -361,6 +374,7 @@ pub const Engine = struct {
     max_gc_objects: usize = interp.default_max_gc_objects,
     max_exn_boxes: usize = interp.default_max_exn_boxes,
     max_call_depth: usize = interp.default_max_call_depth,
+    max_iterations: u64 = interp.default_max_iterations,
 
     /// Which proposals modules made through this engine may use. All-on by default, in which
     /// case the check short-circuits entirely.
@@ -418,6 +432,7 @@ export fn wazmrt_engine_new_with_config(c: ?*const Config, err_out: ?*?*Error) ?
     if (cfg.max_gc_objects != 0) e.max_gc_objects = cap(cfg.max_gc_objects);
     if (cfg.max_exception_boxes != 0) e.max_exn_boxes = cap(cfg.max_exception_boxes);
     if (cfg.max_call_depth != 0) e.max_call_depth = cfg.max_call_depth;
+    if (cfg.max_iterations != 0) e.max_iterations = cfg.max_iterations;
     e.features = cfg.features;
     return e;
 }
@@ -1880,6 +1895,7 @@ fn resolveImports(
         .max_gc_objects = lk.engine.max_gc_objects,
         .max_exn_boxes = lk.engine.max_exn_boxes,
         .max_call_depth = lk.engine.max_call_depth,
+        .max_iterations = lk.engine.max_iterations,
     };
     return null;
 }

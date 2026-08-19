@@ -81,6 +81,114 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
   validation**, which is strong evidence the type-checker is correct across real, deeply-nested
   control flow (not just the simple `wasm_mod` set).
 
+
+## 🏁 TRACK H FINAL SCORE (2026-08-19) — `1.0.1`
+
+| gate | result |
+| --- | --- |
+| conformance | **284 files · 63,934 passed · 0 failed · 0 skipped · 0 file-errors** (baseline still EMPTY) |
+| `test` (Debug) | **764/764** (was 758 — +4 iteration budget, +1 GC ceiling, +1 refill) |
+| `test-safe` (ReleaseSafe) | 764/764 |
+| **`test-shipped` (ReleaseSmall — the config that ships)** | 764/764 |
+| `test-security` | 3/3 from an NTFS cwd |
+| `features` · `capi-smoke` | green |
+| size (ReleaseSmall) | exe **991,744** · lib **1,053,908** · dll **900,608** — all three EXACT |
+
+**Size moved twice in the track, both recorded in `tools/size-ceilings.txt` with the reason:** the
+iteration budget (exe +1,024 · lib +512 · dll +0) and the GC-ceiling fix (exe +512 · lib +76 · dll +0).
+📏 **The DLL — the artifact the `universalWasmLoader-*` ports link — did not move at all, either time.**
+
+### ▶️ Execution is fuzzed now (H5) — and the corpus contains two runaways on purpose
+
+`fuzz.zig` invokes `_start` and every export on each mutated module under a 10,000-iteration budget.
+Two seeds **never terminate** (`(loop (br 0))` and `(func $f (return_call $f))`), so every run exercises
+the budget. The sweep asserts `r.executed > 100` alongside its existing decode/instantiate/assemble
+counters, so the target cannot silently degrade to fuzzing only the front half again.
+
+✅ **Inversion-proven, and this is the part worth keeping:** setting the fuzz budget to unlimited makes
+`zig build test` **hang** (killed at 120 s); restoring it returns to green. **H5 provably depends on
+H3** — delete the iteration budget and this file stops finishing instead of quietly passing.
+
+### The ceiling tests that did not exist before
+
+⚠️ **`max_gc_objects` was configurable, documented and completely untested** — which is how one of its
+two enforcement sites came to read the wrong variable. There is now a test that sets it low, asserts
+the refusal, then sets it high and asserts the success, on the **const-expr** path specifically. It is
+inversion-tested: reverting the one-line fix makes it fail (and leak, which is the const-expr path
+unwinding a partially built instance).
+
+🎓 **General rule this produced:** *for every knob an embedder can turn, one test turns it and proves
+both directions.* A knob tested in one direction only can be implemented as `return error` and pass.
+
+## 🆕 THE ITERATION BUDGET — how its default was measured (Track H3, 2026-08-19)
+
+The ceiling that stops a guest which never returns was **not chosen; it was bracketed.** The whole
+284-file corpus was re-run at descending budgets until it broke:
+
+| `default_max_iterations` | corpus | what broke |
+| --- | --- | --- |
+| `1 << 30` (the default) | ✅ 63,934 passed · 0 failed · 0 skipped | — |
+| `1 << 20` (1,048,576) | ✅ 63,934 passed | — (fits with **under 5%** to spare) |
+| `1 << 18` (262,144) | ❌ 11 failed / 3 files | `return_call`, `return_call_indirect`, `return_call_ref` |
+| `1 << 14` (16,384) | ❌ 36 failed / 8 files | the tail-call trio **+** `memory_copy`, `memory_copy64`, `memory_fill`, `memory_fill64`, `memory_grow64` |
+
+**What the failing runs bought, which is the point of running them:** they *named* the heaviest
+legitimate workload in the spec suite instead of leaving it a guess — `return_call.wast`'s
+**million-hop tail-call chain**. The default sits ~1000x above that measured peak.
+
+⚠️ **The corpus is a LIVE GATE on this number, by construction.** `wast.zig`'s `isRuntimeTrap`
+deliberately excludes `IterationLimitExceeded` (with `GcHeapExhausted` and `ExnStoreExhausted` — our
+resource caps are not §4.2 traps), so a budget set too low makes conformance **fail loudly** rather
+than bank the timeout as the trap an `assert_trap` was asking for. Lower the ceiling and the suite
+tells you; that is why the table above could be produced at all.
+
+**Unit tests: 758 → 762.** The four are deliberately shaped:
+
+1. **Both shapes of non-termination trap** — a loop back-edge *and* a tail call. ⚠️ Two cases, not
+   one: `return_call` reuses its frame, so deleting the tail tick leaves the loop test **passing**
+   while the runtime hangs on the other shape.
+2. **No false positive** — 5,000 back-edges under a 100,000 budget returns `5000`.
+3. **The counter counts THIS loop** — the same call under a 1,000 budget traps.
+4. **The budget refills per top-level call** — three identical calls, each needing most of the
+   budget, all succeed. A budget spent once and never refilled would make a runtime that works, then
+   slows, then stops, with no diagnosis.
+
+
+## 🆕 THE OPTIMIZE-MODE MATRIX (Track H, 2026-08-19) — **the shipped config had never been run**
+
+Before this, the suite had been executed in **Debug** and **ReleaseSafe**, and the conformance corpus in
+**Debug** only. **`ReleaseSmall` — the mode that is actually distributed — had never run either one.**
+Since `ReleaseSmall` is also the mode with Zig's runtime safety checks **off**, that was the one
+configuration whose behaviour nobody had observed.
+
+All four modes now measured, from an NTFS cwd with `ZIG_LOCAL_CACHE_DIR` on NTFS:
+
+| mode | unit suite | `test-security` | conformance (284 files) |
+| --- | --- | --- | --- |
+| Debug | 758/758 | 3/3 | 63,934 passed · 0 failed · 0 skipped · 0 file-errors |
+| ReleaseSafe | 758/758 | — | identical |
+| **ReleaseSmall — SHIPS** | **758/758** | **3/3** | **identical** |
+| ReleaseFast | 758/758 | 3/3 | identical |
+
+**They agree exactly.** That is the evidence Track H wanted: no test passes only because a safety check
+caught something, and no result changes when the checks come out.
+
+🆕 **`zig build test-shipped`** now runs the suite under `ReleaseSmall` as a named gate beside
+`test-safe`. The two are not redundant:
+
+| gate | mode | the question it answers |
+| --- | --- | --- |
+| `test-safe` | ReleaseSafe | *Does any test input reach an out-of-range cast, an OOB index, an overflow, or an `unreachable`?* — it **panics**. |
+| `test-shipped` | ReleaseSmall | *Does the build we distribute **behave** the same?* — a miscompile or optimizer-exposed UB surfaces here and **nowhere else in the gate set**. |
+
+✅ **Inversion-tested when added**: a deliberately failing test was injected, `test-shipped` reported
+`758/760 · 2 failed`, and the injected test was removed and the step re-confirmed green. ⚠️ **This was
+runnable by hand all along** (`zig build test -Doptimize=ReleaseSmall`) **and nobody ever ran it. A flag
+you have to remember is not a gate** — the same argument that put the CLI into `test-safe`.
+
+⚠️ **Conformance takes `-Doptimize` too**, and running the corpus in the shipped mode is cheap. It
+belongs in any pass that touches the interpreter, not only in a release.
+
 ## 📊 CURRENT spec-testsuite score (2026-08-17) — EVERY CORE SPEC FILE IS AT ZERO
 
 **284 files — 63,934 assertions passed / 0 FAILED / ZERO SKIPPED / ZERO unrun**, and `zig build conformance -Dbaseline=tools/conformance-baseline.txt` reports **0 regressions**. This is the number to quote;

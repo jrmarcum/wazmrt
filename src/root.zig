@@ -63,7 +63,7 @@ pub const pin = @import("pin.zig");
 pub const sign = @import("sign.zig");
 
 /// Human-readable library version (keep in sync with build.zig.zon).
-pub const version: [:0]const u8 = "0.1.0";
+pub const version: [:0]const u8 = "1.0.1";
 
 /// Stable C-ABI version for embedders (universalWasmLoader-*). Bump on any
 /// breaking change to the exported C symbols.

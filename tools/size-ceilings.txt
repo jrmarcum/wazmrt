@@ -824,6 +824,68 @@
 # new ones are the CLI's FIRST reachable tests — `main.zig` had no test target until `--features`
 # put a policy parser in it.
 
-wazmrt.exe  990208
-wazmrt.lib  1053320
+
+# ---------------------------------------------------------------------------------------
+# 2026-08-19 — Track H3: the ITERATION BUDGET. exe +1,024, lib +512, dll +0.
+#
+# What bought the bytes: a countdown on `Instance` that stops a guest which never returns —
+# `IterationLimitExceeded` — plus its CLI flag (`--max-iterations`), its C-ABI setter
+# (`wazmrt_config_set_max_iterations`), and the trap's explanatory message. Owner-requested:
+# "we do not want an infinite loop on purpose or by accident by the user."
+#
+# The RUNTIME cost is two `u64` compare-and-decrements, at the only two places a guest can
+# execute unboundedly:
+#   1. a loop back-edge — in `Frame.branch`, riding the `label.is_loop` test that was already
+#      there to decide how to pop the label stack;
+#   2. a tail-call hop — in the `callFunction` trampoline. ⚠️ THIS IS THE ONE A BACK-EDGE-ONLY
+#      DESIGN MISSES: a local `return_call` reuses the native frame by design, so it makes no
+#      backward branch and grows no call depth. `max_call_depth` cannot see it.
+#
+# 📏 **The DLL did not move at all**, and that is the artifact the `universalWasmLoader-*` ports
+# link. The growth is in the CLI (the flag parser and the two-line trap message are strings and
+# argv handling, not interpreter code) and in the static lib. A safety property that costs the
+# embedder-facing artifact ZERO bytes is the cheap end of the security-vs-size trade this project
+# usually has to argue about — cf. the `ReleaseSafe` DLL at 5.4x, which is why `ReleaseSmall`
+# ships.
+#
+# The default (1 << 30) was MEASURED, not chosen: the 284-file corpus was re-run at descending
+# budgets until it broke — green at 1<<20, 11 failures at 1<<18 (only the three `return_call*`
+# files), 36 across 8 files at 1<<14. The heaviest legitimate workload in the spec suite is
+# `return_call.wast`'s million-hop chain, which fits under 1<<20 with <5% to spare; the default
+# sits ~1000x above it.
+#
+# Corpus unchanged at 63,934 passed / 0 failed / 0 skipped / 0 file-errors. Unit tests 758 -> 762
+# (the 4 new ones cover BOTH non-termination shapes, the no-false-positive direction, and that the
+# budget refills per top-level call).
+
+
+# ---------------------------------------------------------------------------------------
+# 2026-08-19 — Track H2: the GC ceiling now binds the CONST-EXPR path. exe +512, lib +76, dll +0.
+#
+# What bought the bytes: `max_gc_objects` had two enforcement sites that did not agree. The run
+# path (`Instance.allocObject`) checked the instance's CONFIGURED ceiling; the const-expr
+# allocator in `evalConstGc` checked `default_max_gc_objects` — the CONSTANT — under a comment
+# calling it "a test helper with no Instance in hand". It is not a test helper: it runs during
+# real instantiation from three call sites in `instantiateWithImports`, and it allocates the
+# objects that GLOBAL and ELEMENT initializers create.
+#
+# So an embedder hardening an untrusted workload with `wazmrt_config_set_max_gc_objects(cfg,
+# small)` had that ceiling IGNORED for every object an initializer allocated — up to the 16 Mi
+# default, and a module chooses how many initializers it has. A configurable, documented security
+# control that silently did not apply on one of its two paths.
+#
+# The fix threads the ceiling through `ConstCtx` and passes it into the allocating closure. The
+# bytes are that field, the extra parameter, and the call-site plumbing at three sites.
+#
+# 📏 **The DLL did not move — again.** Both of Track H's shipped changes (the iteration budget and
+# this one) cost the embedder-facing artifact ZERO bytes. The growth is in the CLI and the static
+# lib, which is the cheap end of the security-vs-size trade this project usually has to argue.
+#
+# ⚠️ The GC ceiling had NO test before this — configurable, documented, and unverified. There is
+# one now, and it is inversion-tested: reverting the one-line check makes it fail.
+#
+# Corpus unchanged at 63,934 passed / 0 failed / 0 skipped / 0 file-errors. Unit tests 762 -> 764.
+
+wazmrt.exe  991744
+wazmrt.lib  1053908
 wazmrt.dll  900608

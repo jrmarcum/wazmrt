@@ -400,6 +400,53 @@ pub fn build(b: *std.Build) void {
         test_safe_step.dependOn(&b.addRunArtifact(cli_tests_safe).step);
     }
 
+    // ---- `zig build test-shipped` — the suite in the config that SHIPS ------
+    // Track H, 2026-08-19. `test-safe` runs the suite with safety checks KEPT;
+    // this one runs it in **ReleaseSmall**, which is what is actually
+    // distributed and which has those checks **off**. The two answer different
+    // questions and neither substitutes for the other:
+    //
+    //   test-safe     — "does any test input reach an out-of-range cast, an OOB
+    //                    index, an overflow, or an `unreachable`?" (it panics)
+    //   test-shipped  — "does the build we distribute BEHAVE the same?" A test
+    //                    that passes only because a safety check happened to
+    //                    catch something, an optimizer-exposed UB, or a
+    //                    miscompile shows up here as a wrong answer, and
+    //                    NOWHERE else in the gate set.
+    //
+    // ⚠️ It was possible to run this by hand all along (`zig build test
+    // -Doptimize=ReleaseSmall`), and nobody ever had: before Track H the suite
+    // had only ever been executed in Debug and ReleaseSafe. **A flag you have
+    // to remember is not a gate** — the same argument that put the CLI into
+    // `test-safe`.
+    {
+        const mod_tests_small = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .imports = full_imports,
+            .target = target,
+            .optimize = .ReleaseSmall,
+        }) });
+        const capi_tests_small = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("src/capi.zig"),
+            .imports = full_imports,
+            .target = target,
+            .optimize = .ReleaseSmall,
+        }) });
+        const cli_tests_small = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .imports = &.{
+                .{ .name = "wazmrt", .module = mod },
+                .{ .name = "build_options", .module = cli_options.createModule() },
+            },
+            .target = target,
+            .optimize = .ReleaseSmall,
+        }) });
+        const test_shipped_step = b.step("test-shipped", "Run the test suite under ReleaseSmall (the SHIPPED config — safety checks off)");
+        test_shipped_step.dependOn(&b.addRunArtifact(mod_tests_small).step);
+        test_shipped_step.dependOn(&b.addRunArtifact(capi_tests_small).step);
+        test_shipped_step.dependOn(&b.addRunArtifact(cli_tests_small).step);
+    }
+
     // ---- Bake-off harness (`zig build bakeoff -Dcorpus=<dir>`) -------------
     // Track 3: measure wazmrt against the runtimes it means to replace, on real
     // modules, with the comparison configured FAIRLY — wasmtime in its

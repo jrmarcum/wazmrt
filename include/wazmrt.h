@@ -103,7 +103,7 @@ extern "C" {
 #define WAZMRT_ABI_VERSION 2u
 
 uint32_t    wazmrt_abi_version(void);     /* bumped on any breaking change to this header */
-const char *wazmrt_version_string(void);  /* e.g. "0.1.0"; static storage, do not free     */
+const char *wazmrt_version_string(void);  /* e.g. "1.0.1"; static storage, do not free     */
 
 /* ---- Opaque handles (owned; each has exactly one _delete) ---------------------------- */
 typedef struct wazmrt_engine      wazmrt_engine_t;
@@ -292,6 +292,25 @@ void wazmrt_config_set_max_exception_boxes(wazmrt_config_t *, uint64_t);
  * before the limit fires. Release builds are fine at the default, which is why the default is
  * not simply lowered. */
 void wazmrt_config_set_max_call_depth(wazmrt_config_t *, uint32_t);
+
+/* Iteration ceiling for one top-level call — the backstop against a guest that never returns.
+ * ONE ITERATION = one loop back-edge, or one tail-call hop. Those are the only two ways a guest
+ * can run unboundedly: recursion is already bounded by the call-depth limit above, and a
+ * `return_call` reuses its frame so it grows no depth at all.
+ *
+ * A guest that exceeds it TRAPS (like any other trap: the call returns NULL and sets *trap_out).
+ * NOTE it bounds non-termination rather than proving it — a legitimately long-running module
+ * trips the same trap, and raising this is the right answer when it does.
+ *
+ * A COUNT, deliberately, not a wall-clock deadline: a deadline makes the same module trap on a
+ * slow machine and pass on a fast one, and wazmrt needs neither a thread nor a clock to enforce
+ * a count (the freestanding build has neither).
+ *
+ * WARNING 0 means "leave at the default" here, exactly like the other ceilings — it does NOT
+ * mean unlimited. Pass UINT64_MAX for effectively no limit. (The `wazmrt` CLI's
+ * `--max-iterations 0` DOES mean unlimited; that is a different surface with its own
+ * convention.) */
+void wazmrt_config_set_max_iterations(wazmrt_config_t *, uint64_t);
 
 /* ---- Engine ---------------------------------------------------------------------------
  * Holds the configuration shared by the stores made from it. Must outlive them.

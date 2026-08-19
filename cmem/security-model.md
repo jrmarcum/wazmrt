@@ -701,6 +701,40 @@ targets can inject `..` and absolute paths:
 #17/#23), so `path_symlink` is effectively POSIX-only; *following* host-placed symlinks still works on
 Windows. Tests run on POSIX CI, skip on unprivileged Windows.
 
+
+## 🆕 Denial of service by NON-TERMINATION is bounded (Track H3, 2026-08-19)
+
+**Until this landed, a hostile — or merely buggy — guest could hang the host process outright**, and
+nothing in this file said so. Every other guest-driven resource had a ceiling (memory, tables, GC
+objects, exception boxes, call depth, s-expression nesting); **time had none**, there was no interrupt,
+and an embedder had no way to take control back.
+
+Now: **`IterationLimitExceeded` after 1 Gi iterations per top-level call by default**, where one
+iteration is one **loop back-edge** or one **tail-call hop**. Between them those cover every way a
+guest can execute unboundedly — recursion is bounded by `max_call_depth`, and ⚠️ a local `return_call`
+reuses its native frame, so it grows no depth and a back-edge-only counter would have missed it
+entirely.
+
+**What this is and is not, stated the way this file states everything else:**
+
+- ✅ It bounds **non-termination**. A guest cannot spin forever.
+- ❌ It does **not detect an infinite loop** — that is not detectable, and the trap message says
+  *"did not terminate within N iterations"* rather than claiming otherwise.
+- ❌ It is **not a time limit**. A guest can still burn a bounded but large amount of CPU, and a
+  budget's worth of `memory.fill` costs more wall-clock than a budget's worth of `nop`. **An embedder
+  that needs a real-time bound still needs to enforce one outside wazmrt** — the count exists because
+  a *deterministic* limit is the one a runtime can enforce with no thread and no clock, and because a
+  wall-clock deadline would make the same module trap on a slow machine and pass on a fast one.
+- ⚠️ It is **per top-level invocation, and re-entry inherits the remainder**. That is deliberate: a
+  guest that could refill its budget by bouncing through a host callback would not have one.
+
+**For the embedder:** `wazmrt_config_set_max_iterations`. `0` leaves the default (this struct's
+convention for every ceiling), `UINT64_MAX` disables the bound. Lowering it is a legitimate hardening
+move for untrusted workloads; the default is sized for *compatibility* (~1000x the heaviest workload
+in the spec suite), not for tightness.
+
+🚦 **Left for Track S to price:** whether the default should be lower for the C ABI than for the CLI,
+and whether an embedder-supplied *deadline* — which does need a thread — belongs in the ABI at all.
 ## Threat model — state the boundary honestly
 
 | Attacker | What stops them |

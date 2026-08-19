@@ -392,6 +392,65 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   of the family satisfy any op — a **reference-forgery primitive that passed validation and executed**
   (`struct.get $b 0` on a `(ref $a)` read an i64 field as a funcref and `call_ref` called it). **Rule: pop
   `V.concreteRef(true, kind, imm.type_index)`;** `subtypeOf` already walks the declared supertype chain.
+
+- 🔒 **AN ITERATION BUDGET BOUNDS NON-TERMINATION — a COUNT, not a clock, and it ticks in TWO places
+  (owner, 2026-08-19, Track H3).** The owner's requirement was *"we do not want an infinite loop on
+  purpose or by accident by the user — we need an internal check mechanism, an error message, and a
+  break on occurrence."* Until this landed, nothing bounded execution time at all: `max_call_depth`
+  bounded recursion, `sexpr.zig` bounded nesting, and a `(loop br 0)` ran forever with no interrupt.
+
+  **Why not the epoch/interrupt flag, which was the other candidate.** An epoch flag is a *delivery*
+  mechanism, not a detector: the interpreter checks a flag that **someone else must set**, which means
+  a watchdog thread holding a clock. wazmrt is single-threaded and dependency-free, and the
+  `wasm32-freestanding` target has neither threads nor a clock — so nothing would ever set the flag and
+  the loop would still hang. Epochs answer *"let the embedder cancel from another thread"*; that is a
+  different question from *"stop by ourselves"*.
+
+  **Why a COUNT and not a deadline.** A wall-clock limit makes the same module trap on a slow machine
+  and pass on a fast one. `default_max_call_depth` already records this principle in its own doc — *a
+  program must not trap in one build and run in another* — and a count keeps the conformance corpus
+  reproducible. It also needs no clock, which is what makes it work on the freestanding target.
+
+  🎯 **THE DESIGN POINT WORTH REMEMBERING: there are TWO ways to run forever, and the obvious one is
+  not the dangerous one.** A back-edge counter alone ships a limit with a hole in it:
+
+  | shape | ticks where | why it is easy to miss |
+  | --- | --- | --- |
+  | loop back-edge | `Frame.branch`, on `label.is_loop` | the obvious one; it even rides a test that was already there |
+  | **tail call** | the trampoline in `callFunction` | ⚠️ a local `return_call` **reuses the native frame on purpose**, so it makes no backward branch AND grows no call depth. `max_call_depth` cannot see it, and neither can a back-edge counter. `(func $f (return_call $f))` would have run forever. |
+
+  Everything else is already bounded — recursion by `max_call_depth`, eager table/GC/memory allocation
+  by their own ceilings, bulk ops by the size of what they walk.
+
+  **The default is measured, not chosen.** The corpus was re-run at descending budgets until it broke:
+  green at `1 << 20`, 11 failures at `1 << 18` (**only** the three `return_call*` files), 36 across 8
+  files at `1 << 14`. The heaviest legitimate workload in the spec suite is therefore the tail-call
+  family — `return_call.wast` asks for a million hops in one invocation and fits under `1 << 20` with
+  under 5% to spare — so the default sits ~1000x above it at `1 << 30`.
+
+  ⚠️ **`wast.zig`'s `isRuntimeTrap` deliberately does NOT admit `IterationLimitExceeded`**, which is
+  what makes the corpus a live gate on the number: too low a budget fails the run loudly instead of
+  banking the timeout as the trap an `assert_trap` was asking for. That follows the rule already
+  written there for `GcHeapExhausted`/`ExnStoreExhausted` — our resource caps are not §4.2 traps.
+  (`CallStackExhausted` **is** admitted, and the difference is deliberate: `call.wast`'s "runaway"
+  cases exist to make an engine's recursion cap fire. No spec test asks an engine to loop forever.)
+
+  ⚠️ **Two surfaces, two conventions for `0`, and both are documented where they are used.** The CLI's
+  `--max-iterations 0` means **unlimited** (the natural CLI idiom); the C ABI's
+  `wazmrt_config_set_max_iterations(cfg, 0)` means **leave at the default**, exactly like every other
+  ceiling on that struct — an embedder wanting no limit passes `UINT64_MAX`, which needs no special
+  case because the counter is a `u64` countdown. Internally "unlimited" is expressed by **filling the
+  counter to `maxInt(u64)` at refill**, so both tick sites keep exactly one test each and the hot path
+  never branches on a mode.
+
+  **The budget refills per TOP-LEVEL invocation, and re-entry inherits the remainder** — the same rule
+  `reentry_depth` follows, for the same reason: a guest that can restart its own budget by bouncing
+  through a host callback does not have a budget.
+
+  ⚠️ **What this does NOT claim.** It bounds non-termination; it does not detect an infinite loop, which
+  is not detectable. A legitimately long-running module trips the same trap, so the CLI's message says
+  *"did not terminate within N iterations"* and names the flag that raises it — never "infinite loop
+  detected".
 - **Per-invocation state is SAVED AND RESTORED, not cleared (2026-07-21).** A host callback may re-enter
   the same instance (`wasm_func_call` from inside a host function — a documented wasm-c-api pattern), so
   zeroing `pending_exn`/`exn_store` on entry destroyed what the *suspended* outer invocation still owned.
@@ -666,8 +725,24 @@ Load-bearing choices and gotchas that must not be silently reverted. Dated; newe
   valid after the input buffer is freed (it does — it copies nothing out of the input except the extent
   integers). Keep it that way; if a future stage needs payload bytes, copy explicitly and document it.
 
-- **Version string single-sourced (2026-07-02).** `root.version` (`"0.1.0"`) is the one truth; keep it
-  in sync with `build.zig.zon` `.version`. The C ABI returns `root.version.ptr`.
+- **Version string single-sourced (2026-07-02).** `root.version` (now `"1.0.0"`) is the one truth; keep
+  it in sync with `build.zig.zon` `.version`. The C ABI returns `root.version.ptr`.
+
+  🔖 **SET TO `1.0.0` ON 2026-08-19 (owner)** — before the first of the four review tracks, not after
+  them. The number now says *this runtime is complete on its own terms*: the conformance baseline is
+  EMPTY, 284 files run with zero failures and zero skips, and every in-scope proposal is implemented.
+  **Tracks H → B → O → S therefore review FINISHED code**, which is the only thing that makes a
+  hardening pass, a bug hunt, an optimization review and a security review worth their cost.
+
+  From here the cadence is the **single-digit ladder** in [`releasing.md`](releasing.md): `+0.0.1` per
+  shipped track, `x.y.9` rolls to `x.(y+1).0`, `x.9.9` rolls to `(x+1).0.0`, and a **breaking change
+  takes the next major immediately**, wherever the ladder happens to be.
+
+  ⚠️ **Four places move together and only a grep keeps them honest**: `src/root.zig`, `build.zig.zon`,
+  the `wazmrt_version_string` example comment in `include/wazmrt.h`, and the tree diagram in
+  `overview.md`. ⚠️ **`abi_version` (2) is a SEPARATE number and does not track this one** — the C ABI
+  is frozen at 2, and only a breaking change to the exported C symbols moves it. A `1.0.0` library
+  version does **not** imply ABI 1.
 
 - **Interpreter architecture = switch-dispatched, IR-ready (owner, 2026-07-02).** wazmrt is an
   **interpreter**, not a JIT/AOT — a native codegen backend violates "smallest binary" and can't run on
