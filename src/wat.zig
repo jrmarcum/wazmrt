@@ -38,6 +38,16 @@ const List = std.ArrayList;
 pub const Error = sexpr.Error || error{
     NotAModule,
     BadModuleField,
+    /// A typeuse wrote BOTH `(type N)` and an inline `(param …)`/`(result …)`,
+    /// and they describe different signatures (§6.6.5).
+    ///
+    /// Split out of `BadModuleField` because this one refusal has to be readable:
+    /// the module is not nonsense, it is *two claims that contradict each other*,
+    /// and the operator needs to know which two. It was worth splitting because
+    /// the check used to be skippable — see `PendingTypeUse` — and a generic
+    /// "bad module field" on a file that used to assemble silently is a bug
+    /// report waiting to happen.
+    InlineTypeUseMismatch,
     BadValType,
     /// A pre-standard spelling the spec renamed and now calls MALFORMED —
     /// `anyfunc` for `funcref` (spec PR #1157). Distinct from `BadValType` so
@@ -310,6 +320,12 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // both — so `(import (func (param f32))) (tag (param i64))` disagreed on the
     // type section and therefore on the digest. (`interop.md` §3.1m, Z4.)
     var func_import_type: List(u32) = .empty;
+    // Every `(type N)` written beside inline `(param …)`/`(result …)`, checked in
+    // one pass at the end rather than where it is parsed. See `PendingTypeUse`:
+    // the index space is still being built while the fields are read, so an early
+    // check silently skips itself and lets an import be bound to a signature the
+    // text never wrote.
+    var pending_typeuse: List(PendingTypeUse) = .empty;
     // Defined memories (multi-memory). Each `(memory …)` appends here; the memory
     // section emits them in order. Imported memories take the low indices, so
     // `mem_names` (below) spans BOTH — imports first, definitions after.
@@ -403,7 +419,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             for (f.exports.items) |name| try exports.append(a, .{ .name = name, .kind = 0, .index = idx });
             if (f.import) |m| {
                 try func_imports.append(a, .{ .module = m.module, .name = m.name, .type_ref = f.type_ref, .params = f.params.items, .results = f.results.items, .exact = f.type_exact });
-                try func_import_type.append(a, try importFuncType(a, &sigs, type_names.items, f.type_ref, f.params.items, f.results.items));
+                try func_import_type.append(a, try importFuncType(a, &sigs, &pending_typeuse, type_names.items, f.type_ref, f.params.items, f.results.items));
             } else {
                 try funcs.append(a, f);
             }
@@ -466,7 +482,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             const tag_index: u32 = @intCast(tag_names.items.len);
             for (tag_exports.items) |en|
                 try exports.append(a, .{ .name = en, .kind = 4, .index = tag_index });
-            const tag_sig = try resolveTagSig(a, &sigs, type_ref, params.items, results.items);
+            const tag_sig = try resolveTagSig(a, &sigs, &pending_typeuse, type_ref, params.items, results.items);
             // An imported tag goes to the import section (low indices); a defined
             // one to the tag section. `tag_names` spans both for `$e` resolution.
             if (import_mn) |im| {
@@ -650,7 +666,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             if (std.mem.eql(u8, dkw, "func")) {
                 const f = try parseFunc(a, desc, type_names.items); // reuse: parses $id + typeuse
                 try func_imports.append(a, .{ .module = (try strAt(items, 1)), .name = (try strAt(items, 2)), .type_ref = f.type_ref, .params = f.params.items, .results = f.results.items, .exact = f.type_exact });
-                try func_import_type.append(a, try importFuncType(a, &sigs, type_names.items, f.type_ref, f.params.items, f.results.items));
+                try func_import_type.append(a, try importFuncType(a, &sigs, &pending_typeuse, type_names.items, f.type_ref, f.params.items, f.results.items));
                 try func_names.append(a, f.name);
             } else if (std.mem.eql(u8, dkw, "table")) {
                 // (import "m" "n" (table $id? min max? reftype)) — imported tables
@@ -695,7 +711,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                     gname = desc[gi].atom;
                     gi += 1;
                 }
-                const sig = try parseTagType(a, desc, gi, &sigs, type_names.items);
+                const sig = try parseTagType(a, desc, gi, &sigs, &pending_typeuse, type_names.items);
                 try tag_imports.append(a, .{ .module = (try strAt(items, 1)), .name = (try strAt(items, 2)), .sig = sig });
                 try tag_names.append(a, gname);
             } else {
@@ -778,8 +794,9 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             const idx = try resolveType(type_names.items, tr);
             // The inline `(param …)`/`(result …)`, when written alongside a
             // `(type …)`, is a CHECK on the named type — not a second, silently
-            // ignored declaration. See `checkInlineTypeUse`.
-            try checkInlineTypeUse(&sigs, idx, f.params.items, f.results.items);
+            // ignored declaration. Recorded, not checked here: `idx` may name a
+            // type nothing has interned yet. See `PendingTypeUse`.
+            try deferInlineTypeUse(a, &pending_typeuse, idx, f.params.items, f.results.items);
             break :blk idx;
         } else try internSig(a, &sigs, f.params.items, f.results.items);
         try func_type.append(a, ti);
@@ -804,7 +821,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // Does any body name a data segment? Decides the data-count section below.
     var code_uses_data_index = false;
     for (funcs.items) |f| {
-        const enc = try encodeBody(a, f, func_names.items, &sigs, type_names.items, global_names.items, table_names.items, elem_names.items, tag_names.items, data_names.items, mem_names.items, gc_field_names.items);
+        const enc = try encodeBody(a, f, func_names.items, &sigs, &pending_typeuse, type_names.items, global_names.items, table_names.items, elem_names.items, tag_names.items, data_names.items, mem_names.items, gc_field_names.items);
         try bodies.append(a, enc.bytes);
         try body_label_names.append(a, enc.label_names);
         if (enc.uses_data_index) code_uses_data_index = true;
@@ -814,10 +831,18 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // exprs/offsets) BEFORE the type section, mirroring the function-body path, so
     // any signature they might intern lands in section 1. Const-exprs can't intern
     // a signature today, but this keeps the invariant structural, not incidental.
-    const global_pay = try encodeGlobalSection(a, globals.items, &sigs, type_names.items, global_names.items, func_names.items, elem_names.items, data_names.items);
-    const table_pay = try encodeTableSection(a, tables.items, &sigs, type_names.items, global_names.items, func_names.items, elem_names.items, data_names.items);
-    const elem_pay = try encodeElementSection(a, elems.items, &sigs, type_names.items, global_names.items, func_names.items, elem_names.items, data_names.items);
-    const data_pay = try encodeDataSection(a, datas.items, &sigs, type_names.items, global_names.items, func_names.items, elem_names.items, data_names.items);
+    const global_pay = try encodeGlobalSection(a, globals.items, &sigs, &pending_typeuse, type_names.items, global_names.items, func_names.items, elem_names.items, data_names.items);
+    const table_pay = try encodeTableSection(a, tables.items, &sigs, &pending_typeuse, type_names.items, global_names.items, func_names.items, elem_names.items, data_names.items);
+    const elem_pay = try encodeElementSection(a, elems.items, &sigs, &pending_typeuse, type_names.items, global_names.items, func_names.items, elem_names.items, data_names.items);
+    const data_pay = try encodeDataSection(a, datas.items, &sigs, &pending_typeuse, type_names.items, global_names.items, func_names.items, elem_names.items, data_names.items);
+
+    // 🔒 THE TYPE SPACE IS COMPLETE HERE, AND NOT ONE LINE EARLIER — the bodies
+    // above intern block-type and `call_indirect` signatures, and the const-expr
+    // sections are allowed to. Only now can "is `(type N)` the type this typeuse
+    // also spelled inline?" be answered; asked while the fields were being read it
+    // answered "index out of range, not my problem" and let an import keep a
+    // signature its own text contradicted. See `PendingTypeUse` (Track B-d).
+    try checkPendingTypeUses(&sigs, pending_typeuse.items);
 
     var out: List(u8) = .empty;
     try out.appendSlice(a, &.{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 }); // header
@@ -1094,10 +1119,10 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
 /// references (checked against any inline `(param …)`/`(result …)` written
 /// beside it), else the interned inline signature. Called AT the import so the
 /// interning happens in source order — see `func_import_type`.
-fn importFuncType(a: std.mem.Allocator, sigs: *List(Sig), type_names: []const ?[]const u8, type_ref: ?Sexpr, params: []const V, results: []const V) Error!u32 {
+fn importFuncType(a: std.mem.Allocator, sigs: *List(Sig), pending: *List(PendingTypeUse), type_names: []const ?[]const u8, type_ref: ?Sexpr, params: []const V, results: []const V) Error!u32 {
     if (type_ref) |tr| {
         const idx = try resolveType(type_names, tr);
-        try checkInlineTypeUse(sigs, idx, params, results);
+        try deferInlineTypeUse(a, pending, idx, params, results);
         return idx;
     }
     return internSig(a, sigs, params, results);
@@ -1167,14 +1192,14 @@ fn emitNameSubsection(a: std.mem.Allocator, out: *List(u8), id: u8, payload: []c
 /// Encode the global section (6) payload: `(valtype, mut, init-const-expr)` per
 /// global. Const-exprs are encoded here (pre-type-section) so any interning lands
 /// in section 1.
-fn encodeGlobalSection(a: std.mem.Allocator, globals: []const GlobalDef, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, elem_names: []const ?[]const u8, data_names: []const ?[]const u8) Error![]const u8 {
+fn encodeGlobalSection(a: std.mem.Allocator, globals: []const GlobalDef, sigs: *List(Sig), pending: *List(PendingTypeUse), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, elem_names: []const ?[]const u8, data_names: []const ?[]const u8) Error![]const u8 {
     if (globals.len == 0) return &.{};
     var s: List(u8) = .empty;
     try uleb(a, &s, globals.len);
     for (globals) |g| {
         try emitValType(a, &s, g.valtype);
         try s.append(a, if (g.mutable) 0x01 else 0x00);
-        try emitConstExpr(a, &s, sigs, type_names, global_names, func_names, elem_names, data_names, g.init);
+        try emitConstExpr(a, &s, sigs, pending, type_names, global_names, func_names, elem_names, data_names, g.init);
     }
     return s.items;
 }
@@ -1184,7 +1209,7 @@ fn encodeGlobalSection(a: std.mem.Allocator, globals: []const GlobalDef, sigs: *
 /// `0x40 0x00 tabletype expr` (function-references) — the only encoding in which
 /// a NON-NULLABLE element type has a starting value, and therefore the only one
 /// the validator can accept for such a table.
-fn encodeTableSection(a: std.mem.Allocator, tables: []const TableDef, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, elem_names: []const ?[]const u8, data_names: []const ?[]const u8) Error![]const u8 {
+fn encodeTableSection(a: std.mem.Allocator, tables: []const TableDef, sigs: *List(Sig), pending: *List(PendingTypeUse), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, elem_names: []const ?[]const u8, data_names: []const ?[]const u8) Error![]const u8 {
     if (tables.len == 0) return &.{};
     var s: List(u8) = .empty;
     try uleb(a, &s, tables.len);
@@ -1193,7 +1218,7 @@ fn encodeTableSection(a: std.mem.Allocator, tables: []const TableDef, sigs: *Lis
         try emitValType(a, &s, t.elem); // element reftype
         try emitLimits(a, &s, t.min, t.max, false, t.is64, 16);
         if (t.init) |init_expr| {
-            try emitConstExpr(a, &s, sigs, type_names, global_names, func_names, elem_names, data_names, &[_]Sexpr{init_expr});
+            try emitConstExpr(a, &s, sigs, pending, type_names, global_names, func_names, elem_names, data_names, &[_]Sexpr{init_expr});
         }
     }
     return s.items;
@@ -1201,7 +1226,7 @@ fn encodeTableSection(a: std.mem.Allocator, tables: []const TableDef, sigs: *Lis
 
 /// Encode the element section (9) payload — all 8 flag variants
 /// (active/passive/declarative × func-index/const-expr forms).
-fn encodeElementSection(a: std.mem.Allocator, elems: []const ElemDef, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, elem_names: []const ?[]const u8, data_names: []const ?[]const u8) Error![]const u8 {
+fn encodeElementSection(a: std.mem.Allocator, elems: []const ElemDef, sigs: *List(Sig), pending: *List(PendingTypeUse), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, elem_names: []const ?[]const u8, data_names: []const ?[]const u8) Error![]const u8 {
     if (elems.len == 0) return &.{};
     var s: List(u8) = .empty;
     try uleb(a, &s, elems.len);
@@ -1228,7 +1253,7 @@ fn encodeElementSection(a: std.mem.Allocator, elems: []const ElemDef, sigs: *Lis
         if (as_expr) flag |= 0b100;
         try s.append(a, flag);
         if (explicit_table) try uleb(a, &s, e.table_index);
-        if (e.mode == .active) try emitOffsetExpr(a, &s, sigs, type_names, global_names, func_names, elem_names, data_names, e.offset_form, e.is64);
+        if (e.mode == .active) try emitOffsetExpr(a, &s, sigs, pending, type_names, global_names, func_names, elem_names, data_names, e.offset_form, e.is64);
         // The leading kind byte: elemkind (0x00) for non-flag-0 func-index
         // variants, reftype for non-flag-4 const-expr variants.
         if (!as_expr and flag != 0) {
@@ -1238,7 +1263,7 @@ fn encodeElementSection(a: std.mem.Allocator, elems: []const ElemDef, sigs: *Lis
         }
         if (e.expr_form) {
             try uleb(a, &s, e.exprs.len);
-            for (e.exprs) |ex| try emitElementExpr(a, &s, sigs, type_names, global_names, func_names, ex);
+            for (e.exprs) |ex| try emitElementExpr(a, &s, sigs, pending, type_names, global_names, func_names, ex);
         } else if (as_expr) {
             // A typed segment written as bare function indices: each index goes
             // out as the `(ref.func $f)` expression it abbreviates.
@@ -1258,7 +1283,7 @@ fn encodeElementSection(a: std.mem.Allocator, elems: []const ElemDef, sigs: *Lis
 
 /// Encode the data section (11) payload: active (flag 0x00, offset const-expr) or
 /// passive (flag 0x01) segments, memory 0.
-fn encodeDataSection(a: std.mem.Allocator, datas: []const DataSeg, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, elem_names: []const ?[]const u8, data_names: []const ?[]const u8) Error![]const u8 {
+fn encodeDataSection(a: std.mem.Allocator, datas: []const DataSeg, sigs: *List(Sig), pending: *List(PendingTypeUse), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, elem_names: []const ?[]const u8, data_names: []const ?[]const u8) Error![]const u8 {
     if (datas.len == 0) return &.{};
     var s: List(u8) = .empty;
     try uleb(a, &s, datas.len);
@@ -1267,12 +1292,12 @@ fn encodeDataSection(a: std.mem.Allocator, datas: []const DataSeg, sigs: *List(S
             try s.append(a, 0x01); // passive
         } else if (seg.mem_index == 0) {
             try s.append(a, 0x00); // active, memory 0
-            try emitOffsetExpr(a, &s, sigs, type_names, global_names, func_names, elem_names, data_names, seg.offset_form, false);
+            try emitOffsetExpr(a, &s, sigs, pending, type_names, global_names, func_names, elem_names, data_names, seg.offset_form, false);
         } else {
             // active, explicit memory index (multi-memory)
             try s.append(a, 0x02);
             try uleb(a, &s, seg.mem_index);
-            try emitOffsetExpr(a, &s, sigs, type_names, global_names, func_names, elem_names, data_names, seg.offset_form, false);
+            try emitOffsetExpr(a, &s, sigs, pending, type_names, global_names, func_names, elem_names, data_names, seg.offset_form, false);
         }
         try uleb(a, &s, seg.bytes.len);
         try s.appendSlice(a, seg.bytes);
@@ -1753,12 +1778,12 @@ fn parseImport(a: std.mem.Allocator, items: []const Sexpr, global_imports: *List
 /// Emit an active segment's offset const-expr + `end`. Unwraps `(offset …)`,
 /// accepts a folded const-expr (`(i32.const N)` / `(global.get $g)`), and emits
 /// an implicit `i32.const 0` when no offset form is present.
-fn emitOffsetExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, elem_names: []const ?[]const u8, data_names: []const ?[]const u8, form: ?Sexpr, is64: bool) Error!void {
+fn emitOffsetExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), pending: *List(PendingTypeUse), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, elem_names: []const ?[]const u8, data_names: []const ?[]const u8, form: ?Sexpr, is64: bool) Error!void {
     if (form) |f| {
         if (f.asList()) |l| {
-            if (l.len != 0 and eqAtom(l[0], "offset")) return emitConstExpr(a, out, sigs, type_names, global_names, func_names, elem_names, data_names, l[1..]);
+            if (l.len != 0 and eqAtom(l[0], "offset")) return emitConstExpr(a, out, sigs, pending, type_names, global_names, func_names, elem_names, data_names, l[1..]);
         }
-        return emitConstExpr(a, out, sigs, type_names, global_names, func_names, elem_names, data_names, &[_]Sexpr{f});
+        return emitConstExpr(a, out, sigs, pending, type_names, global_names, func_names, elem_names, data_names, &[_]Sexpr{f});
     }
     // The IMPLICIT offset takes the target's index type — `i64.const 0` for a
     // 64-bit table/memory. See `ElemDef.is64`.
@@ -1769,8 +1794,8 @@ fn emitOffsetExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), type_n
 
 /// Emit one element-segment const-expr + `end`. Accepts a folded expr form
 /// (`(ref.func $f)`) or an `(item …)` wrapper around an instruction sequence.
-fn emitElementExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, form: Sexpr) Error!void {
-    var ctx: Ctx = .{ .a = a, .out = out, .local_names = &.{}, .func_names = func_names, .sigs = sigs, .type_names = type_names, .global_names = global_names };
+fn emitElementExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), pending: *List(PendingTypeUse), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, form: Sexpr) Error!void {
+    var ctx: Ctx = .{ .a = a, .out = out, .local_names = &.{}, .func_names = func_names, .sigs = sigs, .pending_typeuse = pending, .type_names = type_names, .global_names = global_names };
     if (form.asList()) |l| {
         if (l.len != 0 and eqAtom(l[0], "item")) {
             try emitSeq(&ctx, l[1..]); // (item <instr seq>)
@@ -1783,7 +1808,7 @@ fn emitElementExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), type_
 }
 
 /// Emit a constant init expression (a sequence of instruction forms) + `end`.
-fn emitConstExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, elem_names: []const ?[]const u8, data_names: []const ?[]const u8, exprs: []const Sexpr) Error!void {
+fn emitConstExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), pending: *List(PendingTypeUse), type_names: []const ?[]const u8, global_names: []const ?[]const u8, func_names: []const ?[]const u8, elem_names: []const ?[]const u8, data_names: []const ?[]const u8, exprs: []const Sexpr) Error!void {
     // 🔑 **`elem_names` and `data_names` belong here even though no CONSTANT expression may use
     // them.** `array.new_data $t $d` / `array.new_elem $t $e` are not const-exprs, and the spec
     // asks for them to be refused with "constant expression required" — a VALIDATOR verdict. With
@@ -1792,7 +1817,7 @@ fn emitConstExpr(a: std.mem.Allocator, out: *List(u8), sigs: *List(Sig), type_na
     // instead of passes. **A producer that cannot express a construct cannot let the consumer
     // judge it** — the mirror of the rule `readBlockType` records, and the reason the fix is to
     // emit the bytes rather than to keep guessing at the verdict up here.
-    var ctx: Ctx = .{ .a = a, .out = out, .local_names = &.{}, .func_names = func_names, .sigs = sigs, .type_names = type_names, .global_names = global_names, .elem_names = elem_names, .data_names = data_names };
+    var ctx: Ctx = .{ .a = a, .out = out, .local_names = &.{}, .func_names = func_names, .sigs = sigs, .pending_typeuse = pending, .type_names = type_names, .global_names = global_names, .elem_names = elem_names, .data_names = data_names };
     try emitSeq(&ctx, exprs);
     try out.append(a, @intFromEnum(Op.end));
 }
@@ -1962,12 +1987,62 @@ fn typeUseOrder(seen: *u8, rank: u8) Error!void {
 /// ⚠️ Ignoring it let `(func (type $sig) (result i32) …)`, with `$sig` being
 /// `[i32] -> [i32]`, assemble against `$sig` while the source declared
 /// `[] -> [i32]`. The function then had a parameter its own text denied.
+///
+/// 🔒 **Run this ONLY from `checkPendingTypeUses`, once the type space is
+/// complete.** Called as each typeuse is parsed it answers the wrong question —
+/// see `PendingTypeUse`.
 fn checkInlineTypeUse(sigs: *const List(Sig), type_ref: u32, params: []const V, results: []const V) Error!void {
     if (params.len == 0 and results.len == 0) return; // nothing inline to check
-    if (type_ref >= sigs.items.len) return; // a bad index is a downstream verdict
+    // An index past the end of the FINAL type space is the decoder's verdict, and
+    // both runtimes give it: wasm-tools assembles `(func (type 5))` in a module
+    // with no types at all, and `Module.decode` then refuses those bytes with
+    // `IndexOutOfRange`. So this is a deliberate hand-off, not a gap — but it is
+    // only true once `sigs` has stopped growing.
+    if (type_ref >= sigs.items.len) return;
     const sig = sigs.items[type_ref];
     if (!std.mem.eql(V, sig.params, params) or !std.mem.eql(V, sig.results, results))
-        return error.BadModuleField;
+        return error.InlineTypeUseMismatch;
+}
+
+/// A `(type N)` written beside an inline `(param …)`/`(result …)`, held until the
+/// type space is complete.
+///
+/// 🚨 **Checking it where it is parsed is a TIME-OF-CHECK bug, and it produced
+/// modules whose imports had signatures the text never wrote.** The text format's
+/// type index space is the declared `(type …)` definitions *plus* every signature
+/// the assembler interns implicitly, and implicit ones are appended as they are
+/// met. So at the moment an import is parsed, `(type 0)` may name nothing at all —
+/// `checkInlineTypeUse`'s `type_ref >= sigs.items.len` arm then skipped the
+/// comparison and deferred to a "downstream verdict" that **never arrived**,
+/// because by emit time the assembler had interned enough signatures that index 0
+/// existed and meant something else.
+///
+/// Measured on `wasmtk/tests/module/bindgen_fixtures/fnany_50.wat`, which writes
+/// `(import … (func (type 1) (param i32 i32)))` and declares no types:
+/// wazmrt emitted that import as `(param i32 i32 i32 i32) (result i32)`, the
+/// module validated, and it ran — `rc 0`, no warning. A host wiring that import is
+/// called with four arguments and asked for a result. wasm-tools refuses the file.
+///
+/// 🔑 Interning only ever APPENDS, so an index that resolves at parse time still
+/// means the same thing later; the only failure is asking too early. Recording the
+/// question and answering it once — after every body and const-expr has been
+/// encoded — is therefore both sufficient and the whole fix. (`interop.md`
+/// §3.1m-r, Track B-d.)
+const PendingTypeUse = struct { index: u32, params: []const V, results: []const V };
+
+/// Record a typeuse's inline `(param …)`/`(result …)` against the `(type N)` it
+/// was written beside. Every site that has both goes through here; calling
+/// `checkInlineTypeUse` directly is the bug this exists to prevent.
+fn deferInlineTypeUse(a: std.mem.Allocator, pending: *List(PendingTypeUse), index: u32, params: []const V, results: []const V) Error!void {
+    if (params.len == 0 and results.len == 0) return; // nothing inline to check
+    try pending.append(a, .{ .index = index, .params = params, .results = results });
+}
+
+/// Answer every recorded typeuse question. Call once, after the last thing that
+/// can intern a signature — which is body encoding and the const-expr sections,
+/// not the field loop.
+fn checkPendingTypeUses(sigs: *const List(Sig), pending: []const PendingTypeUse) Error!void {
+    for (pending) |p| try checkInlineTypeUse(sigs, p.index, p.params, p.results);
 }
 
 /// §6.6.13 — reject a repeated identifier in one namespace. Anonymous entries
@@ -2163,6 +2238,11 @@ const Ctx = struct {
     /// Per-type struct field names (indexed by type index; each entry aligned
     /// with that struct's fields), for resolving `struct.get $T $field` by name.
     field_names: []const []const ?[]const u8 = &.{},
+    /// Where a `call_indirect` / block-type `(type N)` written beside inline
+    /// `(param …)`/`(result …)` is recorded, to be checked once the type space
+    /// stops growing. Threaded rather than defaulted, so no path can quietly
+    /// skip the check — which is exactly how B-d survived. See `PendingTypeUse`.
+    pending_typeuse: *List(PendingTypeUse),
     /// Control-flow label stack (innermost last), for resolving `br $name` to a
     /// relative depth.
     labels: List(?[]const u8) = .empty,
@@ -2197,7 +2277,7 @@ fn pushLabel(ctx: *Ctx, label: ?[]const u8) Error!void {
 /// fact the emitter used to throw away that the `name` section needs.
 const EncodedBody = struct { bytes: []const u8, label_names: []const ?[]const u8, uses_data_index: bool };
 
-fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, table_names: []const ?[]const u8, elem_names: []const ?[]const u8, tag_names: []const ?[]const u8, data_names: []const ?[]const u8, mem_names: []const ?[]const u8, field_names: []const []const ?[]const u8) Error!EncodedBody {
+fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, sigs: *List(Sig), pending: *List(PendingTypeUse), type_names: []const ?[]const u8, global_names: []const ?[]const u8, table_names: []const ?[]const u8, elem_names: []const ?[]const u8, tag_names: []const ?[]const u8, data_names: []const ?[]const u8, mem_names: []const ?[]const u8, field_names: []const []const ?[]const u8) Error!EncodedBody {
     var body: List(u8) = .empty;
     // Locals vector: one (count=1, type) group per declared local.
     try uleb(a, &body, f.locals.items.len);
@@ -2205,7 +2285,7 @@ fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, si
         try uleb(a, &body, 1);
         try emitValType(a, &body, t);
     }
-    var ctx: Ctx = .{ .a = a, .out = &body, .local_names = f.local_names.items, .func_names = func_names, .sigs = sigs, .type_names = type_names, .global_names = global_names, .table_names = table_names, .elem_names = elem_names, .tag_names = tag_names, .data_names = data_names, .mem_names = mem_names, .field_names = field_names };
+    var ctx: Ctx = .{ .a = a, .out = &body, .local_names = f.local_names.items, .func_names = func_names, .sigs = sigs, .pending_typeuse = pending, .type_names = type_names, .global_names = global_names, .table_names = table_names, .elem_names = elem_names, .tag_names = tag_names, .data_names = data_names, .mem_names = mem_names, .field_names = field_names };
     try emitSeq(&ctx, f.body);
     try body.append(a, @intFromEnum(Op.end)); // implicit function end
     return .{ .bytes = body.items, .label_names = ctx.label_names.items, .uses_data_index = ctx.uses_data_index };
@@ -2332,7 +2412,7 @@ fn parseCallIndirectType(ctx: *Ctx, items: []const Sexpr, start: usize) Error!st
     }
     if (type_ref) |tr| {
         const idx = try resolveType(ctx.type_names, tr);
-        try checkInlineTypeUse(ctx.sigs, idx, params.items, results.items);
+        try deferInlineTypeUse(ctx.a, ctx.pending_typeuse, idx, params.items, results.items);
         return .{ .idx = idx, .table = table, .next = j };
     }
     return .{ .idx = try internSig(ctx.a, ctx.sigs, params.items, results.items), .table = table, .next = j };
@@ -2779,7 +2859,7 @@ fn parseBlockTypeSig(ctx: *Ctx, l: []const Sexpr, j: *usize) Error!BlockTy {
         }
         j.* += 1;
     }
-    if (type_ref) |tr| try checkInlineTypeUse(ctx.sigs, tr, params.items, results.items);
+    if (type_ref) |tr| try deferInlineTypeUse(ctx.a, ctx.pending_typeuse, tr, params.items, results.items);
     return .{ .type_ref = type_ref, .sig = .{ .params = params.items, .results = results.items } };
 }
 
@@ -4055,7 +4135,7 @@ test "hex float literals are correctly ROUNDED, not truncated" {
 /// Shared by imported tags (top-level `(import … (tag …))` and inline
 /// `(tag (import …) …)`); the defined-tag field inlines the same shape because it
 /// also collects inline exports.
-fn parseTagType(a: std.mem.Allocator, items: []const Sexpr, start: usize, sigs: *List(Sig), type_names: []const ?[]const u8) Error!u32 {
+fn parseTagType(a: std.mem.Allocator, items: []const Sexpr, start: usize, sigs: *List(Sig), pending: *List(PendingTypeUse), type_names: []const ?[]const u8) Error!u32 {
     var j = start;
     var type_ref: ?u32 = null;
     var params: List(V) = .empty;
@@ -4072,16 +4152,16 @@ fn parseTagType(a: std.mem.Allocator, items: []const Sexpr, start: usize, sigs: 
             else => try parseDecls(a, (try wantList(items[j])), &results, null, type_names, false),
         }
     }
-    return resolveTagSig(a, sigs, type_ref, params.items, results.items);
+    return resolveTagSig(a, sigs, pending, type_ref, params.items, results.items);
 }
 
 /// Resolve a tag's signature from an optional `(type $t)` reference and inline
 /// params/results. When BOTH a type index and inline params/results are given,
 /// they must agree (§ typeuse — the inline form is a check); otherwise intern the
 /// inline signature. Shared by imported (`parseTagType`) and defined tags.
-fn resolveTagSig(a: std.mem.Allocator, sigs: *List(Sig), type_ref: ?u32, params: []const V, results: []const V) Error!u32 {
+fn resolveTagSig(a: std.mem.Allocator, sigs: *List(Sig), pending: *List(PendingTypeUse), type_ref: ?u32, params: []const V, results: []const V) Error!u32 {
     if (type_ref) |tr| {
-        try checkInlineTypeUse(sigs, tr, params, results);
+        try deferInlineTypeUse(a, pending, tr, params, results);
         return tr;
     }
     return try internSig(a, sigs, params, results);
@@ -6634,7 +6714,7 @@ test "a tag typeuse with inline params that disagree with (type $t) is rejected"
     defer arena.deinit();
     const a = arena.allocator();
     // `(type $t)` and inline `(param …)` on the same tag must match (§ typeuse).
-    try std.testing.expectError(error.BadModuleField, assemble(a,
+    try std.testing.expectError(error.InlineTypeUseMismatch, assemble(a,
         \\(module (type $t (func (param i32))) (tag $e (type $t) (param i64)))
     ));
     // Agreeing params are fine, and so is `(type $t)` alone.
@@ -7800,11 +7880,62 @@ test "R9: a type use's inline signature must reproduce the type it names" {
         "(module (type $sig (func (param i32 i32) (result i32)))" ++
             " (func (type $sig) (param i32) (result i32) (unreachable)))",
     }) |src| {
-        try std.testing.expectError(error.BadModuleField, assemble(a, src));
+        try std.testing.expectError(error.InlineTypeUseMismatch, assemble(a, src));
     }
     // An inline form that AGREES is the legal redundant spelling.
     _ = try assemble(a, "(module (type $sig (func (param i32) (result i32)))" ++
         " (func (type $sig) (param i32) (result i32) (local.get 0)))");
+}
+
+test "B-d: a `(type N)` nothing has interned YET is still checked, not skipped" {
+    // 🚨 The check above used to run where each typeuse was parsed, and opened
+    // with "if the index is past the end, a bad index is a downstream verdict".
+    // For a numeric `(type N)` that is an index into a space STILL BEING BUILT,
+    // so the comparison skipped itself — and the promised downstream verdict
+    // never arrived, because by emit time the assembler had interned enough
+    // signatures that N existed and meant something else.
+    //
+    // Found by running the sibling runtime over the same corpus:
+    // `bindgen_fixtures/fnany_50.wat` writes `(import … (func (type 1)
+    // (param i32 i32)))` and declares no types at all. wazmrt emitted that
+    // import as `(param i32 i32 i32 i32) (result i32)`, validated it, and ran
+    // it — rc 0, no warning. A host wiring that import is handed four arguments
+    // and asked for a result.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // One per site that can write a typeuse. In every case the referenced index
+    // does not exist when the form is read and is interned by something LATER,
+    // so an eager check sees nothing to compare against.
+    for ([_][]const u8{
+        // An imported function — the shape found in the wild.
+        "(module (import \"e\" \"f\" (func (type 0) (param i32))) (func (param f64) (nop)))",
+        // A defined function's own typeuse: the next function interns index 0.
+        "(module (func (type 0) (param f64) (nop)) (func (param i32) (nop)))",
+        // A tag, which interns during the field loop and so is early too.
+        "(module (tag (type 0) (param f64)) (func (param i32) (nop)))",
+        // `call_indirect`, checked while a BODY is encoded — index 1 is interned
+        // later still, by the block type in the second function.
+        "(module (table 1 funcref)" ++
+            " (func (call_indirect (type 1) (param f64) (f64.const 0) (i32.const 0)))" ++
+            " (func (i32.const 0) (block (param i32) (result i32) (drop) (i32.const 1)) (drop)))",
+    }) |src| {
+        try std.testing.expectError(error.InlineTypeUseMismatch, assemble(a, src));
+    }
+
+    // ⚠️ THE OTHER HALF, and the reason the fix is "ask later" rather than
+    // "reject a forward reference": a forward `(type N)` whose inline signature
+    // AGREES with what lands at N is LEGAL, and wasm-tools assembles it. A
+    // blanket refusal would have passed the four cases above and broken this.
+    _ = try assemble(a, "(module (import \"e\" \"f\" (func (type 0) (param i32))) (func (param i32) (nop)))");
+
+    // 🔒 …and the hand-off that the early return was originally for is KEPT: a
+    // bare `(type N)` past the end of the finished space, with nothing inline to
+    // compare, is not the assembler's verdict. wasm-tools emits those bytes too,
+    // and both runtimes then refuse them at DECODE.
+    const bytes = try assemble(a, "(module (import \"e\" \"f\" (func (type 5))))");
+    try std.testing.expectError(error.IndexOutOfRange, Module.decode(a, bytes));
 }
 
 test "R9: parameter ids bind only where locals exist" {

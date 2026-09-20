@@ -917,6 +917,31 @@
 # Corpus unchanged (288 files / 64,072 passed / 0 failed / 20 skipped / 0 file-errors, the count
 # for this testsuite checkout). Unit tests 772 -> 778 (three new tests, two test binaries).
 
-wazmrt.exe  999936
-wazmrt.lib  1058426
+# ---------------------------------------------------------------------------------------
+# 2026-09-20 — Track B-d: an inline typeuse is checked when the type space is COMPLETE.
+# exe +512, lib +834, dll +0.
+#
+#   exe  999,936 -> 1,000,448
+#   lib  1,058,426 -> 1,059,260
+#   dll  900,608 -> 900,608   (ZERO, for the fourth shipped change running)
+#
+# What bought the bytes: a `PendingTypeUse` record (index + the two value-type slices), the
+# list that collects them, one `pending` parameter threaded through the eight encoders that
+# can meet a typeuse, and the single drain after the const-expr sections. Plus one Error
+# variant — `InlineTypeUseMismatch`, split out of `BadModuleField` so the refusal names what
+# contradicts what, because a file that used to assemble now does not.
+#
+# 🔑 The defect it closes is not a size question at all: `(type N)` naming a type the module
+# had not declared yet was CHECKED AGAINST AN EMPTY SPACE, skipped itself, and let an import
+# keep a signature its own text contradicted — `(param i32 i32)` emitted as
+# `(param i32 i32 i32 i32) (result i32)`, validated, rc 0. 512 bytes is a cheap price for a
+# silent-wrong-output class, and the argument is the same one H2's ceiling fix made.
+#
+# Corpus unchanged (288 files / 64,072 passed / 0 failed / 20 skipped / 0 file-errors).
+# Unit tests 778 -> 780. Cross-runtime digest parity: 954/954 `.wat` and 513/513 `.wasm`, and
+# the two files that were outside the comparison are now refused by BOTH runtimes, so the two
+# listings are finally the same length.
+
+wazmrt.exe  1000448
+wazmrt.lib  1059260
 wazmrt.dll  900608
