@@ -637,6 +637,60 @@ digests are **not portable** for any file using annotations. ⬜ **Scope for the
 honest fix is either to **implement** (option C, as both siblings did, to their measured canonical
 behaviour) or to **REFUSE** an annotation wazmrt cannot honour — but not to keep dropping it.
 
+###### ✅ IMPLEMENTED 2026-09-20 — `custom/` **0/1/20 → 20/0/0**, option C, at owner direction
+
+🔒 Owner: *"definitely implement, the wasmrt team has already addressed this and all tests are green
+across the board no fails or skips."* Three annotation ids are now retained by the lexer and honoured;
+everything else is still dropped there, so the `annotations.wast` printable-ASCII class is untouched.
+
+| id | what it does now |
+| --- | --- |
+| `@custom` | a custom SECTION, laid into the gap its `(before\|after X)` anchor names — 14 flush points, one per canonical slot, each **outside** its section's `if` so the gap exists whether or not the sections around it do |
+| `@name` | overrides the `$id` in the name section for **`module`, `func` and `tag`**, and is legal ONLY in a name-bearing form's identifier slot |
+| `@metadata.code.branch_hint` | a `metadata.code.branch_hint` section immediately before `code`; offset measured from the body start **with the locals vector included**, naming the annotated instruction's OWN opcode |
+
+🔑 **EVERY RULE MEASURED AGAINST THE CANONICAL TOOLCHAIN BEFORE IT WAS BUILT, not read off the spec** —
+the same discipline wasmrt recorded. The measurements that changed the design:
+
+- **`@name`'s legal position is the IDENTIFIER SLOT**, i.e. where a `$id` goes: after the keyword, or
+  after the `$id` when one is written. Refused on `start`, `export`, `import`, `result`, `rec`, `sub`
+  and `field`; accepted on fourteen name-bearing forms. ⚠️ **The slot does NOT inherit** —
+  `(import "a" "b" (func $f (@name "F")))` is legal because the annotation belongs to the nested
+  `func`, so a rule that rejected everything under a non-name-bearing form would have been wrong.
+  🎓 A *second* `@name` on one form lands one past the slot, so *"multiple module"* falls out of the
+  placement rule instead of needing a rule of its own.
+- **A folded form's hint offset is the OUTER opcode, after its operands** — `(@… ) (drop (i32.const 0))`
+  records the `drop`, not the `i32.const`. Flat and folded spellings of one program record the SAME
+  byte. This is why the emitter carries a nesting level: an operand reaches the same opcode writer.
+- **A hint's function index spans the WHOLE function space**, so one import shifts every entry.
+- ⚠️ **The canonical `wat` stage does NOT adjudicate a hint's target** — it emits the section and lets
+  a later stage judge, which is why `branch_hint.wast` files the non-branch case under
+  `assert_invalid_custom`. The corpus asserts only that the module is **refused**, never by which
+  stage, so wazmrt refuses at assembly: earlier, and conformant. Divergence recorded deliberately.
+
+🚨 **ONE NEW DEFECT SURFACED BY THE WORK, and it was an ORDERING bug with a comment that already
+claimed otherwise.** The annotation pre-pass carried the words *"before anything is assembled"* while
+sitting **after** the two type pre-passes, so `(type (struct (field (@name "F") i32)))` reached
+`parseTypeBody` first and came back `BadValType` — a verdict about the wrong thing, decided by
+whichever parser got there first. 🎓 *The comment was right and the position was wrong; only writing a
+test that exercised a type body could tell them apart.*
+
+⬜ **RECORDED GAP, not forgotten:** the canonical toolchain also accepts `@name` on `type`, `table`,
+`memory`, `global`, `elem`, `data`, `param`, `local`, `block`, `loop` and `if` — all eleven measured.
+wazmrt **refuses** those (`honoured_name_forms`), because honouring them means threading an override
+into each of those index spaces' name maps. 🔒 **Refusing, not dropping**, is the deliberate choice:
+`tag` spent this session in the accept-and-drop state and emitted 19 bytes where the canonical encoder
+emitted 32, *while reporting success* — which is the same silent-drop class this whole item exists to
+remove. A unit test pins all eleven, so each line moves to the accept list the day its subsection
+learns the override.
+
+📊 **Gates:** corpus **288 files / 64,092 passed / 0 failed / 0 skipped** (the 20 skips were these three
+`custom/` files). Spec-corpus emitter differential **2,121 agree / 20 differ** — unchanged, and no
+annotation module among the 20. Real-world corpus **1,039 / 1,039 digest parity**. Unit tests **804
+passing / 808 total (4 skipped)**, +6 from the three tests this pass adds — each `wat.zig` test runs in
+both test targets, so a count of tests written is not the count the summary prints.
+**8 of 8 inversions compiled and were caught.** Sizes: exe +10,752, lib +12,186, dll +9,728.
+
 #### ✅ B-a — The EMITTER audit. **COMPLETE 2026-09-20** (`d47ecd18`). **FOUR DEFECTS, 4-FOR-4 AGAIN** `[x]`
 
 🎯 **The prediction held exactly.** The mechanism produced four defects in the sibling project; it

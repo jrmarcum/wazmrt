@@ -13,6 +13,36 @@ Line numbers are hints (they drift) — the function/construct name is the durab
 
 ---
 
+## 🆕 `(@name "…")` is REFUSED on eleven name-bearing forms the canonical toolchain accepts (2026-09-20)
+
+**Anchor:** `honoured_name_forms` in `src/wat.zig`. wazmrt honours the override on **`module`, `func`
+and `tag`** and refuses it — `BadAnnotation`, deliberately — on `type`, `table`, `memory`, `global`,
+`elem`, `data`, `param`, `local`, `block`, `loop` and `if`. All eleven were **measured** as accepted by
+wasm-tools; the placement rule itself (`rejectMisplacedName`) already treats all fourteen as
+name-bearing, so this is purely about which name subsections can carry an override.
+
+**Why refused rather than accepted-and-dropped:** accepting would emit a module byte-identical to one
+that never carried the annotation, which is the exact silent-drop this pass removed. `tag` sat in that
+state mid-pass and produced 19 bytes where the canonical encoder produced 32, *while reporting
+success*. Refusing is narrower than canonical and visible; dropping is wrong and invisible.
+
+**Surfaces when:** a real-world `.wat` from wasm-tools carries `@name` on any of the eleven — wazmrt
+refuses a file the canonical toolchain assembles. ⚠️ **No corpus file does today**: conformance is
+288/64,092/0/0 and both byte-differentials are unchanged, which is the only reason this could be
+deferred rather than fixed.
+
+**The fix:** each of the eleven needs an override list index-aligned with its `*_names` list, merged at
+emit through `nameMapPayloadFinal` (never `nameMapPayload` — `identText` would eat the `$` of a name
+that legitimately begins with one). `func_name_annots` and `tag_name_annots` are the two worked
+examples. 🔑 **A third instance of that shape is the signal to factor it** into one keyed override
+table rather than an eleventh parallel list.
+
+**Pinned by:** the refusal list in `test "@name is legal ONLY in a name-bearing form's identifier
+slot"`. Each line moves to the accept list above it the day its subsection learns the override, so the
+gap is a shrinking list rather than a silence.
+
+---
+
 ## 🆕 `pin <dir>` writes its skip WARNINGS to STDOUT, interleaved with the pin lines (2026-09-20)
 
 **Found while building the cross-runtime digest comparison** (`testing.md`). `wazmrt pin <dir>` prints

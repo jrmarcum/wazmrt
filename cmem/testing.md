@@ -47,7 +47,17 @@ deno run -A tools/emitter-diff.mjs --suite <testsuite-dir> \
 ```
 
 📊 **State at 2026-09-20:** 2,150 modules extracted, 2,141 assembled by both, **2,121 agree · 20
-differ · 0 assembled by only one side.** It was 1,807 agreeing before Track B-a.
+differ · 0 assembled by only one side.** It was 1,807 agreeing before Track B-a. ✅ Unchanged across
+the custom-annotations pass — re-run after it, same three numbers.
+
+⚠️ **This tool scans only the TOP LEVEL of `--suite`**, so the `custom/` subdirectory — the three
+annotation files — is NOT in those numbers. Annotated modules were byte-compared separately, and the
+whole-module `branch_hint.wast` case is byte-identical to the canonical encoder's 249 bytes. 🔑 *A
+coverage number is about the files the tool reached, and `readDir` is not `walk`.*
+
+🔒 **The 9 modules that are extracted but pinned by neither side** (2,150 − 2,141) are `instance__*`,
+`memory*`, `table*` — `BadModuleField` in both runtimes, symmetric and pre-existing. `only-wazmrt 0`
+is the number that matters: wazmrt refuses nothing the other assembles.
 
 🔒 **The 20 are documented, not outstanding** — two legal shorthand choices (singleton `rec` groups
 plus implicit-type reuse; element-segment spelling), each cross-decoded on both runtimes with both
@@ -139,7 +149,7 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
 
 | gate | result |
 | --- | --- |
-| conformance | **288 files · 64,072 passed · 0 failed · 20 skipped · 0 file-errors** (baseline still EMPTY). ⚠️ The counts differ from Track H's `284 · 63,934 · 0 skipped` because this is a **different testsuite checkout**, not a regression — verified by running the same command on `HEAD` before and after every change on 2026-09-20 |
+| conformance | **288 files · 64,092 passed · 0 failed · 0 skipped · 0 file-errors** (baseline still EMPTY). ✅ The last 20 skips closed 2026-09-20 by the custom-annotations pass — they were the three `custom/` files (`custom_annot` 14, `name_annot` 3, `branch_hint` 3), and the tally now matches the canonical runtime's own adjudication of the same directory exactly. ⚠️ The counts differ from Track H's `284 · 63,934 · 0 skipped` because this is a **different testsuite checkout**, not a regression — verified by running the same command on `HEAD` before and after every change on 2026-09-20. *(Superseded: 64,072 passed · 20 skipped.)* |
 | `test` (Debug) | **802/802** (2026-09-20, Track B) — was **765/765** — was 758. **+4** iteration budget (2 tests, and `interp.zig`'s tests run in *both* the module and capi binaries), **+2** GC ceiling (1 test × 2), **+1** misplaced-flag warning (CLI binary only) |
 | `test-safe` (ReleaseSafe) | **800/800** (was 765) |
 | **`test-shipped` (ReleaseSmall — the config that ships)** | **800/800** (was 765) |

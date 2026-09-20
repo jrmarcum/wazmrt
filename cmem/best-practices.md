@@ -1497,3 +1497,57 @@ SHA-256 that this project compares against another runtime.
 CRLF files were then re-checked-out so the tree is consistent, not merely correct on the next touch.
 ⚠️ **Nothing tracked is binary today, which is the only reason `*` can be that blunt** — mark a binary
 file `binary` in `.gitattributes` BEFORE committing the first one. — 2026-09-20, `.gitattributes`
+
+---
+
+### 🎓 "Accepted" is a weaker claim than "honoured" — and a test that only asserts acceptance cannot tell them apart
+
+Writing the custom-annotations pass produced three verdicts a parser can give an annotation, and only
+two of them are defensible:
+
+| verdict | what it means | defensible? |
+| --- | --- | --- |
+| **honoured** | the fact reaches the output | ✅ |
+| **refused** | the module is rejected, loudly, naming the annotation | ✅ |
+| **accepted and dropped** | the tool reports success and emits a module the text did not describe | 🚫 never |
+
+The third is the silent-wrong-output class, and it is the state `tag` was in for most of this pass:
+`(tag (@name "T"))` assembled, exited 0, and produced **19 bytes where the canonical encoder produced
+32**. The unit test covering it said `_ = try assemble(a, src);` — which passes just as happily on a
+tool that throws the annotation away. ⚠️ **An accept-list test is not evidence of a feature.** The
+assertion that found it compares the module built WITH the annotation against the one built WITHOUT:
+
+```zig
+const with = try assemble(a, "(module (tag $t (@name \"theta\") (param i32)))");
+const without = try assemble(a, "(module (tag $t (param i32)))");
+try std.testing.expect(!std.mem.eql(u8, with, without));   // byte-identical == dropped
+```
+
+🔑 **The general rule: when a feature's whole job is to put a fact into the output, the test must read
+the output back.** "It builds" is the assertion that lets a drop through, and it is the assertion that
+is easiest to write.
+
+🔒 **Corollary — when a feature is only partly implemented, refuse the rest rather than accept it.**
+wazmrt honours `@name` on `module`, `func` and `tag`, and **refuses** it on the other eleven forms the
+canonical toolchain accepts. Refusing is narrower than canonical and is a recorded gap; accepting and
+dropping would have been a defect wearing a feature's clothes. Each refusal is pinned by a test, so
+the gap is a list that shrinks rather than a silence. — 2026-09-20, custom-annotations
+
+---
+
+### 🎓 A comment that states an ordering invariant is not the same as code that has it
+
+The annotation pre-pass carried the words *"Checked over the whole tree once, before anything is
+assembled, so the verdict does not depend on which parser happens to reach the annotation first"* —
+and sat **after** the two type pre-passes. `(type (struct (field (@name "F") i32)))` therefore reached
+`parseTypeBody` first and came back `BadValType`: a verdict about the wrong thing, produced by exactly
+the race the comment said had been eliminated.
+
+⚠️ **The comment was correct; only its position was wrong.** Nothing in review catches this, because
+reading the comment tells you the invariant holds. What caught it was a test whose input reached a
+pass that ran *earlier* — and it was found only because the test list was written from measurements
+of what the canonical toolchain accepts, not from what the code looked like it handled.
+
+🔑 **When a comment claims "before X" or "after everything", check the line number, not the sentence.**
+An invariant about ORDER is the one kind of comment that can be falsified by moving nothing but
+itself. — 2026-09-20, `wat.zig` annotation pre-pass
