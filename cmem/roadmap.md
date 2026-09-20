@@ -548,7 +548,37 @@ data segments (active / passive / active-with-memidx), limits flags (`shared`, `
 either read by the emitter or documented as deliberately not emitted; suite and corpus counts do not
 regress. **Expect it to find something** — the mechanism is 4-for-4 in the sibling project.
 
-#### B-b — The INTEROP handoff: Z1, Z2, Z3 — adopt three CLI contract rows `[ ]`
+#### ✅ B-b — The INTEROP handoff: Z1, Z2, Z3. **COMPLETE 2026-09-19** (`0a48957a`)
+
+| item | outcome |
+| --- | --- |
+| **Z1** | ✅ naming an export the module lacks is now rc 1, and it lists what the module does export. The guard looks past the leading host-flag run, not at `rest[0]` — a first cut checked `rest[0]` and `m.wasm --allow-symlink spin` still summarized in silence |
+| **Z2** | ✅ `unknown flag`, rc 1, before the path, after it, and in `.wast`. Single-dash stays the guest's where there IS a guest (v15); `prog.wasm install --yes` still reaches the guest untouched |
+| **Z3** | ✅ the summary header is neutral; the verdict is the `validation:` line |
+| 🚨 **B0** | ✅ **a SECURITY defect found while implementing them — see below** |
+
+##### 🚨 B0's finding — `--allow-symlink` DISARMED the verify gate
+
+`--allow-symlink` was parsed by `runWasi`'s own flag loop but was **missing from `flags_bare`**, so
+`flagRegion` ENDED at it and every host flag written after it became invisible to `hasFlag`,
+`flagValue` and the `--max-iterations` splice. Measured:
+
+```
+wazmrt start.wasm --verify enforce                 -> rc 1, refused
+wazmrt start.wasm --allow-symlink --verify enforce -> rc 0, RAN UNVERIFIED
+```
+
+A user raising verification strictness got **no error and ran without it**. The same line silently
+dropped `--max-iterations`, and the mode dispatch lost the export name with it. One word fixes it;
+the test is inversion-proven (the mutant fails 2 tests).
+
+🎓 **The "one list, because a second copy would drift" comment sits directly above that list and the
+drift had happened anyway** — the list was in one place and the PARSER was reading a different
+vocabulary. *A list kept in one place is not the same as a list kept in agreement with its consumer.*
+That is the **third** configured restriction this project has found silently not applying, after H2's
+GC ceiling and H8's `--features`. All three were fail-OPEN and all three were invisible to a green suite.
+
+#### ~~B-b~~ — original scope, retained for the record `[x]`
 
 🔒 **Owner-directed, via `interop.md` §2.5h** (owner: *"lets pass all three issues to the wazmrt
 team"*). The contract rows are **already decided and numbered** — §2.4a is **v11**, §2.5 is **v12**, the
@@ -623,7 +653,25 @@ row, each **inversion-proven** (reverting the fix fails it); `install --yes` and
 still to reach the guest; conformance and suite counts do not regress. Then **`coordinate`** at the end
 of the track (§1d) and report to the owner.
 
-#### B-c — The T9e/T9i CONVERGENCE: Z4, the pin DB path, and the CLI halves `[ ]`
+#### B-c — The T9e/T9i CONVERGENCE. **3 of 5 done 2026-09-19** (`22437455`) `[~]`
+
+| # | state |
+| --- | --- |
+| **B-c1** `--dir` | ✅ **DONE.** `.:/` works, `::` accepted, drive letter narrowed to one ASCII letter (owner, §5 #10) |
+| **B-c2** Z4 name section | ⬜ **NOT STARTED** — scoped below |
+| **B-c3** pin DB path | ✅ **DONE.** Shared `wasmtk` path → own path → **warn when the sibling's DB exists and ours does not.** Decision is a pure function, all 8 combinations tested, the row that matters inversion-proven |
+| **B-c4** subcommands | ⬜ **NOT STARTED** — `run`/`wasi`/`wast` are aliases onto existing paths; **`wat` is a genuinely new feature** (assemble-to-file), which is why this is not a rename |
+| **B-c5** feature vocabulary | ✅ **DONE.** wasm-tools' whole vocabulary resolves, verified against the tool's own list |
+
+🔎 **Z4 IS SCOPED, and it is smaller than it looks: the assembler ALREADY RETAINS the identifiers.**
+`wat.zig` collects `func_names`, `local_names`, `type_names`, `table_names`, `data_names` and
+`elem_names` as `List(?[]const u8)` for resolution, then **discards them at emit time**. So Z4 is an
+**emit-side** change — write a `name` custom section — not a parser change. ⚠️ **What still needs
+proving before coding:** the exact subsection shape wasm-tools emits (which subsections, whether
+unnamed entries are omitted, ordering), because the gate is *digest equality* with wasmrt. Read it off
+a wasmrt-assembled module rather than from memory of the spec.
+
+#### ~~B-c~~ — original scope, retained for the record
 
 🤝 **From the `coordinate` pass of 2026-09-19** (`interop.md` **v17–v20**). wasmrt landed T9e + T9i and
 its column of §2.1/§2.2 is now green; these are wazmrt's halves. ⚠️ **Every row below was verified by
