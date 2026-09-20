@@ -139,10 +139,10 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
 
 | gate | result |
 | --- | --- |
-| conformance | **284 files · 63,934 passed · 0 failed · 0 skipped · 0 file-errors** (baseline still EMPTY) |
-| `test` (Debug) | **765/765** — was 758. **+4** iteration budget (2 tests, and `interp.zig`'s tests run in *both* the module and capi binaries), **+2** GC ceiling (1 test × 2), **+1** misplaced-flag warning (CLI binary only) |
-| `test-safe` (ReleaseSafe) | 765/765 |
-| **`test-shipped` (ReleaseSmall — the config that ships)** | 765/765 |
+| conformance | **288 files · 64,072 passed · 0 failed · 20 skipped · 0 file-errors** (baseline still EMPTY). ⚠️ The counts differ from Track H's `284 · 63,934 · 0 skipped` because this is a **different testsuite checkout**, not a regression — verified by running the same command on `HEAD` before and after every change on 2026-09-20 |
+| `test` (Debug) | **798/798** (2026-09-20, Track B) — was **765/765** — was 758. **+4** iteration budget (2 tests, and `interp.zig`'s tests run in *both* the module and capi binaries), **+2** GC ceiling (1 test × 2), **+1** misplaced-flag warning (CLI binary only) |
+| `test-safe` (ReleaseSafe) | **796/796** (was 765) |
+| **`test-shipped` (ReleaseSmall — the config that ships)** | **796/796** (was 765) |
 | `test-security` | 3/3 from an NTFS cwd |
 | `features` · `capi-smoke` | green |
 | size (ReleaseSmall) | exe **1,009,664** · lib **1,059,240** · dll **910,336** — all three EXACT (2026-09-20). ⚠️ **Every `dll` number recorded before 2026-09-20 was read off a STALE file** — the gate did not build the shared library it graded, so `900,608` was wrong from the day it was written. See `roadmap.md` → B-e |

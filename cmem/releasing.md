@@ -94,15 +94,23 @@ export, a size or speed change, or anything visible only in the test suite.
 | `include/wazmrt.h` | the `/* e.g. "1.0.1" */` example on `wazmrt_version_string` — cosmetic, but embedders read it |
 | `cmem/overview.md` | the tree diagram's `v1.0.1` annotation |
 
-⚠️ **No test asserts these agree.** `capi_smoke.c` *prints* the version and only pins `abi_version`
-against the header, so the bump is a grep every time:
+✅ **THREE OF THE FOUR ARE NOW PINNED BY A TEST** (2026-09-20, Track B category 5 —
+`src/version_agreement.zig`, its own target on `zig build test`). `root.version` is compared against
+**`build.zig.zon`** and **`include/wazmrt.h`**, and the header's `#define WAZMRT_ABI_VERSION` against
+`abi_version`. A bump that misses one of them is now a red build.
+
+⬜ **The fourth — `cmem/overview.md`'s tree annotation — is deliberately NOT pinned.** It is project
+memory rather than public surface, and reaching into `cmem/` from `src/` would make renaming a memory
+document a compile error in the runtime. **So step 9 below still applies to that one**, and the grep
+is still the way to find it:
 
 ```
 grep -rn '<old version>' src include build.zig.zon cmem
 ```
 
-*(Adding a pinning test is a legitimate Track B finding — the same "a rule nobody has watched fail is not
-enforcement" argument that turned the ABI version into a real gate.)*
+*(This section used to end "adding a pinning test is a legitimate Track B finding" — it was, and this
+is it. ⚠️ The paragraph it replaced said "no test asserts these agree", which stayed true for exactly
+as long as nobody acted on the note directly underneath it.)*
 
 ---
 

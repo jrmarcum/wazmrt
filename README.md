@@ -228,7 +228,16 @@ and refuses absolute paths, `..` escapes, and NT/device prefixes — an interior
 no mutating one (write, create, delete, rename, link, truncate, set-times). Because
 `path_open` can only ever *narrow* an fd's rights against the directory it came
 from, the read-only-ness propagates to the whole subtree — nothing opened under a
-`--ro-dir` preopen can write either. `--env KEY=VAL` (repeatable) sets one
+`--ro-dir` preopen can write either.
+
+`--allow-symlink` lets the guest **create** symlinks inside a preopen. It is
+**off by default**, because a symlink is the classic way out of a sandbox: the
+guest writes a link pointing outside the preopen and then follows it. wazmrt
+resolves guest paths itself and refuses escapes either way, so this flag controls
+creation only — but leaving it off removes the attempt surface entirely, and
+nothing needs it unless the guest genuinely builds links.
+
+`--env KEY=VAL` (repeatable) sets one
 environment variable visible to the guest; the guest's environment is otherwise
 empty. All preopen/`--env` flags are consumed by wazmrt; everything after `--`
 (or the first non-flag) is the guest's `argv`.
