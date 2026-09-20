@@ -863,15 +863,12 @@ fn readBlockType(r: *Reader) DecodeError!BlockType {
         -22 => .{ .value = .arrayref }, // 0x6a
         -23 => .{ .value = .exnref }, // 0x69 (exception ref)
         -15 => .{ .value = .nullref }, // 0x71 (none)
-        -24 => .{ .value = .funcref_nn }, // 0x68 (our synthetic non-null tags)
-        -25 => .{ .value = .externref_nn }, // 0x67
-        -26 => .{ .value = .anyref_nn }, // 0x66
-        -27 => .{ .value = .eqref_nn }, // 0x65
-        -30 => .{ .value = .i31ref_nn }, // 0x62
-        -31 => .{ .value = .structref_nn }, // 0x61
-        -39 => .{ .value = .arrayref_nn }, // 0x59
-        -40 => .{ .value = .nullref_nn }, // 0x58
-        -41 => .{ .value = .exnref_nn }, // 0x57 (synthetic non-null exn ref)
+        // 🚨 **REMOVED 2026-09-20 (Track B): the same nine synthetic tags, as s33 negatives.**
+        // See `Module.readValType` for the full account — the emitter stopped writing them, both
+        // readers kept accepting them, and `-30` (0x62) collided with custom-descriptors' `exact`.
+        // A block type is read here and a param type there; leaving one reader lenient would have
+        // meant the byte was refused in half the positions, which is the failure mode the comment
+        // above `0x57` in that file was written about.
         else => error.UnsupportedOpcode,
     };
 }

@@ -2020,13 +2020,6 @@ const FuncValidator = struct {
     }
 };
 
-/// True if two value-type lists are element-wise equal.
-fn valTypesEqual(a: []const V, b: []const V) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| if (x != y) return false;
-    return true;
-}
-
 /// §3.3.8: a tail call's callee results must be a SUBTYPE SEQUENCE of the
 /// caller's declared results — `[t2*] <: [t2'*]` — not equal to them.
 ///

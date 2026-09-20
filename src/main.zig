@@ -705,6 +705,7 @@ fn printHelp(out: *Io.Writer, prog: []const u8) !void {
         \\                              `::` also separates and is never ambiguous: `--dir C:\data::/d`
         \\                              a lone `:` splits too, except after a drive letter (`C:\tmp`)
         \\  --ro-dir <host>[:<guest>]   grant a read-only preopen (no write/create/delete)
+        \\  --allow-symlink             let the guest CREATE symlinks (OFF by default)
         \\  --env KEY=VALUE             set one environment variable for the guest
         \\  --max-memory <size>         linear-memory ceiling for a WASI command (default 1G; e.g. 512M, 2G)
         \\                              the default ceiling applies to every run mode
@@ -2357,6 +2358,85 @@ test "a wazmrt flag after --allow-symlink still APPLIES (the list drift that dis
     const guest = [_][]const u8{ "--allow-symlink", "install", "--yes" };
     try std.testing.expectEqual(@as(usize, 1), flagRegion(&guest).len);
     try std.testing.expect(!hasFlag(&guest, "--yes"));
+}
+
+test "every flag the HELP documents is in the flag vocabulary, and vice versa" {
+    // 🔒 **The mechanical version of the test above, and the reason Track B category 5 exists.**
+    // That one pins the ONE flag that broke — `--allow-symlink`, missing from `flags_bare`, which
+    // ended the flag region early and let `wazmrt start.wasm --allow-symlink --verify enforce` RUN
+    // UNVERIFIED at rc 0. It does nothing for the NEXT flag added to the help and forgotten here,
+    // which would reproduce the same security class in silence.
+    //
+    // 🎓 *A rule nobody has watched fail is not enforcement* — the argument that turned the ABI
+    // version into a real gate. So: render the help, pull every `--flag` out of it, and require the
+    // two lists to agree in BOTH directions. Adding a flag to one and not the other is now a red
+    // build instead of a defect waiting for someone to measure it against another runtime.
+    var buf: [16 * 1024]u8 = undefined;
+    var w = Io.Writer.fixed(&buf);
+    try printHelp(&w, "wazmrt");
+    const help = w.buffered();
+
+    // Flags that are deliberately NOT in `flagRegion`'s vocabulary, each for a recorded reason.
+    // ⚠️ Adding a name here is the one way to defeat this test, so each needs its reason WITH it.
+    const exempt = [_][]const u8{
+        // Consumed before the module path, and kept out of the lists on purpose so a GUEST's own
+        // `--features mvp` can never narrow the language wazmrt accepts (see the parse site).
+        "--features",
+        // First-argument-only, handled before any flag parsing (§2.4).
+        "--help", "--version",
+        // Subcommand-local: `wat -o`, `wast -v`, `pin --db`, `keygen --out`, `sign --key`. None of
+        // them reaches `flagRegion`, which only ever walks the region after a MODULE path.
+        "--output", "--verbose", "--db", "--out", "--key",
+        // The end-of-flags marker, not a flag.
+        "--",
+    };
+
+    // ---- direction 1: everything the help documents is in the vocabulary ----
+    var i: usize = 0;
+    var documented: usize = 0;
+    while (std.mem.indexOfPos(u8, help, i, "--")) |at| {
+        i = at + 2;
+        var end = i;
+        while (end < help.len and (std.ascii.isAlphanumeric(help[end]) or help[end] == '-')) end += 1;
+        if (end == i) continue; // a bare `--`, or `--` inside prose
+        const flag = help[at..end];
+        for (exempt) |e| if (std.mem.eql(u8, flag, e)) break;
+        // Zig has no labelled `continue` out of a `for`-`else` here, so re-scan.
+        var is_exempt = false;
+        for (exempt) |e| if (std.mem.eql(u8, flag, e)) {
+            is_exempt = true;
+        };
+        if (is_exempt) continue;
+        var known = false;
+        for (flags_with_value) |f| if (std.mem.eql(u8, flag, f)) {
+            known = true;
+        };
+        for (flags_bare) |f| if (std.mem.eql(u8, flag, f)) {
+            known = true;
+        };
+        if (!known) {
+            std.debug.print(
+                "\nhelp documents '{s}' but it is in neither flags_with_value nor flags_bare.\n" ++
+                    "That is the `--allow-symlink` defect: flagRegion would STOP at it and every\n" ++
+                    "host flag after it would be silently handed to the guest.\n",
+                .{flag},
+            );
+            return error.FlagDocumentedButNotParsed;
+        }
+        documented += 1;
+    }
+    // The walk must actually have found flags — a scan that matches nothing passes vacuously.
+    try std.testing.expect(documented >= flags_with_value.len + flags_bare.len);
+
+    // ---- direction 2: everything in the vocabulary is documented ----
+    // An undocumented flag is the milder failure, but it is still a flag the user cannot discover
+    // and that `--help` implicitly denies the existence of.
+    for (flags_with_value ++ flags_bare) |f| {
+        if (std.mem.indexOf(u8, help, f) == null) {
+            std.debug.print("\n'{s}' is parsed but never documented in --help\n", .{f});
+            return error.FlagParsedButNotDocumented;
+        }
+    }
 }
 
 test "an unrecognised flag in a HOST position is an error; guest positions are untouched" {

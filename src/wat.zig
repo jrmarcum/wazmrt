@@ -2439,13 +2439,6 @@ fn parseCallIndirectType(ctx: *Ctx, items: []const Sexpr, start: usize) Error!st
     return .{ .idx = try internSig(ctx.a, ctx.sigs, params.items, results.items), .table = table, .next = j };
 }
 
-/// True if the form is a `call_indirect` type annotation: `(type …)` /
-/// `(param …)` / `(result …)`.
-fn isTypeUse(s: Sexpr) bool {
-    const kw = s.keyword() orelse return false;
-    return std.mem.eql(u8, kw, "type") or std.mem.eql(u8, kw, "param") or std.mem.eql(u8, kw, "result");
-}
-
 /// `op` is `call_indirect` or its tail-call twin `return_call_indirect` — the
 /// immediates are identical, only the opcode byte differs.
 fn emitCallIndirect(ctx: *Ctx, op: Op, type_index: u32, table: u32) Error!void {

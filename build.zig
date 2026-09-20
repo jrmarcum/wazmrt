@@ -340,6 +340,26 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(cli_tests).step);
 
+    // ---- Version agreement (`src/version_agreement.zig`) --------------------
+    // 🔢 Its own target because the check needs `@embedFile` on two files outside `src/`, which
+    // means anonymous imports on the module that compiles it. `root.zig` is compiled into six
+    // different modules, so putting it there would mean wiring those imports into every one of
+    // them — and into every future target. One file, one module, one place to wire.
+    //
+    // 🔒 On `test` only, and not on `test-safe` / `test-shipped`: the claim is that SOURCE FILES
+    // agree with each other, which no optimize mode can change.
+    const version_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/version_agreement.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "wazmrt", .module = mod }},
+        }),
+    });
+    version_tests.root_module.addAnonymousImport("project_manifest", .{ .root_source_file = b.path("build.zig.zon") });
+    version_tests.root_module.addAnonymousImport("project_header", .{ .root_source_file = b.path("include/wazmrt.h") });
+    test_step.dependOn(&b.addRunArtifact(version_tests).step);
+
     // ---- Security gate (`zig build test-security`) -------------------------
     // The sandbox-escape tests SKIP when the harness cannot create a symlink. ⚠️ On the dev machine
     // that is NOT a privilege problem — Developer Mode is on. `std.testing.tmpDir` puts its scratch

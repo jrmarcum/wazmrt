@@ -1018,6 +1018,28 @@
 # B-e — **a `-Doptimize=ReleaseSmall` build runs the gate by itself.** A gate only gates the
 # commits that run it.
 
-wazmrt.exe  1009664
-wazmrt.lib  1059240
-wazmrt.dll  910336
+# ---------------------------------------------------------------------------------------
+# 2026-09-20 — Track B categories 3/4/5 (the general hunt). exe -512, lib -14, dll +512.
+#
+# 📌 **The first entry written by a gate that ran on its own.** B-e wired the size check into a
+# `-Doptimize=ReleaseSmall` build that morning; this is the build that tripped it, without anyone
+# remembering to ask. It is also the first entry with a DLL number that was measured rather than
+# inherited from a stale file.
+#
+# What bought the DLL's 512 bytes: `features.firstViolation` now walks CONSTANT EXPRESSIONS —
+# defined globals' initializers and active element / data segment offsets. `extended_const` was
+# the only one of the nineteen proposals the gate could never return, because arithmetic in an
+# initializer is the only place that proposal can appear and nothing visited those bytes. The bit
+# was published to embedders as `WAZMRT_FEATURE_EXTENDED_CONST` and turning it off did nothing.
+#
+# 📉 The exe and lib got SMALLER in the same commit: the nine synthetic non-null valtype arms came
+# out of both binary readers (they decoded wazmrt's own internal tags as if they were wire bytes,
+# which made wazmrt accept binaries every other runtime refuses), and three dead private functions
+# went with them. **An accept-invalid removed is bytes back.**
+#
+# Corpus unchanged (288 files / 64,072 passed / 0 failed / 20 skipped / 0 file-errors).
+# Unit tests 792 -> 796.
+
+wazmrt.exe  1009152
+wazmrt.lib  1059226
+wazmrt.dll  910848

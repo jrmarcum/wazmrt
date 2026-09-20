@@ -591,10 +591,6 @@ pub const Store = struct {
         return Handle.slot(id).?;
     }
 
-    fn instanceOf(self: *Store, r: Ref) *InstanceSlot {
-        return self.instances.items[r.inst];
-    }
-
     /// Hand the host a HANDLE for an internal reference value.
     ///
     /// Null maps to handle 0, which is invalid-by-construction everywhere else

@@ -285,6 +285,38 @@ fn immIsExact(imm: opcode.Imm) bool {
 ///
 /// Returns the offending feature rather than just failing, so the caller can name it — "this
 /// module uses gc" is actionable; "invalid module" is not.
+/// Decode one constant expression and require every proposal its instructions belong to.
+///
+/// Sets `found` rather than returning it, so the caller keeps `firstViolation`'s "first one wins"
+/// ordering. A const-expr that will not decode is left to the validator, exactly as a malformed
+/// function body is — this pass reports RESTRICTIONS, never malformations.
+fn requireConstExprFeatures(gpa: std.mem.Allocator, fs: Set, expr: []const u8, found: *?Feature) !void {
+    if (expr.len == 0) return; // passive segment: no offset
+    const instrs = opcode.decodeBody(gpa, expr) catch return;
+    defer opcode.freeBody(gpa, instrs);
+    for (instrs) |instr| {
+        // 🔑 **`extended_const` is CONTEXTUAL, which is why the ordinary opcode→proposal map
+        // cannot see it.** `i32.add` is core WebAssembly 1.0 in a function body; the proposal is
+        // that it may appear in a CONSTANT EXPRESSION at all. So `instrFeature` correctly returns
+        // null for it everywhere, and a walk that only asks `instrFeature` — which is what the
+        // body loop does — could never produce this bit no matter where it walked.
+        //
+        // The six are the validator's own list (`validate.zig`, the `0x6a 0x6b 0x6c` / `0x7c 0x7d
+        // 0x7e` arms of the const-expr switch), matched on the DECODED op rather than the raw
+        // byte: an `i32.const` immediate is LEB bytes and can contain 0x6a.
+        switch (instr.op) {
+            .i32_add, .i32_sub, .i32_mul, .i64_add, .i64_sub, .i64_mul => {
+                require(fs, .extended_const, found) catch return;
+            },
+            else => {},
+        }
+        // …and everything a const-expr shares with a body (GC `ref.i31`, `ref.func`, …) is
+        // classified the ordinary way.
+        require(fs, instrFeature(instr), found) catch return;
+        if (immIsExact(instr.imm)) require(fs, .custom_descriptors, found) catch return;
+    }
+}
+
 pub fn firstViolation(gpa: std.mem.Allocator, module: *const Module, fs: Set) !?Feature {
     if (fs.all()) return null; // nothing restricted: skip the whole pass
     var found: ?Feature = null;
@@ -354,6 +386,33 @@ pub fn firstViolation(gpa: std.mem.Allocator, module: *const Module, fs: Set) !?
         // EQUALITY where an ordinary import accepts a subtype. It is a link-time rule with no
         // instruction and no value type of its own, so neither walk reaches it.
         if (im.exact) require(fs, .custom_descriptors, &found) catch return found;
+    }
+
+    // --- CONSTANT EXPRESSIONS ---------------------------------------------------------------
+    // 🚨 **These were never walked, and `extended_const` was the only one of the nineteen
+    // proposals this function could never return** (Track B, 2026-09-20). Arithmetic in an
+    // initializer — `(global i32 (i32.add (i32.const 1) (i32.const 2)))` — IS the extended-const
+    // proposal, and a const-expr is the only place it can appear. So the bit existed in the enum,
+    // was mirrored into `capi.zig`, was published as `WAZMRT_FEATURE_EXTENDED_CONST` in
+    // `wazmrt.h`, was offered in the CLI's `--features` vocabulary, and **turning it off did
+    // nothing**: measured, `--features mvp` validated that module OK while the same command
+    // correctly refused a `sign_extension` one.
+    //
+    // ⚠️ **That is the exact failure this file's own header names** — *"a gate that misses an
+    // opcode is worse than no gate: it reads as a control while letting the thing through"* —
+    // and it was published to embedders as a control they could rely on.
+    //
+    // 🔑 Same decode-and-require loop as the bodies below, over the three places a const-expr
+    // lives: defined globals' initializers, and active element / data segments' offsets. Element
+    // segments in the expression form carry one per entry.
+    {
+        for (module.global_inits) |expr| try requireConstExprFeatures(gpa, fs, expr, &found);
+        for (module.elements) |e| {
+            try requireConstExprFeatures(gpa, fs, e.offset_expr, &found);
+            for (e.exprs) |expr| try requireConstExprFeatures(gpa, fs, expr, &found);
+        }
+        for (module.data) |d| try requireConstExprFeatures(gpa, fs, d.offset_expr, &found);
+        if (found) |_| return found;
     }
 
     // --- function bodies -------------------------------------------------------------------
@@ -496,6 +555,55 @@ test "gating: an exact ref reports the LAYER it is missing — gc before custom_
     // A coherent "no GC" set: `Set.incoherent` requires custom_descriptors to fall with it.
     try std.testing.expectEqual(@as(?Feature, .gc), try needs(src, setWithout(&.{ .gc, .custom_descriptors })));
     try std.testing.expectEqual(@as(?Feature, .custom_descriptors), try needs(src, setWithout(&.{.custom_descriptors})));
+}
+
+test "gating: extended_const — the proposal whose gate could NEVER fire" {
+    // 🚨 **The only one of the nineteen `Feature` members that `firstViolation` could not return**,
+    // because the walk never visited a CONSTANT EXPRESSION — the one place extended-const
+    // arithmetic can appear. The bit was in the enum, mirrored into `capi.zig`, **published to
+    // embedders as `WAZMRT_FEATURE_EXTENDED_CONST` in `wazmrt.h`**, and listed in the CLI's
+    // `--features` vocabulary. Turning it off did nothing.
+    //
+    // Measured before the fix, and the control is what makes it a finding rather than a guess:
+    //   wazmrt --features mvp extended-const.wat  ->  "validation: OK"          ← the subject
+    //   wazmrt --features mvp sign-extension.wat  ->  "FAILED: uses 'sign_extension'" ← the control
+    //
+    // ⚠️ **This file's own header names the failure**: *"a gate that misses an opcode is worse
+    // than no gate: it reads as a control while letting the thing through."*
+    //
+    // 🔑 **And the reason it hid for so long: `extended_const` is CONTEXTUAL.** `i32.add` is core
+    // WebAssembly 1.0 in a function body; the proposal is that it may appear in a const-expr at
+    // all. So the opcode→proposal map is right to return null for it, and no amount of walking
+    // more places would have produced the bit — the const-expr walk has to ask a different
+    // question. *A coverage gap and a classification gap look identical from the outside.*
+    const off = setWithout(&.{.extended_const});
+    const all: Set = .{};
+
+    const uses = [_][]const u8{
+        // A defined global's initializer — the canonical spelling.
+        "(module (global i32 (i32.add (i32.const 1) (i32.const 2))))",
+        "(module (global i64 (i64.mul (i64.const 2) (i64.const 3))))",
+        // An active DATA segment's offset. A gate that covered globals only would pass this.
+        "(module (memory 1) (data (offset (i32.sub (i32.const 8) (i32.const 4))) \"hi\"))",
+        // …and an active ELEMENT segment's offset, the third const-expr position.
+        "(module (table 4 funcref) (func $f) (elem (offset (i32.add (i32.const 1) (i32.const 1))) $f))",
+    };
+    for (uses) |src| {
+        std.testing.expectEqual(@as(?Feature, .extended_const), try needs(src, off)) catch |e| {
+            std.debug.print("not gated: {s}\n", .{src});
+            return e;
+        };
+        // …and granted, the same module is fine.
+        try std.testing.expectEqual(@as(?Feature, null), try needs(src, all));
+    }
+
+    // 🔒 The half that must NOT over-fire: a plain constant initializer is MVP, and so is the same
+    // arithmetic inside a function BODY. Gating either would refuse WebAssembly 1.0.
+    try std.testing.expectEqual(@as(?Feature, null), try needs("(module (global i32 (i32.const 3)))", off));
+    try std.testing.expectEqual(
+        @as(?Feature, null),
+        try needs("(module (func (result i32) (i32.add (i32.const 1) (i32.const 2))))", off),
+    );
 }
 
 test "gating: custom_page_sizes — the proposal that shipped with no switch at all" {

@@ -826,22 +826,42 @@ fn readValType(r: *Reader, kinds: []const CompKind) Error!types.ValType {
         // its top. **Two encodings of one type must land on one value type, and
         // that value type has to be the right one, not merely a consistent one.**
         0x74 => .nullexnref,
-        0x68 => .funcref_nn, // our synthetic non-null tags (assembler round-trip)
-        0x67 => .externref_nn,
-        0x66 => .anyref_nn,
-        0x65 => .eqref_nn,
-        0x62 => .i31ref_nn,
-        0x61 => .structref_nn,
-        0x59 => .arrayref_nn,
-        0x58 => .nullref_nn,
-        // ⚠️ `exnref_nn` was defined in `types.zig` and taught to `readBlockType`,
-        // and THIS reader was missed — so `(ref exn)` round-tripped as a block
-        // type but was `BadValType` in every other position. `try_table.wast`'s
-        // last module uses it in a block RESULT LIST (two results, so the
-        // signature is interned and read back through here rather than through
-        // `readBlockType`), which is why one valid module was rejected. A tag
-        // added to one of two readers is a tag that works in half the positions.
-        0x57 => .exnref_nn,
+        // 🚨 **REMOVED 2026-09-20 (Track B, stale-workaround sweep): the nine SYNTHETIC
+        // non-null tags — 0x68 0x67 0x66 0x65 0x62 0x61 0x59 0x58 0x57.**
+        //
+        // They existed to "round-trip our own assembler output", and the assembler stopped
+        // producing them in two steps: `emitValType` gained its `isNonNullRef` arm on
+        // 2026-08-17, and Track B-a deleted the second emitter (`emitBlockTypeSig`, which was
+        // re-deriving the encoding and writing the raw tag). **Nothing in the tree emits them
+        // any more, and they are not value types in core wasm, GC, EH or custom-descriptors** —
+        // so accepting them made wazmrt take binaries every other runtime refuses. Measured
+        // against the sibling on the same bytes: `0x66` in a param position validated OK here
+        // and was *"byte is not a defined value type"* there.
+        //
+        // ⚠️⚠️ **0x62 is worse than unassigned — it is the custom-descriptors `exact` former**,
+        // and this very file says so 40 lines below (*"a synthetic internal tag squatting on what
+        // has since become real spec syntax… The emitter is fixed"*). The emitter was fixed; the
+        // READER was not, so `readHeapTypeRefEx` read 0x62 as `exact` while `readValType` read
+        // it as `i31ref_nn` — two readers in one file disagreeing about one byte.
+        //
+        // 🎓 *Our assembler is not an oracle for our decoder* — the sixth instance. Fixing one
+        // half of a producer/consumer pair leaves the other half accepting what nothing writes.
+        //
+        // 🔒 The `ValType.*_nn` VALUES stay: they are what `readHeapTypeRef(r, false, …)` returns
+        // for the legitimate `0x64 <heaptype>` form on the next line. Only the raw-byte arms go.
+        // 📌 **The note this arm carried, kept because it aged into the lesson.** `exnref_nn` was
+        // defined in `types.zig` and taught to `readBlockType` while THIS reader was missed, so
+        // `(ref exn)` round-tripped as a block type and was `BadValType` everywhere else;
+        // `try_table.wast`'s last module uses it in a block RESULT LIST, which is interned and
+        // read back through here, and one valid module was rejected. The fix was to add the tag
+        // here too — *"a tag added to one of two readers is a tag that works in half the
+        // positions."*
+        //
+        // ⚠️ **It was the right fix to the wrong layer, and that is why the whole set is gone
+        // now.** The real encoding of `(ref exn)` is `0x64 0x69`, which the `0x64` arm below
+        // already reads. Symmetry between two readers was achieved by teaching both of them a
+        // byte the format does not define. *Two readers agreeing is not evidence either is
+        // right — it is the same trap one level up.*
         0x63 => try readHeapTypeRef(r, true, kinds), // (ref null ht)
         0x64 => try readHeapTypeRef(r, false, kinds), // (ref ht) — non-nullable
         else => error.BadValType,
@@ -1953,6 +1973,54 @@ test "decodes a code section with locals and a body" {
     // export "add" still resolves to the defined function's signature.
     try std.testing.expectEqual(types.ExternKind.func, m.exports[0].type.kind());
     try std.testing.expectEqualSlices(types.ValType, &.{.i32}, m.exports[0].type.func.results);
+}
+
+test "the SYNTHETIC non-null valtype tags are refused, not decoded" {
+    // 🚨 These nine bytes were wazmrt's own INTERNAL `ValType` tags, accepted here so the decoder
+    // could round-trip the assembler's output. The assembler stopped writing them (2026-08-17 for
+    // `emitValType`; Track B-a for the second emitter), and the readers were never updated — so
+    // wazmrt kept accepting binaries **every other runtime refuses**.
+    //
+    // Measured against the sibling on the same bytes, before the fix:
+    //   a func type whose param byte is 0x66  ->  wazmrt: "validation: OK"
+    //                                             wasmrt: "byte is not a defined value type"
+    //
+    // ⚠️⚠️ `0x62` is the custom-descriptors `exact` former, so this reader was squatting on real
+    // spec syntax that `readHeapTypeRefEx` — in THIS FILE — already reads correctly. Two readers,
+    // one file, one byte, two answers.
+    //
+    // 🎓 *Our assembler is not an oracle for our decoder.* Fixing the producer left the consumer
+    // accepting what nothing produces, which is the same blind spot one level up.
+    for ([_]u8{ 0x68, 0x67, 0x66, 0x65, 0x62, 0x61, 0x59, 0x58, 0x57 }) |synthetic| {
+        // type section: 1 type = func, 1 param (the synthetic byte), 0 results.
+        const bytes =
+            types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+            [_]u8{ 0x01, 0x05, 0x01, 0x60, 0x01 } ++ [_]u8{synthetic} ++ [_]u8{0x00};
+        try std.testing.expectError(error.BadValType, Module.decode(std.testing.allocator, &bytes));
+    }
+
+    // 🔒 The control, and the half that must NOT change: the real encodings still decode.
+    // `0x6e` is `anyref`, and `0x64 0x6e` is the genuine `(ref any)` the `_nn` values exist for —
+    // removing the synthetic arms must not have taken the legitimate form with them.
+    for ([_][]const u8{ &.{0x6e}, &.{ 0x64, 0x6e }, &.{ 0x64, 0x69 } }) |enc| {
+        var buf: [32]u8 = undefined;
+        const head = types.magic ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 };
+        @memcpy(buf[0..head.len], &head);
+        var n = head.len;
+        buf[n] = 0x01; // type section
+        buf[n + 1] = @intCast(3 + enc.len + 1); // payload size
+        buf[n + 2] = 0x01; // one type
+        buf[n + 3] = 0x60; // func
+        buf[n + 4] = 0x01; // one param
+        n += 5;
+        @memcpy(buf[n..][0..enc.len], enc);
+        n += enc.len;
+        buf[n] = 0x00; // no results
+        n += 1;
+        var m = try Module.decode(std.testing.allocator, buf[0..n]);
+        defer m.deinit();
+        try std.testing.expectEqual(@as(usize, 1), m.comp_types.len);
+    }
 }
 
 test "resolves a memory export with limits" {

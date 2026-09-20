@@ -62,7 +62,9 @@ pub const wasi = if (enable_wasi) @import("wasi.zig") else struct {};
 pub const pin = @import("pin.zig");
 pub const sign = @import("sign.zig");
 
-/// Human-readable library version (keep in sync with build.zig.zon).
+/// Human-readable library version. **The one truth**; every other copy is checked
+/// against this one by the test at the bottom of this file, so "keep in sync" is
+/// no longer an instruction to a human.
 pub const version: [:0]const u8 = "1.0.1";
 
 /// Stable C-ABI version for embedders (universalWasmLoader-*). Bump on any
@@ -100,3 +102,4 @@ test {
         _ = @import("fuzz.zig"); // malformed-input fuzz targets (see fuzz.zig)
     }
 }
+
