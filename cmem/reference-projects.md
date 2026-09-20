@@ -1,9 +1,38 @@
 # Reference Projects
 
-The nine candidate runtimes named at project inception. We **study** them freely and **adopt**
-selectively — every adoption gated by the Adoption Checklist + a Component Ledger entry in
-`third_party/LICENSES.md`. Licenses were **verified against each upstream `LICENSE` file on
-2026-07-02** (not the GitHub badge — see `licensing.md`).
+## 🔎 AUDITED 2026-09-20 — **six of the nine were never used for anything, and the compliance file no longer lists them**
+
+**Measured, not recalled:** every project name searched across the whole repository with word
+boundaries, excluding the two files that merely list them, each hit classified by where it lives.
+
+| verdict | projects |
+| --- | --- |
+| **Behavioural reference in shipped code** (no code adapted) | **wasmtime** — diagnostic shape, a default recursion limit, a byte collision it named first. `src/interp.zig:473`: *"arrived at independently here and confirmed against"* |
+| **Bake-off competitors only** (binary executed, source never read) | **wasmer**, **wazero** (and wasmtime) |
+| **Formerly adopted, removed** | **wasm-c-api** — the vendored `wasm.h`, 2026-07-02 → 2026-08-11 |
+| ⬜ **No occurrence anywhere in the tree** | **wasm3**, **WAMR**, **wasmi**, **wain**, **wai**, **rust-wasm** — and three of those six appear nowhere in the repository at all |
+
+📌 **`third_party/LICENSES.md` now lists only the first three groups.** A row in a compliance file
+is a claim that a licence was relevant to something we did; for the six it never was. **This file
+keeps all nine**, because *why* a candidate was named is research worth keeping — the two documents
+have different jobs, and conflating them is what let an inventory of intentions read as an
+inventory of obligations for two months.
+
+⚠️⚠️ **AND AN OPEN CONTRADICTION THIS AUDIT SURFACED — FOR THE OWNER, NOT FOR AN AGENT.**
+The table below has a **"What to mine it for"** column and the sentence *"we study them freely"*.
+🔒 **`interop.md` §1 says the opposite:** *"the oracle is still retired … reading a competitor's
+implementation for guidance remains off-limits."* Both are current, both are binding-sounding, and
+they cannot both be followed. The narrow reading is that the retirement is about the **sibling
+`wasmrt`** specifically (§1's subject); the broad reading is the words as written, which would
+forbid the entire "mine it for" column below. 🚫 **Not resolved here** — an agent does not narrow an
+owner's rule by picking the reading that lets it do more work. ⬜ **It has cost nothing so far**,
+because the audit shows no source of any of the nine has actually been consulted.
+
+---
+
+The nine candidate runtimes named at project inception. Licenses were **verified against each
+upstream `LICENSE` file on 2026-07-02** (not the GitHub badge — see `licensing.md`). Every adoption
+is gated by the Adoption Checklist + a Component Ledger entry in `third_party/LICENSES.md`.
 
 | Project | License (SPDX) | Lang | What to mine it for | Status |
 | --- | --- | --- | --- | --- |
@@ -45,6 +74,14 @@ The nine runtimes above remain **Evaluating** — no interpreter/decoder code ad
 (wazmrt's runtime code is still 100% original). When code is first adapted from one, move its row to
 **Adopted**, add the ledger entry, copy the upstream `LICENSE`/`NOTICE` into `third_party/<component>/`,
 and add change-notes + SPDX headers to the adapting source (per the Adoption Checklist).
+
+✅ **CONFIRMED BY MEASUREMENT 2026-09-20, not by assertion.** *"Still 100% original"* had been a
+claim carried forward since 2026-07-02 in a file that nobody re-checked — the same shape as the
+ceilings that were copied forward from a stale artifact. It is now verified: the audit at the top
+of this file found **no source of any of the nine consulted anywhere in the tree**, and the only
+shipped mentions of any of them are wasmtime's observable BEHAVIOUR being matched, one of which
+says in the code that it was arrived at independently. 🎓 *A status column is a dated claim like
+any other; "Evaluating" for two months meant "nobody asked".*
 
 ## ~~C ABI decision (2026-07-02): mirror the wasm-c-api standard~~ — REVERSED 2026-08-11
 

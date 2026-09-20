@@ -32,6 +32,18 @@ and change-statement obligations must be preserved. So:
 NOTICE to propagate, and nothing that has to travel with the artifact: `zig-out/include/` is a single
 file, our own `wazmrt.h`.
 
+✅ **RE-VERIFIED BY MEASUREMENT 2026-09-20, and the reference inventory was cut from nine projects
+to three.** Every candidate runtime was searched across the whole repository; **six had no
+occurrence in `src/`, `include/`, `tools/`, `tests/`, `examples/`, `bench/` or `build.zig` at all**,
+and three of those appear nowhere in the repository whatsoever. ⚠️ **They were still listed in the
+compliance file as "Evaluating"** — a two-month-old statement of intent that read, to anyone
+opening `third_party/LICENSES.md`, as an inventory of obligations. 🔑 **The two relationships that
+survive and look like licence events are not:** executing a competitor's binary in the bake-off
+copies nothing, and matching wasmtime's *observable* diagnostic shape is an interface rather than
+copied expression — `src/interp.zig:473` records it as *"arrived at independently here and confirmed
+against"*. The full table and the reasoning: `third_party/LICENSES.md` → **THE BOTTOM LINE**.
+🎓 *A status column is a dated claim like any other.*
+
 The one component ever vendored — the standard `wasm.h` (`Apache-2.0`) — went when the C ABI was
 replaced by the native `wazmrt.h`. **So wazmrt is now `MIT OR Apache-2.0` end to end, with no
 incorporated code under any other terms**, which is the "self-owned" half of the vision's

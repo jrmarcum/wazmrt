@@ -14,6 +14,30 @@ license compliance.
 
 ---
 
+## 📋 THE BOTTOM LINE (audited 2026-09-20) — **wazmrt carries NO third-party licence obligation**
+
+✅ **Nothing third-party is vendored, adapted, or distributed.** `third_party/` contains this file
+and no code; the Component Ledger is empty; a clean build produces `wazmrt.exe`, `wazmrt.lib`,
+`wazmrt.h` and `wazmrt.dll`, all of them ours. **No NOTICE has to travel with the artifact and no
+upstream LICENSE has to be copied anywhere.**
+
+The audit below cut the reference inventory from nine projects to three, and the reason each of the
+three survives is worth stating precisely, because **two of the relationships look like licence
+events and are not**:
+
+| what we did | is it a licence event? |
+| --- | --- |
+| **Ran a competitor's binary** in `tools/bakeoff.mjs` (wasmtime, wasmer, wazero) | ❌ **No.** Executing an installed program copies nothing into this tree and distributes nothing. It is the same act as a user running it. |
+| **Matched observable BEHAVIOUR** — wasmtime's diagnostic layout, its default recursion limit | ❌ **No.** An error-message shape reached by reading another tool's *output* is an interface, not copied expression. ⚠️ And the standard this project holds itself to is stricter than the law requires: `src/interp.zig:473` records the shape as *"arrived at independently here and confirmed against"* — confirmation after the fact, not derivation. |
+| **Vendored a header** (`wasm-c-api`'s `wasm.h`, 2026-07-02 → 2026-08-11) | ✅ **Yes — and it ended.** The obligation existed while the file did, was satisfied while it did, and terminated when the file was deleted. It is the only one this project has ever had. |
+| **Copied or ported source** from any of the nine candidate runtimes | ❌ **Never happened.** No occurrence of six of them anywhere in the tree; the other three only as competitors or as behaviour to match. |
+
+🔒 **What would change this:** adapting even a few lines from any project — at which point the
+[Adoption Checklist](#adoption-checklist) and a [Component Ledger](#component-ledger) entry are
+mandatory *before* the code lands, not after.
+
+---
+
 ## License obligations at a glance
 
 All reference projects are **permissive** (no copyleft). Compatibility is
@@ -111,22 +135,37 @@ The loader header sat in a sibling repo for the entire life of this entry.
 
 ## Reference project inventory
 
-Evaluation candidates named at project inception. Status is **Evaluating** until
-code is actually adopted (then it also gets a Component Ledger entry above).
-Verified against each upstream `LICENSE` file on 2026-07-02.
+🔎 **AUDITED 2026-09-20 and cut from nine rows to three.** The table used to list every runtime
+named at project inception, all marked *"Evaluating"* — a status that described an intention from
+2026-07-02 and, by the time anyone read it, nothing at all. **Six of the nine had no occurrence
+anywhere in the tree**, so the inventory was claiming a relationship with projects this codebase
+has never touched. What is left is what the tree can evidence.
 
-| Project | License (SPDX) | Status |
+🔒 **The method, because the answer had to be measured and not remembered:** every project name
+was searched across the whole repository with word boundaries, excluding the two files that merely
+*list* them (this one and `cmem/reference-projects.md`), and each hit was classified by **where it
+lives** — shipped code, tooling, or memory prose.
+
+| Project | License (SPDX) | What the relationship ACTUALLY is |
 |---|---|---|
-| [wasm-micro-runtime (WAMR)](https://github.com/bytecodealliance/wasm-micro-runtime) | `Apache-2.0 WITH LLVM-exception` | Evaluating |
-| [wasm3](https://github.com/wasm3/wasm3) | `MIT` | Evaluating |
-| [wasmtime](https://github.com/bytecodealliance/wasmtime) | `Apache-2.0 WITH LLVM-exception` | Evaluating |
-| [wasmer](https://github.com/wasmerio/wasmer) | `MIT` | Evaluating |
-| [wai](https://github.com/k-nasa/wai) | `MIT` | Evaluating |
-| [wasmi](https://github.com/wasmi-labs/wasmi) | `Apache-2.0 OR MIT` | Evaluating |
-| [rust-wasm](https://github.com/yblein/rust-wasm) | `ISC` | Evaluating |
-| [wain](https://github.com/rhysd/wain) | `MIT` | Evaluating |
-| [wazero](https://github.com/tetratelabs/wazero) | `Apache-2.0` | Evaluating |
-| [wasm-c-api](https://github.com/WebAssembly/wasm-c-api) (the C API standard) | `Apache-2.0` | **Adopted** — vendored `wasm.h`, see ledger |
+| [wasmtime](https://github.com/bytecodealliance/wasmtime) | `Apache-2.0 WITH LLVM-exception` | **Behavioural reference, no code.** Its *observable* behaviour is matched deliberately: diagnostic shape (`src/main.zig`, `src/capi.zig` — *"matched byte-for-byte against wasmtime 47 so the two tools can be compared"*), a default recursion limit (`src/validate.zig`), and a byte-collision it named first (`src/Module.zig`). ⚠️ `src/interp.zig:473` states the standard explicitly: *"The shape is wasmtime's, **arrived at independently here** and confirmed against."* Also a bake-off competitor. |
+| [wasmer](https://github.com/wasmerio/wasmer) | `MIT` | **Bake-off competitor only** — `tools/bakeoff.mjs` invokes the installed binary. No source consulted, nothing in `src/`. |
+| [wazero](https://github.com/tetratelabs/wazero) | `Apache-2.0` | **Bake-off competitor only** — same as wasmer. |
+| [wasm-c-api](https://github.com/WebAssembly/wasm-c-api) (the C API standard) | `Apache-2.0` | **Formerly adopted, REMOVED 2026-08-11.** The one real adoption this project ever had; see the struck-through ledger entry above. Remaining mentions in `src/` are historical notes and deliberate contrasts (*"differs from the wasm-c-api ordering"*), not code. |
+
+### Removed from this inventory 2026-09-20 — never used for anything
+
+**wasm3 · wasm-micro-runtime (WAMR) · wasmi · wain · wai · rust-wasm**
+
+Zero occurrences in `src/`, `include/`, `tools/`, `tests/`, `examples/`, `bench/` or `build.zig`.
+Three (`wain`, `wai`, `rust-wasm`) had **no occurrence anywhere in the repository at all**; the
+other three appear only in memory prose *about* which candidates might be studied.
+
+📌 **Removed rather than re-labelled because a row in a licence file is a claim.** Listing a
+project here implies its licence was relevant to something we did, and for these six it never was.
+*An inventory of intentions is indistinguishable, to a reader, from an inventory of obligations.*
+The candidates themselves are not forgotten — `cmem/reference-projects.md` keeps the list and why
+each was named — but that is a research note, and this is a compliance document.
 
 > **Trademarks:** permissive licenses grant no trademark rights. Do not use the
 > "Wasmtime", "Wasmer", "wazero", etc. names to brand wazmrt or imply
