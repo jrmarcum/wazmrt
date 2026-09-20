@@ -1,0 +1,50 @@
+# Line endings — the rule is LF, everywhere, working tree included.
+#
+# ⚠️ git does NOT "want CRLF". Every blob git stores has always been LF here, and
+# still is. The CRLF came from ONE thing: a machine-GLOBAL `core.autocrlf=true`,
+# which converts to CRLF on checkout and back to LF on commit. That setting is not
+# this repo's, it is not the same on every clone, and it is what produced the
+# `warning: LF will be replaced by CRLF the next time Git touches it` noise —
+# emitted whenever a tool wrote a file with LF, which is every tool used here.
+#
+# So the conversion itself was the problem, not the direction of it. Turning it OFF
+# for this tree makes the warning impossible rather than merely quiet: with no
+# conversion there is nothing to warn about. `.gitattributes` is the right place
+# because it travels with the repo and OVERRIDES each developer's `core.autocrlf`,
+# so the answer does not depend on who cloned it.
+#
+# 🔒 Why LF and not CRLF in the working tree:
+#   - the committed bytes are LF regardless, so LF in the tree means the file on
+#     disk and the file in git are byte-identical — diffs, hashes and patches all
+#     line up, and `git status` cannot be dirtied by line endings alone;
+#   - everything this project builds with reads LF on Windows without complaint —
+#     Zig, Deno, Bun, `zig cc`, and the `.wat`/`.wast` corpora;
+#   - a `.wat` fixture's bytes are INPUT to an assembler and, through `pin`, to a
+#     SHA-256 digest. A line ending that depends on the checkout would change a
+#     digest, and this project compares digests against a sibling runtime.
+#
+# ⚠️ If a binary file is ever added, mark it `binary` here BEFORE committing it.
+# Nothing tracked today is binary, which is the only reason `*` can be this blunt.
+
+* text=auto eol=lf
+
+# Explicit, so a new contributor does not have to infer the rule from `*`.
+*.zig   text eol=lf
+*.zon   text eol=lf
+*.c     text eol=lf
+*.h     text eol=lf
+*.rs    text eol=lf
+*.mjs   text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.wat   text eol=lf
+*.wast  text eol=lf
+
+# Not tracked today — listed so the first one added is handled, not discovered.
+*.wasm  binary
+*.exe   binary
+*.lib   binary
+*.dll   binary
+*.png   binary
+*.key   binary
