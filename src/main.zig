@@ -243,11 +243,12 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
         return exit_failure;
     }
 
-    // ⚠️ Before anything is read or run: say so if a wazmrt flag was written
-    // where only the guest will see it. Placed here so it covers EVERY mode —
-    // run, WASI, `.wast` and summarize — rather than the one that happened to
-    // notice. See `warnMisplacedFlags`.
-    try warnMisplacedFlags(out, rest);
+    // ⚠️ Before anything is read or run: refuse if a wazmrt flag was written where
+    // only the guest will see it. Placed here so it covers EVERY mode — run, WASI,
+    // `.wast` and summarize — rather than the one that happened to notice.
+    // 🔒 An ERROR since 2026-09-20 (owner, `interop.md` §5 #11); it warned before.
+    // See `misplacedHostFlag` for why the legitimate case loses nothing.
+    if (try refuseMisplacedHostFlag(out, rest)) |code| return code;
 
     var bytes: []const u8 = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 << 20)) catch |e| {
         try out.print("error: cannot read '{s}': {s}\n", .{ path, @errorName(e) });
@@ -1544,12 +1545,27 @@ fn parseSize(s: []const u8) ?usize {
 ///     error, and ran without it. **That direction is fail-OPEN**, and it is why
 ///     this is a warning and not a comment.
 ///
-/// **Warn, do not refuse.** A guest may legitimately take one of these spellings
-/// as its own argument (`wazmrt tool.wasm build --dir src` is a plausible real
-/// command), so erroring would break valid invocations to catch a typo. ⚠️
-/// Nothing after an explicit `--` is examined: there the user has *said* the rest
-/// belongs to the guest, and warning would punish the correct spelling.
-fn warnMisplacedFlags(out: *Io.Writer, rest: []const []const u8) !void {
+/// 🔒 **REFUSE, do not warn — owner decision, 2026-09-20 (`interop.md` §5 #11).**
+/// This function warned for a year, on the argument that *"a guest may legitimately
+/// take one of these spellings as its own argument (`wazmrt tool.wasm build --dir
+/// src` is a plausible real command), so erroring would break valid invocations to
+/// catch a typo."* ⚠️ **That argument was wrong about its own escape hatch.** The
+/// legitimate case already has an unambiguous spelling — `wazmrt tool.wasm build --
+/// --dir src` — which this walk has always honoured and which says exactly what the
+/// user means. So refusing costs a valid invocation NOTHING; it costs a *sloppy* one
+/// a rewrite, and buys the fail-open cases above an error instead of a line of
+/// output that a script discards and a human scrolls past.
+///
+/// 🎓 *A rule that protects a case the grammar can already express is protecting
+/// nothing; it is only deferring the ambiguity to the reader of the output.*
+///
+/// ⚠️ Nothing after an explicit `--` is examined, and that is now load-bearing
+/// rather than a courtesy: it is the whole escape hatch. A guest that really takes
+/// `--dir` must be invoked with it, which is also what `interop.md` §2.4a already
+/// requires for every other flag-shaped token.
+///
+/// Returns the offending flag, or null when the guest positions are clean.
+fn misplacedHostFlag(rest: []const []const u8) ?[]const u8 {
     const guest = rest[flagRegion(rest).len..];
     for (guest) |a| {
         if (std.mem.eql(u8, a, "--")) break; // explicit hand-off; the user meant it
@@ -1558,13 +1574,33 @@ fn warnMisplacedFlags(out: *Io.Writer, rest: []const []const u8) !void {
         } else for (flags_bare) |f| {
             if (std.mem.eql(u8, a, f)) break true;
         } else false;
-        if (!known) continue;
-        try out.print(
-            "warning: '{s}' came after a non-flag argument, so it was passed to the GUEST and did NOT apply\n" ++
-                "  wazmrt flags must directly follow the module path; use '--' to pass one to the guest on purpose\n",
-            .{a},
-        );
+        if (known) return a;
     }
+    return null;
+}
+
+/// Report a misplaced host flag and refuse the run: returns `exit_failure` when one was found,
+/// null when the line is clean.
+///
+/// 🔒 **Split out from the call site so a test can pin the VERDICT and not merely the message.**
+/// An inversion that deleted the `return exit_failure;` from the caller **compiled, and every
+/// test passed** — the suite was asserting what the function printed and nothing was asserting
+/// that the run stopped. 🎓 *A check that reports is not the same as a check that refuses, and
+/// only one of those is what the contract promises.*
+fn refuseMisplacedHostFlag(out: *Io.Writer, rest: []const []const u8) !?u8 {
+    const bad = misplacedHostFlag(rest) orelse return null;
+    try reportMisplacedHostFlag(out, bad);
+    return exit_failure;
+}
+
+/// Report a `misplacedHostFlag` and the two ways to write what was meant.
+fn reportMisplacedHostFlag(out: *Io.Writer, flag: []const u8) !void {
+    try out.print(
+        "error: '{s}' came after a non-flag argument, so it would be passed to the GUEST and would NOT apply\n" ++
+            "  wazmrt flags must directly follow the module path\n" ++
+            "  to pass it to the guest on purpose, write it after '--'\n",
+        .{flag},
+    );
 }
 
 fn hasFlag(rest: []const []const u8, name: []const u8) bool {
@@ -2228,13 +2264,14 @@ test "--features: a seed is POSITIONAL — only the first item can replace the s
     try parseFails("simd,mvp");
 }
 
-/// `warnMisplacedFlags` against a throwaway writer; returns what it printed.
+/// `misplacedHostFlag` + its report against a throwaway writer; returns what it printed,
+/// which is "" when the guest positions are clean.
 fn misplacedWarnings(rest: []const []const u8) ![]const u8 {
     const S = struct {
         var buf: [2048]u8 = undefined;
     };
     var w: Io.Writer = .fixed(&S.buf);
-    try warnMisplacedFlags(&w, rest);
+    if (misplacedHostFlag(rest)) |bad| try reportMisplacedHostFlag(&w, bad);
     return w.buffered();
 }
 
@@ -2581,7 +2618,7 @@ test "misplacedFeaturesFlag walks exactly the region flagRegion does" {
     }
 }
 
-test "a wazmrt flag written where only the GUEST sees it is warned about" {
+test "a wazmrt flag written where only the GUEST sees it is REFUSED" {
     // 🔒 **Found by cross-project coordination, 2026-08-19** (`interop.md` §2.1m
     // F3 raised the mirror case in wasmrt). wazmrt flags are recognised only in
     // the LEADING run after the module path — a protection built so a guest's own
@@ -2595,11 +2632,18 @@ test "a wazmrt flag written where only the GUEST sees it is warned about" {
     // `wazmrt spin.wat guestarg --max-iterations 1000` ran under the DEFAULT
     // 1<<30 budget and said nothing.
 
+    // 🔒 **It ERRORS since 2026-09-20** (owner, `interop.md` §5 #11) — it warned before, on the
+    // argument that a guest might legitimately take `--dir`. ⚠️ That case already had an exact
+    // spelling (`-- --dir src`), asserted below, so refusing costs a valid invocation nothing.
+
     // The reported case: a value-taking flag after a non-flag argument.
     {
         const w = try misplacedWarnings(&.{ "guestarg", "--max-iterations", "1000" });
         try std.testing.expect(std.mem.indexOf(u8, w, "--max-iterations") != null);
-        try std.testing.expect(std.mem.indexOf(u8, w, "did NOT apply") != null);
+        try std.testing.expect(std.mem.indexOf(u8, w, "would NOT apply") != null);
+        // The verdict is an error, and the message names BOTH ways to write what was meant.
+        try std.testing.expect(std.mem.startsWith(u8, w, "error:"));
+        try std.testing.expect(std.mem.indexOf(u8, w, "after '--'") != null);
     }
     // The fail-open security case.
     {
@@ -2621,6 +2665,28 @@ test "a wazmrt flag written where only the GUEST sees it is warned about" {
     // there would punish the correct spelling for passing a flag on purpose.
     try std.testing.expectEqual(@as(usize, 0), (try misplacedWarnings(&.{ "--", "--max-iterations", "1000" })).len);
     try std.testing.expectEqual(@as(usize, 0), (try misplacedWarnings(&.{ "guestarg", "--", "--verify" })).len);
+    // ---- the VERDICT, not just the message ----
+    //
+    // 🔒 Added after an inversion proof: deleting `return exit_failure;` from the call site
+    // COMPILED and every test above still passed. They assert what is printed; none asserted that
+    // the run stops. `refuseMisplacedHostFlag` exists so this can be pinned.
+    {
+        const S = struct {
+            var buf: [2048]u8 = undefined;
+        };
+        var w: Io.Writer = .fixed(&S.buf);
+        try std.testing.expectEqual(@as(?u8, exit_failure), try refuseMisplacedHostFlag(&w, &.{ "guestarg", "--verify", "enforce" }));
+        try std.testing.expectEqual(@as(?u8, null), try refuseMisplacedHostFlag(&w, &.{ "--verify", "enforce", "guestarg" }));
+        try std.testing.expectEqual(@as(?u8, null), try refuseMisplacedHostFlag(&w, &.{ "guestarg", "--", "--verify" }));
+    }
+
+    // ⚠️ **§2.4a-ii / `interop.md` §5 #12 — the two rules now DISAGREE about one command line.**
+    // `unknownHostFlag` leaves `install --yes` alone on purpose (its own test says so: *"a guest's
+    // own `--yes` must never be read as the host's"*), and this one refuses it. Pinned here so the
+    // contradiction cannot be quietly resolved in one place while the other keeps its promise.
+    try std.testing.expect(unknownHostFlag(&.{ "install", "--yes" }, true) == null);
+    try std.testing.expect(misplacedHostFlag(&.{ "install", "--yes" }) != null);
+
     // A guest argument that merely LOOKS flag-ish is not one of ours.
     try std.testing.expectEqual(@as(usize, 0), (try misplacedWarnings(&.{ "guestarg", "--max-iterations-ish", "--verifyx" })).len);
     // No arguments at all.
