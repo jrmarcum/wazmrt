@@ -27,24 +27,57 @@ segment and no tag, so neither other cause could appear in it — and *write the
 as the fix*: a gate reading "a `name` section is emitted" would have gone green with 621 files still
 disagreeing.
 
-🚨 **Two NEW findings came out of the run, both filed, neither fixed:** **B-d** — `(type N)` naming an
+🚨 **Two NEW findings came out of the run:** **B-d** — `(type N)` naming an
 undeclared type binds an import to a signature the text never wrote (`(param i32 i32)` emitted as
 `(param i32 i32 i32 i32) (result i32)`, rc 0, where wasmrt refuses); **B-e** — the size gate is not
 wired into anything that runs, and `main` was 4,608 bytes over its exe ceiling when this started.
+
+### ✅ B-d IS FIXED — 2026-09-20 (`973dc0de`). **CROSS-RUNTIME PARITY IS NOW TOTAL.**
+
+📊 **Both pin listings are 1,467 lines — `.wat` 954/954 agree, `.wasm` 513/513, nothing in one and not
+the other.** The two files that sat outside the comparison are refused here exactly as the sibling
+refuses them, with a dedicated `InlineTypeUseMismatch` instead of a generic *"bad module field"*.
+
+🔑 **Time-of-check, not a missing check.** `checkInlineTypeUse` opened with *"a bad index is a
+downstream verdict"* and returned — but the text format's type index space is the declared `(type …)`
+defs **plus** every implicitly interned signature, appended as they are met, so at an import that
+index may name nothing. The check skipped itself and the downstream verdict never arrived, because by
+emit time the emitter had manufactured a type at that index. Every typeuse carrying both forms is now
+recorded and answered **once the space is complete**, at all five sites, with the list **threaded
+rather than defaulted** so no path can opt out.
+
+⚠️ **The fix is "ask later", NOT "refuse a forward reference"** — a forward `(type N)` whose inline
+signature agrees with what lands at N is legal and wasm-tools assembles it. It has its own assertion,
+because a blanket refusal would have passed all four failing cases and broken the legal one.
+
+🎓 **The inversion did not compile on the first try** (an unused parameter), and that was visible only
+because the BUILD result was read before the test result. Fourth time this rule has paid.
+
+📌 **B-e remains open** — the size gate is still a step somebody has to remember.
+
+### 🔧 LINE ENDINGS ARE SETTLED — LF everywhere, pinned by `.gitattributes` (owner, 2026-09-20)
+
+git was never asking for CRLF: every blob here is LF. A machine-**global** `core.autocrlf=true` was
+converting on checkout, which is what produced the `LF will be replaced by CRLF` warnings and left 20
+tracked files on disk as CRLF while the rest were LF. **`.gitattributes` now pins LF for the working
+tree too**, which makes the warning impossible rather than quiet, travels with the repo, and overrides
+whatever each clone inherits. Zero committed bytes changed. 🔑 It matters here beyond tidiness: **a
+`.wat` fixture's bytes feed an assembler and then a SHA-256 pin digest compared against the sibling**,
+so a checkout-dependent line ending would move a digest. Full reasoning: `best-practices.md` §6.
 
 **Read this first; it is the shortest true summary of where the project stands.**
 
 | gate | value | note |
 | --- | --- | --- |
 | conformance | **288 files · 64,072 passed · 0 failed · 20 skipped · 0 unrun** | baseline file is **EMPTY**. ⚠️ The counts differ from Track H's `284 · 63,934 · 0 skipped` because this is a **different testsuite checkout** (`wasmtk/…/testsuite-main`), not a regression — verified by running the same command on `HEAD` before and after every change on 2026-09-20 |
-| unit tests | **778/778** | from an NTFS cwd; a `D:` cwd loses 4 to exFAT symlinks |
-| `test-safe` | 778/778 | ReleaseSafe — optimized, safety checks KEPT |
+| unit tests | **780/780** | from an NTFS cwd; a `D:` cwd loses 4 to exFAT symlinks |
+| `test-safe` | 780/780 | ReleaseSafe — optimized, safety checks KEPT |
 | `test-security` | 3/3 | from an NTFS cwd |
-| **`test-shipped`** | **778/778** | Track H — **ReleaseSmall, the config that SHIPS** (checks off) |
+| **`test-shipped`** | **780/780** | Track H — **ReleaseSmall, the config that SHIPS** (checks off) |
 | `features` | green | all four `-Dwat`/`-Dwasi` combinations |
 | `capi-smoke` | green | |
-| 🆕 **`.wat` digest parity** | **954 agree · 0 differ** (`.wasm` 513 · 0) | **not a `zig build` step** — `wazmrt pin <wasmtk>` vs `wasmrt pin <wasmtk>`. See `testing.md`; it found three defects no in-repo gate could see |
-| size (ReleaseSmall) | exe **999,936** · lib **1,058,426** · dll **900,608** | all three EXACT. ⚠️ **The exe ceiling was 4,608 bytes BEHIND reality at `41a96aa3`** — two Track B commits grew it without raising it, which nothing caught because `zig build size` has to be remembered (**B-e**) |
+| 🆕 **`.wat` digest parity** | **954 agree · 0 differ** (`.wasm` 513 · 0) · **both listings 1,467 lines** | **not a `zig build` step** — `wazmrt pin <wasmtk>` vs `wasmrt pin <wasmtk>`. See `testing.md`; it found three defects no in-repo gate could see |
+| size (ReleaseSmall) | exe **1,000,448** · lib **1,059,260** · dll **900,608** | all three EXACT. ⚠️ **The exe ceiling was 4,608 bytes BEHIND reality at `41a96aa3`** — two Track B commits grew it without raising it, which nothing caught because `zig build size` has to be remembered (**B-e**) |
 
 **Shipped 2026-08-18, in order:** Track **F** (feature enforcement — and two gates that did not
 exist), the **skip-closing pass** (two of its four items were rejecting VALID modules),
@@ -53,7 +86,7 @@ exist), the **skip-closing pass** (two of its four items were rejecting VALID mo
 ### 🤝 COORDINATION — **`interop.md` is at CONTRACT VERSION 22 and wasmrt is BEHIND at 10 (⏳ PENDING MIRROR)**
 
 🆕 **v22 (2026-09-20) closes Z4** — `.wat` pin digests are portable, so §3.1's operator note inverts:
-an installer no longer has to pin `.wat` per runtime. It also carries the new **B-d** defect. The
+an installer no longer has to pin `.wat` per runtime; **v23 (same day) fixes B-d**, after which the two pin listings are identical in length. The
 sections below are the 2026-09-19 pass and stay as written; they are the record of how v11–v21 landed.
 
 **Do not restate the contract here** — [`interop.md`](interop.md) is authoritative and this is a pointer.
@@ -165,7 +198,7 @@ sitting still because the sibling is catching up is the cadence working, not a s
 B-c2 2026-09-20). **What is left in B: B-c4** (the four subcommand spellings, including `wat` as a
 genuinely new assemble-to-file feature), **B-a** (the emitter audit — not started, and B-c2 is
 evidence for it: the emitter dropped every identifier and an unread `(module $id)`), plus the two new
-findings **B-d** and **B-e**. The paragraph above stays as the record of why the version sat still.
+finding **B-e** (**B-d** was fixed the same day it was found). The paragraph above stays as the record of why the version sat still.
 
 
 ### 📌 SESSION ADDENDUM — 2026-08-19, late. **No code changed. Track O's first item is now DEFINED, and H4's speed row is superseded.**

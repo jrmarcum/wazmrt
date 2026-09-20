@@ -940,6 +940,22 @@ assembler has interned enough signatures that index 0 exists and means something
 validates and an import runs bound to a signature the text never wrote. ⚠️ **Time-of-check: the guard
 was not wrong about whose job it is, it was wrong about when it was asking.** — Track B-d, 2026-09-20
 
+**THREAD IT, DON'T DEFAULT IT — AN OPTIONAL DEPENDENCY IS AN OPT-OUT NOBODY WILL NOTICE TAKING.**
+B-d's fix needed a pending-checks list at five call sites, two of them behind a `Ctx` built in three
+places. The cheap option was `?*List(…) = null` with a comment saying the two const-expr paths cannot
+reach a real typeuse — and that was *verified*, not assumed: a `block` there unbalances the section
+and a `call_indirect` there is `ConstantExpressionRequired` on both runtimes. It was still the wrong
+shape, because it is the same shape as the bug: a path that quietly does nothing. A required
+parameter costs one line per signature and makes the skip impossible instead of merely unlikely.
+— Track B-d, `wat.zig`
+
+**A GATE WRITTEN BEFORE THE WORK PREDICTS THE SHAPE OF THE ANSWER, AND WHEN IT PREDICTS WRONG SAY SO.**
+B-d's gate said "then the digest comparison covers 956 of 956". It covers 954 of 954, because the two
+files left the comparison instead of joining it — both runtimes now refuse them. Same underlying
+fact, wrong mechanism in the prediction. ⚠️ The failure mode is re-reading the number until it seems
+to match the sentence you wrote earlier; record what happened and correct the sentence.
+— Track B-d, `roadmap.md`
+
 **A GATE THAT HAS TO BE REMEMBERED IS NOT ENFORCEMENT.** `zig build size` is a separate step, so it
 runs when somebody thinks of it — and on 2026-09-20 `main` was found **4,608 bytes over the exe
 ceiling**, put there by two commits that had each grown the CLI without raising the number in the same
@@ -1340,3 +1356,40 @@ rather than half-applied. ⚠️ **A find-and-replace that reports success witho
 anything is the silent-wrong-output class wearing a different hat**, and this project has now bought
 that lesson in Zig, in the CLI, and in its own tooling.
 — three heredoc corruptions in one session, 2026-09-19
+
+---
+
+🔒 **LINE ENDINGS ARE LF, WORKING TREE INCLUDED, AND `.gitattributes` IS WHERE THAT IS DECIDED**
+(owner, 2026-09-20: *"if CRLF is what git wants, we need a rule for using it versus LF so this is a
+non issue"*).
+
+⚠️ **The premise had to be corrected before the rule could be written, and that is the transferable
+part.** git was not asking for CRLF. Every blob in this repo is LF and always has been. The CRLF came
+from a machine-**global** `core.autocrlf=true` — not this repo's setting, not the same on every clone
+— which converts on checkout and back on commit, and emits `warning: LF will be replaced by CRLF the
+next time Git touches it` for every file a tool writes with LF, which is every tool used here. Twenty
+tracked files were sitting on disk as CRLF while the rest were LF.
+
+🎯 **So the conversion was the problem, not its direction** — and the two candidate rules are not
+symmetric. Declaring CRLF in the working tree keeps the conversion and keeps the warning; declaring
+**LF makes the warning impossible**, because there is nothing left to convert. *When a setting is
+producing noise, ask whether the fix is to change its value or to stop it applying.*
+
+**Why `.gitattributes` and not a config setting:** it travels with the repo and **overrides** each
+developer's `core.autocrlf`, so the answer does not depend on who cloned it. A `git config` fix would
+have been correct on exactly one machine.
+
+**Why LF in the tree specifically, here:**
+
+- the committed bytes are LF regardless, so LF on disk means file and blob are byte-identical —
+  diffs, hashes and patches line up, and `git status` cannot be dirtied by line endings alone;
+- everything this project builds with reads LF on Windows: Zig, Deno, Bun, `zig cc`, and the
+  `.wat`/`.wast` corpora;
+- 🔑 **a `.wat` fixture's bytes are input to an assembler and, through `pin`, to a SHA-256 digest that
+  is compared against a sibling runtime.** A line ending that depended on the checkout would move a
+  digest — which is exactly the class of portability defect Track B-c2 spent a day closing.
+
+✅ **Verified to change zero committed bytes:** `git add --renormalize .` staged nothing. The twenty
+CRLF files were then re-checked-out so the tree is consistent, not merely correct on the next touch.
+⚠️ **Nothing tracked is binary today, which is the only reason `*` can be that blunt** — mark a binary
+file `binary` in `.gitattributes` BEFORE committing the first one. — 2026-09-20, `.gitattributes`

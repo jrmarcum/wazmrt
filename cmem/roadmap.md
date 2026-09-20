@@ -743,7 +743,30 @@ dangerous partial fix.** A test that the warning FIRES is part of the item, not 
 row, each inversion-proven; the `wasmtk` `.wat` corpus agreeing on digests; suite and conformance counts
 unchanged. Then `coordinate` at the end of the track (§1d) and report.
 
-#### 🚨 B-d — `(type N)` NAMING AN UNDECLARED TYPE BINDS THE IMPORT TO A DIFFERENT SIGNATURE `[ ]`
+#### ✅ B-d — `(type N)` NAMING AN UNDECLARED TYPE BOUND THE IMPORT TO A DIFFERENT SIGNATURE. **DONE 2026-09-20** (`973dc0de`)
+
+| what | outcome |
+| --- | --- |
+| the defect | ✅ closed. Every typeuse with both `(type N)` and inline `(param …)`/`(result …)` is **recorded** and answered once, after the last thing that can intern a signature |
+| coverage | ✅ all five sites through one recorder: imported functions, defined functions, tags, `call_indirect`, block types. `pending` is **threaded, not defaulted**, so no path can opt out the way this one did |
+| the early return | ✅ **kept, and now truthful** — an index past the end of the FINISHED space is the decoder's verdict, and both runtimes give it |
+| diagnostics | ✅ `InlineTypeUseMismatch` split out of `BadModuleField`: a file that used to assemble now does not, and *"bad module field"* is not an answer to why |
+| both corpus files | ✅ refused, matching wasmrt. **The two pin listings are now the same length — 1,467 lines each** |
+| gates | 778 → **780** tests in all three configs; conformance unchanged; exe +512, lib +834, **dll +0** |
+
+🔑 **"Ask later" and NOT "refuse a forward reference", and the difference is a test.** A forward
+`(type N)` whose inline signature *agrees* with what lands at N is legal — wasm-tools assembles it.
+A blanket refusal would have passed all four failing cases and broken that one, so it is pinned
+explicitly. ⚠️ Interning only ever **appends**, which is what makes deferral sufficient: an index
+that resolves early still means the same thing later, so the only failure mode was asking too soon.
+
+🎓 **The inversion did not compile on the first attempt** — `pending` went unused and Zig refused
+both the parameter and the discard. Caught only because the build result was read before the test
+result, which is the rule this project has now paid for four times. The second attempt compiled and
+failed *only* the new test (778/780) while the two existing in-range typeuse tests kept passing —
+isolating the **deferral**, not the check.
+
+#### ~~B-d~~ — the finding as filed, retained for the record
 
 **Found 2026-09-20 by B-c2's digest run, and it is the silent-wrong-output class in its purest form.**
 It is the reason 2 corpus files sit outside the comparison: **wasmrt refuses them; wazmrt assembles
@@ -782,6 +805,13 @@ complete, where wasm-tools does it.
 corpus files start failing, which is the *right* outcome and still an acceptance change. **Gate:** both
 files rejected with a message naming the mismatch; a test per direction, inversion-proven; corpus and
 suite counts otherwise unchanged; then the digest comparison covers 956 of 956.
+
+✅ **Every cell of that gate was met, except the last one and it was met the OTHER way:** the two
+files are now refused by **both** runtimes, so they leave the comparison instead of joining it. The
+listings are 1,467 lines each and 954 of 954 `.wat` agree — which is the same fact the "956 of 956"
+wording was reaching for, and the wording was wrong about *how*. 📌 A gate written before the work
+predicts the shape of the answer; when it predicts wrong and the outcome is right, say so rather
+than re-reading the number until it matches.
 
 #### ⚠️ B-e — THE SIZE GATE IS NOT WIRED INTO ANYTHING THAT RUNS `[ ]`
 

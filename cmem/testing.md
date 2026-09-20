@@ -18,9 +18,10 @@ wasmrt pin  <wasmtk>  > b.txt        # sibling built into a SCRATCH CARGO_TARGET
 # compare the `<64-hex>  <path>` lines only; both tools print warnings on the same stream
 ```
 
-📊 **State at 2026-09-20** (`a495424f`): **`.wat` 954 agree / 0 differ**, **`.wasm` 513 agree / 0
-differ**. Before B-c2 it was `.wat` 2 / 952. Two `.wat` files are outside the comparison — wasmrt
-refuses them and wazmrt mis-assembles them (**B-d**), and 3 more use obsolete keywords both reject.
+📊 **State at 2026-09-20** (`973dc0de`): **`.wat` 954 agree / 0 differ**, **`.wasm` 513 agree / 0
+differ**, and **both listings are 1,467 lines — nothing is in one and not the other.** Before B-c2 it
+was `.wat` 2 / 952, and until B-d two `.wat` files were in wazmrt's listing only. 3 files use
+obsolete keywords and are refused by both.
 
 ⚠️ **Read the non-digest lines too.** `wazmrt pin <dir>` writes its `warning: skipping …` lines to
 **stdout**, interleaved with the pin lines, so a redirected listing is not a clean allow-list. Filter
