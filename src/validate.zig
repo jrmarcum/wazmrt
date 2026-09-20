@@ -597,13 +597,19 @@ fn validateConstExpr(module: *const Module, expr: []const u8, expected: V, self_
                         }
                         try push(&stack, &sp, V.concreteRefEx(false, .array, ti, true));
                     },
-                    0x1a => { // extern.convert_any : (ref null? any) → (ref null? extern)
-                        if (sp < 1 or !stack[sp - 1].isRef()) return error.TypeMismatch;
-                        stack[sp - 1] = if (stack[sp - 1].isNonNullRef()) .externref_nn else .externref;
-                    },
-                    0x1b => { // any.convert_extern : (ref null? extern) → (ref null? any)
+                    // ⚠️ **This switch is a FOURTH copy of the GC sub-opcode map, and it reads the
+                    // WIRE BYTE directly instead of going through `opcode.zig`** — so when the
+                    // encoder/decoder pair had 0x1a/0x1b swapped (B-a, 2026-09-20), this agreed
+                    // with them and the whole chain was self-consistently wrong. Correcting three
+                    // sites and not this one turned `extern.wast` red, which is how it was found.
+                    // 🎓 *A mapping kept in four places is a mapping that will be right in three.*
+                    0x1a => { // any.convert_extern : (ref null? extern) → (ref null? any)
                         if (sp < 1 or !stack[sp - 1].isRef()) return error.TypeMismatch;
                         stack[sp - 1] = if (stack[sp - 1].isNonNullRef()) .anyref_nn else .anyref;
+                    },
+                    0x1b => { // extern.convert_any : (ref null? any) → (ref null? extern)
+                        if (sp < 1 or !stack[sp - 1].isRef()) return error.TypeMismatch;
+                        stack[sp - 1] = if (stack[sp - 1].isNonNullRef()) .externref_nn else .externref;
                     },
                     else => return error.ConstantExpressionRequired,
                 }

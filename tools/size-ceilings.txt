@@ -964,6 +964,24 @@
 # Corpus unchanged (288 files / 64,072 passed / 0 failed / 20 skipped / 0 file-errors).
 # Unit tests 780 -> 781.
 
+# ---------------------------------------------------------------------------------------
+# 2026-09-20 — Track B-a: the EMITTER audit. exe +0, **lib -20**, dll +0.
+#
+# 📉 **The only entry in this file that LOWERS a number, and the reason is worth keeping:**
+# three of the four defects were fixed by DELETING a reconstruction. `emitBlockTypeSig` was
+# re-deriving the value-type encoding that `emitValType` already knew how to write, and
+# deleting that second copy removed more code than the four guards added. A fact emitted from
+# one place is smaller as well as safer.
+#
+# What changed: `emitBlockTypeSig` delegates to `emitValType` (which fixes a non-null abstract
+# ref being written as wazmrt's internal tag, and `exact` being dropped); the GC conversion
+# opcodes were unswapped at four sites; the folded `if` emits every condition expression rather
+# than the first; and the empty type/function/code sections are no longer written.
+#
+# Corpus unchanged (288 files / 64,072 passed / 0 failed / 20 skipped / 0 file-errors).
+# Unit tests 781 -> 789. Spec-corpus byte agreement with the sibling assembler: 1,807 -> 2,121
+# of 2,141. Real-world corpus unchanged at 954/954 and 513/513.
+
 wazmrt.exe  1009664
-wazmrt.lib  1059260
+wazmrt.lib  1059240
 wazmrt.dll  900608

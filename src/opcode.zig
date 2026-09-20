@@ -77,8 +77,24 @@ pub const Op = enum(u16) {
     // `br_on_cast`, `br_on_cast_fail` and `extern`, blacking out **172
     // assertions**. A feature implemented for one of its two contexts reads as
     // implemented.
-    extern_convert_any = 0x16, // 0xFB 0x1a: [(ref null? any)] -> [(ref null? extern)]
-    any_convert_extern = 0x17, // 0xFB 0x1b: [(ref null? extern)] -> [(ref null? any)]
+    // 🚨 **THE WIRE BYTES WERE SWAPPED, in the encoder AND the decoder, so nothing
+    // wazmrt owns could see it — B-a, 2026-09-20.** The GC proposal assigns
+    // `any.convert_extern` 0xFB **0x1a** and `extern.convert_any` 0xFB **0x1b**;
+    // wazmrt had them the other way round at all three sites, which agreed with
+    // each other and therefore round-tripped perfectly.
+    //
+    // ⚠️ It is wrong in BOTH directions and both were measured against the
+    // sibling on the same bytes: a module wazmrt assembled was refused by every
+    // other runtime (*"type mismatch: expected anyref, found externref"*), and a
+    // correctly-encoded module from any other toolchain was refused HERE, for the
+    // mirror-image reason. Fail-closed, which is why it survived — and it made
+    // these two instructions unusable across the ecosystem in either direction.
+    //
+    // 🎓 The producer/consumer blind spot, for the fifth time: *two halves of one
+    // gap agreeing with each other is not evidence either is right.* Found by
+    // assembling the spec corpus with both toolchains and comparing bytes.
+    extern_convert_any = 0x16, // 0xFB 0x1b: [(ref null? any)] -> [(ref null? extern)]
+    any_convert_extern = 0x17, // 0xFB 0x1a: [(ref null? extern)] -> [(ref null? any)]
 
     // Reference
     ref_null = 0xd0, // immediate: a heaptype byte (func / extern)
@@ -538,8 +554,10 @@ pub fn gcSubOpcode(op: Op) ?u8 {
         .ref_i31 => 0x1c,
         .i31_get_s => 0x1d,
         .i31_get_u => 0x1e,
-        .extern_convert_any => 0x1a,
-        .any_convert_extern => 0x1b,
+        // See the enum declaration: these two were swapped, encoder and decoder
+        // alike, so they agreed with each other and with nothing else.
+        .extern_convert_any => 0x1b,
+        .any_convert_extern => 0x1a,
         else => null,
     };
 }
@@ -1229,8 +1247,8 @@ pub fn decodeBodyTracked(
                 0x1c => .{ .op = .ref_i31, .imm = .none },
                 0x1d => .{ .op = .i31_get_s, .imm = .none },
                 0x1e => .{ .op = .i31_get_u, .imm = .none },
-                0x1a => .{ .op = .extern_convert_any, .imm = .none },
-                0x1b => .{ .op = .any_convert_extern, .imm = .none },
+                0x1a => .{ .op = .any_convert_extern, .imm = .none },
+                0x1b => .{ .op = .extern_convert_any, .imm = .none },
                 else => return error.UnsupportedOpcode,
             };
             try list.append(a, instr);

@@ -924,7 +924,14 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 },
             }
         }
-        try emitSection(a, &out, 1, s.items);
+        // ⚠️ **Emitted only when NON-EMPTY.** A section whose vector is empty is legal
+        // and no other producer writes one: wasm-tools omits it, so an empty type,
+        // function or code section was three bytes apiece that nothing else emits —
+        // and on the spec corpus that alone accounted for ~295 of 325 modules whose
+        // assembled bytes disagreed with the sibling's. Same rule, and same reason,
+        // as the data-count section: implement the condition the format states, not
+        // a superset of it. (Track B-a, 2026-09-20.)
+        if (s.items.len > 1 or entries != 0) try emitSection(a, &out, 1, s.items);
     }
     // Import section (2) — imported functions, tables, memories, globals.
     const n_imports = func_imports.items.len + table_imports.items.len + mem_imports.items.len + global_imports.items.len + tag_imports.items.len;
@@ -988,7 +995,14 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         var s: List(u8) = .empty;
         try uleb(a, &s, func_type.items.len);
         for (func_type.items) |ti| try uleb(a, &s, ti);
-        try emitSection(a, &out, 3, s.items);
+        // ⚠️ **Emitted only when NON-EMPTY.** A section whose vector is empty is legal
+        // and no other producer writes one: wasm-tools omits it, so an empty type,
+        // function or code section was three bytes apiece that nothing else emits —
+        // and on the spec corpus that alone accounted for ~295 of 325 modules whose
+        // assembled bytes disagreed with the sibling's. Same rule, and same reason,
+        // as the data-count section: implement the condition the format states, not
+        // a superset of it. (Track B-a, 2026-09-20.)
+        if (func_type.items.len != 0) try emitSection(a, &out, 3, s.items);
     }
     // Table section (4) — pre-encoded above (before the type section), because a
     // table initializer is a const-expr and may intern a signature.
@@ -1061,7 +1075,14 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             try uleb(a, &s, body.len);
             try s.appendSlice(a, body);
         }
-        try emitSection(a, &out, 10, s.items);
+        // ⚠️ **Emitted only when NON-EMPTY.** A section whose vector is empty is legal
+        // and no other producer writes one: wasm-tools omits it, so an empty type,
+        // function or code section was three bytes apiece that nothing else emits —
+        // and on the spec corpus that alone accounted for ~295 of 325 modules whose
+        // assembled bytes disagreed with the sibling's. Same rule, and same reason,
+        // as the data-count section: implement the condition the format states, not
+        // a superset of it. (Track B-a, 2026-09-20.)
+        if (bodies.items.len != 0) try emitSection(a, &out, 10, s.items);
     }
     // Data section (11) — pre-encoded above (before the type section).
     if (datas.items.len != 0) try emitSection(a, &out, 11, data_pay);
@@ -2617,14 +2638,28 @@ fn emitFoldedIf(ctx: *Ctx, l: []const Sexpr) Error!void {
     const label = parseOptLabel(l, &j);
     const bt = try parseBlockTypeSig(ctx, l, &j);
 
-    // An optional folded condition precedes `(then …)`; emit it first.
-    if (j < l.len) {
-        if (l[j].keyword()) |kw| {
-            if (!std.mem.eql(u8, kw, "then") and !std.mem.eql(u8, kw, "else")) {
-                try emitExpr(ctx, l[j]);
-                j += 1;
-            }
-        }
+    // 🔒 **ZERO OR MORE folded condition expressions precede `(then …)`** — the
+    // grammar is `(if label? blocktype? foldedinstr* (then …) (else …)?)`, and the
+    // star is load-bearing.
+    //
+    // 🚨 **This used to emit AT MOST ONE and drop the rest in silence.**
+    // `if.wast`'s own "atypical folded condition syntax" module writes
+    // `(if (i32.const 1) (i32.eqz) (then) (else))`; wazmrt assembled the
+    // `i32.const 1` and threw the `i32.eqz` away, so the condition was inverted
+    // and the module branched the other way. Not a crash and not a rejection — a
+    // VALID module that is not the module the text described, which is the exact
+    // class Track B-a went looking for.
+    //
+    // ⚠️ **The spec corpus contains the construct and could not catch it**: that
+    // function's `(then)` and `(else)` are both EMPTY, so inverting the condition
+    // changes nothing observable and every assertion still passes. It took
+    // comparing the assembled BYTES against another toolchain — behaviour tests
+    // cannot see a fact the emitter dropped when both branches do the same thing.
+    while (j < l.len) {
+        const kw = l[j].keyword() orelse break;
+        if (std.mem.eql(u8, kw, "then") or std.mem.eql(u8, kw, "else")) break;
+        try emitExpr(ctx, l[j]);
+        j += 1;
     }
     if (j >= l.len) return error.BadImmediate;
     const then_form = l[j].asList() orelse return error.BadImmediate;
@@ -2874,22 +2909,36 @@ fn emitBlockTypeSig(ctx: *Ctx, bt: BlockTy) Error!void {
     const sig = bt.sig;
     if (sig.params.len == 0 and sig.results.len == 0) {
         try ctx.out.append(ctx.a, 0x40);
-    } else if (sig.params.len == 0 and sig.results.len == 1 and !sig.results[0].isConcrete()) {
-        // Single non-concrete result → the single value-type byte.
-        try ctx.out.append(ctx.a, @intCast(@intFromEnum(sig.results[0])));
-    } else if (sig.params.len == 0 and sig.results.len == 1 and sig.results[0].isConcrete()) {
-        // Single CONCRETE ref result → `0x63/0x64 <heaptype>`, the canonical
-        // multi-byte valtype form (§5.3.6).
+    } else if (sig.params.len == 0 and sig.results.len == 1) {
+        // Single result → that value type's own encoding, whatever shape it takes
+        // (§5.3.6). **Delegated to `emitValType`, never re-derived here.**
         //
-        // ⚠️ This used to fall through to an interned type index, because
-        // `readBlockType` could not decode the multi-byte form — a workaround in
-        // the producer for a gap in the consumer. It did not stay cosmetic:
-        // interning MANUFACTURES a type-section entry, so
-        // `(block (result (ref 1)))` in a one-type module made index 1 exist (the
-        // block's own signature, self-referentially) and the module validated,
-        // where `ref.wast` requires "unknown type". Both halves are canonical now.
-        try ctx.out.append(ctx.a, if (sig.results[0].isNonNullRef()) 0x64 else 0x63);
-        try sleb(ctx.a, ctx.out, @intCast(sig.results[0].concreteIndex()));
+        // 🚨 **This branch used to re-derive it and dropped two facts doing so —
+        // B-a's exact mechanism: one fact, two emitters, and the second knows
+        // fewer cases than the first.** It split on `isConcrete()` and, for
+        // everything non-concrete, wrote the raw enum tag. That is correct only
+        // for the value types whose internal tag happens to BE their wire byte.
+        //
+        // ⚠️ **A NON-NULL ABSTRACT ref has no one-byte form at all.** `(ref any)`
+        // is `0x64 0x6E`; wazmrt wrote its internal tag `0x66`, which is not a
+        // wire encoding of anything. The module still loaded HERE, because our
+        // own decoder round-trips our own tag — the producer/consumer blind spot
+        // this project has now paid for five times — while the sibling runtime
+        // refuses the same bytes outright: *"decode failed: unsupported
+        // instruction opcode"*. Found by assembling the spec corpus with both.
+        //
+        // ⚠️ **And the concrete arm dropped `exact`**: it wrote `0x63/0x64 <idx>`
+        // with no `0x62` former, so `(block (result (ref (exact $t))))` silently
+        // became the inexact type — a VALID module that is not the one the text
+        // described, which is the quieter half of the same class.
+        //
+        // The older note this replaces is still worth keeping: this arm used to
+        // fall through to an interned type index, a workaround in the producer
+        // for a gap in the consumer, and interning MANUFACTURES a type-section
+        // entry — so `(block (result (ref 1)))` in a one-type module made index 1
+        // exist (the block's own signature, self-referentially) and validated,
+        // where `ref.wast` requires "unknown type".
+        try emitValType(ctx.a, ctx.out, sig.results[0]);
     } else {
         try sleb(ctx.a, ctx.out, try internSig(ctx.a, ctx.sigs, sig.params, sig.results));
     }
@@ -7885,6 +7934,156 @@ test "R9: a type use's inline signature must reproduce the type it names" {
     // An inline form that AGREES is the legal redundant spelling.
     _ = try assemble(a, "(module (type $sig (func (param i32) (result i32)))" ++
         " (func (type $sig) (param i32) (result i32) (local.get 0)))");
+}
+
+/// The payload of the first section with `id` in an assembled module, or null.
+/// A test-side section walk, so a byte assertion can name the section it means
+/// instead of counting from the file header.
+fn sectionPayload(bytes: []const u8, id: u8) ?[]const u8 {
+    var i: usize = 8;
+    while (i < bytes.len) {
+        const sid = bytes[i];
+        var j = i + 1;
+        var size: usize = 0;
+        var shift: u6 = 0;
+        while (j < bytes.len) : (j += 1) {
+            size |= @as(usize, bytes[j] & 0x7f) << shift;
+            if (bytes[j] & 0x80 == 0) {
+                j += 1;
+                break;
+            }
+            shift += 7;
+        }
+        if (sid == id) return bytes[j..][0..size];
+        i = j + size;
+    }
+    return null;
+}
+
+test "B-a: a block type that is a NON-NULL ABSTRACT ref is not wazmrt's internal tag" {
+    // 🚨 `emitBlockTypeSig` re-derived the value-type encoding instead of calling
+    // `emitValType`, and split only on `isConcrete()`. For everything else it
+    // wrote the raw enum tag — correct only where the tag happens to BE the wire
+    // byte. `(ref any)` has NO one-byte form: it is `0x64 0x6E`, and wazmrt wrote
+    // its internal `0x66`.
+    //
+    // ⚠️ **wazmrt's own decoder read that back happily** — producer and consumer
+    // agreeing with each other, for the fifth time in this project — while the
+    // sibling runtime refused the same bytes outright: *"decode failed:
+    // unsupported instruction opcode"*. So the check has to be on the BYTES.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const bytes = try assemble(a,
+        \\(module (func (param (ref any)) (result (ref any))
+        \\  (block (result (ref any)) (local.get 0))))
+    );
+    const code = sectionPayload(bytes, 10) orelse return error.NoCodeSection;
+    // count, body size, locals=0, `block` (0x02), then `0x64 0x6E` — the
+    // canonical two-byte form of `(ref any)`, read off a wasm-tools module.
+    try std.testing.expectEqualSlices(u8, &.{ 0x02, 0x64, 0x6e }, code[3..6]);
+    var m = try Module.decode(a, bytes);
+    try validate(a, &m);
+
+    // ⚠️ The same branch dropped `exact` on the CONCRETE arm — it wrote
+    // `0x63/0x64 <idx>` with no `0x62` former, so `(ref (exact $t))` silently
+    // became the inexact type. A valid module that is not the one the text
+    // described: the quieter half of the same defect, fixed by the same
+    // delegation to `emitValType`.
+    const ex = try assemble(a,
+        \\(module (type $t (struct))
+        \\  (func (param (ref (exact $t))) (result (ref (exact $t)))
+        \\    (block (result (ref (exact $t))) (local.get 0))))
+    );
+    const ecode = sectionPayload(ex, 10) orelse return error.NoCodeSection;
+    try std.testing.expectEqualSlices(u8, &.{ 0x02, 0x64, 0x62, 0x00 }, ecode[3..7]);
+}
+
+test "B-a: `any.convert_extern` and `extern.convert_any` are not swapped" {
+    // 🚨 The GC proposal assigns `any.convert_extern` 0xFB **0x1a** and
+    // `extern.convert_any` 0xFB **0x1b**. wazmrt had them the other way round in
+    // FOUR places — the encoder table, the decoder, and `validate.zig`'s own
+    // switch on the raw byte — which all agreed, so every gate wazmrt owns was
+    // satisfied and the round trip was perfect.
+    //
+    // ⚠️ Wrong in BOTH directions, both measured against the sibling on the same
+    // bytes: modules wazmrt assembled were refused by every other runtime, and
+    // correctly-encoded modules from any other toolchain were refused here.
+    // 🎓 *Two halves of one gap agreeing with each other is not evidence either
+    // is right.* The external value is the thing to pin, so pin it directly.
+    try std.testing.expectEqual(@as(?u8, 0x1a), opcode.gcSubOpcode(.any_convert_extern));
+    try std.testing.expectEqual(@as(?u8, 0x1b), opcode.gcSubOpcode(.extern_convert_any));
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // …and end to end, because the table being right is only a third of it: the
+    // decoder and the validator have to read the same byte the same way.
+    for ([_]struct { src: []const u8, sub: u8 }{
+        .{ .src = "(module (func (param externref) (result anyref) (any.convert_extern (local.get 0))))", .sub = 0x1a },
+        .{ .src = "(module (func (param anyref) (result externref) (extern.convert_any (local.get 0))))", .sub = 0x1b },
+    }) |c| {
+        const bytes = try assemble(a, c.src);
+        const code = sectionPayload(bytes, 10) orelse return error.NoCodeSection;
+        try std.testing.expectEqualSlices(u8, &.{ 0xfb, c.sub }, code[5..7]);
+        var m = try Module.decode(a, bytes);
+        try validate(a, &m); // the validator must agree with the byte we wrote
+    }
+}
+
+test "B-a: a folded `if` emits EVERY condition expression, not just the first" {
+    // 🚨 The grammar is `(if label? blocktype? foldedinstr* (then …) (else …)?)`
+    // and wazmrt emitted at most ONE of the `foldedinstr*`, dropping the rest in
+    // silence — so `(if (i32.const 1) (i32.eqz) (then) (else))` assembled the
+    // constant and threw the `i32.eqz` away, INVERTING the condition.
+    //
+    // ⚠️ **`if.wast` contains this exact construct and could not catch it**: its
+    // `(then)` and `(else)` are both empty, so inverting the condition changes
+    // nothing observable and every assertion still passes. A behaviour test
+    // cannot see a dropped fact when both branches do the same thing — which is
+    // the whole argument for auditing the emitter by its BYTES.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const src =
+        \\(module (func (export "f") (result i32)
+        \\  (if (result i32) (i32.const 1) (i32.eqz)
+        \\    (then (i32.const 10)) (else (i32.const 20)))))
+    ;
+    const code = sectionPayload(try assemble(a, src), 10) orelse return error.NoCodeSection;
+    // locals=0, `i32.const 1` (0x41 0x01), **`i32.eqz` (0x45)**, `if` (0x04).
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x41, 0x01, 0x45, 0x04 }, code[2..7]);
+    // …and the condition really is inverted by the eqz: 1 → eqz → 0 → else.
+    try std.testing.expectEqual(@as(i32, 20), interp.asI32(try assembleAndRun(src, "f", &.{})));
+}
+
+test "B-a: an EMPTY type, function or code section is not emitted at all" {
+    // Legal either way, and no other producer writes one — wasm-tools omits
+    // them, so on the spec corpus this alone accounted for ~295 of the 325
+    // modules whose bytes disagreed with the sibling's. Same rule and same
+    // reason as the data-count section: implement the condition the format
+    // states, not a superset of it.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const bytes = try assemble(a,
+        \\(module (import "e" "m" (memory 1)) (data (i32.const 0) "hi"))
+    );
+    try std.testing.expect(sectionPayload(bytes, 1) == null); // type
+    try std.testing.expect(sectionPayload(bytes, 3) == null); // function
+    try std.testing.expect(sectionPayload(bytes, 10) == null); // code
+    try std.testing.expect(sectionPayload(bytes, 2) != null); // …import IS there
+    var m = try Module.decode(a, bytes);
+    try validate(a, &m);
+
+    // …and a module that HAS them still emits them.
+    const full = try assemble(a, "(module (func (nop)))");
+    try std.testing.expect(sectionPayload(full, 1) != null);
+    try std.testing.expect(sectionPayload(full, 3) != null);
+    try std.testing.expect(sectionPayload(full, 10) != null);
 }
 
 test "B-d: a `(type N)` nothing has interned YET is still checked, not skipped" {
