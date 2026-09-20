@@ -386,9 +386,9 @@ change only the program name, and it must do the same thing under the other runt
 
 | obligation | state |
 | --- | --- |
-| accept wasmrt's **subcommand spellings** — `run`, `wasi`, `wast` — alongside our extension dispatch | ⬜ not started |
-| grow **`wazmrt wat <file.wat> [-o out]`** (assemble text → binary); wasmrt has it, we do not | ⬜ not started |
-| `--dir` / `--ro-dir`: **accept BOTH separators** — prefer `::`, fall back to a single `:` when the spec has no `::` and the split is not a drive letter | ⬜ not started |
+| accept wasmrt's **subcommand spellings** — `run`, `wasi`, `wast` — alongside our extension dispatch | ✅ **DONE, B-c4** (`8e04263b`) — re-verified by RUNNING each 2026-09-20 |
+| grow **`wazmrt wat <file.wat> [-o out]`** (assemble text → binary); wasmrt has it, we do not | ✅ **DONE, B-c4** — the one genuinely new capability of the four |
+| `--dir` / `--ro-dir`: **accept BOTH separators** — prefer `::`, fall back to a single `:` when the spec has no `::` and the split is not a drive letter | ✅ **DONE** — `splitPreopen`; the `x:/` ambiguity is documented rather than guessed away |
 
 ⚠️ **One of these is a security-posture change, not a convenience:** adopting each other's run modes
 interacts with `will_execute`. `wazmrt prog.wasm` **runs** a WASI command where `wasmrt prog.wasm`
@@ -422,10 +422,10 @@ silent-wrong-output defect. Both are still required for swappability.
 
 | wazmrt obligation | measured evidence | state |
 | --- | --- | --- |
-| accept `run` / `wasi` / `wast` subcommand spellings | `run` → `cannot read 'run'` | ⬜ not started |
-| accept flags **before** the module path (keep the current position working too) | `--dir` first → `cannot read '--dir'` | ⬜ not started |
-| grow `wazmrt wat <file.wat> [-o out]` | absent | ⬜ not started |
-| `--dir`/`--ro-dir`: accept **both** separators | 🔻 F4 **corrected** the old claim — wasmrt fails LOUDLY (`errno 29`) on a single colon, it does **not** mis-preopen | ⬜ not started |
+| accept `run` / `wasi` / `wast` subcommand spellings | *(was: `run` → `cannot read 'run'`)* — 🔬 **re-measured 2026-09-20: `run add.wasm add 2 3` → `5`; `wasi` and `wast` both run** | ✅ **DONE, B-c4** |
+| accept flags **before** the module path (keep the current position working too) | 🔬 **re-measured 2026-09-20 and STILL OPEN: `wazmrt --dir . m.wasm` → `error: unknown flag '--dir'`** | ⬜ **NOT STARTED — the only one of the four still outstanding.** ⚠️ It was about to be marked done with the rest; only running it caught that. `--features` is the sole flag that may precede the path today (§2.4b) |
+| grow `wazmrt wat <file.wat> [-o out]` | *(was: absent)* — 🔬 **re-measured 2026-09-20: assembles, `rc 0`** | ✅ **DONE, B-c4** |
+| `--dir`/`--ro-dir`: accept **both** separators | 🔻 F4 **corrected** the old claim — wasmrt fails LOUDLY (`errno 29`) on a single colon, it does **not** mis-preopen | ✅ **DONE** — `splitPreopen` takes `::` first, then the last single `:`, and never splits a drive letter |
 
 ⚠️ **Sequencing, unchanged:** these add front-end surface and one of them (`will_execute`) is a
 security-posture change, so they land **after** hardening — which is where they now are.
@@ -564,7 +564,7 @@ the SKIP count never moved. *File a suspicion as a suspicion, then measure it be
 | **The second LEB decoder** | ✅ **HARDENED, and verified NOT exploitable first.** `sign.readUleb` ran on untrusted bytes before the real decoder and accepted an over-long 5th byte. Measured: `Module.decode` refuses such a module, so the lax parser was a strict superset-acceptor and the strict one gates execution. Tightened anyway — *"the other layer catches it" must be re-derived every time either layer moves* — and a test now pins the two parsers on what they accept AND refuse |
 | **`atomicIs64` vs `atomicValType`** | ✅ **DERIVED, not pinned.** It was a second copy of the same fourteen literals in another file with the opposite polarity. They agreed — which is why it had to go: *the validator and the interpreter agreeing because they were written from the same head rather than the same table* is how a `try_table` catch label was resolved one frame too deep in three places at once, corpus green |
 | **Stale scope comments + two orphaned doc comments** | ✅ **FIXED.** The scope claims did more than misinform: in two cases the stale comment **picked the error**, and the error picked the column in the conformance score. `simdSig`'s doc was on `atomicValType` and `asStr`'s on `wrapModuleText` — each function carrying someone else's first sentence while another carried none |
-| ⬜ **`hostRefPayload`** (pub, zero callers) and **`BadFuncType`** (unreachable member of a **public** error set) | ⬜ **STILL OPEN — owner decision, and the only one of the six that is.** Removable only if `interp.zig`'s `pub` surface and `DecodeError` are implementation details rather than API. Deleting either is an API change for anyone switching exhaustively or calling through `root.interp` |
+| ✅ **`hostRefPayload`** (pub, zero callers) and **`BadFuncType`** (unreachable member of a **public** error set) | ✅ **DECIDED by the owner 2026-09-20: SUPPORTED API — keep both, documented.** Both now carry the reason in their doc comments, so the next sweep stops there instead of re-deriving it: `interp.zig`'s `pub` surface and `DecodeError`'s membership are **versioned contracts**, and *"unreachable today" is not the same claim as "no longer part of the API"*. *(Original entry: )* ⬜ **STILL OPEN — owner decision, and the only one of the six that is.** Removable only if `interp.zig`'s `pub` surface and `DecodeError` are implementation details rather than API. Deleting either is an API change for anyone switching exhaustively or calling through `root.interp` |
 | ⬜ **Low-value duplicates left standing** | ⬜ `readF32Bits` ≡ `readU32Le` (one function, two names, each doc describing half the truth); three ULEB **encoders** (one test-only); `hexVal` duplicated in `pin.zig`/`sexpr.zig`; export-by-name lookup implemented 4× and open-coded 7× more. **None reconstructs a fact** — they are copies of trivial code, which is the class the duplicate hunt deliberately ranked last |
 | 🆕 ⬜ **Track A's reopen condition is MET** | ⬜ Recorded 2026-09-20 — and the GATE QUESTION is answered below, ahead of any code (owner, 2026-09-20: *"decide the gate question first"*) |
 

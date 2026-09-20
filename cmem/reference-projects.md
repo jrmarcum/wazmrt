@@ -18,15 +18,26 @@ keeps all nine**, because *why* a candidate was named is research worth keeping 
 have different jobs, and conflating them is what let an inventory of intentions read as an
 inventory of obligations for two months.
 
-⚠️⚠️ **AND AN OPEN CONTRADICTION THIS AUDIT SURFACED — FOR THE OWNER, NOT FOR AN AGENT.**
-The table below has a **"What to mine it for"** column and the sentence *"we study them freely"*.
-🔒 **`interop.md` §1 says the opposite:** *"the oracle is still retired … reading a competitor's
-implementation for guidance remains off-limits."* Both are current, both are binding-sounding, and
-they cannot both be followed. The narrow reading is that the retirement is about the **sibling
-`wasmrt`** specifically (§1's subject); the broad reading is the words as written, which would
-forbid the entire "mine it for" column below. 🚫 **Not resolved here** — an agent does not narrow an
-owner's rule by picking the reading that lets it do more work. ⬜ **It has cost nothing so far**,
-because the audit shows no source of any of the nine has actually been consulted.
+✅ **THE CONTRADICTION THIS AUDIT SURFACED IS RETIRED — owner, 2026-09-20. The NARROW reading wins.**
+The table below has a **"What to mine it for"** column and the sentence *"we study them freely"*, while
+`interop.md` §1 said *"reading a competitor's implementation for guidance remains off-limits."* Both
+were current and binding-sounding, and they could not both be followed.
+
+🔒 **The retirement covers the SIBLING `wasmrt` and nothing else** — §1's subject. So:
+
+- **`wasmrt`**: reading its source for design guidance stays off-limits by default, and each exception
+  is owner-directed and logged. Two have been granted (Track B-e; the `@custom` review).
+- **The other eight below**: ✅ studying them is allowed and the "mine it for" column stands. Adoption
+  is still gated by the Adoption Checklist + a Component Ledger entry in `third_party/LICENSES.md` —
+  **that gate is about LICENSING and is untouched by this**; permission to read was never permission
+  to copy.
+- **Behavioural measurement of any of them** was never restricted, and is this project's most
+  productive method. *Measuring what a binary does is not reading how it does it.*
+
+⚠️ **It had cost nothing up to the ruling** — the audit found no source of any of the nine had been
+consulted. 🎓 *The resolution was the owner's to make and took one sentence; the two months were spent
+because nobody asked. An agent does not narrow an owner's rule by picking the reading that lets it do
+more work — but it should surface the conflict the day it sees it.*
 
 ---
 

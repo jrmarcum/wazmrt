@@ -109,7 +109,59 @@ public `Io.Dir.hardLink` spelling alone finds nothing and could easily be misrea
 therefore reopened". Follow the vtable, not the public name.)*
 
 
-### 🟡 H1-a / H1-b — two `unreachable`s that are safe TODAY by construction, not by check (Track H, 2026-08-19)
+### 🔬 H1 — INVESTIGATED 2026-09-20 at the owner's direction. **The entry said TWO. There are 23.**
+
+🔒 Owner, 2026-09-20: *"The third delta needs to be investigated further. The wasmrt project doesn't
+seem to have that issue."* Findings, all measured:
+
+**1. The count was wrong by an order of magnitude.** A census of `src/*.zig` (excluding test blocks,
+and excluding the WASM **opcode** also spelled `unreachable`, which is a different thing and would
+have inflated the number this census exists to make honest) gives **23 `unreachable` sites in shipped
+code** — 11 of them `else => unreachable` switch defaults — across 10 files. wat.zig 6, types.zig 3,
+validate.zig 3, interp.zig 3, capi.zig 2, and one each in sign/opcode/wast/wasi/Module. 🎓 *The entry
+named the two that a specific audit happened to walk past, and the shape of the entry — a table with
+exactly two rows — made that read as the population.*
+
+**2. The two named sites are not the whole family even within their own files.** H1-a cites
+`types.zig` `refHeap`; its invariant is actually enforced one level up in **`concreteRefEx`**, which
+has an `else => unreachable` of its own. H1-b cites the memory dispatch; `interp.zig` also has
+**`fieldFromBytes`** switching on `bytes.len` over 1/2/4/8 with the same shape. Neither was listed.
+
+**3. ⚠️ H1-a IS REACHABLE — not from module input, but from the PUBLIC API.** Traced both ways:
+- **From a module: no.** The only input path is `refTypeValType` → `Module.refHead`, whose `.concrete`
+  arm switches on `comp_types[ti].kind()` (always func/struct/array) and bounds-checks `ti` first. A
+  malformed module cannot get there.
+- **From an embedder: yes.** `root.zig` exports `pub const types`, so `ValType.concreteRefEx` is on the
+  supported surface, and `concreteRefEx(true, .any, 0, false)` reaches `else => unreachable` — **UB in
+  ReleaseSmall, where `unreachable` compiles to nothing.** 🔑 *"Safe by construction" was a claim about
+  the 40 in-tree call sites; the constructor is `pub`, so the callers are not a closed set.*
+
+**4. The cost argument was an assertion; here is the measurement.** The entry said converting the
+invariant to a check *"costs bytes in a build whose size is gated to the byte"*. Adding
+`@setRuntimeSafety(true)` — which turns `unreachable` into a panic in ReleaseSmall — and rebuilding the
+shipped config:
+
+| what | exe | lib | dll |
+| --- | --- | --- | --- |
+| all four family sites | +2,560 | +4,186 | +1,536 |
+| **the three small ones** (`refHeap`, `concreteRefEx`, `fieldFromBytes`) | **+512** | **+1,064** | **+0** |
+
+🔑 **So `execMemory` alone is ~80% of the price, and the other three cost 512 bytes on the exe and
+NOTHING on the DLL.** The blanket "it costs bytes" was true only of the one site nobody would start
+with. 📌 **Recommendation: take the three.** A cheaper fix exists for `concreteRefEx` specifically —
+narrow its `kind` parameter to a 3-value enum so the illegal state is **unrepresentable** and both
+`unreachable`s disappear at zero runtime cost — but it touches 40 call sites and is a Track O shape.
+
+**5. On "wasmrt doesn't seem to have that issue."** Not verified, and **not verifiable under the rule
+as it stands**: reading the sibling's source for design guidance is off-limits by default (§1, narrow
+scope settled the same day), and no behavioural probe distinguishes "panics" from "is UB" without a
+module that reaches the site — which finding 3 says a module cannot. ⬜ **If the owner wants that
+comparison, it needs a scoped exception**, like B-e and the `@custom` review. 💭 The likely mechanism,
+stated as a hypothesis and not a finding: Rust's `unreachable!()` panics in release builds, where
+Zig's `unreachable` is UB in ReleaseSmall — so the same invariant expressed the same way fails safe
+there and unsafely here.
+
+### 🟡 H1-a / H1-b — two `unreachable`s that are safe TODAY by construction, not by check (Track H, 2026-08-19) — *the original entry, superseded above*
 
 **Neither is a defect and neither is reachable now.** They are logged because both are one edit away
 from being silent UB in the **shipped** build — `ReleaseSmall` compiles `unreachable` to nothing, so
