@@ -653,17 +653,47 @@ row, each **inversion-proven** (reverting the fix fails it); `install --yes` and
 still to reach the guest; conformance and suite counts do not regress. Then **`coordinate`** at the end
 of the track (§1d) and report to the owner.
 
-#### B-c — The T9e/T9i CONVERGENCE. **3 of 5 done 2026-09-19** (`22437455`) `[~]`
+#### B-c — The T9e/T9i CONVERGENCE. **4 of 5 done 2026-09-20** (`22437455`, `a495424f`) `[~]`
 
 | # | state |
 | --- | --- |
 | **B-c1** `--dir` | ✅ **DONE.** `.:/` works, `::` accepted, drive letter narrowed to one ASCII letter (owner, §5 #10) |
-| **B-c2** Z4 name section | ⬜ **NOT STARTED** — scoped below |
+| **B-c2** Z4 name section | ✅ **DONE 2026-09-20** (`a495424f`). **954 of 954 comparable `.wat` digests agree, up from 2.** The `name` section was one of **three** causes — see below |
 | **B-c3** pin DB path | ✅ **DONE.** Shared `wasmtk` path → own path → **warn when the sibling's DB exists and ours does not.** Decision is a pure function, all 8 combinations tested, the row that matters inversion-proven |
 | **B-c4** subcommands | ⬜ **NOT STARTED** — `run`/`wasi`/`wast` are aliases onto existing paths; **`wat` is a genuinely new feature** (assemble-to-file), which is why this is not a rename |
 | **B-c5** feature vocabulary | ✅ **DONE.** wasm-tools' whole vocabulary resolves, verified against the tool's own list |
 
-🔎 **Z4 IS SCOPED, and it is smaller than it looks: the assembler ALREADY RETAINS the identifiers.**
+##### ✅ B-c2 (Z4) IS DONE — 2026-09-20 (`a495424f`). **The name section was ONE of THREE causes.**
+
+📊 **The measurement, same command before and after** (`wazmrt pin wasmtk` vs `wasmrt pin wasmtk`,
+both binaries run over the same 1,469-file tree; the sibling built from its committed `ab13ba975`
+into a scratch `CARGO_TARGET_DIR`, nothing written to its tree, §1a):
+
+| stage | `.wat` agree | differ |
+| --- | --- | --- |
+| before | **2** | 952 |
+| + `name` section | 333 | 621 |
+| + data-count rule | 910 | 44 |
+| + import interning order | **954** | **0** |
+
+`.wasm` was 513/513 agreeing at every stage — the whole divergence was text assembly.
+
+| # | cause | what it was |
+| --- | --- | --- |
+| **1** | the `name` section | never emitted. Twelve name spaces collected for resolution and dropped at emit. Shape **read off a wasm-tools-assembled module**, not recalled: subsections ascending, each omitted when empty, anonymous entries **skipped** (not written as empty names), and **no section at all** when nothing is bound. Label entries are keyed by the block's **ordinal in the body, counting unnamed blocks** — not by stack depth, which repeats across siblings and could never index a map |
+| **2** | the data-count section | emitted for **every** module with a data section. Legal, and still wrong: §5.5.16 requires it once a body *names* a segment, which is exactly when wasm-tools writes it, so an unused `(data …)` carried 3 bytes no other assembler emits. Now armed by `memory.init` / `data.drop` / `array.new_data` / `array.init_data`, recorded **at the instruction** — an opcode byte also occurs inside immediates and a byte scan cannot tell the two apart |
+| **3** | implicit type interning ORDER | a `(tag …)` interns while the field loop runs; imported functions were interned in a pass **after** it, so every implicit tag type landed ahead of every implicit import type whatever the source said. wasm-tools interns imports and tags together in source order and **defined functions in a later pass** — which is why a `(func …)` written *before* a `(tag …)` still follows it. Imports are now interned at the import |
+
+🎓 **Two of the three were not in the scope, and the scope was not wrong — it was incomplete in a way
+only the GATE could show.** The item was written as "stop throwing the names away"; the gate was
+"the digests agree". Had the gate been "a name section exists", it would have passed at 333 of 954.
+*The test that can fail for a reason you did not predict is the one worth having.*
+
+⚠️ **The 2 files that remain outside the comparison are a NEW FINDING, not a leftover** — wasmrt
+refuses to assemble them and wazmrt assembles them wrongly. Filed as **B-d** below.
+
+🔎 **Z4's original scoping note — retained; it was right about the mechanism and short by two causes.**
+**The assembler ALREADY RETAINS the identifiers.**
 `wat.zig` collects `func_names`, `local_names`, `type_names`, `table_names`, `data_names` and
 `elem_names` as `List(?[]const u8)` for resolution, then **discards them at emit time**. So Z4 is an
 **emit-side** change — write a `name` custom section — not a parser change. ⚠️ **What still needs
@@ -712,6 +742,62 @@ dangerous partial fix.** A test that the warning FIRES is part of the item, not 
 **Gate:** every "required" cell above verified by running both binaries on the same inputs; a test per
 row, each inversion-proven; the `wasmtk` `.wat` corpus agreeing on digests; suite and conformance counts
 unchanged. Then `coordinate` at the end of the track (§1d) and report.
+
+#### 🚨 B-d — `(type N)` NAMING AN UNDECLARED TYPE BINDS THE IMPORT TO A DIFFERENT SIGNATURE `[ ]`
+
+**Found 2026-09-20 by B-c2's digest run, and it is the silent-wrong-output class in its purest form.**
+It is the reason 2 corpus files sit outside the comparison: **wasmrt refuses them; wazmrt assembles
+them, validates them, and runs them — bound to signatures the text never wrote.**
+
+`wasmtk/tests/module/bindgen_fixtures/fnany_50.wat` (and `hostfn_50.wat`) open with
+
+```wat
+(import "env" "__host_call"  (func $… (type 0) (param i32 i32) (result i32)))
+(import "env" "__host_print" (func $… (type 1) (param i32 i32)))
+```
+
+and the module **declares no `(type …)` at all**. Measured from wazmrt's own output:
+
+| import | the text wrote | wazmrt emitted |
+| --- | --- | --- |
+| `env.__host_call` | `(param i32 i32) (result i32)` | type 0 = **`(param i32) (result i32)`** |
+| `env.__host_print` | `(param i32 i32)` | type 1 = **`(param i32 i32 i32 i32) (result i32)`** |
+
+⚠️ **A host wiring `__host_print` is called with four `i32`s and asked for a result.** Nothing warns,
+nothing fails, `rc 0`. wasmrt says *"inline function type doesn't match type reference"* and stops.
+
+🔑 **The cause is a TIME-OF-CHECK bug, not a missing check.** `checkInlineTypeUse`
+(`src/wat.zig:1965`) opens with `if (type_ref >= sigs.items.len) return; // a bad index is a
+downstream verdict`. At the moment an import is parsed the implicit types do not exist yet, so the
+check **skips itself**, and the promised downstream verdict never arrives: by emit time other
+functions have interned enough signatures that index 0 and 1 exist and mean something else entirely.
+*A guard that defers to a later layer has to be sure the later layer still sees the question.*
+
+⚠️ **Do not "fix" it by deleting the early return** — a genuinely out-of-range index must stay a
+decode error (`(module (import "e" "f" (func (type 0) (param i32))))` is `IndexOutOfRange` on both
+runtimes today, and that is correct). The fix is to move the comparison to **after** the type space is
+complete, where wasm-tools does it.
+
+⚖️ **It changes what assembles, which is why it is its own item and not part of B-c2**: those two
+corpus files start failing, which is the *right* outcome and still an acceptance change. **Gate:** both
+files rejected with a message naming the mismatch; a test per direction, inversion-proven; corpus and
+suite counts otherwise unchanged; then the digest comparison covers 956 of 956.
+
+#### ⚠️ B-e — THE SIZE GATE IS NOT WIRED INTO ANYTHING THAT RUNS `[ ]`
+
+**`zig build size` is a separate step, so it only runs when somebody remembers it — and on
+2026-09-20 nobody had.** `main` at `41a96aa3` was **4,608 bytes over the exe ceiling**: `0a48957a`
+(B-b) and `22437455` (B-c1/c3/c5) both grew the CLI without raising the number, which
+`tools/size-ceilings.txt`'s own header says every growth must do *in the same commit*. The ceiling
+was last touched by Track H2.
+
+🎓 **A rule nobody has watched fail is not enforcement** — the same argument that turned the ABI
+version into a real gate, and B-5 already lists it as this track's documentation theme. The exact
+ceiling design is working as intended; the *scheduling* of the check is what failed. **Options, not a
+decision:** fold `size` into the default step for `ReleaseSmall` builds, or add it to whatever the
+release checklist in [`releasing.md`](releasing.md) makes mandatory. ⚠️ It cannot simply join
+`zig build`, which is Debug — the gate refuses any mode but `ReleaseSmall` (`WrongOptimizeMode`), and
+that refusal is correct.
 
 ---
 

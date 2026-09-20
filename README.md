@@ -322,6 +322,14 @@ tree, hashes each `.wasm`/`.wat` (assembling `.wat` first so the hash matches th
 binary that runs), and appends them all. A `.wat` is assembled before hashing;
 non-module files are skipped.
 
+A `.wat` digest is **portable in practice**: wazmrt's assembler emits the same
+bytes a `wasm-tools`-based toolchain does — including the `name` custom section
+built from the identifiers in the text — so a pin recorded with one matches the
+module the other assembles. Measured over the 954 `.wat` files of the `wasmtk`
+corpus that both assemble: all 954 agree. (Warnings about files that could not be assembled are
+printed alongside the pin lines — filter on the `<64-hex>  <path>` shape when
+redirecting the output into a database file.)
+
 The database is meant to be **root-owned and read-only to the user** (created at
 install time, with privilege); wazmrt only ever reads it. Its first line may set
 the enforcement policy — `# mode: off | warn | enforce`:

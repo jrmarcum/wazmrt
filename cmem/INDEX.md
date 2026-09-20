@@ -8,26 +8,53 @@ a machine-local `CLAUDE.md`.
 and revised without wading through one giant file. Keep files small and single-topic.
 ---
 
-## 🏁 STATE AT PAUSE — 2026-08-19. **TRACK H IS COMPLETE (`1.0.1`) AND WAZMRT IS HOLDING FOR wasmrt.**
-### 🔖 **`1.0.1` — TRACK H IS COMPLETE (2026-08-19).** Version was set to `1.0.0` before the first track; H shipped as `1.0.1`. **wazmrt now HOLDS for wasmrt** — see NEXT below.
+## 🏁 STATE — 2026-09-20. **TRACK B IS IN FLIGHT: B-b done, B-c at 4 of 5, B-a not started.**
+### 🔖 **`1.0.1` shipped Track H (2026-08-19); Track B is being built now and has not been versioned.** The hold that Track H ended in was released by the owner; B-b (`0a48957a`), B-c1/c3/c5 (`22437455`) and **B-c2 (`a495424f`, 2026-09-20)** have landed since.
+
+### ✅ B-c2 (Z4) IS DONE — 2026-09-20. **`.wat` PIN DIGESTS ARE PORTABLE: 954 of 954, up from 2.**
+
+🔑 **Read this one for the method, not the feature.** The item was scoped as "the assembler throws the
+identifiers away, so emit a `name` section", and that diagnosis was confirmed byte-for-byte on one
+file. **It was one of three causes.** Emitting the section took the corpus from 2 agreeing to 333; a
+data-count section emitted for *every* module with a data section (legal, and 3 bytes no other
+producer writes) took it to 910; implicit import types interned *after* every tag's took it to **954
+and 0 differing**. ⚠️ **All three were behaviour-preserving**, so no conformance run, unit test or fuzz
+pass could ever have reported them — they were found by running the sibling on the same bytes.
+
+🎓 **Two rules this bought** (`best-practices.md` §4): *a single-file byte-for-byte confirmation proves
+the cause it finds and says nothing about the ones it cannot reach* — `mathlib.wat` has no unused data
+segment and no tag, so neither other cause could appear in it — and *write the gate as the outcome, not
+as the fix*: a gate reading "a `name` section is emitted" would have gone green with 621 files still
+disagreeing.
+
+🚨 **Two NEW findings came out of the run, both filed, neither fixed:** **B-d** — `(type N)` naming an
+undeclared type binds an import to a signature the text never wrote (`(param i32 i32)` emitted as
+`(param i32 i32 i32 i32) (result i32)`, rc 0, where wasmrt refuses); **B-e** — the size gate is not
+wired into anything that runs, and `main` was 4,608 bytes over its exe ceiling when this started.
 
 **Read this first; it is the shortest true summary of where the project stands.**
 
 | gate | value | note |
 | --- | --- | --- |
-| conformance | **284 files · 63,934 passed · 0 failed · 0 skipped · 0 unrun** | baseline file is **EMPTY** |
-| unit tests | **765/765** | from an NTFS cwd; a `D:` cwd loses 4 to exFAT symlinks |
-| `test-safe` | 765/765 | ReleaseSafe — optimized, safety checks KEPT |
+| conformance | **288 files · 64,072 passed · 0 failed · 20 skipped · 0 unrun** | baseline file is **EMPTY**. ⚠️ The counts differ from Track H's `284 · 63,934 · 0 skipped` because this is a **different testsuite checkout** (`wasmtk/…/testsuite-main`), not a regression — verified by running the same command on `HEAD` before and after every change on 2026-09-20 |
+| unit tests | **778/778** | from an NTFS cwd; a `D:` cwd loses 4 to exFAT symlinks |
+| `test-safe` | 778/778 | ReleaseSafe — optimized, safety checks KEPT |
 | `test-security` | 3/3 | from an NTFS cwd |
-| **`test-shipped`** | **765/765** | 🆕 Track H — **ReleaseSmall, the config that SHIPS** (checks off) |
+| **`test-shipped`** | **778/778** | Track H — **ReleaseSmall, the config that SHIPS** (checks off) |
 | `features` | green | all four `-Dwat`/`-Dwasi` combinations |
-| size (ReleaseSmall) | exe **991,744** · lib **1,053,908** · dll **900,608** | all three EXACT; both Track H moves cost the **dll 0 bytes** |
+| `capi-smoke` | green | |
+| 🆕 **`.wat` digest parity** | **954 agree · 0 differ** (`.wasm` 513 · 0) | **not a `zig build` step** — `wazmrt pin <wasmtk>` vs `wasmrt pin <wasmtk>`. See `testing.md`; it found three defects no in-repo gate could see |
+| size (ReleaseSmall) | exe **999,936** · lib **1,058,426** · dll **900,608** | all three EXACT. ⚠️ **The exe ceiling was 4,608 bytes BEHIND reality at `41a96aa3`** — two Track B commits grew it without raising it, which nothing caught because `zig build size` has to be remembered (**B-e**) |
 
 **Shipped 2026-08-18, in order:** Track **F** (feature enforcement — and two gates that did not
 exist), the **skip-closing pass** (two of its four items were rejecting VALID modules),
 **wide-arithmetic**, Track **L** (legacy `delegate`), Track **A** (custom-annotations).
 
-### 🤝 COORDINATION PASS RUN 2026-09-19 — **`interop.md` is at CONTRACT VERSION 20 and wasmrt is BEHIND at 10 (⏳ PENDING MIRROR)**
+### 🤝 COORDINATION — **`interop.md` is at CONTRACT VERSION 22 and wasmrt is BEHIND at 10 (⏳ PENDING MIRROR)**
+
+🆕 **v22 (2026-09-20) closes Z4** — `.wat` pin digests are portable, so §3.1's operator note inverts:
+an installer no longer has to pin `.wat` per runtime. It also carries the new **B-d** defect. The
+sections below are the 2026-09-19 pass and stay as written; they are the record of how v11–v21 landed.
 
 **Do not restate the contract here** — [`interop.md`](interop.md) is authoritative and this is a pointer.
 Five versions were folded in by this project **as pen-holder** (regime A) in one pass: **v11** §2.4a
@@ -43,7 +70,8 @@ recorded the narrowing in **its** copy while this session was folding the pre-na
 ⚠️ That is the *destructive* half fixed and the *wasted* half still open: **§5 #7** (one coordination
 session at a time) is the standing proposal, and this pass is fresh evidence for it.
 
-⚠⚠ **THREE CONTRACT BREACHES ARE OPEN AGAINST wazmrt'S SHIPPED CLI — Z1, Z2, Z3 — and every one was
+⚠⚠ ~~**THREE CONTRACT BREACHES ARE OPEN**~~ — ✅ **all three CLOSED 2026-09-19 by B-b (`0a48957a`), v21.**
+The paragraph is kept because its last sentence is the durable part. **Z1, Z2, Z3 — and every one was
 invisible to every gate this project owns.** They were found by running the sibling binary on the same
 bytes. **Tracked at [`roadmap.md`](roadmap.md) → Track B → B-b**, build-only: the rows are already
 decided and numbered, so B-b implements and must not relitigate them.
@@ -132,6 +160,12 @@ of each track**, and the project that is ahead **waits**. wazmrt is at a track b
 working its T9i** (the same iteration budget) and has Track-H-equivalent ground to cover. ⚠️ **A version
 sitting still because the sibling is catching up is the cadence working, not a stall.** Track **B**
 (bug hunt, `1.0.2`) starts when the owner says both sides are level.
+
+✅ **SUPERSEDED — the hold ended and Track B is in flight** (B-b 2026-09-19, B-c1/c3/c5 2026-09-19,
+B-c2 2026-09-20). **What is left in B: B-c4** (the four subcommand spellings, including `wat` as a
+genuinely new assemble-to-file feature), **B-a** (the emitter audit — not started, and B-c2 is
+evidence for it: the emitter dropped every identifier and an unread `(module $id)`), plus the two new
+findings **B-d** and **B-e**. The paragraph above stays as the record of why the version sat still.
 
 
 ### 📌 SESSION ADDENDUM — 2026-08-19, late. **No code changed. Track O's first item is now DEFINED, and H4's speed row is superseded.**

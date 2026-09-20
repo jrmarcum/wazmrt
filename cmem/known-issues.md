@@ -13,6 +13,25 @@ Line numbers are hints (they drift) — the function/construct name is the durab
 
 ---
 
+## 🆕 `pin <dir>` writes its skip WARNINGS to STDOUT, interleaved with the pin lines (2026-09-20)
+
+**Found while building the cross-runtime digest comparison** (`testing.md`). `wazmrt pin <dir>` prints
+`warning: skipping '<path>': cannot assemble (ObsoleteKeyword)` on **stdout**, between the
+`<digest>  <path>` lines. The subcommand's documented purpose is to *"print its pin line(s) for a
+root-owned allow-list"*, so the obvious use is `wazmrt pin C:\apps > pins`, and that file then
+contains three lines that are not pins.
+
+⚠️ **What makes it worth an entry rather than a shrug:** the pin DB is the verification root. A parser
+that is lenient about junk lines silently accepts them; one that is strict fails the whole DB on a
+file wazmrt itself wrote. Either way the operator is surprised by output that looked fine on screen.
+The sibling prints the same warnings on **stderr**, which is why its listing is clean.
+
+**Surfaces when:** an installer pipes `pin <dir>` into a DB file, which is exactly what the `--db`
+flag's absence invites. **Fix:** write warnings to stderr. **Not done here** because it is a CLI output
+change with no test around it yet and B-c2 was a digest item; filed for Track B's own sweep.
+
+---
+
 ## 🧭 STANDING DELTAS — ⚠️ **TWO, not three: SD-3 was RETIRED 2026-08-18** (`delegate` shipped)
 
 **A Standing Delta is a known, understood difference between wazmrt and some reference, which stays

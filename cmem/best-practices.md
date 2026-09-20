@@ -911,6 +911,41 @@ unrefusable, so "there is nothing to gate" and "we forgot" have to be distinguis
 The recorded condition: **if annotations ever carry meaning to any consumer — read rather than
 dropped — they need a bit that day.** — Track A, `roadmap.md`
 
+**A SINGLE-FILE BYTE-FOR-BYTE CONFIRMATION PROVES THE CAUSE IT FINDS AND SAYS NOTHING ABOUT THE ONES
+IT CANNOT REACH.** Z4's diagnosis was as strong as a diagnosis gets: assemble `mathlib.wat` with both
+tools, `wasm-tools strip --all` one of them, watch the digests become equal, and read off `objdump`
+that the sole difference is a `custom "name"` section. It was correct, and it was **one of three
+causes** — the file has no unused data segment and no tag, so the other two could not appear in it.
+Emitting the name section took the corpus from 2 agreeing to 333, not to 954. 🎓 **Confirm the cause on
+one file; size the problem on the corpus.** — Track B-c2, 2026-09-20
+
+**WRITE THE GATE AS THE OUTCOME, NOT AS THE FIX — THEN IT CAN FAIL FOR A REASON YOU DID NOT PREDICT.**
+B-c2's item was "stop throwing the names away"; its gate was "the digests agree". Those are not the
+same sentence, and the difference was worth two defects: a gate reading "a `name` section is emitted"
+would have gone green with 621 of 954 files still disagreeing. ⚠️ **A gate phrased as the implementation
+can only confirm that the implementation happened.** — Track B-c2, 2026-09-20
+
+**"LEGAL, AND SIMPLEST" IS NOT A REASON TO EMIT SOMETHING NOBODY ELSE EMITS.** The assembler wrote a
+data-count section for every module with a data section, on the recorded argument that always-emit is
+simplest and always valid. Both halves were true. It still cost 3 bytes per module that no other
+producer writes, and with them the digest equality that makes a `.wat` pin portable — a consequence
+nothing in the original reasoning could have weighed, because the comparison did not exist yet.
+🎓 **When the spec says "required when X", implement X, not a superset of it: the superset is
+indistinguishable from the rule until something compares you against a peer.** — Track B-c2, `wat.zig`
+
+**A GUARD THAT DEFERS TO A LATER LAYER MUST BE SURE THE LATER LAYER STILL SEES THE QUESTION.**
+`checkInlineTypeUse` opens with *"a bad index is a downstream verdict"* and returns. For an import's
+`(type 0)` written before any type exists, the downstream verdict never comes: by emit time the
+assembler has interned enough signatures that index 0 exists and means something else, so the module
+validates and an import runs bound to a signature the text never wrote. ⚠️ **Time-of-check: the guard
+was not wrong about whose job it is, it was wrong about when it was asking.** — Track B-d, 2026-09-20
+
+**A GATE THAT HAS TO BE REMEMBERED IS NOT ENFORCEMENT.** `zig build size` is a separate step, so it
+runs when somebody thinks of it — and on 2026-09-20 `main` was found **4,608 bytes over the exe
+ceiling**, put there by two commits that had each grown the CLI without raising the number in the same
+commit, which the ceilings file's own header requires. The ceiling design (exact, no headroom) worked
+exactly as intended; the *scheduling* of the check is what failed. — Track B-e, `tools/size-ceilings.txt`
+
 ## 5. Recording what you found
 
 **"Update the project memory" means AUDIT for stale live claims, not edit the files you happened to

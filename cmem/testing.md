@@ -6,6 +6,32 @@
 opcode). The C ABI is verified separately from C via `tests/c_smoke.c` compiled with `zig cc` (see
 `design-decisions.md` → "Verified working"). Hand-built byte fixtures live inline in the tests.
 
+## 🆕 Cross-runtime digest parity — the `.wat` assembler's strongest gate (2026-09-20)
+
+**This is not a `zig build` step and it is the check that found three defects no in-repo gate could
+see.** Both runtimes' `pin` hashes the **assembled** bytes, so one command per tree compares two
+assemblers end to end, over ~1,470 real files, with no fixture to write:
+
+```text
+wazmrt pin  <wasmtk>  > a.txt
+wasmrt pin  <wasmtk>  > b.txt        # sibling built into a SCRATCH CARGO_TARGET_DIR (§1a: never their tree)
+# compare the `<64-hex>  <path>` lines only; both tools print warnings on the same stream
+```
+
+📊 **State at 2026-09-20** (`a495424f`): **`.wat` 954 agree / 0 differ**, **`.wasm` 513 agree / 0
+differ**. Before B-c2 it was `.wat` 2 / 952. Two `.wat` files are outside the comparison — wasmrt
+refuses them and wazmrt mis-assembles them (**B-d**), and 3 more use obsolete keywords both reject.
+
+⚠️ **Read the non-digest lines too.** `wazmrt pin <dir>` writes its `warning: skipping …` lines to
+**stdout**, interleaved with the pin lines, so a redirected listing is not a clean allow-list. Filter
+on the digest shape, and see the note in `known-issues.md`.
+
+🔑 **Why it is worth keeping.** Every in-repo gate asks "does this module behave correctly?" This one
+asks "is this the same module another toolchain would have built?" — and the three causes it found
+(no `name` section, an over-eager data-count section, implicit import types interned after tags) were
+all **behaviour-preserving**, so no conformance run, unit test or fuzz pass could ever have reported
+them. See `roadmap.md` → B-c2 and `interop.md` §3.1m-r.
+
 ## External conformance corpora (owner-designated 2026-07-02)
 
 The designated real-world test inputs live in the sibling **wasmtk** project under
