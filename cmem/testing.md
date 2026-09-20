@@ -150,9 +150,9 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
 | gate | result |
 | --- | --- |
 | conformance | **288 files · 64,092 passed · 0 failed · 0 skipped · 0 file-errors** (baseline still EMPTY). ✅ The last 20 skips closed 2026-09-20 by the custom-annotations pass — they were the three `custom/` files (`custom_annot` 14, `name_annot` 3, `branch_hint` 3), and the tally now matches the canonical runtime's own adjudication of the same directory exactly. ⚠️ The counts differ from Track H's `284 · 63,934 · 0 skipped` because this is a **different testsuite checkout**, not a regression — verified by running the same command on `HEAD` before and after every change on 2026-09-20. *(Superseded: 64,072 passed · 20 skipped.)* |
-| `test` (Debug) | **802/802** (2026-09-20, Track B) — was **765/765** — was 758. **+4** iteration budget (2 tests, and `interp.zig`'s tests run in *both* the module and capi binaries), **+2** GC ceiling (1 test × 2), **+1** misplaced-flag warning (CLI binary only) |
-| `test-safe` (ReleaseSafe) | **800/800** (was 765) |
-| **`test-shipped` (ReleaseSmall — the config that ships)** | **800/800** (was 765) |
+| `test` (Debug) | **804/808, 4 skipped** (2026-09-20 — custom-annotations +6, the H7 verdict pin +2; the four skips are exFAT symlink tests) — was **802/802** — was **765/765** — was 758. **+4** iteration budget (2 tests, and `interp.zig`'s tests run in *both* the module and capi binaries), **+2** GC ceiling (1 test × 2), **+1** misplaced-flag warning (CLI binary only) |
+| `test-safe` (ReleaseSafe) | **802/806, 4 skipped** (was 800/800, was 765) |
+| **`test-shipped` (ReleaseSmall — the config that ships)** | **802/806, 4 skipped** (was 800/800, was 765) |
 | `test-security` | 3/3 from an NTFS cwd |
 | `features` · `capi-smoke` | green |
 | size (ReleaseSmall) | exe **1,009,664** · lib **1,059,240** · dll **910,336** — all three EXACT (2026-09-20). ⚠️ **Every `dll` number recorded before 2026-09-20 was read off a STALE file** — the gate did not build the shared library it graded, so `900,608` was wrong from the day it was written. See `roadmap.md` → B-e |

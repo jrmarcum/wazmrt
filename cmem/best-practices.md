@@ -1551,3 +1551,74 @@ of what the canonical toolchain accepts, not from what the code looked like it h
 🔑 **When a comment claims "before X" or "after everything", check the line number, not the sentence.**
 An invariant about ORDER is the one kind of comment that can be falsified by moving nothing but
 itself. — 2026-09-20, `wat.zig` annotation pre-pass
+
+---
+
+### 🎓 A check that REPORTS is not a check that REFUSES — and a test on the message cannot tell them apart
+
+The H7 flip (warn → error) shipped with three tests over its message text. An inversion proof then
+deleted `return exit_failure;` from the call site: it **compiled, and every test passed.** The suite
+asserted what the function printed; nothing asserted that the run stopped.
+
+⚠️ **The whole change was the verdict.** The message had already existed for a month — what the owner
+decided was that the process must now fail. So the one thing the change *was* had no coverage, and the
+three things that had not changed had three tests.
+
+🔑 **The fix is structural, not another assertion.** A verdict that only exists as control flow inside
+a large function cannot be tested; extract it so it is a value:
+
+```zig
+fn refuseMisplacedHostFlag(out: *Io.Writer, rest: []const []const u8) !?u8 {
+    const bad = misplacedHostFlag(rest) orelse return null;
+    try reportMisplacedHostFlag(out, bad);
+    return exit_failure;   // ← now a RETURN VALUE a test can pin
+}
+```
+
+🎓 *When a change is "X should now be fatal", the test to write first is the one that fails if X is
+merely mentioned.* This is the same shape as the custom-annotations lesson one section down — there,
+"accepted" was mistaken for "honoured"; here, "reported" was mistaken for "refused". **Both are the
+gap between a tool noticing something and a tool acting on it, and in both the test sat on the
+noticing.** — 2026-09-20, `interop.md` §5 #11
+
+---
+
+### 🎓 Do not batch-close a set of stale rows: measure them one at a time
+
+`roadmap.md` carried four CLI obligations all marked ⬜ *not started*, all from the same table, all
+believed closed by the same commit. Re-running them: **three were done and the fourth was not.**
+`wazmrt --dir . m.wasm` still answers `error: unknown flag '--dir'`.
+
+⚠️ **They were about to be marked done together**, because the evidence for three of them felt like
+evidence for the batch — same table, same track, same commit message. *A shared provenance is not a
+shared verdict.*
+
+🔑 **The cost of checking was one command per row.** The cost of not checking would have been a closed
+row with an open defect behind it — strictly worse than the stale ⬜, because a ⬜ invites a re-check
+and a ✅ forbids one.
+
+🎓 *Staleness is not uniform. A table that is 75% stale is also 25% accurate, and you cannot tell which
+quarter from the outside.* — 2026-09-20, `roadmap.md` §2.1 obligations
+
+---
+
+### 🔧 `deno eval "…"` as a shell argument is the banned heredoc in a different costume — WRITE THE FILE
+
+The tooling rule says *never pass a script to an interpreter through a shell heredoc*, and names
+`deno eval` as the same class. It was reached for anyway, repeatedly, across two sessions, and it
+**mangled its own input twice**:
+
+| attempt | what the shell did |
+| --- | --- |
+| an `INDEX.md` edit | unescaped backticks were **command-substituted**, deleting every backticked span in the block |
+| retargeting an inversion script | the replacement inserted **literal newlines inside a `"` string** — a JS syntax error |
+
+🔑 **Why it keeps happening:** the edit is small, so a file feels like ceremony. But the failure mode
+is not proportional to the edit's size — it is proportional to how many shell metacharacters the
+CONTENT has, and code content is nothing but shell metacharacters. A one-line edit to a line
+containing a backtick is more dangerous than a fifty-line edit to prose.
+
+🔒 **The rule, restated so it needs no judgement: if the text being written contains a backtick, a
+`$`, a `"`, a `\` or a newline, it goes in a file.** In this project that is every edit to source or
+to `cmem/`. `Write` the script, then run the script — and the script asserts its match counts and
+writes atomically, which the one-liner never does either. — 2026-09-20, third repeat offence
