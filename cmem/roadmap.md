@@ -566,7 +566,37 @@ the SKIP count never moved. *File a suspicion as a suspicion, then measure it be
 | **Stale scope comments + two orphaned doc comments** | ✅ **FIXED.** The scope claims did more than misinform: in two cases the stale comment **picked the error**, and the error picked the column in the conformance score. `simdSig`'s doc was on `atomicValType` and `asStr`'s on `wrapModuleText` — each function carrying someone else's first sentence while another carried none |
 | ⬜ **`hostRefPayload`** (pub, zero callers) and **`BadFuncType`** (unreachable member of a **public** error set) | ⬜ **STILL OPEN — owner decision, and the only one of the six that is.** Removable only if `interp.zig`'s `pub` surface and `DecodeError` are implementation details rather than API. Deleting either is an API change for anyone switching exhaustively or calling through `root.interp` |
 | ⬜ **Low-value duplicates left standing** | ⬜ `readF32Bits` ≡ `readU32Le` (one function, two names, each doc describing half the truth); three ULEB **encoders** (one test-only); `hexVal` duplicated in `pin.zig`/`sexpr.zig`; export-by-name lookup implemented 4× and open-coded 7× more. **None reconstructs a fact** — they are copies of trivial code, which is the class the duplicate hunt deliberately ranked last |
-| 🆕 ⬜ **Track A's reopen condition is MET** | ⬜ Recorded 2026-09-20. Annotations are discarded at the lexer, which is correct *"unless they ever carry meaning to any consumer"* — and `custom_annot.wast`'s `(@custom "name" "bytes")` **emits a custom section**. The condition its own entry set has been met by the corpus; whether to act is a scoping call |
+| 🆕 ⬜ **Track A's reopen condition is MET** | ⬜ Recorded 2026-09-20 — and the GATE QUESTION is answered below, ahead of any code (owner, 2026-09-20: *"decide the gate question first"*) |
+
+###### 🔬 `@custom` — THE GATE QUESTION, ANSWERED BEFORE THE CODE
+
+**Track A's rule:** *"if annotations ever carry meaning to any consumer — read rather than dropped
+— they need a bit that day."* `(@custom "name" "bytes")` **emits a custom section**, so it carries
+meaning and the rule fires. ⚠️ **But the bit the rule asks for cannot be made to work, and that is
+a fact about the mechanism rather than an opinion.** Two measurements:
+
+| fact | consequence |
+| --- | --- |
+| `features.firstViolation` walks a **decoded Module** | A custom section from `@custom` is **byte-indistinguishable** from any other custom section — wazmrt emits `name` and `signature` sections itself. **No post-assembly gate can attribute it** |
+| `grep -c features src/wat.zig` → **0**. `assemble(a, src)` takes no feature set | Gating at assembly time is **new plumbing**, and would be the project's first assembler-level gate |
+
+🔒 **So a `Feature` bit added today could never fire** — which is precisely what `features.zig`'s
+own header forbids: *"a gate that misses an opcode is worse than no gate: it reads as a control
+while letting the thing through."* 🎓 **This is the `extended_const` lesson one layer up**: there,
+the classifier was right to return null and the WALK had to change; here, the walk cannot be
+changed because the evidence is gone by the time the walk runs.
+
+**The three coherent options, none of which is "add a bit and implement":**
+
+| | |
+| --- | --- |
+| **A. Do not implement `@custom`** | The 17 skips stay, **honestly classified as our limitation**. No gate question, no risk, nothing misreported. The conformance number is already truthful about this |
+| **B. Implement it WITH a real assembly-time gate** | Thread a feature set into `wat.assemble`. The only option under which a bit actually fires. New capability, and it changes the assembler's signature and every caller |
+| **C. Implement it with NO bit, and AMEND Track A's rule** | Narrow the rule to *"an annotation whose consumer is the VALIDATOR or INTERPRETER needs a bit; one whose only consumer is the assembler, producing output the module format cannot distinguish, does not"* — and record why. Defensible, and it weakens a rule that has been load-bearing |
+
+📌 **Recommendation: A, or C if `@custom` is wanted.** ⚠️ **Not B for the skip count** — 17 skips
+that are correctly labelled are not a problem worth an assembler-wide gate, and `measure → find →
+optimize → attack` puts new capability after the review tracks, not before them. **Owner's call.**
 
 #### ✅ B-a — The EMITTER audit. **COMPLETE 2026-09-20** (`d47ecd18`). **FOUR DEFECTS, 4-FOR-4 AGAIN** `[x]`
 

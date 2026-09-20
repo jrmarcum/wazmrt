@@ -787,6 +787,17 @@ pub fn hostRefValue(payload: u64) Value {
 }
 
 /// The payload of a host reference built by `hostRefValue`.
+///
+/// 🔒 **DELIBERATELY RETAINED WITH NO IN-TREE CALLER** (owner, 2026-09-20). A dead-code sweep
+/// flagged it: zero callers anywhere in `src/`, `tests/`, `tools/`, `examples/` or the C ABI, and
+/// the forward direction (`hostRefValue`) is used in three places. It stays because `root.zig`
+/// re-exports `interp`, so **`wazmrt.interp.hostRefPayload` is part of the supported embedder
+/// surface** — and an unpaired boxing helper is a worse API than a paired one: an embedder that
+/// can box a host reference must be able to unbox it.
+///
+/// ⚠️ **This note exists so the NEXT sweep stops here instead of re-deriving the question.** It
+/// will look unused again, because it is; "unused in-tree" and "not API" are different claims and
+/// only the second one licenses deletion.
 pub fn hostRefPayload(v: Value) u64 {
     return v & (host_tag - 1);
 }

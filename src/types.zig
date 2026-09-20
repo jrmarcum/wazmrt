@@ -388,6 +388,16 @@ pub const DecodeError = error{
     /// the encoding, so a mismatch is malformed even when the contents parse.
     SectionSizeMismatch,
     /// A function type did not begin with the 0x60 form byte.
+    ///
+    /// 🔒 **NOTHING RETURNS THIS, AND IT STAYS** (owner, 2026-09-20). A dead-code sweep found it
+    /// is the only unreachable member of the 135 error-set variants in the tree: the case it names
+    /// is answered by `BadType` from `readCompType`'s `else` arm, which switches on the form byte.
+    ///
+    /// ⚠️ **`DecodeError` is PUBLIC, so its membership is a versioned contract.** Removing a
+    /// variant breaks any consumer that switches exhaustively, and it buys nothing — an error set
+    /// costs no code size. *"Unreachable today" is not the same claim as "no longer part of the
+    /// API", and only the second one licenses removal.* Left documented so the next sweep stops
+    /// here rather than re-deriving it.
     BadFuncType,
     /// A type-section entry was not a valid composite type (func/struct/array),
     /// or a GC sub type declared more than one supertype.
