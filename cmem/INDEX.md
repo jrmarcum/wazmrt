@@ -8,7 +8,7 @@ a machine-local `CLAUDE.md`.
 and revised without wading through one giant file. Keep files small and single-topic.
 ---
 
-## 🏁 STATE — 2026-09-20. **TRACK B IS IN FLIGHT: B-b done, B-c at 4 of 5, B-a not started.**
+## 🏁 STATE — 2026-09-20. **TRACK B: B-b AND B-c ARE COMPLETE; B-a NOT STARTED; B-e OPEN.**
 ### 🔖 **`1.0.1` shipped Track H (2026-08-19); Track B is being built now and has not been versioned.** The hold that Track H ended in was released by the owner; B-b (`0a48957a`), B-c1/c3/c5 (`22437455`) and **B-c2 (`a495424f`, 2026-09-20)** have landed since.
 
 ### ✅ B-c2 (Z4) IS DONE — 2026-09-20. **`.wat` PIN DIGESTS ARE PORTABLE: 954 of 954, up from 2.**
@@ -55,6 +55,26 @@ because the BUILD result was read before the test result. Fourth time this rule 
 
 📌 **B-e remains open** — the size gate is still a step somebody has to remember.
 
+### ✅ B-c4 IS DONE — 2026-09-20 (`8e04263b`). **B-c IS COMPLETE, 5 of 5.**
+
+`run`, `wasi`, `wat` and `wast` now work, additively — every bare-path form verified unchanged, so
+a command line written for either runtime runs on both. 🔑 **`run` and `wasi` are ALIASES onto the
+existing paths**, so one parser serves both spellings and the verify gate, `--features` and the
+Z1/Z2/Z3 guards cannot drift between them. 🔒 **The named modes do NOT fall back:** `run m.wasm
+nosuch` on a module that also exports `_start` would otherwise run `_start` with `nosuch` as guest
+argv and exit 0.
+
+🆕 **`wat` is the one new capability** — assemble text to a binary. Measured from the sibling rather
+than assumed: without `-o` it writes **nothing** and only reports the size.
+
+⚠️⚠️ **The one real trap, and it is fail-OPEN:** `wasi`'s leading flags are moved behind the path as
+`lead ++ tail`. `tail ++ lead` would put them after an explicit `--`, handing `--dir` to the guest
+as argv so the run proceeds **with no preopen and no message**. Named function (`wasiSplit`), own
+test, inversion-proven against a build that compiled, and confirmed end to end.
+
+📏 exe +9,216 — the largest single exe move in Track B — and **lib +0, dll +0**: none of it is in
+`root.zig`, so CLI convergence costs an embedder nothing.
+
 ### 🔧 LINE ENDINGS ARE SETTLED — LF everywhere, pinned by `.gitattributes` (owner, 2026-09-20)
 
 git was never asking for CRLF: every blob here is LF. A machine-**global** `core.autocrlf=true` was
@@ -70,14 +90,14 @@ so a checkout-dependent line ending would move a digest. Full reasoning: `best-p
 | gate | value | note |
 | --- | --- | --- |
 | conformance | **288 files · 64,072 passed · 0 failed · 20 skipped · 0 unrun** | baseline file is **EMPTY**. ⚠️ The counts differ from Track H's `284 · 63,934 · 0 skipped` because this is a **different testsuite checkout** (`wasmtk/…/testsuite-main`), not a regression — verified by running the same command on `HEAD` before and after every change on 2026-09-20 |
-| unit tests | **780/780** | from an NTFS cwd; a `D:` cwd loses 4 to exFAT symlinks |
-| `test-safe` | 780/780 | ReleaseSafe — optimized, safety checks KEPT |
+| unit tests | **781/781** | from an NTFS cwd; a `D:` cwd loses 4 to exFAT symlinks |
+| `test-safe` | 781/781 | ReleaseSafe — optimized, safety checks KEPT |
 | `test-security` | 3/3 | from an NTFS cwd |
-| **`test-shipped`** | **780/780** | Track H — **ReleaseSmall, the config that SHIPS** (checks off) |
+| **`test-shipped`** | **781/781** | Track H — **ReleaseSmall, the config that SHIPS** (checks off) |
 | `features` | green | all four `-Dwat`/`-Dwasi` combinations |
 | `capi-smoke` | green | |
 | 🆕 **`.wat` digest parity** | **954 agree · 0 differ** (`.wasm` 513 · 0) · **both listings 1,467 lines** | **not a `zig build` step** — `wazmrt pin <wasmtk>` vs `wasmrt pin <wasmtk>`. See `testing.md`; it found three defects no in-repo gate could see |
-| size (ReleaseSmall) | exe **1,000,448** · lib **1,059,260** · dll **900,608** | all three EXACT. ⚠️ **The exe ceiling was 4,608 bytes BEHIND reality at `41a96aa3`** — two Track B commits grew it without raising it, which nothing caught because `zig build size` has to be remembered (**B-e**) |
+| size (ReleaseSmall) | exe **1,009,664** · lib **1,059,260** · dll **900,608** | all three EXACT. ⚠️ **The exe ceiling was 4,608 bytes BEHIND reality at `41a96aa3`** — two Track B commits grew it without raising it, which nothing caught because `zig build size` has to be remembered (**B-e**) |
 
 **Shipped 2026-08-18, in order:** Track **F** (feature enforcement — and two gates that did not
 exist), the **skip-closing pass** (two of its four items were rejecting VALID modules),

@@ -653,15 +653,57 @@ row, each **inversion-proven** (reverting the fix fails it); `install --yes` and
 still to reach the guest; conformance and suite counts do not regress. Then **`coordinate`** at the end
 of the track (§1d) and report to the owner.
 
-#### B-c — The T9e/T9i CONVERGENCE. **4 of 5 done 2026-09-20** (`22437455`, `a495424f`) `[~]`
+#### ✅ B-c — The T9e/T9i CONVERGENCE. **COMPLETE 2026-09-20 — 5 of 5** (`22437455`, `a495424f`, `8e04263b`) `[x]`
 
 | # | state |
 | --- | --- |
 | **B-c1** `--dir` | ✅ **DONE.** `.:/` works, `::` accepted, drive letter narrowed to one ASCII letter (owner, §5 #10) |
 | **B-c2** Z4 name section | ✅ **DONE 2026-09-20** (`a495424f`). **954 of 954 comparable `.wat` digests agree, up from 2.** The `name` section was one of **three** causes — see below |
 | **B-c3** pin DB path | ✅ **DONE.** Shared `wasmtk` path → own path → **warn when the sibling's DB exists and ours does not.** Decision is a pure function, all 8 combinations tested, the row that matters inversion-proven |
-| **B-c4** subcommands | ⬜ **NOT STARTED** — `run`/`wasi`/`wast` are aliases onto existing paths; **`wat` is a genuinely new feature** (assemble-to-file), which is why this is not a rename |
+| **B-c4** subcommands | ✅ **DONE 2026-09-20** (`8e04263b`). All four accepted, additively — every bare form verified unchanged. `run`/`wasi` are **aliases onto the existing paths**, so one parser serves both spellings; **`wat` is the new capability**. 🔒 **The named modes do NOT fall back** — see below |
 | **B-c5** feature vocabulary | ✅ **DONE.** wasm-tools' whole vocabulary resolves, verified against the tool's own list |
+
+##### ✅ B-c4 IS DONE — 2026-09-20 (`8e04263b`). **B-c IS COMPLETE, AND SO IS THE 2026-09-19 LIST.**
+
+```
+wazmrt run  <module> <export> [args...]      wazmrt wat  <file.wat> [-o out.wasm]
+wazmrt wasi [flags] <module> [-- argv]       wazmrt wast <file|dir>... [-v]
+```
+
+🔑 **`run` and `wasi` are ALIASES ONTO THE EXISTING PATHS, not copies of them.** They set a mode
+and move the argument index past the word; everything after is parsed by the same code, so the
+verify gate, `--features`, `--max-iterations` and the Z1/Z2/Z3 guards apply identically whichever
+spelling was used. *A second parser would be a second place for those to drift out of.*
+
+🔒 **THE NAMED MODES DO NOT FALL BACK, and that is the substantive behaviour change.**
+`wazmrt run m.wasm nosuch` on a module that **also** exports `_start` would otherwise slide into
+WASI mode and run something the user never asked for, with `nosuch` quietly becoming guest argv,
+rc 0. That is §2.3's rule applied where the bare form **cannot** apply it: there the word genuinely
+might be argv, which is why that guard is narrow; under `run` the user named the mode. Same for
+`wasi` on a module with no `_start` — a failed run, not a summary.
+
+| piece | note |
+| --- | --- |
+| **`wat`** | the one genuinely NEW capability. ⚠️ **Without `-o` it assembles and reports the size, writing NOTHING** — measured from the sibling, not assumed, because *"assemble"* reads like a verb that produces a file and a default output name would create one the user never named. **No verify gate**, and not because it is "only a tool": it never instantiates or invokes, so there is nothing for a pin to authorize |
+| **`wast`** | multi-target, directories walked recursively, per-file lines plus a total when there is more than one. 🔒 **Gates per script** — `runScriptWith` executes, and *a second entry point to an execution path is a second chance to forget the gate*, which is the exact bug the bare `.wast` path already cost this project |
+| **`wasi`** | the one spelling where WASI flags may **precede** the module, because the sibling's usage line puts them there and, measured, it takes them on either side |
+
+⚠️⚠️ **`lead ++ tail`, NEVER `tail ++ lead` — the one real trap in this item.** An explicit `--`
+lives in the tail, so appending the moved flags after it would hand `--dir` to the **guest** as
+argv and run with no preopen at all, silently: fail-OPEN, on the flag that grants filesystem
+access, from a pure ordering mistake. That is why the split is a named function (`wasiSplit`) with
+its own test rather than four lines inline. Inversion-proven against a build that compiled, and
+confirmed end to end — `wasi --max-memory 1 st.wat -- a b` traps `MemoryLimitExceeded`, so the
+moved flag demonstrably still applies.
+
+🧹 **A smaller untruth the new modes made obvious, fixed here:** the unknown-flag hint said *"use
+`--` to pass it to the guest"* from **every** path — including `.wast`, summarize, `wat` and `run`,
+none of which have guest argv — sending the user to try something that cannot work. Now per-mode.
+*Same class as a line that calls a module valid before it validated.*
+
+📏 **exe +9,216, lib +0, dll +0.** The largest single exe move in Track B, and the embed artifacts
+did not move **at all**: none of this is in `root.zig`, so an embedder gets the engine and not the
+command line. Every earlier ceiling entry had to argue a size/feature trade; this one does not.
 
 ##### ✅ B-c2 (Z4) IS DONE — 2026-09-20 (`a495424f`). **The name section was ONE of THREE causes.**
 

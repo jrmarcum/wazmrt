@@ -58,6 +58,33 @@ compliance process, and for the ledger of any reused code.
 > (v128)** instruction set — every fixed-width op plus the relaxed-SIMD
 > extensions. Requires Zig 0.16.
 
+## Command line
+
+Two spellings of every run mode work, so a command line written for wazmrt or
+for the sibling `wasmrt` runtime runs unchanged on either:
+
+```
+wazmrt <module> <export> [args…]      wazmrt run  <module> <export> [args…]
+wazmrt <module> [flags] [-- argv]     wazmrt wasi [flags] <module> [-- argv]
+wazmrt <script.wast>                  wazmrt wast <file|dir>… [-v]
+wazmrt <module>                       # summarize + validate; executes nothing
+wazmrt wat <file.wat> [-o out.wasm]   # assemble text to a binary
+wazmrt pin | keygen | sign …          # see "Verifying modules" below
+```
+
+The bare forms pick the mode from the module: an argument that names an export
+calls it, otherwise a module exporting `_start` runs as a WASI command, otherwise
+you get a summary. **The named forms do not fall back** — `run` must name an
+export that exists and `wasi` must find `_start`, or the run fails rather than
+quietly doing something else.
+
+`wat` writes a file only with `-o`; on its own it assembles and reports the size.
+`wast` takes several files, or a directory to search recursively, and prints a
+total when given more than one script.
+
+`--features <list>` is the only flag that goes **before** the module path; every
+other one goes after it. Under `wasi`, flags may go on either side.
+
 ## Build
 
 ```
