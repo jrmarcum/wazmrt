@@ -122,6 +122,21 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
     // With no leading `--features` this is exactly the `args[2..]` it replaced.
     var rest = args[argi + 1 ..];
 
+    // 🔒 **`--features` after the module path is an ERROR** (owner, 2026-09-19). It is the one
+    // wazmrt flag that PRECEDES the path, so written after it the flag cannot apply — and until
+    // this check it applied nothing and said nothing, on the one flag whose job is to refuse
+    // modules. Checked before the `--max-iterations` splice and before the file is read, so the
+    // message names the flag rather than the file.
+    if (misplacedFeaturesFlag(rest)) |bad| {
+        try out.print(
+            "error: '{s}' must come BEFORE the module path\n" ++
+                "  usage: wazmrt --features <list> <module> [...]\n" ++
+                "  it is the only wazmrt flag that precedes the module; use '--' to pass it to the guest\n",
+            .{bad},
+        );
+        return exit_failure;
+    }
+
     // `--max-iterations <n>` (Track H) is consumed HERE, before the mode dispatch,
     // and not in `runWasi` alongside the other ceilings. Reason: run mode selects
     // on `rest[0]` naming an export, so a flag left in place would silently push
@@ -463,6 +478,11 @@ fn printHelp(out: *Io.Writer, prog: []const u8) !void {
         \\  {s} <subcommand> ...              pin / keygen / sign (below)
         \\  {s} -h | --help | -v | --version
         \\
+        \\  POSITION  `--features <list>` is the ONLY wazmrt flag that goes BEFORE <module>:
+        \\                {s} --features <list> <module> [...]
+        \\            EVERY other wazmrt flag goes AFTER the module path. Written after
+        \\            the path it is an ERROR, because it could not apply there.
+        \\
         \\RUN MODES
         \\  {s} add.wasm add 2 3
         \\      Instantiate and call `add` with args 2 and 3 (parsed per the function's
@@ -504,8 +524,13 @@ fn printHelp(out: *Io.Writer, prog: []const u8) !void {
         \\      matching root key is embedded (-Droot-key).
         \\
         \\FEATURE FLAGS (the WebAssembly language wazmrt will accept)
-        \\  --features <list>           restrict the accepted proposals; goes BEFORE the module
-        \\      A comma-separated list. Two seeds may lead it: `all` (everything, the default)
+        \\  --features <list>           restrict the accepted proposals
+        \\      POSITION: BEFORE the module path, unlike every other wazmrt flag:
+        \\          {s} --features mvp mod.wasm
+        \\      Written after the path it is an ERROR and nothing runs — it could not have
+        \\      applied there, and until 2026-09-19 it was ignored in silence. After `--`
+        \\      it is the guest's argv and is passed through untouched.
+        \\      VALUE: a comma-separated list. Two seeds may lead it: `all` (everything, the default)
         \\      and `mvp` (nothing but WebAssembly 1.0). Items are proposal names, optionally
         \\      signed: `gc` adds, `-gc` removes.
         \\        --features mvp                       WebAssembly 1.0 and nothing else
@@ -522,7 +547,7 @@ fn printHelp(out: *Io.Writer, prog: []const u8) !void {
         \\  -h, --help                  show this help and exit
         \\  -v, --version               show version information and exit
         \\
-    , .{ wazmrt.version, prog, prog, prog, prog, prog, prog, prog, prog, defaultPinsPath() });
+    , .{ wazmrt.version, prog, prog, prog, prog, prog, prog, prog, prog, prog, defaultPinsPath(), prog });
 }
 
 // ===== Phase 5 — pin verification (see cmem/security-model.md, roadmap.md §5) =====
@@ -787,6 +812,54 @@ fn flagRegion(rest: []const []const u8) []const []const u8 {
         break; // first non-flag argument — everything from here is the guest's
     }
     return rest[0..i];
+}
+
+/// ⚠️ **`--features` written AFTER the module path is an ERROR, not a warning.**
+///
+/// 🔒 **Owner, 2026-09-19:** *"If the `--features <list>` has to go before the module, we need
+/// to identify that in the invocation and help sections for sure, and we need an error thrown when
+/// it is in the wrong location."*
+///
+/// `--features` is the ONE wazmrt flag that precedes the module path, and it is deliberately absent
+/// from `flagRegion`'s lists so a guest's own `--features mvp` can never narrow the language (see
+/// the parse site). ⚠️ **That left it with no position where being wrong was noticed:**
+/// `flagRegion` stops at it, so it reads as the first guest argument, and `warnMisplacedFlags` only
+/// fires for names in those same lists. **Measured 2026-09-19: `wazmrt m.wasm --features mvp` ran
+/// under the FULL feature set and printed nothing** — the fail-OPEN direction, on the one flag
+/// whose entire job is to REFUSE modules.
+///
+/// 🎓 **This is the "one list" comment's blind spot, not a missing entry in it.** Both lists are
+/// complete for flags that TRAIL the path; `--features` is invisible to them because it belongs to
+/// a position neither list describes. *A rule that names the thing it guards will not guard the
+/// thing it does not name.*
+///
+/// **Error, do not warn — a deliberate split from `warnMisplacedFlags`.** That function warns
+/// because a guest may legitimately take `--dir` as its own argument. Here the token sits in a
+/// HOST-flag position (the leading run after the path, before any guest argument), where the user
+/// is unambiguously addressing wazmrt; `interop.md` §2.4a makes that position an error for an
+/// unrecognised `--flag`, and a recognised one written where it cannot work is no better.
+/// ⚠️ Nothing after `--`, and nothing after the first non-flag argument, is examined: there the
+/// token is the guest's, and `warnMisplacedFlags` keeps its warning.
+///
+/// 🔒 **This walk MIRRORS `flagRegion`'s and must keep doing so** — same lists, same stop
+/// conditions. A test pins the two against each other.
+fn misplacedFeaturesFlag(rest: []const []const u8) ?[]const u8 {
+    var i: usize = 0;
+    outer: while (i < rest.len) {
+        if (std.mem.eql(u8, rest[i], "--")) return null; // explicit hand-off; the guest's
+        if (std.mem.eql(u8, rest[i], "--features") or
+            std.mem.startsWith(u8, rest[i], "--features=")) return rest[i];
+        for (flags_with_value) |f| if (std.mem.eql(u8, rest[i], f) and i + 1 < rest.len) {
+            i += 2;
+            continue :outer;
+        };
+        for (flags_bare) |f| if (std.mem.eql(u8, rest[i], f)) {
+            i += 1;
+            continue :outer;
+        };
+        return null; // first non-flag argument — everything from here is the guest's
+    }
+    return null;
 }
 /// Parse a `--max-memory` size: a decimal count of bytes with an optional
 /// `K`/`M`/`G` suffix (`512M`, `2G`, `1073741824`). Returns null if unparseable
@@ -1527,6 +1600,69 @@ fn misplacedWarnings(rest: []const []const u8) ![]const u8 {
     var w: Io.Writer = .fixed(&S.buf);
     try warnMisplacedFlags(&w, rest);
     return w.buffered();
+}
+
+test "--features written AFTER the module path is an ERROR, not a silent no-op" {
+    // 🔒 **Owner, 2026-09-19:** *"we need an error thrown when it is in the wrong location."*
+    //
+    // ⚠️ **Before this, `wazmrt m.wasm --features mvp` ran under the FULL feature set and printed
+    // NOTHING.** `--features` precedes the module path, so it is deliberately absent from
+    // `flagRegion`'s lists (a guest's own `--features mvp` must never narrow the language). The
+    // cost was that no code path noticed it being in the wrong place: `flagRegion` stops at it,
+    // and `warnMisplacedFlags` only fires for names in those lists.
+    //
+    // 🎓 **The fail-OPEN direction on the one flag whose entire job is to REFUSE modules** — the
+    // user asked for a smaller trusted computing base, got no error, and ran with everything on.
+
+    // ---- the wrong position is caught, in every host-flag spelling ----
+    try std.testing.expectEqualStrings("--features", misplacedFeaturesFlag(&.{"--features", "mvp"}).?);
+    try std.testing.expectEqualStrings("--features=mvp", misplacedFeaturesFlag(&.{"--features=mvp"}).?);
+    // ...including after a correctly-placed trailing flag, which is still a HOST position.
+    try std.testing.expectEqualStrings("--features", misplacedFeaturesFlag(&.{ "--dir", ".", "--features", "mvp" }).?);
+    try std.testing.expectEqualStrings("--features", misplacedFeaturesFlag(&.{ "--no-verify", "--features", "mvp" }).?);
+
+    // ---- and the directions that must stay SILENT, which is half the point ----
+
+    // ⚠️ After an explicit `--` the user SAID the rest is the guest's. This is the spelling the
+    // error message recommends, so erroring here would make the advice a lie.
+    try std.testing.expect(misplacedFeaturesFlag(&.{ "--", "--features", "mvp" }) == null);
+    // After the first non-flag argument it is guest argv / export arguments. A guest may
+    // legitimately take `--features` as its own option; `warnMisplacedFlags` keeps that case.
+    try std.testing.expect(misplacedFeaturesFlag(&.{ "guestarg", "--features", "mvp" }) == null);
+    // An ordinary export call must not be disturbed.
+    try std.testing.expect(misplacedFeaturesFlag(&.{ "add", "2", "3" }) == null);
+    // Correctly-placed trailing flags alone: nothing to report.
+    try std.testing.expect(misplacedFeaturesFlag(&.{ "--dir", ".", "--", "x" }) == null);
+    // Empty rest (bare summarize).
+    try std.testing.expect(misplacedFeaturesFlag(&.{}) == null);
+}
+
+test "misplacedFeaturesFlag walks exactly the region flagRegion does" {
+    // 🔒 The two walks share `flags_with_value` / `flags_bare` and must agree on where the
+    // host's flags stop, or one of them will judge a token the other has already handed to the
+    // guest. *A list written out a second time is a list that will drift* — this pins the pair.
+    const cases = [_][]const []const u8{
+        &.{ "--dir", ".", "--no-verify", "guestarg", "--features", "mvp" },
+        &.{ "--max-iterations", "1000", "--", "--features", "mvp" },
+        &.{ "--yes", "--features", "mvp" },
+        &.{"guestarg"},
+        &.{},
+    };
+    for (cases) |rest| {
+        const region = flagRegion(rest);
+        if (misplacedFeaturesFlag(rest)) |bad| {
+            // It reported: the offender must sit at the END of the host-flag region, i.e. at the
+            // first index flagRegion stopped at — never inside the guest's argv.
+            try std.testing.expect(region.len < rest.len);
+            try std.testing.expectEqualStrings(rest[region.len], bad);
+        } else {
+            // It stayed silent: nothing in the host-flag region may be a --features spelling.
+            for (region) |a| {
+                try std.testing.expect(!std.mem.eql(u8, a, "--features"));
+                try std.testing.expect(!std.mem.startsWith(u8, a, "--features="));
+            }
+        }
+    }
 }
 
 test "a wazmrt flag written where only the GUEST sees it is warned about" {

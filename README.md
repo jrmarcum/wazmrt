@@ -272,7 +272,19 @@ chain), so ordinary programs never approach it.
 
 wazmrt accepts every proposal it implements by default. `--features` narrows
 that, and a module needing an excluded proposal is **invalid** — refused before
-anything runs, rather than trapping part-way through:
+anything runs, rather than trapping part-way through.
+
+⚠️ **`--features` goes BEFORE the module path, and it is the only wazmrt flag that does.**
+Every other flag follows the path. **Written after the path it is an error and nothing
+runs** — it could not have applied there, and before 2026-09-19 it was ignored in
+silence, which meant a run you believed was restricted was not:
+
+```sh
+wazmrt --features mvp prog.wasm   # correct — the restriction applies
+wazmrt prog.wasm --features mvp   # error: '--features' must come BEFORE the module path
+wazmrt prog.wasm -- --features mvp  # after `--` it is the guest's argv, untouched
+```
+
 
 ```sh
 wazmrt --features mvp prog.wasm              # WebAssembly 1.0 and nothing else
@@ -290,8 +302,8 @@ This is a smaller trusted computing base, not just conformance: `--features mvp`
 means a guest cannot reach wazmrt's GC allocator, SIMD paths, atomics or
 exception machinery at all. It applies to `.wasm`, `.wat` **and `.wast`** — a
 restriction that stopped at `.wasm` could be stepped around by wrapping the
-module in a script. The flag goes *before* the module path, so it never collides
-with a guest's own argv. Embedders get the same control through
+module in a script. The flag's position before the module path is what keeps it from
+ever colliding with a guest's own argv. Embedders get the same control through
 `wazmrt_config_set_feature` / `wazmrt_config_all_features` (see *Embedding*).
 
 ### Verifying modules (pin database + signatures)
