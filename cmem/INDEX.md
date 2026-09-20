@@ -27,6 +27,52 @@ and revised without wading through one giant file. Keep files small and single-t
 exist), the **skip-closing pass** (two of its four items were rejecting VALID modules),
 **wide-arithmetic**, Track **L** (legacy `delegate`), Track **A** (custom-annotations).
 
+### 🤝 COORDINATION PASS RUN 2026-09-19 — **`interop.md` is at CONTRACT VERSION 20 and wasmrt is BEHIND at 10 (⏳ PENDING MIRROR)**
+
+**Do not restate the contract here** — [`interop.md`](interop.md) is authoritative and this is a pointer.
+Five versions were folded in by this project **as pen-holder** (regime A) in one pass: **v11** §2.4a
+unknown flags · **v12** §2.5 truthful validity claims · **v13** wasmrt's §2.3m annex (the §2.3 Z1 row,
+and per-failure exit codes promoted to ✅ AGREED, closing owner decision #4) · 🔒 **v14 the owner's
+no-"looks like" rule** (§2.4a-i: a host argument is an exact-matched option or an error) · 🔒 **v15 the
+owner's same-day NARROWING** of §2.4a (after the path, a single-dash token is the guest's — but only in a
+mode that HAS guest argv).
+
+🚨 **§1c HAPPENED AGAIN DURING THIS PASS and nothing was lost, which is the point.** wasmrt's session
+recorded the narrowing in **its** copy while this session was folding the pre-narrowing text in as v11.
+✅ **§1a held — each side edited only its own copy** — so the collision cost a re-read, not a rewrite.
+⚠️ That is the *destructive* half fixed and the *wasted* half still open: **§5 #7** (one coordination
+session at a time) is the standing proposal, and this pass is fresh evidence for it.
+
+⚠⚠ **THREE CONTRACT BREACHES ARE OPEN AGAINST wazmrt'S SHIPPED CLI — Z1, Z2, Z3 — and every one was
+invisible to every gate this project owns.** They were found by running the sibling binary on the same
+bytes. **Tracked at [`roadmap.md`](roadmap.md) → Track B → B-b**, build-only: the rows are already
+decided and numbered, so B-b implements and must not relitigate them.
+
+🆕 **v16 (§2.4b) is different from the rest of this pass: it is SHIPPED, not just recorded.** A flag
+with a required position, written where it cannot apply, is now an **error**. It was prompted by the
+owner and it found a live fail-OPEN defect — `wazmrt m.wasm --features mvp` exited **0** having run
+under the **full** feature set, silently ignoring the one flag whose job is to refuse modules. Fixed,
+inversion-proven, suite green at 767. Tracked as **H8** in [`roadmap.md`](roadmap.md).
+
+🤝 **SECOND PASS, same day — wasmrt landed T9e + T9i, folded in as v17–v20.** **v17** Z4: `.wat` pin
+digests are not portable, and the cause is the `name` section wazmrt does not emit · **v18** the pin DB
+path is **DECIDED** (shared `wasmtk` path + fallback + anti-silent-disarm warning), closing the file's
+most dangerous row · **v19** §3.7a **CLOSED** — both runtimes now trap on both non-terminating shapes,
+re-verified here by running both · **v20** §2.1/§2.2 — **wasmrt's column is green** (F1 is closed; it
+accepts our bare-path forms, both `--dir` separators and both feature vocabularies).
+
+⚠️⚠️ **THIS PASS FOUND A LIVE wazmrt DEFECT BY RUNNING: `--dir .:/` DOES NOT WORK — and it is the
+example wazmrt's own `--help` prints.** The split guard is `i > 1` (for `C:\tmp`), so a one-character
+relative host path reads as a drive letter and is never split. 🔒 **That is §5 #10's heuristic giving a
+wrong answer on ordinary input.** Tracked as **B-c1** and it should go first. Our outstanding halves are
+**B-c** in [`roadmap.md`](roadmap.md): the `--dir` defect, Z4, the pin DB path + warning, the four
+subcommand spellings, and the hyphenated feature vocabulary.
+
+⏳ **Two things need the OWNER, not an agent** (`interop.md` §5): **#10** — §2.2's `--dir` drive-letter
+fallback is itself a "looks like" rule and the one heuristic this contract has **AGREED** to, so v14
+puts it in tension; **#11** — whether H7's warn should become an error. 🚫 **Neither was decided here:
+a pen-holder does not repeal an agreed row by implication.**
+
 ### 🎯 NEXT — **v1.0.0 is set, and four review tracks follow it** (owner, 2026-08-19)
 
 **The version was raised `0.1.0` → `1.0.0` BEFORE the first track, not after the last one.** It had said

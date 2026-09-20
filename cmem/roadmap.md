@@ -46,11 +46,41 @@ test; now make it hold up against things we do not test."*
 | **H5** — fuzz coverage | ✅ **execution is fuzzed for the first time**, inversion-proven |
 | **H6** — SD-2 reopen condition | ✅ re-tested at the source; stays open |
 | **H7** — misplaced-flag warning | ✅ **added AFTER the track shipped** — found by cross-coordination; fail-open flags now warn; **zero bytes** |
+| **H8** — `--features` position | ✅ **added AFTER the track shipped, 2026-09-19** (owner) — writing it after the module path was **silently ignored**, so a run the user restricted to `mvp` executed under the FULL feature set with rc 0. Now an error; help + README state the position. `interop.md` **§2.4b / v16** |
 
 🎓 **THE TRACK'S LESSON, and it is not about any one bug: the two most valuable findings were holes in
 the GATE SET, not in the code.** The corpus had never run in the config that ships, and the
 interpreter had never been fuzzed at all. Both were invisible to every existing gate *because* the
 gates were the thing that was wrong — a suite that passes cannot report the test nobody wrote.
+
+##### ✅ H8's finding — the one flag that REFUSES modules was silently dropped
+
+🔒 **Owner, 2026-09-19:** *"we need an error thrown when it is in the wrong location."*
+
+`--features` is the only wazmrt flag that precedes the module path. Written **after** it —
+`wazmrt m.wasm --features mvp` — it was **ignored in silence and the run exited 0**, under the full
+feature set. A user hardening an untrusted workload asked for a smaller trusted computing base,
+got no error and no warning, and ran with SIMD, GC, atomics and exception machinery all reachable.
+
+⚠️ **It fell between the two mechanisms that exist to catch exactly this.** `flagRegion` deliberately
+excludes `--features` — a guest's own `--features mvp` must never narrow the language, the same
+reasoning that keeps `--no-verify` out of the trailing region. **H7 warns only for names in those same
+lists.** So the flag had no position in which being wrong was noticed. 🎓 *A rule that names the things
+it guards will not guard the thing it does not name* — and this is the **third** time this project has
+found a configured restriction that silently did not apply (H2's GC ceiling, §2.4's `install --yes`,
+now this). **All three were fail-OPEN, and all three were invisible to a green suite.**
+
+**Fixed** by `misplacedFeaturesFlag`, a walk that mirrors `flagRegion`'s over the same two lists and
+errors when a `--features` spelling appears in the leading host-flag run. ⚠️ **Error, not warn** — the
+token is in a position where the user is unambiguously addressing wazmrt, unlike H7's case where the
+guest may legitimately own the spelling. Nothing after `--` or after the first guest argument is
+examined. **Inversion-tested**: stubbing the detector to `return null` fails the new test; restored,
+the suite is green at **767** (4 skipped — the known exFAT symlink cases on a `D:` cwd).
+
+🎓 **The help was half the fix, and the owner asked for it explicitly.** The position now appears in
+USAGE and in the FEATURE FLAGS entry, and in the README's `--features` section rather than buried in
+its closing paragraph. *A constraint documented only where the reader already knows to look is not
+documented.*
 
 ##### ✅ H2's finding — a configured ceiling that silently did not apply
 
@@ -458,6 +488,8 @@ its `file:line` and why it was left.
 
 ### 🔍 Track B — Bug hunt + code hygiene. `1.0.2` `[ ]`
 
+📌 **This track now carries TWO OWNER-DIRECTED items that did not come from our own hunt: B-b (the Z1–Z3 handoff) and B-c (the T9e/T9i convergence, `interop.md` v17–v20).** Its contract rows are already decided and numbered (`interop.md` §2.4a/v11, §2.5/v12, §2.3/v13), so B-b is build-only. ⚠️ **It belongs here rather than in H because all three are the silent-wrong-output class this track exists to hunt** — and because **not one of them was visible to any gate wazmrt owns.** They were found by running the sibling binary on the same bytes.
+
 **This is `INDEX.md`'s "look for code issues" trigger run as a scheduled task**, not a new process — read
 that trigger first; it is binding and already specifies the method (fan out parallel read-only
 investigators per category, consolidate, report `file:line` + one line + severity, fix the safe ones, and
@@ -515,6 +547,123 @@ data segments (active / passive / active-with-memidx), limits flags (`shared`, `
 **Gate:** the round-trip test exists and is green over the whole corpus; every parser-recorded field is
 either read by the emitter or documented as deliberately not emitted; suite and corpus counts do not
 regress. **Expect it to find something** — the mechanism is 4-for-4 in the sibling project.
+
+#### B-b — The INTEROP handoff: Z1, Z2, Z3 — adopt three CLI contract rows `[ ]`
+
+🔒 **Owner-directed, via `interop.md` §2.5h** (owner: *"lets pass all three issues to the wazmrt
+team"*). The contract rows are **already decided and numbered** — §2.4a is **v11**, §2.5 is **v12**, the
+§2.3 Z1 row is **v13**, the owner's **no-"looks like"** rule is **v14** (§2.4a-i), and the owner's **narrowing** of §2.4a is **v15** — folded in by this project as pen-holder on 2026-09-19. ⚠️ **So this item is
+BUILD-ONLY: the design argument is closed and must not be relitigated here.** Read `interop.md` §2.4a,
+§2.5 and §2.5h-a before starting; §2.5h-a carries the re-measured before/after for all three.
+
+**Why it is in Track B and not a hardening patch:** all three are the **silent-wrong-output class**,
+which item 1 of this track says to hunt hardest, and two of them are item 2's *fall-through* shape
+exactly — unhandled input that proceeds instead of erroring. 🎓 **Every one of them was invisible to
+every gate this project owns**, and that is the finding worth more than the three fixes: they were
+found by a *differential* run against the sibling, because a suite that only asks "did wazmrt agree
+with wazmrt" cannot see them.
+
+| # | what wazmrt does today (measured 2026-09-19, 1.0.1) | what the contract now requires | verify by running |
+| --- | --- | --- | --- |
+| **Z1** | `wazmrt valid.wasm nosuch` → **rc 0**, prints the summary, the name silently dropped | fail with **rc 1** and **name the export**, when the word **can only be** an export name | `wazmrt m.wasm nosuch` → rc 1, message names `nosuch` |
+| **Z2** | `m.wasm --bogus` → **rc 0** (handed to the guest); `s.wast --bogus` → **rc 0** (ignored); `valid.wasm -la` in a no-guest-argv mode → **rc 0** (ignored); `--bogus m.wasm` → rc 1 but *"cannot read '--bogus': FileNotFound"* — ⚠⚠ **a v14 breach, not a wording nit: the parser guessed the flag was a PATH** | **`unknown flag`** naming it, **rc 1**, in every host-flag position — 🆕 **but after the path, only for a `--flag` when the mode HAS guest argv** (v15); guest positions **never examined** | `wazmrt m.wasm --bogus`, `wazmrt --bogus m.wasm`, `wazmrt s.wast --bogus`, `wazmrt valid.wasm -la` → `unknown flag`, rc 1 · `wazmrt m.wasm -- --bogus` **and `wazmrt start.wasm -la`** → **untouched, rc 0** |
+| **Z3** | header `invalid.wasm: valid wasm v1, 5 section(s)` above `validation: FAILED …` (rc **1** — already correct) | **no line may call a module valid unless it validated**; neutral wording until it has | `wazmrt invalid.wasm` → no output line claims validity; rc 1 |
+
+⚠⚠ **Z1 IS THE ONE WITH A DESIGN CALL IN IT, and it is wazmrt's to make.** The bare path runs `_start`
+when the module exports one, so a following word may legitimately be **guest argv** rather than an
+export name. The failure applies only where the word **can only be** an export name — the module has no
+`_start`, or the word sits in the export position of an explicit call form. §2.5h fixes the observable
+requirement (*"never silently succeed at something other than what was asked"*) and leaves the line
+to us. 🔎 **Narrowing measured here:** `wazmrt invalid.wasm bad` **already exits 1**, so this is not a
+general "the export name is ignored" defect — it is specific to a module that **validates**. The name is
+dropped only on the run where everything else succeeded.
+
+⚠️ **Z2 is the one that can be over-fixed.** Erroring on anything flag-shaped is wrong and §2.4 already
+records what it costs: `… prog.wasm install --yes` must reach the guest untouched, or a guest's own
+`--yes` silently disables verification — **a trap this project has already paid for once.** The rule is
+resolved by **position**, not by spelling. **H7 stays and is complementary**: a *known* host flag
+stranded in a guest position still only **warns** (it may be the guest's own); an *unknown* one in a
+**host** position **errors**.
+
+⚠⚠ **v14 RAISES THE BAR ON Z2, AND IT IS THE PART MOST LIKELY TO BE UNDER-BUILT.** The owner's rule
+(§2.4a-i) is **exact match or error** — so the fix is not "add an `unknown flag` message", it is
+**remove every resemblance-based branch from host argument parsing**: no treating a flag-shaped
+argument as a path (which is what wazmrt does today and what makes its rc-1 case *wrong* rather than
+merely ill-worded), no prefix/abbreviation matching, no fuzzy adoption. 🎓 **An error message may name
+a near spelling; it may never ACT on one.** ⚠️ **Do not over-apply it either:** the host/guest boundary
+is **grammar** (`--`, and the first non-flag argument after the path), not resemblance, and it stays —
+`prog.wasm install --yes` must still reach the guest untouched.
+
+⚠️ **One thing B-b must NOT decide on its own: `--dir`'s drive-letter fallback** (`interop.md` §2.2)
+is itself a "looks like" rule, it is **AGREED** in the contract, and it is now §5 **#10** awaiting the
+owner. **Leave it exactly as it is** while adopting v14 everywhere else, and do not let a sweep for
+heuristics quietly take it out — that would be repealing an agreed contract row by implication.
+
+🆕 **v15 NARROWED THE RULE MID-PASS, AND IT CUTS BOTH WAYS — READ THIS BEFORE CODING Z2.** After the
+module path, **in a mode that HAS guest argv** (`_start` present), a **single-dash** token is the
+guest's and runs as written: `start.wasm -la` must keep working, and ✅ **wazmrt already does this
+correctly** — measured. Only an unknown **`--flag`** errors there. ⚠⚠ **The carve-out does NOT reach a
+mode with no guest argv** (summarize, `.wast`, `wat`): there, §2.4a item 4 makes **every** argument a
+host position, both dash forms, and `wazmrt valid.wasm -la` returns **rc 0** today — a breach.
+🎓 **Reading only v15's headline — "after the path, one dash is the guest's" — and applying it
+everywhere would ship a second Z2.** The rule is scoped by *whether there is a guest to hand it to*.
+
+⚠️ **Why the single dash is safe to pass through, and why the owner accepted its cost:** every host
+flag legal after the path is double-dash, `-h`/`-v` are first-argument-only, and the subcommand flags
+live in modes with no guest argv — so a single dash there **cannot** be a host flag. The cost is that a
+mistyped `-dir /tmp` reaches the guest silently. 🔒 **The owner was offered a "looks like a host flag"
+warning for that case and refused it** — do not add one, in any form, however cheap it looks.
+
+🚦 **Do not adopt these in a `cmem`-only pass.** Each needs a test that fails before the fix, and the
+negative cases (`-- --bogus` untouched; `install --yes` reaching the guest) matter more than the
+positive ones — `interop.md` §4 checks 8–10 are written as the differential form of exactly that.
+
+**Gate:** all three verify-by-running commands above behave as the right-hand column says; a test per
+row, each **inversion-proven** (reverting the fix fails it); `install --yes` and `-- --bogus` proven
+still to reach the guest; conformance and suite counts do not regress. Then **`coordinate`** at the end
+of the track (§1d) and report to the owner.
+
+#### B-c — The T9e/T9i CONVERGENCE: Z4, the pin DB path, and the CLI halves `[ ]`
+
+🤝 **From the `coordinate` pass of 2026-09-19** (`interop.md` **v17–v20**). wasmrt landed T9e + T9i and
+its column of §2.1/§2.2 is now green; these are wazmrt's halves. ⚠️ **Every row below was verified by
+RUNNING both binaries**, wasmrt's built from its committed `51254b9cf` into a scratch target dir so
+nothing was written to its tree (§1a).
+
+| # | item | wazmrt today (measured) | required | contract |
+| --- | --- | --- | --- | --- |
+| **B-c1** | ⚠️⚠️ **`--dir .:/` is BROKEN** | `error: --dir '.:/': FileNotFound` — **the example wazmrt's own `--help` prints** | split it correctly, **and** accept `::` | §2.2z, **v20** |
+| **B-c2** | **Z4 — the `name` section** | not emitted; 952 of 959 `.wat` digests differ from wasmrt's | emit it from the text's identifiers | §3.1m, **v17** |
+| **B-c3** | **the pin DB path + warning** | reads `C:\ProgramData\wazmrt\pins` only | `wasmtk` path first, own path as fallback, **and warn when the sibling's DB exists and ours does not** | §3.3, **v18** |
+| **B-c4** | **the subcommand spellings** | `run`/`wasi`/`wast`/`wat` → `cannot read 'run'` | accept all four additively | §2.1, **v20** |
+| **B-c5** | **the hyphenated feature vocabulary** | `bulk-memory-operations` → `unknown proposal` | accept both spellings, as wasmrt does | §2.2, **v20** |
+
+⚠️⚠️ **B-c1 IS A LIVE DEFECT AND SHOULD GO FIRST — it is not a divergence, it is wazmrt failing its own
+documentation.** The split takes the last `:` **only when its index is > 1**, a guard that exists to
+stop `C:\tmp` becoming `C` + `\tmp`. A **one-character relative host path** is indistinguishable from
+a drive letter under that rule, so `.:/` is never split; `./:/` works. 🔒 **This is §5 #10 — the
+"looks like a drive letter" heuristic the owner's v14 rule put in tension — giving a wrong answer on
+ordinary input.** ⚠️ **Do not "fix" it by deleting the guard**: that re-breaks `--dir C:\data:/data`,
+which is the case the guard was bought for. And ⚠️ **adding `::` alone does not fix it either** —
+`.:/` fails for a reason unrelated to which separator is preferred. **The owner's ruling on §5 #10 is
+what decides whether the replacement may be a heuristic at all**, so if it is still open when this item
+starts, ask rather than choose.
+
+🎯 **B-c2 (Z4) is "stop throwing the names away", NOT "match wasmrt's bytes."** The `.wat` text carries
+identifiers; wazmrt's assembler discards them. Emitting a `name` section is the fix the owner's standing
+direction already implies — *do not discard information the source carries* — and the digests converging
+is the **test** that it worked, not the goal. **Gate:** `wazmrt pin f.wat` and `wasmrt pin f.wat` agree
+over the `wasmtk` corpus. 📌 Today only **2 of 959** agree, and those two are the only files with **zero
+`$identifiers`** — so that pair is the control, and it must keep agreeing.
+
+⚠️ **B-c3's warning is the load-bearing half, not the path.** A shared path alone still fails silently
+during a part-migrated deployment: the binary swaps, the DB sits at the sibling's old path, nothing is
+found, and `armed = false` is an ordinary state with no error attached. **Adopting only the path is the
+dangerous partial fix.** A test that the warning FIRES is part of the item, not a nicety.
+
+**Gate:** every "required" cell above verified by running both binaries on the same inputs; a test per
+row, each inversion-proven; the `wasmtk` `.wat` corpus agreeing on digests; suite and conformance counts
+unchanged. Then `coordinate` at the end of the track (§1d) and report.
 
 ---
 
