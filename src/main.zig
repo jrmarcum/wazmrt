@@ -387,7 +387,53 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
 /// for an `all` / `mvp` / `none` SEED, which replaces the whole set rather than editing it.
 const FeatureItem = struct { f: ?wazmrt.features.Feature, on: bool };
 
-/// Classify one already-trimmed item, or report why it is not one.
+/// Resolve one proposal name, in **either vocabulary**.
+///
+/// 🤝 `interop.md` §2.2 (v20): wasmrt accepts both spellings and wazmrt accepted only its own, so
+/// `--features bulk-memory-operations` was an `unknown proposal` error here while the identical
+/// command line worked on the sibling. **A shared CLI whose flag VALUES are not shared is not
+/// swappable**, so this is a contract row, not a nicety.
+///
+/// Three passes, most specific first:
+///   1. this enum's own name (`bulk_memory`) — unchanged, and still what wazmrt prints;
+///   2. the same name with **hyphens**;
+///   3. three longer proposal-repository spellings that carry no shorter form here.
+///
+/// 🔎 **Pass 2 covers wasm-tools' ENTIRE vocabulary, and that was measured, not assumed.**
+/// `wasm-tools validate --features <unknown>` prints its valid list, and every name in it that
+/// wazmrt models is this enum's name with `_` written `-`: `bulk-memory`, `sign-extension`,
+/// `saturating-float-to-int`, `exceptions`, `reference-types`, `tail-call`, `custom-page-sizes`,
+/// `custom-descriptors`, `wide-arithmetic`, `function-references`, `multi-memory`, `multi-value`,
+/// `extended-const`, `relaxed-simd`, `memory64`, `gc`, `simd`, `threads`.
+/// ⚠️ **A first draft of this function hard-coded four "spec names" — `bulk-memory-operations`,
+/// `sign-extension-ops`, `nontrapping-float-to-int-conversions`, `exception-handling` — as though
+/// wasm-tools used them. It does not.** Three of the four turned out to be real anyway, as aliases
+/// *wasmrt* carries, which is why they are here; but the justification was invented and one branch
+/// would have been dead. 🎓 *Being right for a reason you did not check is not being right.*
+///
+/// Pass 3 is therefore scoped to what was **verified by running the sibling**: each name below was
+/// fed to `wasmrt --features` and accepted. `mutable-global` and `tail-calls` were rejected by it
+/// and are deliberately absent.
+///
+/// ⚠️ **An unrecognised name stays an ERROR** (see the caller). Widening the vocabulary must not
+/// widen it to "anything we failed to parse": `--features mvp,sim` silently meaning `mvp` is the
+/// security-control-that-drops-what-it-was-told failure this file already refuses.
+fn featureFromSpelling(name: []const u8) ?wazmrt.features.Feature {
+    if (std.meta.stringToEnum(wazmrt.features.Feature, name)) |f| return f;
+    var buf: [64]u8 = undefined;
+    if (name.len > buf.len) return null;
+    for (name, 0..) |c, i| buf[i] = if (c == '-') '_' else c;
+    const n = buf[0..name.len];
+    if (std.meta.stringToEnum(wazmrt.features.Feature, n)) |f| return f;
+    // Longer proposal-repository spellings, each verified accepted by wasmrt (2026-09-19).
+    if (std.mem.eql(u8, n, "bulk_memory_operations")) return .bulk_memory;
+    if (std.mem.eql(u8, n, "sign_extension_ops")) return .sign_extension;
+    if (std.mem.eql(u8, n, "nontrapping_float_to_int_conversions")) return .saturating_float_to_int;
+    if (std.mem.eql(u8, n, "exception_handling")) return .exceptions;
+    return null;
+}
+
+/// Classify one already-trimmed item, or report why it is not one./// Classify one already-trimmed item, or report why it is not one.
 ///
 /// ⚠️ **An unrecognised name is an ERROR, never a skip.** Ignoring it would leave the user
 /// believing they had restricted something: `--features mvp,sim` would silently be `mvp`, and
@@ -410,7 +456,7 @@ fn parseFeatureItem(item: []const u8, first: bool, out: *Io.Writer) !FeatureItem
         try out.print("error: --features: '{s}' names no proposal\n", .{item});
         return error.BadFeatures;
     }
-    const f = std.meta.stringToEnum(wazmrt.features.Feature, name) orelse {
+    const f = featureFromSpelling(name) orelse {
         try out.print("error: --features: unknown proposal '{s}'\n", .{name});
         try out.print("  known: all, mvp", .{});
         for (0..wazmrt.features.count) |i| {
@@ -555,6 +601,8 @@ fn printHelp(out: *Io.Writer, prog: []const u8) !void {
         \\
         \\WASI FLAGS (before `--`)
         \\  --dir <host>[:<guest>]      grant a read-write preopen (the guest's only files)
+        \\                              `::` also separates and is never ambiguous: `--dir C:\data::/d`
+        \\                              a lone `:` splits too, except after a drive letter (`C:\tmp`)
         \\  --ro-dir <host>[:<guest>]   grant a read-only preopen (no write/create/delete)
         \\  --env KEY=VALUE             set one environment variable for the guest
         \\  --max-memory <size>         linear-memory ceiling for a WASI command (default 1G; e.g. 512M, 2G)
@@ -569,7 +617,10 @@ fn printHelp(out: *Io.Writer, prog: []const u8) !void {
         \\                              ignored under a root-owned `# mode: enforce`
         \\  --verify off|warn|enforce   raise verification strictness (never lowers it)
         \\  --no-verify, --yes          run an unverified module (refused under enforce)
-        \\      Default pin DB: {s}
+        \\      Pin DB lookup order: {s}
+        \\                           then {s}   (wazmrt's own path, kept for existing installs)
+        \\      If neither exists but the sibling runtime's DB does, wazmrt says so rather than
+        \\      running unverified in silence.
         \\
         \\SUBCOMMANDS
         \\  pin <file|dir> [--db <path>]
@@ -608,7 +659,7 @@ fn printHelp(out: *Io.Writer, prog: []const u8) !void {
         \\  -h, --help                  show this help and exit
         \\  -v, --version               show version information and exit
         \\
-    , .{ wazmrt.version, prog, prog, prog, prog, prog, prog, prog, prog, prog, defaultPinsPath(), prog });
+    , .{ wazmrt.version, prog, prog, prog, prog, prog, prog, prog, prog, prog, sharedPinsPath(), defaultPinsPath(), prog });
 }
 
 // ===== Phase 5 — pin verification (see cmem/security-model.md, roadmap.md §5) =====
@@ -829,11 +880,90 @@ fn signSubcommand(arena: std.mem.Allocator, io: Io, out: *Io.Writer, rest: []con
     try out.print("signed {s} -> {s}\n  public key: {s}\n", .{ in_path, out_path, &pub_hex });
 }
 
+const windows = @import("builtin").os.tag == .windows;
+
+/// 🔒 **The SHARED pin DB, named for the deployment both runtimes ship inside** (owner, 2026-09-19;
+/// `interop.md` §3.3, contract v18). Looked at first by wazmrt and by wasmrt alike, so an operator
+/// who swaps one binary for the other keeps the same policy.
+fn sharedPinsPath() []const u8 {
+    return if (windows) "C:\\ProgramData\\wasmtk\\pins" else "/etc/wasmtk/pins";
+}
+
+/// wazmrt's own historical path, kept as a FALLBACK so existing installs keep working.
 fn defaultPinsPath() []const u8 {
-    return if (@import("builtin").os.tag == .windows)
-        "C:\\ProgramData\\wazmrt\\pins"
+    return if (windows) "C:\\ProgramData\\wazmrt\\pins" else "/etc/wazmrt/pins";
+}
+
+/// The SIBLING's path. Read for one purpose only: to tell "this host has no pin policy" apart from
+/// "this host has one and I am not the runtime that was installed with it".
+fn siblingPinsPath() []const u8 {
+    return if (windows) "C:\\ProgramData\\wasmrt\\pins" else "/etc/wasmrt/pins";
+}
+
+/// Where the default pin DB was found, and what it said.
+const PinDbLookup = struct { path: []const u8, text: ?[]const u8 };
+
+/// Resolve the default pin DB: shared path, then our own, **and say something loud when neither
+/// exists but the sibling's does.**
+///
+/// ⚠⚠ **The WARNING is the load-bearing half of this row, not the shared path** (`interop.md` §3.3).
+/// A shared path alone still fails silently the moment a deployment is part-migrated: the binary is
+/// swapped, the DB is still at the sibling's path, nothing is found, and `armed = false` is a
+/// *perfectly ordinary* state with no error attached to it. 🎓 **The failure mode was never "no DB" —
+/// it is "no DB, and no reason to think that is wrong."** Detecting the sibling's DB is the one cheap
+/// signal that distinguishes the two, and without it swapping runtimes is a **silent security
+/// downgrade**, which is the worst defect class either project tracks.
+///
+/// ⚠️ It warns; it does not refuse. Refusing would make installing either runtime on a host that has
+/// never had a pin policy an error, and "no policy" is a legitimate configuration.
+fn resolvePinDb(arena: std.mem.Allocator, io: Io, out: *Io.Writer) !?PinDbLookup {
+    const read = struct {
+        fn f(a: std.mem.Allocator, i: Io, o: *Io.Writer, p: []const u8) !?[]const u8 {
+            return Io.Dir.cwd().readFileAlloc(i, p, a, .limited(1 << 20)) catch |e| switch (e) {
+                error.FileNotFound => null,
+                else => {
+                    try o.print("error: cannot read pin DB '{s}': {s}\n", .{ p, @errorName(e) });
+                    return error.Reported;
+                },
+            };
+        }
+    }.f;
+
+    const shared_text = try read(arena, io, out, sharedPinsPath());
+    const own_text = if (shared_text == null) try read(arena, io, out, defaultPinsPath()) else null;
+    // The sibling's path is consulted ONLY when neither of ours exists — never to read a policy
+    // from, only to answer "is this host actually unmanaged?".
+    const sibling_text = if (shared_text == null and own_text == null)
+        try read(arena, io, out, siblingPinsPath())
     else
-        "/etc/wazmrt/pins";
+        null;
+
+    const choice = choosePinDb(shared_text != null, own_text != null, sibling_text != null);
+    if (choice.warn_sibling) {
+        try out.print(
+            "warning: no pin DB at '{s}' or '{s}', but one EXISTS at '{s}'\n" ++
+                "  this host has a pin policy installed for the sibling runtime and wazmrt is NOT reading it\n" ++
+                "  verification is effectively OFF for this run; move or copy it to '{s}' to apply it\n",
+            .{ sharedPinsPath(), defaultPinsPath(), siblingPinsPath(), sharedPinsPath() },
+        );
+    }
+    return switch (choice.which) {
+        .shared => .{ .path = sharedPinsPath(), .text = shared_text },
+        .own => .{ .path = defaultPinsPath(), .text = own_text },
+        .none => .{ .path = sharedPinsPath(), .text = null },
+    };
+}
+
+/// Which DB wins, and whether to shout — **a pure function, so it can be tested exhaustively**
+/// without a root-owned file on the machine running the tests. (wasmrt reached the same shape for
+/// the same reason; `interop.md` §3.3.)
+const PinDbChoice = struct { which: enum { shared, own, none }, warn_sibling: bool };
+
+fn choosePinDb(shared_exists: bool, own_exists: bool, sibling_exists: bool) PinDbChoice {
+    if (shared_exists) return .{ .which = .shared, .warn_sibling = false };
+    if (own_exists) return .{ .which = .own, .warn_sibling = false };
+    // ⚠️ Unarmed is a legitimate state; unarmed WHILE THE SIBLING'S POLICY SITS THERE is not.
+    return .{ .which = .none, .warn_sibling = sibling_exists };
 }
 
 /// The wazmrt-flag region: the LEADING run of recognized wazmrt flags after the
@@ -980,6 +1110,38 @@ fn reportUnknownFlag(out: *Io.Writer, bad: []const u8) !void {
         .{bad},
     );
 }
+/// Split a `--dir` / `--ro-dir` spec into a host path and the guest path it is mounted at.
+///
+/// ⚠⚠ **The rule this replaces was BROKEN, and it broke the example wazmrt's own `--help` prints.**
+/// It split on the last `:` **only when its index was > 1** — a guard meant to stop `C:\tmp` becoming
+/// `C` + `\tmp`. But a **one-character relative host path** puts its colon at index 1 too, so `.:/`
+/// was never split: the whole string became the host path and the run died with
+/// `error: --dir '.:/': FileNotFound`. `./:/` worked, which is how long it hid. Measured 2026-09-19
+/// during a cross-project pass; `interop.md` §2.2 had claimed since v1 that `--dir .:/` was a working
+/// wazmrt invocation, and that claim had been **written from reading and never run**.
+///
+/// 🔒 **Owner decision, 2026-09-19 (`interop.md` §5 #10):** keep accepting a single `:`, but narrow
+/// the drive-letter case to what a drive letter actually is — **exactly one ASCII letter, at the
+/// start**. `.` is not a letter, so `.:/` splits; `C:\tmp` still does not.
+///
+/// The order matters and is the agreed resolution in §2.2 — **both runtimes accept both spellings**:
+///
+///   1. **`::` wins wherever it appears.** It is unambiguous and it is wasmrt's preferred spelling,
+///      so a caller who wants no guessing at all has a way to say so.
+///   2. Otherwise the **last** single `:` splits — so `C:\data:/data` mounts `C:\data` at `/data`.
+///   3. Unless that colon is a **drive letter** (`C:\tmp`), in which case there is no guest path and
+///      the spec is mounted at itself.
+///
+/// ⚠️ **One genuinely ambiguous case survives and is documented rather than guessed away:** `x:/`
+/// means drive `X:` under rule 3, never the relative directory `x` mounted at `/`. Write `./x:/` or
+/// `x::/` for the latter. *A rule that resolves every case is a rule that is wrong about one of them.*
+fn splitPreopen(spec: []const u8) struct { []const u8, []const u8 } {
+    if (std.mem.lastIndexOf(u8, spec, "::")) |i| return .{ spec[0..i], spec[i + 2 ..] };
+    const i = std.mem.lastIndexOfScalar(u8, spec, ':') orelse return .{ spec, spec };
+    if (i == 1 and std.ascii.isAlphabetic(spec[0])) return .{ spec, spec }; // a drive letter
+    return .{ spec[0..i], spec[i + 1 ..] };
+}
+
 /// Parse a `--max-memory` size: a decimal count of bytes with an optional
 /// `K`/`M`/`G` suffix (`512M`, `2G`, `1073741824`). Returns null if unparseable
 /// or if the multiplier overflows, so the caller can fail loudly rather than
@@ -1115,14 +1277,9 @@ fn verifyGate(
     // unmanaged-machine overrides — take effect. Under a root enforce, both the
     // pin set and the policy come from root, so redirecting via `--pins` or
     // lowering via `--verify` is ignored.
-    const default_path = defaultPinsPath();
-    const default_text: ?[]const u8 = Io.Dir.cwd().readFileAlloc(io, default_path, arena, .limited(1 << 20)) catch |e| switch (e) {
-        error.FileNotFound => null,
-        else => {
-            try out.print("error: cannot read pin DB '{s}': {s}\n", .{ default_path, @errorName(e) });
-            return false;
-        },
-    };
+    const looked_up = resolvePinDb(arena, io, out) catch return false;
+    const default_path = looked_up.?.path;
+    const default_text: ?[]const u8 = looked_up.?.text;
     const root_enforce = if (default_text) |t| (wazmrt.pin.modeFromDb(t) orelse .off) == .enforce else false;
 
     const pins_flag = if (root_enforce) null else flagValue(rest, "--pins");
@@ -1379,11 +1536,7 @@ fn runWasi(
         const ro = std.mem.eql(u8, flag, "--ro-dir");
         if ((std.mem.eql(u8, flag, "--dir") or ro) and rest.len >= 2) {
             const spec = rest[1];
-            // Split on the LAST ':' so a Windows host path (`C:\tmp`) still parses.
-            const host, const guest = if (std.mem.lastIndexOfScalar(u8, spec, ':')) |i|
-                if (i > 1) .{ spec[0..i], spec[i + 1 ..] } else .{ spec, spec }
-            else
-                .{ spec, spec };
+            const host, const guest = splitPreopen(spec);
             // 🔒 Read-write does NOT include planting symlinks unless `--allow-symlink` asked for it.
             const rmask = if (ro)
                 wazmrt.wasi.readOnlyRights
@@ -1719,6 +1872,100 @@ fn misplacedWarnings(rest: []const []const u8) ![]const u8 {
     var w: Io.Writer = .fixed(&S.buf);
     try warnMisplacedFlags(&w, rest);
     return w.buffered();
+}
+
+test "the pin DB lookup prefers the SHARED path and never disarms in silence" {
+    // 🔒 `interop.md` §3.3, contract v18 (owner, 2026-09-19). All eight combinations, because the
+    // one that matters is a single row and it is the one nobody would think to write by hand.
+    const S = struct {
+        fn eq(sh: bool, own: bool, sib: bool, which: @TypeOf(@as(PinDbChoice, undefined).which), warn: bool) !void {
+            const c = choosePinDb(sh, own, sib);
+            try std.testing.expectEqual(which, c.which);
+            try std.testing.expectEqual(warn, c.warn_sibling);
+        }
+    };
+    // The shared wasmtk path wins whenever it exists — that is what makes a binary swap keep its
+    // policy — and the sibling's presence is then irrelevant.
+    try S.eq(true, true, true, .shared, false);
+    try S.eq(true, true, false, .shared, false);
+    try S.eq(true, false, true, .shared, false);
+    try S.eq(true, false, false, .shared, false);
+    // Our own path is the fallback, so existing installs keep working.
+    try S.eq(false, true, true, .own, false);
+    try S.eq(false, true, false, .own, false);
+    // ⚠⚠ **THE ROW THIS WHOLE DECISION EXISTS FOR.** Neither of ours, but the sibling's policy is
+    // sitting right there: a part-migrated host. Without the warning this is indistinguishable from
+    // an unmanaged machine — `armed = false`, no error, everything runs. A SILENT security downgrade.
+    try S.eq(false, false, true, .none, true);
+    // Genuinely no pin policy anywhere: unarmed, and silent, because that is a real configuration.
+    try S.eq(false, false, false, .none, false);
+}
+
+test "--dir splits host from guest, and a DRIVE LETTER is not a separator" {
+    // ⚠⚠ The rule this replaced split on the last `:` only when its index was > 1, to protect
+    // `C:\tmp`. A ONE-CHARACTER relative host path puts its colon at index 1 too, so `.:/` was
+    // never split — and `--dir .:/` is the example wazmrt's own `--help` prints. It failed with
+    // `FileNotFound` on the whole spec. `./:/` worked, which is how long it hid.
+    // 🔒 Owner, 2026-09-19 (`interop.md` §5 #10): a drive letter is exactly one ASCII letter at
+    // the start — nothing else.
+    const S = struct {
+        fn eq(spec: []const u8, host: []const u8, guest: []const u8) !void {
+            const h, const g = splitPreopen(spec);
+            try std.testing.expectEqualStrings(host, h);
+            try std.testing.expectEqualStrings(guest, g);
+        }
+    };
+    // The regression, and the form the help documents.
+    try S.eq(".:/", ".", "/");
+    try S.eq("./:/", "./", "/");
+    try S.eq("sub:/s", "sub", "/s");
+    // `::` wins wherever it appears — wasmrt's spelling, and the way to ask for no guessing at all.
+    try S.eq(".::/", ".", "/");
+    try S.eq("C:\\data::/d", "C:\\data", "/d");
+    // ⚠️ A drive letter is NOT a separator: no guest path, the spec mounts at itself.
+    try S.eq("C:\\tmp", "C:\\tmp", "C:\\tmp");
+    // ...but a drive-qualified path with a real guest path still splits on the LAST colon.
+    try S.eq("C:\\data:/data", "C:\\data", "/data");
+    // No colon at all: mounted at itself.
+    try S.eq(".", ".", ".");
+}
+
+test "--features accepts wasm-tools' vocabulary as well as wazmrt's own" {
+    // 🤝 `interop.md` §2.2 (v20): the same `--features` line must work on both runtimes.
+    // `bulk-memory-operations` was an `unknown proposal` here while it worked on wasmrt.
+    //
+    // 🔎 Every hyphenated name below appears in `wasm-tools validate --features <unknown>`'s
+    // "Valid features" list — read from the tool, not recalled.
+    const S = struct {
+        fn is(comptime want: wazmrt.features.Feature, spelling: []const u8) !void {
+            try std.testing.expectEqual(want, featureFromSpelling(spelling).?);
+        }
+    };
+    try S.is(.bulk_memory, "bulk_memory"); // wazmrt's own
+    try S.is(.bulk_memory, "bulk-memory"); // wasm-tools'
+    try S.is(.sign_extension, "sign-extension");
+    try S.is(.saturating_float_to_int, "saturating-float-to-int");
+    try S.is(.exceptions, "exceptions");
+    try S.is(.reference_types, "reference-types");
+    try S.is(.tail_call, "tail-call");
+    try S.is(.custom_page_sizes, "custom-page-sizes");
+    try S.is(.custom_descriptors, "custom-descriptors");
+    try S.is(.wide_arithmetic, "wide-arithmetic");
+    try S.is(.function_references, "function-references");
+
+    // The longer proposal-repository spellings, each verified accepted by wasmrt.
+    try S.is(.bulk_memory, "bulk-memory-operations");
+    try S.is(.sign_extension, "sign-extension-ops");
+    try S.is(.saturating_float_to_int, "nontrapping-float-to-int-conversions");
+    try S.is(.exceptions, "exception-handling");
+
+    // ⚠️ Widening the vocabulary must NOT widen it to "anything": an unknown name stays an error,
+    // or a restriction silently drops what it was told to exclude. Both of these are rejected by
+    // wasmrt too, which is why they are the ones pinned here.
+    try std.testing.expect(featureFromSpelling("mutable-global") == null);
+    try std.testing.expect(featureFromSpelling("tail-calls") == null);
+    try std.testing.expect(featureFromSpelling("sim") == null);
+    try std.testing.expect(featureFromSpelling("") == null);
 }
 
 test "a wazmrt flag after --allow-symlink still APPLIES (the list drift that disarmed --verify)" {
