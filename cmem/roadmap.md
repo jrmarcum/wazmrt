@@ -486,7 +486,11 @@ its `file:line` and why it was left.
 
 ---
 
-### 🔍 Track B — Bug hunt + code hygiene. `1.0.2` `[ ]`
+### ✅ Track B — Bug hunt + code hygiene. **COMPLETE 2026-09-20** `1.0.2` `[x]`
+
+**Five named items (B-a, B-b, B-c 5/5, B-d, B-e) AND the general hunt (categories 3, 4, 5).**
+⚠️ **NOT VERSIONED** — `releasing.md`'s checklist has not been run, and whether `1.0.2` ships is the
+owner's call, not a consequence of the last box being ticked.
 
 📌 **This track now carries TWO OWNER-DIRECTED items that did not come from our own hunt: B-b (the Z1–Z3 handoff) and B-c (the T9e/T9i convergence, `interop.md` v17–v20).** Its contract rows are already decided and numbered (`interop.md` §2.4a/v11, §2.5/v12, §2.3/v13), so B-b is build-only. ⚠️ **It belongs here rather than in H because all three are the silent-wrong-output class this track exists to hunt** — and because **not one of them was visible to any gate wazmrt owns.** They were found by running the sibling binary on the same bytes.
 
