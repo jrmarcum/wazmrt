@@ -74,7 +74,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    b.installArtifact(exe);
+    const install_exe = b.addInstallArtifact(exe, .{});
+    b.getInstallStep().dependOn(&install_exe.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -99,7 +100,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     cabi.installHeader(b.path("include/wazmrt.h"), "wazmrt.h");
-    b.installArtifact(cabi);
+    const install_cabi = b.addInstallArtifact(cabi, .{});
+    b.getInstallStep().dependOn(&install_cabi.step);
 
     // ---- C ABI *shared* library (`zig build dll`) --------------------------
     // The same implementation as a dynamic library, so host languages can load it over FFI
@@ -115,7 +117,21 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    const install_dll = b.addInstallArtifact(dll, .{});
+    // ⚠️⚠️ **The DLL installs into `zig-out/dll/`, NOT alongside the static library, and that is a
+    // correctness fix rather than tidiness.** A Windows shared library installs two files: the
+    // `.dll` and its IMPORT library — which is also called `wazmrt.lib`. With both going to
+    // `zig-out/lib/`, `zig build dll` silently overwrote the 1 MB static library with a 21 KB
+    // import stub. `tools/size-ceilings.txt` carried a warning about it *("measure the static lib
+    // from a plain `zig build`, never after `dll`")*, which is the shape of a hazard that has been
+    // documented instead of removed.
+    //
+    // 🔒 **It also made the size gate structurally unable to measure all three artifacts in one
+    // run**, which is why the DLL went 34 days and +9,728 bytes unmeasured (Track B-e). Separate
+    // directories let the three coexist, so the gate can build and grade every one of them.
+    const install_dll = b.addInstallArtifact(dll, .{
+        .dest_dir = .{ .override = .{ .custom = "dll" } },
+        .implib_dir = .{ .override = .{ .custom = "dll" } },
+    });
     const dll_step = b.step("dll", "Build the C ABI as a shared library (for FFI)");
     dll_step.dependOn(&install_dll.step);
 
@@ -129,7 +145,7 @@ pub fn build(b: *std.Build) void {
     // `zig build --build-file` run from another drive, which is how the sandbox tests have to be
     // run on this machine.
     ffi.addFileArg(b.path("examples/deno_ffi_capi.mjs"));
-    ffi.setEnvironmentVariable("WAZMRT_CAPI_DLL", b.getInstallPath(.bin, "wazmrt.dll"));
+    ffi.setEnvironmentVariable("WAZMRT_CAPI_DLL", b.getInstallPath(.{ .custom = "dll" }, "wazmrt.dll"));
     ffi.step.dependOn(&install_dll.step);
     const ffi_step = b.step("ffi-demo", "Build the DLL + run the Deno FFI demo (needs deno)");
     ffi_step.dependOn(&ffi.step);
@@ -529,11 +545,34 @@ pub fn build(b: *std.Build) void {
         run_size.addArg(b.fmt("{s},{s}", .{ if (want_wat) "wat" else "nowat", if (want_wasi) "wasi" else "nowasi" }));
         run_size.addArg(b.getInstallPath(.bin, ""));
         run_size.addArg(b.getInstallPath(.lib, ""));
+        run_size.addArg(b.getInstallPath(.{ .custom = "dll" }, ""));
         run_size.has_side_effects = true; // measure what is on disk NOW, never a cached verdict
-        run_size.step.dependOn(b.getInstallStep());
+        run_size.step.dependOn(&install_exe.step);
+        run_size.step.dependOn(&install_cabi.step);
+        // 🔒 **The gate BUILDS the shared library it grades.** It used to depend on the install step
+        // only, and `dll` is a separate step — so the DLL it measured was whatever an earlier
+        // invocation had left in `zig-out`. On 2026-09-20 that file was **34 days old**, and the real
+        // artifact had grown **+9,728 bytes** in the meantime with four consecutive commits recording
+        // "dll +0" from it. ⚠️ *A number that matches the ceiling to the byte is evidence of a stale
+        // file, not of a change that cost nothing.* (Track B-e.)
+        run_size.step.dependOn(&install_dll.step);
 
         const size_step = b.step("size", "Check shipped artifact sizes (needs -Doptimize=ReleaseSmall)");
         size_step.dependOn(&run_size.step);
+
+        // 🔒 **THE TRIGGER, and it is the whole point of Track B-e: a gate only gates the commits
+        // that RUN it.** This gate has worked correctly since Track 2c and still let +9,728 bytes of
+        // DLL and 4,608 bytes of exe through, because `zig build size` is a step somebody has to
+        // remember. It cannot simply join `zig build` — that is Debug, and the ceilings describe
+        // ReleaseSmall, which the tool correctly refuses to grade.
+        //
+        // So it attaches to the install step **exactly when the optimize mode is the one the
+        // ceilings describe**: build the configuration that SHIPS and you have checked it, with no
+        // extra command and nothing to remember. Debug and the other modes are untouched, and so is
+        // every gated `-Dwat=false` build, which the tool refuses for its own reasons.
+        if (optimize == .ReleaseSmall and want_wat and want_wasi) {
+            b.getInstallStep().dependOn(&run_size.step);
+        }
     }
 
     // ---- Spec-conformance runner (`zig build conformance -Dtestsuite=<dir>`) -

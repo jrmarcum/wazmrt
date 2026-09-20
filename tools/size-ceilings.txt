@@ -14,8 +14,11 @@
 # Baseline measured 2026-08-11, Zig 0.16.0, x86_64-windows, ReleaseSmall:
 #   wazmrt.exe  911,360    wazmrt.lib  279,444    wazmrt.dll  227,328
 #
-# NOTE: `wazmrt.lib` is the STATIC library only. `zig build dll` overwrites it with the DLL's much
-# smaller import library, so measure the static lib from a plain `zig build`, never after `dll`.
+# NOTE: `wazmrt.lib` is the STATIC library only. ✅ **FIXED 2026-09-20 (Track B-e)** — the DLL and its
+# import library now install to `zig-out/dll/`, so `zig build dll` no longer overwrites the 1 MB static
+# library with a 21 KB import stub. The warning this replaces ("measure the static lib from a plain
+# `zig build`, never after `dll`") was a hazard documented instead of removed, and it was also why the
+# gate could not grade all three artifacts in one run. Build order no longer matters.
 
 # RAISED 2026-08-11 by the ABI-2 flip (`zig build` now installs src/capi.zig, not
 # src/wasm_c_api.zig). What bought the bytes, and it is FEATURES, not waste:
@@ -982,6 +985,39 @@
 # Unit tests 781 -> 789. Spec-corpus byte agreement with the sibling assembler: 1,807 -> 2,121
 # of 2,141. Real-world corpus unchanged at 954/954 and 513/513.
 
+# ---------------------------------------------------------------------------------------
+# 2026-09-20 — Track B-e. 🚨 **THE DLL CEILING HAS BEEN WRONG SINCE 2026-08-19, AND THE GATE
+# COULD NOT HAVE TOLD YOU.** 900,608 -> 910,336. The exe and lib are unchanged.
+#
+# ⚠️ **Read this before trusting any "dll +0" line above.** `zig build dll` was a SEPARATE step,
+# and the size gate depended only on the install step — so the DLL it graded was whatever an
+# earlier invocation had left in `zig-out`. On 2026-09-20 that file was dated **2026-08-17**.
+# When it was missing entirely the gate printed `(not built — skipped)` and then **OK**, so the
+# shared library could not be gated at all: stale, or silently unmeasured, or both.
+#
+# 📐 **ATTRIBUTED BEFORE PAYING FOR IT, by building each parent commit in a worktree** rather
+# than assuming the growth was the newest change's:
+#
+#   6cc89ce5  Track H, the commit that WROTE `900608`   ->  906,240   (already 5,632 over)
+#   41a96aa3  before Track B's 2026-09-20 work          ->  906,240
+#   a495424f  B-c2 (the `name` section)                 ->  906,240   (+0 — the claim was right)
+#   973dc0de  B-d (inline typeuse)                      ->  906,240   (+0)
+#   8e04263b  B-c4 (subcommand spellings)               ->  906,240   (+0)
+#   d47ecd18  B-a (the emitter audit)                   ->  910,336   (**+4,096**)
+#
+# 🎓 **So three of the four "dll +0" claims this file makes today were TRUE — and every one of
+# them was checked against a number that was already wrong.** Being right for a reason you did
+# not check is being lucky. The fourth, B-a's, was wrong: it cost the DLL one 4 KiB page, which
+# is what a change to `wat.zig` + `opcode.zig` + `validate.zig` costs an artifact that contains
+# all three. The 5,632 that predates today belongs to Track H's own commits and was never
+# attributed, because nothing ever measured it.
+#
+# ✅ **What changed so this cannot recur:** the `size` step now DEPENDS ON BUILDING the DLL, the
+# DLL installs to `zig-out/dll/` so its import library stops overwriting the 1 MB static lib,
+# a ceiling with no artifact is now a hard FAILURE instead of a skip, and — the actual point of
+# B-e — **a `-Doptimize=ReleaseSmall` build runs the gate by itself.** A gate only gates the
+# commits that run it.
+
 wazmrt.exe  1009664
 wazmrt.lib  1059240
-wazmrt.dll  900608
+wazmrt.dll  910336

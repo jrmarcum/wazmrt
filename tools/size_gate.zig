@@ -10,10 +10,18 @@
 //! same commit, which puts every increase in the log with a reason.
 //!
 //! Usage: `size_gate <ceilings-file> <optimize-mode> <features> <dir> [dir...]`
-//! Artifacts are looked up by base name in the given directories. A name listed in the ceilings file
-//! but absent from all of them is **skipped, not failed** — `zig build dll` is a separate step, so the
-//! shared library is legitimately missing from a plain `zig build`. But if NOTHING is found the gate
-//! fails: a gate that checks nothing is not a gate.
+//! Artifacts are looked up by base name in the given directories. 🔒 **A name listed in the ceilings
+//! file but absent from all of them is a FAILURE.**
+//!
+//! ⚠️⚠️ **It used to be a SKIP, and that accommodation cost 34 days and 9,728 bytes** (Track B-e,
+//! 2026-09-20). The reason given was sound at the time — `zig build dll` was a separate step, so the
+//! shared library was legitimately missing from a plain `zig build` — but it meant the DLL was
+//! measured only when somebody had happened to build it, and otherwise skipped while the gate still
+//! printed OK. The file on disk turned out to be **from 2026-08-17**, and four consecutive commits
+//! recorded "dll +0" from it. 🎓 *A gate that reports OK for the thing it did not look at is worse
+//! than no gate, because it is also a claim.*
+//!
+//! The `size` step now BUILDS all three artifacts, so absence can only mean a real problem.
 
 const std = @import("std");
 const Io = std.Io;
@@ -68,7 +76,7 @@ pub fn main(init: std.process.Init) !void {
 
     var over: usize = 0;
     var checked: usize = 0;
-    var skipped: usize = 0;
+    var missing: usize = 0;
 
     try out.print("\n  Size gate ({s})\n", .{ceilings_path});
     try out.print("  {s:<14} {s:>10} {s:>10} {s:>10}\n", .{ "artifact", "actual", "ceiling", "delta" });
@@ -90,8 +98,8 @@ pub fn main(init: std.process.Init) !void {
         };
 
         const actual = sizeOf(io, arena, dirs, name) orelse {
-            skipped += 1;
-            try out.print("  {s:<14} {s:>10}   (not built — skipped)\n", .{ name, "-" });
+            missing += 1;
+            try out.print("  {s:<14} {s:>10}   ⚠️ NOT BUILT\n", .{ name, "-" });
             continue;
         };
         checked += 1;
@@ -113,6 +121,15 @@ pub fn main(init: std.process.Init) !void {
         try out.print("  Build first: `zig build -Doptimize=ReleaseSmall` (and `dll` for the shared library).\n\n", .{});
         return error.NothingMeasured;
     }
+    // An artifact the ceilings name and the build did not produce is a hole in the
+    // gate's coverage, and coverage is the only thing a gate has. Reported before
+    // the over-ceiling case so a run that is BOTH says so.
+    if (missing > 0) {
+        try out.print("\n  {d} artifact(s) named in the ceilings were NOT BUILT, so nothing graded them.\n", .{missing});
+        try out.print("  The size step builds all three; if one is missing the build did not do what it says.\n", .{});
+        try out.print("  (This was a silent skip until 2026-09-20, and the DLL drifted +9,728 bytes behind it.)\n\n", .{});
+        return error.ArtifactNotBuilt;
+    }
     if (over > 0) {
         try out.print("\n  {d} artifact(s) OVER ceiling.\n", .{over});
         try out.print("  If the growth is intended, raise the number in {s} IN THE SAME COMMIT and say\n", .{ceilings_path});
@@ -120,7 +137,7 @@ pub fn main(init: std.process.Init) !void {
         return error.SizeOverCeiling;
     }
 
-    try out.print("\n  OK — {d} checked, {d} skipped, none over ceiling.\n\n", .{ checked, skipped });
+    try out.print("\n  OK — {d} checked, none missing, none over ceiling.\n\n", .{checked});
 }
 
 /// Size of `name` in the first of `dirs` that has it, or null if none does.

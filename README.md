@@ -104,9 +104,11 @@ zig build conformance -Dtestsuite=<dir> -Dbaseline=tools/conformance-baseline.tx
                                    #   -Dbaseline=<file>        gate on regressions, not zero failures
                                    #   -Dwrite-baseline=true    generate that baseline from today's run
                                    #   -Dfailures=N             list up to N failures per file (default 1)
-zig build size -Doptimize=ReleaseSmall    # fail the build if a shipped artifact grew past its ceiling
+zig build size -Doptimize=ReleaseSmall    # check shipped artifact sizes against their ceilings
+                                   #   …and a plain `zig build -Doptimize=ReleaseSmall` runs this
+                                   #   by itself: the config that ships is the config that is gated
 zig build wasm                     # build the runtime itself as a wasm module
-zig build dll                      # C-ABI shared library (for FFI: Deno, ctypes, …)
+zig build dll                      # C-ABI shared library -> zig-out/dll/ (for FFI: Deno, ctypes, …)
 zig build capi-smoke               # build + run the C example (needs no external deps)
 zig build ffi-demo                 # build the DLL + run examples/deno_ffi_capi.mjs (needs deno)
 zig build size -Doptimize=ReleaseSmall   # fail if a shipped artifact grew past its ceiling
@@ -193,7 +195,8 @@ that improved so you can re-generate. If `zig build` ever fails with a bare `err
 before doing any work, the local `.zig-cache` is corrupt — `rm -rf .zig-cache`.
 
 The runtime loads over FFI from any host language: `zig build dll` produces a
-libc-free `wazmrt.dll`, and
+libc-free `zig-out/dll/wazmrt.dll` (its own directory, so the import library
+beside it does not collide with the static `zig-out/lib/wazmrt.lib`), and
 [`examples/deno_ffi_capi.mjs`](examples/deno_ffi_capi.mjs) `Deno.dlopen`s it,
 assembles a `.wat`, and serves the guest's import from a JavaScript callback that
 reads guest memory — no wasmtime, no JS engine executing the wasm.
