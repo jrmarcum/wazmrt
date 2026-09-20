@@ -560,7 +560,7 @@ running their binary — is required by `coordinate`. The retired oracle is not 
 their code for **design guidance** stays off-limits; reading it to check a **contract row** is the
 whole point. A finding about their project is **reported to the owner**, never edited into their memory.
 
-### 📌 THE ONE DESIGN-GUIDANCE READ SO FAR — owner-directed, 2026-09-20, Track B-e
+### 📌 THE DESIGN-GUIDANCE READS SO FAR — BOTH owner-directed, 2026-09-20 (Track B-e; the `@custom` gate question)
 
 🔒 **The retired oracle is NOT reopened, and this entry exists so nobody reads it as precedent.** The
 owner directed: *"lets consult the wasmrt project for where it belongs"* — where the size gate should
@@ -576,6 +576,14 @@ design being borrowed.
 
 ✅ **The rule for next time, unchanged: ask the owner.** A contract row is readable any time; how to
 build something is not.
+
+📌 **SECOND read, same day, also owner-directed: how `wasmrt` and `binaryang` each resolved
+`@custom`.** It answered the gate question outright — **neither added a feature bit**, both treated
+annotations as fidelity work — and it turned up a **live wazmrt defect** the question had not
+anticipated: an annotated module assembles byte-identically to one without the annotation, so
+wazmrt silently drops what the text asked for. 🎓 **Both reads paid, and both were about a decision
+already made elsewhere rather than a design to copy** — which is the shape that makes the exception
+worth granting. Details: `roadmap.md` → the `@custom` gate question.
 
 ## 🔒🔒 PROVE OR VALIDATE BEFORE ACTING — never guess, never assume (owner, 2026-09-19)
 

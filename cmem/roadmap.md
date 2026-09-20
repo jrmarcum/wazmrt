@@ -594,9 +594,48 @@ changed because the evidence is gone by the time the walk runs.
 | **B. Implement it WITH a real assembly-time gate** | Thread a feature set into `wat.assemble`. The only option under which a bit actually fires. New capability, and it changes the assembler's signature and every caller |
 | **C. Implement it with NO bit, and AMEND Track A's rule** | Narrow the rule to *"an annotation whose consumer is the VALIDATOR or INTERPRETER needs a bit; one whose only consumer is the assembler, producing output the module format cannot distinguish, does not"* — and record why. Defensible, and it weakens a rule that has been load-bearing |
 
-📌 **Recommendation: A, or C if `@custom` is wanted.** ⚠️ **Not B for the skip count** — 17 skips
-that are correctly labelled are not a problem worth an assembler-wide gate, and `measure → find →
-optimize → attack` puts new capability after the review tracks, not before them. **Owner's call.**
+📌 **Recommendation as first written: A, or C if `@custom` is wanted.** ⚠️ **Not B for the skip
+count** — 17 correctly-labelled skips are not worth an assembler-wide gate.
+
+###### ✅ ANSWERED BY BOTH SIBLINGS — reviewed 2026-09-20 at the owner's direction
+
+⚠️ **Owner-directed read of `wasmrt` and `binaryang` for how each resolved this.** `interop.md` §1's
+retired oracle forbids reading a competitor's implementation for design guidance by default;
+**scoped exception for this question, not a reopening** — the second such, after B-e.
+
+🔑 **NEITHER ADDED A FEATURE BIT.** wasmrt's `Feature` enum carries the same proposals wazmrt's does
+and **no annotation member**. Both treated annotations as **fidelity work, not a proposal** — so
+the answer to the gate question is **option C**, and Track A's *"needs a bit that day"* rule needs
+the narrowing C describes.
+
+| | how it was resolved |
+| --- | --- |
+| **wasmrt** (Track A, 2026-09-19) | 🔒 Owner: *"we do not want the lexer to throw away information … align with canonical wasmtime and wasm."* `custom/` **0/1/20 → 20/0/0**. ⚠️ **Every behaviour MEASURED against wasm-tools 1.259 before it was built, not read off the spec** — `@custom` at its `(before\|after X)` slot, default `(after last)`, `after` anchors before `before` anchors in a gap, **`datacount` is not an anchor**; `@name` overrides the `$id` and is **refused on a struct field**; branch hints → `metadata.code.branch_hint`; malformed/misplaced → **module refused**; a hint on a non-branch → **emitted, not refused** |
+| **binaryang** | Records it as divergences against wabt. 🔑 **C5, and it is the one that bites wazmrt: a `(@custom "name" …)` in text IS the name section — written verbatim, and NONE is generated from the module's `$id`s.** Also C2/C4: `wasm2wat` prints every custom section with its position and `wat2wasm` honours it, where wabt's own writer emits `(@custom …)` its parser cannot read, so a wabt round trip **drops every custom section** |
+
+🎓 **Independent confirmation of a B-c2 rule:** wasmrt's measured table says `$id` labels are
+*"numbered over EVERY block (`(block (block $b))` → label 1)"* — the ordinal rule wazmrt derived
+empirically for the `name` section, reached separately and agreeing.
+
+🚨 **AND THE REVIEW FOUND A LIVE wazmrt DEFECT, which none of options A/B/C anticipated.** Measured
+on the same bytes:
+
+```
+(module (@custom "greet" "hi") (func $f))   wazmrt e414279a…   wasmrt f3041539…
+(module                       (func $f))   wazmrt e414279a…   wasmrt e414279a…
+```
+
+⚠️⚠️ **wazmrt produces BYTE-IDENTICAL output with and without the annotation** — it discards it at
+the lexer and says nothing. The text asked for a custom section; the module does not have one.
+🔒 **That is not "a proposal we do not target", it is the silent-drop class**, and it violates the
+same standing owner direction that drove Z4 — *do not discard information the source carries* —
+which is the very sentence wasmrt's owner quoted when directing their fix.
+
+📌 **So the recommendation CHANGES: not A.** Skipping the spec files was the visible half; the
+invisible half is that every annotated `.wat` assembles to the wrong module in silence, and `.wat`
+digests are **not portable** for any file using annotations. ⬜ **Scope for the owner:** the minimum
+honest fix is either to **implement** (option C, as both siblings did, to their measured canonical
+behaviour) or to **REFUSE** an annotation wazmrt cannot honour — but not to keep dropping it.
 
 #### ✅ B-a — The EMITTER audit. **COMPLETE 2026-09-20** (`d47ecd18`). **FOUR DEFECTS, 4-FOR-4 AGAIN** `[x]`
 
