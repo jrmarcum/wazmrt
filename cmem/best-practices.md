@@ -16,6 +16,41 @@ pair.** Most entries exist because someone competent did the obvious thing.
 
 ## 1. Verifying a change
 
+🔒🔒 **DO NOT GUESS OR ASSUME — PROVE OR VALIDATE BEFORE ACTING (owner, 2026-09-19). This is the
+rule the other rules in this file are instances of.**
+
+Before a fact reaches code, a test, a document or a claim to the owner, **ask the artifact that owns
+it.** Run the binary. Read the enum. Query the tool. Grep the header. ⚠️ **"I know this" is not a
+source**, and neither is a sibling project's prose about a third tool.
+
+**The cost is asymmetric and that is the whole argument.** Checking costs one command. A wrong
+assumption that compiles becomes a comment asserting it, a test pinning it, and a contract row quoting
+it — and by then it reads as verified because three files agree.
+
+🎓 **The subtler half: PROVE THE REASON, not just the answer.** A `--features` alias table was written
+naming four spellings as "the spec's vocabulary". Asking the tool —
+`wasm-tools validate --features <unknown>` prints its valid list — showed wasm-tools uses **none of
+them**; its names are this project's own enum names with `-` for `_`. Three of the four turned out to
+be real anyway, as aliases the *sibling runtime* carries, so the code would have worked and one branch
+would have been dead. **The answer was nearly right and the reason was invented.** *Being right for a
+reason you did not check is not being right; it is being lucky, and luck does not survive the next
+edit.*
+
+**What this has already cost here, four times, all the same shape — a claim written from READING:**
+
+| claim | reality when finally run |
+| --- | --- |
+| `--dir` single colon *"does not error, it preopens the wrong thing"* | it fails loudly, `errno 29` — carried since contract v1 |
+| *"`--dir .:/` is a working wazmrt invocation"* | it has never worked; the drive-letter guard eats it |
+| *"the summarize row is AGREED, output identical"* | the text differs; only behaviour and exit code agreed |
+| the `--features` alias rationale above | wasm-tools uses none of those names |
+
+⚠️ **This rule outranks speed, and it outranks a plausible chain of reasoning.** If the proof is
+expensive, say the claim is unverified — ⬜ **UNVERIFIED is a legitimate status and a guess wearing
+confident wording is not.** `interop.md` §1 rule 4 (*verify by RUNNING both, never by reading either*)
+is this rule applied to one file; §6's assert-your-match-count is this rule applied to an edit.
+— owner, 2026-09-19, after the fourth read-not-verify error in two days
+
 **Diff the OUTPUT, not the exit code.** A build that still exits 0 while silently dropping passes is a
 regression. Re-run the affected `.wast` files and compare `N passed / N failed` against the pre-change
 baseline. — the standing rule in the "look for code issues" trigger, `INDEX.md`
@@ -1208,7 +1243,11 @@ shrink the workload, it changes its SHAPE. — 2026-08-19, `testing.md`
 
 ## 6. Tooling — how scripts are written and run
 
-🔒 **EVERY SCRIPT IN THIS REPO IS A DENO `.mjs`. No bash, no PowerShell, no Python, no bun, no npm.**
+🔒 **EVERY SCRIPT IN THIS REPO RUNS UNDER DENO OR BUN — nothing else.** 🚫 **No Python, no bash, no
+PowerShell, no `.bat`, no npm.** (owner, 2026-09-19: *"python scripts not allowed either only deno or
+bun"*.) **Deno is the default and the only one currently wired into `build.zig`**; Bun is permitted for
+new work. ⚠️ A script written for one must not be rewritten for the other casually — *a list written
+out a second time is a list that will drift* — so pick per script and say which at the top of the file.
 The tree already worked this way — `tools/phases.mjs`, `tools/bakeoff.mjs` and `examples/deno_ffi_capi.mjs`
 are run by `deno run --allow-…` from `build.zig`, and the only other tooling language is Zig itself
 (`tools/size_gate.zig`, `tools/conformance.zig`) — but **nothing said so**, which left the convention one
@@ -1227,9 +1266,13 @@ contributor away from a second runtime. Now it is a rule.
   asserts nothing and gets everything.
 - **Deno is already a declared dependency** for `phases`, `bakeoff` and `ffi-demo`. Adding Python or a
   shell adds a *new* platform assumption to a project whose first invariant is **zero dependencies**.
-- **Not bun, for the same reason there is one pin DB path:** nothing in the tree uses it, and two script
-  runtimes is *a list written out a second time*, which is the failure this project names most often.
-  If bun ever replaces Deno it replaces it everywhere, in one change, with this rule updated.
+- **Bun is allowed alongside Deno by the owner's decision**, and the same arguments carry: both are
+  single-binary, cross-platform, and run the same `.mjs` without a package step. ⚠️ **What is NOT
+  allowed is drifting between them inside one script's lifetime** — if a tool is a Deno script it stays
+  one until someone deliberately ports it and updates whatever invokes it. Today everything in
+  `build.zig` invokes `deno`, so Deno remains the default for anything the build runs.
+- 🚫 **Python is out by name** — it is a third runtime with a version/venv surface neither of the
+  other two has, in a project whose first invariant is **zero dependencies**.
 
 ⚠️ **This binds throwaway work too, not just committed tools.** A one-off migration or an audit sweep is
 where the temptation to "just pipe it through bash" is strongest, and it is exactly where a silent

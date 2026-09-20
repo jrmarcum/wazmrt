@@ -378,12 +378,33 @@ running their binary — is required by `coordinate`. The retired oracle is not 
 their code for **design guidance** stays off-limits; reading it to check a **contract row** is the
 whole point. A finding about their project is **reported to the owner**, never edited into their memory.
 
-## 🔧 TOOLING — Deno only, and no heredocs (binding on every agent, 2026-09-19)
+## 🔒🔒 PROVE OR VALIDATE BEFORE ACTING — never guess, never assume (owner, 2026-09-19)
 
-🔒 **Every script in this repo is a Deno `.mjs`.** No bash, no PowerShell, no Python, no bun, no npm.
-The only other tooling language is Zig itself (`tools/size_gate.zig`, `tools/conformance.zig`). The tree
-already worked this way — `tools/phases.mjs`, `tools/bakeoff.mjs`, `examples/deno_ffi_capi.mjs`, all run
-by `deno run --allow-…` from `build.zig` — but nothing said so until now. ⚠️ **It binds throwaway work
+**Binding on every agent, and it outranks speed.** Before a fact reaches code, a test, a document or a
+claim to the owner, **ask the artifact that owns it**: run the binary, read the enum, query the tool,
+grep the header. ⚠️ **"I know this" is not a source**, and neither is another project's prose about a
+third tool.
+
+🎓 **Prove the REASON, not just the answer.** A `--features` alias table named four spellings as "the
+spec's vocabulary"; the tool's own list used none of them. Three were real anyway — as aliases the
+*sibling* carries — so the code would have worked with an invented justification and one dead branch.
+*Being right for a reason you did not check is being lucky, and luck does not survive the next edit.*
+
+⬜ **UNVERIFIED is a legitimate status.** If the proof is expensive, say the claim is unverified rather
+than dressing a guess in confident wording. This has already cost four claims-written-from-reading in
+two days, every one of them wrong when finally run.
+
+📖 **The rule and its incident table: [`best-practices.md`](best-practices.md) §1.** `interop.md` §1
+rule 4 is this rule applied to a contract row; §6's assert-your-match-count is it applied to an edit.
+
+## 🔧 TOOLING — Deno or Bun only, and no heredocs (binding on every agent, 2026-09-19)
+
+🔒 **Every script in this repo runs under Deno or Bun — nothing else.** 🚫 **No Python, no bash, no
+PowerShell, no `.bat`, no npm** (owner: *"python scripts not allowed either only deno or bun"*). The
+only other tooling language is Zig itself (`tools/size_gate.zig`, `tools/conformance.zig`).
+**Deno is the default and the only one `build.zig` invokes today** — `tools/phases.mjs`,
+`tools/bakeoff.mjs`, `examples/deno_ffi_capi.mjs` all run via `deno run --allow-…`; Bun is permitted
+for new work, chosen per script and named at the top of the file. ⚠️ **It binds throwaway work
 too**, not just committed tools: a one-off sweep is where "just pipe it through bash" is most tempting
 and where a silent mis-measurement costs most, because nobody reviews a command that already ran.
 
