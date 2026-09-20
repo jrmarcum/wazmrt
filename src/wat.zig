@@ -28,6 +28,8 @@
 const std = @import("std");
 const sexpr = @import("sexpr.zig");
 const opcode = @import("opcode.zig");
+// Only the tests below read back an assembled module; the decoder already links this.
+const Reader = @import("Reader.zig");
 const types = @import("types.zig");
 
 const V = types.ValType;
@@ -38,6 +40,12 @@ const List = std.ArrayList;
 pub const Error = sexpr.Error || error{
     NotAModule,
     BadModuleField,
+    /// A malformed `(@custom …)` — no name, a name that is not a string, an unknown or
+    /// wrong-sided anchor (`(after first)`, `(before last)`, `(after datacount)`), more than one
+    /// placement clause, or a non-string in the contents. ⚠️ **Refused, not ignored:** an
+    /// annotation a tool DOES understand and cannot honour is a malformation, which is how
+    /// wasm-tools treats it. An annotation it does not understand is still dropped at the lexer.
+    BadAnnotation,
     /// A typeuse wrote BOTH `(type N)` and an inline `(param …)`/`(result …)`,
     /// and they describe different signatures (§6.6.5).
     ///
@@ -152,6 +160,10 @@ fn strAt(items: []const Sexpr, i: usize) Error![]const u8 {
 
 const Func = struct {
     name: ?[]const u8 = null,
+    /// A `(@name "…")` override for the name section. Kept SEPARATE from `name`, which is the
+    /// `$id` used to resolve references and carries its `$` — the annotation is the name itself
+    /// and may hold characters an identifier could not.
+    name_annot: ?[]const u8 = null,
     params: List(V) = .empty,
     results: List(V) = .empty,
     locals: List(V) = .empty,
@@ -176,6 +188,227 @@ const Func = struct {
 const ImportedFunc = struct { module: []const u8, name: []const u8, type_ref: ?Sexpr, params: []const V, results: []const V, exact: bool = false };
 
 const ExportDef = struct { name: []const u8, kind: u8, index: u32 };
+
+/// A `(@custom "name" (before|after X)? "contents"*)` annotation, resolved to where it goes.
+///
+/// 🔒 **Every rule below was MEASURED against the sibling assembler before it was written**, which
+/// measured itself against wasm-tools 1.259 — not read off the spec. The placement rules are the
+/// kind that look obvious and are not: an absent anchor still resolves to the position it *would*
+/// have occupied, `datacount` is not an anchor at all, and `first`/`last` are each valid on only
+/// one side.
+const CustomSection = struct {
+    name: []const u8,
+    contents: []const u8,
+    /// Canonical slot this section sits AFTER — see `anchorSlot`. `-1` is before everything.
+    slot: i32,
+    /// 0 for an `after` anchor, 1 for a `before` one. ⚠️ **In one gap, every `after` precedes
+    /// every `before`, whatever order the source wrote them in** — measured both ways round.
+    side: u8,
+    // ⚠️ No `seq` field: source order is preserved because `flushCustomSections` iterates the
+    // collection in the order the fields were parsed. A stored index would be a second copy of
+    // information the slice already carries.
+};
+
+/// The canonical section order, as slots. ⚠️ **This is the EMIT order, not the section ids** —
+/// `tag` (13) is emitted between `memory` (5) and `global` (6) per the EH proposal, and
+/// `datacount` (12) between `elem` and `code`. An anchor names a position in this list.
+///
+/// 🔑 `datacount` occupies a slot but is **not a valid anchor name** — measured: both
+/// `(before datacount)` and `(after datacount)` are refused. It is listed here because the slot
+/// still exists and custom sections must be able to land on either side of it.
+const section_slots = [_][]const u8{
+    "type", "import", "func",   "table", "memory", "tag",  "global",
+    "export", "start", "elem",  "datacount", "code", "data",
+};
+
+/// The slot an anchor name denotes, or null if it is not a section anchor.
+fn anchorSlot(name: []const u8) ?i32 {
+    for (section_slots, 0..) |s, i| {
+        if (std.mem.eql(u8, name, s)) return @intCast(i);
+    }
+    return null;
+}
+
+/// Parse one `(@custom …)` into the section it describes.
+///
+/// Grammar, measured: `(@custom <name:string> ( (before|after) <anchor> )? <contents:string>*)`.
+/// The contents are concatenated; an empty list is a zero-length section, which is legal.
+fn parseCustomAnnotation(a: std.mem.Allocator, ann: sexpr.Annot) Error!CustomSection {
+    var i: usize = 0;
+    // The name is required and is a STRING — `(@custom)` and `(@custom foo)` are both refused.
+    if (i >= ann.items.len) return error.BadAnnotation;
+    const name = switch (ann.items[i]) {
+        .string => |s| s,
+        else => return error.BadAnnotation,
+    };
+    // ⚠️ A section name is a wasm `name`, so it must be valid UTF-8 — `(@custom "\df")` is
+    // malformed. The ordinary string rule allows arbitrary bytes (`(data "\ef")` is fine), which
+    // is why this cannot be left to the lexer: the same token is legal in one position and not
+    // in the other.
+    if (!std.unicode.utf8ValidateSlice(name)) return error.BadAnnotation;
+    i += 1;
+
+    // At most ONE placement clause, and it must come before the contents — measured:
+    // `(@custom "g" (after last) (before code) "x")` is refused.
+    var slot: i32 = @intCast(section_slots.len - 1); // default: `(after last)`
+    var side: u8 = 0;
+    if (i < ann.items.len) {
+        if (ann.items[i].asList()) |l| {
+            const kw = if (l.len == 2) (l[0].asAtom() orelse "") else "";
+            const is_before = std.mem.eql(u8, kw, "before");
+            const is_after = std.mem.eql(u8, kw, "after");
+            if (!is_before and !is_after) return error.BadAnnotation;
+            const anchor = l[1].asAtom() orelse return error.BadAnnotation;
+            if (is_after) {
+                side = 0;
+                // ⚠️ `last` is an `after`-only anchor and `first` a `before`-only one; the other
+                // pairing is refused rather than treated as a synonym. Measured both ways.
+                slot = if (std.mem.eql(u8, anchor, "last"))
+                    @intCast(section_slots.len - 1)
+                else
+                    anchorSlot(anchor) orelse return error.BadAnnotation;
+            } else {
+                side = 1;
+                // `before Y` lands in the same gap as `after <the slot before Y>`, which is what
+                // makes the two comparable — and the gap exists whether or not Y does.
+                slot = if (std.mem.eql(u8, anchor, "first"))
+                    -1
+                else
+                    (anchorSlot(anchor) orelse return error.BadAnnotation) - 1;
+            }
+            i += 1;
+        }
+    }
+
+    var contents: List(u8) = .empty;
+    while (i < ann.items.len) : (i += 1) {
+        switch (ann.items[i]) {
+            .string => |s| try contents.appendSlice(a, s),
+            else => return error.BadAnnotation,
+        }
+    }
+    return .{ .name = name, .contents = contents.items, .slot = slot, .side = side };
+}
+
+/// Refuse a `(@custom …)` written anywhere but as a direct child of `(module …)`.
+///
+/// 🔒 **`@custom` names a SECTION, and a section is a property of the module** — so
+/// `(type (@custom "bla") $t (func))`, `(func (@custom "bla"))`, `(func (block (@custom "bla")))`
+/// and `(func (nop (@custom "bla")))` are all malformed, and the corpus asserts each one
+/// separately. ⚠️ **Refused rather than ignored:** this is an annotation wazmrt *does* understand
+/// in a position where it cannot mean anything, which is a malformation — distinct from an
+/// annotation it does not understand, which the lexer still drops.
+///
+/// Walks values rather than fields, because the misplacement can be arbitrarily deep.
+fn rejectNestedCustom(v: Sexpr) Error!void {
+    switch (v) {
+        .annotation => |an| if (std.mem.eql(u8, an.id, "custom")) return error.BadAnnotation else {
+            for (an.items) |item| try rejectNestedCustom(item);
+        },
+        .list => |l| for (l) |item| try rejectNestedCustom(item),
+        .atom, .string => {},
+    }
+}
+
+/// The forms that CARRY A NAME, and therefore admit `(@name "…")`. Measured against the
+/// canonical toolchain rather than assumed: every one of these accepts the annotation in its
+/// identifier slot, and every form outside the list refuses it there — `start`, `export`,
+/// `import`, `result`, `rec`, `sub` and `field` among the ones checked.
+const name_bearing_forms = [_][]const u8{
+    "module", "func",  "type",  "table", "memory", "global", "elem",
+    "data",   "tag",   "param", "local", "block",  "loop",   "if",
+};
+
+/// The name-bearing forms whose `(@name "…")` this build actually WRITES INTO THE NAME SECTION.
+///
+/// 🔒 **Narrower than `name_bearing_forms`, and deliberately so.** The name section has twelve
+/// subsections and this build honours the override in three of them; for the rest the annotation
+/// is *understood and cannot be honoured*, which this project treats as a malformation — the same
+/// rule `@custom` follows. Accepting one and dropping it would emit a module byte-identical to
+/// one that never carried it, which is precisely the silent-wrong-output this pass removed.
+///
+/// ⚠️ **This is narrower than the canonical toolchain**, which accepts `(@name …)` on `type`,
+/// `table`, `memory`, `global`, `elem`, `data`, `param`, `local`, `block`, `loop` and `if` too.
+/// Measured, all eleven. Widening it means threading an override into each of those index spaces'
+/// name maps — filed, not forgotten. Until then wazmrt refuses rather than lies.
+const honoured_name_forms = [_][]const u8{ "module", "func", "tag" };
+
+/// A `$id` atom — the thing that occupies a form's identifier slot.
+fn isIdAtom(s: Sexpr) bool {
+    const at = s.asAtom() orelse return false;
+    return at.len > 1 and at[0] == '$';
+}
+
+/// The index of a form's identifier slot: right after the keyword, or right after the `$id`.
+fn identSlot(form: []const Sexpr) usize {
+    return if (form.len > 1 and isIdAtom(form[1])) 2 else 1;
+}
+
+/// The `(@name "…")` in a form's identifier slot, if it has one. Placement has already been
+/// adjudicated by `rejectMisplacedName`, so anything found here is in the legal position.
+fn nameOverride(form: []const Sexpr) Error!?[]const u8 {
+    const slot = identSlot(form);
+    if (slot >= form.len) return null;
+    const an = form[slot].asAnnotation() orelse return null;
+    if (!std.mem.eql(u8, an.id, "name")) return null;
+    if (an.items.len != 1) return error.BadAnnotation;
+    return switch (an.items[0]) {
+        .string => |s| s,
+        else => error.BadAnnotation,
+    };
+}
+
+/// Refuse a `(@name "…")` written anywhere but the IDENTIFIER SLOT of a name-bearing form.
+///
+/// 🔒 The legal position is the one a `$id` would occupy — immediately after the keyword, or
+/// immediately after the `$id` when one is written. `(module (func) (@name "M"))` and
+/// `(module (start $f (@name "M")) (func $f))` are both *"misplaced"*, and a SECOND annotation
+/// on one form lands one past the slot, so `(module (@name "M1") (@name "M2"))` — *"multiple
+/// module"* — falls out of this same rule instead of needing one of its own.
+///
+/// ⚠️ **The slot is re-derived at every level and does NOT inherit.**
+/// `(import "a" "b" (func $f (@name "F")))` is legal even though `import` bears no name,
+/// because the annotation belongs to the `func` nested inside it — so a rule that rejected
+/// everything under a non-name-bearing form would be wrong. Measured both ways.
+fn rejectMisplacedName(v: Sexpr) Error!void {
+    const form = v.asList() orelse return;
+    // The index a `$id` would occupy, or `null` when this form cannot be named at all.
+    const kw: ?[]const u8 = if (form.len != 0) form[0].asAtom() else null;
+    const slot: ?usize = blk: {
+        const k = kw orelse break :blk null;
+        for (name_bearing_forms) |n| {
+            if (std.mem.eql(u8, n, k)) break :blk identSlot(form);
+        }
+        break :blk null;
+    };
+    for (form, 0..) |item, i| {
+        if (item.asAnnotation()) |an| {
+            if (std.mem.eql(u8, an.id, "name")) {
+                // Misplaced — no slot on this form, or not the slot.
+                if (i != (slot orelse return error.BadAnnotation)) return error.BadAnnotation;
+                // In the right place, on a form whose name map this build does not yet write.
+                // Refused rather than dropped — see `honoured_name_forms`.
+                for (honoured_name_forms) |h| {
+                    if (std.mem.eql(u8, h, kw.?)) break;
+                } else return error.BadAnnotation;
+            }
+        }
+        try rejectMisplacedName(item);
+    }
+}
+
+/// Emit every `@custom` section anchored at `slot`, in (side, source-order).
+fn flushCustomSections(a: std.mem.Allocator, out: *List(u8), customs: []const CustomSection, slot: i32) Error!void {
+    for ([_]u8{ 0, 1 }) |side| { // every `after` in this gap, then every `before`
+        for (customs) |c| {
+            if (c.slot != slot or c.side != side) continue;
+            var s: List(u8) = .empty;
+            try nameBytes(a, &s, c.name);
+            try s.appendSlice(a, c.contents);
+            try emitSection(a, out, 0, s.items);
+        }
+    }
+}
 /// A parsed data segment: `offset_form == null` is passive; otherwise active
 /// (at `mem_index`, always 0 — the single supported memory) with that offset
 /// const-expr. `offset_form` may be `(offset …)`, a folded `(i32.const …)`, or
@@ -288,6 +521,10 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     var tag_types: List(u32) = .empty;
     var tag_imports: List(ImportedTag) = .empty;
     var tag_names: List(?[]const u8) = .empty;
+    // `(@name "…")` overrides per TAG, index-aligned with `tag_names`. Separate from it for the
+    // same reason `func_name_annots` is separate: `tag_names` holds the `$id` that resolves a
+    // reference and carries its `$`; this holds the name itself.
+    var tag_name_annots: List(?[]const u8) = .empty;
     // GC composite kinds, index-aligned with the leading named `(type …)` defs
     // in `sigs`; struct/array carry their fields (func types use `sigs`).
     var gc_types: List(GcTypeDef) = .empty;
@@ -329,6 +566,16 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // check silently skips itself and lets an import be bound to a signature the
     // text never wrote.
     var pending_typeuse: List(PendingTypeUse) = .empty;
+    // Module-level `(@custom …)` sections, in source order — see `CustomSection`.
+    var customs: List(CustomSection) = .empty;
+    // A module-level `(@name "…")`, which overrides `(module $id …)` in the name section.
+    var module_name_annot: ?[]const u8 = null;
+    // `(@name "…")` overrides per FUNCTION, index-aligned with `func_names`. Separate from it
+    // because the two are different things: `func_names` holds the `$id` that resolves a
+    // reference and carries its `$`; this holds the name itself.
+    var func_name_annots: List(?[]const u8) = .empty;
+    // Whether any ordinary field has been seen — `@name`'s position rule needs it.
+    var saw_any_field = false;
     // Defined memories (multi-memory). Each `(memory …)` appends here; the memory
     // section emits them in order. Imported memories take the low indices, so
     // `mem_names` (below) spans BOTH — imports first, definitions after.
@@ -365,6 +612,25 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // with `type_forms` — `rec_sizes` is per group, and the implicit-type rule
     // below has to ask the question per type.
     var type_group_size: List(u32) = .empty;
+
+    // 🔒 **Annotation placement is adjudicated FIRST, over the whole tree, before any pass
+    // parses anything.** `@custom` is legal only as a direct child of the module form, and
+    // `@name` only in a name-bearing form's identifier slot — see `rejectNestedCustom` and
+    // `rejectMisplacedName`.
+    //
+    // ⚠️ **The order is load-bearing, and this loop used to sit AFTER the two type pre-passes.**
+    // `(type (struct (field (@name "F") i32)))` then reached `parseTypeBody` first, which read
+    // the annotation as a field's storage type and answered `BadValType` — a verdict about the
+    // wrong thing, decided by whichever parser happened to get there first. The comment on this
+    // loop already claimed "before anything is assembled"; only the position was wrong.
+    for (module[start..]) |field| {
+        if (field.asAnnotation() != null) continue; // a direct child is the legal position
+        try rejectNestedCustom(field);
+        // The MODULE form's own slot is checked by the field loop further down (via
+        // `saw_any_field`), because only that loop knows whether a field has already been seen.
+        try rejectMisplacedName(field);
+    }
+
     for (module[start..]) |field| {
         const kw = field.keyword() orelse continue;
         if (std.mem.eql(u8, kw, "type")) {
@@ -406,7 +672,33 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // a defined tag before it would otherwise mis-align the source-order tag space.
     var seen_definition = false;
     for (module[start..]) |field| {
+        // 🆕 A module-level `(@custom …)` is a SECTION, not a field — collected here and laid
+        // out at emit. ⚠️ It is position-INDEPENDENT: measured, the same annotation written
+        // before or after the `(func …)` produces byte-identical output, because only its
+        // `(before|after X)` clause decides where it lands.
+        if (field.asAnnotation()) |ann| {
+            if (std.mem.eql(u8, ann.id, "custom")) {
+                try customs.append(a, try parseCustomAnnotation(a, ann));
+                continue;
+            }
+            // 🆕 A module-level `(@name "…")` renames the MODULE, overriding `(module $id …)`.
+            // ⚠️ It is only legal in the name POSITION — immediately after `module` and its
+            // optional `$id` — and only once. `(module (func) (@name "M"))` is *"misplaced"* and
+            // `(module (@name "M1") (@name "M2"))` is *"multiple module"*, both malformed.
+            if (std.mem.eql(u8, ann.id, "name")) {
+                if (saw_any_field or module_name_annot != null) return error.BadAnnotation;
+                if (ann.items.len != 1) return error.BadAnnotation;
+                module_name_annot = switch (ann.items[0]) {
+                    .string => |s| s,
+                    else => return error.BadAnnotation,
+                };
+                continue;
+            }
+            // Any other retained id reaching module level is one this loop does not implement.
+            return error.BadAnnotation;
+        }
         const kw = field.keyword() orelse return error.BadModuleField;
+        saw_any_field = true;
         const items = (try wantList(field));
         if (fieldIsImport(kw, items)) {
             if (seen_definition) return error.ImportAfterDefinition;
@@ -427,6 +719,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 try funcs.append(a, f);
             }
             try func_names.append(a, f.name);
+            try func_name_annots.append(a, f.name_annot);
         } else if (std.mem.eql(u8, kw, "export")) {
             // (export "name" (func|table|memory|global|tag $id|N))
             //
@@ -494,6 +787,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 try tag_types.append(a, tag_sig);
             }
             try tag_names.append(a, nm);
+            try tag_name_annots.append(a, try nameOverride(items));
         } else if (std.mem.eql(u8, kw, "memory")) {
             var mi: usize = 1;
             var this_name: ?[]const u8 = null;
@@ -671,6 +965,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 try func_imports.append(a, .{ .module = (try strAt(items, 1)), .name = (try strAt(items, 2)), .type_ref = f.type_ref, .params = f.params.items, .results = f.results.items, .exact = f.type_exact });
                 try func_import_type.append(a, try importFuncType(a, &sigs, &pending_typeuse, type_names.items, f.type_ref, f.params.items, f.results.items));
                 try func_names.append(a, f.name);
+                try func_name_annots.append(a, f.name_annot);
             } else if (std.mem.eql(u8, dkw, "table")) {
                 // (import "m" "n" (table $id? min max? reftype)) — imported tables
                 // take the low table indices (before any defined table).
@@ -728,6 +1023,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                 const sig = try parseTagType(a, desc, gi, &sigs, &pending_typeuse, type_names.items);
                 try tag_imports.append(a, .{ .module = (try strAt(items, 1)), .name = (try strAt(items, 2)), .sig = sig });
                 try tag_names.append(a, gname);
+                try tag_name_annots.append(a, try nameOverride(desc));
             } else {
                 try parseImport(a, items, &global_imports, &global_names, type_names.items); // global
             }
@@ -834,11 +1130,42 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     var body_label_names: List([]const ?[]const u8) = .empty;
     // Does any body name a data segment? Decides the data-count section below.
     var code_uses_data_index = false;
-    for (funcs.items) |f| {
+    // 🆕 The `metadata.code.branch_hint` section's entries, already encoded: one per function
+    // that carries at least one hint, `(func_idx, vec(offset, size, bytes))`. Built inside this
+    // loop because a hint's offset only exists while its body is being encoded.
+    var hint_entries: List(u8) = .empty;
+    var hint_func_count: usize = 0;
+    // ⚠️ Hints index the WHOLE function space, so every defined function's entry is shifted by
+    // the imported ones. `func_names` spans imports + definitions; `funcs` only definitions.
+    const defined_func_base = func_names.items.len - funcs.items.len;
+    for (funcs.items, 0..) |f, di| {
         const enc = try encodeBody(a, f, func_names.items, &sigs, &pending_typeuse, type_names.items, global_names.items, table_names.items, elem_names.items, tag_names.items, data_names.items, mem_names.items, gc_field_names.items);
         try bodies.append(a, enc.bytes);
         try body_label_names.append(a, enc.label_names);
         if (enc.uses_data_index) code_uses_data_index = true;
+        if (enc.branch_hints.len != 0) {
+            hint_func_count += 1;
+            try uleb(a, &hint_entries, defined_func_base + di);
+            try uleb(a, &hint_entries, enc.branch_hints.len);
+            for (enc.branch_hints) |h| {
+                try uleb(a, &hint_entries, h.offset);
+                try uleb(a, &hint_entries, 1); // the value is one byte wide
+                try hint_entries.append(a, h.value);
+            }
+        }
+    }
+    if (hint_func_count != 0) {
+        var pay: List(u8) = .empty;
+        try uleb(a, &pay, hint_func_count);
+        try pay.appendSlice(a, hint_entries.items);
+        // Emitted through the same `@custom` machinery, anchored `(before code)` — measured,
+        // that is exactly where the canonical encoder puts it.
+        try customs.append(a, .{
+            .name = "metadata.code.branch_hint",
+            .contents = pay.items,
+            .slot = (anchorSlot("code") orelse unreachable) - 1,
+            .side = 1,
+        });
     }
 
     // Pre-encode every const-expr-bearing section (global inits, element and data
@@ -860,6 +1187,13 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
 
     var out: List(u8) = .empty;
     try out.appendSlice(a, &.{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 }); // header
+
+    // 🆕 `@custom` sections are laid out into the GAPS between numbered sections, by the
+    // `(before|after X)` anchor each one names. This is slot -1 — `(before first)`, ahead of
+    // everything. Each numbered section below is followed by its own flush, so a gap exists
+    // whether or not the sections around it do: an anchor naming an ABSENT section still
+    // resolves to the position that section would have held (measured).
+    try flushCustomSections(a, &out, customs.items, -1);
 
     // Type section (1) — func sigs (named + interned block-type sigs) plus GC
     // struct/array composite types. `gc_types` covers the leading named defs;
@@ -947,6 +1281,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         // a superset of it. (Track B-a, 2026-09-20.)
         if (s.items.len > 1 or entries != 0) try emitSection(a, &out, 1, s.items);
     }
+    try flushCustomSections(a, &out, customs.items, 0); // after type
     // Import section (2) — imported functions, tables, memories, globals.
     const n_imports = func_imports.items.len + table_imports.items.len + mem_imports.items.len + global_imports.items.len + tag_imports.items.len;
     if (n_imports != 0) {
@@ -1004,6 +1339,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         };
         try emitSection(a, &out, 2, s.items);
     }
+    try flushCustomSections(a, &out, customs.items, 1); // after import
     // Function section (3)
     {
         var s: List(u8) = .empty;
@@ -1018,9 +1354,11 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         // a superset of it. (Track B-a, 2026-09-20.)
         if (func_type.items.len != 0) try emitSection(a, &out, 3, s.items);
     }
+    try flushCustomSections(a, &out, customs.items, 2); // after func
     // Table section (4) — pre-encoded above (before the type section), because a
     // table initializer is a const-expr and may intern a signature.
     if (tables.items.len != 0) try emitSection(a, &out, 4, table_pay);
+    try flushCustomSections(a, &out, customs.items, 3); // after table
     // Memory section (5) — the *defined* memories only (imported ones live in
     // the import section). Multi-memory: a vector of limits.
     if (memories.items.len != 0) {
@@ -1029,6 +1367,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         for (memories.items) |m| try emitLimits(a, &s, m.min, m.max, m.shared, m.is64, m.page_size_log2);
         try emitSection(a, &out, 5, s.items);
     }
+    try flushCustomSections(a, &out, customs.items, 4); // after memory
     // Tag section (13) — exception tags. Ordered after memory (5) and before
     // global (6), per the EH proposal's section order.
     if (tag_types.items.len != 0) {
@@ -1040,8 +1379,10 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         }
         try emitSection(a, &out, 13, s.items);
     }
+    try flushCustomSections(a, &out, customs.items, 5); // after tag
     // Global section (6) — pre-encoded above (before the type section).
     if (globals.items.len != 0) try emitSection(a, &out, 6, global_pay);
+    try flushCustomSections(a, &out, customs.items, 6); // after global
     // Export section (7)
     if (exports.items.len != 0) {
         var s: List(u8) = .empty;
@@ -1053,14 +1394,17 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         }
         try emitSection(a, &out, 7, s.items);
     }
+    try flushCustomSections(a, &out, customs.items, 7); // after export
     // Start section (8) — the funcidx to run at instantiation.
     if (start_ref) |ref| {
         var s: List(u8) = .empty;
         try uleb(a, &s, try resolveByName(func_names.items, ref));
         try emitSection(a, &out, 8, s.items);
     }
+    try flushCustomSections(a, &out, customs.items, 8); // after start
     // Element section (9) — pre-encoded above (before the type section).
     if (elems.items.len != 0) try emitSection(a, &out, 9, elem_pay);
+    try flushCustomSections(a, &out, customs.items, 9); // after elem
     // Data-count section (12) — the segment count, ahead of the code that uses
     // it. §5.5.16 REQUIRES it in any module whose code has `memory.init`/
     // `data.drop`, and we emitted it never: every `(data …)` module this
@@ -1081,6 +1425,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         try uleb(a, &s, datas.items.len);
         try emitSection(a, &out, 12, s.items);
     }
+    try flushCustomSections(a, &out, customs.items, 10); // after datacount
     // Code section (10) — pre-encoded bodies
     {
         var s: List(u8) = .empty;
@@ -1098,8 +1443,10 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         // a superset of it. (Track B-a, 2026-09-20.)
         if (bodies.items.len != 0) try emitSection(a, &out, 10, s.items);
     }
+    try flushCustomSections(a, &out, customs.items, 11); // after code
     // Data section (11) — pre-encoded above (before the type section).
     if (datas.items.len != 0) try emitSection(a, &out, 11, data_pay);
+    try flushCustomSections(a, &out, customs.items, 12); // after data
 
     // `name` custom section (§7.4), LAST — the identifiers the text carried.
     //
@@ -1119,16 +1466,30 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // files with zero `$identifiers` already agreed and must keep agreeing.
     {
         var s: List(u8) = .empty;
-        if (module_name) |nm| {
+        // 🆕 `(@name "…")` OVERRIDES `(module $id …)`, and unlike an `$id` it is already the
+        // name — no `$` to strip, and it may hold characters an identifier could not
+        // (`(module (@name "Modül"))`). That is the whole point of the annotation: it separates
+        // *what the module is called* from *what the text calls it to resolve references*.
+        if (module_name_annot orelse if (module_name) |nm| identText(nm) else null) |nm| {
             var sub: List(u8) = .empty;
-            try nameBytes(a, &sub, identText(nm));
+            try nameBytes(a, &sub, nm);
             try emitNameSubsection(a, &s, 0, sub.items);
         }
         // Locals and labels are keyed by FUNCTION index, so the defined
         // functions start past the imports.
         var local_groups: List([]const ?[]const u8) = .empty;
         for (funcs.items) |f| try local_groups.append(a, f.local_names.items);
-        try emitNameSubsection(a, &s, 1, try nameMapPayload(a, func_names.items));
+        {
+            // 🆕 `(@name "…")` wins over the `$id`. Resolved into a final list here rather than
+            // inside `nameMapPayload`, so the annotation is never run through `identText`: a
+            // name that legitimately begins with `$` would otherwise lose it.
+            var final_funcs: List(?[]const u8) = .empty;
+            for (func_names.items, 0..) |id, fi| {
+                const annotated = if (fi < func_name_annots.items.len) func_name_annots.items[fi] else null;
+                try final_funcs.append(a, annotated orelse if (id) |x| identText(x) else null);
+            }
+            try emitNameSubsection(a, &s, 1, try nameMapPayloadFinal(a, final_funcs.items));
+        }
         try emitNameSubsection(a, &s, 2, try indirectNameMapPayload(a, local_groups.items, func_imports.items.len));
         try emitNameSubsection(a, &s, 3, try indirectNameMapPayload(a, body_label_names.items, func_imports.items.len));
         try emitNameSubsection(a, &s, 4, try nameMapPayload(a, type_names.items));
@@ -1138,7 +1499,17 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
         try emitNameSubsection(a, &s, 8, try nameMapPayload(a, elem_names.items));
         try emitNameSubsection(a, &s, 9, try nameMapPayload(a, data_names.items));
         try emitNameSubsection(a, &s, 10, try indirectNameMapPayload(a, gc_field_names.items, 0));
-        try emitNameSubsection(a, &s, 11, try nameMapPayload(a, tag_names.items));
+        {
+            // 🆕 `(@name "…")` wins over the `$id`, and is NOT run through `identText` — a name
+            // that legitimately begins with `$` would otherwise lose it. Same shape as the
+            // function-name subsection above.
+            var final_tags: List(?[]const u8) = .empty;
+            for (tag_names.items, 0..) |id, ti| {
+                const annotated = if (ti < tag_name_annots.items.len) tag_name_annots.items[ti] else null;
+                try final_tags.append(a, annotated orelse if (id) |x| identText(x) else null);
+            }
+            try emitNameSubsection(a, &s, 11, try nameMapPayloadFinal(a, final_tags.items));
+        }
         if (s.items.len != 0) {
             var sec: List(u8) = .empty;
             try nameBytes(a, &sec, "name");
@@ -1169,6 +1540,26 @@ fn importFuncType(a: std.mem.Allocator, sigs: *List(Sig), pending: *List(Pending
 /// is matched against.
 fn identText(id: []const u8) []const u8 {
     return if (id.len != 0 and id[0] == '$') id[1..] else id;
+}
+
+/// As `nameMapPayload`, but the names are ALREADY FINAL — no `$` is stripped. Used where a
+/// `(@name "…")` override may be present: the annotation is the name itself, so running it
+/// through `identText` would eat a leading `$` the author wrote on purpose.
+fn nameMapPayloadFinal(a: std.mem.Allocator, names: []const ?[]const u8) Error![]const u8 {
+    var count: usize = 0;
+    for (names) |n| {
+        if (n != null) count += 1;
+    }
+    if (count == 0) return &.{};
+    var s: List(u8) = .empty;
+    try uleb(a, &s, count);
+    for (names, 0..) |n, i| {
+        if (n) |nm| {
+            try uleb(a, &s, i);
+            try nameBytes(a, &s, nm);
+        }
+    }
+    return s.items;
 }
 
 /// Encode a `namemap` (§7.4.1): a vector of ascending `(index, name)` pairs with
@@ -1892,6 +2283,23 @@ fn parseFunc(a: std.mem.Allocator, form: []const Sexpr, type_names: []const ?[]c
     // the type use is itself ordered — see `typeUseOrder`.
     var seen: u8 = 0;
     while (i < form.len) : (i += 1) {
+        // 🆕 `(func $id? (@name "…") …)` — the annotation renames the function in the name
+        // section, overriding the `$id`. It sits in the same position the `$id` does, so it is
+        // consumed here rather than being left to `break` into the body as an instruction.
+        if (form[i].asAnnotation()) |ann| {
+            // ⚠️ Any OTHER retained id here starts the body, and must not be consumed as a
+            // header item: `(func (export "f") (result i32) (@metadata.code.branch_hint "\00")
+            // (if …))` writes its hint in exactly this position, and erroring instead killed
+            // `branch_hint.wast`'s only module. A misplaced `@name` cannot reach this point —
+            // `rejectMisplacedName` has already walked the whole field.
+            if (!std.mem.eql(u8, ann.id, "name")) break;
+            if (ann.items.len != 1) return error.BadAnnotation;
+            f.name_annot = switch (ann.items[0]) {
+                .string => |s| s,
+                else => return error.BadAnnotation,
+            };
+            continue;
+        }
         const kw = form[i].keyword() orelse break; // start of the body
         const list = (try wantList(form[i]));
         if (std.mem.eql(u8, kw, "export")) {
@@ -2306,7 +2714,23 @@ const Ctx = struct {
     /// const-expr that reaches one of these is refused by the validator, so no
     /// module carrying one is ever emitted.
     uses_data_index: bool = false,
+    /// Nesting depth of the `emitOne` currently running. Used for one thing only: tying a
+    /// branch hint to the form it annotates rather than to one of that form's OPERANDS,
+    /// which are emitted first and through the same opcode writer — see `takeBranchHint`.
+    level: u32 = 0,
+    /// A `(@metadata.code.branch_hint …)` awaiting its instruction: the value, and the
+    /// `level` the annotated form will run at.
+    pending_hint: ?struct { value: u8, level: u32 } = null,
+    /// Every branch hint this body recorded, in emission order.
+    branch_hints: List(BranchHint) = .empty,
 };
+
+/// One `@metadata.code.branch_hint`, resolved to the byte it annotates.
+///
+/// ⚠️ `offset` is measured from the START OF THE FUNCTION BODY — the locals vector
+/// INCLUDED, not from the first instruction. Measured against the canonical encoding, where
+/// a hint on the first `if` of a body with one local group records 8, not 5.
+const BranchHint = struct { offset: u32, value: u8 };
 
 /// Open a control-flow label: push it on the resolution stack AND record it, by
 /// ordinal, for the `name` section. Every structured control instruction —
@@ -2319,7 +2743,7 @@ fn pushLabel(ctx: *Ctx, label: ?[]const u8) Error!void {
 
 /// The encoded body plus the label names it opened, in ordinal order — the one
 /// fact the emitter used to throw away that the `name` section needs.
-const EncodedBody = struct { bytes: []const u8, label_names: []const ?[]const u8, uses_data_index: bool };
+const EncodedBody = struct { bytes: []const u8, label_names: []const ?[]const u8, uses_data_index: bool, branch_hints: []const BranchHint };
 
 fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, sigs: *List(Sig), pending: *List(PendingTypeUse), type_names: []const ?[]const u8, global_names: []const ?[]const u8, table_names: []const ?[]const u8, elem_names: []const ?[]const u8, tag_names: []const ?[]const u8, data_names: []const ?[]const u8, mem_names: []const ?[]const u8, field_names: []const []const ?[]const u8) Error!EncodedBody {
     var body: List(u8) = .empty;
@@ -2332,7 +2756,7 @@ fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, si
     var ctx: Ctx = .{ .a = a, .out = &body, .local_names = f.local_names.items, .func_names = func_names, .sigs = sigs, .pending_typeuse = pending, .type_names = type_names, .global_names = global_names, .table_names = table_names, .elem_names = elem_names, .tag_names = tag_names, .data_names = data_names, .mem_names = mem_names, .field_names = field_names };
     try emitSeq(&ctx, f.body);
     try body.append(a, @intFromEnum(Op.end)); // implicit function end
-    return .{ .bytes = body.items, .label_names = ctx.label_names.items, .uses_data_index = ctx.uses_data_index };
+    return .{ .bytes = body.items, .label_names = ctx.label_names.items, .uses_data_index = ctx.uses_data_index, .branch_hints = ctx.branch_hints.items };
 }
 
 /// Emit a sequence of instruction forms (folded lists and/or flat atoms).
@@ -2344,11 +2768,61 @@ fn emitSeq(ctx: *Ctx, items: []const Sexpr) Error!void {
 /// Emit one instruction (flat or folded) starting at `items[i]`; return the
 /// index of the next instruction.
 fn emitOne(ctx: *Ctx, items: []const Sexpr, i: usize) Error!usize {
+    // An annotation in an instruction position emits NO instruction — it annotates the one
+    // that follows, so it is handled before the level bookkeeping and never counts as a form.
+    if (items[i].asAnnotation()) |an| return armBranchHint(ctx, an, items, i);
+    ctx.level += 1;
+    defer ctx.level -= 1;
     return switch (items[i]) {
         .list => |l| emitFoldedOne(ctx, l, i),
         .atom => |name| emitFlatOne(ctx, items, i, name),
         .string => error.UnknownInstr,
+        .annotation => unreachable, // handled above
     };
+}
+
+/// Arm the branch hint an annotation in an instruction position carries, after checking
+/// everything about it that is decidable here: the value, and the instruction it points at.
+///
+/// 🔒 **The target must be an `if` or a `br_if`.** Those are the two instructions the
+/// branch-hints proposal hints, so a hint on anything else is an annotation wazmrt *does*
+/// understand and cannot honour — a malformation, by the same rule `@custom` follows.
+///
+/// ⚠️ The canonical toolchain instead emits the section and lets a later stage adjudicate the
+/// target; the corpus asserts only that such a module is REFUSED, never which stage refuses
+/// it (`branch_hint.wast` files that case under `assert_invalid_custom`). Refusing here is
+/// therefore conformant, and strictly earlier.
+fn armBranchHint(ctx: *Ctx, an: sexpr.Annot, items: []const Sexpr, i: usize) Error!usize {
+    if (!std.mem.eql(u8, an.id, "metadata.code.branch_hint")) return error.BadAnnotation;
+    // Exactly one one-byte string: `"\00"` (unlikely taken) or `"\01"` (likely taken).
+    if (an.items.len != 1) return error.BadAnnotation;
+    const s = switch (an.items[0]) {
+        .string => |x| x,
+        else => return error.BadAnnotation,
+    };
+    if (s.len != 1 or (s[0] != 0 and s[0] != 1)) return error.BadAnnotation;
+    if (ctx.pending_hint != null) return error.BadAnnotation; // two hints on one instruction
+    if (i + 1 >= items.len) return error.BadAnnotation; // nothing left to annotate
+    // A second annotation in the target position is neither a list nor an atom, so it lands
+    // here too — which is exactly the "duplicate annotation" case.
+    const target = items[i + 1].keyword() orelse items[i + 1].asAtom() orelse return error.BadAnnotation;
+    if (!std.mem.eql(u8, target, "if") and !std.mem.eql(u8, target, "br_if")) return error.BadAnnotation;
+    ctx.pending_hint = .{ .value = s[0], .level = ctx.level + 1 };
+    return i + 1;
+}
+
+/// Record the armed branch hint at the annotated instruction's OWN opcode, if this is that
+/// instruction. Called from each site that writes an opcode a hint can target.
+///
+/// ⚠️ The `level` guard is what makes a FOLDED form come out right: `(br_if $l (i32.const 0))`
+/// emits its operand first, through this same writer, one level deeper — without the guard the
+/// operand would take the hint and the offset would name `i32.const`. Measured: the flat and
+/// folded spellings of one program record the SAME offset.
+fn takeBranchHint(ctx: *Ctx) Error!void {
+    const h = ctx.pending_hint orelse return;
+    if (h.level != ctx.level) return;
+    ctx.pending_hint = null;
+    try ctx.branch_hints.append(ctx.a, .{ .offset = @intCast(ctx.out.items.len), .value = h.value });
 }
 
 fn emitExpr(ctx: *Ctx, s: Sexpr) Error!void {
@@ -2683,6 +3157,8 @@ fn emitFoldedIf(ctx: *Ctx, l: []const Sexpr) Error!void {
     j += 1;
     const else_form: ?[]const Sexpr = if (j < l.len) l[j].asList() else null;
 
+    // After the condition, before the opcode — the byte a hint on this `if` names.
+    try takeBranchHint(ctx);
     try ctx.out.append(ctx.a, @intFromEnum(Op.@"if"));
     try emitBlockTypeSig(ctx, bt);
     try pushLabel(ctx, label);
@@ -2718,6 +3194,7 @@ fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Erro
     const op = lookupOp(name) orelse return if (untargetedProposalMnemonic(name)) error.UnsupportedInstr else error.UnknownInstr;
     switch (op) {
         .block, .loop, .@"if" => {
+            try takeBranchHint(ctx); // a flat `if` reaches its opcode through here
             try ctx.out.append(ctx.a, opcode.wireByte(op) orelse return error.UnsupportedInstr);
             var j = i + 1;
             const label = parseOptLabel(items, &j);
@@ -3131,6 +3608,7 @@ fn emitBulkTableImm(ctx: *Ctx, op: Op, idxs: []const Sexpr) Error!void {
 }
 
 fn emitInstr(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
+    try takeBranchHint(ctx); // a flat or folded `br_if` reaches its opcode through here
     try emitOpcode(ctx, op);
     // call_ref / return_call_ref carry a *type* index (the ref's signature), not
     // a func index — resolve it against the type names.
@@ -9219,5 +9697,182 @@ test "array.new_data/new_elem reach the VALIDATOR from a const-expr instead of d
         defer m.deinit();
         // ...and is refused at the layer that can say why.
         try std.testing.expectError(error.ConstantExpressionRequired, validate(a, &m));
+    }
+}
+
+/// Test helper: the PAYLOAD of the custom section called `name` (the bytes after its name), or
+/// null when the module has none. Walks the section list properly rather than searching for the
+/// name as a substring — those same bytes occur inside a data segment, and a substring search
+/// would find that one and call the test green.
+fn findCustomPayload(bin: []const u8, name: []const u8) !?[]const u8 {
+    var r = Reader.init(bin[8..]); // past the magic + version
+    while (!r.atEnd()) {
+        const id = try r.readByte();
+        const size = try r.readVarU32();
+        const body = try r.readBytes(size);
+        if (id != 0) continue;
+        var sub = Reader.init(body);
+        const nlen = try sub.readVarU32();
+        const got = try sub.readBytes(nlen);
+        if (std.mem.eql(u8, got, name)) return body[sub.pos..];
+    }
+    return null;
+}
+
+test "@name is legal ONLY in a name-bearing form's identifier slot" {
+    // 🔒 REGRESSION TEST FOR AN ANNOTATION ACCEPTED WHERE IT CANNOT MEAN ANYTHING.
+    // `name_annot.wast` asserts "misplaced @name annotation" for a `(@name …)` written inside
+    // `start`, which bears no name at all. wazmrt ACCEPTED it and emitted a module with no trace
+    // of the annotation — silent-wrong-output, not a missing feature.
+    //
+    // The slot is the position a `$id` occupies, and it is re-derived at EVERY level: the
+    // `import` case below is legal precisely because the annotation belongs to the `func` nested
+    // inside it, so a rule that rejected everything under a non-name-bearing form would be wrong.
+    // Both directions are measured against the canonical toolchain.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    for ([_][]const u8{
+        "(module (start $f (@name \"M\")) (func $f))", // `start` bears no name
+        "(module (func) (@name \"M\"))", // past the module's own slot
+        "(module (@name \"M1\") (@name \"M2\"))", // the second is one past the slot
+        "(module (func (@name \"A\") (@name \"B\")))", // ditto, on a func
+        "(module (func $f (param i32) (@name \"F\")))", // after the type use, not in the slot
+        "(module (func (export \"e\") (@name \"F\")))", // an export already took position 1
+        "(module (export (@name \"E\") \"e\" (func 0)) (func))", // `export` bears no name
+        "(module (type (struct (field (@name \"F\") i32))))", // nor does a struct field
+    }) |src| {
+        try std.testing.expectError(error.BadAnnotation, assemble(a, src));
+    }
+
+    // In the slot, on a form whose name map this build WRITES — accepted and honoured.
+    for ([_][]const u8{
+        "(module (@name \"M\"))",
+        "(module $m (@name \"M\"))",
+        "(module (func $f (@name \"F\")))",
+        "(module (func (@name \"F\") (param i32)))",
+        "(module (import \"a\" \"b\" (func $f (@name \"F\"))))", // the slot is the FUNC's, not the import's
+        "(module (tag (@name \"T\")))",
+        "(module (tag $t (@name \"T\") (param i32)))",
+        "(module (import \"a\" \"b\" (tag $t (@name \"T\"))))",
+    }) |src| {
+        _ = try assemble(a, src);
+    }
+
+    // 🔒 **Accepted is not the same as honoured.** An override that is DROPPED produces a module
+    // byte-identical to one that never carried it, and `tag` was in exactly that state until its
+    // name subsection learned to read the override — it assembled, reported success, and emitted
+    // 19 bytes where the canonical encoder emitted 32. Assert the name actually reaches the
+    // section, not merely that the module builds.
+    const with = try assemble(a, "(module (tag $t (@name \"theta\") (param i32)))");
+    const without = try assemble(a, "(module (tag $t (param i32)))");
+    try std.testing.expect(!std.mem.eql(u8, with, without));
+    try std.testing.expect(std.mem.indexOf(u8, (try findCustomPayload(with, "name")).?, "theta") != null);
+
+    // The same question asked of a function and of the module itself.
+    const fwith = try assemble(a, "(module $m (@name \"lambda\") (func $f (@name \"mu\")))");
+    const fnames = (try findCustomPayload(fwith, "name")).?;
+    try std.testing.expect(std.mem.indexOf(u8, fnames, "lambda") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fnames, "mu") != null);
+
+    // ⚠️ In the slot, on a name-bearing form whose name map this build does NOT yet write.
+    // Refused, not dropped — see `honoured_name_forms`. **This is narrower than the canonical
+    // toolchain, which accepts all eleven**, so each line here is a recorded gap rather than a
+    // rule: when a subsection learns the override, its line moves up to the accept list above.
+    for ([_][]const u8{
+        "(module (type $t (@name \"T\") (func)))",
+        "(module (table (@name \"T\") 1 funcref))",
+        "(module (memory (@name \"M\") 1))",
+        "(module (global (@name \"G\") i32 (i32.const 0)))",
+        "(module (elem (@name \"E\") func))",
+        "(module (data (@name \"D\") \"x\") (memory 1))",
+        "(module (func (param (@name \"P\") i32)))",
+        "(module (func (local (@name \"L\") i32)))",
+        "(module (func (block (@name \"B\"))))",
+        "(module (func (loop (@name \"L\"))))",
+        "(module (func (if (@name \"I\") (i32.const 0) (then))))",
+    }) |src| {
+        try std.testing.expectError(error.BadAnnotation, assemble(a, src));
+    }
+}
+
+test "@metadata.code.branch_hint lands on the annotated instruction's OWN opcode" {
+    // 🔒 The offset is measured from the START OF THE BODY — the locals vector INCLUDED — and it
+    // names the byte of the instruction's own opcode, which for a FOLDED form comes after its
+    // operands. Both facts are measured against the canonical encoder, and getting either wrong
+    // produces a section that decodes cleanly while pointing at the wrong instruction — which no
+    // behaviour test in this project can see.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The flat and folded spellings of one program must record the SAME offset.
+    const flat = try assemble(a, "(module (func (i32.const 0) (@metadata.code.branch_hint \"\\00\") if end))");
+    const folded = try assemble(a, "(module (func (@metadata.code.branch_hint \"\\00\") (if (i32.const 0) (then))))");
+    try std.testing.expectEqualSlices(u8, flat, folded);
+
+    // vec(func)=1 · func 0 · vec(hint)=1 · offset 3 · size 1 · value 0x00.
+    // The body is `00 41 00 04 40 0b 0b`, so byte 3 is the `if` (0x04), not the `i32.const`.
+    const pay = (try findCustomPayload(flat, "metadata.code.branch_hint")).?;
+    try std.testing.expectEqualSlices(u8, &.{ 0x01, 0x00, 0x01, 0x03, 0x01, 0x00 }, pay);
+
+    // ⚠️ A folded operand of any depth must not steal the hint — it reaches the SAME opcode
+    // writer, just one level deeper. Body: `00 41 01 41 02 6a 45 04 40 0b 0b`, so the `if` is 7.
+    const deep = try assemble(a, "(module (func (@metadata.code.branch_hint \"\\01\") (if (i32.eqz (i32.add (i32.const 1) (i32.const 2))) (then))))");
+    const deep_pay = (try findCustomPayload(deep, "metadata.code.branch_hint")).?;
+    try std.testing.expectEqualSlices(u8, &.{ 0x01, 0x00, 0x01, 0x07, 0x01, 0x01 }, deep_pay);
+
+    // ⚠️ The index spans the WHOLE function space, so one import shifts the entry from 0 to 1.
+    const imported = try assemble(a, "(module (import \"a\" \"b\" (func)) (func (i32.const 0) (@metadata.code.branch_hint \"\\00\") if end))");
+    const imp_pay = (try findCustomPayload(imported, "metadata.code.branch_hint")).?;
+    try std.testing.expectEqual(@as(u8, 0x01), imp_pay[1]);
+
+    // The locals vector counts toward the offset: two groups (`02 01 7e 01 7d`) push it to 7.
+    const locals = try assemble(a, "(module (func (local i64) (local f32) (i32.const 0) (@metadata.code.branch_hint \"\\01\") if end))");
+    const loc_pay = (try findCustomPayload(locals, "metadata.code.branch_hint")).?;
+    try std.testing.expectEqual(@as(u8, 0x07), loc_pay[3]);
+
+    // A `br_if` is the other hintable instruction, folded condition and all.
+    const brif = try assemble(a, "(module (func (block (@metadata.code.branch_hint \"\\01\") (br_if 0 (i32.eqz (i32.const 7))))))");
+    try std.testing.expect((try findCustomPayload(brif, "metadata.code.branch_hint")) != null);
+
+    // A module with no hint gets NO section — the feature is not a reason to emit an empty one.
+    const none = try assemble(a, "(module (func (i32.const 0) if end))");
+    try std.testing.expect((try findCustomPayload(none, "metadata.code.branch_hint")) == null);
+}
+
+test "a branch hint wazmrt cannot honour is refused, never dropped" {
+    // 🔒 The doctrine `@custom` already follows: an annotation this build UNDERSTANDS and cannot
+    // honour is a malformation. Dropping it would emit a module byte-identical to one that never
+    // carried the hint at all, which is the defect this whole pass exists to remove.
+    //
+    // ⚠️ The canonical toolchain instead emits the section and adjudicates the target later. The
+    // corpus asserts only that such a module is REFUSED — `branch_hint.wast` files the non-branch
+    // target under `assert_invalid_custom`, never naming a stage — so refusing here is conformant
+    // and strictly earlier.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    for ([_][]const u8{
+        // The target is not a branch.
+        "(module (func (i32.const 0) (i32.const 0) (@metadata.code.branch_hint \"\\01\") i32.eq drop))",
+        "(module (func (@metadata.code.branch_hint \"\\00\") nop))",
+        "(module (func (@metadata.code.branch_hint \"\\00\") block end))",
+        "(module (func (@metadata.code.branch_hint \"\\00\") (drop (i32.const 0))))",
+        // Nothing left to annotate.
+        "(module (func (i32.const 0) drop (@metadata.code.branch_hint \"\\00\")))",
+        // Two hints on one instruction.
+        "(module (func (i32.const 0) (@metadata.code.branch_hint \"\\00\") (@metadata.code.branch_hint \"\\01\") if end))",
+        // The value is exactly one byte, and only 0x00 or 0x01.
+        "(module (func (i32.const 0) (@metadata.code.branch_hint \"\\02\") if end))",
+        "(module (func (i32.const 0) (@metadata.code.branch_hint \"\") if end))",
+        "(module (func (i32.const 0) (@metadata.code.branch_hint \"\\00\\01\") if end))",
+        "(module (func (i32.const 0) (@metadata.code.branch_hint) if end))",
+        // A hint is an instruction-position annotation; at module level it means nothing.
+        "(module (@metadata.code.branch_hint \"\\01\") (func))",
+    }) |src| {
+        try std.testing.expectError(error.BadAnnotation, assemble(a, src));
     }
 }

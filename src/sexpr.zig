@@ -10,6 +10,27 @@
 
 const std = @import("std");
 
+/// A RETAINED annotation — `(@id …)` whose contents were parsed rather than skipped.
+///
+/// 🔑 **Only the ids the assembler implements are retained; every other annotation is still
+/// DROPPED at the lexer exactly as before.** That is not a shortcut, it is the semantics: an
+/// annotation a tool does not understand is meant to be ignored, and `annotations.wast` spends
+/// most of its assertions checking that arbitrary ones are skipped (and that the character class
+/// inside them is still enforced). Retaining only `@custom`, `@name` and the branch hint keeps
+/// every one of those cases on the byte-identical path they were already on.
+pub const Annot = struct {
+    /// The id WITHOUT the `@`.
+    id: []const u8,
+    /// The contents, parsed as ordinary values.
+    items: []const Sexpr,
+};
+
+/// The annotation ids the assembler acts on. Anything else is dropped at the lexer.
+///
+/// ⚠️ Adding an id here changes what reaches `wat.zig` — and an id that reaches it without a
+/// handler is a value the field loops will not recognise. Keep this list and the handlers in step.
+pub const retained_annotations = [_][]const u8{ "custom", "name", "metadata.code.branch_hint" };
+
 pub const Sexpr = union(enum) {
     /// A keyword (`module`, `i32.add`), identifier (`$x`), number, or
     /// `key=value` token — kept as raw source text for the assembler to parse.
@@ -17,6 +38,8 @@ pub const Sexpr = union(enum) {
     /// A string literal, decoded to its byte values (escapes resolved).
     string: []const u8,
     list: []const Sexpr,
+    /// `(@id …)` for one of `retained_annotations`. See `Annot`.
+    annotation: Annot,
 
     /// For a list, the leading atom (its "keyword"), else null.
     pub fn keyword(self: Sexpr) ?[]const u8 {
@@ -39,6 +62,14 @@ pub const Sexpr = union(enum) {
     pub fn asList(self: Sexpr) ?[]const Sexpr {
         return switch (self) {
             .list => |l| l,
+            else => null,
+        };
+    }
+
+    /// The annotation this value is, if it is one.
+    pub fn asAnnotation(self: Sexpr) ?Annot {
+        return switch (self) {
+            .annotation => |an| an,
             else => null,
         };
     }
@@ -247,6 +278,18 @@ const Parser = struct {
     /// and it is the single largest group in the file. Tab, newline and carriage return are
     /// explicitly ALLOWED; every other control byte and `0x7f` are not.
     fn skipAnnotation(self: *Parser) Error!void {
+        _ = try self.annotation();
+    }
+
+    /// Consume one `(@id …)`. Returns the annotation when `id` is one the assembler acts on
+    /// (`retained_annotations`), and null when it was skipped as opaque text.
+    ///
+    /// 🔑 **The two paths differ in what they do with the CONTENTS, not with the id.** A retained
+    /// annotation's body is parsed as ordinary values, because `@custom`'s body is a name, an
+    /// optional `(before|after X)` and string literals. An unretained one keeps the opaque
+    /// balanced-text scan — which is what enforces the printable-ASCII class `annotations.wast`
+    /// spends most of its assertions on, and what makes `((@a)@b)` behave.
+    fn annotation(self: *Parser) Error!?Annot {
         self.depth += 1;
         defer self.depth -= 1;
         if (self.depth > max_depth) return error.NestingTooDeep;
@@ -254,18 +297,48 @@ const Parser = struct {
 
         // `annotid ::= '@' idchar+ | '@' string` — NO separator, and non-empty.
         if (self.pos >= self.src.len) return error.UnclosedAnnotation;
+        var id: []const u8 = undefined;
         if (self.src[self.pos] == '"') {
-            const s = try self.parseString();
-            if (s.len == 0) return error.EmptyAnnotationId;
+            id = try self.parseString();
+            if (id.len == 0) return error.EmptyAnnotationId;
             // An annotation id is an IDENTIFIER, so it carries the identifier UTF-8 rule rather
             // than the permissive string one — `(@"\ef")` is malformed.
-            if (!std.unicode.utf8ValidateSlice(s)) return error.BadIdentifier;
+            if (!std.unicode.utf8ValidateSlice(id)) return error.BadIdentifier;
         } else {
             const start = self.pos;
             while (self.pos < self.src.len and isIdChar(self.src[self.pos])) self.pos += 1;
             if (self.pos == start) return error.EmptyAnnotationId;
+            id = self.src[start..self.pos];
         }
-        return self.skipAnnotationBody();
+
+        var retained = false;
+        for (retained_annotations) |known| {
+            if (std.mem.eql(u8, id, known)) retained = true;
+        }
+        if (!retained) {
+            try self.skipAnnotationBody();
+            return null;
+        }
+
+        // Retained: parse the body as values, up to the matching `)`.
+        var items: std.ArrayList(Sexpr) = .empty;
+        while (true) {
+            self.skipTrivia();
+            if (self.pos >= self.src.len) return error.UnclosedAnnotation;
+            if (self.src[self.pos] == ')') {
+                self.pos += 1;
+                break;
+            }
+            // ⚠️ A nested annotation inside a retained one follows the ordinary rule — retained if
+            // known, dropped if not — so `(@custom "n" (@x) "c")` loses the `(@x)` and keeps the
+            // rest, which is what dropping an un-understood annotation means.
+            if (self.atAnnotation()) {
+                if (try self.annotation()) |nested| try items.append(self.a, .{ .annotation = nested });
+                continue;
+            }
+            try items.append(self.a, try self.parseValue());
+        }
+        return .{ .id = id, .items = items.items };
     }
 
     /// The opaque remainder, up to and including the matching `)`. Shared by the annotation
@@ -330,7 +403,7 @@ const Parser = struct {
             // ordinary atom the assembler rejects as an unknown operator, which is the verdict
             // the corpus asks for.
             if (self.atAnnotation()) {
-                try self.skipAnnotation();
+                if (try self.annotation()) |ann| try items.append(self.a, .{ .annotation = ann });
                 continue;
             }
             try items.append(self.a, try self.parseValue());

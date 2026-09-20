@@ -1074,6 +1074,34 @@
 #
 # Unit tests 796 -> 802. Corpus unchanged (288 / 64,072 / 0 failed / 20 skipped).
 
-wazmrt.exe  1009152
-wazmrt.lib  1058980
-wazmrt.dll  910336
+# ---------------------------------------------------------------------------------------
+# 2026-09-20 — CUSTOM ANNOTATIONS (`@custom`, `@name`, `@metadata.code.branch_hint`).
+# **exe +10,752, lib +12,186, dll +9,728.** A feature pass, so the numbers go up.
+#
+# What bought the bytes — the lexer used to DROP every annotation, which made wazmrt emit a
+# byte-identical module whether the annotation was written or not. Silent-wrong-output, not a
+# missing feature: the text said one thing and the binary said another, and nothing could see it.
+# Three annotation ids are now retained and honoured:
+#
+#   @custom                      a custom SECTION, laid out into the gap its `(before|after X)`
+#                                anchor names — 14 flush points, one per canonical slot
+#   @name                        overrides the `$id` in the name section for `module`, `func` and
+#                                `tag`, and is legal ONLY in a name-bearing form's identifier slot
+#                                (`rejectMisplacedName`). On the other eleven name-bearing forms
+#                                it is REFUSED, not dropped — see `honoured_name_forms`
+#   @metadata.code.branch_hint   a `metadata.code.branch_hint` section before `code`, offsets
+#                                measured from the body start with the locals vector included
+#
+# ⚠️ The `lib` grows most (+11,732) because it carries `wat.zig` twice over — see the ABI-2 note
+# above; an embedder who never assembles text still pays for all of this until `-Dwat=false`
+# exists. That remains the argument for Track 2c, and this pass made it 11 KB stronger.
+#
+# Corpus 64,072 / 20 skipped -> **64,092 / 0 skipped**: the 20 were the three `custom/` files,
+# which no longer contain a construct this build cannot put to the test.
+#
+# Unit tests 804 passing / 808 total (4 skipped). Spec-corpus emitter differential unchanged at
+# 2,121 agree / 20 differ; real-world corpus 1,039 / 1,039 digest parity.
+
+wazmrt.exe  1019904
+wazmrt.lib  1071166
+wazmrt.dll  920064

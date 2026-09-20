@@ -305,7 +305,14 @@ const Runner = struct {
             try self.assertExhaustion(cmd.asList().?);
         } else if (std.mem.eql(u8, kw, "assert_exception")) {
             try self.assertException(cmd.asList().?);
-        } else if (std.mem.eql(u8, kw, "assert_invalid") or std.mem.eql(u8, kw, "assert_malformed")) {
+        } else if (std.mem.eql(u8, kw, "assert_invalid") or std.mem.eql(u8, kw, "assert_malformed") or
+            // 🆕 The custom-annotations proposal's own spellings (`custom/*.wast`). They assert
+            // exactly what the plain forms do — **the module must be REJECTED** — and differ only
+            // in that the expected message names an annotation. ⚠️ Until they were dispatched
+            // here they fell to the unknown-command arm and were SKIPPED, which is all 20 of the
+            // corpus's remaining skips: three files whose every assertion uses these two words.
+            std.mem.eql(u8, kw, "assert_malformed_custom") or std.mem.eql(u8, kw, "assert_invalid_custom"))
+        {
             try self.assertRejected(cmd.asList().?);
         } else if (std.mem.eql(u8, kw, "assert_unlinkable")) {
             try self.assertUnlinkable(cmd.asList().?);
