@@ -980,6 +980,30 @@ other runtime would load. ⚠️ **The field-coverage sweep this audit also ran 
 defect was never an unread field, it was a second writer. 🎓 *When you find a function that rebuilds
 what another function already emits, the question is not whether it is correct today.* — Track B-a, `wat.zig`
 
+**A MEASURING TOOL MUST BUILD WHAT IT REPORTS, IN THE SAME RUN.** The size gate depended on the
+install step, and the DLL is a *separate* step — so it graded whatever an earlier invocation had left
+in `zig-out`. On 2026-09-20 that file was **34 days old** and the real artifact had grown +9,728 bytes
+behind it, while four consecutive commits recorded "dll +0" from it. ⚠️ **A number that matches the
+ceiling to the byte is evidence of a stale file, not of a change that cost nothing** — treat an exact
+match as a prompt to check the timestamp. 📎 *Arrived at independently by the sibling project, which
+wrote the rule from watching THIS gate drift; adopted here under an owner-directed consultation.*
+— Track B-e, `build.zig`
+
+**A HAZARD WITH A WARNING WRITTEN NEXT TO IT IS STILL A HAZARD — AND THE WARNING IS WHAT STOPS ANYONE
+REMOVING IT.** `zig build dll` overwrote the 1 MB static library with the DLL's 21 KB import library,
+because both are called `wazmrt.lib`. `size-ceilings.txt` had carried a note about it for weeks
+(*"measure the static lib from a plain `zig build`, never after `dll`"*), which made the collision feel
+handled. It was not: it was also the reason the size gate could never measure all three artifacts in
+one run. 🎓 **When a document tells a human to sequence their commands to avoid corruption, the fix is
+in the build, not the document.** — Track B-e, `build.zig`
+
+**ATTRIBUTE AN OVERSHOOT BEFORE PAYING FOR IT.** When a ceiling breaks, build the PARENT COMMITS in a
+worktree instead of assuming the growth is yours. Doing that for the DLL showed three of the four
+changes that day really had cost zero, one had cost exactly one 4 KiB page, and 5,632 bytes predated
+all of them — a split no amount of reasoning about likely causes would have produced, and the
+difference between raising a ceiling with an explanation and raising it with a guess. 📎 *Also the
+sibling's rule.* — Track B-e, `tools/size-ceilings.txt`
+
 **A GATE THAT HAS TO BE REMEMBERED IS NOT ENFORCEMENT.** `zig build size` is a separate step, so it
 runs when somebody thinks of it — and on 2026-09-20 `main` was found **4,608 bytes over the exe
 ceiling**, put there by two commits that had each grown the CLI without raising the number in the same

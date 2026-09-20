@@ -145,7 +145,7 @@ The CLI now also type-checks each module (`validation: OK` / `FAILED — <error>
 | **`test-shipped` (ReleaseSmall — the config that ships)** | 765/765 |
 | `test-security` | 3/3 from an NTFS cwd |
 | `features` · `capi-smoke` | green |
-| size (ReleaseSmall) | exe **991,744** · lib **1,053,908** · dll **900,608** — all three EXACT |
+| size (ReleaseSmall) | exe **1,009,664** · lib **1,059,240** · dll **910,336** — all three EXACT (2026-09-20). ⚠️ **Every `dll` number recorded before 2026-09-20 was read off a STALE file** — the gate did not build the shared library it graded, so `900,608` was wrong from the day it was written. See `roadmap.md` → B-e |
 
 **Size moved twice in the track, both recorded in `tools/size-ceilings.txt` with the reason:** the
 iteration budget (exe +1,024 · lib +512 · dll +0) and the GC-ceiling fix (exe +512 · lib +76 · dll +0).

@@ -917,7 +917,56 @@ wording was reaching for, and the wording was wrong about *how*. 📌 A gate wri
 predicts the shape of the answer; when it predicts wrong and the outcome is right, say so rather
 than re-reading the number until it matches.
 
-#### ⚠️ B-e — THE SIZE GATE IS NOT WIRED INTO ANYTHING THAT RUNS `[ ]`
+#### ✅ B-e — THE SIZE GATE IS WIRED IN NOW, AND IT HAD BEEN GRADING A 34-DAY-OLD DLL. **DONE 2026-09-20** (`90d501d2`)
+
+🔑 **The item was "give the gate a trigger". Consulting the sibling found the trigger AND two defects
+the item had not suspected.** ⚠️ **That consultation was OWNER-DIRECTED**, and `interop.md` §1's
+retired oracle otherwise forbids reading their tree for design guidance — recorded as a **scoped
+exception for this item, not a reopening**. It paid: they had already written the rule, from watching
+*this* gate accrue drift.
+
+> *"A gate only gates the commits that RUN it."* … *"A size gate reads whatever is on disk, including
+> yesterday's artifact. A number that matches the ceiling to the byte is evidence of a stale file, not
+> of a change that cost nothing."* — wasmrt's `best-practices.md`
+
+🚨 **Both were live here.** `zig build dll` is a separate step and the gate depended only on the
+install step, so the DLL it graded was whatever an earlier invocation had left in `zig-out`. **That
+file was dated 2026-08-17.** And when it was absent the gate printed `(not built — skipped)` and then
+**OK** — so the shared library was stale, or silently ungraded, and never actually gated.
+
+🔎 **The root cause was a PATH COLLISION that had been documented instead of fixed.** A Windows shared
+library installs a `.dll` *and* an import library, also called `wazmrt.lib` — so `zig build dll`
+overwrote the 1 MB static library with a 21 KB stub. `size-ceilings.txt` carried a warning about it
+(*"measure the static lib from a plain `zig build`, never after `dll`"*), and that same collision is
+why the gate could not measure all three artifacts in one run. 🎓 **A hazard with a warning written
+next to it is still a hazard; the warning is what stops anyone removing it.**
+
+| fix | |
+| --- | --- |
+| **the trigger** | `-Doptimize=ReleaseSmall` runs the gate by itself. It cannot join plain `zig build` — that is Debug, which the tool correctly refuses to grade — so it attaches exactly when the mode is the one the ceilings describe. **Build the config that ships and you have checked it** |
+| **the staleness** | the `size` step now DEPENDS ON BUILDING the DLL |
+| **the collision** | the DLL and its import library install to `zig-out/dll/`; all three artifacts coexist and build order stops mattering |
+| **the silent skip** | a ceiling naming an artifact nothing built is a hard **failure**. Verified with a deliberately bogus entry |
+
+📐 **ATTRIBUTED BEFORE PAYING FOR IT** — the sibling's third rule — by building each parent commit in
+a worktree rather than assuming the growth was the newest change's:
+
+| commit | dll |
+| --- | --- |
+| `6cc89ce5` Track H — **the commit that WROTE `900608`** | **906,240** (already 5,632 over) |
+| `41a96aa3` before today's Track B work | 906,240 |
+| `a495424f` B-c2, the `name` section | 906,240 (**+0**) |
+| `973dc0de` B-d, inline typeuse | 906,240 (**+0**) |
+| `8e04263b` B-c4, subcommand spellings | 906,240 (**+0**) |
+| `d47ecd18` B-a, the emitter audit | **910,336 (+4,096)** |
+
+🎓 **Three of the four "dll +0" claims made on 2026-09-20 were TRUE, and every one was checked against
+a number that was already wrong.** *Being right for a reason you did not check is being lucky.* B-a's
+was the false one — one 4 KiB page, which is what touching `wat.zig`, `opcode.zig` and `validate.zig`
+costs an artifact containing all three. ⚠️ The 5,632 that predates today belongs to **Track H's own
+commits** and was never attributed, because nothing ever measured it. Ceiling now **910,336**.
+
+#### ~~B-e~~ — the item as filed, retained for the record
 
 **`zig build size` is a separate step, so it only runs when somebody remembers it — and on
 2026-09-20 nobody had.** `main` at `41a96aa3` was **4,608 bytes over the exe ceiling**: `0a48957a`
