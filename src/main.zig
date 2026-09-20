@@ -117,6 +117,16 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
         return exit_failure;
     }
 
+    // ⚠️ **Z2 / v14: a flag-shaped argument in the module-path position is an unknown flag, not a
+    // missing file.** This used to fall through to the read below and report
+    // `cannot read '--bogus': FileNotFound` — the right exit code with a message that sends the
+    // user to look at the filesystem for a typo in their flag. `-h`/`-v` are handled above as the
+    // first argument only (§2.4), and `--features` has already been consumed.
+    if (args[argi].len >= 2 and args[argi][0] == '-') {
+        try reportUnknownFlag(out, args[argi]);
+        return exit_failure;
+    }
+
     const path = args[argi];
     // Everything after the module path: the export selector, the WASI flags, the guest's argv.
     // With no leading `--features` this is exactly the `args[2..]` it replaced.
@@ -160,6 +170,15 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
             break;
         }
     }
+    // ⚠️ **Z2: an unrecognised `--flag` in the leading host-flag run stops the run** (§2.4a), before
+    // the file is read, so the message names the flag rather than the file. Single-dash tokens are
+    // NOT examined here: by v15 they are the guest's wherever there is a guest, and the two modes
+    // with no guest argv re-check with `single_dash = true` once the mode is known.
+    if (unknownHostFlag(rest, false)) |bad| {
+        try reportUnknownFlag(out, bad);
+        return exit_failure;
+    }
+
     // ⚠️ Before anything is read or run: say so if a wazmrt flag was written
     // where only the guest will see it. Placed here so it covers EVERY mode —
     // run, WASI, `.wast` and summarize — rather than the one that happened to
@@ -173,6 +192,13 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
 
     // .wast script mode: parse + run the assertions, print a pass/fail summary.
     if (std.mem.endsWith(u8, path, ".wast")) {
+        // ⚠️ **§2.4a item 4: a command with no guest argv has no guest positions**, so a single-dash
+        // token here is ours too and an unrecognised one is an error. `wazmrt s.wast --bogus` used
+        // to exit 0 with the flag silently ignored.
+        if (unknownHostFlag(rest, true)) |bad| {
+            try reportUnknownFlag(out, bad);
+            return exit_failure;
+        }
         // `runScript` INSTANTIATES AND INVOKES the script's modules — including
         // `(module binary "…")` raw payloads — so this path executes and must be
         // gated exactly like a module. It used to `return` before the gate below,
@@ -277,7 +303,42 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
         return std.math.cast(u8, code) orelse exit_failure;
     }
 
-    try out.print("{s}: valid wasm v{d}, {d} section(s)\n", .{ path, module.version, module.sections.len });
+    // 🔒 **Z3 / `interop.md` §2.5: no line may call a module VALID unless it validated.** This
+    // header prints BEFORE validation runs at the end of this path, so it said "valid wasm v1" above
+    // its own "validation: FAILED" — the exit code was right and the first line a human reads was
+    // not. Neutral wording is the fix; the verdict is the `validation:` line below.
+    // 🔒 **Z1 / `interop.md` §2.3: never silently succeed at something other than what was asked.**
+    // Reaching here means the first argument named no export AND the module has no `_start` — so it
+    // could only ever have been an export name, and the run used to print a summary and exit **0**
+    // with the word silently dropped. ⚠️ The guard is deliberately narrow, as §2.5h asks: where the
+    // module DOES export `_start` the same word may legitimately be guest argv, and that path
+    // returned above without reaching this.
+    // ⚠️ **Look past the leading host-flag run, not at `rest[0]`.** A first cut checked `rest[0]`
+    // and `wazmrt m.wasm --allow-symlink spin` still summarized in silence — the word sat behind a
+    // flag, so the guard never saw it. `flagRegion` already knows where our flags stop; use it.
+    // ⚠️ An explicit `--` is left alone: the user SAID the rest is the guest's, and a guest position
+    // is never examined (§2.4a), even when it turns out there is no guest to receive it.
+    const first_word = flagRegion(rest).len;
+    if (rest.len > first_word and !std.mem.eql(u8, rest[first_word], "--")) {
+        try out.print("error: no exported function '{s}' in {s}\n", .{ rest[first_word], path });
+        if (module.exports.len == 0) {
+            try out.print("  the module exports nothing\n", .{});
+        } else {
+            try out.print("  exports:", .{});
+            for (module.exports) |e| try out.print(" {s}", .{e.name});
+            try out.print("\n", .{});
+        }
+        return exit_failure;
+    }
+
+    // ⚠️ **§2.4a item 4 again:** summarize has no guest argv either, so a leftover single-dash flag
+    // is a host position. The `--flag` case was caught before the read; this catches `-x`.
+    if (unknownHostFlag(rest, true)) |bad| {
+        try reportUnknownFlag(out, bad);
+        return exit_failure;
+    }
+
+    try out.print("{s}: wasm v{d}, {d} section(s)\n", .{ path, module.version, module.sections.len });
     for (module.sections) |s| {
         try out.print("  - {s} (payload {d} bytes @ 0x{x})\n", .{ @tagName(s.id), s.size, s.offset });
     }
@@ -793,7 +854,18 @@ fn defaultPinsPath() []const u8 {
 /// for repeatedly, and a drifted copy here would mean a flag that is parsed but
 /// never warned about, or warned about but not parsed.
 const flags_with_value = [_][]const u8{ "--dir", "--ro-dir", "--env", "--verify", "--pins", "--max-memory", "--max-table-elems", "--max-iterations" };
-const flags_bare = [_][]const u8{ "--no-verify", "--yes" };
+///
+/// 🚨 **`--allow-symlink` WAS MISSING FROM THIS LIST AND IT DISARMED THE VERIFY GATE.**
+/// `runWasi` parses it in its own flag loop, but `flagRegion` never knew about it, so the region
+/// ENDED at it and every host flag written after it became invisible to `hasFlag`, `flagValue`
+/// and the `--max-iterations` splice. Measured 2026-09-19:
+/// `wazmrt start.wasm --allow-symlink --verify enforce` ran an **unverified** module, **rc 0**,
+/// where the same line without `--allow-symlink` correctly refuses it. `--max-iterations` after it
+/// was likewise dropped, and the mode dispatch lost the export name to boot.
+/// 🎓 **This is exactly the drift the comment above warns about, and it had already happened** —
+/// the "one list" was one list and the parser was still reading a different vocabulary. *A list
+/// kept in one place is not the same as a list kept in agreement with its consumer.*
+const flags_bare = [_][]const u8{ "--no-verify", "--yes", "--allow-symlink" };
 
 fn flagRegion(rest: []const []const u8) []const []const u8 {
     const two = flags_with_value;
@@ -860,6 +932,53 @@ fn misplacedFeaturesFlag(rest: []const []const u8) ?[]const u8 {
         return null; // first non-flag argument — everything from here is the guest's
     }
     return null;
+}
+
+/// ⚠️ **Z2 / `interop.md` §2.4a: a flag-shaped argument in a HOST-flag position that this command
+/// does not recognise is an ERROR.** Returns the offending token, or null.
+///
+/// 🔒 **Owner, 2026-09-19 — v14, no "looks like":** *"If it is a valid cli option run it, if not
+/// throw and error."* So this compares against the recognised set and nothing else: no prefix
+/// matching, no near-miss adoption, and above all **no guessing that a flag is a PATH** — which is
+/// what wazmrt used to do (`cannot read '--bogus': FileNotFound`, sending the user to the
+/// filesystem to debug a typo'd flag).
+///
+/// 🎯 **`single_dash` is v15, the owner's same-day narrowing, and it is scoped by MODE.** After the
+/// module path, a single-dash token is the GUEST's and runs as written (`prog.wasm -la`) — because
+/// every host flag legal there is double-dash, so a lone dash cannot be one of ours. That carve-out
+/// only applies where there IS a guest: in summarize and `.wast` there is no argv to hand it to, so
+/// every argument is a host position (§2.4a item 4) and callers pass `single_dash = true`.
+///
+/// ⚠️ **Guest positions are never examined**, which is the half that keeps `prog.wasm install --yes`
+/// working: the walk stops at an explicit `--` and at the first non-flag argument, so a guest's own
+/// `--yes` can never be mistaken for the host's. §2.4 records what that trap cost.
+fn unknownHostFlag(rest: []const []const u8, single_dash: bool) ?[]const u8 {
+    var i: usize = 0;
+    outer: while (i < rest.len) {
+        const a = rest[i];
+        if (std.mem.eql(u8, a, "--")) return null; // explicit hand-off; the guest's
+        if (a.len < 2 or a[0] != '-') return null; // first non-flag argument — the guest's
+        if (a[1] != '-' and !single_dash) return null; // v15: a lone dash belongs to the guest
+        for (flags_with_value) |f| if (std.mem.eql(u8, a, f) and i + 1 < rest.len) {
+            i += 2;
+            continue :outer;
+        };
+        for (flags_bare) |f| if (std.mem.eql(u8, a, f)) {
+            i += 1;
+            continue :outer;
+        };
+        return a;
+    }
+    return null;
+}
+
+/// Report an unknown host flag and fail. One wording, so the two call sites cannot drift.
+fn reportUnknownFlag(out: *Io.Writer, bad: []const u8) !void {
+    try out.print(
+        "error: unknown flag '{s}'\n" ++
+            "  run with --help for the flags this command accepts; use '--' to pass it to the guest\n",
+        .{bad},
+    );
 }
 /// Parse a `--max-memory` size: a decimal count of bytes with an optional
 /// `K`/`M`/`G` suffix (`512M`, `2G`, `1073741824`). Returns null if unparseable
@@ -1600,6 +1719,64 @@ fn misplacedWarnings(rest: []const []const u8) ![]const u8 {
     var w: Io.Writer = .fixed(&S.buf);
     try warnMisplacedFlags(&w, rest);
     return w.buffered();
+}
+
+test "a wazmrt flag after --allow-symlink still APPLIES (the list drift that disarmed --verify)" {
+    // 🚨 **This is a SECURITY regression test.** `--allow-symlink` is parsed by `runWasi`'s own flag
+    // loop but was missing from `flags_bare`, so `flagRegion` ENDED at it and every host flag after
+    // it became invisible to `hasFlag`, `flagValue` and the `--max-iterations` splice.
+    //
+    // Measured before the fix, 2026-09-19:
+    //   wazmrt start.wasm --verify enforce                  -> rc 1, refused (correct)
+    //   wazmrt start.wasm --allow-symlink --verify enforce  -> rc 0, **RAN UNVERIFIED**
+    //
+    // 🎓 The "one list" comment above `flags_with_value` exists to stop exactly this, and it had
+    // happened anyway: the list was in one place and the PARSER was reading a different vocabulary.
+    // *A list kept in one place is not the same as a list kept in agreement with its consumer.*
+
+    // The whole line must be consumed as host flags — nothing may be left for the guest.
+    const line = [_][]const u8{ "--allow-symlink", "--verify", "enforce", "--no-verify", "--max-iterations", "1000" };
+    try std.testing.expectEqual(line.len, flagRegion(&line).len);
+
+    // The direction that actually bit: a verification flag written after it must still be FOUND.
+    try std.testing.expect(hasFlag(&line, "--no-verify"));
+    try std.testing.expectEqualStrings("enforce", flagValue(&line, "--verify").?);
+    try std.testing.expectEqualStrings("1000", flagValue(&line, "--max-iterations").?);
+
+    // ⚠️ And the protection it must NOT weaken: past the first guest argument, nothing is ours.
+    const guest = [_][]const u8{ "--allow-symlink", "install", "--yes" };
+    try std.testing.expectEqual(@as(usize, 1), flagRegion(&guest).len);
+    try std.testing.expect(!hasFlag(&guest, "--yes"));
+}
+
+test "an unrecognised flag in a HOST position is an error; guest positions are untouched" {
+    // 🔒 Z2 / `interop.md` §2.4a, as narrowed by v15, and §2.4a-i (v14): exact match or error.
+    // wazmrt used to exit **0** for an unknown flag after the module path and in `.wast`, and to
+    // report one before the path as `cannot read '--bogus': FileNotFound` — a path-guess.
+
+    // ---- host positions: an unknown `--flag` is an error regardless of mode ----
+    try std.testing.expectEqualStrings("--bogus", unknownHostFlag(&.{"--bogus"}, false).?);
+    try std.testing.expectEqualStrings("--bogus", unknownHostFlag(&.{ "--dir", ".", "--bogus" }, false).?);
+    try std.testing.expectEqualStrings("--bogus", unknownHostFlag(&.{ "--allow-symlink", "--bogus" }, false).?);
+
+    // ---- v15: a SINGLE-dash token is the guest's wherever there IS a guest ----
+    try std.testing.expect(unknownHostFlag(&.{"-la"}, false) == null);
+    // ...and a host position wherever there is NOT (summarize, `.wast`, `wat` — §2.4a item 4).
+    try std.testing.expectEqualStrings("-la", unknownHostFlag(&.{"-la"}, true).?);
+
+    // ---- recognised flags are consumed, with and without their values ----
+    try std.testing.expect(unknownHostFlag(&.{ "--dir", ".", "--no-verify", "--max-memory", "1M" }, true) == null);
+
+    // ---- guest positions are NEVER examined, which is half the rule ----
+    // After an explicit `--` the user said the rest is the guest's.
+    try std.testing.expect(unknownHostFlag(&.{ "--", "--bogus" }, true) == null);
+    // ⚠️ After the first non-flag argument. This is `prog.wasm install --yes`, the case §2.4 was
+    // bought with: a guest's own `--yes` must never be read as the host's.
+    try std.testing.expect(unknownHostFlag(&.{ "install", "--yes" }, true) == null);
+    try std.testing.expect(unknownHostFlag(&.{ "add", "-1", "2" }, true) == null);
+    // A lone "-" is a conventional stdin/stdout stand-in, not a flag.
+    try std.testing.expect(unknownHostFlag(&.{"-"}, true) == null);
+    try std.testing.expect(unknownHostFlag(&.{}, true) == null);
 }
 
 test "--features written AFTER the module path is an ERROR, not a silent no-op" {
