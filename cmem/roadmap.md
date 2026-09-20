@@ -566,7 +566,7 @@ the SKIP count never moved. *File a suspicion as a suspicion, then measure it be
 | **Stale scope comments + two orphaned doc comments** | ✅ **FIXED.** The scope claims did more than misinform: in two cases the stale comment **picked the error**, and the error picked the column in the conformance score. `simdSig`'s doc was on `atomicValType` and `asStr`'s on `wrapModuleText` — each function carrying someone else's first sentence while another carried none |
 | ✅ **`hostRefPayload`** (pub, zero callers) and **`BadFuncType`** (unreachable member of a **public** error set) | ✅ **DECIDED by the owner 2026-09-20: SUPPORTED API — keep both, documented.** Both now carry the reason in their doc comments, so the next sweep stops there instead of re-deriving it: `interp.zig`'s `pub` surface and `DecodeError`'s membership are **versioned contracts**, and *"unreachable today" is not the same claim as "no longer part of the API"*. *(Original entry: )* ⬜ **STILL OPEN — owner decision, and the only one of the six that is.** Removable only if `interp.zig`'s `pub` surface and `DecodeError` are implementation details rather than API. Deleting either is an API change for anyone switching exhaustively or calling through `root.interp` |
 | ⬜ **Low-value duplicates left standing** | ⬜ `readF32Bits` ≡ `readU32Le` (one function, two names, each doc describing half the truth); three ULEB **encoders** (one test-only); `hexVal` duplicated in `pin.zig`/`sexpr.zig`; export-by-name lookup implemented 4× and open-coded 7× more. **None reconstructs a fact** — they are copies of trivial code, which is the class the duplicate hunt deliberately ranked last |
-| 🆕 ⬜ **Track A's reopen condition is MET** | ⬜ Recorded 2026-09-20 — and the GATE QUESTION is answered below, ahead of any code (owner, 2026-09-20: *"decide the gate question first"*) |
+| ✅ **Track A's reopen condition is MET** | ✅ **CLOSED 2026-09-20 — the gate question was answered first (owner: *"decide the gate question first"*), then the code shipped.** Option C: no feature bit, annotations are fidelity work. `custom/` 0/1/20 → **20/0/0**; corpus 64,092 / 0 failed / **0 skipped**. See the ✅ IMPLEMENTED section below |
 
 ###### 🔬 `@custom` — THE GATE QUESTION, ANSWERED BEFORE THE CODE
 
@@ -633,9 +633,12 @@ which is the very sentence wasmrt's owner quoted when directing their fix.
 
 📌 **So the recommendation CHANGES: not A.** Skipping the spec files was the visible half; the
 invisible half is that every annotated `.wat` assembles to the wrong module in silence, and `.wat`
-digests are **not portable** for any file using annotations. ⬜ **Scope for the owner:** the minimum
-honest fix is either to **implement** (option C, as both siblings did, to their measured canonical
-behaviour) or to **REFUSE** an annotation wazmrt cannot honour — but not to keep dropping it.
+digests are **not portable** for any file using annotations. ✅ **Scope for the owner — ANSWERED the
+same day: implement (option C).** The minimum honest fix was either to **implement**, as both siblings
+did, to their measured canonical behaviour, or to **REFUSE** an annotation wazmrt cannot honour — but
+not to keep dropping it. 🔑 **In the end BOTH were used**, and the split is the interesting part: the
+three ids wazmrt can honour are implemented, and the eleven `@name` positions it cannot are *refused*.
+See the ✅ IMPLEMENTED section immediately below.
 
 ###### ✅ IMPLEMENTED 2026-09-20 — `custom/` **0/1/20 → 20/0/0**, option C, at owner direction
 
