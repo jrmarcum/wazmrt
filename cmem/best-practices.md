@@ -1203,3 +1203,62 @@ the 2026-07-16 note in `testing.md` even names the symptom. It stayed unchased b
 bytes, where instantiate is ~0.0 µs; on a real 46 KB guest it is 304–376 µs, a third of cold start.
 **Pick the benchmark module before trusting the ranking it produces** — a microbenchmark does not merely
 shrink the workload, it changes its SHAPE. — 2026-08-19, `testing.md`
+
+---
+
+## 6. Tooling — how scripts are written and run
+
+🔒 **EVERY SCRIPT IN THIS REPO IS A DENO `.mjs`. No bash, no PowerShell, no Python, no bun, no npm.**
+The tree already worked this way — `tools/phases.mjs`, `tools/bakeoff.mjs` and `examples/deno_ffi_capi.mjs`
+are run by `deno run --allow-…` from `build.zig`, and the only other tooling language is Zig itself
+(`tools/size_gate.zig`, `tools/conformance.zig`) — but **nothing said so**, which left the convention one
+contributor away from a second runtime. Now it is a rule.
+
+**Why Deno and not a shell:**
+
+- **The shell is not one thing on this machine.** `bash` here is Git Bash, with MSYS path conversion that
+  silently rewrites arguments — it turned `--dir .:/` into `--dir .;C:/…` during a differential run and
+  produced a measurement that looked like a runtime defect and was not. PowerShell 5.1 has different
+  quoting again, no `&&`, and `Set-Content` defaults to ANSI. **A `.mjs` behaves identically on all
+  three platforms.** Portability is not a nicety here: the project is built and gated on Windows,
+  Linux and macOS.
+- **Explicit permissions match the project's posture.** `deno run --allow-read --allow-run` states what a
+  script may touch, in the same spirit as the WASI rights model this runtime implements. A shell script
+  asserts nothing and gets everything.
+- **Deno is already a declared dependency** for `phases`, `bakeoff` and `ffi-demo`. Adding Python or a
+  shell adds a *new* platform assumption to a project whose first invariant is **zero dependencies**.
+- **Not bun, for the same reason there is one pin DB path:** nothing in the tree uses it, and two script
+  runtimes is *a list written out a second time*, which is the failure this project names most often.
+  If bun ever replaces Deno it replaces it everywhere, in one change, with this rule updated.
+
+⚠️ **This binds throwaway work too, not just committed tools.** A one-off migration or an audit sweep is
+where the temptation to "just pipe it through bash" is strongest, and it is exactly where a silent
+mis-measurement costs the most — because nobody reviews a command that already ran.
+— tooling convention made explicit, 2026-09-19
+
+🚫 **NEVER PASS A SCRIPT TO AN INTERPRETER THROUGH A SHELL HEREDOC. Write the file, then run the file.**
+`cmd <<'EOF' … EOF` puts an invisible escaping layer between what you wrote and what the interpreter
+parses, and **it fails silently far more often than it fails loudly.** Three distinct corruptions in a
+single session, all from the same shape:
+
+1. **Escapes were consumed twice.** `"…path\n"` written inside a heredoc-delivered script arrived as a
+   *real newline* and was emitted into a Zig string literal, producing a source file that could not
+   compile — and the build reported it only as `error: Unexpected`, naming no line.
+2. **Backslashes were halved before the interpreter saw them.** A replacement meant to match Zig's `\\`
+   multiline prefix matched **zero** occurrences. The edit did nothing. *It was caught only because the
+   script asserted its match count* — without that assert it would have been a silent no-op reported as
+   success.
+3. **A quote inside the body aborted the whole command** with `unexpected EOF while looking for matching`,
+   after the earlier statements in the same command had already run — leaving a half-applied change.
+
+**A file on disk has exactly one layer of escaping: its own.** Write it, then run it. The file is also
+re-runnable, diffable, and reviewable, none of which a heredoc is.
+
+🔒 **COROLLARY, and it is the half that catches the silent case: an edit script MUST assert its match
+count and write ATOMICALLY.** Every replacement asserts it matched **exactly once** — not "at least
+once", which passes when a pattern accidentally matches twice and corrupts both sites — and the file is
+written **only after every replacement has succeeded**, so a failed edit leaves the original untouched
+rather than half-applied. ⚠️ **A find-and-replace that reports success without checking it changed
+anything is the silent-wrong-output class wearing a different hat**, and this project has now bought
+that lesson in Zig, in the CLI, and in its own tooling.
+— three heredoc corruptions in one session, 2026-09-19

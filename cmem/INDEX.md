@@ -378,6 +378,31 @@ running their binary — is required by `coordinate`. The retired oracle is not 
 their code for **design guidance** stays off-limits; reading it to check a **contract row** is the
 whole point. A finding about their project is **reported to the owner**, never edited into their memory.
 
+## 🔧 TOOLING — Deno only, and no heredocs (binding on every agent, 2026-09-19)
+
+🔒 **Every script in this repo is a Deno `.mjs`.** No bash, no PowerShell, no Python, no bun, no npm.
+The only other tooling language is Zig itself (`tools/size_gate.zig`, `tools/conformance.zig`). The tree
+already worked this way — `tools/phases.mjs`, `tools/bakeoff.mjs`, `examples/deno_ffi_capi.mjs`, all run
+by `deno run --allow-…` from `build.zig` — but nothing said so until now. ⚠️ **It binds throwaway work
+too**, not just committed tools: a one-off sweep is where "just pipe it through bash" is most tempting
+and where a silent mis-measurement costs most, because nobody reviews a command that already ran.
+
+🚫 **Never pass a script to an interpreter through a shell heredoc.** `cmd <<'EOF' … EOF` adds an
+invisible escaping layer and **fails silently more often than loudly** — three distinct corruptions in
+one session: escapes consumed twice (a real newline emitted into a Zig string literal, which the build
+reported only as `error: Unexpected`), backslashes halved so a replacement matched **zero** occurrences
+and did nothing, and a quote in the body aborting a command whose earlier statements had already run.
+**Write the file, then run the file** — one layer of escaping, and the result is re-runnable and
+diffable. Passing a script as a shell *argument* (`deno eval "…"`) is the same class; use a file.
+
+🔒 **Corollary — an edit script asserts its match count and writes atomically.** Every replacement must
+match **exactly once** (not "at least once", which passes when a pattern matches twice and corrupts both
+sites), and the file is written only after every edit succeeds, so a failure leaves the original
+untouched. ⚠️ *A find-and-replace that reports success without checking it changed anything is the
+silent-wrong-output class wearing a different hat.*
+
+📖 **Full rationale and the incidents: [`best-practices.md`](best-practices.md) §6.**
+
 ### The "look for code issues" trigger (binding on every agent)
 
 When the owner says **"look for code issues"** (or a synonym — "code audit", "audit the code", "hunt
