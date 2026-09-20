@@ -516,7 +516,69 @@ investigators per category, consolidate, report `file:line` + one line + severit
    turned the ABI version into a real gate. The version-string drift in `releasing.md` (four copies, no
    test) is a ready-made instance.
 
-#### B-a — The EMITTER audit: forms reconstructed from partial facts `[ ]`
+#### ✅ B-a — The EMITTER audit. **COMPLETE 2026-09-20** (`d47ecd18`). **FOUR DEFECTS, 4-FOR-4 AGAIN** `[x]`
+
+🎯 **The prediction held exactly.** The mechanism produced four defects in the sibling project; it
+produced four here. None was visible to any gate wazmrt owns, and all four were **behaviour-preserving
+under wazmrt's own tests** — which is the whole reason the item insisted on mechanical checks.
+
+⚠️ **The field-coverage sweep came back CLEAN — no parser-recorded field is unread — and that was not
+the useful half.** The defects live in the *second* emitter for a fact, not in an unread field. What
+found them: **assembling 2,141 top-level modules extracted from the spec `.wast` corpus with both
+toolchains and comparing the bytes.** 334 disagreed at the start; 20 remain, all legal.
+
+| stage | agree / 2,141 |
+| --- | --- |
+| before | 1,807 |
+| + block-type delegation | 1,811 |
+| + the GC conversion opcodes | 1,816 |
+| + empty sections omitted | 2,120 |
+| + folded-`if` conditions | **2,121** |
+
+| # | defect | why nothing here could see it |
+| --- | --- | --- |
+| **1** | **a block type that is a NON-NULL ABSTRACT ref was wazmrt's INTERNAL enum tag.** `emitBlockTypeSig` re-derived the valtype encoding instead of calling `emitValType`, splitting only on `isConcrete()` and writing the raw tag for the rest — right only where the tag happens to BE the wire byte. `(ref any)` has no one-byte form; it is `0x64 0x6E` and wazmrt wrote `0x66` | our decoder read our own tag back happily. **The sibling refused the bytes outright** — *"unsupported instruction opcode"*. wazmrt was emitting modules no other runtime can load |
+| **2** | **the same branch dropped `exact`** — `0x63/0x64 <idx>` with no `0x62` former, so `(ref (exact $t))` became the inexact type | a valid module that is not the one the text described: the quiet half of the same defect |
+| **3** | **`any.convert_extern` / `extern.convert_any` wire bytes SWAPPED in FOUR places** — the encoder table, the decoder, the enum's doc comments, and `validate.zig`'s own switch on the raw byte, which bypasses `opcode.zig` entirely | all four agreed, so the round trip was perfect. ⚠️ **Wrong in BOTH directions**: modules wazmrt assembled were refused by every other runtime, and correctly-encoded modules from any other toolchain were refused here |
+| **4** | **a folded `if` emitted only the FIRST condition expression.** The grammar is `foldedinstr*`; `(if (i32.const 1) (i32.eqz) (then) (else))` assembled the constant and threw the `eqz` away, **inverting the condition** | 🔒 **`if.wast` contains that exact construct** under *"atypical folded condition syntax"* — and **both arms are empty**, so inverting the condition changes nothing observable and every assertion passes |
+
+🔑 **Defect 3's fourth site is the lesson to keep:** fixing three and not the fourth turned `extern.wast`
+red, which is how the fourth was found. ⚠️ *A mapping kept in four places is a mapping that will be
+right in three* — and `validate.zig` reading the raw wire byte instead of the enum is why the fourth
+copy existed at all.
+
+🧹 **Also: the empty type, function and code sections are no longer emitted.** Legal either way and no
+other producer writes one, so this alone was **~295 of the 325** remaining disagreements. Same rule and
+same reason as B-c2's data-count section: implement the condition the format states, not a superset.
+
+✅ **THE RESIDUAL 20 ARE NOT DEFECTS**, and each was cross-decoded on both runtimes with both
+encodings — all four combinations validate OK. Documented here as deliberate, per the gate:
+
+| class | wazmrt | wasm-tools |
+| --- | --- | --- |
+| singleton `rec` groups (15) | drops the header, and **reuses an eligible declared type for an implicit typeuse** — §6.6.12 permits exactly that, and `type-rec.wast`'s own comment (*"the implicit type of `$f` is `$ft`"*) endorses it | keeps the header, mints a fresh type |
+| element segments (5) | encodes what the text **spelled** — `(elem funcref …)` takes the reftype form | normalises funcref segments to the elemkind shorthand |
+
+⚠️ **REOPEN CONDITION:** if a `.wat` pin ever has to be portable for a module with an explicit
+singleton `(rec …)` or a `funcref`-spelled element segment, these become work. Nothing in the
+real-world corpus contains either — it is still **954/954** — so the cost is unpaid, not zero.
+
+🛠️ **The check is committed as [`tools/emitter-diff.mjs`](../tools/emitter-diff.mjs)** so it is
+repeatable rather than a thing somebody once ran. ⚠️ **It is OPTIONAL and reaches outside the repo**,
+like the Bake Off: it needs a second assembler, and nothing in `zig build` depends on it.
+
+📉 **Size went DOWN** (lib −20, exe and dll unchanged) — the only ceiling entry that lowers a number.
+Three of the four fixes were *deleting a reconstruction*; a fact emitted from one place is smaller as
+well as safer.
+
+📌 **What the gate asked for versus what was done, stated plainly:** the field sweep and the shorthand
+review happened as written. **The round-trip property test did NOT** — a self-contained round trip
+needs a disassembler wazmrt does not have. The differential above is strictly stronger where it
+applies (it has an external oracle rather than our own parser as its own judge) and strictly weaker in
+that it is not self-contained. ⬜ **A self-contained round-trip test remains open** and is the natural
+home for anything the sibling and wazmrt would get wrong the same way.
+
+#### ~~B-a~~ — the item as scoped, retained for the record
 
 **A named sub-task because in `wasmrt` this exact mechanism produced FOUR defects and every one was found
 by accident** — by some *other* check happening to read a field the emitter had dropped. wazmrt has the

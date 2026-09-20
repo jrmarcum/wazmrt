@@ -33,6 +33,32 @@ asks "is this the same module another toolchain would have built?" — and the t
 all **behaviour-preserving**, so no conformance run, unit test or fuzz pass could ever have reported
 them. See `roadmap.md` → B-c2 and `interop.md` §3.1m-r.
 
+### 🆕 `tools/emitter-diff.mjs` — the same idea over the SPEC corpus (Track B-a, 2026-09-20)
+
+**The real-world corpus agrees 954/954, and that is exactly why it could not find the next four
+defects: it contains no GC block types, no `exact`, no `extern`/`any` conversions and no atypical
+folded conditions.** ⚠️ *A corpus that exercises none of the exotic encodings will report perfect
+agreement and mean nothing by it.* This tool extracts every **top-level** `(module …)` from the spec
+`.wast` files into a standalone `.wat` and runs the same digest comparison over all of them.
+
+```
+deno run -A tools/emitter-diff.mjs --suite <testsuite-dir> \
+    --wazmrt ./zig-out/bin/wazmrt.exe --other <second-runtime>
+```
+
+📊 **State at 2026-09-20:** 2,150 modules extracted, 2,141 assembled by both, **2,121 agree · 20
+differ · 0 assembled by only one side.** It was 1,807 agreeing before Track B-a.
+
+🔒 **The 20 are documented, not outstanding** — two legal shorthand choices (singleton `rec` groups
+plus implicit-type reuse; element-segment spelling), each cross-decoded on both runtimes with both
+encodings, all four combinations validating. `roadmap.md` → B-a carries the table and the reopen
+condition. **Compare against 20, not against 0.**
+
+⚠️ **Optional, and it reaches outside the repo** — like the Bake Off it needs a second assembler, and
+nothing in `zig build` depends on it. ⬜ **A self-contained round-trip test is still missing**: it
+would need a disassembler wazmrt does not have, and it is the only thing that could catch a fact both
+toolchains drop the same way.
+
 ## External conformance corpora (owner-designated 2026-07-02)
 
 The designated real-world test inputs live in the sibling **wasmtk** project under

@@ -956,6 +956,30 @@ fact, wrong mechanism in the prediction. ⚠️ The failure mode is re-reading t
 to match the sentence you wrote earlier; record what happened and correct the sentence.
 — Track B-d, `roadmap.md`
 
+**A BEHAVIOUR TEST CANNOT SEE A DROPPED FACT WHEN BOTH BRANCHES DO THE SAME THING.** wazmrt's folded
+`if` emitted only the first of its condition expressions, so
+`(if (i32.const 1) (i32.eqz) (then) (else))` assembled the constant, threw the `eqz` away and
+**inverted the condition**. `if.wast` contains that exact construct, under a heading announcing it —
+and cannot catch it, because that function's `then` and `else` are both empty. 🎓 **The corpus
+exercising a construct is not the corpus checking it.** Audit an emitter by its BYTES, against another
+producer; "the tests pass" says nothing about a fact that never reaches an observable. — Track B-a, 2026-09-20
+
+**A MAPPING KEPT IN FOUR PLACES IS A MAPPING THAT WILL BE RIGHT IN THREE.** `any.convert_extern` and
+`extern.convert_any` had their wire bytes swapped in the encoder table, the decoder, the enum's doc
+comments **and** `validate.zig`'s own switch on the raw byte — which bypasses `opcode.zig` entirely.
+All four agreed, so the round trip was perfect and every gate passed. ⚠️ Fixing three of them turned
+`extern.wast` red, which is how the fourth was found: *the failure that appears when you half-fix a
+duplicated fact is the duplicate announcing itself.* The one to distrust is the copy that reads the
+raw wire value instead of the shared enum. — Track B-a, `validate.zig`
+
+**ONE FACT, TWO EMITTERS, AND THE SECOND ALWAYS KNOWS FEWER CASES.** `emitValType` handled concrete
+refs, non-null abstract refs and plain value types. `emitBlockTypeSig` re-derived the same encoding
+and handled two of those three, writing wazmrt's INTERNAL enum tag for the case it had not thought
+about — a byte that is not a wire encoding of anything, which our own decoder round-tripped and no
+other runtime would load. ⚠️ **The field-coverage sweep this audit also ran came back clean**: the
+defect was never an unread field, it was a second writer. 🎓 *When you find a function that rebuilds
+what another function already emits, the question is not whether it is correct today.* — Track B-a, `wat.zig`
+
 **A GATE THAT HAS TO BE REMEMBERED IS NOT ENFORCEMENT.** `zig build size` is a separate step, so it
 runs when somebody thinks of it — and on 2026-09-20 `main` was found **4,608 bytes over the exe
 ceiling**, put there by two commits that had each grown the CLI without raising the number in the same

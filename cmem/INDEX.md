@@ -8,7 +8,40 @@ a machine-local `CLAUDE.md`.
 and revised without wading through one giant file. Keep files small and single-topic.
 ---
 
-## 🏁 STATE — 2026-09-20. **TRACK B: B-b AND B-c ARE COMPLETE; B-a NOT STARTED; B-e OPEN.**
+## 🏁 STATE — 2026-09-20. **TRACK B: B-a, B-b, B-c AND B-d ARE COMPLETE. ONLY B-e IS OPEN.**
+
+### ✅ B-a IS DONE — 2026-09-20 (`d47ecd18`). **FOUR EMITTER DEFECTS, AND THE PREDICTION WAS EXACT.**
+
+The item said this mechanism produced four defects in the sibling project and would produce more
+here. It produced **four**. ⚠️ **None was visible to any gate wazmrt owns, and all four were
+behaviour-preserving under wazmrt's own tests.**
+
+⚠️ **The field-coverage sweep came back CLEAN, and that is the finding about the METHOD:** no
+parser-recorded field is unread. The defects were never unread fields — they were a **second emitter
+for a fact the first one already knew how to write**. What found them was assembling **2,141
+top-level modules from the spec corpus with both toolchains and comparing bytes**: 1,807 agreed at
+the start, **2,121** now.
+
+| | what it was |
+| --- | --- |
+| **1** | a block type that is a **non-null abstract ref** was wazmrt's **internal enum tag** — `(ref any)` is `0x64 0x6E`, wazmrt wrote `0x66`. Our decoder read it back; **the sibling could not load the module at all** |
+| **2** | the same branch **dropped `exact`**, so `(ref (exact $t))` silently became the inexact type |
+| **3** | `any.convert_extern` / `extern.convert_any` **wire bytes swapped in FOUR agreeing places**, one of them `validate.zig` switching on the raw byte instead of the enum. **Wrong in both directions** |
+| **4** | a folded `if` emitted only the **first** condition expression, **inverting the condition** — and `if.wast` contains that exact construct with **both arms empty**, so nothing observable changes |
+
+🎓 **The two rules this bought** (`best-practices.md` §4): *a behaviour test cannot see a dropped fact
+when both branches do the same thing*, and *a mapping kept in four places is a mapping that will be
+right in three* — fixing three of the four opcode sites turned `extern.wast` red, which is how the
+fourth was found.
+
+🧹 Also: the **empty** type, function and code sections are gone (~295 of the 325 residual
+disagreements). ✅ The remaining **20 are documented legal shorthand choices**, cross-decoded both
+ways on both runtimes — compare against 20, not 0. 🛠️ The check is committed as
+[`tools/emitter-diff.mjs`](../tools/emitter-diff.mjs), **optional and outward-reaching like the Bake
+Off**. ⬜ A self-contained **round-trip** test is still missing — it needs a disassembler wazmrt does
+not have, and it is the only thing that could catch a fact both toolchains drop the same way.
+
+📉 **Size went DOWN** (lib −20): three of the four fixes were *deleting a reconstruction*.
 ### 🔖 **`1.0.1` shipped Track H (2026-08-19); Track B is being built now and has not been versioned.** The hold that Track H ended in was released by the owner; B-b (`0a48957a`), B-c1/c3/c5 (`22437455`) and **B-c2 (`a495424f`, 2026-09-20)** have landed since.
 
 ### ✅ B-c2 (Z4) IS DONE — 2026-09-20. **`.wat` PIN DIGESTS ARE PORTABLE: 954 of 954, up from 2.**
@@ -90,14 +123,14 @@ so a checkout-dependent line ending would move a digest. Full reasoning: `best-p
 | gate | value | note |
 | --- | --- | --- |
 | conformance | **288 files · 64,072 passed · 0 failed · 20 skipped · 0 unrun** | baseline file is **EMPTY**. ⚠️ The counts differ from Track H's `284 · 63,934 · 0 skipped` because this is a **different testsuite checkout** (`wasmtk/…/testsuite-main`), not a regression — verified by running the same command on `HEAD` before and after every change on 2026-09-20 |
-| unit tests | **781/781** | from an NTFS cwd; a `D:` cwd loses 4 to exFAT symlinks |
-| `test-safe` | 781/781 | ReleaseSafe — optimized, safety checks KEPT |
+| unit tests | **789/789** | from an NTFS cwd; a `D:` cwd loses 4 to exFAT symlinks |
+| `test-safe` | 789/789 | ReleaseSafe — optimized, safety checks KEPT |
 | `test-security` | 3/3 | from an NTFS cwd |
-| **`test-shipped`** | **781/781** | Track H — **ReleaseSmall, the config that SHIPS** (checks off) |
+| **`test-shipped`** | **789/789** | Track H — **ReleaseSmall, the config that SHIPS** (checks off) |
 | `features` | green | all four `-Dwat`/`-Dwasi` combinations |
 | `capi-smoke` | green | |
-| 🆕 **`.wat` digest parity** | **954 agree · 0 differ** (`.wasm` 513 · 0) · **both listings 1,467 lines** | **not a `zig build` step** — `wazmrt pin <wasmtk>` vs `wasmrt pin <wasmtk>`. See `testing.md`; it found three defects no in-repo gate could see |
-| size (ReleaseSmall) | exe **1,009,664** · lib **1,059,260** · dll **900,608** | all three EXACT. ⚠️ **The exe ceiling was 4,608 bytes BEHIND reality at `41a96aa3`** — two Track B commits grew it without raising it, which nothing caught because `zig build size` has to be remembered (**B-e**) |
+| 🆕 **`.wat` digest parity** | real-world **954 · 0** (`.wasm` 513 · 0), both listings 1,467 lines · 🆕 **spec corpus 2,121 · 20** (the 20 are documented legal shorthands — `tools/emitter-diff.mjs`) | **not a `zig build` step** — `wazmrt pin <wasmtk>` vs `wasmrt pin <wasmtk>`. See `testing.md`; it found three defects no in-repo gate could see |
+| size (ReleaseSmall) | exe **1,009,664** · lib **1,059,240** · dll **900,608** | all three EXACT. ⚠️ **The exe ceiling was 4,608 bytes BEHIND reality at `41a96aa3`** — two Track B commits grew it without raising it, which nothing caught because `zig build size` has to be remembered (**B-e**) |
 
 **Shipped 2026-08-18, in order:** Track **F** (feature enforcement — and two gates that did not
 exist), the **skip-closing pass** (two of its four items were rejecting VALID modules),
