@@ -41,7 +41,6 @@ pub const Error = sexpr.Error || error{ BadCommand, BadValue } || std.mem.Alloca
 fn nth(items: []const Sexpr, i: usize) Error!Sexpr {
     return if (i < items.len) items[i] else error.BadCommand;
 }
-/// A form as a string literal (an action/register name), or `error.BadCommand`.
 /// A `(module quote …)` payload is EITHER a complete `(module …)` form or a bare
 /// sequence of module fields (`"(func …)" "(global …)"`) — the spec's text format
 /// allows both, and the corpus uses both, sometimes with the opening `(module`
@@ -77,6 +76,10 @@ fn wrapModuleText(a: std.mem.Allocator, text: []const u8) ![]const u8 {
     return std.fmt.allocPrint(a, "(module {s})", .{text});
 }
 
+/// A form as a string literal (an action/register name), or `error.BadCommand`.
+///
+/// 📌 This line had been glued to the top of `wrapModuleText`'s doc block, leaving that function
+/// described by someone else's first sentence and this one undocumented (Track B, 2026-09-20).
 fn asStr(s: Sexpr) Error![]const u8 {
     return switch (s) {
         .string => |x| x,
@@ -315,7 +318,11 @@ const Runner = struct {
         } else if (std.mem.eql(u8, kw, "invoke") or std.mem.eql(u8, kw, "get")) {
             _ = self.runAction(cmd) catch |e| self.fail("action failed: {s}", .{@errorName(e)});
         } else {
-            self.summary.skipped += 1; // (module quote …), assert_exception, …
+            // ⚠️ Both examples this comment used to give are now HANDLED elsewhere —
+            // `(module quote …)` by R5, `assert_exception` by the dispatch above — so neither can
+            // reach here. Left unnamed rather than guessed at; if this arm is ever seen firing,
+            // record what reached it. (Track B, 2026-09-20.)
+            self.summary.skipped += 1;
         }
     }
 
@@ -1110,7 +1117,7 @@ const Runner = struct {
     /// opcode we have not implemented — it belongs on this list.
     fn isOurLimitation(e: anyerror) bool {
         return switch (e) {
-            error.BadCommand, // e.g. `(module quote …)`, not implemented
+            error.BadCommand, // an unknown module keyword — NOT `(module quote …)`, which R5 implemented
             error.NotAModule,
             // ⚠️ `error.UnknownInstr` USED TO BE ON THIS LIST and was removed 2026-08-17. It meant
             // "the assembler doesn't know this mnemonic", which conflated two opposite things:
@@ -1122,7 +1129,13 @@ const Runner = struct {
             // `(i32.load32 …)` is malformed, which it is: that mnemonic exists in no wasm
             // proposal, and answering "unknown" was answering CORRECTLY.
             error.UnsupportedInstr,
-            // Recognised syntax from a proposal we do not target (`pagesize`).
+            // ⚠️ **This arm now has NO known instance, and that is worth stating rather than
+            // leaving an example that stopped being true.** Its comment cited `pagesize` —
+            // Track P implemented custom-page-sizes on 2026-08-17, and Track B (2026-09-20)
+            // removed the stale arm that was still answering `UnsupportedProposal` for a
+            // MALFORMED one, which scored wazmrt's correct rejections as our gap.
+            // The category stays because a future untargeted proposal will need it; if one is
+            // added, name it here.
             // The module may be valid under that proposal, so refusing it is our
             // gap — banking these as passes is exactly the green-washing the
             // comment above describes.
@@ -1167,7 +1180,7 @@ const Runner = struct {
             // We never got as far as linking, so we have no verdict to give.
             // `assertRejected` already drew this line; this arm did not, and
             // charged our own gaps as conformance failures — `memory_max.wast`
-            // reported two where one was simply `(pagesize …)`, syntax we refuse
+            // reported two where one was simply `(pagesize …)` — syntax wazmrt refused
             // by design. NOTE the order: `isLinkError` is asked FIRST and this
             // list stays narrow, so a real wrong-STAGE rejection (T5's
             // `InvalidLimits` at decode where the spec wants a link failure)

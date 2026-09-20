@@ -2308,13 +2308,22 @@ fn sig(pop: []const V, push: []const V) FuncValidator.Sig {
     return .{ .pop = pop, .push = push };
 }
 
-/// Value-type signature of a `0xFD` SIMD op (by sub-opcode). Total — an
-/// unclassified op defaults to the common binary shape `v128,v128 -> v128`;
-/// that only affects functions using unimplemented ops, which trap at execution
-/// before the annotation is used (see `interp` drop/select width handling).
 /// The value type (`i32`/`i64`) an atomic load/store/rmw/cmpxchg operates on.
 /// Determined by the sub-opcode: the `i32.*`/`i64.*` prefix in the mnemonic.
-fn atomicValType(sub: u32) V {
+///
+/// 📌 An ORPHANED paragraph describing `simdSig` used to sit above these two lines, so this
+/// function carried someone else's doc and `simdSig` carried none. Moved to its own declaration
+/// (Track B, 2026-09-20) — *a doc comment attached to the wrong function is worse than no doc,
+/// because it is read as true of the thing beneath it.*
+/// 🔒 **`pub` so `interp.zig` can DERIVE from it rather than keep its own copy.** It had one:
+/// `atomicIs64`, same fourteen literals and the same modulo-7 trick, written independently with
+/// the opposite polarity, in another file, with nothing enforcing that the two agreed. They did —
+/// and *"the validator and the interpreter agree because they were written from the same head,
+/// not the same table"* is how a `try_table` catch label ended up resolved one frame too deep in
+/// the assembler, the validator **and** the interpreter simultaneously, with the whole corpus
+/// green. Two consumers agreeing is not corroboration when they share the mistake.
+/// (Track B, 2026-09-20.)
+pub fn atomicValType(sub: u32) V {
     return switch (sub) {
         0x10, 0x12, 0x13, 0x17, 0x19, 0x1a => .i32, // i32 loads/stores (full/8/16)
         0x11, 0x14, 0x15, 0x16, 0x18, 0x1b, 0x1c, 0x1d => .i64, // i64 loads/stores
@@ -2327,6 +2336,10 @@ fn atomicValType(sub: u32) V {
     };
 }
 
+/// Value-type signature of a `0xFD` SIMD op (by sub-opcode). Total — an
+/// unclassified op defaults to the common binary shape `v128,v128 -> v128`;
+/// that only affects functions using unimplemented ops, which trap at execution
+/// before the annotation is used (see `interp` drop/select width handling).
 fn simdSig(sub: u32) FuncValidator.Sig {
     return switch (sub) {
         0x00...0x0a, 0x5c, 0x5d => sig(i32_1, v128_1), // loads: addr -> v128

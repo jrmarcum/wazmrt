@@ -97,7 +97,10 @@ pub const Error = sexpr.Error || error{
     /// can see it, because the binary format has no names at all.
     DuplicateName,
     /// Syntax wazmrt RECOGNISES as belonging to a wasm proposal it does not
-    /// target — today only `(memory … (pagesize N))` (custom-page-sizes).
+    /// target. ⚠️ **The example this line used to give — `(memory … (pagesize N))` — is no longer
+    /// one:** Track P implemented custom-page-sizes 2026-08-17. Left without an example on purpose;
+    /// a scope claim with a stale instance is worse than one with none, because the instance is
+    /// what readers check against. (Track B, 2026-09-20.)
     ///
     /// Distinct from `BadModuleField` on purpose. The module may be perfectly
     /// valid under its proposal, so refusing it is *our* gap, not a verdict on
@@ -700,6 +703,17 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
                     mi2 += 1;
                 }
                 const lim = try parseMemLimits(desc, &mi2, false, false);
+                // 🚨 **THE THIRD MEMORY SITE, and it was the one that did not check.**
+                // `checkMemTail`'s own doc names three places a memory can be written; only the
+                // defined form and the INLINE import called it, so a trailing form here was
+                // silently dropped — `(import "m" "n" (memory 0 (bogus)))` assembled and
+                // **validated OK**, where the other two spellings correctly say `BadModuleField`
+                // and the sibling refuses it outright.
+                //
+                // ⚠️ That is the exact defect `checkMemTail` was written for, still live at the
+                // site its own comment counted. 🎓 *A helper that documents how many callers it
+                // needs has told you what to grep for — and nothing greps a comment.*
+                try checkMemTail(desc, mi2);
                 try mem_imports.append(a, .{ .module = (try strAt(items, 1)), .name = (try strAt(items, 2)), .min = lim.min, .max = lim.max, .shared = lim.shared, .is64 = lim.is64, .page_size_log2 = lim.page_size_log2 });
                 try mem_names.append(a, mname);
             } else if (std.mem.eql(u8, dkw, "tag")) {
@@ -1758,14 +1772,23 @@ fn parseGlobal(a: std.mem.Allocator, items: []const Sexpr, globals: *List(Global
     try global_names.append(a, name);
 }
 
-/// Top-level `(import "m" "n" (global $id? (mut? valtype)))`. Only global imports
-/// are assembled today; a func/table/memory import errors (honest, not silent).
+/// Top-level `(import "m" "n" (global $id? (mut? valtype)))`.
+///
+/// ⚠️ **The doc used to say "only global imports are assembled today; a func/table/memory import
+/// errors" — and that has been false since those were implemented.** The caller dispatches `func`,
+/// `table`, `memory` and `tag` itself and only reaches this function for globals, so the guard
+/// below is not "we don't support that", it is "that descriptor keyword is not a thing".
+///
+/// 🚨 It answered `UnsupportedInstr`, which is on `wast.isOurLimitation`, so
+/// `(import "m" "n" (bogus))` — a plain malformation — scored as OUR GAP and was banked as a
+/// **SKIP** instead of as the correct rejection. Same mis-verdict as `checkMemTail`'s stale
+/// `pagesize` arm, and found the same way: *the comment claimed a scope the code had outgrown.*
 fn parseImport(a: std.mem.Allocator, items: []const Sexpr, global_imports: *List(ImportedGlobal), global_names: *List(?[]const u8), type_names: []const ?[]const u8) Error!void {
     const module = (try strAt(items, 1));
     const name = (try strAt(items, 2));
     const desc = try wantList(try nth(items, 3));
     const dkw = try wantAtom(try nth(desc, 0));
-    if (!std.mem.eql(u8, dkw, "global")) return error.UnsupportedInstr; // func/table/memory imports
+    if (!std.mem.eql(u8, dkw, "global")) return error.BadModuleField; // not a descriptor keyword
     var di: usize = 1;
     var gname: ?[]const u8 = null;
     if (di < desc.len and isId(desc[di])) {
@@ -3779,12 +3802,19 @@ fn pageSizeLog2(n: u64) Error!u8 {
 /// the one the text asked for. A trailing ATOM already failed (`parseU64` chokes
 /// on it); only lists slipped through, which is why this went unnoticed.
 ///
-/// `pagesize` is named separately because it is real syntax from a real proposal
-/// we do not implement, not a typo — see `error.UnsupportedProposal`.
+/// ⚠️ **The `pagesize` arm is GONE (Track B, 2026-09-20), and the comment it carried was the
+/// reason to look.** It said *"`pagesize` is named separately because it is real syntax from a
+/// real proposal we do not implement"* — and Track P **implemented custom-page-sizes** on
+/// 2026-08-17. `parseMemLimits` consumes a well-formed `(pagesize N)` before this runs, so the arm
+/// could only ever fire for a MALFORMED one: `(pagesize)`, `(pagesize 1 2)`, a duplicate.
+///
+/// 🚨 **Those are malformations, and it answered `UnsupportedProposal` — which is on
+/// `wast.isOurLimitation`.** So the conformance runner banked wazmrt's *correct rejections* as
+/// **SKIPs**, which is the green-washing that list's own comment was written against: a refusal we
+/// are entitled to give, scored as a gap we have. 🎓 *A stale scope comment does not just misinform
+/// — here it picked the error, and the error picked the column in the score.*
 fn checkMemTail(items: []const Sexpr, mi: usize) Error!void {
     if (mi >= items.len) return;
-    if (items[mi].asList()) |l| if (l.len != 0 and eqAtom(l[0], "pagesize"))
-        return error.UnsupportedProposal;
     return error.BadModuleField;
 }
 
@@ -7978,6 +8008,53 @@ fn sectionPayload(bytes: []const u8, id: u8) ?[]const u8 {
         i = j + size;
     }
     return null;
+}
+
+test "trailing junk is refused at ALL THREE memory sites, and as a MALFORMATION" {
+    // 🚨 `checkMemTail`'s own doc names three places a memory can be written, and only two called
+    // it. The third — top-level `(import "m" "n" (memory …))` — silently dropped a trailing form,
+    // so `(import "m" "n" (memory 0 (bogus)))` **validated OK** while the other two spellings
+    // correctly refused it and the sibling rejected it outright.
+    //
+    // ⚠️ That is the exact defect `checkMemTail` exists for — *"every trailing form was silently
+    // dropped… the module built, ran, and disagreed with its own source"*, 18 assertions — still
+    // live at the site its own comment counted. 🎓 *A helper that documents how many callers it
+    // needs has told you what to grep for, and nothing greps a comment.*
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    for ([_][]const u8{
+        "(module (memory 0 (bogus)))", // defined
+        "(module (memory (import \"m\" \"n\") 0 (bogus)))", // inline import
+        "(module (import \"m\" \"n\" (memory 0 (bogus))))", // ⬅️ the site that did not check
+    }) |src| {
+        std.testing.expectError(error.BadModuleField, assemble(a, src)) catch |e| {
+            std.debug.print("\nnot refused: {s}\n", .{src});
+            return e;
+        };
+    }
+
+    // 🔒 **And the VERDICT matters, not just the refusal.** A malformed `(pagesize …)` used to
+    // answer `UnsupportedProposal`, and an unknown import descriptor `UnsupportedInstr` — both of
+    // which are on `wast.isOurLimitation`, so the conformance runner banked wazmrt's *correct
+    // rejections* as SKIPs. The comments that chose those errors claimed scopes the code had
+    // outgrown: Track P implemented custom-page-sizes, and func/table/memory imports are assembled.
+    for ([_][]const u8{
+        "(module (memory 1 (pagesize)))", // arity: not a well-formed pagesize
+        "(module (memory 1 (pagesize 1 2)))",
+        "(module (import \"m\" \"n\" (bogus)))", // not a descriptor keyword at all
+    }) |src| {
+        std.testing.expectError(error.BadModuleField, assemble(a, src)) catch |e| {
+            std.debug.print("\nwrong verdict for: {s}\n", .{src});
+            return e;
+        };
+    }
+
+    // …and the well-formed forms these guards sit next to must still assemble.
+    _ = try assemble(a, "(module (memory 1 (pagesize 1)))");
+    _ = try assemble(a, "(module (import \"m\" \"n\" (memory 1 2)))");
+    _ = try assemble(a, "(module (import \"m\" \"n\" (memory 0 (pagesize 1))))");
 }
 
 test "every abstract heap type has its `…ref` shorthand, exn included" {

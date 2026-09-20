@@ -1059,6 +1059,21 @@
 #
 # Unit tests 796 -> 798. Corpus unchanged.
 
+# ---------------------------------------------------------------------------------------
+# 2026-09-20 — Track B, clearing the filed items before Track O. exe +0, **lib -256**, dll +0.
+#
+# 📉 Another lowering, and the same cause as the last one: **three duplicated facts were deleted
+# rather than pinned.** `interp.atomicIs64` now derives from `validate.atomicValType` (it was a
+# second copy of the same fourteen literals, in another file, with the opposite polarity and
+# nothing enforcing agreement), `checkMemTail`'s stale `pagesize` arm went, and `sign.readUleb`'s
+# 5-byte handling collapsed onto the same shape `Reader.readVarU32` uses.
+#
+# ⚠️ Nothing in this pass was added to make the artifacts smaller — every byte saved is a second
+# implementation of something that only needed one. That is the pattern worth expecting from a
+# duplicate hunt, and the opposite of what a feature pass does.
+#
+# Unit tests 796 -> 802. Corpus unchanged (288 / 64,072 / 0 failed / 20 skipped).
+
 wazmrt.exe  1009152
-wazmrt.lib  1059236
+wazmrt.lib  1058980
 wazmrt.dll  910336

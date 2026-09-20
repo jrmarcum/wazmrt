@@ -5094,15 +5094,19 @@ fn pushConst(stack: *[16]Value, sp: *usize, v: Value) Error!void {
 /// Shared integer binary-op semantics for i32 (S=i32,U=u32) and i64.
 /// True if an atomic sub-opcode operates on i64 (else i32). Loads/stores name
 /// the type; rmw/cmpxchg groups of 7 put i64 at positions 1,4,5,6.
+/// Does this atomic sub-opcode operate on `i64`?
+///
+/// 🔒 **DERIVED from `validate.atomicValType`, which is the one table.** This used to be a second
+/// copy — the same fourteen literals and the same modulo-7 trick, written independently, in
+/// another file, with the opposite polarity and nothing enforcing that the two agreed.
+///
+/// ⚠️ They *did* agree, which is exactly why it was worth removing: *the validator and the
+/// interpreter agreeing because they were written from the same head rather than the same table*
+/// is how a `try_table` catch label came to be resolved one frame too deep in the assembler, the
+/// validator **and** the interpreter simultaneously, with the entire corpus green. **Two consumers
+/// agreeing is not corroboration when they share the mistake.** (Track B, 2026-09-20.)
 fn atomicIs64(sub: u32) bool {
-    return switch (sub) {
-        0x11, 0x14, 0x15, 0x16, 0x18, 0x1b, 0x1c, 0x1d => true,
-        0x10, 0x12, 0x13, 0x17, 0x19, 0x1a => false,
-        else => switch ((sub - 0x1e) % 7) {
-            1, 4, 5, 6 => true,
-            else => false,
-        },
-    };
+    return @import("validate.zig").atomicValType(sub) == .i64;
 }
 
 /// Keep only the low `width` bytes of `v` (the access width of a sub-width

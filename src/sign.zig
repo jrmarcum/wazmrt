@@ -86,7 +86,20 @@ pub const Verdict = enum {
 };
 
 /// Read a ULEB128 `u32` at `pos.*`, advancing it. Returns null on truncation or
-/// on an over-long encoding (guards against overflow on untrusted input).
+/// on an over-long encoding.
+///
+/// 🔒 **Strictness MATCHES `Reader.readVarU32` exactly, and a test pins that.** This is the
+/// second ULEB decoder in the tree and it runs on **untrusted bytes BEFORE the real decoder** —
+/// `findSignature` walks an arbitrary file's section table. Two parsers for one format, with
+/// different ideas of what is valid, is a parser differential waiting for a use.
+///
+/// ⚠️ **The laxer version was NOT exploitable and it was still worth removing** (Track B,
+/// 2026-09-20). It accepted a 5th byte with value bits above bit 31 and silently truncated it,
+/// where `readVarU32` returns `LebOverflow`. Measured: a module with an over-long section length
+/// is refused by `Module.decode`, so it can never reach execution — the lax parser was a strict
+/// SUPERSET-acceptor and the strict one gates the run. 🎓 *But "the other layer catches it" is an
+/// argument that has to be re-derived every time someone touches either layer, and this one cost
+/// two lines to retire permanently.* Track S should not have to rediscover it.
 fn readUleb(b: []const u8, pos: *usize) ?u32 {
     var result: u32 = 0;
     var shift: u6 = 0;
@@ -94,7 +107,12 @@ fn readUleb(b: []const u8, pos: *usize) ?u32 {
         if (pos.* >= b.len) return null;
         const byte = b[pos.*];
         pos.* += 1;
-        if (shift >= 32) return null; // 5+ bytes would overflow a u32
+        if (shift == 28) {
+            // 5th byte: only 4 value bits fit, and there must be no 6th byte —
+            // `byte >> 4` catches both the extra value bits and the continuation flag.
+            if (byte >> 4 != 0) return null;
+            return result | (@as(u32, byte) << 28);
+        }
         result |= @as(u32, byte & 0x7f) << @intCast(shift);
         if (byte & 0x80 == 0) break;
         shift += 7;
@@ -311,4 +329,62 @@ test "a foreign-named custom section is ignored → unsigned" {
     try out.appendSlice(gpa, body);
     const kp = testKey(1);
     try std.testing.expectEqual(Verdict.unsigned, verify(out.items, kp.public_key.bytes));
+}
+
+test "the signature scanner's LEB decoder is exactly as strict as the module decoder's" {
+    // 🔒 **Two ULEB decoders for one format is a parser differential**, and this one runs on
+    // UNTRUSTED bytes before the real decoder ever sees them: `findSignature` walks an arbitrary
+    // file's section table. Rather than argue every time that the other layer catches it, assert
+    // the two agree — on the values they accept AND on what they refuse.
+    //
+    // ⚠️ The laxity this pins away was real and NOT exploitable: `readUleb` used to accept a 5th
+    // byte with value bits above bit 31 and truncate it, where `Reader.readVarU32` returns
+    // `LebOverflow`. Measured at the time: a module carrying an over-long section length is
+    // refused by `Module.decode`, so the lax parser was a strict superset-acceptor and the strict
+    // one gated execution. 🎓 *An argument that has to be re-derived whenever either layer is
+    // touched is worth two lines to retire.*
+    const Reader = @import("Reader.zig");
+
+    // Every encoding both must ACCEPT, with the same value.
+    const good = [_]struct { bytes: []const u8, want: u32 }{
+        .{ .bytes = &.{0x00}, .want = 0 },
+        .{ .bytes = &.{0x7f}, .want = 127 },
+        .{ .bytes = &.{ 0x80, 0x01 }, .want = 128 },
+        .{ .bytes = &.{ 0xe5, 0x8e, 0x26 }, .want = 624485 },
+        // The largest legal 5-byte encoding: 0xffff_ffff.
+        .{ .bytes = &.{ 0xff, 0xff, 0xff, 0xff, 0x0f }, .want = 0xffff_ffff },
+    };
+    for (good) |c| {
+        var pos: usize = 0;
+        try std.testing.expectEqual(@as(?u32, c.want), readUleb(c.bytes, &pos));
+        try std.testing.expectEqual(c.bytes.len, pos); // consumed exactly the encoding
+        var r = Reader{ .bytes = c.bytes, .pos = 0 };
+        try std.testing.expectEqual(c.want, try r.readVarU32());
+    }
+
+    // …and every OVER-LONG encoding both must refuse, for the same reason.
+    const overlong = [_][]const u8{
+        &.{ 0xff, 0xff, 0xff, 0xff, 0x10 }, // 5th byte has value bits above bit 31
+        &.{ 0xff, 0xff, 0xff, 0xff, 0x7f }, // …the loudest version of the same
+        &.{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x00 }, // a 6th byte at all
+    };
+    for (overlong) |bytes| {
+        var pos: usize = 0;
+        try std.testing.expectEqual(@as(?u32, null), readUleb(bytes, &pos));
+        var r = Reader{ .bytes = bytes, .pos = 0 };
+        try std.testing.expectError(error.LebOverflow, r.readVarU32());
+    }
+
+    // ⚠️ TRUNCATION is a different refusal and the two spell it differently — `readUleb` has no
+    // error set, so it answers `null` for every rejection, while `readVarU32` distinguishes
+    // running out of bytes from a malformed number. **Both still refuse**, which is the property
+    // that matters; asserting `LebOverflow` here would have been asserting the wrong thing, and
+    // it is how this test failed on its first run.
+    {
+        const truncated: []const u8 = &.{0x80};
+        var pos: usize = 0;
+        try std.testing.expectEqual(@as(?u32, null), readUleb(truncated, &pos));
+        var r = Reader{ .bytes = truncated, .pos = 0 };
+        try std.testing.expectError(error.UnexpectedEof, r.readVarU32());
+    }
 }
