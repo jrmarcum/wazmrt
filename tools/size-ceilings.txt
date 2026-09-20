@@ -942,6 +942,28 @@
 # the two files that were outside the comparison are now refused by BOTH runtimes, so the two
 # listings are finally the same length.
 
-wazmrt.exe  1000448
+# ---------------------------------------------------------------------------------------
+# 2026-09-20 — Track B-c4: the sibling's subcommand spellings. exe +9,216, lib +0, dll +0.
+#
+#   exe  1,000,448 -> 1,009,664
+#   lib  1,059,260 -> 1,059,260   (ZERO)
+#   dll  900,608 -> 900,608       (ZERO, for the fifth shipped change running)
+#
+# 🔑 **The whole cost is in the CLI, which is exactly right for this item, and it is the largest
+# single exe move in Track B.** What bought it: two new subcommands with real bodies — `wat`
+# (assemble to a file, a capability wazmrt did not have) and `wast` (multi-target, recursive
+# directory walk, per-file totals) — plus the `wasi` argument-reordering split, the mode enum and
+# its no-fallback guards, and the per-mode unknown-flag hint. `wast <dir>` pulls in a second
+# directory walker beside `pin`'s.
+#
+# 📏 **The static lib and the DLL did not move at all**, and that is the structural point rather
+# than luck: none of this is in `root.zig`. An embedder linking wazmrt gets the engine, not the
+# command line, so CLI convergence with the sibling costs the embed artifacts nothing. Every
+# earlier entry in this file had to argue the size/feature trade; this one does not.
+#
+# Corpus unchanged (288 files / 64,072 passed / 0 failed / 20 skipped / 0 file-errors).
+# Unit tests 780 -> 781.
+
+wazmrt.exe  1009664
 wazmrt.lib  1059260
 wazmrt.dll  900608

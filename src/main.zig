@@ -41,6 +41,17 @@ pub fn main(init: std.process.Init) !void {
     if (code != 0) std.process.exit(code);
 }
 
+/// Which run mode the command line ASKED FOR, as opposed to the one the module
+/// turns out to support (`interop.md` §2.1, v20).
+///
+/// 🔒 **The distinction is the whole point of the explicit spellings.** `.auto` is
+/// the bare-path form and falls back: an argument that names no export, on a
+/// module with no `_start`, ends at the summary. `run` and `wasi` say which mode
+/// the user meant, so falling back would be **succeeding at something other than
+/// what was asked** — the §2.3 rule Z1 exists for. `wazmrt wasi m.wasm` on a
+/// module with no `_start` is a failed run, not a summary.
+const Mode = enum { auto, run, wasi };
+
 /// The CLI body. Returns the process exit status.
 fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer) !u8 {
     const args = try init.minimal.args.toSlice(arena);
@@ -79,6 +90,28 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
         return 0;
     }
 
+    // 🤝 **The sibling's subcommand spellings** (`interop.md` §2.1, v20 — Track B-c4). wazmrt
+    // dispatches on the file extension and on whether an export was named; wasmrt names the mode
+    // outright. **The agreed target is ADDITIVE: each accepts the other's spelling and neither
+    // loses the form it already ships**, so every bare-path invocation below is untouched and
+    // these four are new positions that used to be `cannot read 'run': FileNotFound`.
+    //
+    // 🔑 **`run` and `wasi` are ALIASES onto the existing paths, not copies of them.** They set a
+    // mode and move `argi` past the word; everything after is parsed by the same code, so the
+    // verify gate, the feature restriction, `--max-iterations` and the Z1/Z2/Z3 guards apply
+    // identically whichever spelling was used. *A second parser would be a second place for those
+    // to drift out of.* ⚠️ `wat` is a genuinely NEW capability (assemble to a file), which is why
+    // this item is not a rename.
+    //
+    // 🔒 **Recognised as the FIRST argument only**, like `-h`/`-v` and the three subcommands above
+    // (§2.1's last row). `wazmrt m.wasm run` is a module named `m.wasm` being asked for an export
+    // called `run`, and it must stay that way.
+    var mode: Mode = .auto;
+    if (std.mem.eql(u8, args[1], "wat")) return watSubcommand(arena, io, out, args[2..]);
+    if (std.mem.eql(u8, args[1], "wast")) return wastSubcommand(arena, io, out, args[2..]);
+    if (std.mem.eql(u8, args[1], "run")) mode = .run;
+    if (std.mem.eql(u8, args[1], "wasi")) mode = .wasi;
+
     // `--features <list>` (F5-CLI) — the accepted WebAssembly LANGUAGE, restricted.
     //
     // ⚠️ **It sits BEFORE the module path, and it is the only wazmrt flag that does.** Every
@@ -93,7 +126,9 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
     // 🔒 It is also why the flag is NOT in `flagRegion`'s lists: a guest argv that happens to
     // read `--features mvp` must never narrow the language wazmrt accepts, the same reasoning
     // that put `--no-verify` there in the first place.
-    var argi: usize = 1;
+    // Past the subcommand word when there was one, so `run --features mvp m.wasm add`
+    // parses exactly as `--features mvp m.wasm add` does — one parser, both spellings.
+    var argi: usize = if (mode == .auto) 1 else 2;
     var cli_features: wazmrt.features.Set = .{};
     while (argi < args.len) {
         const spec: []const u8 = if (std.mem.eql(u8, args[argi], "--features") and argi + 1 < args.len) blk: {
@@ -117,20 +152,44 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
         return exit_failure;
     }
 
+    // Which token is the module path, and what follows it.
+    //
+    // 🤝 **`wasi` is the one spelling where WASI flags may PRECEDE the path** — the sibling's
+    // usage line is `wasi [flags] <file> [-- argv]`, and measured, it accepts them on either side.
+    // wazmrt's parser wants the path first, so the leading flag run is moved BEHIND it.
+    // ⚠️ **`lead ++ tail`, never `tail ++ lead`:** an explicit `--` lives in `tail`, so appending
+    // the flags after it would hand `--dir` to the guest as argv — silently dropping a sandbox
+    // grant, which is the fail-OPEN direction §2.4b exists to catch.
+    // 🔒 This does NOT loosen §2.4b for the bare form: there, every wazmrt flag but `--features`
+    // still trails the path, and one written before it is still an unknown-flag error below.
+    var path: []const u8 = undefined;
+    var rest: []const [:0]const u8 = undefined;
+    if (mode == .wasi) {
+        const split = (try wasiSplit(arena, args[argi..])) orelse {
+            try out.print(
+                "error: wasi: no module given\n  usage: wazmrt wasi [flags] <module> [-- argv]\n",
+                .{},
+            );
+            return exit_failure;
+        };
+        path = split.path;
+        rest = split.rest;
+    } else {
+        path = args[argi];
+        rest = args[argi + 1 ..];
+    }
+
     // ⚠️ **Z2 / v14: a flag-shaped argument in the module-path position is an unknown flag, not a
     // missing file.** This used to fall through to the read below and report
     // `cannot read '--bogus': FileNotFound` — the right exit code with a message that sends the
     // user to look at the filesystem for a typo in their flag. `-h`/`-v` are handled above as the
     // first argument only (§2.4), and `--features` has already been consumed.
-    if (args[argi].len >= 2 and args[argi][0] == '-') {
-        try reportUnknownFlag(out, args[argi]);
+    // In `wasi` mode this is also what catches an unrecognised LEADING flag: `flagRegion` stops at
+    // it, so it lands in the path position and is named here rather than opened as a file.
+    if (path.len >= 2 and path[0] == '-') {
+        try reportUnknownFlag(out, path, mode != .run);
         return exit_failure;
     }
-
-    const path = args[argi];
-    // Everything after the module path: the export selector, the WASI flags, the guest's argv.
-    // With no leading `--features` this is exactly the `args[2..]` it replaced.
-    var rest = args[argi + 1 ..];
 
     // 🔒 **`--features` after the module path is an ERROR** (owner, 2026-09-19). It is the one
     // wazmrt flag that PRECEDES the path, so written after it the flag cannot apply — and until
@@ -174,8 +233,13 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
     // the file is read, so the message names the flag rather than the file. Single-dash tokens are
     // NOT examined here: by v15 they are the guest's wherever there is a guest, and the two modes
     // with no guest argv re-check with `single_dash = true` once the mode is known.
+    // 🔑 Whether THIS command can have a guest is already knowable here, and the hint is only
+    // true when it can: `run` passes function arguments, not argv, and a `.wast` script has no
+    // argv at all. `.auto`/`wasi` on a binary stays optimistic — the module has not been decoded
+    // yet, so `_start` is genuinely unknown, and over-offering `--` there costs nothing.
+    const may_have_guest = mode != .run and !std.mem.endsWith(u8, path, ".wast");
     if (unknownHostFlag(rest, false)) |bad| {
-        try reportUnknownFlag(out, bad);
+        try reportUnknownFlag(out, bad, may_have_guest);
         return exit_failure;
     }
 
@@ -196,7 +260,7 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
         // token here is ours too and an unrecognised one is an error. `wazmrt s.wast --bogus` used
         // to exit 0 with the flag silently ignored.
         if (unknownHostFlag(rest, true)) |bad| {
-            try reportUnknownFlag(out, bad);
+            try reportUnknownFlag(out, bad, false);
             return exit_failure;
         }
         // `runScript` INSTANTIATES AND INVOKES the script's modules — including
@@ -255,7 +319,13 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
     // in-memory `bytes` (exactly what we execute — TOCTOU-safe) are hashed and
     // checked against the root-owned pin DB per the enforcement policy. The
     // summarize path below never executes, so it is never gated.
-    const will_execute = (rest.len >= 1 and findExport(&module, rest[0]) != null) or
+    // 🔒 **An explicit `run`/`wasi` IS an intent to execute, whatever the module turns out to
+    // contain.** Without this, `wazmrt wasi unauthorized.wasm` on a module with no `_start` would
+    // skip the gate, then report which exports it does have — inspecting and describing a module
+    // the pin DB never authorized. Authorization first is this path's standing order; the mode
+    // check below therefore runs *after* the gate rather than short-circuiting it.
+    const will_execute = mode != .auto or
+        (rest.len >= 1 and findExport(&module, rest[0]) != null) or
         findExport(&module, "_start") != null;
     if (will_execute and !(try verifyGate(arena, io, out, bytes, path, rest))) return exit_failure;
 
@@ -281,6 +351,34 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
             try printInvalidity(out, e);
             return exit_failure;
         };
+    }
+
+    // 🔒 **THE EXPLICIT SPELLINGS DO NOT FALL BACK** (`interop.md` §2.3 — the Z1 rule, applied
+    // where the bare form cannot apply it). `wazmrt run m.wasm nosuch` on a module that also
+    // exports `_start` would otherwise slide into WASI mode and run something the user never
+    // asked for, with `nosuch` quietly becoming guest argv — succeeding at a different job and
+    // reporting rc 0. In the bare form that word genuinely might be argv, which is why the guard
+    // there is narrow; here the user named the mode, so there is nothing to be ambiguous about.
+    switch (mode) {
+        .auto => {},
+        .run => {
+            if (rest.len == 0 or std.mem.eql(u8, rest[0], "--")) {
+                try out.print(
+                    "error: run: no function named\n  usage: wazmrt run <module> <function> [args...]\n",
+                    .{},
+                );
+                return exit_failure;
+            }
+            if (findExport(&module, rest[0]) == null) {
+                try reportMissingExport(out, &module, rest[0], path);
+                return exit_failure;
+            }
+        },
+        .wasi => if (findExport(&module, "_start") == null) {
+            try out.print("error: wasi: '{s}' exports no '_start'\n", .{path});
+            try printExportList(out, &module);
+            return exit_failure;
+        },
     }
 
     // Run mode: `wazmrt <module.wasm> <export> [args...]` — invoke and print.
@@ -320,21 +418,14 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, io: Io, out: *Io.Writer
     // is never examined (§2.4a), even when it turns out there is no guest to receive it.
     const first_word = flagRegion(rest).len;
     if (rest.len > first_word and !std.mem.eql(u8, rest[first_word], "--")) {
-        try out.print("error: no exported function '{s}' in {s}\n", .{ rest[first_word], path });
-        if (module.exports.len == 0) {
-            try out.print("  the module exports nothing\n", .{});
-        } else {
-            try out.print("  exports:", .{});
-            for (module.exports) |e| try out.print(" {s}", .{e.name});
-            try out.print("\n", .{});
-        }
+        try reportMissingExport(out, &module, rest[first_word], path);
         return exit_failure;
     }
 
     // ⚠️ **§2.4a item 4 again:** summarize has no guest argv either, so a leftover single-dash flag
     // is a host position. The `--flag` case was caught before the read; this catches `-x`.
     if (unknownHostFlag(rest, true)) |bad| {
-        try reportUnknownFlag(out, bad);
+        try reportUnknownFlag(out, bad, false);
         return exit_failure;
     }
 
@@ -577,18 +668,28 @@ fn printHelp(out: *Io.Writer, prog: []const u8) !void {
         \\
         \\A <module> is a `.wasm` binary or a `.wat` text file (assembled on the fly).
         \\
-        \\USAGE
+        \\USAGE — both spellings work, so a command line written for either runtime runs here:
         \\  {s} <module> <export> [args...]   invoke an exported function and print results
         \\  {s} <module> [wasi-flags] [-- argv]  run a WASI `_start` command module
         \\  {s} <module>                      summarize + validate (no matching export/_start)
         \\  {s} <script.wast>                 run a spec-test (.wast) script
+        \\  {s} run <module> <export> [args...]   invoke an exported function
+        \\  {s} wasi [flags] <module> [-- argv]   run a WASI `_start` command
+        \\  {s} wat <file.wat> [-o out.wasm]      assemble the text format to a binary
+        \\  {s} wast <file|dir>... [-v]           run .wast spec scripts
         \\  {s} <subcommand> ...              pin / keygen / sign (below)
         \\  {s} -h | --help | -v | --version
+        \\
+        \\  The named modes do NOT fall back: `run` must name an export that exists and
+        \\  `wasi` must find `_start`, or the run fails. The bare forms still choose the
+        \\  mode from the module, which is the behaviour they have always had.
         \\
         \\  POSITION  `--features <list>` is the ONLY wazmrt flag that goes BEFORE <module>:
         \\                {s} --features <list> <module> [...]
         \\            EVERY other wazmrt flag goes AFTER the module path. Written after
         \\            the path it is an ERROR, because it could not apply there.
+        \\            EXCEPT under `wasi`, whose flags may precede the module too —
+        \\            `wasi --dir .:/ prog.wasm` and `wasi prog.wasm --dir .:/` both work.
         \\
         \\RUN MODES
         \\  {s} add.wasm add 2 3
@@ -659,7 +760,7 @@ fn printHelp(out: *Io.Writer, prog: []const u8) !void {
         \\  -h, --help                  show this help and exit
         \\  -v, --version               show version information and exit
         \\
-    , .{ wazmrt.version, prog, prog, prog, prog, prog, prog, prog, prog, prog, sharedPinsPath(), defaultPinsPath(), prog });
+    , .{ wazmrt.version, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, sharedPinsPath(), defaultPinsPath(), prog });
 }
 
 // ===== Phase 5 — pin verification (see cmem/security-model.md, roadmap.md §5) =====
@@ -673,6 +774,260 @@ const PinEntry = struct { hex: wazmrt.pin.Hex, label: []const u8 };
 /// <path>` also appends there. Meant to be run with privilege by an installer —
 /// the runtime only ever *reads* the DB. The **directory** form lets a packager
 /// pin a whole bundle in one step.
+const WasiSplit = struct { path: [:0]const u8, rest: []const [:0]const u8 };
+
+/// Split the sibling's `wasi [flags] <module> [flags] [-- argv]` into the module
+/// path and the tail wazmrt's own parser expects — **the leading flags first,
+/// then everything that followed the path**. Null when no non-flag token is
+/// present, i.e. no module was named.
+///
+/// ⚠️⚠️ **`lead ++ tail`, NEVER `tail ++ lead`, and that is the whole reason this
+/// is a named function with a test instead of four lines inline.** An explicit
+/// `--` lives in `tail`; appending the flags after it would put `--dir` into the
+/// GUEST's argv, where wazmrt never looks — so `wasi --dir /data prog.wasm -- x`
+/// would run with no preopen at all and say nothing. That is the fail-OPEN
+/// direction §2.4b exists to catch, produced by an ordering mistake that no
+/// amount of reading the happy path would reveal.
+///
+/// 🔒 An unrecognised LEADING flag is deliberately not diagnosed here:
+/// `flagRegion` stops at it, so it lands in the path position and the caller's
+/// flag-shaped-path check names it (§2.4a) instead of opening it as a file.
+fn wasiSplit(a: std.mem.Allocator, sub: []const [:0]const u8) !?WasiSplit {
+    const lead = flagRegion(sub).len;
+    if (lead == sub.len) return null;
+    const tail = sub[lead + 1 ..];
+    const merged = try a.alloc([:0]const u8, lead + tail.len);
+    @memcpy(merged[0..lead], sub[0..lead]);
+    @memcpy(merged[lead..], tail);
+    return .{ .path = sub[lead], .rest = merged };
+}
+
+/// `wazmrt wat <file.wat> [-o <out.wasm>]` — assemble the text format to a binary.
+///
+/// 🆕 **The one genuinely NEW capability in Track B-c4** (`interop.md` §2.1: *"wazmrt must grow
+/// it"*). The other three spellings are aliases onto paths that already existed; this is the
+/// assembler, which wazmrt has always had, finally reachable without running the module.
+///
+/// 🔒 **Without `-o` it assembles and reports the size, writing NOTHING** — measured from the
+/// sibling rather than assumed, because "assemble" reads like a verb that produces a file and it
+/// does not. A default output name would be worse than no output: it would create a file next to
+/// the source that the user never named.
+///
+/// ⚠️ **No verify gate here, deliberately, and the reason is not "it is only a tool":** this path
+/// never instantiates or invokes anything, so there is nothing for a pin to authorize. The gate
+/// exists to stand in front of EXECUTION, and `.wast` earned its gate precisely because
+/// `runScript` executes. Assembling text to bytes is the same operation `pin` itself performs
+/// before hashing.
+fn watSubcommand(arena: std.mem.Allocator, io: Io, out: *Io.Writer, rest: []const []const u8) !u8 {
+    var in_path: ?[]const u8 = null;
+    var out_path: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const a = rest[i];
+        if (std.mem.eql(u8, a, "-o") or std.mem.eql(u8, a, "--output")) {
+            if (i + 1 >= rest.len) {
+                try out.print("error: wat: '{s}' needs a path\n", .{a});
+                return exit_failure;
+            }
+            out_path = rest[i + 1];
+            i += 1;
+            continue;
+        }
+        // §2.4a item 4: this command has no guest argv, so EVERY argument is a
+        // host position and a single dash is ours too — `-x` is an error, not a
+        // filename. The same reading `.wast` and summarize use.
+        if (a.len >= 2 and a[0] == '-') {
+            try reportUnknownFlag(out, a, false);
+            return exit_failure;
+        }
+        if (in_path != null) {
+            try out.print("error: wat: one input file at a time (already given '{s}')\n", .{in_path.?});
+            return exit_failure;
+        }
+        in_path = a;
+    }
+    const src_path = in_path orelse {
+        try out.print("usage: wazmrt wat <file.wat> [-o <out.wasm>]\n", .{});
+        return exit_failure;
+    };
+
+    const text = Io.Dir.cwd().readFileAlloc(io, src_path, arena, .limited(64 << 20)) catch |e| {
+        try out.print("error: cannot read '{s}': {s}\n", .{ src_path, @errorName(e) });
+        return exit_failure;
+    };
+    const bytes = wazmrt.wat.assemble(arena, text) catch |e| {
+        try out.print("error: cannot assemble '{s}': {s}\n", .{ src_path, @errorName(e) });
+        return exit_failure;
+    };
+    if (out_path) |dst| {
+        Io.Dir.cwd().writeFile(io, .{ .sub_path = dst, .data = bytes }) catch |e| {
+            try out.print("error: cannot write '{s}': {s}\n", .{ dst, @errorName(e) });
+            return exit_failure;
+        };
+        try out.print("{s}: {d} bytes\n", .{ dst, bytes.len });
+    } else {
+        try out.print("{s}: assembled {d} bytes\n", .{ src_path, bytes.len });
+    }
+    return 0;
+}
+
+/// `wazmrt wast <file|dir>... [-v] [--features <list>]` — run one or more `.wast`
+/// spec scripts, or every script under a directory.
+///
+/// 🤝 The sibling's spelling (`interop.md` §2.1). wazmrt's own `wazmrt s.wast` keeps working and
+/// is unchanged; this adds the multi-target and directory forms it never had.
+///
+/// 🔒 **The verify gate runs per script, exactly as the bare form's does, and that is not
+/// optional.** `runScriptWith` INSTANTIATES AND INVOKES the modules a script contains, including
+/// `(module binary "…")` raw payloads — so this is an execution path. The bare `.wast` path once
+/// returned before its gate, which meant any wasm could be run unpinned under a root-owned
+/// `# mode: enforce` just by wrapping it in a script, and the attacker picks the extension.
+/// ⚠️ **A second entry point to an execution path is a second chance to forget the gate.**
+///
+/// 🔑 `--features` reaches here for the same reason: a restriction that covered `.wasm` and not
+/// `.wast` could be stepped around by wrapping the module in a script.
+fn wastSubcommand(arena: std.mem.Allocator, io: Io, out: *Io.Writer, rest: []const []const u8) !u8 {
+    var targets: std.ArrayList([]const u8) = .empty;
+    var verbose = false;
+    var cli_features: wazmrt.features.Set = .{};
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const a = rest[i];
+        if (std.mem.eql(u8, a, "-v") or std.mem.eql(u8, a, "--verbose")) {
+            verbose = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--features") and i + 1 < rest.len) {
+            cli_features = parseFeatures(rest[i + 1], cli_features, out) catch return exit_failure;
+            i += 1;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--features=")) {
+            cli_features = parseFeatures(a["--features=".len..], cli_features, out) catch return exit_failure;
+            continue;
+        }
+        // No guest argv in this mode, so a single dash is a host position too (§2.4a item 4).
+        if (a.len >= 2 and a[0] == '-') {
+            try reportUnknownFlag(out, a, false);
+            return exit_failure;
+        }
+        try targets.append(arena, a);
+    }
+    if (targets.items.len == 0) {
+        try out.print("usage: wazmrt wast <file|dir>... [-v]\n", .{});
+        return exit_failure;
+    }
+    if (cli_features.incoherent()) |pair| {
+        try out.print("error: --features: '{s}' is layered on '{s}' and cannot be enabled without it\n", .{ pair[0].name(), pair[1].name() });
+        return exit_failure;
+    }
+
+    // Expand directories into the scripts under them, so one line of output per
+    // script either way and the totals mean the same thing in both forms.
+    var scripts: std.ArrayList([]const u8) = .empty;
+    for (targets.items) |t| {
+        const st = Io.Dir.cwd().statFile(io, t, .{}) catch |e| {
+            try out.print("error: cannot stat '{s}': {s}\n", .{ t, @errorName(e) });
+            return exit_failure;
+        };
+        if (st.kind != .directory) {
+            try scripts.append(arena, t);
+            continue;
+        }
+        collectWastFiles(arena, io, t, &scripts) catch |e| {
+            try out.print("error: cannot walk '{s}': {s}\n", .{ t, @errorName(e) });
+            return exit_failure;
+        };
+    }
+    if (scripts.items.len == 0) {
+        try out.print("error: no .wast scripts under the given path(s)\n", .{});
+        return exit_failure;
+    }
+
+    var total_passed: usize = 0;
+    var total_failed: usize = 0;
+    var total_skipped: usize = 0;
+    var errored: usize = 0;
+    for (scripts.items) |script| {
+        const bytes = Io.Dir.cwd().readFileAlloc(io, script, arena, .limited(64 << 20)) catch |e| {
+            try out.print("error: cannot read '{s}': {s}\n", .{ script, @errorName(e) });
+            errored += 1;
+            continue;
+        };
+        // See the doc comment: this executes, so it is gated like a module.
+        if (!(try verifyGate(arena, io, out, bytes, script, rest))) return exit_failure;
+        const s = wazmrt.wast.runScriptWith(arena, bytes, script, cli_features) catch |e| {
+            try out.print("error: cannot run '{s}': {s}\n", .{ script, @errorName(e) });
+            errored += 1;
+            continue;
+        };
+        total_passed += s.passed;
+        total_failed += s.failed;
+        total_skipped += s.skipped;
+        try out.print("{s}: {d} passed, {d} failed, {d} skipped\n", .{ script, s.passed, s.failed, s.skipped });
+        for (s.failures.items) |f| try out.print("  failure: {s}\n", .{f});
+        // ⚠️ `runScriptWith` caps the failure list it retains. Saying "and N more"
+        // is what stopped 25 distinct decoder defects reading as one problem; `-v`
+        // is for when the cap itself is what you are fighting, and says so rather
+        // than pretending the remainder was printed.
+        if (s.failed > s.failures.items.len) {
+            if (verbose) {
+                try out.print("  ... and {d} more, NOT listed — the runner keeps only the first {d}\n", .{ s.failed - s.failures.items.len, s.failures.items.len });
+            } else {
+                try out.print("  ... and {d} more\n", .{s.failed - s.failures.items.len});
+            }
+        }
+    }
+
+    // One script keeps the single-line output the bare form has always printed;
+    // more than one gets a total, because a per-file list with no sum is a list
+    // somebody has to add up by hand.
+    if (scripts.items.len > 1 or errored != 0) {
+        try out.print("total: {d} file(s) — {d} passed, {d} failed, {d} skipped", .{ scripts.items.len, total_passed, total_failed, total_skipped });
+        if (errored != 0) try out.print(", {d} could not be run", .{errored});
+        try out.print("\n", .{});
+    }
+    // A failing assertion is a failing run — and so is a script that could not be
+    // read or parsed, which used to be indistinguishable from one that passed.
+    return if (total_failed != 0 or errored != 0) exit_failure else 0;
+}
+
+/// Collect every `.wast` under `dir_path`, recursively, in walk order.
+fn collectWastFiles(arena: std.mem.Allocator, io: Io, dir_path: []const u8, outp: *std.ArrayList([]const u8)) !void {
+    var dir = try Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+    var walker = try dir.walk(arena);
+    defer walker.deinit();
+    while (try walker.next(io)) |ent| {
+        if (ent.kind != .file) continue;
+        if (!std.mem.endsWith(u8, ent.basename, ".wast")) continue;
+        // `ent.path` is invalidated by the next `walker.next`, so copy it now —
+        // the same trap `collectDirPins` documents.
+        try outp.append(arena, try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir_path, ent.path }));
+    }
+}
+
+/// Z1's refusal (`interop.md` §2.3): an export was named and the module does not
+/// have it. One wording, two callers — the bare form's guard and the explicit
+/// `run` spelling — because *a message written out a second time is a message
+/// that will drift*, and this one is a contract row.
+fn reportMissingExport(out: *Io.Writer, module: *const wazmrt.Module, name: []const u8, path: []const u8) !void {
+    try out.print("error: no exported function '{s}' in {s}\n", .{ name, path });
+    try printExportList(out, module);
+}
+
+/// The `exports:` line under a refusal — or an explicit statement that there are
+/// none, which is the case a bare list would render as blank and unreadable.
+fn printExportList(out: *Io.Writer, module: *const wazmrt.Module) !void {
+    if (module.exports.len == 0) {
+        try out.print("  the module exports nothing\n", .{});
+        return;
+    }
+    try out.print("  exports:", .{});
+    for (module.exports) |e| try out.print(" {s}", .{e.name});
+    try out.print("\n", .{});
+}
+
 fn pinSubcommand(arena: std.mem.Allocator, io: Io, out: *Io.Writer, rest: []const []const u8) !void {
     var target: ?[]const u8 = null;
     var db_path: ?[]const u8 = null;
@@ -1102,13 +1457,21 @@ fn unknownHostFlag(rest: []const []const u8, single_dash: bool) ?[]const u8 {
     return null;
 }
 
-/// Report an unknown host flag and fail. One wording, so the two call sites cannot drift.
-fn reportUnknownFlag(out: *Io.Writer, bad: []const u8) !void {
-    try out.print(
-        "error: unknown flag '{s}'\n" ++
-            "  run with --help for the flags this command accepts; use '--' to pass it to the guest\n",
-        .{bad},
-    );
+/// Report an unknown host flag and fail. One wording, so the call sites cannot drift.
+///
+/// ⚠️ **`has_guest` exists because the hint was false in half the places it printed.** The second
+/// line used to advise *"use `--` to pass it to the guest"* unconditionally — including from
+/// `.wast`, `wat` and summarize, which have no guest argv at all, so `--` there does nothing and
+/// the advice sends the user to try something that cannot work. **A hint that names a remedy the
+/// printing path does not have is the same defect class as a line that calls a module valid before
+/// it validated** (§2.5 / Z3), and `--max-iterations` already cost this project the lesson once.
+fn reportUnknownFlag(out: *Io.Writer, bad: []const u8, has_guest: bool) !void {
+    try out.print("error: unknown flag '{s}'\n", .{bad});
+    if (has_guest) {
+        try out.print("  run with --help for the flags this command accepts; use '--' to pass it to the guest\n", .{});
+    } else {
+        try out.print("  run with --help for the flags this command accepts (this command takes no guest arguments)\n", .{});
+    }
 }
 /// Split a `--dir` / `--ro-dir` spec into a host path and the guest path it is mounted at.
 ///
@@ -2024,6 +2387,55 @@ test "an unrecognised flag in a HOST position is an error; guest positions are u
     // A lone "-" is a conventional stdin/stdout stand-in, not a flag.
     try std.testing.expect(unknownHostFlag(&.{"-"}, true) == null);
     try std.testing.expect(unknownHostFlag(&.{}, true) == null);
+}
+
+test "B-c4: `wasi`'s leading flags move BEHIND the module, never behind the `--`" {
+    // 🤝 `interop.md` §2.1 (v20): the sibling's spelling is `wasi [flags] <file> [-- argv]`, and
+    // measured, it accepts the flags on either side. wazmrt's parser wants the path first, so the
+    // leading run is moved — and the ORDER of that move is the whole risk.
+    //
+    // ⚠️⚠️ `tail ++ lead` would put `--dir` AFTER the explicit `--`, where it becomes the guest's
+    // argv and wazmrt never looks at it: the run then proceeds with no preopen and says nothing.
+    // Fail-OPEN, from an ordering mistake, on the flag that grants filesystem access.
+    const a = std.testing.allocator;
+
+    // Flags before the path, with an explicit guest hand-off after it.
+    {
+        const s = (try wasiSplit(a, &.{ "--dir", ".:/", "prog.wasm", "--", "x" })).?;
+        defer a.free(s.rest);
+        try std.testing.expectEqualStrings("prog.wasm", s.path);
+        try std.testing.expectEqual(@as(usize, 4), s.rest.len);
+        try std.testing.expectEqualStrings("--dir", s.rest[0]);
+        try std.testing.expectEqualStrings(".:/", s.rest[1]);
+        // 🔒 The `--` must still come AFTER the flags, or the grant is lost.
+        try std.testing.expectEqualStrings("--", s.rest[2]);
+        try std.testing.expectEqualStrings("x", s.rest[3]);
+    }
+    // Flags on BOTH sides — the sibling accepts that, so both must survive.
+    {
+        const s = (try wasiSplit(a, &.{ "--dir", ".:/", "prog.wasm", "--env", "A=1", "--", "x" })).?;
+        defer a.free(s.rest);
+        try std.testing.expectEqualStrings("prog.wasm", s.path);
+        try std.testing.expectEqualSlices([:0]const u8, &.{ "--dir", ".:/", "--env", "A=1", "--", "x" }, s.rest);
+    }
+    // The bare `wasi <file>` form, and `wasi <file> [flags]` — nothing to move.
+    {
+        const s = (try wasiSplit(a, &.{ "prog.wasm", "--allow-symlink" })).?;
+        defer a.free(s.rest);
+        try std.testing.expectEqualStrings("prog.wasm", s.path);
+        try std.testing.expectEqualSlices([:0]const u8, &.{"--allow-symlink"}, s.rest);
+    }
+    // No module named at all: flags only, and flags that consume a value.
+    try std.testing.expect((try wasiSplit(a, &.{})) == null);
+    try std.testing.expect((try wasiSplit(a, &.{ "--dir", "." })) == null);
+    // ⚠️ An UNRECOGNISED leading flag is NOT consumed — `flagRegion` stops at it, so it lands in
+    // the path position where the caller reports it as an unknown flag (§2.4a) rather than
+    // trying to open it as a file. Pinned here because it is the behaviour the caller relies on.
+    {
+        const s = (try wasiSplit(a, &.{ "--bogus", "prog.wasm" })).?;
+        defer a.free(s.rest);
+        try std.testing.expectEqualStrings("--bogus", s.path);
+    }
 }
 
 test "--features written AFTER the module path is an ERROR, not a silent no-op" {
