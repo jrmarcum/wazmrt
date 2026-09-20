@@ -301,6 +301,15 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     var import_order: List(ImportTag) = .empty;
     var global_names: List(?[]const u8) = .empty;
     var func_imports: List(ImportedFunc) = .empty;
+    // Type index of each imported function, interned AT THE IMPORT rather than in
+    // a pass after the field loop. The pass was equivalent for the bytes it wrote
+    // and not for the ORDER it wrote them in: a `(tag …)` interns its type while
+    // the field loop runs, so every implicit tag type landed ahead of every
+    // implicit import type no matter what the source said. wasm-tools interns
+    // imports and tags together, in source order, and defined functions after
+    // both — so `(import (func (param f32))) (tag (param i64))` disagreed on the
+    // type section and therefore on the digest. (`interop.md` §3.1m, Z4.)
+    var func_import_type: List(u32) = .empty;
     // Defined memories (multi-memory). Each `(memory …)` appends here; the memory
     // section emits them in order. Imported memories take the low indices, so
     // `mem_names` (below) spans BOTH — imports first, definitions after.
@@ -313,7 +322,11 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     var mem_names: List(?[]const u8) = .empty;
     var start_ref: ?Sexpr = null;
 
-    const start: usize = if (module.len > 1 and isId(module[1])) 2 else 1; // skip optional module $name
+    const has_module_id = module.len > 1 and isId(module[1]);
+    const start: usize = if (has_module_id) 2 else 1; // skip optional module $name
+    // `(module $id …)`'s identifier — subsection 0 of the `name` section. It was
+    // skipped and dropped; nothing else in the binary can carry it.
+    const module_name: ?[]const u8 = if (has_module_id) module[1].asAtom() else null;
 
     // Pre-pass A: collect every `(type …)` name first (a concrete `(ref $t)` in a
     // field/param may forward-reference a later type, e.g. within a `(rec …)`
@@ -390,6 +403,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             for (f.exports.items) |name| try exports.append(a, .{ .name = name, .kind = 0, .index = idx });
             if (f.import) |m| {
                 try func_imports.append(a, .{ .module = m.module, .name = m.name, .type_ref = f.type_ref, .params = f.params.items, .results = f.results.items, .exact = f.type_exact });
+                try func_import_type.append(a, try importFuncType(a, &sigs, type_names.items, f.type_ref, f.params.items, f.results.items));
             } else {
                 try funcs.append(a, f);
             }
@@ -636,6 +650,7 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
             if (std.mem.eql(u8, dkw, "func")) {
                 const f = try parseFunc(a, desc, type_names.items); // reuse: parses $id + typeuse
                 try func_imports.append(a, .{ .module = (try strAt(items, 1)), .name = (try strAt(items, 2)), .type_ref = f.type_ref, .params = f.params.items, .results = f.results.items, .exact = f.type_exact });
+                try func_import_type.append(a, try importFuncType(a, &sigs, type_names.items, f.type_ref, f.params.items, f.results.items));
                 try func_names.append(a, f.name);
             } else if (std.mem.eql(u8, dkw, "table")) {
                 // (import "m" "n" (table $id? min max? reftype)) — imported tables
@@ -754,16 +769,8 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // Function type indices (`(type $t)` reference, else intern the inline sig),
     // then pre-encode bodies (which may intern block-type sigs / resolve
     // call_indirect type refs), so the type section is complete before emit.
-    // Imported-function type indices (for the import section).
-    var func_import_type: List(u32) = .empty;
-    for (func_imports.items) |fi| {
-        const ti = if (fi.type_ref) |tr| blk: {
-            const idx = try resolveType(type_names.items, tr);
-            try checkInlineTypeUse(&sigs, idx, fi.params, fi.results);
-            break :blk idx;
-        } else try internSig(a, &sigs, fi.params, fi.results);
-        try func_import_type.append(a, ti);
-    }
+    // (Imported-function type indices were interned in the field loop, in source
+    // order alongside the tags — see `func_import_type`'s declaration.)
 
     var func_type: List(u32) = .empty;
     for (funcs.items) |*f| {
@@ -791,7 +798,17 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     }
 
     var bodies: List([]const u8) = .empty;
-    for (funcs.items) |f| try bodies.append(a, try encodeBody(a, f, func_names.items, &sigs, type_names.items, global_names.items, table_names.items, elem_names.items, tag_names.items, data_names.items, mem_names.items, gc_field_names.items));
+    // Label names, one list per DEFINED function (index-aligned with `funcs`),
+    // kept for the `name` section below.
+    var body_label_names: List([]const ?[]const u8) = .empty;
+    // Does any body name a data segment? Decides the data-count section below.
+    var code_uses_data_index = false;
+    for (funcs.items) |f| {
+        const enc = try encodeBody(a, f, func_names.items, &sigs, type_names.items, global_names.items, table_names.items, elem_names.items, tag_names.items, data_names.items, mem_names.items, gc_field_names.items);
+        try bodies.append(a, enc.bytes);
+        try body_label_names.append(a, enc.label_names);
+        if (enc.uses_data_index) code_uses_data_index = true;
+    }
 
     // Pre-encode every const-expr-bearing section (global inits, element and data
     // exprs/offsets) BEFORE the type section, mirroring the function-body path, so
@@ -996,11 +1013,17 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // `data.drop`, and we emitted it never: every `(data …)` module this
     // assembler produced was malformed the moment a body touched a segment.
     // Nothing caught it because the decoder did not enforce the rule either —
-    // the two halves of the same gap agreed with each other. Emitting it
-    // whenever there IS a data section is simplest and always legal: when no
-    // instruction needs it the section is merely optional, and `decode` checks
-    // the count against `data.len` either way.
-    if (datas.items.len != 0) {
+    // the two halves of the same gap agreed with each other.
+    //
+    // ⚠️ It was then emitted whenever there WAS a data section, on the argument
+    // that always-emit is simplest and always legal. Both halves of that are
+    // true and it is still the wrong rule: wasm-tools emits the section exactly
+    // when §5.5.16 requires it, so an unused `(data …)` cost 3 bytes nobody
+    // asked for and, with them, digest equality on every such file — the second
+    // cause behind the `.wat` pin divergence, and one the `name` section fix
+    // left standing. Emit it when a body names a segment, which is the rule the
+    // spec states rather than a superset of it. (`interop.md` §3.1m, Z4.)
+    if (datas.items.len != 0 and code_uses_data_index) {
         var s: List(u8) = .empty;
         try uleb(a, &s, datas.items.len);
         try emitSection(a, &out, 12, s.items);
@@ -1018,7 +1041,127 @@ pub fn assembleModule(a: std.mem.Allocator, module: []const Sexpr) Error![]const
     // Data section (11) — pre-encoded above (before the type section).
     if (datas.items.len != 0) try emitSection(a, &out, 11, data_pay);
 
+    // `name` custom section (§7.4), LAST — the identifiers the text carried.
+    //
+    // ⚠️ The assembler collected every one of these for resolution and then threw
+    // them away at emit, so an assembled module told you nothing about the source
+    // it came from: no function was named in a trap, and a `.wat` pinned here
+    // hashed differently from the same file pinned by any wasm-tools-based tool —
+    // 952 of the 959 `.wat` files in the sibling corpus disagreed for this one
+    // reason. The standing rule is not to discard information the source carries;
+    // the digests converging is the TEST that this emits the right bytes, not the
+    // goal. (`interop.md` §3.1m, Z4.)
+    //
+    // 🔒 Shape, read off a wasm-tools-assembled module rather than recalled:
+    // subsections ascending, each omitted when its map is empty, anonymous
+    // entries skipped rather than written as empty names, and the whole section
+    // absent when a module names nothing at all — which is why the two corpus
+    // files with zero `$identifiers` already agreed and must keep agreeing.
+    {
+        var s: List(u8) = .empty;
+        if (module_name) |nm| {
+            var sub: List(u8) = .empty;
+            try nameBytes(a, &sub, identText(nm));
+            try emitNameSubsection(a, &s, 0, sub.items);
+        }
+        // Locals and labels are keyed by FUNCTION index, so the defined
+        // functions start past the imports.
+        var local_groups: List([]const ?[]const u8) = .empty;
+        for (funcs.items) |f| try local_groups.append(a, f.local_names.items);
+        try emitNameSubsection(a, &s, 1, try nameMapPayload(a, func_names.items));
+        try emitNameSubsection(a, &s, 2, try indirectNameMapPayload(a, local_groups.items, func_imports.items.len));
+        try emitNameSubsection(a, &s, 3, try indirectNameMapPayload(a, body_label_names.items, func_imports.items.len));
+        try emitNameSubsection(a, &s, 4, try nameMapPayload(a, type_names.items));
+        try emitNameSubsection(a, &s, 5, try nameMapPayload(a, table_names.items));
+        try emitNameSubsection(a, &s, 6, try nameMapPayload(a, mem_names.items));
+        try emitNameSubsection(a, &s, 7, try nameMapPayload(a, global_names.items));
+        try emitNameSubsection(a, &s, 8, try nameMapPayload(a, elem_names.items));
+        try emitNameSubsection(a, &s, 9, try nameMapPayload(a, data_names.items));
+        try emitNameSubsection(a, &s, 10, try indirectNameMapPayload(a, gc_field_names.items, 0));
+        try emitNameSubsection(a, &s, 11, try nameMapPayload(a, tag_names.items));
+        if (s.items.len != 0) {
+            var sec: List(u8) = .empty;
+            try nameBytes(a, &sec, "name");
+            try sec.appendSlice(a, s.items);
+            try emitSection(a, &out, 0, sec.items);
+        }
+    }
+
     return out.items;
+}
+
+/// The type index of an imported function's typeuse: the named `(type $t)` it
+/// references (checked against any inline `(param …)`/`(result …)` written
+/// beside it), else the interned inline signature. Called AT the import so the
+/// interning happens in source order — see `func_import_type`.
+fn importFuncType(a: std.mem.Allocator, sigs: *List(Sig), type_names: []const ?[]const u8, type_ref: ?Sexpr, params: []const V, results: []const V) Error!u32 {
+    if (type_ref) |tr| {
+        const idx = try resolveType(type_names, tr);
+        try checkInlineTypeUse(sigs, idx, params, results);
+        return idx;
+    }
+    return internSig(a, sigs, params, results);
+}
+
+/// The text of an identifier as the `name` section spells it: without the
+/// leading `$`, which is s-expression syntax and not part of the name. Every
+/// name list in this assembler stores the `$` because that is what a reference
+/// is matched against.
+fn identText(id: []const u8) []const u8 {
+    return if (id.len != 0 and id[0] == '$') id[1..] else id;
+}
+
+/// Encode a `namemap` (§7.4.1): a vector of ascending `(index, name)` pairs with
+/// every anonymous entry skipped. Returns an EMPTY slice when nothing in `names`
+/// is named — the caller's signal to omit the subsection rather than write a
+/// zero-count one, which is a different byte string and would break the digest.
+fn nameMapPayload(a: std.mem.Allocator, names: []const ?[]const u8) Error![]const u8 {
+    var count: usize = 0;
+    for (names) |n| {
+        if (n != null) count += 1;
+    }
+    if (count == 0) return &.{};
+    var s: List(u8) = .empty;
+    try uleb(a, &s, count);
+    for (names, 0..) |n, i| {
+        if (n) |nm| {
+            try uleb(a, &s, i);
+            try nameBytes(a, &s, identText(nm));
+        }
+    }
+    return s.items;
+}
+
+/// Encode an `indirectnamemap` (§7.4.1): a vector of `(index, namemap)` pairs,
+/// for locals (2), labels (3) and struct fields (10). `groups[i]` belongs to
+/// index `first_index + i` — the offset exists because locals and labels are
+/// keyed by function index and the defined functions follow the imported ones.
+/// A group with nothing named is dropped, and when none survives the whole
+/// subsection is empty.
+fn indirectNameMapPayload(a: std.mem.Allocator, groups: []const []const ?[]const u8, first_index: usize) Error![]const u8 {
+    const Entry = struct { idx: usize, payload: []const u8 };
+    var entries: List(Entry) = .empty;
+    for (groups, 0..) |g, i| {
+        const p = try nameMapPayload(a, g);
+        if (p.len != 0) try entries.append(a, .{ .idx = first_index + i, .payload = p });
+    }
+    if (entries.items.len == 0) return &.{};
+    var s: List(u8) = .empty;
+    try uleb(a, &s, entries.items.len);
+    for (entries.items) |e| {
+        try uleb(a, &s, e.idx);
+        try s.appendSlice(a, e.payload);
+    }
+    return s.items;
+}
+
+/// Append one `name`-section subsection (id, size, payload) — and nothing at all
+/// when the payload is empty.
+fn emitNameSubsection(a: std.mem.Allocator, out: *List(u8), id: u8, payload: []const u8) Error!void {
+    if (payload.len == 0) return;
+    try out.append(a, id);
+    try uleb(a, out, payload.len);
+    try out.appendSlice(a, payload);
 }
 
 /// Encode the global section (6) payload: `(valtype, mut, init-const-expr)` per
@@ -2023,9 +2166,38 @@ const Ctx = struct {
     /// Control-flow label stack (innermost last), for resolving `br $name` to a
     /// relative depth.
     labels: List(?[]const u8) = .empty,
+    /// Every control-flow label this body opened, in EMISSION order — one entry
+    /// per structured control instruction, `null` when it carried no `$id`.
+    /// Feeds the `name` section's label subsection (3), whose key is that
+    /// ordinal and NOT the stack depth: `labels` is a stack that pops, so its
+    /// depth repeats across siblings and could never index a map. Both are
+    /// written by `pushLabel` so they cannot drift apart.
+    label_names: List(?[]const u8) = .empty,
+    /// Set when this body emits an instruction that names a DATA SEGMENT
+    /// (`memory.init`, `data.drop`, `array.new_data`, `array.init_data`) — the
+    /// exact condition §5.5.16 makes the data-count section mandatory for.
+    /// Recorded AT the instruction rather than inferred from the finished bytes,
+    /// because an opcode byte also occurs inside immediates and literals and a
+    /// scan cannot tell the two apart. `false` on the const-expr paths: a
+    /// const-expr that reaches one of these is refused by the validator, so no
+    /// module carrying one is ever emitted.
+    uses_data_index: bool = false,
 };
 
-fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, table_names: []const ?[]const u8, elem_names: []const ?[]const u8, tag_names: []const ?[]const u8, data_names: []const ?[]const u8, mem_names: []const ?[]const u8, field_names: []const []const ?[]const u8) Error![]const u8 {
+/// Open a control-flow label: push it on the resolution stack AND record it, by
+/// ordinal, for the `name` section. Every structured control instruction —
+/// `block`, `loop`, `if`, `try`, `try_table`, folded and flat — goes through
+/// here; appending to `ctx.labels` directly would silently drop the name.
+fn pushLabel(ctx: *Ctx, label: ?[]const u8) Error!void {
+    try ctx.label_names.append(ctx.a, label);
+    try ctx.labels.append(ctx.a, label);
+}
+
+/// The encoded body plus the label names it opened, in ordinal order — the one
+/// fact the emitter used to throw away that the `name` section needs.
+const EncodedBody = struct { bytes: []const u8, label_names: []const ?[]const u8, uses_data_index: bool };
+
+fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, sigs: *List(Sig), type_names: []const ?[]const u8, global_names: []const ?[]const u8, table_names: []const ?[]const u8, elem_names: []const ?[]const u8, tag_names: []const ?[]const u8, data_names: []const ?[]const u8, mem_names: []const ?[]const u8, field_names: []const []const ?[]const u8) Error!EncodedBody {
     var body: List(u8) = .empty;
     // Locals vector: one (count=1, type) group per declared local.
     try uleb(a, &body, f.locals.items.len);
@@ -2036,7 +2208,7 @@ fn encodeBody(a: std.mem.Allocator, f: Func, func_names: []const ?[]const u8, si
     var ctx: Ctx = .{ .a = a, .out = &body, .local_names = f.local_names.items, .func_names = func_names, .sigs = sigs, .type_names = type_names, .global_names = global_names, .table_names = table_names, .elem_names = elem_names, .tag_names = tag_names, .data_names = data_names, .mem_names = mem_names, .field_names = field_names };
     try emitSeq(&ctx, f.body);
     try body.append(a, @intFromEnum(Op.end)); // implicit function end
-    return body.items;
+    return .{ .bytes = body.items, .label_names = ctx.label_names.items, .uses_data_index = ctx.uses_data_index };
 }
 
 /// Emit a sequence of instruction forms (folded lists and/or flat atoms).
@@ -2220,7 +2392,7 @@ fn emitFoldedBlock(ctx: *Ctx, op: Op, l: []const Sexpr) Error!void {
     var j: usize = 1;
     const label = parseOptLabel(l, &j);
     try emitBlockTypeSig(ctx, try parseBlockTypeSig(ctx, l, &j));
-    try ctx.labels.append(ctx.a, label);
+    try pushLabel(ctx, label);
     try emitSeq(ctx, l[j..]);
     try ctx.out.append(ctx.a, @intFromEnum(Op.end));
     _ = ctx.labels.pop();
@@ -2240,7 +2412,7 @@ fn emitTryTable(ctx: *Ctx, l: []const Sexpr) Error!void {
     // deep — the exact mirror of the validator's bug, so the two halves agreed
     // with each other and neither was an oracle for the other.
     try emitCatchClauses(ctx, l, &j);
-    try ctx.labels.append(ctx.a, label);
+    try pushLabel(ctx, label);
     try emitSeq(ctx, l[j..]);
     try ctx.out.append(ctx.a, @intFromEnum(Op.end));
     _ = ctx.labels.pop();
@@ -2305,7 +2477,7 @@ fn emitFoldedTry(ctx: *Ctx, l: []const Sexpr) Error!void {
 
     try ctx.out.append(ctx.a, @intFromEnum(Op.try_));
     try emitBlockTypeSig(ctx, bt);
-    try ctx.labels.append(ctx.a, label);
+    try pushLabel(ctx, label);
     try emitSeq(ctx, do_form[1..]);
 
     // `(delegate $l)` forwards an exception to an enclosing try INSTEAD of running this try's
@@ -2382,7 +2554,7 @@ fn emitFoldedIf(ctx: *Ctx, l: []const Sexpr) Error!void {
 
     try ctx.out.append(ctx.a, @intFromEnum(Op.@"if"));
     try emitBlockTypeSig(ctx, bt);
-    try ctx.labels.append(ctx.a, label);
+    try pushLabel(ctx, label);
     try emitSeq(ctx, then_form[1..]);
     if (else_form) |ef| {
         if (ef.len == 0) return error.BadImmediate; // `(else …)`, not `()`
@@ -2419,7 +2591,7 @@ fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Erro
             var j = i + 1;
             const label = parseOptLabel(items, &j);
             try emitBlockTypeSig(ctx, try parseBlockTypeSig(ctx, items, &j));
-            try ctx.labels.append(ctx.a, label);
+            try pushLabel(ctx, label);
             return j;
         },
         .try_table => {
@@ -2433,7 +2605,7 @@ fn emitFlatOne(ctx: *Ctx, items: []const Sexpr, i: usize, name: []const u8) Erro
             const bt = try parseBlockTypeSig(ctx, items, &j);
             try emitBlockTypeSig(ctx, bt);
             try emitCatchClauses(ctx, items, &j);
-            try ctx.labels.append(ctx.a, label);
+            try pushLabel(ctx, label);
             return j;
         },
         // §6.5.2: a flat `else`/`end` may REPEAT the enclosing block's label —
@@ -2818,10 +2990,14 @@ fn emitInstr(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
         // `parseIndex`: data was the only index space whose operand was
         // numeric-only, so `data.drop $d` / `memory.init $d` failed with
         // `BadImmediate` while `elem.drop $e` / `table.init $e` resolved.
-        .data => try uleb(ctx.a, ctx.out, try resolveByName(ctx.data_names, try imm0(immediates))),
+        .data => {
+            ctx.uses_data_index = true;
+            try uleb(ctx.a, ctx.out, try resolveByName(ctx.data_names, try imm0(immediates)));
+        },
         // `memory.init <memidx>? <dataidx>`: two immediates = [mem, data]; one =
         // [data], mem 0. The binary is data index then memory index.
         .data_init => {
+            ctx.uses_data_index = true;
             if (immediates.len >= 2) {
                 try uleb(ctx.a, ctx.out, try resolveByName(ctx.data_names, immediates[1]));
                 try uleb(ctx.a, ctx.out, try resolveByName(ctx.mem_names, immediates[0]));
@@ -2884,6 +3060,7 @@ fn emitInstr(ctx: *Ctx, op: Op, immediates: []const Sexpr) Error!void {
         // resolved against the DATA names (`$d` or a numeric index), the same way
         // `memory.init` does; the type index comes first in both text and binary.
         .gc_data => {
+            ctx.uses_data_index = true;
             if (immediates.len < 2) return error.BadImmediate;
             try uleb(ctx.a, ctx.out, try resolveType(ctx.type_names, immediates[0]));
             try uleb(ctx.a, ctx.out, try resolveByName(ctx.data_names, immediates[1]));
@@ -6939,11 +7116,168 @@ test "custom page sizes: the limits flag round-trips, and BYTE-granular bounds a
     try std.testing.expectError(error.MemoryOutOfBounds, assembleAndRun(src, "load", &.{interp.i32Value(3)}));
 }
 
-test "the assembler emits a data-count section for any module with data segments" {
+/// The payload of an assembled module's `name` custom section (everything after
+/// the section's own `"name"` string), or null when there is none. Walks the
+/// section list rather than searching for the bytes: `name` occurs inside data
+/// segments and export strings too, and a search would find those.
+fn nameSectionPayload(bytes: []const u8) ?[]const u8 {
+    var i: usize = 8; // past the magic + version
+    while (i < bytes.len) {
+        const id = bytes[i];
+        var j = i + 1;
+        var size: usize = 0;
+        var shift: u6 = 0;
+        while (j < bytes.len) : (j += 1) {
+            size |= @as(usize, bytes[j] & 0x7f) << shift;
+            if (bytes[j] & 0x80 == 0) {
+                j += 1;
+                break;
+            }
+            shift += 7;
+        }
+        const payload = bytes[j..][0..size];
+        if (id == 0) {
+            var k: usize = 0;
+            var len: usize = 0;
+            var s2: u6 = 0;
+            while (k < payload.len) : (k += 1) {
+                len |= @as(usize, payload[k] & 0x7f) << s2;
+                if (payload[k] & 0x80 == 0) {
+                    k += 1;
+                    break;
+                }
+                s2 += 7;
+            }
+            if (std.mem.eql(u8, payload[k..][0..len], "name")) return payload[k + len ..];
+        }
+        i = j + size;
+    }
+    return null;
+}
+
+test "the assembler emits a `name` section carrying every identifier the text bound" {
+    // Z4 (`interop.md` §3.1m). The assembler collected all twelve of these name
+    // spaces for resolution and dropped every one at emit, so an assembled
+    // module could not say what anything in it was called — and a `.wat` pinned
+    // here hashed differently from the same file pinned by any wasm-tools-based
+    // tool. 952 of the 959 `.wat` files in the sibling corpus disagreed.
+    //
+    // ⚠️ The golden below was READ OFF a wasm-tools-assembled module, not
+    // recalled from the spec: the shape questions that decide the bytes (are
+    // anonymous entries written as empty names or skipped? is an empty map a
+    // zero count or an absent subsection?) are conventions, and guessing one
+    // wrong costs the digest without costing validity.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Every subsection at once: module(0) func(1) local(2) label(3) type(4)
+    // table(5) memory(6) global(7) elem(8) data(9) field(10) tag(11).
+    const src =
+        \\(module $m
+        \\  (type $s (struct (field $x i32)))
+        \\  (import "e" "t" (tag $it))
+        \\  (import "e" "f" (func $if))
+        \\  (import "e" "m" (memory $im 1))
+        \\  (import "e" "g" (global $ig i32))
+        \\  (import "e" "b" (table $ib 1 funcref))
+        \\  (table $tb 1 funcref)
+        \\  (memory $mm 1)
+        \\  (global $g i32 (i32.const 0))
+        \\  (tag $tg)
+        \\  (elem $el func $fn)
+        \\  (data $da "a")
+        \\  (func $fn (param $p i32)
+        \\    (local $l i32)
+        \\    (block $bl (nop))
+        \\    (nop))
+        \\  (func (nop)))
+    ;
+    const golden = [_]u8{
+        0x00, 0x02, 0x01, 0x6d, 0x01, 0x09, 0x02, 0x00, 0x02, 0x69, 0x66, 0x01,
+        0x02, 0x66, 0x6e, 0x02, 0x09, 0x01, 0x01, 0x02, 0x00, 0x01, 0x70, 0x01,
+        0x01, 0x6c, 0x03, 0x07, 0x01, 0x01, 0x01, 0x00, 0x02, 0x62, 0x6c, 0x04,
+        0x04, 0x01, 0x00, 0x01, 0x73, 0x05, 0x09, 0x02, 0x00, 0x02, 0x69, 0x62,
+        0x01, 0x02, 0x74, 0x62, 0x06, 0x09, 0x02, 0x00, 0x02, 0x69, 0x6d, 0x01,
+        0x02, 0x6d, 0x6d, 0x07, 0x08, 0x02, 0x00, 0x02, 0x69, 0x67, 0x01, 0x01,
+        0x67, 0x08, 0x05, 0x01, 0x00, 0x02, 0x65, 0x6c, 0x09, 0x05, 0x01, 0x00,
+        0x02, 0x64, 0x61, 0x0a, 0x06, 0x01, 0x00, 0x01, 0x00, 0x01, 0x78, 0x0b,
+        0x09, 0x02, 0x00, 0x02, 0x69, 0x74, 0x01, 0x02, 0x74, 0x67,
+    };
+    const bytes = try assemble(a, src);
+    try std.testing.expectEqualSlices(u8, &golden, nameSectionPayload(bytes) orelse return error.NoNameSection);
+    // …and it is still a module: a custom section the decoder must skip.
+    var m = try Module.decode(a, bytes);
+    try validate(a, &m);
+
+    // 🔒 The control. A module that binds NO identifier gets no section at all —
+    // not an empty one. These are the only two files in the sibling corpus that
+    // agreed before this change, and they must keep agreeing.
+    try std.testing.expect(nameSectionPayload(try assemble(a, "(module (func (nop)))")) == null);
+}
+
+test "a `name` label entry is keyed by the block's ORDINAL, not its stack depth" {
+    // The label stack pops, so two sibling blocks sit at the same depth; keying
+    // the map by depth would write two entries with one index. wasm-tools
+    // numbers every structured control instruction in the body, counting the
+    // unnamed ones, and names only those that have a name.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // block(0) block $named(1) loop(2) block $second(3) — so the map is
+    // {1: "named", 3: "second"} and NOT {1: …, 1: …}.
+    const src =
+        \\(module (func
+        \\  (block (block $named (nop)))
+        \\  (loop (nop))
+        \\  (block $second (nop))))
+    ;
+    const golden = [_]u8{
+        0x03, 0x12, 0x01, 0x00, 0x02, 0x01, 0x05, 0x6e, 0x61, 0x6d, 0x65, 0x64,
+        0x03, 0x06, 0x73, 0x65, 0x63, 0x6f, 0x6e, 0x64,
+    };
+    try std.testing.expectEqualSlices(u8, &golden, nameSectionPayload(try assemble(a, src)) orelse return error.NoNameSection);
+}
+
+test "an imported function's type is interned in source order, alongside the tags" {
+    // A `(tag …)` interns its type while the field loop runs; imported functions
+    // were interned in a pass afterwards. So every implicit tag type landed
+    // ahead of every implicit import type whatever the source said — the type
+    // SECTION then differed from wasm-tools' for the same text, which is a
+    // different module by digest and an identical one by behaviour. Nothing
+    // wazmrt owns could see it; the sibling's binary on the same bytes could.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const src =
+        \\(module
+        \\  (import "e" "f" (func (param f32)))
+        \\  (tag $t (param i64))
+        \\  (func $a (param f64) (nop)))
+    ;
+    const m = try Module.decode(a, try assemble(a, src));
+    // Source order: the import's (f32) first, the tag's (i64) second, and the
+    // DEFINED function's (f64) after both — defined funcs are a later pass in
+    // wasm-tools too, which is why a func written before a tag still follows it.
+    try std.testing.expectEqual(@as(usize, 3), m.comp_types.len);
+    for ([_]V{ .f32, .i64, .f64 }, 0..) |want, i| {
+        try std.testing.expectEqual(@as(usize, 1), m.comp_types[i].func.params.len);
+        try std.testing.expectEqual(want, m.comp_types[i].func.params[0]);
+    }
+}
+
+test "the assembler emits a data-count section exactly when a body names a data segment" {
     // §5.5.16 requires it once a body uses `memory.init`/`data.drop`, and we
     // emitted it never — so every such module this assembler produced was
     // malformed. Invisible until the decoder started enforcing the rule, since
     // the two gaps agreed with each other.
+    //
+    // The over-correction then emitted it for any module with a data section at
+    // all. Legal, and still wrong: wasm-tools emits it exactly when required, so
+    // an unused `(data …)` put 3 bytes in the binary that no other assembler
+    // writes — and with them went digest equality on every such `.wat`.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -6962,6 +7296,22 @@ test "the assembler emits a data-count section for any module with data segments
     // data-count section would then disagree with nothing but still be noise.
     const m2 = try Module.decode(a, try assemble(a, "(module (memory 1))"));
     try std.testing.expectEqual(@as(?u32, null), m2.data_count);
+
+    // ⚠️ The row that matters: data segments PRESENT, no body naming one ⇒ still
+    // no section. This is what the always-emit rule got wrong.
+    const m3 = try Module.decode(a, try assemble(a,
+        \\(module (memory 1) (data (i32.const 0) "abc") (func (export "f") (nop)))
+    ));
+    try std.testing.expectEqual(@as(?u32, null), m3.data_count);
+
+    // …and each of the GC data-segment instructions arms it too, not just the
+    // bulk-memory pair. `array.new_data` names a segment exactly as
+    // `memory.init` does, so the section is just as required.
+    const m4 = try Module.decode(a, try assemble(a,
+        \\(module (type $a (array i8)) (data $d "abc")
+        \\  (func (export "f") (drop (array.new_data $a $d (i32.const 0) (i32.const 3)))))
+    ));
+    try std.testing.expectEqual(@as(?u32, 1), m4.data_count);
 }
 
 test "legacy rethrow re-raises from the CURRENT position, so an inner try catches it" {

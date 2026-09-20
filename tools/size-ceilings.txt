@@ -886,6 +886,37 @@
 #
 # Corpus unchanged at 63,934 passed / 0 failed / 0 skipped / 0 file-errors. Unit tests 762 -> 764.
 
-wazmrt.exe  991744
-wazmrt.lib  1053908
+# ---------------------------------------------------------------------------------------
+# 2026-09-20 — Track B-c2 (Z4): the assembler emits a `name` section. exe +3,584, lib +4,518,
+# dll +0 against the measurement immediately below — but the ceiling moves further than that,
+# and the difference is the point of this note.
+#
+# ⚠️⚠️ THE EXE WAS ALREADY 4,608 BYTES OVER ITS CEILING AT HEAD, BEFORE THIS CHANGE. Measured by
+# stashing this work and re-running the gate: `996,352` against a ceiling of `991,744`. The two
+# preceding Track B commits — `0a48957a` (B-b: Z1/Z2/Z3) and `22437455` (B-c1/c3/c5) — grew the
+# CLI and did not raise the number in the same commit, which is the one thing this file's header
+# says every growth must do. Nothing caught it because neither commit ran `zig build size`, and
+# the step is not part of `zig build`. 🎓 **A gate that has to be remembered is not enforcement**
+# — the same argument that made the ABI version a real check. Filed for Track B's own hunt.
+#
+# So this raise covers two distinct things and says which is which:
+#   exe  991,744 -> 999,936   (+4,608 already on main from B-b/B-c1, +3,584 from this change)
+#   lib  1,053,908 -> 1,058,426   (all of it this change)
+#   dll  900,608 -> 900,608   (ZERO — the embed artifact does not move)
+#
+# What bought this change's bytes: the `name` custom section (§7.4) that `assembleModule` now
+# writes — twelve subsections, a `namemap`/`indirectnamemap` encoder pair, the per-body label
+# ordinal list threaded out of `encodeBody`, and the module-id capture. Against it, the
+# data-count section is now emitted only when a body names a segment rather than for every module
+# with a data section, which gives 3 bytes back per such MODULE but costs code here.
+#
+# 📏 The DLL is unchanged for the third shipped change running. The assembler lives in the embed
+# artifact, so this one could have moved it and did not: ReleaseSmall had headroom in the same
+# pages.
+#
+# Corpus unchanged (288 files / 64,072 passed / 0 failed / 20 skipped / 0 file-errors, the count
+# for this testsuite checkout). Unit tests 772 -> 778 (three new tests, two test binaries).
+
+wazmrt.exe  999936
+wazmrt.lib  1058426
 wazmrt.dll  900608
