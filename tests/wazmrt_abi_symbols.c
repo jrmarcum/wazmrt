@@ -74,6 +74,12 @@ const void *const wazmrt_abi_symbols[] = {
     (const void *)&wazmrt_module_new,
     (const void *)&wazmrt_module_new_wat,
     (const void *)&wazmrt_module_validate,
+    /* ⚠️ ADDED 2026-09-20 (Track B, dead-code sweep). This file's own header says it is generated
+       from the header and "cannot disagree with what we publish" — and it did: wazmrt_ref_is_valid
+       has been declared in wazmrt.h and exercised by capi_smoke.c since refs became handles, and
+       was the ONE published symbol this completeness gate never linked against. A gate that omits
+       a symbol reports OK for the thing it did not look at. */
+    (const void *)&wazmrt_ref_is_valid,
     (const void *)&wazmrt_store_delete,
     (const void *)&wazmrt_store_new,
     (const void *)&wazmrt_trap_delete,

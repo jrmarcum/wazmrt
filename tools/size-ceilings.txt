@@ -1040,6 +1040,25 @@
 # Corpus unchanged (288 files / 64,072 passed / 0 failed / 20 skipped / 0 file-errors).
 # Unit tests 792 -> 796.
 
+# ---------------------------------------------------------------------------------------
+# 2026-09-20 — Track B general hunt, second pass. exe +0, lib +10, **dll -512**.
+#
+# `shorthandRefType` was a second copy of `abstractHeapCode`'s table and had drifted: `exnref` and
+# `nullexnref` were missing, so `(table 1 exnref)` — a valid module the sibling accepts — was
+# refused here as `BadImmediate`. It is now DERIVED from the one table instead of re-typed, which
+# is the `emitValType` lesson applied one file over.
+#
+# 📉 **Deriving gave the DLL a whole page back** while costing the static lib 10 bytes: one
+# twelve-entry table and its comparison loop went away, replaced by a suffix strip and two small
+# exclusion lists. The exe did not move.
+#
+# Also in this pass: `wazmrt_ref_is_valid` added to `tests/wazmrt_abi_symbols.c` (the completeness
+# gate whose own header says it "cannot disagree with what we publish" was missing the one symbol
+# added when refs became handles), and a doc comment in `main.zig` that had been concatenated onto
+# itself by a bad edit.
+#
+# Unit tests 796 -> 798. Corpus unchanged.
+
 wazmrt.exe  1009152
-wazmrt.lib  1059226
-wazmrt.dll  910848
+wazmrt.lib  1059236
+wazmrt.dll  910336

@@ -524,7 +524,7 @@ fn featureFromSpelling(name: []const u8) ?wazmrt.features.Feature {
     return null;
 }
 
-/// Classify one already-trimmed item, or report why it is not one./// Classify one already-trimmed item, or report why it is not one.
+/// Classify one already-trimmed item, or report why it is not one.
 ///
 /// ⚠️ **An unrecognised name is an ERROR, never a skip.** Ignoring it would leave the user
 /// believing they had restricted something: `--features mvp,sim` would silently be `mvp`, and

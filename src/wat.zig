@@ -3005,15 +3005,42 @@ fn abstractHeapCode(atom: []const u8) ?i64 {
 }
 
 /// A shorthand reference-type atom (`anyref`/…) → nullable target + code.
+/// 🔒 **DERIVED from `abstractHeapCode`, never a second copy of it.**
+///
+/// 🚨 It *was* a second copy — the same ten heads with the same ten codes, eighteen lines below
+/// the original — and it had already drifted: **`exnref` and `nullexnref` were missing**, so
+/// `isRefType("exnref")` said false and `(table 1 exnref)` routed down the func-index path and
+/// died as `BadImmediate`. Measured against the sibling: both `(table 1 exnref)` and
+/// `(table 1 nullexnref)` validate there and were REJECTED here — valid modules refused.
+///
+/// ⚠️⚠️ **The table it was copied from carries a ⚠️ block about this exact omission**, recording
+/// that `exn` had been missing from IT once and cost `ref_null.wast`'s first module and 32
+/// assertions behind it. The copy inherited the bug the original had already been fixed for.
+/// 🎓 *One fact, two tables, and the second is where the next omission lands* — the same shape as
+/// `emitValType`/`emitBlockTypeSig` (Track B-a), one file over.
+///
+/// The derivation is the spec's own: a shorthand is its heap type plus `ref` — except the four
+/// BOTTOM types, which spell theirs `null<x>ref` rather than `<bottom>ref`.
 fn shorthandRefType(atom: []const u8) ?RefTypeTarget {
-    const map = .{
-        .{ "anyref", -0x12 },  .{ "eqref", -0x13 },      .{ "i31ref", -0x14 },
-        .{ "structref", -0x15 }, .{ "arrayref", -0x16 }, .{ "nullref", -0x0f },
-        .{ "funcref", -0x10 }, .{ "externref", -0x11 },  .{ "nullfuncref", -0x0d },
-        .{ "nullexternref", -0x0e },
+    if (!std.mem.endsWith(u8, atom, "ref")) return null;
+    const head = atom[0 .. atom.len - "ref".len];
+    if (head.len == 0) return null;
+
+    // `nullref`/`nullfuncref`/`nullexternref`/`nullexnref` → none/nofunc/noextern/noexn.
+    const bottoms = .{
+        .{ "null", "none" },          .{ "nullfunc", "nofunc" },
+        .{ "nullextern", "noextern" }, .{ "nullexn", "noexn" },
     };
-    inline for (map) |m| if (std.mem.eql(u8, atom, m[0])) return .{ .nullable = true, .code = m[1] };
-    return null;
+    inline for (bottoms) |b| if (std.mem.eql(u8, head, b[0]))
+        return .{ .nullable = true, .code = abstractHeapCode(b[1]).? };
+
+    // ⚠️ …and the bottoms are reachable ONLY through those spellings. Deriving blindly would also
+    // accept `nofuncref` / `noexternref` / `noneref` / `noexnref`, which are not wasm text — the
+    // cost of deriving instead of listing, and cheaper to exclude than to re-type the whole map.
+    inline for (.{ "none", "nofunc", "noextern", "noexn" }) |b|
+        if (std.mem.eql(u8, head, b)) return null;
+
+    return .{ .nullable = true, .code = abstractHeapCode(head) orelse return null };
 }
 
 /// Emit a `ref.test`/`ref.cast`: `0xFB`, the null/non-null sub-opcode, then the
@@ -7951,6 +7978,44 @@ fn sectionPayload(bytes: []const u8, id: u8) ?[]const u8 {
         i = j + size;
     }
     return null;
+}
+
+test "every abstract heap type has its `…ref` shorthand, exn included" {
+    // 🚨 `shorthandRefType` was a SECOND COPY of `abstractHeapCode`'s table — same heads, same
+    // codes, eighteen lines apart — and the copy was missing `exnref` / `nullexnref`. So
+    // `isRefType("exnref")` said false and `(table 1 exnref)` routed down the func-index path,
+    // where `exnref` was read as a function NAME and died as `BadImmediate`.
+    //
+    // ⚠️ Measured against the sibling: `(table 1 exnref)` and `(table 1 nullexnref)` both validate
+    // there and were REJECTED here — valid modules refused, with an error three steps from the
+    // cause. And the table it was copied from carries a ⚠️ block about `exn` having been missing
+    // from IT once. **The copy inherited a bug the original had already been fixed for.**
+    //
+    // 🔒 Derived now, so the next heap type added to `abstractHeapCode` cannot go missing here.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Every shorthand the spec defines, in a position that routes through `isRefType`.
+    for ([_][]const u8{
+        "anyref",  "eqref",     "i31ref",        "structref", "arrayref",
+        "funcref", "externref", "exnref",        "nullref",   "nullfuncref",
+        "nullexternref",        "nullexnref",
+    }) |shorthand| {
+        const src = try std.fmt.allocPrint(a, "(module (table 1 {s}))", .{shorthand});
+        _ = assemble(a, src) catch |e| {
+            std.debug.print("\n`(table 1 {s})` was refused: {s}\n", .{ shorthand, @errorName(e) });
+            return e;
+        };
+    }
+
+    // ⚠️ The half deriving could break: the BOTTOM types are spelled `null…ref`, never
+    // `<bottom>ref`. `nofuncref` and friends are not wasm text and must stay refused — a derived
+    // table that accepted them would be trading a reject-valid for an accept-invalid.
+    for ([_][]const u8{ "noneref", "nofuncref", "noexternref", "noexnref", "ref" }) |not_text| {
+        const src = try std.fmt.allocPrint(a, "(module (table 1 {s}))", .{not_text});
+        try std.testing.expectError(error.BadImmediate, assemble(a, src));
+    }
 }
 
 test "B-a: a block type that is a NON-NULL ABSTRACT ref is not wazmrt's internal tag" {
