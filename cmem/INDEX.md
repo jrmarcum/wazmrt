@@ -491,6 +491,42 @@ silent-wrong-output class wearing a different hat.*
 
 📖 **Full rationale and the incidents: [`best-practices.md`](best-practices.md) §6.**
 
+## 📏 LINE ENDINGS — **LF, EVERYWHERE, NO EXCEPTIONS** (owner, 2026-09-20; binding on every agent)
+
+🔒 **Every file in this repository uses LF (`\n`). Never CRLF. Not in the repository, not in the
+working tree, not in a file any tool or agent writes.** LF is git's own storage format, and matching
+it end-to-end is what removes the friction: nothing is converted, so nothing can warn, drift, or
+differ between clones.
+
+**The rule is enforced by [`.gitattributes`](../.gitattributes), which is the source of truth.** It
+pins `* text=auto eol=lf` and travels with the repo, so it **overrides** whatever `core.autocrlf` any
+particular machine has set. ⚠️ **Do not "fix" a line-ending complaint with `git config`** — that is
+correct on exactly one machine and invisible to the next clone.
+
+⚠️ **The premise this replaced was wrong, and it is worth keeping the correction: git was NOT asking
+for CRLF.** Every blob here has always been LF. A machine-**global** `core.autocrlf=true` was
+converting on checkout and back on commit, which is what emitted `warning: LF will be replaced by CRLF
+the next time Git touches it` for every file a tool wrote — and left 20 tracked files sitting on disk
+as CRLF while the rest were LF. 🎯 **The conversion was the problem, not its direction**, and that is
+why the two candidate rules are not symmetric: choosing CRLF keeps the conversion and keeps the
+warning; choosing LF makes the warning impossible.
+
+🔑 **Why this is more than tidiness HERE:** a `.wat` fixture's bytes are input to the assembler and,
+through `pin`, to a **SHA-256 digest compared against the sibling runtime**. A line ending that
+depended on who checked the file out would move a digest — the exact class of portability defect
+Track B-c2 spent a day closing.
+
+**What this obliges an agent to do:**
+
+- write LF when creating or editing any file (Deno/Bun `writeTextFile` already does);
+- ⚠️ **mark a binary file `binary` in `.gitattributes` BEFORE committing the first one** — nothing
+  tracked today is binary, which is the only reason `*` can be that blunt;
+- if a CRLF file ever appears, re-check it out rather than hand-editing it:
+  `git ls-files -z | xargs -0 file | grep CRLF` names them.
+
+📖 Full reasoning and the verification that it changed zero committed bytes:
+[`best-practices.md`](best-practices.md) §6.
+
 ### The "look for code issues" trigger (binding on every agent)
 
 When the owner says **"look for code issues"** (or a synonym — "code audit", "audit the code", "hunt

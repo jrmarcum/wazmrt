@@ -1379,6 +1379,14 @@ producing noise, ask whether the fix is to change its value or to stop it applyi
 developer's `core.autocrlf`, so the answer does not depend on who cloned it. A `git config` fix would
 have been correct on exactly one machine.
 
+🔒 **And why `.editorconfig` TOO, rather than either alone — the two rules cover different moments.**
+`.gitattributes` governs what git stores and checks out; it cannot reach a file an editor saves with
+CRLF before it is ever staged. `.editorconfig` governs what the editor writes; it cannot reach a clone
+made with a different `core.autocrlf`. Neither is redundant and they must agree. ⚠️ The
+`.editorconfig` deliberately turns **off** whitespace trimming for `*.wat`/`*.wast`: those files are
+input to the assembler and then to a pin digest, so an editor "tidying" a trailing space would move a
+SHA-256 that this project compares against another runtime.
+
 **Why LF in the tree specifically, here:**
 
 - the committed bytes are LF regardless, so LF on disk means file and blob are byte-identical —
