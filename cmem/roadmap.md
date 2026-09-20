@@ -516,6 +516,48 @@ investigators per category, consolidate, report `file:line` + one line + severit
    turned the ABI version into a real gate. The version-string drift in `releasing.md` (four copies, no
    test) is a ready-made instance.
 
+#### ✅ THE GENERAL HUNT — categories 3, 4 and 5. **RUN 2026-09-20** (`e5ac7fb3`, `7de54a45`) `[x]`
+
+**`INDEX.md`'s "look for code issues" trigger, run as written**: two read-only investigators fanned
+out per category, consolidated here. ⚠️ **Every finding was re-verified by RUNNING before it was
+acted on** — the investigators located, they did not adjudicate, and two of their claims changed
+shape under test.
+
+| # | found | class |
+| --- | --- | --- |
+| **1** | 🚨 **`extended_const` was a PUBLISHED gate that could never fire.** In the enum, mirrored into `capi.zig`, published as `WAZMRT_FEATURE_EXTENDED_CONST`, offered in `--features` — and turning it off did nothing. `firstViolation` never walked a CONSTANT EXPRESSION, the only place the proposal can appear. **The only one of nineteen the function could not return** | unenforced control |
+| **2** | 🚨 **Both binary readers accepted wazmrt's INTERNAL valtype tags as wire bytes** (nine of them). wazmrt took binaries every other runtime refuses; `0x62` collided with custom-descriptors' `exact`, which a reader **in the same file** already read correctly | accept-invalid |
+| **3** | 🚨 **`(table 1 exnref)` was REFUSED and it is valid** — `shorthandRefType` was a second copy of `abstractHeapCode`'s table and had drifted | reject-valid |
+| **4** | **`--allow-symlink` was not in `--help`** — the flag granting a guest symlink creation, and the subject of B0's verify-disarm | undocumented surface |
+| **5** | **`wazmrt_ref_is_valid` missing from the ABI completeness gate**, whose header says it *"cannot disagree with what we publish"* | gate hole |
+| **6** | version string pinned across `root.zig` / `build.zig.zon` / `wazmrt.h`, and `WAZMRT_ABI_VERSION` against `abi_version` | category 5, mechanical |
+| **7** | three dead private functions removed; a doc comment concatenated onto itself | hygiene |
+
+🎓 **THE METHOD RESULT, and it is the transferable one: the field-coverage sweep came back CLEAN.**
+No parser-recorded field is unread, no struct field unreferenced, one orphaned enum member and one
+orphaned error variant out of 738 scanned. ⚠️ **Category 4 as written — "find unused things" —
+found almost nothing. What it actually found was DUPLICATES**: #2 and #3 are both *one fact, two
+implementations, and the second knows less than the first*, which is B-a's mechanism again. **The
+dead-code question worth asking in this codebase is not "what is unreachable" but "what is written
+twice".**
+
+🔑 **#1's real lesson is about CLASSIFICATION, not coverage.** `extended_const` is contextual:
+`i32.add` is core WebAssembly in a function body, and the proposal is that it may appear in a
+const-expr *at all*. So the opcode→proposal map was right to return null for it, and **no amount of
+walking more places would have produced the bit** — the const-expr walk had to ask a different
+question. *A coverage gap and a classification gap look identical from outside.*
+
+##### ⬜ FILED, NOT FIXED — from the same sweep, each with what would settle it
+
+| item | status |
+| --- | --- |
+| **`UnsupportedProposal` / `UnsupportedInstr` mis-verdicts** — `checkMemTail`'s pagesize arm (`wat.zig`) and `parseImport`'s descriptor arm now fire only for MALFORMATIONS, but both errors are on `wast.isOurLimitation`, so the conformance runner banks them as **SKIP** rather than as correct rejections. ⚠️ **Unverified**; it would inflate the 20-skip figure. Settle by asserting the two malformed spellings and reading which column they land in | ⬜ |
+| **The third memory site** — `checkMemTail`'s doc names three, only two call it; top-level `(import "m" "n" (memory …))` may still drop trailing junk silently. Settle by assembling `(module (import "m" "n" (memory 0 (bogus))))` | ⬜ |
+| **Stale scope comments** — `wat.zig` and `wast.zig` still say `(pagesize N)` is "a proposal we do not implement" (Track P implemented it) and that `(module quote …)` is "not implemented" (R5 implemented it) | ⬜ |
+| **`hostRefPayload`** (pub, zero callers) and **`BadFuncType`** (unreachable member of a **public** error set) — both removable only if `interp.zig`'s pub surface and `DecodeError` are implementation details rather than API. **Owner decision** | ⬜ |
+| **Remaining duplicate pairs** — `atomicIs64` vs `atomicValType` (same fact, two files, opposite polarity); three ULEB encoders and two decoders **with different strictness**, the laxer one running on untrusted bytes *before* the real decoder; `readF32Bits` ≡ `readU32Le` | ⬜ |
+| **Two orphaned doc comments** — `simdSig`'s doc is attached to `atomicValType`, `asStr`'s to `wrapModuleText` | ⬜ |
+
 #### ✅ B-a — The EMITTER audit. **COMPLETE 2026-09-20** (`d47ecd18`). **FOUR DEFECTS, 4-FOR-4 AGAIN** `[x]`
 
 🎯 **The prediction held exactly.** The mechanism produced four defects in the sibling project; it

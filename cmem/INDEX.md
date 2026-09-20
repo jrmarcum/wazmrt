@@ -8,7 +8,37 @@ a machine-local `CLAUDE.md`.
 and revised without wading through one giant file. Keep files small and single-topic.
 ---
 
-## 🏁 STATE — 2026-09-20. **ALL FIVE NAMED B ITEMS ARE DONE — BUT TRACK B IS NOT.**
+## 🏁 STATE — 2026-09-20. **TRACK B IS COMPLETE: all five named items AND the general hunt.**
+
+✅ **B-a, B-b, B-c (5/5), B-d, B-e — and categories 3, 4 and 5 of the track's own list**, run as
+`INDEX.md`'s "look for code issues" trigger specifies: two read-only investigators fanned out per
+category, **every finding re-verified by RUNNING before it was acted on**. 🚫 **Not versioned** —
+whether `1.0.2` ships is the owner's call, and `releasing.md`'s checklist has not been run.
+
+⬜ **Six items are FILED, NOT FIXED** (`roadmap.md` → the general hunt), each with what would settle
+it. The two worth knowing: a cluster of `UnsupportedProposal`/`UnsupportedInstr` mis-verdicts that
+may be inflating the conformance SKIP count, and a laxer second LEB decoder that runs on untrusted
+bytes before the real one.
+
+### ✅ THE GENERAL HUNT — 2026-09-20 (`e5ac7fb3`, `7de54a45`). **Three defects the tests could not see.**
+
+🚨 **`extended_const` was a PUBLISHED gate that could never fire** — in the enum, mirrored into
+`capi.zig`, published as `WAZMRT_FEATURE_EXTENDED_CONST`, offered in `--features`, and turning it
+off did nothing. 🚨 **Both binary readers accepted wazmrt's own INTERNAL valtype tags as wire
+bytes**, so wazmrt took binaries every other runtime refuses. 🚨 **`(table 1 exnref)` was refused
+and it is valid.** Plus: `--allow-symlink` was absent from `--help`, the ABI completeness gate was
+missing a published symbol, and the version string is now pinned across its copies.
+
+🎓 **THE METHOD RESULT IS THE TRANSFERABLE PART: the field-coverage sweep came back CLEAN.** Nothing
+unread, nothing unreferenced. ⚠️ **Category 4 as written — "find unused things" — found almost
+nothing; what it found were DUPLICATES.** Two of the three defects are *one fact, two
+implementations, and the second knows less than the first* — B-a's mechanism, twice more. **In this
+codebase the dead-code question to ask is not "what is unreachable" but "what is written twice".**
+
+🔑 And `extended_const`'s lesson is about CLASSIFICATION, not coverage: the proposal is contextual
+(`i32.add` is core in a body; the proposal is that it may appear in a const-expr at all), so the
+opcode→proposal map was right to return null and no amount of walking more places would have
+produced the bit. *A coverage gap and a classification gap look identical from outside.*
 
 ✅ **B-a, B-b, B-c (5/5), B-d and B-e are complete.** ⚠️ **The track is not, and the distinction
 matters:** those are the *named sub-tasks*. Track B's own list has five general hunt categories, and
@@ -155,14 +185,14 @@ so a checkout-dependent line ending would move a digest. Full reasoning: `best-p
 | gate | value | note |
 | --- | --- | --- |
 | conformance | **288 files · 64,072 passed · 0 failed · 20 skipped · 0 unrun** | baseline file is **EMPTY**. ⚠️ The counts differ from Track H's `284 · 63,934 · 0 skipped` because this is a **different testsuite checkout** (`wasmtk/…/testsuite-main`), not a regression — verified by running the same command on `HEAD` before and after every change on 2026-09-20 |
-| unit tests | **789/789** | from an NTFS cwd; a `D:` cwd loses 4 to exFAT symlinks |
-| `test-safe` | 789/789 | ReleaseSafe — optimized, safety checks KEPT |
+| unit tests | **798/798** | from an NTFS cwd; a `D:` cwd loses 4 to exFAT symlinks |
+| `test-safe` | 796/796 | ReleaseSafe — optimized, safety checks KEPT |
 | `test-security` | 3/3 | from an NTFS cwd |
-| **`test-shipped`** | **789/789** | Track H — **ReleaseSmall, the config that SHIPS** (checks off) |
+| **`test-shipped`** | **796/796** | Track H — **ReleaseSmall, the config that SHIPS** (checks off) |
 | `features` | green | all four `-Dwat`/`-Dwasi` combinations |
 | `capi-smoke` | green | |
 | 🆕 **`.wat` digest parity** | real-world **954 · 0** (`.wasm` 513 · 0), both listings 1,467 lines · 🆕 **spec corpus 2,121 · 20** (the 20 are documented legal shorthands — `tools/emitter-diff.mjs`) | **not a `zig build` step** — `wazmrt pin <wasmtk>` vs `wasmrt pin <wasmtk>`. See `testing.md`; it found three defects no in-repo gate could see |
-| size (ReleaseSmall) | exe **1,009,664** · lib **1,059,240** · dll **910,336** | all three EXACT. ⚠️ **The exe ceiling was 4,608 bytes BEHIND reality at `41a96aa3`** — two Track B commits grew it without raising it, which nothing caught because `zig build size` has to be remembered (**B-e**) |
+| size (ReleaseSmall) | exe **1,009,152** · lib **1,059,236** · dll **910,336** | all three EXACT. ⚠️ **The exe ceiling was 4,608 bytes BEHIND reality at `41a96aa3`** — two Track B commits grew it without raising it, which nothing caught because `zig build size` has to be remembered (**B-e**) |
 
 **Shipped 2026-08-18, in order:** Track **F** (feature enforcement — and two gates that did not
 exist), the **skip-closing pass** (two of its four items were rejecting VALID modules),

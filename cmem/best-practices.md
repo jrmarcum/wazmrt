@@ -1004,6 +1004,31 @@ all of them — a split no amount of reasoning about likely causes would have pr
 difference between raising a ceiling with an explanation and raising it with a guess. 📎 *Also the
 sibling's rule.* — Track B-e, `tools/size-ceilings.txt`
 
+**A COVERAGE GAP AND A CLASSIFICATION GAP LOOK IDENTICAL FROM OUTSIDE.** `extended_const` was the
+only one of nineteen proposals the feature gate could never return, and the obvious diagnosis —
+"the walk misses a place" — was only half of it. `i32.add` is core WebAssembly in a function body;
+the proposal is that it may appear in a **constant expression at all**. So the opcode→proposal map
+was *right* to return null for it, and no amount of walking more places would have produced the
+bit: the const-expr walk had to ask a different question. 🎓 **When a classifier returns nothing
+for an input you believe it should classify, ask whether the answer depends on CONTEXT before you
+go looking for the place you forgot to visit.** — Track B, `features.zig`
+
+**IN A CODEBASE THIS DISCIPLINED, "WHAT IS UNREACHABLE" IS THE WRONG DEAD-CODE QUESTION — ASK
+"WHAT IS WRITTEN TWICE".** A full reachability sweep over 914 functions, 246 fields, 603 enum
+members and 135 error variants found three dead private functions and two orphaned members. The
+same sweep's *duplicate* analysis found two live defects: a decoder accepting bytes nothing emits,
+and a reftype table that had drifted from the table it was copied from. ⚠️ **Both were one fact
+with two implementations, and in both the second knew less than the first** — the third and fourth
+instances of that shape in two days. — Track B categories 3/4, 2026-09-20
+
+**A COPY INHERITS THE BUG THE ORIGINAL WAS ALREADY FIXED FOR.** `shorthandRefType` was a duplicate
+of `abstractHeapCode`'s table and was missing `exnref`/`nullexnref` — and the original carries a ⚠️
+block recording that `exn` had been missing from IT once, at the cost of a whole `.wast` file. The
+fix to the first copy never reached the second, because nothing connected them. 🔒 **Derive the
+second from the first, even when deriving needs a guard**: here the bottom types spell their
+shorthand `null…ref`, so the derivation had to exclude `nofuncref` and friends — cheaper than
+re-typing twelve entries and waiting for the next omission. — Track B, `wat.zig`
+
 **A GATE THAT HAS TO BE REMEMBERED IS NOT ENFORCEMENT.** `zig build size` is a separate step, so it
 runs when somebody thinks of it — and on 2026-09-20 `main` was found **4,608 bytes over the exe
 ceiling**, put there by two commits that had each grown the CLI without raising the number in the same
