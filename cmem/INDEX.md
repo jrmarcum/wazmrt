@@ -15,7 +15,7 @@ and revised without wading through one giant file. Keep files small and single-t
 category, **every finding re-verified by RUNNING before it was acted on**. 🚫 **Not versioned** —
 whether `1.0.2` ships is the owner's call, and `releasing.md`'s checklist has not been run.
 
-⬜ **Six items are FILED, NOT FIXED** (`roadmap.md` → the general hunt), each with what would settle
+✅ **The six filed items were worked through 2026-09-20 (`91aee68c`) — four fixed, two left open on purpose.** ⬜ **Still open:** `hostRefPayload`/`BadFuncType` (an owner call on whether those `pub` surfaces are API), some low-value duplicates of trivial code, and 🆕 **Track A's reopen condition, which the corpus has now MET** — `(@custom …)` emits a custom section, and annotations are discarded at the lexer. ⚠️ **Two of the six were filed UNVERIFIED and verification changed both:** the third memory site was a real accept-invalid, and the mis-verdict cluster was real while the consequence filed for it — an inflated SKIP count — was not. ~~Six items are FILED, NOT FIXED~~ (`roadmap.md` → the general hunt), each with what would settle
 it. The two worth knowing: a cluster of `UnsupportedProposal`/`UnsupportedInstr` mis-verdicts that
 may be inflating the conformance SKIP count, and a laxer second LEB decoder that runs on untrusted
 bytes before the real one.
@@ -185,14 +185,14 @@ so a checkout-dependent line ending would move a digest. Full reasoning: `best-p
 | gate | value | note |
 | --- | --- | --- |
 | conformance | **288 files · 64,072 passed · 0 failed · 20 skipped · 0 unrun** | baseline file is **EMPTY**. ⚠️ The counts differ from Track H's `284 · 63,934 · 0 skipped` because this is a **different testsuite checkout** (`wasmtk/…/testsuite-main`), not a regression — verified by running the same command on `HEAD` before and after every change on 2026-09-20 |
-| unit tests | **798/798** | from an NTFS cwd; a `D:` cwd loses 4 to exFAT symlinks |
-| `test-safe` | 796/796 | ReleaseSafe — optimized, safety checks KEPT |
+| unit tests | **802/802** | from an NTFS cwd; a `D:` cwd loses 4 to exFAT symlinks |
+| `test-safe` | 800/800 | ReleaseSafe — optimized, safety checks KEPT |
 | `test-security` | 3/3 | from an NTFS cwd |
-| **`test-shipped`** | **796/796** | Track H — **ReleaseSmall, the config that SHIPS** (checks off) |
+| **`test-shipped`** | **800/800** | Track H — **ReleaseSmall, the config that SHIPS** (checks off) |
 | `features` | green | all four `-Dwat`/`-Dwasi` combinations |
 | `capi-smoke` | green | |
 | 🆕 **`.wat` digest parity** | real-world **954 · 0** (`.wasm` 513 · 0), both listings 1,467 lines · 🆕 **spec corpus 2,121 · 20** (the 20 are documented legal shorthands — `tools/emitter-diff.mjs`) | **not a `zig build` step** — `wazmrt pin <wasmtk>` vs `wasmrt pin <wasmtk>`. See `testing.md`; it found three defects no in-repo gate could see |
-| size (ReleaseSmall) | exe **1,009,152** · lib **1,059,236** · dll **910,336** | all three EXACT. ⚠️ **The exe ceiling was 4,608 bytes BEHIND reality at `41a96aa3`** — two Track B commits grew it without raising it, which nothing caught because `zig build size` has to be remembered (**B-e**) |
+| size (ReleaseSmall) | exe **1,009,152** · lib **1,058,980** · dll **910,336** | all three EXACT. ⚠️ **The exe ceiling was 4,608 bytes BEHIND reality at `41a96aa3`** — two Track B commits grew it without raising it, which nothing caught because `zig build size` has to be remembered (**B-e**) |
 
 **Shipped 2026-08-18, in order:** Track **F** (feature enforcement — and two gates that did not
 exist), the **skip-closing pass** (two of its four items were rejecting VALID modules),

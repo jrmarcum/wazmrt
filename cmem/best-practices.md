@@ -1029,6 +1029,29 @@ second from the first, even when deriving needs a guard**: here the bottom types
 shorthand `null…ref`, so the derivation had to exclude `nofuncref` and friends — cheaper than
 re-typing twelve entries and waiting for the next omission. — Track B, `wat.zig`
 
+**A STALE SCOPE COMMENT DOES NOT JUST MISINFORM — IT CAN PICK THE ERROR, AND THE ERROR PICKS THE
+COLUMN IN THE SCORE.** Two comments claimed proposals were unimplemented long after Track P and R5
+implemented them. Because they claimed *"a proposal we do not target"*, the code beneath them
+answered `UnsupportedProposal`/`UnsupportedInstr` — both on `wast.isOurLimitation` — so wazmrt's
+**correct rejections of malformed input** were banked as SKIPs: a refusal we were entitled to give,
+scored as a gap we have. 🎓 *When a comment names a limitation, check whether anything downstream
+reads that claim as data.* — Track B, `wat.zig` / `wast.zig`
+
+**FILE A SUSPICION AS A SUSPICION, THEN MEASURE IT BEFORE YOU PRICE IT.** Six items were filed from
+an audit, two of them explicitly unverified. Verification changed both: the third memory site was a
+genuine accept-invalid, and the mis-verdict cluster was real **while the consequence filed for it
+was not** — the claim was that it inflated the conformance SKIP count, and the count never moved.
+⚠️ Fixing it was still right on its own terms; the *reason recorded* for fixing it was wrong, and
+an unexamined reason is what a future pass would have inherited. — Track B, 2026-09-20
+
+**"THE OTHER LAYER CATCHES IT" IS AN ARGUMENT WITH AN EXPIRY DATE.** A second LEB decoder ran on
+untrusted bytes before the real one and was laxer about over-long encodings. It was **verified not
+exploitable** — the strict decoder gates execution, so the lax one was a superset-acceptor — and
+tightened anyway, because that argument has to be re-derived every time either layer is touched and
+it cost two lines to retire. 🔒 **Prefer removing the differential to documenting why it is safe**,
+especially ahead of a security review that would otherwise have to rediscover the reasoning.
+— Track B, `sign.zig`
+
 **A GATE THAT HAS TO BE REMEMBERED IS NOT ENFORCEMENT.** `zig build size` is a separate step, so it
 runs when somebody thinks of it — and on 2026-09-20 `main` was found **4,608 bytes over the exe
 ceiling**, put there by two commits that had each grown the CLI without raising the number in the same

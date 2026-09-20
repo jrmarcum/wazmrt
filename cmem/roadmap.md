@@ -551,16 +551,22 @@ const-expr *at all*. So the opcode→proposal map was right to return null for i
 walking more places would have produced the bit** — the const-expr walk had to ask a different
 question. *A coverage gap and a classification gap look identical from outside.*
 
-##### ⬜ FILED, NOT FIXED — from the same sweep, each with what would settle it
+##### ✅ THE FILED ITEMS — WORKED THROUGH 2026-09-20 (`91aee68c`). **Six closed, two open.**
+
+🔑 **Two were filed UNVERIFIED and verification changed both**: the third memory site was a real
+accept-invalid, and the mis-verdict cluster was real while **the consequence filed for it was not** —
+the SKIP count never moved. *File a suspicion as a suspicion, then measure it before you price it.*
 
 | item | status |
 | --- | --- |
-| **`UnsupportedProposal` / `UnsupportedInstr` mis-verdicts** — `checkMemTail`'s pagesize arm (`wat.zig`) and `parseImport`'s descriptor arm now fire only for MALFORMATIONS, but both errors are on `wast.isOurLimitation`, so the conformance runner banks them as **SKIP** rather than as correct rejections. ⚠️ **Unverified**; it would inflate the 20-skip figure. Settle by asserting the two malformed spellings and reading which column they land in | ⬜ |
-| **The third memory site** — `checkMemTail`'s doc names three, only two call it; top-level `(import "m" "n" (memory …))` may still drop trailing junk silently. Settle by assembling `(module (import "m" "n" (memory 0 (bogus))))` | ⬜ |
-| **Stale scope comments** — `wat.zig` and `wast.zig` still say `(pagesize N)` is "a proposal we do not implement" (Track P implemented it) and that `(module quote …)` is "not implemented" (R5 implemented it) | ⬜ |
-| **`hostRefPayload`** (pub, zero callers) and **`BadFuncType`** (unreachable member of a **public** error set) — both removable only if `interp.zig`'s pub surface and `DecodeError` are implementation details rather than API. **Owner decision** | ⬜ |
-| **Remaining duplicate pairs** — `atomicIs64` vs `atomicValType` (same fact, two files, opposite polarity); three ULEB encoders and two decoders **with different strictness**, the laxer one running on untrusted bytes *before* the real decoder; `readF32Bits` ≡ `readU32Le` | ⬜ |
-| **Two orphaned doc comments** — `simdSig`'s doc is attached to `atomicValType`, `asStr`'s to `wrapModuleText` | ⬜ |
+| **The third memory site** | ✅ **CONFIRMED AND FIXED** (`91aee68c`). `(import "m" "n" (memory 0 (bogus)))` assembled and **validated OK**; the other two spellings refuse it and so does the sibling. `checkMemTail`'s doc named three sites and two called it |
+| **`UnsupportedProposal` / `UnsupportedInstr` mis-verdicts** | ✅ **REAL, FIXED — and the consequence claimed for them was NOT real.** Both now `BadModuleField`, so wazmrt's correct rejections stop scoring as our gap. ⚠️ **But the SKIP count did not move**: still 20, measured. The 20 are three files in a `custom/` subdirectory the Track H corpus lacked — `custom_annot`, `name_annot`, `branch_hint` — using `(@custom …)` and branch-hint metadata, i.e. untargeted proposal syntax, **correctly** classified. 🎓 *The mis-verdict was worth fixing on its own terms; the reason filed for fixing it was wrong.* |
+| **The second LEB decoder** | ✅ **HARDENED, and verified NOT exploitable first.** `sign.readUleb` ran on untrusted bytes before the real decoder and accepted an over-long 5th byte. Measured: `Module.decode` refuses such a module, so the lax parser was a strict superset-acceptor and the strict one gates execution. Tightened anyway — *"the other layer catches it" must be re-derived every time either layer moves* — and a test now pins the two parsers on what they accept AND refuse |
+| **`atomicIs64` vs `atomicValType`** | ✅ **DERIVED, not pinned.** It was a second copy of the same fourteen literals in another file with the opposite polarity. They agreed — which is why it had to go: *the validator and the interpreter agreeing because they were written from the same head rather than the same table* is how a `try_table` catch label was resolved one frame too deep in three places at once, corpus green |
+| **Stale scope comments + two orphaned doc comments** | ✅ **FIXED.** The scope claims did more than misinform: in two cases the stale comment **picked the error**, and the error picked the column in the conformance score. `simdSig`'s doc was on `atomicValType` and `asStr`'s on `wrapModuleText` — each function carrying someone else's first sentence while another carried none |
+| ⬜ **`hostRefPayload`** (pub, zero callers) and **`BadFuncType`** (unreachable member of a **public** error set) | ⬜ **STILL OPEN — owner decision, and the only one of the six that is.** Removable only if `interp.zig`'s `pub` surface and `DecodeError` are implementation details rather than API. Deleting either is an API change for anyone switching exhaustively or calling through `root.interp` |
+| ⬜ **Low-value duplicates left standing** | ⬜ `readF32Bits` ≡ `readU32Le` (one function, two names, each doc describing half the truth); three ULEB **encoders** (one test-only); `hexVal` duplicated in `pin.zig`/`sexpr.zig`; export-by-name lookup implemented 4× and open-coded 7× more. **None reconstructs a fact** — they are copies of trivial code, which is the class the duplicate hunt deliberately ranked last |
+| 🆕 ⬜ **Track A's reopen condition is MET** | ⬜ Recorded 2026-09-20. Annotations are discarded at the lexer, which is correct *"unless they ever carry meaning to any consumer"* — and `custom_annot.wast`'s `(@custom "name" "bytes")` **emits a custom section**. The condition its own entry set has been met by the corpus; whether to act is a scoping call |
 
 #### ✅ B-a — The EMITTER audit. **COMPLETE 2026-09-20** (`d47ecd18`). **FOUR DEFECTS, 4-FOR-4 AGAIN** `[x]`
 
