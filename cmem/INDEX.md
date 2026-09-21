@@ -1,5 +1,10 @@
 # cmem — Portable Project Memory for wazmrt
 
+> **At session start, read `../../cmem/handoffs.md` for letters addressed to this repo.** The workspace
+> session (`../../cmem/INDEX.md`) reviews across the sibling repos and reports there; nothing is ever
+> written into this repo from outside. (owner directive, 2026-09-20)
+
+
 This folder is the **authoritative, portable project memory** for `wazmrt`. It lives inside the
 project tree, so it travels with the project (USB drive, clones) and is **committed to git** — unlike
 a machine-local `CLAUDE.md`.
